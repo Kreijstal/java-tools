@@ -991,7 +991,7 @@ test('overload resolution is identical inside local and anonymous classes', (t) 
 // type that is a subclass of the argument. That let the by-name fallback in
 // selectUserMethodDescriptor claim a method the call could not invoke, and
 // because the fallback runs before the hierarchy walk it also hid the inherited
-// method that did apply. orbdefence shipped `pk.a(Lvi;I)V` for an `s` argument.
+// method that did apply. regression corpus shipped `pk.a(Lvi;I)V` for an `s` argument.
 test('an overload needing a downcast loses to the inherited one that applies', (t) => {
   const result = frontend.compileJavaSource(INAPPLICABLE_OVERLOAD_SMOKE_SOURCE, {
     sourceFileName: 'InapplicableOverloadSmoke.java',

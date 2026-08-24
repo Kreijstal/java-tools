@@ -7,7 +7,7 @@
 // negateBooleanExpression matched /^(.+) (==|!=|...) (.+)$/ against the whole
 // rendered string. The leading (.+) is greedy, so for a call expression it split
 // on an operator inside the ARGUMENTS and flipped that instead of negating the
-// call. Dekobloko hit this: negating
+// call. reference workload hit this: negating
 //   ((nm) x).a(a, b, c, stackIn_41_4 != 0, 2, param4)
 // rewrote the argument to `== 0`, inverting the lobby list's skip-the-walk flag.
 // The rows decoded, inserted, laid out and painted correctly and were then

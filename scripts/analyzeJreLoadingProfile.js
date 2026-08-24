@@ -3,7 +3,7 @@
 
 // Views over a HotSpot JFR recording of a game boot, as produced by
 // `scripts/run-jre-reflection-main-menu.js --game NAME --jfr-profile OUT.jfr`
-// (from the dekobloko work tree).
+// (from the reference-workload work tree).
 //
 //   node scripts/analyzeJreLoadingProfile.js RECORDING.jfr timeline [BUCKET_S]
 //       samples per time bucket, with the dominant method in each. Use this

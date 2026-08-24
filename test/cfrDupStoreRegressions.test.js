@@ -17,7 +17,7 @@
 //               param1 = param0 << 16;   // shifts twice -> 32 bits -> 0
 //     correct:  one shift, one value, stored to both
 //
-// Found in vertigo2's `oo`, the software rasterizer. Its three triangle-fill
+// Found in regression corpus's `oo`, the software rasterizer. Its three triangle-fill
 // methods convert coordinates to 16.16 fixed point via chained assignment, and
 // the decompiler emitted 18 of these cross-slot re-shifts (6 per method, which
 // is exactly the `ishl` count excess over the original class). A doubly

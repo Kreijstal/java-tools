@@ -147,13 +147,13 @@ exits, and only external jump predecessors are redirected.
 
 Verified via ASM `BasicVerifier`: the transformed class is exactly as verifiable
 as the input, and a CFG that made Vineflower crash becomes structurable
-(`orbdefence` irreducibility 2→0, `steelsentinels` 7→0). Gated conservatively:
+(`regression corpus` irreducibility 2→0, `steelsentinels` 7→0). Gated conservatively:
 refuses on exception-range overlap, more than one non-redirectable entry, or a
 region over the size cap.
 
 **Important finding:** region-splitting is a tool *for our own structurer*, not
 for CFR. Feeding split bytecode back through CFR makes CFR's output *worse*
-(`orbdefence` 4→15 markers, `steelsentinels` 2→26) because CFR re-linearizes the
+(`regression corpus` 4→15 markers, `steelsentinels` 2→26) because CFR re-linearizes the
 clones. So region-split is wired into the structurer path only, never into the
 CFR-gated baseline.
 

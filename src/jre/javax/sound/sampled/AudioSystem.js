@@ -4,7 +4,7 @@ const { newJavaObject, getLineForInfo, isSourceDataLineInfo } =
 
 // getMixerInfo() previously returned null, which no JRE ever does: the
 // contract is an array, empty at worst. Guest code loops over the result
-// without a null check -- orbdefence scans it for a "soundmax" substring --
+// without a null check -- regression corpus scans it for a "soundmax" substring --
 // so null turns a device query into a NullPointerException in the guest.
 //
 // Reporting zero mixers would be just as misleading in the other direction:

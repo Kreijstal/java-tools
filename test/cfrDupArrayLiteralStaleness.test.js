@@ -21,7 +21,7 @@
 // fix both came out as a bare `param0`, so element 0 silently reported the
 // post-store value.
 //
-// Found in voidhunters. `wlb` builds the game's config geometry as running
+// Found in regression corpus. `wlb` builds the game's config geometry as running
 // accumulations feeding dup-filled vertex arrays; the stale elements corrupted
 // the polygon handed to `wfb`, which left `hab.field_g[3].field_o` one entry
 // short (15 instead of 16). `ml`'s constructor sizes `field_d` from that length,

@@ -8023,7 +8023,7 @@ function negateBooleanExpression(value) {
   // Only invert an operator that is genuinely the TOP-LEVEL comparison. The
   // regex is greedy, so for a call expression it happily splits on a `!=` that
   // sits inside the argument list -- negating an argument instead of the call.
-  // Dekobloko hit exactly that: negating
+  // reference workload hit exactly that: negating
   //   ((nm) x).a(a, b, c, stackIn_41_4 != 0, 2, param4)
   // rewrote the ARGUMENT to `== 0`, inverting the lobby list's skip-the-walk
   // flag and leaving the player list clipped to nothing. Balanced brackets on

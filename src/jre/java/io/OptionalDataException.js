@@ -1,4 +1,4 @@
-// Named by java.io serialization code that voidhunters catches; without a model
+// Named by java.io serialization code that regression corpus catches; without a model
 // the frontend could not resolve the simple name under `import java.io.*` and
 // emitted a default-package class reference that exists nowhere.
 module.exports = {

@@ -700,7 +700,7 @@ test('does not remove an identity operator with an alternate entry', (t) => {
 // argument stop hiding real facts. That pruning is NOT applied to the program
 // the decompiler emits, so a parameter that only looks constant because the
 // varying store became unreachable would be specialized to a wrong literal.
-// Observed on Dekobloko: cl.a(String,int,int,String,int)'s second parameter was
+// Observed on reference workload: cl.a(String,int,int,String,int)'s second parameter was
 // rewritten to 0 while sf still passed a computed width at a live call site.
 function constantArgumentDivergenceAsts() {
   const callee = () => method('d', '(I)V', ['static'], [

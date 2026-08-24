@@ -1840,7 +1840,7 @@ class JitCompiler {
       ...(this.postIncrementHelpersEnabled ? ["dup_x1"] : []),
       ...EXTENDED_TIER_OPCODES,
       "monitorenter", "monitorexit", "saload", "sastore", "sipush",
-      // drem/l2d were the only opcodes left rejecting orbdefence's hot
+      // drem/l2d were the only opcodes left rejecting regression corpus's hot
       // ja.a(B)I, which took the slow scheduler path on 100% of its samples
       // and 66% of scheduler time. stackEffect already scored both; only the
       // emitter cases and this gate entry were missing.

@@ -739,7 +739,7 @@ Ldone1:
 .end class
 `;
 
-// Reduced from dekobloko qk.run (dekobloko-work issues #4 and #13). The
+// Reduced from reference-workload qk.run (reference-workload-work issues #4 and #13). The
 // synchronized region has two distinct exits, and the normal exit computes a
 // ring-buffer write length whose shorter branch must skip the tail assignment.
 // Losing either piece produces valid-looking but incorrect Java: wait() runs

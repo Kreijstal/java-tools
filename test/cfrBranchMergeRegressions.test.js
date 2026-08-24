@@ -9,7 +9,7 @@
 // outright. javac stays at zero errors and the class verifies, so the damage is
 // visible only in the emitted source.
 //
-// Found in vertigo2's `qm`, the Jagex account prompt. Its click handler
+// Found in regression corpus's `qm`, the software renderer account prompt. Its click handler
 // dispatches three buttons, and the bytecode gives each its own action:
 //
 //     E ("Go Back")                -> sd.f(-1)
@@ -59,7 +59,7 @@ function decompileFixture(tempDir, name, source) {
 //               adjacent and the `h` one runs play() on the way.
 //   guarded  -- the same topology wearing the gamepack's clothes (opaque
 //               predicate, outer RuntimeException wrapper, trailing modulo),
-//               matching vertigo2 `qm` after the bytecode passes run. Kept
+//               matching regression corpus `qm` after the bytecode passes run. Kept
 //               because the extra structure has historically changed which
 //               structurer claims a method.
 //   plain    -- the control. Here the second predecessor really is empty, so

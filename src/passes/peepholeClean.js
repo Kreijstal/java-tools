@@ -2107,7 +2107,7 @@ function removeDeadGotoIslandsAfterTerminals(code, context = null) {
       // A referenced label in that skipped range is a live alternate entry,
       // so the following goto is not a dead post-terminal island: removing it
       // changes the branch target's continuation (and can disconnect a whole
-      // region, as in Dekobloko's flat-triangle rasterizer).
+      // region, as in reference workload's flat-triangle rasterizer).
       let hasLiveEntry = false;
       for (let k = scanStart; k <= j; k += 1) {
         const label = trimLabel(codeItems[k] && codeItems[k].labelDef);

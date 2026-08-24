@@ -2,9 +2,9 @@
 // bytecode) but ignores the ACC_SYNCHRONIZED flag on METHODS, so several
 // threads run inside a synchronized method at once.
 //
-// Found via orbdefence on jvm.js: the game's audio pump (la.a, lj.b, lj.a) is
+// Found via regression corpus on jvm.js: the game's audio pump (la.a, lj.b, lj.a) is
 // built entirely from synchronized methods, and two threads call into it -- the
-// audio thread (oa.run) and the game thread (OrbDefence.run -> tf.a -> lj.c).
+// audio thread (oa.run) and the game thread (RegressionCorpus.run -> tf.a -> lj.c).
 // Without the monitor the game thread mutates the synth's voice list while the
 // audio thread iterates it, so im.d(int) dereferences a cursor whose node has
 // been unlinked and throws NPE. la.a() catches it, closes the SourceDataLine

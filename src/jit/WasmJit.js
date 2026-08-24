@@ -1127,7 +1127,7 @@ class MethodTranslator {
   // loop left a ready module at runs==exits, contributing nothing.
   checkcastImport(ins, itemIndex, underTypes, op = 'checkcast') {
     // Opt-in: compiling casts is correct (see wasmInstanceLink tests) but
-    // measured net-negative on dekobloko — it unlocks tiny deoptable
+    // measured net-negative on reference-workload — it unlocks tiny deoptable
     // callees whose per-call partial-protocol overhead exceeds interpreting
     // them. Revisit when a larger region can keep these operations in wasm.
     if (!this.wasmJit || !this.wasmJit.instanceLinkEnabled ||

@@ -1,7 +1,7 @@
 "use strict";
 
 // Historical oracle for the polygon edge-table rasterizer used by several
-// Jagex-era software renderers.  Recognition is deliberately independent of
+// software renderer-era software renderers.  Recognition is deliberately independent of
 // class, method, and field names:
 //
 //   public wrapper -> private wrapper -> edge builder + scan iterator -> span

@@ -681,7 +681,7 @@ registerProcessor("jvm-source-data-line", JVMSourceDataLineProcessor);`;
     return Math.max(-1, Math.min(1, value));
   }
 
-  // Install the unlock path before the game creates SourceDataLine. Dekobloko
+  // Install the unlock path before the game creates SourceDataLine. reference workload
   // opens audio only after its login gesture; installing here lets Firefox
   // create and resume the context inside that gesture instead of creating a
   // permanently suspended context several seconds later.

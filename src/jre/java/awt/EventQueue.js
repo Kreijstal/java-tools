@@ -2,7 +2,7 @@ module.exports = {
   super: 'java/lang/Object',
   methods: {
     '<init>()V': () => {},
-    // The FunOrb loader posts custom events / inspects the queue; a permissive
+    // The legacy applet loader posts custom events / inspects the queue; a permissive
     // no-op queue keeps the applet boot path alive in this headless JVM.
     'postEvent(Ljava/awt/AWTEvent;)V': () => {},
     'peekEvent()Ljava/awt/AWTEvent;': () => null,

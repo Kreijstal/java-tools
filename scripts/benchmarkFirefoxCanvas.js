@@ -87,7 +87,7 @@ const durationMs = Number(process.env.CANVAS_BENCHMARK_MS || 4000);
         }
       };
 
-      const jagexStyleBlend = (frame) => {
+      const softwareRasterBlend = (frame) => {
         let red = Math.imul(frame, 1234567);
         let green = Math.imul(frame, 7654321);
         let blue = Math.imul(frame, 334455);
@@ -122,16 +122,16 @@ const durationMs = Number(process.env.CANVAS_BENCHMARK_MS || 4000);
           fullRaster(frame);
           upload();
         }),
-        await rafTest('Jagex-style blend and upload', (frame) => {
-          jagexStyleBlend(frame);
+        await rafTest('software-raster blend and upload', (frame) => {
+          softwareRasterBlend(frame);
           upload();
         }),
       ];
       const tightLoopTests = [
         tightTest('full JavaScript raster', fullRaster),
-        tightTest('Jagex-style blend', jagexStyleBlend),
-        tightTest('Jagex-style blend and upload', (frame) => {
-          jagexStyleBlend(frame);
+        tightTest('software-raster blend', softwareRasterBlend),
+        tightTest('software-raster blend and upload', (frame) => {
+          softwareRasterBlend(frame);
           upload();
         }),
       ];
