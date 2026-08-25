@@ -570,37 +570,6 @@ public class StructuredNormalFlowReference {
   t.end();
 });
 
-test('relaxed reference returns admit only terminal throw gaps', async (t) => {
-  const { jvm, thread } = await makeHarness(t,
-    'StructuredTerminalThrowReference', `
-public class StructuredTerminalThrowReference {
-  public static int[] drive(int[] values, int n) {
-    for (int i = 0; i < n; i++) values[i] += i;
-    if (n < 0) throw null;
-    return values;
-  }
-}
-`);
-  jvm.jit.wasmJit.relaxedRefReturn = true;
-  jvm.jit.wasmJit.structuredEnabled = false;
-  const values = [2, 4, 6, 8];
-  values.type = '[I';
-  await invoke(jvm, thread, 'StructuredTerminalThrowReference', 'drive',
-    '([II)[I', [values, values.length]);
-  t.deepEqual(values.slice(), [2, 5, 8, 11],
-    'the admitted module preserves the successful reference-return path');
-  const method = await jvm.findMethodInHierarchy(
-    'StructuredTerminalThrowReference', 'drive', '([II)[I');
-  const state = jvm.jit.wasmJit.state.get(method);
-  t.equal(state?.status, 'ready',
-    'a reference module with only uncaught terminal throw gaps is installed');
-  t.ok(state?.meta?.referenceReturnTerminalThrowGaps,
-    'admission records the structural terminal-throw proof');
-  t.notOk(state?.meta?.normalFlowFullyCompiled,
-    'the proof does not misreport the demoted throw arm as compiled');
-  t.end();
-});
-
 test('compiled newarray throws a catchable NegativeArraySizeException', async (t) => {
   const { jvm, thread } = await makeHarness(t, 'StructuredNegSize', `
 public class StructuredNegSize {

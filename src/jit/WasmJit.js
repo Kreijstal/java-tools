@@ -1413,18 +1413,6 @@ class MethodTranslator {
     const normalReachable = this.normalReachableBlocks(N);
     this.normalFlowFullyCompiled = [...normalReachable]
       .every((b) => this.supportedBlocks.has(b));
-    const normalGaps = [...normalReachable]
-      .filter((b) => !this.supportedBlocks.has(b));
-    this.referenceReturnTerminalThrowGaps = excTable.length === 0 &&
-      normalGaps.length > 0 && normalGaps.every((b) => {
-        const from = this.blockStarts[b];
-        const to = b + 1 < N ? this.blockStarts[b + 1] : this.items.length;
-        for (let index = to - 1; index >= from; index -= 1) {
-          const instruction = this.items[index]?.instruction;
-          if (instruction) return getOp(instruction) === 'athrow';
-        }
-        return false;
-      });
     // Normal-flow items NOT covered by supported blocks: compile()'s tier
     // preference compares coverage GAPS across tiers. Gaps, not covered
     // counts: the tiers partition and expand items differently, so covered
@@ -2285,8 +2273,6 @@ class MethodTranslator {
       blockCount: this.blockStarts.length,
       fullyCompiled: this.supportedBlocks.size === this.blockStarts.length,
       normalFlowFullyCompiled: this.normalFlowFullyCompiled,
-      referenceReturnTerminalThrowGaps:
-        this.referenceReturnTerminalThrowGaps,
       // instance-dispatch sites can deopt at runtime (dispatch-map miss or
       // partial target), so callers must give this module a real frame and
       // the NestedDeopt protocol even when it is fully compiled
@@ -2910,9 +2896,7 @@ class WasmJit {
       // runs==exits, and partial wasm that exits on every entry is exactly
       // what the whole-method-JS preference exists to avoid.
       const refReturnComplete = this.relaxedRefReturn
-        ? primary.normalFlowFullyCompiled ||
-          primary.referenceReturnTerminalThrowGaps
-        : primary.fullyCompiled;
+        ? primary.normalFlowFullyCompiled : primary.fullyCompiled;
       if (!refReturnComplete &&
           (primary.retChar === 'L' || primary.retChar === '[')) {
         st.referenceReturnRejection = {
