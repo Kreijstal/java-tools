@@ -2808,6 +2808,18 @@ class HotCallGraphRegionCompiler {
     const rootArguments = plan.root.generated
       .jvmStructuredRegionArgumentNames;
     const rootName = functionNames.get(plan.root.method);
+    const rootNeedsReceiver = !(
+      (plan.root.method.flags || []).includes("static") ||
+      (Number(plan.root.method.accessFlags) & 0x0008) !== 0);
+    // A positional graph entry is optional. Prove that its receiver still has
+    // reference shape before any fused guest effect: stale/rebound call-site
+    // feedback must fall back to canonical invocation, never reinterpret a
+    // primitive operand as local0 and corrupt instance fields.
+    const rootReceiverGuard = !framedRoot && rootNeedsReceiver
+      ? "if (argument0 === null || (typeof argument0 !== 'object' && " +
+        "typeof argument0 !== 'string' && typeof argument0 !== 'function')) " +
+        "return ssaAsyncInvoke;"
+      : null;
     const unprunedModuleSource = [
       "'use strict';",
       ...declarations,
@@ -2817,6 +2829,7 @@ class HotCallGraphRegionCompiler {
         : "if (!jvmRegionGuard(thread, helpers)) {",
       framedRoot ? null : "  return helpers.asyncInvokeSentinel();",
       framedRoot ? null : "}",
+      rootReceiverGuard,
       framedRoot ? null :
         `return ${rootName}(helpers,${rootArguments.join(",")}${
           rootArguments.length ? "," : ""}thread,2);`,
