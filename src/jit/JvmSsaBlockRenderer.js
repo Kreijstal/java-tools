@@ -4878,6 +4878,11 @@ class JvmSsaBlockRenderer {
                       : `(${positionalRawInvoke} || ${positionalInvoke}) && ${receiverGuard}`}) {`,
                 ]),
                 `  ${usedDirect} = true;`,
+                ...(this.jit.positionalCallSafePointChargingEnabled &&
+                    structured.loopHeaders.size > 0 ? [
+                  `  safePointBudget -= ((${positionalRawInvoke} || ` +
+                    `${positionalInvoke}).jvmSafePointCharge || 0);`,
+                ] : []),
                 ...(inlineCheckedLeafLines ? [
                   `  ${inlineCheckedLeafLabel}: {`,
                   ...inlineCheckedLeafLines.map((line) => `    ${line}`),

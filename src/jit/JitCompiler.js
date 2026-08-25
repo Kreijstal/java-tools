@@ -163,6 +163,8 @@ class JitCompiler {
       eagerMonomorphicCallMaxCodeItems > 0
         ? Math.floor(eagerMonomorphicCallMaxCodeItems) : 96;
     this.eagerMonomorphicCallLinkCount = 0;
+    this.positionalCallSafePointChargingEnabled =
+      options.positionalCallSafePointCharging === true;
     // Positional adapters are code-shape templates. Many independent call
     // sites reach the same method and used to parse an identical Function for
     // every site during asset loading. Cache the unbound template by resolved
@@ -6297,6 +6299,17 @@ class JitCompiler {
       ? `${lookupClass}.${method.name}${site.descriptor}` : "";
     const positionalTrace = Boolean(
       positionalTracePattern && positionalTraceKey.includes(positionalTracePattern));
+    const publishSafePointCharge = () => {
+      const invoke = target.positionalInvoker;
+      if (!invoke) return invoke;
+      const charge = method && Array.isArray(method.attributes)
+        ? Math.max(1, this.getCodeItems(method).length) : 1;
+      invoke.jvmSafePointCharge = charge;
+      if (typeof invoke.jvmRawInvoke === "function") {
+        invoke.jvmRawInvoke.jvmSafePointCharge = charge;
+      }
+      return invoke;
+    };
     if (positionalTrace) {
       console.error("[positional-selection]", JSON.stringify({
         method: positionalTraceKey,
@@ -6316,7 +6329,7 @@ class JitCompiler {
     if (target.inlineIntegerRegion) {
       target.positionalInvoker = this.getDirectInlineIntegerRegion(
         method, site.params, site.returnType);
-      return target.positionalInvoker;
+      return publishSafePointCharge();
     }
     if (!method || !generated || generated.jvmSynchronous !== true ||
         target.intrinsic || target.memoizedIntegralLeaf ||
@@ -6349,7 +6362,7 @@ class JitCompiler {
       target.positionalInvoker.jvmRestoresExceptionFrames = true;
       target.positionalInvoker.jvmRawInvoke =
         generated.jvmHotCallGraphDirectPositionalBody;
-      return target.positionalInvoker;
+      return publishSafePointCharge();
     }
     if (!resumableHotGraphPositional &&
         typeof generated.jvmDirectPositionalBody === "function") {
@@ -6361,7 +6374,7 @@ class JitCompiler {
       target.positionalInvoker =
         generated.jvmDirectPositionalBody.bind(null, this);
       target.positionalInvoker.jvmDebugGuarded = true;
-      return target.positionalInvoker;
+      return publishSafePointCharge();
     }
     if (!resumableHotGraphPositional &&
         this.checkedLeafDirectPositionalEnabled &&
@@ -6386,7 +6399,7 @@ class JitCompiler {
       // sites. Selection is based solely on the verified checked-leaf shape.
       target.positionalInvoker.jvmRawInvoke =
         nestedBody;
-      return target.positionalInvoker;
+      return publishSafePointCharge();
     }
     if (!resumableHotGraphPositional &&
         typeof generated.jvmRestoringDirectPositionalBody === "function") {
@@ -6418,7 +6431,7 @@ class JitCompiler {
       // invoke pc and operands until the ordinary exception dispatcher has
       // processed that reconstructed frame.
       target.positionalInvoker.jvmRestoresExceptionFrames = true;
-      return target.positionalInvoker;
+      return publishSafePointCharge();
     }
     const argumentsList = Array.from(
       { length: argumentCount }, (_unused, index) => `argument${index}`);
@@ -6665,7 +6678,11 @@ class JitCompiler {
       };
       target.positionalInvoker = entry.bind(null, plan);
       target.positionalInvoker.jvmCanonicalFrameAdapter = true;
-      return target.positionalInvoker;
+      // A generated caller accounts for its own bytecodes at loop backedges.
+      // Charge the resolved child's structural size to that same budget so a
+      // sequence of short positional calls cannot reset the scheduler quantum
+      // on every invocation and monopolize the browser event loop.
+      return publishSafePointCharge();
     } catch (_) {
       target.positionalInvoker = null;
       return null;
