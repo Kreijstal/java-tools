@@ -8390,6 +8390,59 @@ public class ArbitraryAssetWork {
   t.end();
 });
 
+test('structured JVM SSA keeps proven float-to-byte loops in one finite quantum', async (t) => {
+  const classpath = compileJavaFixture(t, 'FloatByteConversionHarness', `
+public class FloatByteConversionHarness {
+  static float[] samples(float[] values) { return values; }
+  static void convert(float[] values, byte[] output) {
+    float[] decoded = samples(values);
+    int length = decoded.length;
+    if (length > output.length) length = output.length;
+    for (int index = 0; index < length; index++) {
+      int sample = (int) (128.0f + decoded[index] * 128.0f);
+      if ((sample & -256) != 0) sample = ~sample >> 31;
+      output[index] = (byte) (sample - 128);
+    }
+  }
+}
+`);
+  const jvm = new JVM({ classpath, jit: {
+    warmupThreshold: 0,
+    structuredSsa: true,
+    hotCallGraphRegions: true,
+    hotCallGraphDirectSafePointBudget: 10000,
+    profileMethods: false,
+  } });
+  await jvm.loadClassByName('FloatByteConversionHarness');
+  const method = await jvm.findMethodInHierarchy(
+    'FloatByteConversionHarness', 'convert', '([F[B)V');
+  const generated = jvm.jit.structuredSsa.compile(method);
+  t.ok(generated?.jvmStructuredSsa,
+    'the call-bearing conversion method selects structured SSA');
+  t.ok(generated.jvmStructuredSource.includes(
+    'ssaRuntimeCoarseTrips') && generated.jvmStructuredSource.includes(
+      '<= 1000000'),
+  'the proven float-to-byte loop receives a bounded million-element quantum');
+
+  const values = [0.0, 0.5, -1.0, 2.0, -3.0];
+  values.type = '[F';
+  const output = new Int8Array(values.length);
+  output.type = '[B';
+  const thread = {
+    id: 0, name: 'float-byte-conversion-test', callStack: new Stack(),
+    status: 'runnable', pendingException: null,
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+  jvm.classInitializationState.set(
+    'FloatByteConversionHarness', 'INITIALIZED');
+  await invoke(jvm, thread, 'FloatByteConversionHarness', 'convert',
+    '([F[B)V', [values, output]);
+  t.deepEqual(Array.from(output), [0, 64, -128, 127, -128],
+    'the widened quantum preserves Java float conversion and byte narrowing');
+  t.end();
+});
+
 test('verified primitive-return call graphs retain virtual intermediate frames',
   async (t) => {
   const className = 'ArbitraryCompiledCallChain';

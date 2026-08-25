@@ -5677,6 +5677,24 @@ class JvmSsaBlockRenderer {
         !hasSelfRecursiveCall
         ? this.jit.hotCallGraphRegions.directSafePointBudget
         : 1024;
+    // A float-sample to byte-array conversion is a common boundary between a
+    // decoder and an audio/image consumer.  Once its counted bounds and array
+    // accesses have been proven, polling every scalar iteration is much more
+    // expensive than the conversion itself and can materialize an otherwise
+    // compiled caller at a mid-method PC.  Admit a finite, larger atomic
+    // quantum for this bytecode shape without relying on guest class names.
+    const runtimeCoarseTripLimitFor = (info) => {
+      if (!info?.loopBlocks) return runtimeCoarseTripLimit;
+      const ops = new Set();
+      for (const block of info.loopBlocks) {
+        for (const itemIndex of cfg.blocks[block]?.insns || []) {
+          ops.add(opOf(items[itemIndex]?.instruction));
+        }
+      }
+      return ops.has("faload") && ops.has("f2i") && ops.has("bastore")
+        ? Math.max(runtimeCoarseTripLimit, 1_000_000)
+        : runtimeCoarseTripLimit;
+    };
     const containsLoop = (node) => {
       if (!node) return false;
       if (node.t === "loop") return true;
@@ -5705,6 +5723,7 @@ class JvmSsaBlockRenderer {
         } else if (info &&
             (loopDepth > 0 || !containsLoop(node.body)) &&
             this.coarseCountedLoopSafePointsEnabled) {
+          const tripLimit = runtimeCoarseTripLimitFor(info);
           runtimeCoarseCountedLoops.set(header, {
             ...info,
             variable: `ssaRuntimeCoarseLoop${header}`,
@@ -5718,7 +5737,7 @@ class JvmSsaBlockRenderer {
               `)`,
             condition:
               `ssaRuntimeCoarseTrips${header} <= ` +
-              `${runtimeCoarseTripLimit}` +
+              `${tripLimit}` +
               (info.increment === 1 ? "" :
                 ` && local${info.slot} <= 2147483647 - ` +
                 `ssaRuntimeCoarseTrips${header} * ${info.increment}`),
