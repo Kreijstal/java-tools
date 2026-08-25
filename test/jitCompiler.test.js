@@ -8532,8 +8532,6 @@ public final class SequentialLoopBudgetShape {
     'the admitted loop charges its own verified trip count once');
   t.ok(source.includes('--safePointBudget <= 0'),
     'the later effectful loop observes a coarse charge crossing zero');
-  t.ok(source.includes('if (safePointBudget <= 0) {'),
-    'a runtime-bounded loop observes its up-front charge at loop exit');
 
   const thread = {
     id: 0, name: 'sequential-loop-budget',

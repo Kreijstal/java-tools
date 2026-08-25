@@ -9010,17 +9010,6 @@ class JvmSsaBlockRenderer {
           ]),
           ...indent(countedLoop ? countedLoop.body : loopBody), "}",
           ...(countedLoop ? countedLoop.exit : []),
-          // A runtime-coarse loop charges its complete verified trip count up
-          // front so its numeric backedge stays branch-free.  The charge may
-          // exhaust the scheduler budget, however, and nested coarse loops
-          // can otherwise keep accumulating negative credit without ever
-          // consulting the scheduler.  Poll once at the loop boundary: this
-          // preserves the optimizable inner loop while bounding uninterrupted
-          // guest work.  Reusing the header restoration is precise because a
-          // resumed framed entry simply observes the loop's false condition.
-          ...(runtimeCoarse
-            ? ["if (safePointBudget <= 0) {", ...indent(materialize), "}"]
-            : []),
         ];
         const unpolledLoop = [
           `${node.label}: while (${countedLoop
