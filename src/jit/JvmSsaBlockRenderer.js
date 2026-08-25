@@ -1860,6 +1860,56 @@ class JvmSsaBlockRenderer {
         persistentStaticArrayLocalViews.set(slot, view);
         persistentStaticArrayStoreViews.set(storeIndex, view);
       }
+      // javac commonly stages one static array reference through several
+      // verifier locals before entering a deeply nested numeric region.  The
+      // root local above already owns a stable raw companion, but losing that
+      // fact at `aload source; astore target` makes every later element access
+      // repeat the array representation branch. Propagate the same companion
+      // through unique, dominated local copies. The target remains the
+      // canonical JVM reference and the root assignment remains the sole raw
+      // pointer initializer.
+      let propagatedStaticArrayView = true;
+      while (propagatedStaticArrayView) {
+        propagatedStaticArrayView = false;
+        for (let storeIndex = 1; storeIndex < items.length; storeIndex += 1) {
+          if (!normalReachableItems.has(storeIndex)) continue;
+          const store = items[storeIndex]?.instruction;
+          const storeOp = opOf(store);
+          if (!/^astore(?:_[0-3])?$/.test(storeOp)) continue;
+          const load = items[storeIndex - 1]?.instruction;
+          const loadOp = opOf(load);
+          if (!/^aload(?:_[0-3])?$/.test(loadOp)) continue;
+          const sourceSlot = localIndex(load, loadOp);
+          const targetSlot = localIndex(store, storeOp);
+          const sourceView = persistentStaticArrayLocalViews.get(sourceSlot);
+          if (!sourceView || sourceSlot === targetSlot ||
+              persistentStaticArrayLocalViews.has(targetSlot)) continue;
+          const stores = [];
+          const loads = [];
+          for (let itemIndex = 0; itemIndex < items.length; itemIndex += 1) {
+            if (!normalReachableItems.has(itemIndex)) continue;
+            const instruction = items[itemIndex]?.instruction;
+            const op = opOf(instruction);
+            if (/^astore(?:_[0-3])?$/.test(op) &&
+                localIndex(instruction, op) === targetSlot) stores.push(itemIndex);
+            if (/^aload(?:_[0-3])?$/.test(op) &&
+                localIndex(instruction, op) === targetSlot) loads.push(itemIndex);
+          }
+          if (stores.length !== 1 || stores[0] !== storeIndex || !loads.length) {
+            continue;
+          }
+          const storeBlock = itemBlocks.get(storeIndex);
+          if (!Number.isInteger(storeBlock) || loads.some((loadIndex) => {
+            const loadBlock = itemBlocks.get(loadIndex);
+            if (!Number.isInteger(loadBlock)) return true;
+            return loadBlock === storeBlock
+              ? loadIndex <= storeIndex
+              : !dominators.get(loadBlock)?.has(storeBlock);
+          })) continue;
+          persistentStaticArrayLocalViews.set(targetSlot, sourceView);
+          propagatedStaticArrayView = true;
+        }
+      }
       // Preserve a raw companion for a primitive array created by `newarray`
       // or returned by a call and then stored into one dominated JVM local.
       // The producer bytecode may execute repeatedly (for example once per
@@ -9671,10 +9721,10 @@ class JvmSsaBlockRenderer {
         renderedTreeSource.includes(entryArrayDataVariable(slot)))
       .map((slot) =>
         `const ${entryArrayDataVariable(slot)} = helpers.arrayData(local${slot});`);
-    const persistentStaticArrayDataDeclarations =
-      [...persistentStaticArrayLocalViews.values(),
-        ...persistentProducedArrayLocalViews.values()].map((view) =>
-        `let ${view.data} = null;`);
+    const persistentStaticArrayDataDeclarations = [...new Set([
+      ...persistentStaticArrayLocalViews.values(),
+      ...persistentProducedArrayLocalViews.values(),
+    ].map((view) => view.data))].map((data) => `let ${data} = null;`);
     const guardedArrayDataVariables = [
       ...entryArrayDataDeclarations.map((line) =>
         /^const ([A-Za-z0-9_$]+)/.exec(line)?.[1]).filter(Boolean),
