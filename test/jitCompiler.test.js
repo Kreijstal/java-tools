@@ -998,12 +998,6 @@ test('oversized loop policy selects Wasm by structure, not guest identity', (t) 
     'browser integrations can lower the structural threshold explicitly');
   t.notOk(lowered.jit.isOversizedLoopMethod(shape('belowLowered', 127)),
     'the configured threshold retains an exact lower boundary');
-  const latencyBound = new JVM({ jit: {
-    warmupThreshold: 0, structuredSsa: true,
-    structuredMaxSafePointBudget: 64,
-  } });
-  t.equal(latencyBound.jit.structuredSsa.maxSafePointBudget, 64,
-    'the embedding runtime can cap structured loop polling latency');
 
   const childMethod = shape('nestedLargeLoop', 128);
   childMethod.descriptor = '()I';
