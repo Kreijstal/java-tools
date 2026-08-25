@@ -2720,17 +2720,33 @@ class JitCompiler {
         const header = labels.get(branch.arg);
         if (!Number.isInteger(header) || header <= 0 || header >= backedge ||
             computedDepths && depths[header] !== 0) continue;
-        const headerOps = items.slice(header, header + 3)
+        const headerOps = items.slice(header, header + 7)
           .map((item) => getOp(item?.instruction));
-        if (!/^iload(?:_[0-3])?$/.test(headerOps[0] || "") ||
-            !/^iload(?:_[0-3])?$/.test(headerOps[1] || "") ||
-            headerOps[2] !== "if_icmpge") continue;
+        const directBound = /^iload(?:_[0-3])?$/.test(headerOps[0] || "") &&
+          /^iload(?:_[0-3])?$/.test(headerOps[1] || "") &&
+          headerOps[2] === "if_icmpge";
+        const shiftedBound = /^iload(?:_[0-3])?$/.test(headerOps[0] || "") &&
+          /^iload(?:_[0-3])?$/.test(headerOps[1] || "") &&
+          /^iload(?:_[0-3])?$/.test(headerOps[2] || "") &&
+          /^iconst_[0-5]$/.test(headerOps[3] || "") &&
+          headerOps[4] === "iadd" && headerOps[5] === "ishr" &&
+          headerOps[6] === "if_icmplt";
+        if (!directBound && !shiftedBound) continue;
         const counterSlot = localSlot(items[header].instruction, headerOps[0]);
         const boundSlot = localSlot(items[header + 1].instruction, headerOps[1]);
-        const exit = labels.get(items[header + 2].instruction.arg);
+        const shiftSlot = shiftedBound
+          ? localSlot(items[header + 2].instruction, headerOps[2]) : null;
+        const shiftConstant = shiftedBound ? Number(headerOps[3].slice(-1)) : null;
+        const exit = directBound
+          ? labels.get(items[header + 2].instruction.arg) : header + 7;
+        const body = shiftedBound
+          ? labels.get(items[header + 6].instruction.arg) : header + 3;
         if (!Number.isInteger(counterSlot) || !Number.isInteger(boundSlot) ||
             counterSlot === boundSlot || !Number.isInteger(exit) ||
             exit <= backedge || exit >= items.length ||
+            shiftedBound && (!Number.isInteger(shiftSlot) ||
+              shiftSlot === counterSlot || !Number.isInteger(body) ||
+              body <= exit || body > backedge) ||
             computedDepths && depths[exit] !== 0) continue;
         let valid = true;
         let counterWrites = 0;
@@ -2753,10 +2769,11 @@ class JitCompiler {
               if (Number(instruction.incr) !== 1) valid = false;
               counterWrites += 1;
             }
-            if (slot === boundSlot) valid = false;
+            if (slot === boundSlot || shiftedBound && slot === shiftSlot) valid = false;
           } else if (/^istore(?:_[0-3])?$/.test(op) &&
               (localSlot(instruction, op) === counterSlot ||
-               localSlot(instruction, op) === boundSlot)) {
+               localSlot(instruction, op) === boundSlot ||
+               shiftedBound && localSlot(instruction, op) === shiftSlot)) {
             valid = false;
           }
           if (op === "goto" || op === "goto_w" || op.startsWith("if")) {
@@ -2771,6 +2788,9 @@ class JitCompiler {
         candidates.push({
           header, backedge, exit, counterSlot, boundSlot,
           arrayLocalSlots, floatTraffic,
+          boundExpression: shiftedBound ? {
+            kind: "signed-shift-add", shiftSlot, add: shiftConstant,
+          } : null,
         });
       }
       candidates.sort((left, right) =>
@@ -2780,6 +2800,7 @@ class JitCompiler {
       if (candidate) {
         const {
           header, backedge, exit, counterSlot, boundSlot, arrayLocalSlots,
+          boundExpression,
         } = candidate;
         const syntheticItems = items.map((item, index) => ({
           ...item,
@@ -2817,11 +2838,11 @@ class JitCompiler {
           const id = this.inlineLoopRegions.length;
           this.inlineLoopRegions.push({
             generated, method, header, exit, counterSlot, boundSlot,
-            scalarBounded: true, maximumIterations: 4096,
+            boundExpression, scalarBounded: true, maximumIterations: 4096,
           });
           plans.push({
             id, header, exit, counterSlot, boundSlot,
-            scalarBounded: true,
+            boundExpression, scalarBounded: true,
           });
         }
       }
@@ -3015,7 +3036,12 @@ class JitCompiler {
     if (!region) return false;
     if (region.scalarBounded) {
       const counter = Number(frame.locals[region.counterSlot]);
-      const bound = Number(frame.locals[region.boundSlot]);
+      let bound = Number(frame.locals[region.boundSlot]);
+      if (region.boundExpression?.kind === "signed-shift-add") {
+        const shift = Number(frame.locals[region.boundExpression.shiftSlot]);
+        if (!Number.isInteger(shift)) return false;
+        bound >>= (shift + region.boundExpression.add) & 31;
+      }
       const remaining = bound - counter;
       return Number.isInteger(counter) && Number.isInteger(bound) &&
         remaining >= 0 && remaining <= region.maximumIterations;
