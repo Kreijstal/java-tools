@@ -781,8 +781,18 @@ class JitCompiler {
   hasReadyFullWasm(method) {
     const state = this.wasmJit.enabled && method
       ? this.wasmJit.state.get(method) : null;
-    return Boolean(state && state.status === "ready" &&
-      state.meta && state.meta.fullyCompiled);
+    if (!state || state.status !== "ready" ||
+        !state.meta || !state.meta.fullyCompiled) return false;
+    // "Fully compiled" describes bytecode coverage, not whether execution
+    // actually remains in Wasm. A call-bearing module can cover every block
+    // yet exit at nearly every invocation boundary. Once enough non-fuel
+    // observations prove that behavior, allow a complete whole-method JS body
+    // to take ownership instead of repeatedly crossing Wasm -> interpreter.
+    const runs = Number(state.runs) || 0;
+    const nonFuelExits = Math.max(0,
+      (Number(state.exits) || 0) - (Number(state.fuelExits) || 0));
+    if (runs >= 64 && nonFuelExits * 10 >= runs * 9) return false;
+    return true;
   }
 
   tryRunStableGeneratedFrame(frame, thread, readyFullWasm = false) {

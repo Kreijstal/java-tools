@@ -11891,6 +11891,34 @@ public class SynchronousExecuteHarness {
     'promotion does not re-enter the stale stable JavaScript body');
   t.ok(promotedResult.completed,
     'the promoted frame completes through the normal scheduler protocol');
+
+  jvm.jit.wasmJit.state.set(method, {
+    status: 'ready', meta: { fullyCompiled: true },
+    runs: 100, exits: 95, fuelExits: 0,
+  });
+  const stormFrame = new Frame(method);
+  stormFrame.className = 'SynchronousExecuteHarness';
+  stormFrame.locals[0] = out;
+  const stormThread = {
+    id: 3,
+    name: 'wasm-exit-storm-execute-test',
+    callStack: new Stack(),
+    status: 'runnable',
+    pendingException: null,
+  };
+  stormThread.callStack.push(stormFrame);
+  jvm.threads = [stormThread];
+  jvm.currentThreadIndex = 0;
+  out[0] = 0;
+  const stormResult = await jvm.execute();
+  t.equal(out[0], 4950,
+    'a repeatedly exiting Wasm body yields ownership to complete JavaScript');
+  t.equal(wasmEntries, 1,
+    'the proven exit storm does not enter Wasm again');
+  t.ok(jvm.jit.stableGeneratedEntryRunCount > stableRuns,
+    'the stable generated entry receives the pathological Wasm method');
+  t.ok(stormResult.completed,
+    'the JavaScript takeover completes through normal scheduling');
   t.end();
 });
 
