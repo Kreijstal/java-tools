@@ -2815,6 +2815,7 @@ class WasmJit {
           this.structuredCompiles += 1;
         } catch (err) {
           if (!(err instanceof Unsupported)) throw err;
+          st.structuredFailReason = err.message;
           // A structured rejection for a reason a later class load can undo is
           // the strongest rebuild signal there is: the whole inlining backend
           // was lost, not one block. Recorded here because the dispatcher meta
