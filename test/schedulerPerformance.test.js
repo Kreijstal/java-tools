@@ -60,6 +60,29 @@ test('serial scheduler does not starve low-priority guest work', (t) => {
   t.end();
 });
 
+test('a due AWT frame producer runs before background guest work', (t) => {
+  const jvm = new JVM({ fakeTime: 1000 });
+  const background = { status: 'runnable', callStack: new Stack() };
+  const renderer = {
+    status: 'SLEEPING', sleepUntil: 1001, callStack: new Stack(),
+  };
+  jvm.threads = [background, renderer];
+  jvm.currentThreadIndex = 0;
+  jvm._awtRenderPriority = { thread: renderer, until: 1050 };
+
+  const scheduled = jvm._prepareSchedulerTick();
+  t.equal(renderer.status, 'runnable', 'the elapsed frame sleep is awakened');
+  t.equal(scheduled.thread, renderer,
+    'the due renderer is selected ahead of background decoding');
+
+  jvm._awtRenderPriority.until = 999;
+  jvm.currentThreadIndex = 0;
+  t.equal(jvm._prepareSchedulerTick().thread, background,
+    'expired render priority does not permanently weight the scheduler');
+  t.equal(jvm._awtRenderPriority, null, 'expired render priority is cleared');
+  t.end();
+});
+
 test('scheduler stack limit is configurable for recursive-call diagnostics', (t) => {
   const configured = new JVM({ maxStackDepth: 73 });
   const invalid = new JVM({ maxStackDepth: 0 });
