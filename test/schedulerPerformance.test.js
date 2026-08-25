@@ -60,6 +60,27 @@ test('serial scheduler does not starve low-priority guest work', (t) => {
   t.end();
 });
 
+test('frame-producer preference can be disabled for fair loading', (t) => {
+  const preferred = new JVM();
+  const fair = new JVM({ frameProducerPriority: false });
+  const makeThreads = () => [
+    { status: 'runnable', callStack: new Stack() },
+    { status: 'runnable', callStack: new Stack() },
+  ];
+  preferred.threads = makeThreads();
+  preferred.currentThreadIndex = 0;
+  preferred._awtFrameProducerThread = preferred.threads[1];
+  fair.threads = makeThreads();
+  fair.currentThreadIndex = 0;
+  fair._awtFrameProducerThread = fair.threads[1];
+
+  t.equal(preferred._prepareSchedulerTick().thread, preferred.threads[1],
+    'the default retains frame-producer preference');
+  t.equal(fair._prepareSchedulerTick().thread, fair.threads[0],
+    'disabled preference retains the round-robin selection');
+  t.end();
+});
+
 test('scheduler stack limit is configurable for recursive-call diagnostics', (t) => {
   const configured = new JVM({ maxStackDepth: 73 });
   const invalid = new JVM({ maxStackDepth: 0 });

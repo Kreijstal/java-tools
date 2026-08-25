@@ -234,6 +234,11 @@ class JVM {
     this.eventLoopYieldStrategy =
       configuredYieldStrategy === "message-channel"
         ? "message-channel" : "timer";
+    // Pinning the most recent software-frame publisher is useful while it is
+    // drawing, but a Java game thread can remain runnable while synchronously
+    // loading or decoding assets. Allow browser integrations to A/B ordinary
+    // fair round-robin scheduling for that phase without changing guest code.
+    this.frameProducerPriority = options.frameProducerPriority !== false;
     const configuredBurst = options.interpreterBurst ??
       env.JVM_INTERPRETER_BURST;
     this.interpreterBurst = Math.max(1, Number(configuredBurst) || 1024);
@@ -1301,7 +1306,8 @@ class JVM {
     // still run while the animation thread sleeps between frames, matching
     // native JVM concurrency without assigning a game-specific priority.
     const frameProducer = this._awtFrameProducerThread;
-    if (frameProducer && frameProducer.status === "runnable") {
+    if (this.frameProducerPriority && frameProducer &&
+        frameProducer.status === "runnable") {
       const producerIndex = this.threads.indexOf(frameProducer);
       if (producerIndex >= 0) this.currentThreadIndex = producerIndex;
     }
