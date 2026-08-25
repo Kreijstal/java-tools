@@ -990,7 +990,10 @@ test('oversized loop policy selects Wasm by structure, not guest identity', (t) 
     'the runtime counter records structurally selected methods once');
   const lowered = new JVM({ jit: {
     warmupThreshold: 0, oversizedWasmFirstCodeItems: 128,
+    wasmRelaxedReferenceReturns: true,
   } });
+  t.equal(lowered.jit.wasmJit.relaxedRefReturn, true,
+    'the normal-flow reference-return proof is explicitly configurable');
   t.ok(lowered.jit.isOversizedLoopMethod(shape('loweredThreshold', 128)),
     'browser integrations can lower the structural threshold explicitly');
   t.notOk(lowered.jit.isOversizedLoopMethod(shape('belowLowered', 127)),
