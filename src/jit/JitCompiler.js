@@ -467,6 +467,7 @@ class JitCompiler {
     this.runnerMethodRunCounts = new Map();
     this.methodDeoptCounts = new Map();
     this.methodDeoptReasons = new Map();
+    this.lastMethodDeoptReasons = new WeakMap();
     this.methodDeoptSites = new Map();
     this.experimentalControlFlow = options.experimentalControlFlow ?? (
       typeof process !== "undefined" && process.env
@@ -521,7 +522,7 @@ class JitCompiler {
     return capturesBooleanStatic(method) && normalFlowContainsInvoke(codeItems);
   }
 
-  canRun(frame, codegenEligible = false) {
+  canRun(frame, codegenEligible = false, publishedGenerated = false) {
     if (!this.enabled || !frame || !frame.method || !frame.instructions) {
       return false;
     }
@@ -560,9 +561,9 @@ class JitCompiler {
     if (this.loopWarmupThreshold && count < this.loopWarmupThreshold) {
       return false;
     }
-    const supported = codegenEligible
+    const supported = publishedGenerated || (codegenEligible
       ? this.isCodegenSupported(frame.method)
-      : this.isSupported(frame.method);
+      : this.isSupported(frame.method));
     if (!supported) frame.jitJsDisabled = true;
     return supported;
   }
@@ -699,13 +700,16 @@ class JitCompiler {
         this.isDynamicArrayStructuredFirstMethod(frame.method)) &&
       !wasmPriorityLoop;
     if (wholeMethodPreferred && canProbeGenerated) {
-      let codegenEligible = this.isCodegenSupported(frame.method);
+      const publishedStructured = this.codegenCache.get(frame.method);
+      let codegenEligible = Boolean(publishedStructured?.jvmStructuredSsa) ||
+        this.isCodegenSupported(frame.method);
       if (!codegenEligible && this.adaptiveConstructorCallersEnabled &&
           this.isCodegenSupported(frame.method, true)) {
         codegenEligible = this.observeAdaptiveCodegenHeat(frame);
         awaitingAdaptivePromotion = !codegenEligible;
       }
-      if (codegenEligible) canRunGenerated = this.canRun(frame, true);
+      if (codegenEligible) canRunGenerated = this.canRun(frame, true,
+        Boolean(publishedStructured?.jvmStructuredSsa));
     }
 
     if (!canRunGenerated && this.wasmJit.enabled && !this.runningFrames.has(frame)) {
@@ -1119,6 +1123,8 @@ class JitCompiler {
 
   finishTryRunFrame(frame, thread, methodKey, result) {
     if (result && result.deopt) {
+      this.lastMethodDeoptReasons.set(
+        frame.method, result.reason || "unspecified");
       if (this.profileMethods) {
         this.lastDeoptReason = result.reason;
         this.methodDeoptCounts.set(
