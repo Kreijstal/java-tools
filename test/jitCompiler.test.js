@@ -8299,6 +8299,8 @@ public class ArbitraryAssetWork {
     warmupThreshold: 0, structuredSsa: true, compiledCallChains: true,
     profileMethods: false, eagerMonomorphicCalls: false,
     structuredPerLoopPollBudgets: true,
+    structuredLargeReferenceLoopPollBudget: 128,
+    structuredLargeReferenceLoopMinCodeItems: 8,
   } });
   await jvm.loadClassByName('ArbitraryAssetWork');
   const method = await jvm.findMethodInHierarchy(
@@ -8325,6 +8327,12 @@ public class ArbitraryAssetWork {
   t.notOk(generated.jvmStructuredSource.includes(
     'if (helpers.continueStructuredQuantum(thread)) { safePointBudget = 10000;'),
   'generated source does not retain the old fixed 10k-backedge deadline check');
+  const referenceMethod = await jvm.findMethodInHierarchy(
+    'ArbitraryAssetWork', 'updateFloats', '(Ljava/lang/Object;I)[F');
+  const boundedReferenceGenerated =
+    jvm.jit.structuredSsa.compile(referenceMethod);
+  t.equal(boundedReferenceGenerated.jvmStructuredSafePointBudget, 128,
+    'large reference-returning loops honor their independent poll ceiling');
   const thread = {
     id: 0, name: 'late-positional-link', callStack: new Stack(),
     status: 'runnable', pendingException: null,
