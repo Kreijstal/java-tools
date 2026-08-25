@@ -604,8 +604,6 @@ class JvmSsaBlockRenderer {
       options.structuredCoarseCountedLoopSafePoints !== false &&
       !(typeof process !== "undefined" && process.env &&
         process.env.JVM_DISABLE_STRUCTURED_COARSE_COUNTED_SAFEPOINTS === "1");
-    this.maxLoopPollBudget = Math.max(32, Math.floor(
-      Number(options.structuredMaxLoopPollBudget ?? 10000) || 10000));
     this.versionedRuntimeCoarseLoopsEnabled =
       options.structuredVersionedRuntimeCoarseLoops !== false &&
       !(typeof process !== "undefined" && process.env &&
@@ -8244,10 +8242,9 @@ class JvmSsaBlockRenderer {
     const methodLoopWorkEstimate = Math.max(1,
       items.length + methodInvokeCount * 32 + methodAllocationCount * 16);
     const methodPollBudget = hasAtomicUnsafeOperation
-      ? Math.max(Math.min(64, this.maxLoopPollBudget), Math.min(
-        this.maxLoopPollBudget,
+      ? Math.max(64, Math.min(10000,
         Math.floor(16384 / methodLoopWorkEstimate)))
-      : this.maxLoopPollBudget;
+      : 10000;
     const naturalBlocksByLoop = new Map([...structured.loopHeaders].map(
       (header) => [header,
         naturalLoopBlocksFor(header) || new Set([header])],
@@ -8280,12 +8277,11 @@ class JvmSsaBlockRenderer {
       loopWorkEstimates.set(header, work);
       loopPollBudgets.set(header, this.perLoopPollBudgetsEnabled &&
         hasAtomicUnsafeOperation
-        ? Math.max(Math.min(64, this.maxLoopPollBudget), Math.min(
-          this.maxLoopPollBudget, Math.floor(16384 / work)))
+        ? Math.max(64, Math.min(10000, Math.floor(16384 / work)))
         : methodPollBudget);
     }
     const loopWorkEstimate = Math.max(1, ...loopWorkEstimates.values());
-    const structuralPollBudget = Math.min(this.maxLoopPollBudget,
+    const structuralPollBudget = Math.min(10000,
       ...loopPollBudgets.values());
     // Keep the shared counter in guest-iteration units. Each admitted coarse
     // loop charges its verified trip count once; unrelated later loops must not
