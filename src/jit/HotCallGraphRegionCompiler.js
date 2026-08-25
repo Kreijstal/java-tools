@@ -3140,6 +3140,19 @@ class HotCallGraphRegionCompiler {
             });
             continue;
           }
+          // Keep a fully compiled, productive Wasm child behind a canonical
+          // Frame boundary.  Lexically embedding its structured JavaScript
+          // body would bypass normal tier selection for the lifetime of this
+          // fused module and is especially costly for large numeric kernels.
+          if (this.jit.hasReadyFullWasm(target.method)) {
+            node.boundaries.push({
+              pc: site.pc,
+              op: site.op,
+              reason: "productive-wasm-target",
+              site,
+            });
+            continue;
+          }
           if (!this.jit.canCompileSynchronously(target.method)) {
             node.boundaries.push({
               pc: site.pc,

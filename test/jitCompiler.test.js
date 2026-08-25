@@ -11874,7 +11874,16 @@ public class SynchronousExecuteHarness {
     positionalInvoker: linkedInvoke,
   };
   jvm.jit.trackGeneratedTarget(method, linkedTarget, linkedSite);
+  let wasmGraphInvalidations = 0;
+  const markGeneratedTargetUpgrade = jvm.jit.hotCallGraphRegions
+    .markGeneratedTargetUpgrade.bind(jvm.jit.hotCallGraphRegions);
+  jvm.jit.hotCallGraphRegions.markGeneratedTargetUpgrade = (candidate) => {
+    if (candidate === method) wasmGraphInvalidations += 1;
+    return markGeneratedTargetUpgrade(candidate);
+  };
   jvm.jit.publishWasmTargetReady(method);
+  t.equal(wasmGraphInvalidations, 1,
+    'Wasm promotion invalidates fused graphs that captured the JavaScript child');
   t.equal(linkedSite.fastPositional, null,
     'a complete Wasm child withdraws an existing direct JavaScript edge');
   t.equal(jvm.jit.getPositionalGeneratedInvoker(linkedSite, linkedTarget), null,

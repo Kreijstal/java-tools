@@ -2572,6 +2572,12 @@ class JitCompiler {
 
   publishWasmTargetReady(method) {
     if (!method || !this.hasReadyFullWasm(method)) return;
+    // A fused call-graph module owns lexical calls to its children and does
+    // not consult the ordinary call-site fastPositional slot.  Invalidate
+    // every dependent root before withdrawing those slots, otherwise an
+    // already installed graph can keep running the superseded JavaScript
+    // child indefinitely.
+    this.hotCallGraphRegions?.markGeneratedTargetUpgrade(method);
     const entries = this.generatedTargetsByMethod.get(method);
     if (!entries) return;
     for (const { target, site } of entries) {
