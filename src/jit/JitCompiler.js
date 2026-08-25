@@ -7351,12 +7351,11 @@ class JitCompiler {
   }
 
   getSynchronousIntrinsic(method, descriptor) {
-    // The only production intrinsic recognized from guest bytecode is the
-    // small, general primitive-array memmove idiom below. Avoid canonicalizing
-    // every arbitrary callee merely to discover that large guest-kernel
-    // oracles are disabled.
+    // Production intrinsics are limited to the small general idioms below.
+    // Avoid canonicalizing every arbitrary callee merely to discover that
+    // large guest-kernel oracles are disabled.
     if (!this.guestKernelOraclesEnabled &&
-        descriptor !== "([II[III)V") {
+        descriptor !== "([II[III)V" && descriptor !== "()I") {
       return null;
     }
     const codeItems = this.getCodeItems(method);
@@ -7367,6 +7366,80 @@ class JitCompiler {
     const intrinsicCodeItems = stripProvenDeadEntryInitializers(
       codeItems, code?.code?.exceptionTable || []);
     const ops = normalizeIntrinsicCompilerIdioms(intrinsicCodeItems);
+
+    // A compact mutable bit cursor occurs in decoders independently of any
+    // guest identity.  Keeping it behind the generic synchronous-call bridge
+    // still allocates/restores a child Frame on every bit.  Recognize the
+    // complete straight-line bytecode shape, bind initialized storage
+    // locations (never captured values), and reject before the first write if
+    // the array access would throw.  That makes ASYNC_INVOKE a true
+    // before-effects fallback to canonical bytecode execution.
+    const bitCursorOps = [
+      "getstatic", "getstatic", "iaload", "getstatic", "ishr",
+      "iconst_1", "iand", "istore_0",
+      "getstatic", "iconst_1", "iadd", "putstatic",
+      "getstatic", "getstatic", "iconst_3", "ishr", "iadd", "putstatic",
+      "getstatic", "bipush", "iand", "putstatic", "iload_0", "ireturn",
+    ];
+    if (descriptor === "()I" && ops.length === bitCursorOps.length &&
+        bitCursorOps.every((op, index) => ops[index] === op)) {
+      const fieldInstructions = intrinsicCodeItems
+        .map((item) => item?.instruction)
+        .filter((instruction) => {
+          const op = getOp(instruction);
+          return op === "getstatic" || op === "putstatic";
+        });
+      const fields = fieldInstructions.map((instruction) => instruction.arg);
+      const key = (field) => JSON.stringify(field);
+      const descriptors = fields.map((field) => field?.[2]?.[1]);
+      const arrayKey = key(fields[0]);
+      const byteKey = key(fields[1]);
+      const bitKey = key(fields[2]);
+      const expectedKeys = [
+        arrayKey, byteKey, bitKey, bitKey, bitKey,
+        byteKey, bitKey, byteKey, bitKey, bitKey,
+      ];
+      const constants = intrinsicCodeItems
+        .map((item) => item?.instruction)
+        .filter((instruction) => getOp(instruction) === "bipush")
+        .map((instruction) => Number(instruction.arg));
+      if (fields.length === expectedKeys.length && arrayKey && byteKey && bitKey &&
+          arrayKey !== byteKey && arrayKey !== bitKey && byteKey !== bitKey &&
+          descriptors[0] === "[I" && descriptors.slice(1).every((value) => value === "I") &&
+          fields.every((field, index) => key(field) === expectedKeys[index]) &&
+          constants.length === 1 && constants[0] === 7) {
+        const sites = [fields[0], fields[1], fields[2]].map((field) =>
+          this.registerFieldSite(field));
+        const direct = sites.map((site, index) =>
+          this.registerDirectStaticTarget(site, index > 0));
+        if (direct.every(Boolean)) {
+          const targets = direct.map((entry) =>
+            this.directStaticTargets[entry.targetId]);
+          const read = (target) => target.kind === "map"
+            ? target.fields.get(target.key) : target.fields[target.key];
+          const write = (target, value) => {
+            if (target.kind === "map") target.fields.set(target.key, value);
+            else target.fields[target.key] = value;
+            this.markStaticTargetChanged(target);
+          };
+          const intrinsic = () => {
+            const array = read(targets[0]);
+            const byteIndex = Number(read(targets[1])) | 0;
+            const bitIndex = Number(read(targets[2])) | 0;
+            const data = this.arrayData(array);
+            if (!data || (byteIndex >>> 0) >= data.length) return ASYNC_INVOKE;
+            const value = (Number(data[byteIndex]) >> (bitIndex & 31)) & 1;
+            const advancedBit = (bitIndex + 1) | 0;
+            write(targets[2], advancedBit);
+            write(targets[1], (byteIndex + (advancedBit >> 3)) | 0);
+            write(targets[2], advancedBit & 7);
+            return value;
+          };
+          intrinsic.jvmDirectKind = "mutableStaticBitCursor";
+          return intrinsic;
+        }
+      }
+    }
 
     let parsedDescriptor = null;
     try { parsedDescriptor = parseDescriptor(descriptor); } catch (_) { /* not an intrinsic */ }
@@ -9224,6 +9297,9 @@ class JitCompiler {
       if (typeof intrinsic.jvmPositional !== "function") return null;
       direct.positionalId = this.directSynchronousIntrinsics.length;
       this.directSynchronousIntrinsics.push(intrinsic.jvmPositional);
+    } else if (intrinsic.jvmDirectKind === "mutableStaticBitCursor") {
+      direct.positionalId = this.directSynchronousIntrinsics.length;
+      this.directSynchronousIntrinsics.push(intrinsic);
     }
     return direct;
   }
