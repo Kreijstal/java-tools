@@ -1391,7 +1391,7 @@ class HotCallGraphRegionCompiler {
     this.maxCodeItems = Math.max(64, Math.min(1_000_000,
       Number(options.hotCallGraphMaxCodeItems ??
         environment.JVM_HOT_CALL_GRAPH_MAX_CODE_ITEMS) || 20_000));
-    this.directSafePointBudget = Math.max(10_000, Math.min(1_000_000,
+    this.directSafePointBudget = Math.max(32, Math.min(1_000_000,
       Number(options.hotCallGraphDirectSafePointBudget ??
         environment.JVM_HOT_CALL_GRAPH_DIRECT_SAFE_POINT_BUDGET) ||
         1_000_000));
@@ -2762,7 +2762,14 @@ class HotCallGraphRegionCompiler {
         })
         : {source: rewritten.source, count: 0, outlinedSourceBytes: 0,
           largestOutlinedSourceBytes: 0, helperSources: []};
-      const emittedSource = outlined.source;
+      // A fused graph is one scheduler execution unit. Per-method generated
+      // sources normally own their counter, but retaining those declarations
+      // here resets the quantum at every internal edge and lets a deep graph
+      // run for N independent budgets. Remove only the renderer's exact
+      // declaration; every node then closes over the module-owned counter.
+      const emittedSource = outlined.source.replace(
+        /(^|\n)([ \t]*)let safePointBudget = \d+;(?=\n|$)/g,
+        "$1$2");
       outlinedLoops += outlined.count;
       outlinedLoopSourceBytes += outlined.outlinedSourceBytes;
       largestOutlinedLoopSourceBytes = Math.max(
@@ -2822,6 +2829,7 @@ class HotCallGraphRegionCompiler {
       : null;
     const unprunedModuleSource = [
       "'use strict';",
+      `let safePointBudget = ${this.directSafePointBudget};`,
       ...declarations,
       framedRoot
         ? `return ${rootName}(` +

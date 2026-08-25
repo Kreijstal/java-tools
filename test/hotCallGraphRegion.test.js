@@ -28,12 +28,15 @@ test('hot call-graph roots have a conservative structural size bound', (t) => {
   const widened = new JVM({jit: {
     hotCallGraphRegions: true,
     hotCallGraphMaxRootCodeItems: 4096,
+    hotCallGraphDirectSafePointBudget: 256,
   }});
 
   t.equal(ordinary.jit.hotCallGraphRegions.maxRootCodeItems, 2048,
     'the default admits large roots after structural edge verification');
   t.equal(widened.jit.hotCallGraphRegions.maxRootCodeItems, 4096,
     'an explicit structural experiment can widen the root bound');
+  t.equal(widened.jit.hotCallGraphRegions.directSafePointBudget, 256,
+    'a fused graph can use a browser-sized scheduler quantum');
   t.notOk(ordinary.jit.hotCallGraphRegions.loopOutliningEnabled,
     'post-render loop outlining remains disabled after its live rejection');
   t.end();
@@ -578,6 +581,9 @@ public class GenericCallGraphLoop {
     `let safePointBudget = ${jvm.jit.hotCallGraphRegions
       .directSafePointBudget};`),
   'the ordinary module retains a bounded structural safe-point counter');
+  t.equal((plan.positionalBody.jvmHotCallGraphRegionSource.match(
+    /let safePointBudget =/g) || []).length, 1,
+  'the fused graph owns one shared quantum instead of resetting it per node');
   t.ok(generatedRoot.jvmAdaptivePositionalSource.includes('yield '),
     'the bounded ordinary module retains an iterator-owning fallback ABI');
   t.equal(generatedRoot.jvmStructuredRuntimeCoarseTripLimit,
