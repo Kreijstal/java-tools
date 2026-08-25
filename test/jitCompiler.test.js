@@ -3867,9 +3867,19 @@ public final class ArbitraryEagerMonomorphicCallHarness {
     return value;
   }
 
+  private static int nonNull(Object value) {
+    return value == null ? 0 : 1;
+  }
+
   static int repeat(Object value, int count) {
     while (count-- > 0) value = identity(value);
     return value == null ? 0 : 1;
+  }
+
+  static int sum(Object object, int count) {
+    int value = 0;
+    while (count-- > 0) value += nonNull(object);
+    return value;
   }
 }
 `);
@@ -3966,6 +3976,33 @@ public final class ArbitraryEagerMonomorphicCallHarness {
       candidate?.methodName === 'identity');
   t.notOk(uninitializedSite?.fastPositional,
     'an uninitialized static owner is not eagerly linked');
+
+  const largePrimitiveJvm = new JVM({classpath, jit: {
+    warmupThreshold: 0,
+    profileMethods: false,
+    preferWholeMethodJs: true,
+    structuredSsa: true,
+    eagerLargeLoopPrimitiveCalls: true,
+    eagerLargeLoopPrimitiveCallerMinCodeItems: 1,
+  }});
+  await largePrimitiveJvm.loadClassByName(className);
+  largePrimitiveJvm.classInitializationState.set(className, 'INITIALIZED');
+  const primitiveCaller = await largePrimitiveJvm.findMethodInHierarchy(
+    className, 'sum', '(Ljava/lang/Object;I)I');
+  largePrimitiveJvm.jit.structuredSsa.compile(primitiveCaller);
+  const primitiveSite = largePrimitiveJvm.jit.syncCallSites.find(
+    (candidate) => candidate?.declaredClassName === className &&
+      candidate?.methodName === 'nonNull');
+  t.equal(typeof primitiveSite?.fastPositional?.invoke, 'function',
+    'large-loop policy links a primitive leaf before caller execution');
+  const referenceCaller = await largePrimitiveJvm.findMethodInHierarchy(
+    className, 'repeat', '(Ljava/lang/Object;I)I');
+  largePrimitiveJvm.jit.structuredSsa.compile(referenceCaller);
+  const referenceSite = largePrimitiveJvm.jit.syncCallSites.find(
+    (candidate) => candidate?.declaredClassName === className &&
+      candidate?.methodName === 'identity');
+  t.notOk(referenceSite?.fastPositional,
+    'large-loop policy excludes reference-returning callees');
   t.end();
 });
 

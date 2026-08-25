@@ -153,6 +153,14 @@ class JitCompiler {
       options.eagerMonomorphicCalls === true ||
       Boolean(typeof process !== "undefined" && process.env &&
         process.env.JVM_ENABLE_EAGER_MONOMORPHIC_CALLS === "1");
+    this.eagerLargeLoopPrimitiveCallsEnabled =
+      options.eagerLargeLoopPrimitiveCalls === true;
+    const eagerLargeLoopPrimitiveCallerMinCodeItems = Number(
+      options.eagerLargeLoopPrimitiveCallerMinCodeItems ?? 1024);
+    this.eagerLargeLoopPrimitiveCallerMinCodeItems = Number.isFinite(
+      eagerLargeLoopPrimitiveCallerMinCodeItems) &&
+      eagerLargeLoopPrimitiveCallerMinCodeItems > 0
+      ? Math.floor(eagerLargeLoopPrimitiveCallerMinCodeItems) : 1024;
     const eagerMonomorphicCallMaxCodeItems = Number(
       options.eagerMonomorphicCallMaxCodeItems ??
       (typeof process !== "undefined" && process.env
@@ -5947,7 +5955,19 @@ class JitCompiler {
   // the positional entry selected by getPositionalGeneratedInvoker.
   primeMonomorphicSyncCallSite(id, method, lookupClass) {
     const site = this.syncCallSites[id];
-    if (!this.eagerMonomorphicCallsEnabled || this.profileMethods || !site ||
+    let largeLoopPrimitive = false;
+    if (this.eagerLargeLoopPrimitiveCallsEnabled && site?.callerMethod) {
+      const callerItems = this.getCodeItems(site.callerMethod);
+      const returnDescriptor = String(site.descriptor || "").slice(
+        String(site.descriptor || "").indexOf(")") + 1);
+      largeLoopPrimitive = callerItems.length >=
+          this.eagerLargeLoopPrimitiveCallerMinCodeItems &&
+        !returnDescriptor.startsWith("L") &&
+        !returnDescriptor.startsWith("[") &&
+        this.hasBackwardBranch(site.callerMethod);
+    }
+    if ((!this.eagerMonomorphicCallsEnabled && !largeLoopPrimitive) ||
+        this.profileMethods || !site ||
         !method || method.name === "<init>" || method.name === "<clinit>" ||
         (site.op !== "invokestatic" && site.op !== "invokespecial") ||
         site.fastPositional ||
