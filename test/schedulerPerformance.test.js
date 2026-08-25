@@ -60,6 +60,27 @@ test('serial scheduler does not starve low-priority guest work', (t) => {
   t.end();
 });
 
+test('AWT input handlers supersede a continuously runnable frame producer', (t) => {
+  const jvm = new JVM();
+  const producer = { status: 'runnable', callStack: new Stack() };
+  const eventThread = { status: 'runnable', callStack: new Stack() };
+  producer.callStack.push({ method: { name: 'render' } });
+  eventThread.callStack.push({ method: { name: 'mouseMoved' } });
+  jvm.threads = [producer, eventThread];
+  jvm.currentThreadIndex = 0;
+  jvm._awtFrameProducerThread = producer;
+  jvm._awtEventThread = eventThread;
+
+  t.equal(jvm._prepareSchedulerTick().thread, eventThread,
+    'a queued input callback receives a scheduler turn before rendering');
+
+  eventThread.status = 'terminated';
+  eventThread.callStack.items.length = 0;
+  t.equal(jvm._prepareSchedulerTick().thread, producer,
+    'the frame producer regains priority as soon as the callback completes');
+  t.end();
+});
+
 test('scheduler stack limit is configurable for recursive-call diagnostics', (t) => {
   const configured = new JVM({ maxStackDepth: 73 });
   const invalid = new JVM({ maxStackDepth: 0 });

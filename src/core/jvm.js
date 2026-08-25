@@ -1306,6 +1306,19 @@ class JVM {
       if (producerIndex >= 0) this.currentThreadIndex = producerIndex;
     }
 
+    // Input handlers must run before the next animation quantum. Otherwise a
+    // permanently runnable frame producer is selected again on every tick and
+    // the AWT event thread can remain runnable forever without executing even
+    // its first bytecode. The event pump installs at most one handler frame at
+    // a time, so completing that frame cannot turn a stream of mouse-move
+    // events into unbounded starvation of the producer.
+    const awtEventThread = this._awtEventThread;
+    if (awtEventThread && awtEventThread.status === "runnable" &&
+        awtEventThread.callStack && !awtEventThread.callStack.isEmpty()) {
+      const eventIndex = this.threads.indexOf(awtEventThread);
+      if (eventIndex >= 0) this.currentThreadIndex = eventIndex;
+    }
+
     let thread = this.threads[this.currentThreadIndex];
 
     // Find the next runnable thread
