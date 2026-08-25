@@ -2948,22 +2948,13 @@ class JitCompiler {
       if (!resume) resume = this.compileBaselineMethod(method);
     } catch (_) { resume = null; }
     if (!resume || resume.jvmSynchronous !== true) return fast;
-    const hasStructuredContinuation = fast.jvmHasStructuredContinuation;
-    const dispatcher = typeof hasStructuredContinuation === "function"
-      ? function (
-        frame, thread, helpers, initialBytecodeChecks, framelessEntry,
-      ) {
-        return frame.pc === 0 || hasStructuredContinuation(frame)
-          ? fast(frame, thread, helpers, initialBytecodeChecks, framelessEntry)
-          : resume(frame, thread, helpers, initialBytecodeChecks);
-      }
-      : function (
-        frame, thread, helpers, initialBytecodeChecks, framelessEntry,
-      ) {
-        return frame.pc === 0
-          ? fast(frame, thread, helpers, initialBytecodeChecks, framelessEntry)
-          : resume(frame, thread, helpers, initialBytecodeChecks);
-      };
+    const dispatcher = function (
+      frame, thread, helpers, initialBytecodeChecks, framelessEntry,
+    ) {
+      return frame.pc === 0 || fast.jvmHasStructuredContinuation?.(frame)
+        ? fast(frame, thread, helpers, initialBytecodeChecks, framelessEntry)
+        : resume(frame, thread, helpers, initialBytecodeChecks);
+    };
     for (const key of Object.keys(fast)) dispatcher[key] = fast[key];
     dispatcher.jvmSynchronous = true;
     dispatcher.jvmResumeBody = true;
