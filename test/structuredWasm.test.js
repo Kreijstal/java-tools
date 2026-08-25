@@ -537,6 +537,60 @@ public class StructuredPartialReference {
   t.end();
 });
 
+test('dispatcher wasm compiles uncaught terminal throws with an exact pc',
+  async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'DispatcherTerminalThrow', `
+public class DispatcherTerminalThrow {
+  public static int drive(int n) {
+    int sum = 0;
+    for (int i = 0; i < n; i++) sum += i;
+    if (n < 0) throw null;
+    return sum;
+  }
+}
+`);
+  jvm.jit.wasmJit.structuredEnabled = false;
+  const ticks = await invoke(jvm, thread, 'DispatcherTerminalThrow', 'drive',
+    '(I)I', [100]);
+  t.ok(ticks > 0, 'the successful path completes through normal scheduling');
+  const method = await jvm.findMethodInHierarchy(
+    'DispatcherTerminalThrow', 'drive', '(I)I');
+  const state = jvm.jit.wasmJit.state.get(method);
+  t.equal(state?.status, 'ready', 'the dispatcher module is installed');
+  t.notOk([...state.meta.demoteReasons.values()].includes('athrow'),
+    'the uncaught throw block no longer creates a normal-flow coverage gap');
+  t.ok(state.meta.normalFlowFullyCompiled,
+    'all successful and terminal normal-flow blocks are compiled');
+  const athrowPc = jvm.jit.getCodeItems(method).findIndex((item) =>
+    (item?.instruction?.op || item?.instruction) === 'athrow');
+  const handleException = jvm.handleException.bind(jvm);
+  let thrownState = null;
+  jvm.handleException = (error, pc, activeThread) => {
+    if (!thrownState) {
+      thrownState = {
+        error, pc,
+        framePc: activeThread.callStack.isEmpty()
+          ? null : activeThread.callStack.peek().pc,
+      };
+    }
+    return handleException(error, pc, activeThread);
+  };
+  thread.status = 'runnable';
+  let uncaught = null;
+  try {
+    await invoke(jvm, thread, 'DispatcherTerminalThrow', 'drive', '(I)I', [-1]);
+  } catch (error) {
+    uncaught = error;
+  }
+  t.equal(uncaught?.type, 'java/lang/NullPointerException',
+    'the uncaught compiled exception leaves through the guest protocol');
+  t.equal(thrownState?.error?.type, 'java/lang/NullPointerException',
+    'compiled throw null preserves the guest exception type');
+  t.equal(thrownState?.framePc, athrowPc,
+    'the non-EH import publishes the exact throwing bytecode pc');
+  t.end();
+});
+
 test('relaxed reference returns require complete normal flow', async (t) => {
   const { jvm, thread } = await makeHarness(t,
     'StructuredNormalFlowReference', `
