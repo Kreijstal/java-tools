@@ -115,7 +115,7 @@ module.exports = {
       }
     }, ['java/io/IOException', 'java/lang/NullPointerException', 'java/lang/IndexOutOfBoundsException']),
     
-    'write(I)V': withThrows(async (jvm, obj, args) => {
+    'write(I)V': withThrows((jvm, obj, args) => {
       const b = args[0];
       if (!obj.fileHandle) {
         jvm.throwException('java/io/IOException', 'File not open');
@@ -124,8 +124,15 @@ module.exports = {
       
       try {
         const buffer = Buffer.from([b & 0xFF]);
-        await obj.fileHandle.write(buffer, 0, 1, obj.position);
-        obj.position += 1;
+        if (typeof jvm.fs.writeSync === 'function' &&
+            Number.isInteger(obj.fileHandle.fd)) {
+          jvm.fs.writeSync(obj.fileHandle.fd, buffer, 0, 1, obj.position);
+          obj.position += 1;
+          return;
+        }
+        return obj.fileHandle.write(buffer, 0, 1, obj.position).then(() => {
+          obj.position += 1;
+        });
       } catch (e) {
         jvm.throwException('java/io/IOException', 'Write failed');
       }
@@ -136,7 +143,7 @@ module.exports = {
       return module.exports.methods['write([BII)V'](jvm, obj, [arr, 0, arr.length]);
     }, ['java/io/IOException']),
 
-    'write([BII)V': withThrows(async (jvm, obj, args) => {
+    'write([BII)V': withThrows((jvm, obj, args) => {
       const arr = args[0] || [];
       const off = args[1] | 0;
       const len = args[2] | 0;
@@ -147,9 +154,17 @@ module.exports = {
       try {
         const buffer = Buffer.alloc(len);
         for (let i = 0; i < len; i++) buffer[i] = arr[off + i] & 0xff;
-        await obj.fileHandle.write(buffer, 0, len, obj.position);
-        if (DEBUG) console.error(`[raf] write ${obj.path} pos=${obj.position} len=${len}`);
-        obj.position += len;
+        if (typeof jvm.fs.writeSync === 'function' &&
+            Number.isInteger(obj.fileHandle.fd)) {
+          jvm.fs.writeSync(obj.fileHandle.fd, buffer, 0, len, obj.position);
+          if (DEBUG) console.error(`[raf] writeSync ${obj.path} pos=${obj.position} len=${len}`);
+          obj.position += len;
+          return;
+        }
+        return obj.fileHandle.write(buffer, 0, len, obj.position).then(() => {
+          if (DEBUG) console.error(`[raf] write ${obj.path} pos=${obj.position} len=${len}`);
+          obj.position += len;
+        });
       } catch (e) {
         if (DEBUG) console.error(`[raf] write FAIL ${obj.path} pos=${obj.position} len=${len}: ${e.message}`);
         jvm.throwException('java/io/IOException', 'Write failed');
