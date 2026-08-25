@@ -791,7 +791,12 @@ class JitCompiler {
     const runs = Number(state.runs) || 0;
     const nonFuelExits = Math.max(0,
       (Number(state.exits) || 0) - (Number(state.fuelExits) || 0));
-    if (runs >= 64 && nonFuelExits * 10 >= runs * 9) return false;
+    // Frequent cross-tier exits are substantially more expensive than their
+    // raw body time in SpiderMonkey.  Once one in four warmed invocations has
+    // already fallen back, prefer the complete structured JavaScript body;
+    // retaining Wasm until a 90% failure rate strands call-heavy numeric
+    // decoders in minute-long Wasm -> JS transition storms.
+    if (runs >= 64 && nonFuelExits * 4 >= runs) return false;
     return true;
   }
 

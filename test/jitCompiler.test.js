@@ -11920,7 +11920,7 @@ public class SynchronousExecuteHarness {
 
   jvm.jit.wasmJit.state.set(method, {
     status: 'ready', meta: { fullyCompiled: true },
-    runs: 100, exits: 95, fuelExits: 0,
+    runs: 100, exits: 25, fuelExits: 0,
   });
   t.equal(typeof jvm.jit.getPositionalGeneratedInvoker(
     linkedSite, linkedTarget), 'function',
