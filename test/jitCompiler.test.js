@@ -12222,6 +12222,7 @@ public final class PositionalQuantumPollHarness {
     preferWholeMethodJs: true,
     structuredSsa: true,
     positionalCallSafePointPolling: true,
+    structuredMaxLoopPollBudget: 128,
     profileMethods: false,
   } });
   await jvm.loadClassByName(className);
@@ -12233,6 +12234,8 @@ public final class PositionalQuantumPollHarness {
   const generated = jvm.jit.structuredSsa.compile(caller);
   t.ok(generated?.jvmStructuredContinuation,
     'the arbitrary call-bearing loop owns an exact continuation');
+  t.ok(generated.jvmStructuredSafePointBudget <= 128,
+    'the configured maximum bounds ordinary loop polling as well');
 
   const cursor = [0];
   cursor.type = '[I';
