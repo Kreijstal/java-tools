@@ -2846,9 +2846,23 @@ class WasmJit {
       // compiled pc-0 entry and unboxed slots — a dispatcher module missing
       // either can never be linked no matter how much more it covers.
       const linkable = (m) => m.externalEntry.has(0) && !m.boxedCount;
+      const coverageDiagnostic = (candidate) => candidate ? {
+        normalFlowFullyCompiled: Boolean(candidate.normalFlowFullyCompiled),
+        fullyCompiled: Boolean(candidate.fullyCompiled),
+        uncoveredItems: Number(candidate.uncoveredItems) || 0,
+        boxedCount: Number(candidate.boxedCount) || 0,
+        entryCompiled: candidate.externalEntry.has(0),
+        demoteReasons: [...(candidate.demoteReasons || new Map()).entries()],
+      } : null;
+      st.wasmCandidateCoverage = {
+        structured: coverageDiagnostic(structuredMeta),
+        dispatcher: coverageDiagnostic(meta),
+        structuredDiscarded: false,
+      };
       if (structuredMeta && meta &&
           structuredMeta.uncoveredItems > meta.uncoveredItems &&
           (linkable(meta) || !linkable(structuredMeta))) {
+        st.wasmCandidateCoverage.structuredDiscarded = true;
         structuredMeta = null;
       }
       // A partial module can leave and later resume with locals captured
