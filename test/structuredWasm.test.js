@@ -537,6 +537,39 @@ public class StructuredPartialReference {
   t.end();
 });
 
+test('relaxed reference returns require complete normal flow', async (t) => {
+  const { jvm, thread } = await makeHarness(t,
+    'StructuredNormalFlowReference', `
+public class StructuredNormalFlowReference {
+  public static int[] drive(int[] values, int n) {
+    try {
+      for (int i = 0; i < n; i++) values[i] += i;
+    } catch (RuntimeException error) {
+      throw error;
+    }
+    return values;
+  }
+}
+`);
+  jvm.jit.wasmJit.relaxedRefReturn = true;
+  const values = [3, 5, 7, 9];
+  values.type = '[I';
+  await invoke(jvm, thread, 'StructuredNormalFlowReference', 'drive',
+    '([II)[I', [values, values.length]);
+  t.deepEqual(values.slice(), [3, 6, 9, 12],
+    'the relaxed module preserves every reference-array effect');
+  const method = await jvm.findMethodInHierarchy(
+    'StructuredNormalFlowReference', 'drive', '([II)[I');
+  const state = jvm.jit.wasmJit.state.get(method);
+  t.equal(state?.status, 'ready',
+    'the reference-returning module is installed explicitly');
+  t.ok(state?.meta?.normalFlowFullyCompiled,
+    'admission proves every normal-flow block is compiled');
+  t.notOk(state?.meta?.fullyCompiled,
+    'the exception table still distinguishes the relaxed proof');
+  t.end();
+});
+
 test('compiled newarray throws a catchable NegativeArraySizeException', async (t) => {
   const { jvm, thread } = await makeHarness(t, 'StructuredNegSize', `
 public class StructuredNegSize {
