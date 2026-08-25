@@ -604,10 +604,6 @@ class JvmSsaBlockRenderer {
       options.structuredCoarseCountedLoopSafePoints !== false &&
       !(typeof process !== "undefined" && process.env &&
         process.env.JVM_DISABLE_STRUCTURED_COARSE_COUNTED_SAFEPOINTS === "1");
-    this.largeReferenceLoopPollBudget = Math.max(32, Math.floor(Number(
-      options.structuredLargeReferenceLoopPollBudget ?? 10000) || 10000));
-    this.largeReferenceLoopMinCodeItems = Math.max(8, Math.floor(Number(
-      options.structuredLargeReferenceLoopMinCodeItems ?? 1024) || 1024));
     this.versionedRuntimeCoarseLoopsEnabled =
       options.structuredVersionedRuntimeCoarseLoops !== false &&
       !(typeof process !== "undefined" && process.env &&
@@ -8245,20 +8241,10 @@ class JvmSsaBlockRenderer {
     }
     const methodLoopWorkEstimate = Math.max(1,
       items.length + methodInvokeCount * 32 + methodAllocationCount * 16);
-    // Large reference-returning loop methods cannot use the complete numeric
-    // Wasm tier and commonly perform one-shot asset construction. Give browser
-    // integrations an opt-in tighter observation interval for that structural
-    // shape without perturbing large void decoder graphs or ordinary methods.
-    const referenceReturn = /\)(?:\[|L)/.test(method.descriptor || "");
-    const structuralMaximumPollBudget = referenceReturn &&
-      items.length >= this.largeReferenceLoopMinCodeItems &&
-      structured.loopHeaders.size > 0
-      ? this.largeReferenceLoopPollBudget : 10000;
     const methodPollBudget = hasAtomicUnsafeOperation
-      ? Math.max(Math.min(64, structuralMaximumPollBudget), Math.min(
-        structuralMaximumPollBudget,
+      ? Math.max(64, Math.min(10000,
         Math.floor(16384 / methodLoopWorkEstimate)))
-      : structuralMaximumPollBudget;
+      : 10000;
     const naturalBlocksByLoop = new Map([...structured.loopHeaders].map(
       (header) => [header,
         naturalLoopBlocksFor(header) || new Set([header])],
@@ -8291,12 +8277,11 @@ class JvmSsaBlockRenderer {
       loopWorkEstimates.set(header, work);
       loopPollBudgets.set(header, this.perLoopPollBudgetsEnabled &&
         hasAtomicUnsafeOperation
-        ? Math.max(Math.min(64, structuralMaximumPollBudget), Math.min(
-          structuralMaximumPollBudget, Math.floor(16384 / work)))
+        ? Math.max(64, Math.min(10000, Math.floor(16384 / work)))
         : methodPollBudget);
     }
     const loopWorkEstimate = Math.max(1, ...loopWorkEstimates.values());
-    const structuralPollBudget = Math.min(structuralMaximumPollBudget,
+    const structuralPollBudget = Math.min(10000,
       ...loopPollBudgets.values());
     // Keep the shared counter in guest-iteration units. Each admitted coarse
     // loop charges its verified trip count once; unrelated later loops must not
