@@ -470,7 +470,7 @@ class JitCompiler {
     // so latch the instrumentation flags once.
     this._envInstrumented = Boolean(typeof process !== "undefined" && process.env &&
       (process.env.JVM_TRACE || process.env.JVM_PROFILE_HOT_METHODS === "1"));
-    this.wasmJit = new WasmJit(jvm, this, options);
+    this.wasmJit = new WasmJit(jvm, this);
     const regionOptions = this.rendererPipelineEnabled
       ? { ...options, structuredSsa: true }
       : options;
