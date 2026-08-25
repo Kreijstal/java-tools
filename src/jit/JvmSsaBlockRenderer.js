@@ -706,6 +706,10 @@ class JvmSsaBlockRenderer {
     this.linearPartitionSegmentBytes = Math.max(4096, Math.min(131072,
       Number(options.structuredLinearPartitionSegmentBytes ??
         environment.JVM_STRUCTURED_LINEAR_PARTITION_SEGMENT_BYTES) || 32768));
+    this.linearPartitionMinimumSegmentBytes = Math.max(1024, Math.min(32768,
+      Number(options.structuredLinearPartitionMinimumSegmentBytes ??
+        environment.JVM_STRUCTURED_LINEAR_PARTITION_MINIMUM_SEGMENT_BYTES) ||
+        8192));
     this.switchesEnabled = options.structuredSwitches !== false &&
       environment.JVM_DISABLE_STRUCTURED_SWITCHES !== "1";
     this.restoringRangeGuardDeoptEnabled =
@@ -10607,6 +10611,7 @@ class JvmSsaBlockRenderer {
       ? partitionOversizedLinearBlocks(canonicalGeneratedSource, {
         maximumUnitBytes: this.linearPartitionUnitBytes,
         targetSegmentBytes: this.linearPartitionSegmentBytes,
+        minimumSegmentBytes: this.linearPartitionMinimumSegmentBytes,
         rootProgramGenerator: true,
         namespace: "structured",
       })
