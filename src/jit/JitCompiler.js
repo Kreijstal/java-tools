@@ -411,10 +411,6 @@ class JitCompiler {
       options.scalarBoundedInlineRegions === true ||
       Boolean(typeof process !== "undefined" && process.env &&
         process.env.JVM_ENABLE_SCALAR_BOUNDED_INLINE_REGIONS === "1");
-    this.preferInlineFloatLoopRegions =
-      options.preferInlineFloatLoopRegions === true ||
-      Boolean(typeof process !== "undefined" && process.env &&
-        process.env.JVM_PREFER_INLINE_FLOAT_LOOP_REGIONS === "1");
     this.scalarLoopMethodRunCounts = new Map();
     this.structuredSsaMethodRunCounts = new Map();
     this.oversizedWasmFirstMethods = new WeakMap();
@@ -2292,7 +2288,7 @@ class JitCompiler {
       (this.isDynamicArrayStructuredFirstMethod(method) ||
         this.isCallGraphStructuredFirstMethod(method));
     const inlineLoopRegions = this.structuredOnlyCodegenMethods.has(method) ||
-      wholeGraphCandidate && !this.preferInlineFloatLoopRegions
+      wholeGraphCandidate
       ? [] : this.compileInlinePrimitiveLoopRegions(method);
     const structuredSsa = inlineLoopRegions.length
       ? null : this.structuredSsa.compile(method);
