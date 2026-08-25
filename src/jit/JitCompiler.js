@@ -163,6 +163,10 @@ class JitCompiler {
       eagerMonomorphicCallMaxCodeItems > 0
         ? Math.floor(eagerMonomorphicCallMaxCodeItems) : 96;
     this.eagerMonomorphicCallLinkCount = 0;
+    this.smallRestoringContinuationCallsEnabled =
+      options.smallRestoringContinuationCalls === true;
+    this.smallRestoringContinuationMaxCodeItems = Math.max(8, Math.floor(
+      Number(options.smallRestoringContinuationMaxCodeItems ?? 96) || 96));
     // Positional adapters are code-shape templates. Many independent call
     // sites reach the same method and used to parse an identical Function for
     // every site during asset loading. Cache the unbound template by resolved
@@ -6341,6 +6345,14 @@ class JitCompiler {
       this.hotCallGraphRegions.enabled &&
       generated.jvmStructuredContinuation === true &&
       typeof generated.jvmAdaptivePositionalBody === "function";
+    const primitiveReturn = new Set([
+      "boolean", "byte", "char", "short", "int",
+      "long", "float", "double", "void",
+    ]).has(site.returnType);
+    const smallRestoringContinuation = resumableHotGraphPositional &&
+      this.smallRestoringContinuationCallsEnabled && primitiveReturn &&
+      this.getCodeItems(method).length <=
+        this.smallRestoringContinuationMaxCodeItems;
     if (!resumableHotGraphPositional &&
         typeof generated.jvmHotCallGraphDirectPositionalBody === "function") {
       target.positionalInvoker =
@@ -6388,7 +6400,7 @@ class JitCompiler {
         nestedBody;
       return target.positionalInvoker;
     }
-    if (!resumableHotGraphPositional &&
+    if ((!resumableHotGraphPositional || smallRestoringContinuation) &&
         typeof generated.jvmRestoringDirectPositionalBody === "function") {
       // A verified acyclic field/primitive-array leaf can use the same scalar
       // call ABI without eagerly constructing its child Frame.  Its generated
@@ -6475,10 +6487,6 @@ class JitCompiler {
     // the canonical child-Frame path. Acyclic entries explicitly marked
     // jvmFramelessPositional cannot suspend, so their reference return is just
     // as safe as a primitive and needs no child Frame.
-    const primitiveReturn = new Set([
-      "boolean", "byte", "char", "short", "int",
-      "long", "float", "double", "void",
-    ]).has(site.returnType);
     const referenceFrameless =
       !primitiveReturn && Boolean(immediateFramelessBody);
     const framelessBody = immediateFramelessBody ||
