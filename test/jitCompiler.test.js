@@ -3951,6 +3951,27 @@ public final class ArbitraryEagerMonomorphicCallHarness {
   t.equal(disabledJvm.jit.eagerMonomorphicCallLinkCount, 0,
     'the disabled path records no eager link');
 
+  const primitiveOnlyJvm = new JVM({classpath, jit: {
+    warmupThreshold: 0,
+    profileMethods: false,
+    preferWholeMethodJs: true,
+    structuredSsa: true,
+    eagerMonomorphicCalls: true,
+    eagerMonomorphicPrimitiveOnly: true,
+  }});
+  await primitiveOnlyJvm.loadClassByName(className);
+  primitiveOnlyJvm.classInitializationState.set(className, 'INITIALIZED');
+  const primitiveOnlyCaller = await primitiveOnlyJvm.findMethodInHierarchy(
+    className, 'repeat', '(Ljava/lang/Object;I)I');
+  primitiveOnlyJvm.jit.structuredSsa.compile(primitiveOnlyCaller);
+  const excludedReferenceSite = primitiveOnlyJvm.jit.syncCallSites.find(
+    (candidate) => candidate?.declaredClassName === className &&
+      candidate?.methodName === 'identity');
+  t.notOk(excludedReferenceSite?.fastPositional,
+    'primitive-only eager linking structurally excludes reference returns');
+  t.equal(primitiveOnlyJvm.jit.eagerMonomorphicCallLinkCount, 0,
+    'the excluded reference target publishes no eager link');
+
   const uninitializedJvm = new JVM({classpath, jit: {
     warmupThreshold: 0,
     profileMethods: false,

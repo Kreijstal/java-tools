@@ -153,6 +153,11 @@ class JitCompiler {
       options.eagerMonomorphicCalls === true ||
       Boolean(typeof process !== "undefined" && process.env &&
         process.env.JVM_ENABLE_EAGER_MONOMORPHIC_CALLS === "1");
+    // The unresolved eager-link bug corrupts reference returns. Embedders may
+    // still use the independently typed primitive/void ABI while retaining a
+    // hard structural exclusion for every reference-returning target.
+    this.eagerMonomorphicPrimitiveOnly =
+      options.eagerMonomorphicPrimitiveOnly === true;
     const eagerMonomorphicCallMaxCodeItems = Number(
       options.eagerMonomorphicCallMaxCodeItems ??
       (typeof process !== "undefined" && process.env
@@ -5953,6 +5958,12 @@ class JitCompiler {
         site.fastPositional ||
         site.op === "invokestatic" && !site.initializationToken.initialized) {
       return false;
+    }
+    if (this.eagerMonomorphicPrimitiveOnly) {
+      const returnDescriptor = String(site.descriptor || "").split(")")[1] || "";
+      if (returnDescriptor.startsWith("L") || returnDescriptor.startsWith("[")) {
+        return false;
+      }
     }
     const items = this.getCodeItems(method);
     if (!items.length ||
