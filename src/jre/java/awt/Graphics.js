@@ -211,8 +211,9 @@ function presentSoftSurface(jvm, comp) {
   return true;
 }
 
-function markSoftSurfaceDirty(jvm, comp) {
+function markSoftSurfaceDirty(jvm, comp, thread = null) {
   if (!comp) return;
+  if (jvm && thread) jvm._awtFrameProducerThread = thread;
   comp._pixelsVersion = (comp._pixelsVersion || 0) + 1;
   const stats = presentationStats(jvm);
   if (stats) stats.dirtyMarks += 1;
@@ -393,7 +394,7 @@ module.exports = {
       }
     },
 
-    'drawImage(Ljava/awt/Image;IILjava/awt/image/ImageObserver;)Z': (jvm, obj, args) => {
+    'drawImage(Ljava/awt/Image;IILjava/awt/image/ImageObserver;)Z': (jvm, obj, args, thread) => {
       const stats = presentationStats(jvm);
       if (stats) stats.drawImageCalls += 1;
       const graphicsContext = obj._awtGraphics;
@@ -480,7 +481,7 @@ module.exports = {
           if (target && !target._canvasElement && jvm._awtCanvasElement) {
             target._canvasElement = jvm._awtCanvasElement;
           }
-          if (presentedBySoftwareSurface) markSoftSurfaceDirty(jvm, target);
+          if (presentedBySoftwareSurface) markSoftSurfaceDirty(jvm, target, thread);
           if (stats && presentedBySoftwareSurface) stats.softwareBlits += 1;
         }
         dumpFrame(pixels, imageObj._width, imageObj._height, jvm);

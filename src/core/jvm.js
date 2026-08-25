@@ -1295,6 +1295,17 @@ class JVM {
       this._audioPriority = null;
     }
 
+    // A browser JVM serializes Java threads onto one JavaScript thread. Once
+    // AWT identifies the thread that publishes complete frames, let that
+    // thread keep its CPU turn until it sleeps or blocks. Background loaders
+    // still run while the animation thread sleeps between frames, matching
+    // native JVM concurrency without assigning a game-specific priority.
+    const frameProducer = this._awtFrameProducerThread;
+    if (frameProducer && frameProducer.status === "runnable") {
+      const producerIndex = this.threads.indexOf(frameProducer);
+      if (producerIndex >= 0) this.currentThreadIndex = producerIndex;
+    }
+
     let thread = this.threads[this.currentThreadIndex];
 
     // Find the next runnable thread
