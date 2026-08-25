@@ -1046,9 +1046,9 @@ function partitionOversizedLinearBlocks(source, options = {}) {
     // another ABI layer and grows the source. Innermost-only per round,
     // mirroring the loop outliner: queued source edits stay non-overlapping
     // and shrunken parents re-qualify on the next round's reparse.
-    const innermost = collectOversizedUnits(program, maximumUnitBytes);
-    if (rootProgramGenerator && rewritten.length > maximumUnitBytes &&
-        !innermost.length) {
+    const innermost = rootProgramGenerator
+      ? [] : collectOversizedUnits(program, maximumUnitBytes);
+    if (rootProgramGenerator && rewritten.length > maximumUnitBytes) {
       innermost.push({
         type: "FunctionExpression",
         generator: true,
