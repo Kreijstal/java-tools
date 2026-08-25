@@ -1954,7 +1954,9 @@ class JitCompiler {
     const code = method.attributes.find((attribute) => attribute.type === "code");
     if (!code) return false;
     const exceptionTable = code.code.exceptionTable || [];
-    if (exceptionTable.length &&
+    const wrappedLinearFieldInitializer = exceptionTable.length > 0 &&
+      this.hasExceptionWrappedLinearFieldInitializer(method, codeItems);
+    if (exceptionTable.length && !wrappedLinearFieldInitializer &&
         !this.hasOnlyNoOpExceptionHandlers(method, codeItems)) return false;
 
     // The only constructor call may initialize this object through its direct
@@ -1962,8 +1964,11 @@ class JitCompiler {
     // nested objects, this(...) chains, and effectful recovery/finally
     // construction shapes. Bare or wrap-and-rethrow diagnostic handlers are
     // admitted by the proof above because they do not alter normal flow.
+    const normalIndexes = wrappedLinearFieldInitializer
+      ? reachableInstructionIndexes(codeItems, []) : null;
     const instructions = codeItems
-      .map((item) => item && item.instruction)
+      .map((item, index) => normalIndexes && !normalIndexes.has(index)
+        ? null : item && item.instruction)
       .filter(Boolean);
     if (getOp(instructions[0]) !== "aload_0" ||
         getOp(instructions[1]) !== "invokespecial") {
@@ -2008,7 +2013,50 @@ class JitCompiler {
           !op.endsWith("return");
       });
     return trivialForwarder || linearFieldInitializer ||
+      wrappedLinearFieldInitializer ||
       this.hasBackwardBranch(method);
+  }
+
+  hasExceptionWrappedLinearFieldInitializer(method, codeItems) {
+    const owner = this.jvm.findClassNameForMethod?.(method);
+    const ownerClass = owner && this.jvm.classes[owner]?.ast?.classes?.[0];
+    if (!ownerClass?.superClassName) return false;
+    const reachable = reachableInstructionIndexes(codeItems, []);
+    const instructions = [...reachable].sort((left, right) => left - right)
+      .map((index) => codeItems[index]?.instruction)
+      .filter(Boolean)
+      .filter((instruction) => {
+        const op = getOp(instruction);
+        return op !== "nop" && op !== "goto" && op !== "goto_w";
+      });
+    if (instructions.length < 3 || getOp(instructions[0]) !== "aload_0" ||
+        getOp(instructions[1]) !== "invokespecial" ||
+        getOp(instructions[instructions.length - 1]) !== "return") {
+      return false;
+    }
+    const superTarget = instructions[1].arg;
+    if (!Array.isArray(superTarget) || superTarget[1] !== ownerClass.superClassName ||
+        !Array.isArray(superTarget[2]) || superTarget[2][0] !== "<init>" ||
+        superTarget[2][1] !== "()V") return false;
+    const valueOps = new Set([
+      "aconst_null", "aload", "aload_1", "aload_2", "aload_3",
+      "bipush", "sipush", "ldc", "ldc_w",
+      "iconst_m1", "iconst_0", "iconst_1", "iconst_2", "iconst_3",
+      "iconst_4", "iconst_5", "iload", "iload_1", "iload_2", "iload_3",
+      "fconst_0", "fconst_1", "fconst_2", "fload", "fload_1", "fload_2",
+      "fload_3", "lconst_0", "lconst_1", "lload", "lload_1", "lload_2",
+      "lload_3", "dconst_0", "dconst_1", "dload", "dload_1", "dload_2",
+      "dload_3",
+    ]);
+    for (let index = 2; index < instructions.length - 1; index += 3) {
+      const receiver = instructions[index];
+      const value = instructions[index + 1];
+      const store = instructions[index + 2];
+      if (!receiver || !value || !store || getOp(receiver) !== "aload_0" ||
+          !valueOps.has(getOp(value)) || getOp(store) !== "putfield" ||
+          !Array.isArray(store.arg) || store.arg[1] !== owner) return false;
+    }
+    return (instructions.length - 3) % 3 === 0;
   }
 
   hasJitSafeMonitorBody(codeItems) {

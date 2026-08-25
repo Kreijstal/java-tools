@@ -13845,6 +13845,18 @@ public class GeneratedLoopConstructorHarness {
       }
     }
   }
+
+  static class WrappedAssignment extends Base {
+    Object value;
+
+    WrappedAssignment(Object value) {
+      try {
+        this.value = value;
+      } catch (RuntimeException error) {
+        throw new IllegalStateException(error);
+      }
+    }
+  }
 }
 `);
   const jvm = new JVM({
@@ -13893,6 +13905,27 @@ public class GeneratedLoopConstructorHarness {
   'a constructor never publishes an omitted-frame restoring ABI');
   t.notOk(jvm.jit.codegenCache.get(constructor)?.jvmFramelessPositional,
     'constructor initialization remains visible to canonical scheduling');
+
+  await jvm.loadClassByName(
+    'GeneratedLoopConstructorHarness$WrappedAssignment');
+  const wrappedConstructor = await jvm.findMethodInHierarchy(
+    'GeneratedLoopConstructorHarness$WrappedAssignment', '<init>',
+    '(Ljava/lang/Object;)V');
+  t.ok(jvm.jit.isJitSafeConstructor(wrappedConstructor),
+    'an exception-wrapped normal path of direct this-field assignments is admitted');
+  t.ok(jvm.jit.isCodegenSupported(wrappedConstructor),
+    'the narrowly proven wrapped field initializer can use generated JavaScript');
+  const wrappedReceiver = jvm.jit.allocateObject(
+    'GeneratedLoopConstructorHarness$WrappedAssignment');
+  const wrappedValue = jvm.jit.allocateObject('java/lang/Object');
+  await invoke(jvm, thread,
+    'GeneratedLoopConstructorHarness$WrappedAssignment', '<init>',
+    '(Ljava/lang/Object;)V', [wrappedReceiver, wrappedValue]);
+  t.equal(wrappedReceiver.fields[
+    'GeneratedLoopConstructorHarness$WrappedAssignment.value'], wrappedValue,
+  'the generated wrapped constructor preserves its field assignment');
+  t.ok(jvm.jit.codegenCache.get(wrappedConstructor)?.jvmStructuredSsa,
+    'the wrapped constructor retains the initialization-safe structured body');
 
   await jvm.loadClassByName(
     'GeneratedLoopConstructorHarness$RethrowingValues');
