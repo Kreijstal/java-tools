@@ -649,13 +649,13 @@ class MethodTranslator {
     const callerBox = this.box;
     const resumePc = itemIndex + 1;
     let scratchFrame = null;
+    let scratchArgs = null;
     // Non-partial sites skip the empty-under-stack requirement, so their
     // callee must never deopt. A recompile may repoint the state to a module
     // with instance-dispatch sites (which can miss); pin the link-time pair
     // as the safe fallback for those sites.
     const pinned = { run: (calleeSt.callee || calleeSt).run, meta: calleeMeta };
     const fn = (...all) => {
-      const args = underCount ? all.slice(underCount) : all;
       const current = calleeSt.callee || calleeSt;
       // A dependency-world recompile resets the callee state (meta/run/callee
       // all null) while this closure is still reachable from a running caller
@@ -666,11 +666,20 @@ class MethodTranslator {
         (currentMeta.fullyCompiled && !currentMeta.deoptableCalls &&
           !currentMeta.boxedCount && !currentMeta.usedEh))) ? current : pinned;
       const meta = calleeMod.meta;
-      const full = new Array(meta.paramSlots.length + 2);
+      // The partial bridge already serializes its ordinary path through one
+      // reusable scratch Frame. Reuse its fixed-arity Wasm argument buffer as
+      // well: static calls cannot suspend, and recursive re-entry is detected
+      // by the same inUse bit and receives a private buffer. This removes one
+      // Array (and the former all.slice) per nested call without changing the
+      // spill/deopt ownership protocol.
+      const reusableArgs = !scratchFrame || !scratchFrame.inUse;
+      const full = reusableArgs
+        ? scratchArgs || (scratchArgs = new Array(meta.paramSlots.length + 2))
+        : new Array(meta.paramSlots.length + 2);
       for (let i = 0; i < meta.paramSlots.length; i++) {
         const p = meta.paramSlots[i];
         const pos = argPosBySlot.get(p.slot);
-        if (pos !== undefined) full[i] = args[pos];
+        if (pos !== undefined) full[i] = all[underCount + pos];
         else full[i] = p.t === T.i64 ? 0n : (p.t === T.ref ? null : 0);
       }
       full[meta.paramSlots.length] = 0;
