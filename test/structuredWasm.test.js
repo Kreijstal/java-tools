@@ -891,6 +891,45 @@ public class StructuredVCallEh {
   t.end();
 });
 
+test('dispatcher wasm compiles unhandled athrow with an exact unwind pc', async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'DispatcherUnhandledThrow', `
+public class DispatcherUnhandledThrow {
+  static RuntimeException failure;
+  static int drive(int[] out, int n) {
+    int sum = 0;
+    for (int i = 0; i < n; i++) sum += i;
+    if (n < 0) throw failure;
+    out[0] = sum;
+    return sum;
+  }
+}
+`, { JVM_WASM_STRUCTURED: '0' });
+  const out = [0];
+  out.type = '[I';
+  await invoke(jvm, thread, 'DispatcherUnhandledThrow', 'drive', '([II)I',
+    [out, 100]);
+  const method = await jvm.findMethodInHierarchy(
+    'DispatcherUnhandledThrow', 'drive', '([II)I');
+  const st = jvm.jit.wasmJit.state.get(method);
+  t.ok(st?.meta && !st.meta.structured,
+    'the fixture selects the dispatcher backend');
+  t.notOk([...st.meta.demoteReasons.values()].includes('athrow'),
+    'an athrow terminator no longer creates a dispatcher exit stub');
+
+  const failure = { type: 'java/lang/RuntimeException', fields: {} };
+  const classData = jvm.classes.DispatcherUnhandledThrow;
+  classData.staticFields.set('failure:Ljava/lang/RuntimeException;', failure);
+  let thrown = null;
+  try {
+    await invoke(jvm, thread, 'DispatcherUnhandledThrow', 'drive', '([II)I',
+      [out, -1]);
+  } catch (error) {
+    thrown = error;
+  }
+  t.equal(thrown, failure, 'the guest exception unwinds unchanged');
+  t.end();
+});
+
 test('dispatcher tier compiles live-handler-range blocks with EH', async (t) => {
   const { jvm, thread } = await makeHarness(t, 'DispatchEh', `
 public class DispatchEh {
