@@ -416,6 +416,8 @@ class JitCompiler {
     this.structuredSsaMethodRunCounts = new Map();
     this.oversizedWasmFirstMethods = new WeakMap();
     this.oversizedWasmFirstMethodCount = 0;
+    this.oversizedWasmFirstCodeItems = Math.max(128, Math.floor(Number(
+      options.oversizedWasmFirstCodeItems ?? 2048) || 2048));
     this.longArithmeticWasmFirstMethods = new WeakMap();
     this.longArithmeticWasmFirstMethodCount = 0;
     this.longArithmeticWasmFirstEnabled =
@@ -845,7 +847,8 @@ class JitCompiler {
       return this.oversizedWasmFirstMethods.get(method);
     }
     const codeItems = this.getCodeItems(method);
-    const oversized = codeItems.filter((item) => item?.instruction).length >= 2048 &&
+    const oversized = codeItems.filter((item) => item?.instruction).length >=
+      this.oversizedWasmFirstCodeItems &&
       this.hasBackwardBranch(method);
     this.oversizedWasmFirstMethods.set(method, oversized);
     if (oversized) this.oversizedWasmFirstMethodCount += 1;
@@ -7182,6 +7185,31 @@ class JitCompiler {
       child.jitGeneratedReturnParent = frame;
       child.jitGeneratedReturnType = returnType;
       return { deopt: true, reason: "synchronized monitor contended" };
+    }
+    // A large loop selected for Wasm-first execution can be reached through
+    // a synchronous generated call before it ever owns a scheduler tick.
+    // Consult the same nested Wasm protocol used by asynchronous generated
+    // calls; otherwise runGeneratedFrame below installs JavaScript directly
+    // and the method's Wasm state remains permanently cold. A partial exit
+    // keeps the materialized child on the stack and hands scheduling back to
+    // the verified parent continuation.
+    if (this.wasmJit.enabled && this.isOversizedLoopMethod(method)) {
+      const wasmResult = this.wasmJit.runNested(child, thread);
+      if (wasmResult.returned) {
+        target.freeFrame = child;
+        if (returnType === "V" || wasmResult.isVoid) return RETURN_VOID;
+        return wasmResult.value;
+      }
+      if (wasmResult.exited) {
+        child.jitGeneratedReturnParent = frame;
+        child.jitGeneratedReturnType = returnType;
+        return {
+          deopt: true,
+          transient: true,
+          reason: `wasm-first synchronous callee exit ${lookupClass}.` +
+            `${method.name}${descriptor}`,
+        };
+      }
     }
     const result = this.runGeneratedFrame(generated, child, thread, false);
     if (result && typeof result.then === "function") {

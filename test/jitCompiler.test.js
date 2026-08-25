@@ -966,6 +966,8 @@ test('oversized loop policy selects Wasm by structure, not guest identity', (t) 
     descriptor: '()V',
     flags: ['private'],
     attributes: [{ type: 'code', code: {
+      localsSize: '1',
+      stackSize: '1',
       codeItems: Array.from({ length }, (_unused, index) => ({
         labelDef: index === 0 ? 'Lentry:' : `L${index}:`,
         instruction: index === length - 1 && backward
@@ -986,6 +988,47 @@ test('oversized loop policy selects Wasm by structure, not guest identity', (t) 
     'constructors retain their observable initialization policy');
   t.equal(jvm.jit.oversizedWasmFirstMethodCount, 1,
     'the runtime counter records structurally selected methods once');
+  const lowered = new JVM({ jit: {
+    warmupThreshold: 0, oversizedWasmFirstCodeItems: 128,
+  } });
+  t.ok(lowered.jit.isOversizedLoopMethod(shape('loweredThreshold', 128)),
+    'browser integrations can lower the structural threshold explicitly');
+  t.notOk(lowered.jit.isOversizedLoopMethod(shape('belowLowered', 127)),
+    'the configured threshold retains an exact lower boundary');
+
+  const childMethod = shape('nestedLargeLoop', 128);
+  childMethod.descriptor = '()I';
+  const parentMethod = shape('parent', 1, false);
+  const parent = new Frame(parentMethod);
+  parent.className = 'ThresholdHarness';
+  const thread = {
+    status: 'runnable', pendingException: null, callStack: new Stack(),
+  };
+  thread.callStack.push(parent);
+  let generatedRuns = 0;
+  const generated = () => {
+    generatedRuns += 1;
+    return { returned: true, value: 9 };
+  };
+  generated.jvmSynchronous = true;
+  let nestedRuns = 0;
+  lowered.jit.wasmJit.enabled = true;
+  lowered.jit.wasmJit.runNested = (child) => {
+    nestedRuns += 1;
+    thread.callStack.pop();
+    return { returned: true, value: 7, isVoid: false, child };
+  };
+  const nested = lowered.jit.tryInvokeResolvedTarget({
+    op: 'invokestatic', descriptor: '()I', params: [], returnType: 'I',
+  }, {
+    method: childMethod, lookupClass: 'ThresholdHarness', generated,
+  }, parent, thread);
+  t.equal(nested, 7,
+    'a selected synchronous child enters the nested Wasm protocol');
+  t.equal(nestedRuns, 1,
+    'the nested Wasm gate is consulted exactly once');
+  t.equal(generatedRuns, 0,
+    'successful nested Wasm execution bypasses the JavaScript child body');
   t.end();
 });
 
