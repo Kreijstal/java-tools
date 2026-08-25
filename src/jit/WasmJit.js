@@ -2899,6 +2899,14 @@ class WasmJit {
         ? primary.normalFlowFullyCompiled : primary.fullyCompiled;
       if (!refReturnComplete &&
           (primary.retChar === 'L' || primary.retChar === '[')) {
+        st.referenceReturnRejection = {
+          relaxed: this.relaxedRefReturn,
+          normalFlowFullyCompiled: Boolean(primary.normalFlowFullyCompiled),
+          fullyCompiled: Boolean(primary.fullyCompiled),
+          uncoveredItems: Number(primary.uncoveredItems) || 0,
+          demoteReasons: [...(primary.demoteReasons || new Map()).entries()],
+          structured: primary === structuredMeta,
+        };
         throw new Unsupported('partial module has a reference return'
           + (this.debug
             ? ` [normalFlow=${primary.normalFlowFullyCompiled} full=${primary.fullyCompiled}`

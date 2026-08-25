@@ -534,6 +534,15 @@ public class StructuredPartialReference {
     'the partial reference-return module is not installed');
   t.equal(state?.failReason, 'partial module has a reference return',
     'the rejection is structural and independent of method identity');
+  t.equal(state?.referenceReturnRejection?.relaxed, false,
+    'the diagnostic records the active conservative proof');
+  t.equal(state?.referenceReturnRejection?.normalFlowFullyCompiled, false,
+    'the diagnostic records incomplete normal-flow coverage');
+  t.ok(Array.isArray(state?.referenceReturnRejection?.demoteReasons),
+    'the failed state retains actionable demotion diagnostics');
+  t.ok(state.referenceReturnRejection.uncoveredItems > 0 ||
+      state.referenceReturnRejection.demoteReasons.length > 0,
+  'the diagnostic identifies incomplete compiled coverage');
   t.end();
 });
 
