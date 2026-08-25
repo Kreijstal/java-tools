@@ -519,6 +519,7 @@ function outlineLargeRegionLoops(source, options = {}) {
   const helperSources = [];
   const helperNames = new Set();
   const sharedStateName = `jvmRegionOutlinedState${namespace}`;
+  const generator = options.generator === true;
 
   const childrenOf = (node) => {
     const children = [];
@@ -611,6 +612,7 @@ function outlineLargeRegionLoops(source, options = {}) {
       const referenced = [];
       const written = new Set();
       let unsupported = false;
+      let hasYield = false;
       const audit = (node, parent = null, functionDepth = 0) => {
         if (!node?.type) return;
         if (node.type === "LabeledStatement") labels.add(node.label.name);
@@ -638,7 +640,10 @@ function outlineLargeRegionLoops(source, options = {}) {
           referenced.push(node);
         }
         if (functionDepth === 0) {
-          if (node.type === "YieldExpression" ||
+          if (node.type === "YieldExpression") {
+            if (generator) hasYield = true;
+            else unsupported = true;
+          } else if (
               node.type === "AwaitExpression" ||
               node.type === "ThisExpression" ||
               node.type === "Super" ||
@@ -714,7 +719,8 @@ function outlineLargeRegionLoops(source, options = {}) {
         `  ${name} = ${sharedStateName}[${index + 2}];`);
       helperNames.add(helperName);
       helperSources.push([
-        `function ${helperName}(${[...freeNames, outputName].join(",")}) {`,
+        `function${hasYield ? "*" : ""} ${helperName}(${[
+          ...freeNames, outputName].join(",")}) {`,
         "  try {",
         ...fragment.split("\n").map((line) => `    ${line}`),
         `    ${outputName}[0] = 0;`,
@@ -734,7 +740,8 @@ function outlineLargeRegionLoops(source, options = {}) {
         end: candidate.region.end,
         replacement: [
           "{",
-          `  ${helperName}(${[...freeNames, sharedStateName].join(",")});`,
+          `  ${hasYield ? "yield* " : ""}${helperName}(${[
+            ...freeNames, sharedStateName].join(",")});`,
           ...assignLiveOuts,
           `  if (${sharedStateName}[0] === 1) ` +
             `return ${sharedStateName}[1];`,
@@ -3468,6 +3475,7 @@ module.exports = HotCallGraphRegionCompiler;
 // Exposed for structural tests; not a public API.
 module.exports.partitionOversizedLinearBlocks =
   partitionOversizedLinearBlocks;
+module.exports.outlineLargeRegionLoops = outlineLargeRegionLoops;
 module.exports.liftOversizedUnitLocalsToEnvironment =
   liftOversizedUnitLocalsToEnvironment;
 module.exports.splitModuleSourceForFactoryHoist =

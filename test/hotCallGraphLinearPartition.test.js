@@ -1,6 +1,9 @@
 const test = require('tape');
 const {parse} = require('acorn');
-const {partitionOversizedLinearBlocks, liftOversizedUnitLocalsToEnvironment} =
+const {
+  partitionOversizedLinearBlocks, liftOversizedUnitLocalsToEnvironment,
+  outlineLargeRegionLoops,
+} =
   require('../src/jit/HotCallGraphRegionCompiler');
 
 // Differential coverage for the straight-line partition pass: every case
@@ -421,5 +424,42 @@ test('framed-style generator: lift then partition end to end', (t) => {
     (size) => size > OPTIONS.maximumUnitBytes * 2);
   t.deepEqual(oversized, [],
     'every framed-style unit fits twice the requested budget');
+  t.end();
+});
+
+test('loop outlining preserves generator yields and abandonment', (t) => {
+  const repeated = Array.from({length: 180}, (_unused, index) =>
+    `value = (value + ${index + 1}) | 0;`).join('\n');
+  const moduleSource = `return function* work(limit, log) {
+    let value = 0;
+    try {
+      for (let index = 0; index < limit; index += 1) {
+        ${repeated}
+        log.push(value);
+        yield value;
+      }
+      return value;
+    } finally {
+      log.push('finally');
+    }
+  };`;
+  const outlined = outlineLargeRegionLoops(moduleSource, {
+    minimumSourceBytes: 4096, maximumOutlines: 4,
+    namespace: 31, generator: true,
+  });
+  t.ok(outlined.count > 0, 'the yield-bearing loop is outlined');
+  const transformed = compile(`${outlined.source}\n${
+    outlined.helperSources.join('\n')}`);
+  const original = compile(moduleSource);
+  for (const maximumSteps of [0, 1, 3, Infinity]) {
+    const expectedLog = [];
+    const actualLog = [];
+    const expected = drive(original, [6, expectedLog], maximumSteps);
+    const actual = drive(transformed, [6, actualLog], maximumSteps);
+    t.deepEqual(actual, expected,
+      `outlined completion matches through ${maximumSteps} steps`);
+    t.deepEqual(actualLog, expectedLog,
+      `outlined yield/finally order matches through ${maximumSteps} steps`);
+  }
   t.end();
 });

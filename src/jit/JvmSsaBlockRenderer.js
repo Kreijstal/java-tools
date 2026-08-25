@@ -11,6 +11,7 @@ const { buildSsa } = require("../analysis/opgraph/ssa");
 const { kindWidth } = require("../analysis/opgraph/ssaTypes");
 const { parse: parseJavaScript } = require("acorn");
 const {
+  outlineLargeRegionLoops,
   partitionOversizedLinearBlocks,
 } = require("./HotCallGraphRegionCompiler");
 const STRUCTURED_CONTINUATION = Symbol("jvm.structuredSsaContinuation");
@@ -710,6 +711,12 @@ class JvmSsaBlockRenderer {
       Number(options.structuredLinearPartitionMinimumSegmentBytes ??
         environment.JVM_STRUCTURED_LINEAR_PARTITION_MINIMUM_SEGMENT_BYTES) ||
         8192));
+    this.loopOutliningEnabled =
+      options.structuredLoopOutlining === true ||
+      environment.JVM_ENABLE_STRUCTURED_LOOP_OUTLINING === "1";
+    this.loopOutlineSourceBytes = Math.max(4096, Math.min(262144,
+      Number(options.structuredLoopOutlineSourceBytes ??
+        environment.JVM_STRUCTURED_LOOP_OUTLINE_SOURCE_BYTES) || 16384));
     this.switchesEnabled = options.structuredSwitches !== false &&
       environment.JVM_DISABLE_STRUCTURED_SWITCHES !== "1";
     this.restoringRangeGuardDeoptEnabled =
@@ -10605,17 +10612,29 @@ class JvmSsaBlockRenderer {
       ...declarations, ...tree];
     const body = buildBody(renderedTree);
     const canonicalGeneratedSource = body.join("\n");
+    const outlinedGenerated = this.loopOutliningEnabled && useContinuations
+      ? outlineLargeRegionLoops(canonicalGeneratedSource, {
+        minimumSourceBytes: this.loopOutlineSourceBytes,
+        maximumOutlines: 32,
+        namespace: 97,
+        generator: true,
+      })
+      : {source: canonicalGeneratedSource, helperSources: [], count: 0,
+        outlinedSourceBytes: 0};
+    const outlinedGeneratedSource = outlinedGenerated.count > 0
+      ? `${outlinedGenerated.source}\n${outlinedGenerated.helperSources.join("\n")}`
+      : canonicalGeneratedSource;
     const partitionedGenerated = this.linearPartitionEnabled &&
       useContinuations &&
-      canonicalGeneratedSource.length > this.linearPartitionUnitBytes
-      ? partitionOversizedLinearBlocks(canonicalGeneratedSource, {
+      outlinedGeneratedSource.length > this.linearPartitionUnitBytes
+      ? partitionOversizedLinearBlocks(outlinedGeneratedSource, {
         maximumUnitBytes: this.linearPartitionUnitBytes,
         targetSegmentBytes: this.linearPartitionSegmentBytes,
         minimumSegmentBytes: this.linearPartitionMinimumSegmentBytes,
         rootProgramGenerator: true,
         namespace: "structured",
       })
-      : {source: canonicalGeneratedSource, count: 0,
+      : {source: outlinedGeneratedSource, count: 0,
         partitionedSourceBytes: 0};
     const generatedSource = partitionedGenerated.source;
     try {
@@ -12548,6 +12567,9 @@ class JvmSsaBlockRenderer {
         partitionedGenerated.count;
       generated.jvmStructuredPartitionedSourceBytes =
         partitionedGenerated.partitionedSourceBytes;
+      generated.jvmStructuredOutlinedLoopCount = outlinedGenerated.count;
+      generated.jvmStructuredOutlinedLoopSourceBytes =
+        outlinedGenerated.outlinedSourceBytes;
       this.compiledLoopCount += structured.loopHeaders.size;
       if (guardedStaticBooleanSites.size) {
         this.guardedBooleanMethodCount += 1;
