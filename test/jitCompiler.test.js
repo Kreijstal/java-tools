@@ -9072,12 +9072,10 @@ public final class StructuredLateStaticArrayRangeHarness {
   static float sum(int limit, boolean replace) {
     if (limit < 0) limit = -limit;
     float[] values = source;
-    float[] alias = values;
-    float[] working = alias;
     if (replace) source = replacement;
     float sum = 0.0f;
     for (int index = 0; index < limit; index++) {
-      sum += working[index];
+      sum += values[index];
     }
     return sum;
   }
@@ -9102,8 +9100,8 @@ public final class StructuredLateStaticArrayRangeHarness {
   const sourceText = generated?.jvmStructuredSource || '';
   t.ok(generated?.jvmStructuredSsa,
     'the late static-array loop selects structured SSA');
-  t.equal(generated.jvmStructuredPersistentStaticArrayLocalViewCount, 3,
-    'dominated local-copy chains retain the persistent raw-array companion');
+  t.equal(generated.jvmStructuredPersistentStaticArrayLocalViewCount, 1,
+    'unique dominated astore keeps one persistent raw-array companion');
   t.ok(generated.jvmStructuredArrayRangeGuardCount >= 1 &&
       sourceText.includes('ssaStaticArrayLocalData'),
     'later blocks retain enough SSA provenance for a range guard');
