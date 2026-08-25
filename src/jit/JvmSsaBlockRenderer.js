@@ -12515,6 +12515,7 @@ class JvmSsaBlockRenderer {
       generated.jvmStructuredBoundedIterationProduct =
         atomicBoundedLoops ? boundedIterationProduct : 0;
       generated.jvmStructuredSource = generatedSource;
+      generated.jvmStructuredGeneratedBody = generatedBody;
       this.compiledLoopCount += structured.loopHeaders.size;
       if (guardedStaticBooleanSites.size) {
         this.guardedBooleanMethodCount += 1;
