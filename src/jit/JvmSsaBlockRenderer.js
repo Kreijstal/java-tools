@@ -8257,13 +8257,9 @@ class JvmSsaBlockRenderer {
     // to be large. Poll sites use <= 0 so a coarse charge may cross the boundary
     // without losing the next scheduler check.
     const safePointInitialBudget = structuralPollBudget;
-    // Publish framed region IR for mixed recursive graphs too. The region
-    // compiler keeps recursive SCCs as standalone restoring nodes and lowers
-    // the surrounding acyclic edges jointly; withholding the root source
-    // here made that supported backend path unreachable for large numeric
-    // decoders that happen to contain one recursive edge.
     const regionCallGraphCandidate = useContinuations &&
-      callSites.size > 0 && this.jit.hotCallGraphRegions?.enabled;
+      callSites.size > 0 && !hasSelfRecursiveCall &&
+      this.jit.hotCallGraphRegions?.enabled;
     const indent = (lines) => lines.map((line) => `  ${line}`);
     const expandContinuationFallbacks = (lines, continuationMode) =>
       lines.flatMap((line) => {
