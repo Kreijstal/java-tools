@@ -1322,6 +1322,59 @@ public class InlineArrayRegionHarness {
   t.end();
 });
 
+test('baseline generated methods isolate scalar-bounded float transforms', async (t) => {
+  const classpath = compileJavaFixture(t, 'InlineFloatRegionHarness', `
+public final class InlineFloatRegionHarness {
+  static int touches;
+  static void touch() { touches++; }
+  static void transform(float[] left, float[] right, int limit) {
+    touch();
+    for (int index = 0; index < limit; index++) {
+      float a = left[index];
+      float b = right[index];
+      left[index] = a + b;
+      right[index] = (a - b) * 0.5f;
+    }
+    touch();
+  }
+}
+`);
+  const jvm = new JVM({ classpath, jit: {
+    warmupThreshold: 0, profileMethods: false,
+  } });
+  await jvm.loadClassByName('InlineFloatRegionHarness');
+  jvm.classInitializationState.set('InlineFloatRegionHarness', 'INITIALIZED');
+  jvm.classes.InlineFloatRegionHarness.staticFields.set('touches:I', 0);
+  const thread = {
+    id: 0, name: 'inline-float-region', callStack: new Stack(),
+    status: 'runnable', pendingException: null,
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+  const left = [1, 2, 3, 4];
+  const right = [0.5, 1.5, -2, 8];
+  left.type = right.type = '[F';
+
+  await invoke(jvm, thread, 'InlineFloatRegionHarness', 'transform',
+    '([F[FI)V', [left, right, 4]);
+  const method = await jvm.findMethodInHierarchy(
+    'InlineFloatRegionHarness', 'transform', '([F[FI)V');
+  const generated = jvm.jit.codegenCache.get(method);
+  const plan = jvm.jit.compileInlinePrimitiveLoopRegions(method)[0];
+  const region = plan && jvm.jit.inlineLoopRegions[plan.id];
+  t.equal(generated?.jvmInlineLoopRegionCount, 1,
+    'the scalar-bounded float loop is embedded in the baseline body');
+  t.ok(plan?.scalarBounded && region?.maximumIterations === 4096,
+    'the ordinary helper retains a finite runtime trip guard');
+  t.deepEqual(left.slice(), [1.5, 3.5, 1, 12],
+    'the isolated helper preserves float additions');
+  t.deepEqual(right.slice(), [0.25, 0.25, 2.5, -2],
+    'the isolated helper preserves float subtraction and narrowing');
+  t.equal(jvm.classes.InlineFloatRegionHarness.staticFields.get('touches:I'), 2,
+    'effects surrounding the isolated loop execute exactly once');
+  t.end();
+});
+
 test('monitor-bearing methods isolate scalar-bounded byte-copy regions', (t) => {
   const owner = 'ArbitraryScalarBoundedRegion';
   const field = ['Field', owner, ['source', '[B']];
