@@ -1225,11 +1225,10 @@ class JVM {
   _prepareSchedulerTick() {
     // On each tick, check for threads that need to be woken up.
     const audioPriority = this._audioPriority;
-    const renderPriority = this._awtRenderPriority;
     const hasTimedThread = this.threads.some((t) =>
       (t.status === 'SLEEPING' && t.sleepUntil !== undefined) ||
       (t.status === 'WAITING' && t.waitDeadline !== undefined)) ||
-      Boolean(audioPriority) || Boolean(renderPriority);
+      Boolean(audioPriority);
     const schedulerNow = hasTimedThread ? this.clock.millis() : 0;
     for (const t of this.threads) {
       if (t.status === "SLEEPING" && schedulerNow >= t.sleepUntil) {
@@ -1294,20 +1293,6 @@ class JVM {
       if (priorityIndex >= 0) this.currentThreadIndex = priorityIndex;
     } else if (audioPriority) {
       this._audioPriority = null;
-    }
-
-    // A sleeping animation producer becomes runnable only when its frame
-    // deadline arrives. Select it before background decode work for this one
-    // quantum; it will publish and sleep again, leaving the remaining CPU to
-    // loaders. This emulates the concurrency of native JVM threads without
-    // permanently weighting Java Thread priorities.
-    if (renderPriority && renderPriority.thread &&
-        renderPriority.thread.status === "runnable" &&
-        schedulerNow <= renderPriority.until) {
-      const priorityIndex = this.threads.indexOf(renderPriority.thread);
-      if (priorityIndex >= 0) this.currentThreadIndex = priorityIndex;
-    } else if (renderPriority && schedulerNow > renderPriority.until) {
-      this._awtRenderPriority = null;
     }
 
     let thread = this.threads[this.currentThreadIndex];
