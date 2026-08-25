@@ -8241,6 +8241,10 @@ public class ArbitraryAssetWork {
   }
 
   static float[] updateFloats(Object values, int scale) {
+    if (scale == 0) {
+      String checked = (String) values;
+      if (checked == null) return null;
+    }
     float[] result = (float[]) values;
     for (int index = 0; index < result.length; index++) {
       result[index] = result[index] / scale + 0.5f;
@@ -8321,7 +8325,10 @@ public class ArbitraryAssetWork {
     'ArbitraryAssetWork', 'updateFloats', '(Ljava/lang/Object;I)[F');
   const floatGenerated = jvm.jit.structuredSsa.compile(floatReturn);
   t.equal(typeof floatGenerated?.jvmRestoringDirectPositionalBody, 'function',
-    'a verified float-array loop publishes the same restoring scalar ABI');
+    'an unrelated object checkcast does not reject a reference-returning ABI');
+  t.ok(floatGenerated.jvmRestoringDirectPositionalSource.includes(
+    'java/lang/String'),
+  'the direct body retains the non-array checkcast and its canonical guard');
   const floatValues = jvm.jit.newPrimitiveArray(2, 'float');
   floatValues[0] = 3;
   floatValues[1] = 7;

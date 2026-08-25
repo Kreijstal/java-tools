@@ -9928,14 +9928,6 @@ class JvmSsaBlockRenderer {
           `unverified reference-array element at ${index}`;
         break;
       }
-      if (op === "checkcast" &&
-          restoringDirectReturnsReference &&
-          !directPrimitiveDescriptors.has(instruction.arg)) {
-        restoringDirectPositionalEligible = false;
-        restoringDirectRejection =
-          `non-primitive-array reference-return checkcast at ${index}`;
-        break;
-      }
       const constantValue = Number(instruction.arg?.value ?? instruction.arg);
       if ((op === "ldc" || op === "ldc_w") &&
           !Number.isFinite(constantValue)) {
