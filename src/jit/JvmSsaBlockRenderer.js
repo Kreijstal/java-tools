@@ -4159,19 +4159,6 @@ class JvmSsaBlockRenderer {
                 ...materializeLines(callStack, index).map((line) => `  ${line}`),
                 `  throw ${caught};`, "}");
             }
-          } else if (site.directIntrinsic?.kind === "mutableStaticBitCursor" &&
-              Number.isInteger(site.directIntrinsic.positionalId) &&
-              site.argumentCount === 0 && !site.returnsVoid) {
-            const callStack = [...stack];
-            const out = value();
-            lines.push(`const ${out} = helpers.directSynchronousIntrinsics[` +
-              `${site.directIntrinsic.positionalId}]();`,
-            `if (${out} === helpers.asyncInvokeSentinel()) {`,
-            ...materializeLines(callStack, index).map((line) => `  ${line}`),
-            "  helpers.skipJitOnce(frame);",
-            "  return { deopt: true, transient: true, reason: 'mutable static bit cursor guard' };",
-            "}");
-            stack.push(out);
           } else if (site.directIntrinsic?.kind === "clippedStaticSpan" &&
               site.directIntrinsic.paramCount === 4 && site.directIntrinsic.returnsVoid &&
               site.directIntrinsic.staticFieldSites?.length === 6) {
