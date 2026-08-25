@@ -2752,29 +2752,7 @@ class JitCompiler {
         let counterWrites = 0;
         let floatTraffic = 0;
         const arrayLocalSlots = new Set();
-        const activeIndices = new Set();
-        const pendingIndices = [header];
-        while (pendingIndices.length) {
-          const index = pendingIndices.pop();
-          if (index === exit || index < header || index > backedge ||
-              activeIndices.has(index)) continue;
-          activeIndices.add(index);
-          const instruction = items[index]?.instruction;
-          const op = getOp(instruction);
-          if (op === "goto" || op === "goto_w") {
-            const target = labels.get(instruction.arg);
-            if (Number.isInteger(target)) pendingIndices.push(target);
-          } else if (op?.startsWith("if")) {
-            const target = labels.get(instruction.arg);
-            if (Number.isInteger(target)) pendingIndices.push(target);
-            pendingIndices.push(index + 1);
-          } else if (op !== "return" && op !== "athrow") {
-            pendingIndices.push(index + 1);
-          }
-        }
-        if (!activeIndices.has(backedge)) continue;
         for (let index = header; index <= backedge && valid; index += 1) {
-          if (!activeIndices.has(index)) continue;
           const instruction = items[index]?.instruction;
           const op = getOp(instruction);
           if (!scalarFloatAllowed.has(op)) { valid = false; break; }
@@ -2809,7 +2787,7 @@ class JitCompiler {
         if (!valid || counterWrites !== 1 || floatTraffic < 4) continue;
         candidates.push({
           header, backedge, exit, counterSlot, boundSlot,
-          arrayLocalSlots, activeIndices, floatTraffic,
+          arrayLocalSlots, floatTraffic,
           boundExpression: shiftedBound ? {
             kind: "signed-shift-add", shiftSlot, add: shiftConstant,
           } : null,
@@ -2822,11 +2800,11 @@ class JitCompiler {
       if (candidate) {
         const {
           header, backedge, exit, counterSlot, boundSlot, arrayLocalSlots,
-          activeIndices, boundExpression,
+          boundExpression,
         } = candidate;
         const syntheticItems = items.map((item, index) => ({
           ...item,
-          instruction: activeIndices.has(index)
+          instruction: index >= header && index <= backedge
             ? item.instruction : index === exit ? "return" : "nop",
         }));
         syntheticItems[0] = {
