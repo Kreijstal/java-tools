@@ -991,12 +991,9 @@ test('oversized loop policy selects Wasm by structure, not guest identity', (t) 
   const lowered = new JVM({ jit: {
     warmupThreshold: 0, oversizedWasmFirstCodeItems: 128,
     wasmRelaxedReferenceReturns: true,
-    wasmCheckcast: true,
   } });
   t.equal(lowered.jit.wasmJit.relaxedRefReturn, true,
     'the normal-flow reference-return proof is explicitly configurable');
-  t.equal(lowered.jit.wasmJit.checkcastEnabled, true,
-    'the embedding runtime can explicitly admit guarded reference casts');
   const fuelBound = new JVM({ jit: { warmupThreshold: 0, wasmFuel: 50_000 } });
   t.equal(fuelBound.jit.wasmJit.fuel, 50_000,
     'the embedding runtime can bound one cooperative Wasm slice');

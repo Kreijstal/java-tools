@@ -467,15 +467,7 @@ class StructuredWasmCompiler {
     if (this.usedHeap) env.mem = this.heap.memory;
     // Deopt stubs exit mid-method needing a real frame, so modules that have
     // them must take the partial-callee protocol (and are never pinned).
-    // Handler-only reporter blocks are present in the structured tree so EH
-    // can enter them, but they are not reachable from the method's ordinary
-    // entry edges. They cannot produce a successful reference return after a
-    // partial exit, which is the invariant this flag proves. Match the
-    // dispatcher backend: require coverage only for verifier-reachable normal
-    // flow, while fullyCompiled below remains false when handlers exist.
-    const normalFlowFullyCompiled =
-      [...this.demoted.keys()].every((id) => !fn.reachable.has(id)) &&
-      [...this.deoptBlocks.keys()].every((id) => !fn.reachable.has(id));
+    const normalFlowFullyCompiled = this.demoted.size === 0 && this.deoptBlocks.size === 0;
     // A guard-miss stub is a rare-path exit, but it still makes this module
     // partial — and a partial module that returns a REFERENCE cannot be linked
     // as a callee at all (see the reference-return rule in WasmJit.compile).
@@ -529,8 +521,7 @@ class StructuredWasmCompiler {
       // instruction-bearing items in DEMOTED tree blocks (counted like the
       // dispatcher's uncoveredItems). Inline guard-miss deopt stubs are
       // rare-path exits by design, not gaps.
-      uncoveredItems: [...this.demoted.keys()].filter((id) =>
-        treeBlocks.has(id) && fn.reachable.has(id))
+      uncoveredItems: [...this.demoted.keys()].filter((id) => treeBlocks.has(id))
         .reduce((sum, id) => sum +
           cfg.blocks[id].insns.filter((i) => items[i] && items[i].instruction).length, 0),
       boxedCount: 0,
