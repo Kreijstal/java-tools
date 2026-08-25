@@ -13771,6 +13771,70 @@ public class AdaptiveComplexConstructorHarness {
   t.end();
 });
 
+test('structured SSA preserves instanceof and cold class resolution', async (t) => {
+  const classpath = compileJavaFixture(t, 'StructuredInstanceofHarness', `
+public class StructuredInstanceofHarness {
+  static class Marker {}
+
+  public static void count(Object value, int[] out) {
+    int result = 0;
+    for (int index = 0; index < 8; index++) {
+      if (value instanceof Marker) result++;
+    }
+    out[0] = result;
+  }
+}
+`);
+  const jvm = new JVM({ classpath, jit: {
+    warmupThreshold: 0,
+    preferWholeMethodJs: true,
+    rendererPipeline: true,
+    structuredSsa: true,
+  } });
+  jvm.jit.wasmJit.enabled = false;
+  await jvm.loadClassByName('StructuredInstanceofHarness');
+  jvm.classInitializationState.set(
+    'StructuredInstanceofHarness', 'INITIALIZED');
+  const method = await jvm.findMethodInHierarchy(
+    'StructuredInstanceofHarness', 'count', '(Ljava/lang/Object;[I)V');
+  const thread = {
+    id: 0, name: 'structured-instanceof', callStack: new Stack(),
+    status: 'runnable', pendingException: null,
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+
+  const out = jvm.jit.newPrimitiveArray(1, 'int');
+  await invoke(jvm, thread, 'StructuredInstanceofHarness', 'count',
+    '(Ljava/lang/Object;[I)V', [null, out]);
+  t.equal(out[0], 0,
+  'null is never an instance and needs no class resolution');
+  t.ok(jvm.jit.codegenCache.get(method)?.jvmStructuredSsa,
+    'the loop containing instanceof compiles through structured SSA');
+
+  const tryInstanceOfSync = jvm.jit.tryInstanceOfSync.bind(jvm.jit);
+  let forcedColdFallbacks = 0;
+  jvm.jit.tryInstanceOfSync = (...args) => {
+    if (forcedColdFallbacks++ === 0) return jvm.jit.asyncInvokeSentinel();
+    return tryInstanceOfSync(...args);
+  };
+  const plainObject = jvm.jit.allocateObject('java/lang/Object');
+  await invoke(jvm, thread, 'StructuredInstanceofHarness', 'count',
+    '(Ljava/lang/Object;[I)V', [plainObject, out]);
+  t.equal(out[0], 0,
+  'cold target resolution resumes with the correct false result');
+  t.ok(forcedColdFallbacks > 0,
+    'the structured path exercised its exact-PC cold fallback');
+
+  const marker = jvm.jit.allocateObject(
+    'StructuredInstanceofHarness$Marker');
+  await invoke(jvm, thread, 'StructuredInstanceofHarness', 'count',
+    '(Ljava/lang/Object;[I)V', [marker, out]);
+  t.equal(out[0], 8,
+  'the warm structured path preserves the true result on every iteration');
+  t.end();
+});
+
 test('verified loop constructors and their trivial superclass chain use whole-method codegen', async (t) => {
   const classpath = compileJavaFixture(t, 'GeneratedLoopConstructorHarness', `
 public class GeneratedLoopConstructorHarness {

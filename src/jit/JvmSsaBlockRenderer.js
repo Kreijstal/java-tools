@@ -3860,6 +3860,25 @@ class JvmSsaBlockRenderer {
               "  }",
               "}");
           }
+        } else if (op === "instanceof") {
+          const input = pop();
+          if (input === null) valid = false;
+          else {
+            const candidate = value(), out = value();
+            const target = JSON.stringify(instruction.arg);
+            lines.push(
+              `const ${candidate} = ${input};`,
+              `const ${out} = helpers.tryInstanceOfSync(${candidate}, ${target});`,
+              `if (${out} === helpers.asyncInvokeSentinel()) {`,
+              ...materializeLines([...stack, candidate], index)
+                .map((line) => `  ${line}`),
+              "  helpers.skipJitOnce(frame);",
+              "  return { deopt: true, transient: true, " +
+                "reason: 'cold structured SSA instanceof' };",
+              "}",
+            );
+            stack.push(out);
+          }
         } else if (op === "getfield") {
           const objectInput = pop(), site = fieldSites.get(index);
           if (objectInput === null || site === undefined) valid = false;
