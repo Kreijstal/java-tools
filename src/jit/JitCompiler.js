@@ -666,7 +666,9 @@ class JitCompiler {
     // for methods the JS tier claims first. Diagnostic mode only; a no-op
     // unless JVM_WASM_CENSUS_SHADOW=1.
     if (this.wasmJit.censusShadow) this.wasmJit.censusProbe(frame);
-    const stableResult = this.tryRunStableGeneratedFrame(frame, thread);
+    const readyFullWasm = this.hasReadyFullWasm(frame.method);
+    const stableResult = this.tryRunStableGeneratedFrame(
+      frame, thread, readyFullWasm);
     if (stableResult) return stableResult;
 
     // SpiderMonkey pays a high cost for frequent Wasm -> JS -> Wasm exits.
@@ -689,6 +691,7 @@ class JitCompiler {
       (this.isOversizedLoopMethod(frame.method) ||
         this.isLongArithmeticLoopMethod(frame.method) ||
         this.isArrayKernelWasmFirstMethod(frame.method) ||
+        readyFullWasm ||
         this.wasmJit.probeFullCoverage(frame));
     const wholeMethodPreferred =
       (this.prefersWholeMethodJs(frame.method) ||
@@ -775,7 +778,14 @@ class JitCompiler {
     return this.runSelectedGeneratedFrame(generated, frame, thread);
   }
 
-  tryRunStableGeneratedFrame(frame, thread) {
+  hasReadyFullWasm(method) {
+    const state = this.wasmJit.enabled && method
+      ? this.wasmJit.state.get(method) : null;
+    return Boolean(state && state.status === "ready" &&
+      state.meta && state.meta.fullyCompiled);
+  }
+
+  tryRunStableGeneratedFrame(frame, thread, readyFullWasm = false) {
     if (!this.enabled || !frame || !frame.method || !frame.instructions ||
         frame.jitJsDisabled || this.runningFrames.has(frame) ||
         this._envInstrumented) return null;
@@ -784,7 +794,8 @@ class JitCompiler {
     if (!stableEntry || stableEntry.jit !== this || !stableEntry.generated) {
       return null;
     }
-    if (this.wasmJit.enabled && !this.prefersWholeMethodJs(frame.method)) {
+    if (this.wasmJit.enabled &&
+        (readyFullWasm || !this.prefersWholeMethodJs(frame.method))) {
       return null;
     }
     if (frame.jitSkipOnce) {

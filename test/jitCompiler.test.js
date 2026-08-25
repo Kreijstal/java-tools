@@ -11802,6 +11802,42 @@ public class SynchronousExecuteHarness {
     'the stable entry completes through the normal scheduler protocol');
   t.ok(jvm.jit.stableGeneratedEntryRunCount > 0,
     'a warmed method bypasses repeated tier-admission work');
+
+  const stableRuns = jvm.jit.stableGeneratedEntryRunCount;
+  let wasmEntries = 0;
+  jvm.jit.wasmJit.enabled = true;
+  jvm.jit.wasmJit.state.set(method, {
+    status: 'ready', meta: { fullyCompiled: true },
+  });
+  jvm.jit.wasmJit.tryRunFrame = (candidateFrame, candidateThread) => {
+    wasmEntries += 1;
+    out[0] = 777;
+    candidateThread.callStack.pop();
+    return { handled: true, returned: true };
+  };
+  const promotedFrame = new Frame(method);
+  promotedFrame.className = 'SynchronousExecuteHarness';
+  promotedFrame.locals[0] = out;
+  const promotedThread = {
+    id: 2,
+    name: 'wasm-promoted-execute-test',
+    callStack: new Stack(),
+    status: 'runnable',
+    pendingException: null,
+  };
+  promotedThread.callStack.push(promotedFrame);
+  jvm.threads = [promotedThread];
+  jvm.currentThreadIndex = 0;
+  out[0] = 0;
+  const promotedResult = await jvm.execute();
+  t.equal(out[0], 777,
+    'a fully compiled Wasm body supersedes the warmed JavaScript entry');
+  t.equal(wasmEntries, 1,
+    'the ready Wasm gate receives the promoted frame exactly once');
+  t.equal(jvm.jit.stableGeneratedEntryRunCount, stableRuns,
+    'promotion does not re-enter the stale stable JavaScript body');
+  t.ok(promotedResult.completed,
+    'the promoted frame completes through the normal scheduler protocol');
   t.end();
 });
 
