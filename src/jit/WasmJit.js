@@ -660,7 +660,6 @@ class MethodTranslator {
       // indexed access to the non-escaping arguments view lets the engine
       // keep these values in the call frame on the ordinary path.
       const all = arguments;
-      const args = underCount ? all.slice(underCount) : all;
       const current = calleeSt.callee || calleeSt;
       // A dependency-world recompile resets the callee state (meta/run/callee
       // all null) while this closure is still reachable from a running caller
@@ -675,7 +674,7 @@ class MethodTranslator {
       for (let i = 0; i < meta.paramSlots.length; i++) {
         const p = meta.paramSlots[i];
         const pos = argPosBySlot.get(p.slot);
-        if (pos !== undefined) full[i] = args[pos];
+        if (pos !== undefined) full[i] = all[underCount + pos];
         else full[i] = p.t === T.i64 ? 0n : (p.t === T.ref ? null : 0);
       }
       full[meta.paramSlots.length] = 0;
