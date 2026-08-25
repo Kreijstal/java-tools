@@ -687,7 +687,8 @@ class JitCompiler {
     // evidence rather than a guess, and cannot select the partial-module
     // shape the JS preference exists to avoid. Off unless
     // JVM_WASM_PREFER_FULL_COVERAGE=1.
-    const wasmPriorityLoop = this.wasmJit.enabled &&
+    const wasmExitStorm = this.hasWasmExitStorm(frame.method);
+    const wasmPriorityLoop = this.wasmJit.enabled && !wasmExitStorm &&
       (this.isOversizedLoopMethod(frame.method) ||
         this.isLongArithmeticLoopMethod(frame.method) ||
         this.isArrayKernelWasmFirstMethod(frame.method) ||
@@ -788,16 +789,22 @@ class JitCompiler {
     // yet exit at nearly every invocation boundary. Once enough non-fuel
     // observations prove that behavior, allow a complete whole-method JS body
     // to take ownership instead of repeatedly crossing Wasm -> interpreter.
+    if (this.hasWasmExitStorm(method)) return false;
+    return true;
+  }
+
+  hasWasmExitStorm(method) {
+    const state = this.wasmJit.enabled && method
+      ? this.wasmJit.state.get(method) : null;
+    if (!state || state.status !== "ready") return false;
     const runs = Number(state.runs) || 0;
     const nonFuelExits = Math.max(0,
       (Number(state.exits) || 0) - (Number(state.fuelExits) || 0));
     // Frequent cross-tier exits are substantially more expensive than their
-    // raw body time in SpiderMonkey.  Once one in four warmed invocations has
-    // already fallen back, prefer the complete structured JavaScript body;
-    // retaining Wasm until a 90% failure rate strands call-heavy numeric
-    // decoders in minute-long Wasm -> JS transition storms.
-    if (runs >= 64 && nonFuelExits * 4 >= runs) return false;
-    return true;
+    // raw body time in SpiderMonkey.  Apply this to partial modules too:
+    // oversized-loop priority must not permanently trap a method in a module
+    // whose unsupported islands exit on every invocation.
+    return runs >= 64 && nonFuelExits * 4 >= runs;
   }
 
   tryRunStableGeneratedFrame(frame, thread, readyFullWasm = false) {

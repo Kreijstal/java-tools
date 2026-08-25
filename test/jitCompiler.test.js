@@ -11922,6 +11922,8 @@ public class SynchronousExecuteHarness {
     status: 'ready', meta: { fullyCompiled: true },
     runs: 100, exits: 25, fuelExits: 0,
   });
+  t.ok(jvm.jit.hasWasmExitStorm(method),
+    'the generic exit-storm gate also covers partial Wasm priority');
   t.equal(typeof jvm.jit.getPositionalGeneratedInvoker(
     linkedSite, linkedTarget), 'function',
   'an exit-storm child can republish its complete JavaScript edge');
