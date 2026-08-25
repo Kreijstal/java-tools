@@ -143,7 +143,11 @@ registerProcessor("jvm-source-data-line", JVMSourceDataLineProcessor);`;
       return null;
     }
     if (!sharedAudioContext || sharedAudioContext.state === "closed") {
-      sharedAudioContext = new AudioContextCtor();
+      const unlockedContext = global.__jvmSharedAudioContext;
+      sharedAudioContext = unlockedContext && unlockedContext.state !== "closed"
+        ? unlockedContext
+        : new AudioContextCtor();
+      global.__jvmSharedAudioContext = sharedAudioContext;
       if (sharedAudioContext.audioWorklet && global.AudioWorkletNode &&
           global.Blob && global.URL &&
           typeof global.URL.createObjectURL === "function") {
