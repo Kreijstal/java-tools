@@ -694,6 +694,8 @@ class JvmSsaBlockRenderer {
     this.perLoopPollBudgetsEnabled =
       options.structuredPerLoopPollBudgets === true ||
       environment.JVM_ENABLE_STRUCTURED_PER_LOOP_POLL_BUDGETS === "1";
+    this.maxSafePointBudget = Math.max(1, Math.min(10000, Math.floor(Number(
+      options.structuredMaxSafePointBudget ?? 10000) || 10000)));
     this.switchesEnabled = options.structuredSwitches !== false &&
       environment.JVM_DISABLE_STRUCTURED_SWITCHES !== "1";
     this.restoringRangeGuardDeoptEnabled =
@@ -8249,7 +8251,7 @@ class JvmSsaBlockRenderer {
         : methodPollBudget);
     }
     const loopWorkEstimate = Math.max(1, ...loopWorkEstimates.values());
-    const structuralPollBudget = Math.min(10000,
+    const structuralPollBudget = Math.min(this.maxSafePointBudget,
       ...loopPollBudgets.values());
     // Keep the shared counter in guest-iteration units. Each admitted coarse
     // loop charges its verified trip count once; unrelated later loops must not
