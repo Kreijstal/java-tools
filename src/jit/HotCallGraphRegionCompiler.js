@@ -505,7 +505,7 @@ function splitModuleSourceForFactoryHoist(moduleSource) {
  * this is intentionally a structural AST pass, never a guest-name heuristic.
  */
 function outlineLargeRegionLoops(source, options = {}) {
-  const minimumSourceBytes = Math.max(4096,
+  const minimumSourceBytes = Math.max(512,
     Number(options.minimumSourceBytes) || 32768);
   const maximumOutlines = Math.max(0,
     Math.min(64, Number(options.maximumOutlines) || 16));

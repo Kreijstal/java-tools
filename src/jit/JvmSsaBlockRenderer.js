@@ -714,7 +714,7 @@ class JvmSsaBlockRenderer {
     this.loopOutliningEnabled =
       options.structuredLoopOutlining === true ||
       environment.JVM_ENABLE_STRUCTURED_LOOP_OUTLINING === "1";
-    this.loopOutlineSourceBytes = Math.max(4096, Math.min(262144,
+    this.loopOutlineSourceBytes = Math.max(512, Math.min(262144,
       Number(options.structuredLoopOutlineSourceBytes ??
         environment.JVM_STRUCTURED_LOOP_OUTLINE_SOURCE_BYTES) || 16384));
     this.switchesEnabled = options.structuredSwitches !== false &&
