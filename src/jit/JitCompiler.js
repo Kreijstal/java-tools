@@ -2743,7 +2743,7 @@ class JitCompiler {
           ? labels.get(items[header + 6].instruction.arg) : header + 3;
         if (!Number.isInteger(counterSlot) || !Number.isInteger(boundSlot) ||
             counterSlot === boundSlot || !Number.isInteger(exit) ||
-            (directBound && exit <= backedge) || exit >= items.length ||
+            exit <= backedge || exit >= items.length ||
             shiftedBound && (!Number.isInteger(shiftSlot) ||
               shiftSlot === counterSlot || !Number.isInteger(body) ||
               body <= exit || body > backedge) ||
