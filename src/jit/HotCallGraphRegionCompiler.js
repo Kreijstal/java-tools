@@ -2824,7 +2824,7 @@ class HotCallGraphRegionCompiler {
     // A framed root shares one function-scoped local namespace across the
     // whole body; lift it into an environment array first so partitioning
     // does not re-plumb hundreds of names through every segment boundary.
-    const partitionStarted = process.hrtime.bigint();
+    const partitionStarted = this.jit.monotonicNow();
     const lifted = framedRoot && this.framedPartitionEnabled
       ? liftOversizedUnitLocalsToEnvironment(unprunedModuleSource, {
         maximumUnitBytes: this.linearPartitionUnitBytes,
@@ -2841,8 +2841,7 @@ class HotCallGraphRegionCompiler {
         namespace: "0",
       })
       : {source: unprunedModuleSource, count: 0, partitionedSourceBytes: 0};
-    this.partitionPassMillis +=
-      Number(process.hrtime.bigint() - partitionStarted) / 1e6;
+    this.partitionPassMillis += this.jit.monotonicNow() - partitionStarted;
     this.partitionedSegmentCount += partitioned.count;
     this.partitionedSegmentSourceBytes += partitioned.partitionedSourceBytes;
     if (framedRoot) this.framedPartitionedSegmentCount += partitioned.count;
