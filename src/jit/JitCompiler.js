@@ -165,6 +165,8 @@ class JitCompiler {
     this.eagerMonomorphicCallLinkCount = 0;
     this.positionalCallSafePointPollingEnabled =
       options.positionalCallSafePointPolling === true;
+    this.positionalCallSafePointPollBudget = Math.max(32, Math.floor(
+      Number(options.positionalCallSafePointPollBudget ?? 256) || 256));
     // Positional adapters are code-shape templates. Many independent call
     // sites reach the same method and used to parse an identical Function for
     // every site during asset loading. Cache the unbound template by resolved

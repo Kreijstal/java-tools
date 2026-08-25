@@ -12260,6 +12260,9 @@ public final class PositionalQuantumPollHarness {
   t.ok(generated.jvmStructuredSource.includes(
     "reason: 'structured SSA positional quantum'"),
   'the continuation polls at the exact positional call boundary');
+  t.ok(generated.jvmStructuredSource.includes(
+    'safePointBudget = Math.min(safePointBudget, 256);'),
+  'the child-work poll clamps an inherited long parent quantum');
   t.notOk(generated.jvmRestoringDirectPositionalSource?.includes(
     "reason: 'structured SSA positional quantum'"),
   'ordinary restoring entries do not acquire an invalid generator yield');

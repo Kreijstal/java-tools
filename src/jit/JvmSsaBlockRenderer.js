@@ -4831,16 +4831,20 @@ class JvmSsaBlockRenderer {
                   structured.loopHeaders.size > 0) {
                 continuationFallbacks.set(positionalQuantumMarker, {
                   continuation: [
+                    `safePointBudget = Math.min(safePointBudget, ${
+                      this.jit.positionalCallSafePointPollBudget});`,
                     `safePointBudget -= ((${positionalRawInvoke} || ` +
                       `${positionalInvoke}).jvmSafePointCharge || 0);`,
                     "if (safePointBudget <= 0) {",
                     "  if (helpers.continueStructuredQuantum(thread)) {",
-                    "    safePointBudget = 10000;",
+                    `    safePointBudget = ${
+                      this.jit.positionalCallSafePointPollBudget};`,
                     "  } else {",
                     ...materializeLines(callStack, index)
                       .map((line) => `    ${line}`),
                     "    helpers.structuredSsa.safePointCount += 1;",
-                    "    safePointBudget = 10000;",
+                    `    safePointBudget = ${
+                      this.jit.positionalCallSafePointPollBudget};`,
                     "    yield { deopt: true, transient: true, " +
                       "reason: 'structured SSA positional quantum' };",
                     "  }",
