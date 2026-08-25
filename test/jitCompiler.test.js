@@ -30,6 +30,18 @@ const awt = require('../src/platform/awt');
 
 const WASM_TRY_TABLE_SUPPORTED = supportsWasmTryTable();
 
+test('browser options expose direct static Wasm links', (t) => {
+  const ordinary = new JVM();
+  const enabled = new JVM({jit: {wasmDirectStaticLink: true}});
+  t.notOk(ordinary.jit.wasmJit.directStaticLinkEnabled,
+    'the experimental link remains disabled by default');
+  t.ok(enabled.jit.wasmJit.directStaticLinkEnabled,
+    'the JVM option reaches the Wasm compiler');
+  t.equal(enabled.jit.wasmJit.directStaticLinkCount, 0,
+    'the browser-visible counter starts empty');
+  t.end();
+});
+
 test('JIT analysis reuses immutable bytecode label maps', (t) => {
   const codeItems = [
     {labelDef: 'L0:', instruction: 'iconst_0'},
