@@ -508,7 +508,7 @@ public class StructuredAlloc {
   t.end();
 });
 
-test('partial wasm leaves reference returns on the canonical tier', async (t) => {
+test('dependency-partial wasm leaves reference returns retryable on the canonical tier', async (t) => {
   const { jvm, thread } = await makeHarness(t, 'StructuredPartialReference', `
 public class StructuredPartialReference {
   public static Object drive(Object[] out, int n) {
@@ -530,10 +530,10 @@ public class StructuredPartialReference {
     'StructuredPartialReference', 'drive',
     '([Ljava/lang/Object;I)Ljava/lang/Object;');
   const state = jvm.jit.wasmJit.state.get(method);
-  t.equal(state?.status, 'failed',
+  t.equal(state?.status, 'cold',
     'the partial reference-return module is not installed');
-  t.equal(state?.failReason, 'partial module has a reference return',
-    'the rejection is structural and independent of method identity');
+  t.ok(state?.blockers?.length > 0,
+    'a pending dependency keeps the structurally rejected module retryable');
   t.equal(state?.referenceReturnRejection?.relaxed, false,
     'the diagnostic records the active conservative proof');
   t.equal(state?.referenceReturnRejection?.normalFlowFullyCompiled, false,

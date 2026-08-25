@@ -481,6 +481,9 @@ class JitCompiler {
     if (options.wasmStructured === true) {
       this.wasmJit.structuredEnabled = true;
     }
+    if (options.wasmCheckcast === true) {
+      this.wasmJit.checkcastEnabled = true;
+    }
     if (options.wasmRelaxedReferenceReturns === true) {
       this.wasmJit.relaxedRefReturn = true;
     }

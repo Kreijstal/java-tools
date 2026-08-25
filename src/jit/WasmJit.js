@@ -2922,10 +2922,15 @@ class WasmJit {
           demoteReasons: [...(primary.demoteReasons || new Map()).entries()],
           structured: primary === structuredMeta,
         };
+        const reasons = [...(primary.demoteReasons || new Map()).values()];
+        const blockers = [...(primary.demoteBlockers || [])];
+        const dependencyOnly = reasons.length > 0 && blockers.length > 0 &&
+          reasons.every((reason) => DEFERRABLE_DEMOTE.test(reason));
         throw new Unsupported('partial module has a reference return'
           + (this.debug
             ? ` [normalFlow=${primary.normalFlowFullyCompiled} full=${primary.fullyCompiled}`
-              + ` demotes=${JSON.stringify([...(primary.demoteReasons || [])])}]` : ''));
+              + ` demotes=${JSON.stringify([...(primary.demoteReasons || [])])}]` : ''),
+        dependencyOnly ? blockers : null);
       }
       if (asCallee) {
         // A linked callee spills into a real scratch frame and unwinds via
@@ -3081,6 +3086,18 @@ class WasmJit {
         st.entries = 0;
         if (this.debug) console.error(`[wasmjit] deferred ${st.key}: no compiled loop yet ` +
           `(retry after ${st.retryAfter} entries or dependency compilation)`);
+        return;
+      }
+      if (err instanceof Unsupported &&
+          err.message.startsWith('partial module has a reference return') &&
+          blockedNames(err).length) {
+        st.retryAfter = 1;
+        st.deferredEpoch = this.compileEpoch;
+        st.blockers = blockedNames(err).sort();
+        st.status = 'cold';
+        st.entries = 0;
+        if (this.debug) console.error(
+          `[wasmjit] deferred ${st.key}: reference-return dependency`);
         return;
       }
       st.status = 'failed';

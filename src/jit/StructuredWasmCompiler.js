@@ -30,7 +30,8 @@ const {
   emitTryTableCatchAll,
   wasmProfilerName, parseMethodDescriptor, descToWasm,
   BRANCH_COND, BRANCH_ZERO, ICONST, BIN_OPS, ARRAY_LOAD, ARRAY_STORE,
-  Unsupported, NestedDeopt, isGuestThrow, sig, assembleModule, liveExceptionRanges,
+  Unsupported, blockedNames, NestedDeopt, isGuestThrow, sig, assembleModule,
+  liveExceptionRanges,
   maxImpls, NPE, AIOOBE,
 } = require('./wasmShared');
 const monoArray = require('./monoArray');
@@ -379,6 +380,7 @@ class StructuredWasmCompiler {
     // rejecting the method.
     const treeBlocks = collectTreeBlocks(structured.tree);
     this.demoted = new Map();
+    this.demoteBlockers = new Set();
     if (this.liveRanges.length && !this.ehMethod) {
       for (const id of treeBlocks) {
         const insns = cfg.blocks[id].insns;
@@ -398,6 +400,9 @@ class StructuredWasmCompiler {
       } catch (err) {
         if (!(err instanceof Unsupported)) throw err;
         this.demoted.set(id, err.message);
+        for (const blocker of blockedNames(err)) {
+          this.demoteBlockers.add(blocker);
+        }
       }
     }
     // Debug bisection: force specific blocks to fall back to the interpreter.
@@ -504,6 +509,7 @@ class StructuredWasmCompiler {
       spillSlots: this.spillSlots || new Map(),
       externalEntry: new Set([0]),
       demoteReasons: this.demoted,
+      demoteBlockers: this.demoteBlockers,
       blockCount: cfg.n,
       fullyCompiled: normalFlowFullyCompiled && table.length === 0,
       normalFlowFullyCompiled,
@@ -1399,7 +1405,8 @@ class StructuredWasmCompiler {
     // net-negative on the dispatcher tier (it unlocks tiny cast-bearing
     // callees whose import-dispatch overhead exceeds interpreting them).
     if (op === 'checkcast' || op === 'instanceof') {
-      if (!this.origIdx || this.origIdx[node.itemIdx] !== -1) {
+      if ((!this.origIdx || this.origIdx[node.itemIdx] !== -1) &&
+          !this.wasmJit?.checkcastEnabled) {
         throw new Unsupported(`op ${op}`);
       }
       if (op === 'instanceof' && (!this.wasmJit || this.wasmJit.fieldCacheEnabled !== false)) {
