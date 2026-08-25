@@ -1302,8 +1302,18 @@ class JVM {
     // native JVM concurrency without assigning a game-specific priority.
     const frameProducer = this._awtFrameProducerThread;
     if (frameProducer && frameProducer.status === "runnable") {
-      const producerIndex = this.threads.indexOf(frameProducer);
-      if (producerIndex >= 0) this.currentThreadIndex = producerIndex;
+      // Three producer quanta followed by one ordinary round-robin quantum
+      // keeps animation responsive without starving loaders that the render
+      // thread may itself be polling. Absolute producer priority deadlocks
+      // progress whenever a game busy-waits for a background archive worker.
+      this._awtFrameProducerQuanta =
+        ((this._awtFrameProducerQuanta || 0) + 1) % 4;
+      if (this._awtFrameProducerQuanta !== 0) {
+        const producerIndex = this.threads.indexOf(frameProducer);
+        if (producerIndex >= 0) this.currentThreadIndex = producerIndex;
+      }
+    } else {
+      this._awtFrameProducerQuanta = 0;
     }
 
     let thread = this.threads[this.currentThreadIndex];
