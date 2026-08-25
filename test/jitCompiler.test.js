@@ -45,6 +45,55 @@ test('JIT analysis reuses immutable bytecode label maps', (t) => {
   t.end();
 });
 
+test('graph handoffs discard an impossible stale primitive above a receiver',
+  (t) => {
+  const owner = 'GraphReceiverResidueOwner';
+  const callee = {
+    className: owner,
+    name: 'value', descriptor: '()I', flags: ['private'],
+    attributes: [{type: 'code', code: {
+      codeItems: [
+        {labelDef: 'L0:', instruction: 'iconst_0'},
+        {labelDef: 'L1:', instruction: 'ireturn'},
+      ],
+      exceptionTable: [], localsSize: '1', stackSize: '1',
+    }}],
+  };
+  const callerMethod = {
+    className: owner, name: 'caller', descriptor: '()V',
+    flags: ['static'], attributes: [{type: 'code', code: {
+      codeItems: [], exceptionTable: [], localsSize: '0', stackSize: '0',
+    }}],
+  };
+  const jvm = new JVM({jit: {
+    warmupThreshold: 0, hotCallGraphRegions: true,
+  }});
+  jvm.classes[owner] = {
+    staticFields: new Map(),
+    ast: {classes: [{superClassName: null, items: [
+      {type: 'method', method: callee},
+    ]}]},
+  };
+  jvm.classInitializationState.set(owner, 'INITIALIZED');
+  const siteId = jvm.jit.registerSyncCallSite('invokespecial', {
+    arg: ['Method', owner, ['value', '()I']],
+  }, callerMethod, 0);
+  const caller = new Frame(callerMethod);
+  caller.className = owner;
+  const receiver = {type: owner, fields: {}};
+  caller.stack.items.push(receiver, 1);
+  const thread = {status: 'runnable', callStack: new Stack()};
+  thread.callStack.push(caller);
+
+  t.equal(jvm.jit.tryInvokeSyncAt(siteId, caller, thread), 0,
+    'the verified receiver beneath the residue reaches the callee');
+  t.equal(jvm.jit.graphStaleReceiverOperandRecoveryCount, 1,
+    'the graph recovery is counted explicitly');
+  t.equal(caller.stack.items.length, 0,
+    'the receiver and stale primitive are consumed exactly once');
+  t.end();
+});
+
 test('loaded Method identities retain their declaring-class index', (t) => {
   const method = {name: 'work', descriptor: '()V'};
   const jvm = new JVM();

@@ -402,6 +402,7 @@ class JitCompiler {
     this.inlineLoopRegionRunCount = 0;
     this.inlineLoopRegionOsrCount = 0;
     this.inlineLoopRegions = [];
+    this.graphStaleReceiverOperandRecoveryCount = 0;
     this.inlineLoopRegionCache = new WeakMap();
     this.inlineLoopRegionPcCache = new WeakMap();
     this.inlineLoopRegionsEnabled = options.inlineLoopRegions !== false &&
@@ -6074,9 +6075,29 @@ class JitCompiler {
       }
     }
     const stack = frame.stack.items;
-    const receiverIndex = stack.length - site.params.length - 1;
-    const receiver = site.op === "invokestatic"
+    let receiverIndex = stack.length - site.params.length - 1;
+    let receiver = site.op === "invokestatic"
       ? null : stack[receiverIndex];
+    // A graph handoff can complete a primitive-returning child after its
+    // generated caller has already reconstructed the next zero-argument
+    // instance receiver. The stale return then sits above that receiver and
+    // would be mistaken for `this`. Verified bytecode cannot legally invoke
+    // an instance method on a primitive, so remove exactly that impossible
+    // one-slot residue and preserve the canonical receiver beneath it.
+    if (this.hotCallGraphRegions.enabled && site.op !== "invokestatic" &&
+        site.params.length === 0 && receiverIndex > 0 &&
+        receiver !== null && typeof receiver !== "object" &&
+        typeof receiver !== "string" && typeof receiver !== "function") {
+      const candidate = stack[receiverIndex - 1];
+      if (candidate !== null && candidate !== undefined &&
+          (typeof candidate === "object" || typeof candidate === "string" ||
+           typeof candidate === "function")) {
+        stack.splice(receiverIndex, 1);
+        receiverIndex -= 1;
+        receiver = candidate;
+        this.graphStaleReceiverOperandRecoveryCount += 1;
+      }
+    }
     if (site.op !== "invokestatic" &&
         (receiver === null || receiver === undefined)) {
       throw { type: "java/lang/NullPointerException", message: null };
