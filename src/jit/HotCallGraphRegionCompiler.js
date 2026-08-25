@@ -1030,6 +1030,8 @@ function partitionOversizedLinearBlocks(source, options = {}) {
   let partitionedSourceBytes = 0;
   let appendedHelperCount = 0;
   const helperSources = [];
+  let attemptedRuns = 0;
+  let oversizedStatements = 0;
 
   for (let round = 0; round < maximumRounds &&
     segmentCount < maximumSegments; round += 1) {
@@ -1087,6 +1089,7 @@ function partitionOversizedLinearBlocks(source, options = {}) {
 
       const tryExtractRun = (runStatements) => {
         if (segmentCount >= maximumSegments) return;
+        attemptedRuns += 1;
         const runStartPosition = runStatements[0].start;
         const runEndPosition = runStatements[runStatements.length - 1].end;
         if (process.env.JVM_DEBUG_PARTITION === "1") {
@@ -1349,6 +1352,7 @@ function partitionOversizedLinearBlocks(source, options = {}) {
           const statement = statements[index];
           const bytes = statement.end - statement.start;
           if (bytes > targetSegmentBytes) {
+            oversizedStatements += 1;
             flush(index);
             runStart = index + 1;
             recurseIntoStatement(statement);
@@ -1390,6 +1394,8 @@ function partitionOversizedLinearBlocks(source, options = {}) {
     source: rewritten,
     count: segmentCount,
     partitionedSourceBytes,
+    attemptedRuns,
+    oversizedStatements,
   };
 }
 

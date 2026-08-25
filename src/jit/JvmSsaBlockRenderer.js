@@ -12567,6 +12567,10 @@ class JvmSsaBlockRenderer {
         partitionedGenerated.count;
       generated.jvmStructuredPartitionedSourceBytes =
         partitionedGenerated.partitionedSourceBytes;
+      generated.jvmStructuredPartitionAttemptedRuns =
+        partitionedGenerated.attemptedRuns || 0;
+      generated.jvmStructuredPartitionOversizedStatements =
+        partitionedGenerated.oversizedStatements || 0;
       generated.jvmStructuredOutlinedLoopCount = outlinedGenerated.count;
       generated.jvmStructuredOutlinedLoopSourceBytes =
         outlinedGenerated.outlinedSourceBytes;
