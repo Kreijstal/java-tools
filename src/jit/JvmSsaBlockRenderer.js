@@ -10,6 +10,9 @@ const { parseDescriptor } = require("../parsing/typeParser");
 const { buildSsa } = require("../analysis/opgraph/ssa");
 const { kindWidth } = require("../analysis/opgraph/ssaTypes");
 const { parse: parseJavaScript } = require("acorn");
+const {
+  partitionOversizedLinearBlocks,
+} = require("./HotCallGraphRegionCompiler");
 const STRUCTURED_CONTINUATION = Symbol("jvm.structuredSsaContinuation");
 const STRUCTURED_LONG_OPCODES = new Set([
   "lconst_0", "lconst_1",
@@ -694,6 +697,15 @@ class JvmSsaBlockRenderer {
     this.perLoopPollBudgetsEnabled =
       options.structuredPerLoopPollBudgets === true ||
       environment.JVM_ENABLE_STRUCTURED_PER_LOOP_POLL_BUDGETS === "1";
+    this.linearPartitionEnabled =
+      options.structuredLinearPartition === true ||
+      environment.JVM_ENABLE_STRUCTURED_LINEAR_PARTITION === "1";
+    this.linearPartitionUnitBytes = Math.max(16384, Math.min(262144,
+      Number(options.structuredLinearPartitionUnitBytes ??
+        environment.JVM_STRUCTURED_LINEAR_PARTITION_UNIT_BYTES) || 49152));
+    this.linearPartitionSegmentBytes = Math.max(4096, Math.min(131072,
+      Number(options.structuredLinearPartitionSegmentBytes ??
+        environment.JVM_STRUCTURED_LINEAR_PARTITION_SEGMENT_BYTES) || 32768));
     this.switchesEnabled = options.structuredSwitches !== false &&
       environment.JVM_DISABLE_STRUCTURED_SWITCHES !== "1";
     this.restoringRangeGuardDeoptEnabled =
@@ -10588,7 +10600,19 @@ class JvmSsaBlockRenderer {
       ...materializeHelperDeclarations(),
       ...declarations, ...tree];
     const body = buildBody(renderedTree);
-    const generatedSource = body.join("\n");
+    const canonicalGeneratedSource = body.join("\n");
+    const partitionedGenerated = this.linearPartitionEnabled &&
+      useContinuations &&
+      canonicalGeneratedSource.length > this.linearPartitionUnitBytes
+      ? partitionOversizedLinearBlocks(canonicalGeneratedSource, {
+        maximumUnitBytes: this.linearPartitionUnitBytes,
+        targetSegmentBytes: this.linearPartitionSegmentBytes,
+        rootProgramGenerator: true,
+        namespace: "structured",
+      })
+      : {source: canonicalGeneratedSource, count: 0,
+        partitionedSourceBytes: 0};
+    const generatedSource = partitionedGenerated.source;
     try {
       const positionalAstRejections = [];
       const createStructuredFunction = (tier, parameters, source, ...options) => {
@@ -12515,6 +12539,10 @@ class JvmSsaBlockRenderer {
       generated.jvmStructuredBoundedIterationProduct =
         atomicBoundedLoops ? boundedIterationProduct : 0;
       generated.jvmStructuredSource = generatedSource;
+      generated.jvmStructuredPartitionedSegmentCount =
+        partitionedGenerated.count;
+      generated.jvmStructuredPartitionedSourceBytes =
+        partitionedGenerated.partitionedSourceBytes;
       this.compiledLoopCount += structured.loopHeaders.size;
       if (guardedStaticBooleanSites.size) {
         this.guardedBooleanMethodCount += 1;

@@ -1017,6 +1017,7 @@ function partitionOversizedLinearBlocks(source, options = {}) {
   const namespace = String(options.namespace ?? "0")
     .replace(/[^A-Za-z0-9_]/g, "") || "0";
   const sharedStateName = `jvmRegionSegmentState${namespace}`;
+  const rootProgramGenerator = options.rootProgramGenerator === true;
   let rewritten = source;
   let segmentCount = 0;
   let partitionedSourceBytes = 0;
@@ -1039,6 +1040,22 @@ function partitionOversizedLinearBlocks(source, options = {}) {
     // mirroring the loop outliner: queued source edits stay non-overlapping
     // and shrunken parents re-qualify on the next round's reparse.
     const innermost = collectOversizedUnits(program, maximumUnitBytes);
+    if (rootProgramGenerator && rewritten.length > maximumUnitBytes &&
+        !innermost.length) {
+      innermost.push({
+        type: "FunctionExpression",
+        generator: true,
+        params: [],
+        start: 0,
+        end: rewritten.length,
+        body: {
+          type: "BlockStatement",
+          start: 0,
+          end: rewritten.length,
+          body: program.body,
+        },
+      });
+    }
     if (!innermost.length) break;
 
     const edits = [];
