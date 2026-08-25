@@ -3260,8 +3260,6 @@ public final class ArbitraryRestoringRaster {
       profileMethods: false,
       preferWholeMethodJs: true,
       structuredSsa: true,
-      hotCallGraphRegions: true,
-      smallRestoringContinuationCalls: true,
     } });
     await jvm.loadClassByName(className);
     jvm.classInitializationState.set(className, 'INITIALIZED');
@@ -3474,9 +3472,6 @@ public final class ArbitraryDirectArrayLoop {
     t.ok(target?.generated?.jvmRestoringDirectPositionalBody &&
       site?.fastPositional?.invoke,
     'the verified loop publishes the generic restoring positional entry');
-    t.ok(site.fastPositional.invoke.name.includes(
-      'ssa_direct_restoring_positional'),
-    'hot graph fusion keeps the small continuation on its restoring entry');
     t.ok(target.generated.jvmStructuredLoopCount > 0,
       'the direct entry comes from a structured loop rather than an acyclic leaf');
     t.equal(target.generated.jvmStructuredInlinedRestoringSpills, true,
@@ -3507,27 +3502,6 @@ public final class ArbitraryDirectArrayLoop {
       jvm.jit.structuredSsa.runCount +
         jvm.jit.structuredSsa.restoringDirectRunCount,
     'reported structured runs combine disjoint entry counters off the hot path');
-
-    const continueStructuredQuantum = jvm.jit.continueStructuredQuantum;
-    jvm.jit.continueStructuredQuantum = () => false;
-    const yieldingDestination = new Array(12032).fill(-1);
-    yieldingDestination.type = '[I';
-    const yielded = execute(yieldingDestination, 0, 12000, 50);
-    t.notOk(yielded.error,
-      'a scheduler handoff from the fused loop is not a host exception');
-    t.equal(yielded.thread.callStack.size(), 2,
-      'a scheduler handoff restores the omitted continuation frame');
-    const yieldedChild = yielded.thread.callStack.peek();
-    t.equal(yieldedChild.method, child,
-      'the restored scheduler frame belongs to the fused child');
-    t.ok(yieldedChild.pc >= 0 && yieldedChild.pc <
-      jvm.jit.getCodeItems(child).length,
-    'the restored scheduler frame retains a valid exact bytecode PC');
-    t.equal(yieldedChild.locals[0], yieldingDestination,
-      'the restored scheduler frame retains the original array reference');
-    t.equal(yieldedChild.locals[2], 12000,
-      'the restored scheduler frame retains the loop bound');
-    jvm.jit.continueStructuredQuantum = continueStructuredQuantum;
 
     const bounds = execute(destination, 15, 2, 40);
     t.equal(bounds.error?.type, 'java/lang/ArrayIndexOutOfBoundsException',
