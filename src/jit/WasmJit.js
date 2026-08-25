@@ -2296,7 +2296,7 @@ class MethodTranslator {
 
 
 class WasmJit {
-  constructor(jvm, jit) {
+  constructor(jvm, jit, options = {}) {
     this.jvm = jvm;
     this.jit = jit;
     const env = (typeof process !== 'undefined' && process.env) || {};
@@ -2316,7 +2316,8 @@ class WasmJit {
     // never fires for methods invoked once with a multi-minute loop (va.d).
     this.warmupThreshold = Number(env.JVM_WASM_JIT_WARMUP || 1);
     this.retryBackoffMax = Math.max(1, Number(env.JVM_WASM_JIT_RETRY_BACKOFF_MAX || 4096));
-    this.structuredEnabled = env.JVM_WASM_STRUCTURED === '1';
+    this.structuredEnabled = options.structuredWasm === true ||
+      env.JVM_WASM_STRUCTURED === '1';
     this.instanceLinkEnabled = env.JVM_WASM_DEVIRT !== '0';
     // Direct wasm->wasm static links: eligible fully-compiled callees are
     // called through their runv export with no JS bridge on the path.

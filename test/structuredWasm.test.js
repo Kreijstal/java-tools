@@ -92,6 +92,14 @@ function withEnv(t, vars) {
   });
 }
 
+test('browser callers can enable structured Wasm without process env', (t) => {
+  withEnv(t, { JVM_WASM_JIT: '1', JVM_WASM_STRUCTURED: '0' });
+  const jvm = new JVM({ jit: { structuredWasm: true } });
+  t.equal(jvm.jit.wasmJit.structuredEnabled, true,
+    'the public JIT option reaches the structured Wasm tier');
+  t.end();
+});
+
 async function makeHarness(t, className, source, extraEnv = {}) {
   withEnv(t, { JVM_WASM_JIT: '1', JVM_WASM_STRUCTURED: '1', ...extraEnv });
   const classpath = compileJavaFixture(t, className, source);
