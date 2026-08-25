@@ -12201,6 +12201,86 @@ test('ordinary generated call sites reuse canonical positional adapters', (t) =>
   t.end();
 });
 
+test('structured continuations poll after accumulated positional child work',
+  async (t) => {
+  const className = 'PositionalQuantumPollHarness';
+  const classpath = compileJavaFixture(t, className, `
+public final class PositionalQuantumPollHarness {
+  private static int read(int limit, int[] cursor) {
+    while (cursor[0] < limit) cursor[0]++;
+    return cursor[0] & 7;
+  }
+  static int accumulate(int count, int[] cursor) {
+    int result = 0;
+    for (int index = 0; index < count; index++) result += read(index, cursor);
+    return result;
+  }
+}
+`);
+  const jvm = new JVM({ classpath, jit: {
+    warmupThreshold: 0,
+    preferWholeMethodJs: true,
+    structuredSsa: true,
+    positionalCallSafePointPolling: true,
+    profileMethods: false,
+  } });
+  await jvm.loadClassByName(className);
+  jvm.classInitializationState.set(className, 'INITIALIZED');
+  const caller = await jvm.findMethodInHierarchy(
+    className, 'accumulate', '(I[I)I');
+  const child = await jvm.findMethodInHierarchy(
+    className, 'read', '(I[I)I');
+  const generated = jvm.jit.structuredSsa.compile(caller);
+  t.ok(generated?.jvmStructuredContinuation,
+    'the arbitrary call-bearing loop owns an exact continuation');
+
+  const cursor = [0];
+  cursor.type = '[I';
+  const thread = {
+    id: 0, name: 'positional-quantum-poll', status: 'runnable',
+    pendingException: null, callStack: new Stack(),
+  };
+  const execute = (count) => {
+    const frame = new Frame(caller);
+    frame.className = className;
+    frame.locals[0] = count;
+    frame.locals[1] = cursor;
+    thread.callStack.items.length = 0;
+    thread.callStack.push(frame);
+    return { frame, result: generated(frame, thread, jvm.jit, false) };
+  };
+
+  execute(4);
+  const site = jvm.jit.syncCallSites.find((candidate) =>
+    candidate?.callerMethod === caller && candidate.methodName === 'read' &&
+    candidate.fastPositional?.invoke);
+  t.equal(site?.fastPositional?.invoke?.jvmSafePointCharge,
+    jvm.jit.getCodeItems(child).length,
+  'the linked child publishes its structural bytecode charge');
+  t.ok(generated.jvmStructuredSource.includes(
+    "reason: 'structured SSA positional quantum'"),
+  'the continuation polls at the exact positional call boundary');
+  t.notOk(generated.jvmRestoringDirectPositionalSource?.includes(
+    "reason: 'structured SSA positional quantum'"),
+  'ordinary restoring entries do not acquire an invalid generator yield');
+
+  cursor[0] = 0;
+  const continueStructuredQuantum = jvm.jit.continueStructuredQuantum;
+  jvm.jit.continueStructuredQuantum = () => false;
+  const yielded = execute(20000);
+  t.ok(yielded.result?.deopt && yielded.result.transient,
+    'accumulated child work yields through the parent continuation');
+  t.equal(yielded.result.reason, 'structured SSA positional quantum',
+    'the handoff is attributed to the positional call boundary');
+  t.ok(yielded.frame.pc > 0 && yielded.frame.pc <
+    jvm.jit.getCodeItems(caller).length,
+  'the handoff materializes an exact in-method caller PC');
+  t.ok(cursor[0] > 0 && cursor[0] < 19999,
+    'the quantum yields after real progress but before completion');
+  jvm.jit.continueStructuredQuantum = continueStructuredQuantum;
+  t.end();
+});
+
 test('frame positional deoptimization links the canonical child return', (t) => {
   const jvm = new JVM({jit: {warmupThreshold: 0}});
   const method = {name: 'parent', descriptor: '()V', flags: ['static'],

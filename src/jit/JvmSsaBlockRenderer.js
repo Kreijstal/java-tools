@@ -4825,6 +4825,31 @@ class JvmSsaBlockRenderer {
               }
               const selfRecursiveMarker = site.selfRecursive
                 ? `/*__SSA_SELF_RECURSIVE_CALL_${index}__*/` : "";
+              const positionalQuantumMarker =
+                `__JVM_POSITIONAL_QUANTUM_${index}_${site.id}__`;
+              if (this.jit.positionalCallSafePointPollingEnabled &&
+                  structured.loopHeaders.size > 0) {
+                continuationFallbacks.set(positionalQuantumMarker, {
+                  continuation: [
+                    `safePointBudget -= ((${positionalRawInvoke} || ` +
+                      `${positionalInvoke}).jvmSafePointCharge || 0);`,
+                    "if (safePointBudget <= 0) {",
+                    "  if (helpers.continueStructuredQuantum(thread)) {",
+                    "    safePointBudget = 10000;",
+                    "  } else {",
+                    ...materializeLines(callStack, index)
+                      .map((line) => `    ${line}`),
+                    "    helpers.structuredSsa.safePointCount += 1;",
+                    "    safePointBudget = 10000;",
+                    "    yield { deopt: true, transient: true, " +
+                      "reason: 'structured SSA positional quantum' };",
+                    "  }",
+                    "}",
+                  ],
+                  ordinary: [],
+                  checkedLeaf: [],
+                });
+              }
               let selfRecursiveGuardLine = null;
               if (site.selfRecursive) {
                 selfRecursiveCallExpressions.set(index, {
@@ -4878,6 +4903,9 @@ class JvmSsaBlockRenderer {
                       : `(${positionalRawInvoke} || ${positionalInvoke}) && ${receiverGuard}`}) {`,
                 ]),
                 `  ${usedDirect} = true;`,
+                ...(this.jit.positionalCallSafePointPollingEnabled &&
+                    structured.loopHeaders.size > 0
+                  ? [positionalQuantumMarker] : []),
                 ...(inlineCheckedLeafLines ? [
                   `  ${inlineCheckedLeafLabel}: {`,
                   ...inlineCheckedLeafLines.map((line) => `    ${line}`),
