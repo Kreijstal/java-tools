@@ -991,7 +991,8 @@ test('oversized loop policy selects Wasm by structure, not guest identity', (t) 
   const lowered = new JVM({ jit: {
     warmupThreshold: 0, oversizedWasmFirstCodeItems: 128,
     wasmRelaxedReferenceReturns: true, wasmStructured: true,
-    wasmCheckcast: true,
+    wasmCheckcast: true, wasmDirectStaticLink: true,
+    wasmDirectInstanceLink: true,
   } });
   t.equal(lowered.jit.wasmJit.structuredEnabled, true,
     'browser integrations can explicitly enable structured Wasm');
@@ -999,6 +1000,10 @@ test('oversized loop policy selects Wasm by structure, not guest identity', (t) 
     'browser integrations can explicitly enable Wasm cast lowering');
   t.equal(lowered.jit.wasmJit.relaxedRefReturn, true,
     'the normal-flow reference-return proof is explicitly configurable');
+  t.equal(lowered.jit.wasmJit.directStaticLinkEnabled, true,
+    'browser integrations can explicitly enable direct static Wasm links');
+  t.equal(lowered.jit.wasmJit.directInstanceLinkEnabled, true,
+    'browser integrations can explicitly enable guarded instance Wasm links');
   t.ok(lowered.jit.isOversizedLoopMethod(shape('loweredThreshold', 128)),
     'browser integrations can lower the structural threshold explicitly');
   t.notOk(lowered.jit.isOversizedLoopMethod(shape('belowLowered', 127)),

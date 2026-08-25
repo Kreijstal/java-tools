@@ -487,6 +487,12 @@ class JitCompiler {
     if (options.wasmRelaxedReferenceReturns === true) {
       this.wasmJit.relaxedRefReturn = true;
     }
+    if (options.wasmDirectStaticLink === true) {
+      this.wasmJit.directStaticLinkEnabled = true;
+    }
+    if (options.wasmDirectInstanceLink === true) {
+      this.wasmJit.directInstanceLinkEnabled = true;
+    }
     const regionOptions = this.rendererPipelineEnabled
       ? { ...options, structuredSsa: true }
       : options;
