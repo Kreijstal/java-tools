@@ -478,6 +478,9 @@ class JitCompiler {
     this._envInstrumented = Boolean(typeof process !== "undefined" && process.env &&
       (process.env.JVM_TRACE || process.env.JVM_PROFILE_HOT_METHODS === "1"));
     this.wasmJit = new WasmJit(jvm, this);
+    if (options.wasmStructured === true) {
+      this.wasmJit.structuredEnabled = true;
+    }
     if (options.wasmRelaxedReferenceReturns === true) {
       this.wasmJit.relaxedRefReturn = true;
     }
