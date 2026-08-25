@@ -463,3 +463,31 @@ test('loop outlining preserves generator yields and abandonment', (t) => {
   }
   t.end();
 });
+
+test('standalone generator bodies partition with exact source offsets', (t) => {
+  const body = [
+    'let value = seed | 0;',
+    ...Array.from({length: 700}, (_unused, index) =>
+      `value = (value + ${index + 1}) | 0;`),
+    'yield value;',
+    ...Array.from({length: 700}, (_unused, index) =>
+      `value = (value ^ ${index + 17}) | 0;`),
+    'return value;',
+  ].join('\n');
+  const partitioned = partitionOversizedLinearBlocks(body, {
+    ...OPTIONS, rootProgramGenerator: true,
+  });
+  t.ok(partitioned.attemptedRuns > 0,
+    'analysis accepts yields from a standalone generator body');
+  t.ok(partitioned.count > 0, 'the standalone body is actually partitioned');
+  const build = (source) => new Function(
+    `return function* work(seed) { ${source} };`)();
+  const original = build(body);
+  const transformed = build(partitioned.source);
+  for (const maximumSteps of [0, 1, Infinity]) {
+    t.deepEqual(drive(transformed, [9], maximumSteps),
+      drive(original, [9], maximumSteps),
+    `standalone completion matches through ${maximumSteps} steps`);
+  }
+  t.end();
+});

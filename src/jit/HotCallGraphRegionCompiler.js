@@ -1037,7 +1037,15 @@ function partitionOversizedLinearBlocks(source, options = {}) {
     segmentCount < maximumSegments; round += 1) {
     let program;
     try {
-      program = parse(rewritten, {
+      // A standalone structured source is a generator *body*, not a complete
+      // program. Acorn correctly rejects its top-level yield tokens. Replace
+      // them only in the analysis copy with same-width unary expressions so
+      // every AST offset still indexes the untouched emitted source.
+      const parseable = rootProgramGenerator
+        ? rewritten.replace(/\byield\*/g, "void  ")
+          .replace(/\byield\b/g, "void ")
+        : rewritten;
+      program = parse(parseable, {
         ecmaVersion: "latest", ranges: true, allowReturnOutsideFunction: true,
       });
     } catch (_) {
@@ -1156,6 +1164,11 @@ function partitionOversizedLinearBlocks(source, options = {}) {
             if (node.type === "YieldExpression") {
               if (unitIsGenerator) runHasYield = true;
               else unsupported = true;
+            }
+            if (unitIsGenerator && node.type === "UnaryExpression" &&
+                node.operator === "void" &&
+                rewritten.slice(node.start, node.start + 5) === "yield") {
+              runHasYield = true;
             }
             if (node.type === "AwaitExpression" ||
                 node.type === "ThisExpression" ||
