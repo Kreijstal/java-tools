@@ -694,7 +694,7 @@ class JitCompiler {
         this.isArrayKernelWasmFirstMethod(frame.method) ||
         readyFullWasm ||
         this.wasmJit.probeFullCoverage(frame));
-    const wholeMethodPreferred =
+    const wholeMethodPreferred = wasmExitStorm ||
       (this.prefersWholeMethodJs(frame.method) ||
         this.isDynamicArrayStructuredFirstMethod(frame.method)) &&
       !wasmPriorityLoop;
