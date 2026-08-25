@@ -2338,10 +2338,6 @@ class WasmJit {
     // relaxation is reasoned-out but UNMEASURED, so it does not run by
     // default.
     this.relaxedRefReturn = env.JVM_WASM_RELAXED_REF_RETURN === '1';
-    // Maximum compiled block transfers in one cooperative scheduler slice.
-    // Embedders may tighten this latency bound without changing the generic
-    // runtime's historical throughput-oriented default.
-    this.fuel = FUEL;
     this.hierarchy = new ClassHierarchy(jvm);
     this.structuredCompiles = 0;
     this.runCount = 0;
@@ -3161,7 +3157,7 @@ class WasmJit {
       else args[i] = toWasmValue(t, v);
     }
     args[meta.paramSlots.length] = blk;
-    args[meta.paramSlots.length + 1] = this.fuel;
+    args[meta.paramSlots.length + 1] = FUEL;
 
     st.runs += 1;
     this.runCount += 1;

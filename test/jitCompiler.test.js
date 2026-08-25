@@ -994,9 +994,6 @@ test('oversized loop policy selects Wasm by structure, not guest identity', (t) 
   } });
   t.equal(lowered.jit.wasmJit.relaxedRefReturn, true,
     'the normal-flow reference-return proof is explicitly configurable');
-  const fuelBound = new JVM({ jit: { warmupThreshold: 0, wasmFuel: 50_000 } });
-  t.equal(fuelBound.jit.wasmJit.fuel, 50_000,
-    'the embedding runtime can bound one cooperative Wasm slice');
   t.ok(lowered.jit.isOversizedLoopMethod(shape('loweredThreshold', 128)),
     'browser integrations can lower the structural threshold explicitly');
   t.notOk(lowered.jit.isOversizedLoopMethod(shape('belowLowered', 127)),

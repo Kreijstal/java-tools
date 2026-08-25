@@ -474,12 +474,6 @@ class JitCompiler {
     this._envInstrumented = Boolean(typeof process !== "undefined" && process.env &&
       (process.env.JVM_TRACE || process.env.JVM_PROFILE_HOT_METHODS === "1"));
     this.wasmJit = new WasmJit(jvm, this);
-    if (options.wasmFuel !== undefined) {
-      const requestedFuel = Math.floor(Number(options.wasmFuel));
-      if (Number.isFinite(requestedFuel) && requestedFuel > 0) {
-        this.wasmJit.fuel = requestedFuel;
-      }
-    }
     if (options.wasmRelaxedReferenceReturns === true) {
       this.wasmJit.relaxedRefReturn = true;
     }
