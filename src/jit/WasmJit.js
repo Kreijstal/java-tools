@@ -654,7 +654,12 @@ class MethodTranslator {
     // with instance-dispatch sites (which can miss); pin the link-time pair
     // as the safe fallback for those sites.
     const pinned = { run: (calleeSt.callee || calleeSt).run, meta: calleeMeta };
-    const fn = (...all) => {
+    const fn = function () {
+      // Keep the imported bridge fixed at the WebAssembly call boundary.
+      // A rest parameter eagerly allocates an Array on every invocation;
+      // indexed access to the non-escaping arguments view lets the engine
+      // keep these values in the call frame on the ordinary path.
+      const all = arguments;
       const args = underCount ? all.slice(underCount) : all;
       const current = calleeSt.callee || calleeSt;
       // A dependency-world recompile resets the callee state (meta/run/callee
