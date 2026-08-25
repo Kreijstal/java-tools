@@ -6421,8 +6421,16 @@ class JitCompiler {
         `(result && result.deopt ? "deopt:" + result.reason : ` +
         `plan.describe(useFrameless ? result : result && result.value)));`
       : "";
-    const immediateFramelessBody = generated.jvmFramelessPositional === true
-      ? generated : null;
+    // A call-bearing instance entry may restore a suspended child after a
+    // graph module has republished one of its nested targets. Until that
+    // restoration ABI carries an independently verified receiver slot, keep
+    // the instance Frame canonical: otherwise a primitive nested return can
+    // be restored into local0 and later be consumed as `this` by putfield.
+    const graphUnsafeInstanceCallEntry =
+      this.hotCallGraphRegions.enabled && receiverSlots === 1 &&
+      generated.jvmStructuredRegionCallSites?.length > 0;
+    const immediateFramelessBody = !graphUnsafeInstanceCallEntry &&
+      generated.jvmFramelessPositional === true ? generated : null;
     // A continuation-capable region must own the iterator from its first
     // positional invocation. Running its finite ordinary module first can
     // exhaust the scalar budget, reconstruct the root at a mid-method PC, and
@@ -6432,8 +6440,8 @@ class JitCompiler {
     const hotGraphFramedBody = resumableHotGraphPositional &&
       typeof generated.jvmHotCallGraphFramedBody === "function"
       ? generated.jvmHotCallGraphFramedBody : null;
-    const adaptiveFramelessBody = hotGraphFramedBody ||
-      generated.jvmAdaptivePositionalBody || null;
+    const adaptiveFramelessBody = graphUnsafeInstanceCallEntry ? null :
+      hotGraphFramedBody || generated.jvmAdaptivePositionalBody || null;
     const canonicalGeneratedBody = hotGraphFramedBody || generated;
     // Reference-returning adaptive entries can hand an object back while a
     // nested scheduler-visible continuation still owns it. Keep those calls on
