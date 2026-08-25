@@ -8259,8 +8259,11 @@ class JvmSsaBlockRenderer {
     const safePointInitialBudget = structuralPollBudget;
     // Recursive SCCs remain standalone restoring nodes; publishing the root
     // IR lets the graph compiler fuse the surrounding acyclic portion.
+    const hotCallGraph = this.jit.hotCallGraphRegions;
     const regionCallGraphCandidate = useContinuations &&
-      callSites.size > 0 && this.jit.hotCallGraphRegions?.enabled;
+      callSites.size > 0 && hotCallGraph?.enabled &&
+      items.length >= hotCallGraph.minRootCodeItems &&
+      items.length <= hotCallGraph.maxRootCodeItems;
     const indent = (lines) => lines.map((line) => `  ${line}`);
     const expandContinuationFallbacks = (lines, continuationMode) =>
       lines.flatMap((line) => {
