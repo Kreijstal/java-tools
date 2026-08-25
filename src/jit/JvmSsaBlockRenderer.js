@@ -8257,9 +8257,10 @@ class JvmSsaBlockRenderer {
     // to be large. Poll sites use <= 0 so a coarse charge may cross the boundary
     // without losing the next scheduler check.
     const safePointInitialBudget = structuralPollBudget;
+    // Recursive SCCs remain standalone restoring nodes; publishing the root
+    // IR lets the graph compiler fuse the surrounding acyclic portion.
     const regionCallGraphCandidate = useContinuations &&
-      callSites.size > 0 && !hasSelfRecursiveCall &&
-      this.jit.hotCallGraphRegions?.enabled;
+      callSites.size > 0 && this.jit.hotCallGraphRegions?.enabled;
     const indent = (lines) => lines.map((line) => `  ${line}`);
     const expandContinuationFallbacks = (lines, continuationMode) =>
       lines.flatMap((line) => {
