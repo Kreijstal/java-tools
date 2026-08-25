@@ -11862,6 +11862,23 @@ public class SynchronousExecuteHarness {
   jvm.jit.wasmJit.state.set(method, {
     status: 'ready', meta: { fullyCompiled: true },
   });
+  const linkedInvoke = () => undefined;
+  const linkedSite = {
+    op: 'invokestatic', descriptor: '([I)V',
+    params: ['int[]'], returnType: 'void',
+    fastPositional: { invoke: linkedInvoke },
+  };
+  const linkedTarget = {
+    method, lookupClass: 'SynchronousExecuteHarness',
+    generated: jvm.jit.getGeneratedFunction(method),
+    positionalInvoker: linkedInvoke,
+  };
+  jvm.jit.trackGeneratedTarget(method, linkedTarget, linkedSite);
+  jvm.jit.publishWasmTargetReady(method);
+  t.equal(linkedSite.fastPositional, null,
+    'a complete Wasm child withdraws an existing direct JavaScript edge');
+  t.equal(jvm.jit.getPositionalGeneratedInvoker(linkedSite, linkedTarget), null,
+    'new callers retain the canonical child Frame for Wasm tier selection');
   jvm.jit.wasmJit.tryRunFrame = (candidateFrame, candidateThread) => {
     wasmEntries += 1;
     out[0] = 777;
@@ -11896,6 +11913,9 @@ public class SynchronousExecuteHarness {
     status: 'ready', meta: { fullyCompiled: true },
     runs: 100, exits: 95, fuelExits: 0,
   });
+  t.equal(typeof jvm.jit.getPositionalGeneratedInvoker(
+    linkedSite, linkedTarget), 'function',
+  'an exit-storm child can republish its complete JavaScript edge');
   const stormFrame = new Frame(method);
   stormFrame.className = 'SynchronousExecuteHarness';
   stormFrame.locals[0] = out;

@@ -2570,6 +2570,24 @@ class JitCompiler {
     }
   }
 
+  publishWasmTargetReady(method) {
+    if (!method || !this.hasReadyFullWasm(method)) return;
+    const entries = this.generatedTargetsByMethod.get(method);
+    if (!entries) return;
+    for (const { target, site } of entries) {
+      const invoke = target.positionalInvoker;
+      target.positionalInvoker = undefined;
+      if (site.fastPositional?.invoke === invoke) site.fastPositional = null;
+      if (target.targetClassName && site.fastPositionalTargets?.[
+        target.targetClassName]?.invoke === invoke) {
+        delete site.fastPositionalTargets[target.targetClassName];
+      }
+      if (site.fastDynamicTarget?.target === target) {
+        site.fastDynamicTarget.positional = null;
+      }
+    }
+  }
+
   compileInlinePrimitiveLoopRegions(method) {
     if (this.inlineLoopRegionCache.has(method)) {
       return this.inlineLoopRegionCache.get(method);
@@ -6374,8 +6392,15 @@ class JitCompiler {
   getPositionalGeneratedInvoker(site, target) {
     if (!this.positionalGeneratedCallsEnabled) return null;
     if (!target || target.positionalInvoker === null) return null;
-    if (target.positionalInvoker) return target.positionalInvoker;
     const { method, lookupClass, generated } = target;
+    // A direct JavaScript edge bypasses normal frame-entry tier selection.
+    // Do not publish or reuse one while the callee has a complete productive
+    // Wasm body; returning null makes the caller materialize the canonical
+    // child Frame, whose next scheduler entry selects Wasm. If that module
+    // later proves to be an exit storm, hasReadyFullWasm() becomes false and
+    // this same target may publish its JavaScript positional entry normally.
+    if (method && this.hasReadyFullWasm(method)) return null;
+    if (target.positionalInvoker) return target.positionalInvoker;
     const positionalTracePattern = typeof process !== "undefined" && process.env
       ? process.env.JVM_TRACE_POSITIONAL_GENERATED || "" : "";
     const positionalTraceKey = method

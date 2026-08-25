@@ -2993,6 +2993,7 @@ class WasmJit {
       const rank = (m) => (m.fullyCompiled ? 2 : m.normalFlowFullyCompiled ? 1 : 0);
       st.callee = st.osr && rank(st.osr.meta) > rank(st.meta) ? st.osr : null;
       st.status = 'ready';
+      this.jit.publishWasmTargetReady?.(frame.method);
       // Stamped before this compile's own epoch bump, so "ready at epoch E"
       // always compares strictly less than any later compile's start epoch.
       if (st.key && !this.keyReadyEpoch.has(st.key)) {
