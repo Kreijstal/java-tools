@@ -614,7 +614,6 @@ class MethodTranslator {
           return p.slot === slot && p.t === descToWasm(params[i]);
         });
       if (identity) {
-        this.wasmJit.directStaticLinkCount += 1;
         const key = `${className}.${name}${descriptor}`;
         const importName = `dcall_${key}`.replace(/[^\w]/g, '_');
         const wParams = params.map(descToWasm);
@@ -2297,7 +2296,7 @@ class MethodTranslator {
 
 
 class WasmJit {
-  constructor(jvm, jit, options = {}) {
+  constructor(jvm, jit) {
     this.jvm = jvm;
     this.jit = jit;
     const env = (typeof process !== 'undefined' && process.env) || {};
@@ -2321,9 +2320,7 @@ class WasmJit {
     this.instanceLinkEnabled = env.JVM_WASM_DEVIRT !== '0';
     // Direct wasm->wasm static links: eligible fully-compiled callees are
     // called through their runv export with no JS bridge on the path.
-    this.directStaticLinkEnabled = options.wasmDirectStaticLink === true ||
-      env.JVM_WASM_DIRECT_STATIC_LINK === '1';
-    this.directStaticLinkCount = 0;
+    this.directStaticLinkEnabled = env.JVM_WASM_DIRECT_STATIC_LINK === '1';
     // Direct wasm->wasm instance links: a monomorphic-in-practice site calls
     // its single ready fully-compiled target through runv behind an in-wasm
     // null check (invokespecial) or a one-import receiver-class guard
