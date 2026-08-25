@@ -211,19 +211,8 @@ function presentSoftSurface(jvm, comp) {
   return true;
 }
 
-function markSoftSurfaceDirty(jvm, comp, thread = null) {
+function markSoftSurfaceDirty(jvm, comp) {
   if (!comp) return;
-  if (jvm && thread) {
-    // Browser JVMs multiplex Java threads on one host thread. Remember the
-    // producer of a completed frame briefly so its next timed wake-up is not
-    // queued behind CPU-heavy audio/resource workers. The producer sleeps
-    // between frames, so this preserves loader progress while matching the
-    // concurrent scheduling a native JVM gives animation and decode threads.
-    jvm._awtRenderPriority = {
-      thread,
-      until: jvm.clock.millis() + 50,
-    };
-  }
   comp._pixelsVersion = (comp._pixelsVersion || 0) + 1;
   const stats = presentationStats(jvm);
   if (stats) stats.dirtyMarks += 1;
@@ -284,7 +273,7 @@ function colorToRgb(colorObj) {
   return 0;
 }
 
-function softFillRect(jvm, obj, x, y, w, h, thread = null) {
+function softFillRect(jvm, obj, x, y, w, h) {
   const surface = softSurface(jvm, obj);
   if (!surface) return;
   const rgb = obj._softColor || 0;
@@ -294,7 +283,7 @@ function softFillRect(jvm, obj, x, y, w, h, thread = null) {
     const row = yy * surface.width;
     for (let xx = x0; xx < x1; xx++) surface.pixels[row + xx] = rgb;
   }
-  markSoftSurfaceDirty(jvm, obj._component, thread);
+  markSoftSurfaceDirty(jvm, obj._component);
 }
 
 module.exports = {
@@ -322,13 +311,13 @@ module.exports = {
       }
     },
 
-    'fillRect(IIII)V': (jvm, obj, args, thread) => {
+    'fillRect(IIII)V': (jvm, obj, args) => {
       const graphicsContext = obj._awtGraphics;
       if (graphicsContext && graphicsContext.fillRect) {
         graphicsContext.fillRect(args[0], args[1], args[2], args[3]);
         return;
       }
-      softFillRect(jvm, obj, args[0], args[1], args[2], args[3], thread);
+      softFillRect(jvm, obj, args[0], args[1], args[2], args[3]);
     },
 
     'drawRect(IIII)V': (jvm, obj, args) => {
@@ -404,7 +393,7 @@ module.exports = {
       }
     },
 
-    'drawImage(Ljava/awt/Image;IILjava/awt/image/ImageObserver;)Z': (jvm, obj, args, thread) => {
+    'drawImage(Ljava/awt/Image;IILjava/awt/image/ImageObserver;)Z': (jvm, obj, args) => {
       const stats = presentationStats(jvm);
       if (stats) stats.drawImageCalls += 1;
       const graphicsContext = obj._awtGraphics;
@@ -491,7 +480,7 @@ module.exports = {
           if (target && !target._canvasElement && jvm._awtCanvasElement) {
             target._canvasElement = jvm._awtCanvasElement;
           }
-          if (presentedBySoftwareSurface) markSoftSurfaceDirty(jvm, target, thread);
+          if (presentedBySoftwareSurface) markSoftSurfaceDirty(jvm, target);
           if (stats && presentedBySoftwareSurface) stats.softwareBlits += 1;
         }
         dumpFrame(pixels, imageObj._width, imageObj._height, jvm);
