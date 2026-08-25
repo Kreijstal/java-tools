@@ -7375,17 +7375,14 @@ class JitCompiler {
     // the array access would throw.  That makes ASYNC_INVOKE a true
     // before-effects fallback to canonical bytecode execution.
     const bitCursorOps = [
-      "getstatic", "getstatic", null, "getstatic", "ishr",
+      "getstatic", "getstatic", "iaload", "getstatic", "ishr",
       "iconst_1", "iand", "istore_0",
       "getstatic", "iconst_1", "iadd", "putstatic",
       "getstatic", "getstatic", "iconst_3", "ishr", "iadd", "putstatic",
       "getstatic", "bipush", "iand", "putstatic", "iload_0", "ireturn",
     ];
-    const bitArrayLoad = ops[2];
-    if (descriptor === "()I" &&
-        (bitArrayLoad === "iaload" || bitArrayLoad === "baload") &&
-        ops.length === bitCursorOps.length &&
-        bitCursorOps.every((op, index) => op === null || ops[index] === op)) {
+    if (descriptor === "()I" && ops.length === bitCursorOps.length &&
+        bitCursorOps.every((op, index) => ops[index] === op)) {
       const fieldInstructions = intrinsicCodeItems
         .map((item) => item?.instruction)
         .filter((instruction) => {
@@ -7406,12 +7403,9 @@ class JitCompiler {
         .map((item) => item?.instruction)
         .filter((instruction) => getOp(instruction) === "bipush")
         .map((instruction) => Number(instruction.arg));
-      const arrayDescriptor = descriptors[0];
       if (fields.length === expectedKeys.length && arrayKey && byteKey && bitKey &&
           arrayKey !== byteKey && arrayKey !== bitKey && byteKey !== bitKey &&
-          ((arrayDescriptor === "[I" && bitArrayLoad === "iaload") ||
-            (arrayDescriptor === "[B" && bitArrayLoad === "baload")) &&
-          descriptors.slice(1).every((value) => value === "I") &&
+          descriptors[0] === "[I" && descriptors.slice(1).every((value) => value === "I") &&
           fields.every((field, index) => key(field) === expectedKeys[index]) &&
           constants.length === 1 && constants[0] === 7) {
         const sites = [fields[0], fields[1], fields[2]].map((field) =>
@@ -7434,10 +7428,7 @@ class JitCompiler {
             const bitIndex = Number(read(targets[2])) | 0;
             const data = this.arrayData(array);
             if (!data || (byteIndex >>> 0) >= data.length) return ASYNC_INVOKE;
-            const raw = Number(data[byteIndex]);
-            const element = arrayDescriptor === "[B"
-              ? (raw << 24) >> 24 : raw | 0;
-            const value = (element >> (bitIndex & 31)) & 1;
+            const value = (Number(data[byteIndex]) >> (bitIndex & 31)) & 1;
             const advancedBit = (bitIndex + 1) | 0;
             write(targets[2], advancedBit);
             write(targets[1], (byteIndex + (advancedBit >> 3)) | 0);

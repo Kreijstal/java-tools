@@ -8030,7 +8030,7 @@ test('structured calls inline a checked mutable static bit cursor', async (t) =>
   const className = 'MutableStaticBitCursorHarness';
   const classpath = compileJavaFixture(t, className, `
 public final class MutableStaticBitCursorHarness {
-  static byte[] words;
+  static int[] words;
   static int byteIndex;
   static int bitIndex;
   static int result;
@@ -8050,7 +8050,7 @@ public final class MutableStaticBitCursorHarness {
     return value;
   }
 
-  static void reset(byte[] input, int nextByte, int nextBit) {
+  static void reset(int[] input, int nextByte, int nextBit) {
     words = input;
     byteIndex = nextByte;
     bitIndex = nextBit;
@@ -8070,15 +8070,15 @@ public final class MutableStaticBitCursorHarness {
   jvm.threads = [thread];
   jvm.currentThreadIndex = 0;
 
-  const input = [-74, 0b01001001];
-  input.type = '[B';
-  await invoke(jvm, thread, className, 'reset', '([BII)V', [input, 0, 0]);
+  const input = [0b10110110, 0b01001001];
+  input.type = '[I';
+  await invoke(jvm, thread, className, 'reset', '([III)V', [input, 0, 0]);
   const readMethod = await jvm.findMethodInHierarchy(className, 'readBit', '()I');
   const directRead = jvm.jit.getSynchronousIntrinsic(readMethod, '()I');
   t.deepEqual(Array.from({length: 10}, () => directRead([], 0)),
     [0, 1, 1, 0, 1, 1, 0, 1, 1, 0],
   'the bound intrinsic observes every live cursor update');
-  await invoke(jvm, thread, className, 'reset', '([BII)V', [input, 0, 0]);
+  await invoke(jvm, thread, className, 'reset', '([III)V', [input, 0, 0]);
   await invoke(jvm, thread, className, 'drain', '(I)I', [10]);
   t.equal(classData.staticFields.get('result:I'), 0b0110110110,
     'the intrinsic preserves bit order across the byte cursor boundary');
@@ -8094,8 +8094,8 @@ public final class MutableStaticBitCursorHarness {
     'the admitted bit-read path avoids generic call dispatch');
 
   const empty = [];
-  empty.type = '[B';
-  await invoke(jvm, thread, className, 'reset', '([BII)V', [empty, 0, 5]);
+  empty.type = '[I';
+  await invoke(jvm, thread, className, 'reset', '([III)V', [empty, 0, 5]);
   let thrown = null;
   try {
     await invoke(jvm, thread, className, 'drain', '(I)I', [1]);
