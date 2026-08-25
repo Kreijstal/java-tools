@@ -2158,14 +2158,13 @@ class MethodTranslator {
       } else if (op === 'return') {
         emit(OP.i32_const, ...sleb(-1), OP.return);
         return code;
-      } else if (op === 'athrow') {
-        // Throw the ref JS-side. EH methods dispatch through their method-level
-        // try_table. Without EH, publish the exact normalized bytecode pc
-        // before unwinding so executeTick's ordinary guest exception path
-        // retains the same attribution as the former interpreter demotion.
+      } else if (op === 'athrow' && this.ehMethod) {
+        // Throw the ref JS-side; the method-level try_table handler dispatches it
+        // at this block's pc via -3. Only compiled under EH — without the
+        // try, an unwind here would lose to the interpreter's precise-pc
+        // handling that demotion currently provides.
         pop();
         emit(OP.call, ...uleb(this.addImport('athrow', [T.ref], [], (ref) => {
-          if (!this.ehMethod && this.box.frame) this.box.frame.pc = i;
           if (ref === null || ref === undefined) {
             throw { type: 'java/lang/NullPointerException', message: null };
           }

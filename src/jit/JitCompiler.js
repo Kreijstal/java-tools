@@ -481,9 +481,6 @@ class JitCompiler {
     if (options.wasmRelaxedReferenceReturns === true) {
       this.wasmJit.relaxedRefReturn = true;
     }
-    if (options.wasmCheckcast === true) {
-      this.wasmJit.checkcastEnabled = true;
-    }
     const regionOptions = this.rendererPipelineEnabled
       ? { ...options, structuredSsa: true }
       : options;
