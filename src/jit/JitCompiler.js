@@ -1014,9 +1014,7 @@ class JitCompiler {
   }
 
   isImportedArrayJsClosurePreferred(method, visiting = null) {
-    // Heap-backed primitive arrays are directly addressable by structured
-    // Wasm, so there is no imported-element locality penalty to avoid.
-    if (!method || this.jvm.wasmHeap) return false;
+    if (!method) return false;
     if (this.importedArrayJsClosureMethods.has(method)) {
       return this.importedArrayJsClosureMethods.get(method);
     }
