@@ -27,7 +27,7 @@ const { buildCfgFromCode, structure, IrreducibleError } = require('../decompiler
 const { buildSsa } = require('../analysis/opgraph/ssa');
 const {
   T, OP, TRUNC_SAT, uleb, sleb, f32bytes, f64bytes,
-  emitTryTableCatchAll,
+  emitTryTableCatchAll, supportsWasmTryTable,
   wasmProfilerName, parseMethodDescriptor, descToWasm,
   BRANCH_COND, BRANCH_ZERO, ICONST, BIN_OPS, ARRAY_LOAD, ARRAY_STORE,
   Unsupported, blockedNames, NestedDeopt, isGuestThrow, sig, assembleModule,
@@ -275,7 +275,8 @@ class StructuredWasmCompiler {
     this.liveRanges = liveExceptionRanges(
       this.jvm, { ...codeAttr.code, codeItems: items }, this.labelIndex,
     );
-    this.ehMethod = process.env.JVM_WASM_EH !== '0' && this.liveRanges.length > 0;
+    this.ehMethod = process.env.JVM_WASM_EH !== '0' &&
+      supportsWasmTryTable() && this.liveRanges.length > 0;
     this.usedEh = false;
     // Invoke sites that can hand the call back to the interpreter (partial
     // or late-bound callees). Keyed by item index: the demotion dry-run

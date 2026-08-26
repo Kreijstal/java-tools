@@ -82,7 +82,7 @@ const {
   NestedDeopt,
   isGuestThrow,
   FUEL,
-  isNoOpExceptionHandler, liveExceptionRanges,
+  isNoOpExceptionHandler, liveExceptionRanges, supportsWasmTryTable,
   retvGlobalEntry, runvWrapperBody, specokGlobalEntry,
   maxImpls,
 } = require('./wasmShared');
@@ -1253,7 +1253,8 @@ class MethodTranslator {
     // dispatcher body plus a per-block current-pc local. Must be decided
     // before the first addImport so every import gets the recording wrapper.
     const env = (typeof process !== 'undefined' && process.env) || {};
-    this.ehMethod = env.JVM_WASM_EH !== '0' && liveRanges.length > 0;
+    this.ehMethod = env.JVM_WASM_EH !== '0' &&
+      supportsWasmTryTable() && liveRanges.length > 0;
     this.inferSlotTypes();
     this.runtimeImports();
     this.arrayImports();
