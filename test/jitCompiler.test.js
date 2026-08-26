@@ -6867,6 +6867,14 @@ test('structured SSA emits verified transparent int blits without call dispatch'
     'the intrinsic exposes a method-name-independent run counter');
   t.equal(jvm.jit.transparentIntBlitSlowPathCount, 0,
     'valid rectangles use the prevalidated raw-array path');
+  const noThrowDestination = new Array(8).fill(7);
+  noThrowDestination.type = '[I';
+  t.equal(jvm.jit.transparentIntBlitNoThrow(
+    noThrowDestination, source, 0, 0, 0, 2, 2, 2, 1), true,
+  'verified generated callers complete without a host exception boundary');
+  t.equal(jvm.jit.transparentIntBlitNoThrow(
+    noThrowDestination, source, 0, -1, 0, 2, 2, 2, 1), false,
+  'invalid ranges request the materialized throwing fallback');
 
   const transparentDestination = [7];
   transparentDestination.type = '[I';
