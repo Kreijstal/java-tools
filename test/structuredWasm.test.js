@@ -1069,3 +1069,82 @@ public class NestedEhJsFallback {
     'caller used the structured SSA tier');
   t.end();
 });
+
+test('per-opcode i32 array load imports match the generic normalizer', (t) => {
+  const {
+    addArrayImports,
+  } = require('../src/jit/wasmRuntimeImports');
+  const { arrayLoadImportName, T } = require('../src/jit/wasmShared');
+  const { normalizeArrayLoad } = require('../src/instructions/utils');
+  const imports = new Map();
+  const registry = {
+    importIndexByName: new Map(),
+    addImport(name, params, results, fn) {
+      if (this.importIndexByName.has(name)) return this.importIndexByName.get(name);
+      const index = imports.size;
+      imports.set(name, fn);
+      this.importIndexByName.set(name, index);
+      return index;
+    },
+  };
+  addArrayImports(registry, 'probe');
+
+  t.notOk(registry.importIndexByName.has('aget_baload'),
+    'per-opcode loads are not registered until one is emitted');
+  t.equal(arrayLoadImportName(registry, 'baload', T.i32), 'aget_baload',
+    'an i32 load resolves to its per-opcode import');
+  t.ok(registry.importIndexByName.has('aget_baload'),
+    'resolving the name registered the import on demand');
+  t.equal(arrayLoadImportName(registry, 'aaload', T.ref), 'aget_r',
+    'reference loads keep the shared per-type import');
+  t.equal(arrayLoadImportName(registry, 'laload', T.i64), 'aget_l',
+    'long loads keep the shared per-type import');
+
+  const mkArray = (type, elementType, values) => {
+    const a = values.slice();
+    a.type = type;
+    a.elementType = elementType;
+    return a;
+  };
+  const cases = [
+    ['baload', mkArray('[B', 'byte', [0, 1, 127, -128, 200, -1])],
+    ['baload', mkArray('[Z', 'boolean', [0, 1, 0, 1])],
+    ['caload', mkArray('[C', 'char', [0, 65, 0xffff, 0x1ffff, -1])],
+    ['saload', mkArray('[S', 'short', [0, 1, 32767, -32768, 40000, -1])],
+    ['iaload', mkArray('[I', 'int', [0, -1, 2147483647, -2147483648])],
+    // an opcode/descriptor mismatch must still take the generic path
+    ['iaload', mkArray('[B', 'byte', [200, -1, 5])],
+    ['caload', mkArray('[I', 'int', [0x1ffff, -1])],
+  ];
+  for (const [op, array] of cases) {
+    arrayLoadImportName(registry, op, T.i32);
+    const load = imports.get(`aget_${op}`);
+    for (let i = 0; i < array.length; i++) {
+      t.equal(load(array, i), normalizeArrayLoad(array[i], null, array),
+        `${op} on ${array.type} index ${i} matches the generic normalizer`);
+    }
+  }
+
+  const ints = mkArray('[I', 'int', [7, 8]);
+  const generic = imports.get('aget_i');
+  const specialized = imports.get('aget_iaload');
+  for (const oob of [2, -1, 1 << 30]) {
+    let a = null; let b = null;
+    try { generic(ints, oob); } catch (e) { a = e; }
+    try { specialized(ints, oob); } catch (e) { b = e; }
+    t.deepEqual(b, a, `out-of-bounds index ${oob} throws the same guest error`);
+  }
+  let nullGeneric = null; let nullSpecialized = null;
+  try { generic(null, 0); } catch (e) { nullGeneric = e; }
+  try { specialized(null, 0); } catch (e) { nullSpecialized = e; }
+  t.deepEqual(nullSpecialized, nullGeneric, 'a null array throws the same NPE');
+
+  // non-plain-Array backings (the {elements} wrapper) keep the shared zoo path
+  const wrapped = { type: '[B', elementType: 'byte', length: 3, elements: [200, 1, 2] };
+  for (let i = 0; i < 3; i++) {
+    t.equal(imports.get('aget_baload')(wrapped, i),
+      normalizeArrayLoad(wrapped.elements[i], null, wrapped),
+      `wrapped byte array index ${i} matches the generic normalizer`);
+  }
+  t.end();
+});

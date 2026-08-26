@@ -14,7 +14,7 @@ const {
   resolveInstanceFieldKey, allocPrimitiveArray, allocReferenceArray,
 } = require('../instructions/object');
 const {
-  T, NPE, AIOOBE, MATH_INTRINSICS, Unsupported,
+  T, NPE, AIOOBE, MATH_INTRINSICS, Unsupported, I32_LOAD_OPS,
   mathIntrinsicFunction,
   descToWasm, toWasmValue, parseMethodDescriptor,
 } = require('./wasmShared');
@@ -48,6 +48,8 @@ const ARRAY_TRACE_TAIL = Number(process.env.JVM_WASM_TRACE_ARRAYS_TAIL || 400);
 // chunk that the hashes identify.
 const ARRAY_TRACE_FROM = Number(process.env.JVM_WASM_TRACE_ARRAYS_FROM || 0);
 const ARRAY_TRACE_TO = Number(process.env.JVM_WASM_TRACE_ARRAYS_TO || 0);
+// Sentinel: this array is not the descriptor the opcode implies.
+const NOT_MINE = Symbol('array-load-kind-mismatch');
 const arrayTraceWindow = [];
 const arrayTraceChunks = [];
 const arrayTraceTail = [];
@@ -162,6 +164,65 @@ function addTypedArrayStoreImports(reg, methodName, traceKey = methodName) {
   checkedStore('sastore', T.i32, (_a, v) => (v << 16) >> 16);
 }
 
+// The four i32-backed array loads all shared one generic `aget_i` import, and
+// that import re-derived the element kind from the array descriptor on EVERY
+// element: normalizeArrayLoad compares `arrayRef.type` against up to six
+// descriptor strings, then compares the derived kind against up to four more,
+// then coerces. The opcode is known at compile time, so the kind is too.
+// These closures narrow inline for the descriptor the opcode implies and hand
+// anything else to the generic helper, so the result is identical element for
+// element (including the boolean-array and non-plain-Array cases). The plain
+// `Array.isArray` element read is inlined per closure for the same reason
+// `aget_r` inlines it: it keeps one monomorphic keyed load per import instead
+// of a call into the shared array zoo plus a sentinel comparison.
+function makeI32ArrayLoad(op, methodName, trace) {
+  const name = `aget_${op}`;
+  // `narrow(value, array)` mirrors exactly one branch of normalizeArrayLoad,
+  // and returns the NOT_MINE sentinel when this array is not the descriptor
+  // the opcode implies (then the generic helper decides, as before).
+  const narrow = op === 'baload'
+    ? (v, a) => {
+      const t = a.type;
+      if (t === '[B') {
+        return a.elementType === 'boolean' ? (v ? 1 : 0) : (Number(v) << 24) >> 24;
+      }
+      if (t === '[Z') return v ? 1 : 0;
+      return NOT_MINE;
+    }
+    : op === 'caload'
+      ? (v, a) => (a.type === '[C' ? Number(v) & 0xffff : NOT_MINE)
+      : op === 'saload'
+        ? (v, a) => (a.type === '[S' ? (Number(v) << 16) >> 16 : NOT_MINE)
+        : (v, a) => (a.type === '[I' ? Number(v) | 0 : NOT_MINE);
+  return (a, i) => {
+    if (trace) trace(name, a, i);
+    if (a === null || a === undefined) {
+      throw NPE(`Attempted load on null array in ${methodName}`);
+    }
+    if (Array.isArray(a)) {
+      const u = i >>> 0;
+      if (u >= a.length) throw AIOOBE(i, a.length);
+      const v = a[u];
+      const narrowed = narrow(v, a);
+      return narrowed === NOT_MINE ? normalizeArrayLoad(v, null, a) : narrowed;
+    }
+    const value = monoArray.load(a, i);
+    if (value === monoArray.OOB) throw AIOOBE(i, monoArray.len(a));
+    return normalizeArrayLoad(value, null, a);
+  };
+}
+
+// Install the on-demand factory the emitters reach through
+// wasmShared.arrayLoadImportName. Registration is deferred to the first
+// i32 load actually emitted.
+function addI32ArrayLoadImports(reg, methodName, trace) {
+  reg.i32LoadImportFor = (op) => {
+    if (!I32_LOAD_OPS.includes(op)) throw new Unsupported(`array load ${op}`);
+    return reg.addImport(`aget_${op}`, [T.ref, T.i32], [T.i32],
+      makeI32ArrayLoad(op, methodName, trace));
+  };
+}
+
 function addArrayImports(reg, methodName, typedArrayStores = true, traceKey = methodName) {
   const trace = arrayTracer(traceKey);
   const mk = (suffix, t) => {
@@ -206,6 +267,7 @@ function addArrayImports(reg, methodName, typedArrayStores = true, traceKey = me
     }
   };
   mk('i', T.i32); mk('l', T.i64); mk('f', T.f32); mk('d', T.f64); mk('r', T.ref);
+  addI32ArrayLoadImports(reg, methodName, trace);
   if (typedArrayStores) addTypedArrayStoreImports(reg, methodName, traceKey);
   reg.addImport('alen', [T.ref], [T.i32], (a) => {
     if (a === null || a === undefined) throw NPE(`Attempted to get length of null array in ${methodName}`);
@@ -449,6 +511,7 @@ function addTimeImport(reg, jvm, ins) {
 
 module.exports = {
   arrayTracer,
+  addI32ArrayLoadImports,
   addRuntimeImports,
   pushImportFor,
   addArrayImports,

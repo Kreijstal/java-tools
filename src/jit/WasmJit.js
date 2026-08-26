@@ -66,6 +66,7 @@ const { resolveInstanceFieldKey, runtimeClassName } = require('../instructions/o
 const {
   addMathImport, addTimeImport, addNewArrayImport, addANewArrayImport,
   addNewImport, addTypedArrayStoreImports, arrayTracer,
+  addI32ArrayLoadImports,
 } = require('./wasmRuntimeImports');
 const { ClassHierarchy } = require('../analysis/closedWorld/classHierarchy');
 const { revalidateSpeculations } = require('./wasmInline');
@@ -77,6 +78,7 @@ const {
   getOp, descToWasm, toWasmValue, parseMethodDescriptor, sig,
   NPE, AIOOBE,
   BRANCH_COND, BRANCH_ZERO, ICONST, BIN_OPS, ARRAY_LOAD, ARRAY_STORE,
+  arrayLoadImportName,
   Unsupported,
   blockedNames,
   NestedDeopt,
@@ -291,6 +293,7 @@ class MethodTranslator {
       }
     };
     mk('i', T.i32); mk('l', T.i64); mk('f', T.f32); mk('d', T.f64); mk('r', T.ref);
+    addI32ArrayLoadImports(self, name, trace);
     if (self.wasmJit.typedArrayStoresEnabled) {
       addTypedArrayStoreImports(self, name,
         `${self.className}.${self.method.name}${self.method.descriptor}`);
@@ -1927,7 +1930,7 @@ class MethodTranslator {
       else if (op in ARRAY_LOAD) {
         const t = ARRAY_LOAD[op];
         pop(T.i32); pop(T.ref);
-        emit(OP.call, ...uleb(this.importIndexByName.get(`aget_${sig(t)}`)));
+        emit(OP.call, ...uleb(this.importIndexByName.get(arrayLoadImportName(this, op, t))));
         push(t);
       } else if (op in ARRAY_STORE) {
         const t = ARRAY_STORE[op];

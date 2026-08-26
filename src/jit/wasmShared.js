@@ -250,6 +250,18 @@ const ARRAY_LOAD = {
   iaload: T.i32, baload: T.i32, caload: T.i32, saload: T.i32,
   laload: T.i64, faload: T.f32, daload: T.f64, aaload: T.ref,
 };
+// The four i32-backed loads get per-opcode import closures that narrow inline
+// (see wasmRuntimeImports.makeI32ArrayLoad); the opcode fixes the element kind
+// that the shared `aget_i` import had to re-derive from the array descriptor
+// on every element. Fall back to the per-wasm-type import for modules that did
+// not register them (and for every non-i32 load).
+const I32_LOAD_OPS = ['baload', 'caload', 'saload', 'iaload'];
+function arrayLoadImportName(reg, op, t) {
+  // Registered on first use rather than up front, so modules that never load
+  // an i32 element carry no extra import. addImport is idempotent.
+  if (t === T.i32 && reg.i32LoadImportFor) { reg.i32LoadImportFor(op); return `aget_${op}`; }
+  return `aget_${sig(t)}`;
+}
 const ARRAY_STORE = {
   iastore: T.i32, bastore: T.i32, castore: T.i32, sastore: T.i32,
   lastore: T.i64, fastore: T.f32, dastore: T.f64, aastore: T.ref,
@@ -558,6 +570,7 @@ module.exports = {
   emitTryTableCatchAll, supportsWasmTryTable,
   wasmProfilerName, wasmFunctionNameSection,
   getOp, descToWasm, toWasmValue, parseMethodDescriptor, sig,
+  I32_LOAD_OPS, arrayLoadImportName,
   NPE, AIOOBE,
   BRANCH_COND, BRANCH_ZERO, ICONST, BIN_OPS, ARRAY_LOAD, ARRAY_STORE,
   MATH_INTRINSICS,

@@ -30,6 +30,7 @@ const {
   emitTryTableCatchAll, supportsWasmTryTable,
   wasmProfilerName, parseMethodDescriptor, descToWasm,
   BRANCH_COND, BRANCH_ZERO, ICONST, BIN_OPS, ARRAY_LOAD, ARRAY_STORE,
+  arrayLoadImportName,
   Unsupported, blockedNames, NestedDeopt, isGuestThrow, sig, assembleModule,
   liveExceptionRanges,
   maxImpls, NPE, AIOOBE,
@@ -1140,7 +1141,7 @@ class StructuredWasmCompiler {
         return finish();
       }
       out.push(...use(0), ...use(1), OP.call,
-        ...uleb(this.importIndexByName.get(`aget_${sig(t)}`)));
+        ...uleb(this.importIndexByName.get(arrayLoadImportName(this, op, t))));
       return finish();
     }
     if (ARRAY_STORE[op] !== undefined) {
@@ -1494,7 +1495,8 @@ class StructuredWasmCompiler {
       ? [...arr, ...idx, ...storeSeq, OP.call,
         ...uleb(this.importIndexByName.get(storeImport))]
       : [...arr, ...idx, OP.call,
-        ...uleb(this.importIndexByName.get(`aget_${sig(importT)}`))];
+        ...uleb(this.importIndexByName.get(
+          arrayLoadImportName(this, node.op, importT)))];
     const heapOp = [OP[acc.op], ...uleb(acc.shift), ...uleb(0)];
     return [
       // fill once per run: base (-1 for null/non-heap) and length
