@@ -6578,6 +6578,40 @@ class JitCompiler {
     return result;
   }
 
+  tryInvokeInterpreterVoidReferenceHelper(
+    frame, thread, op, resolvedTarget, callState,
+  ) {
+    const method = resolvedTarget?.method;
+    if (!method || callState?.returnType !== "void" ||
+        !this.isReferenceFieldHelperJsPreferred(method)) return false;
+    let linked = callState.jitReferenceHelperTarget;
+    if (!linked || linked.method !== method ||
+        linked.lookupClass !== resolvedTarget.owner) {
+      const site = {
+        op: `invoke${op}`,
+        descriptor: method.descriptor,
+        params: callState.params,
+        returnType: callState.returnType,
+        declaredClassName: resolvedTarget.owner,
+      };
+      const target = {
+        method,
+        lookupClass: resolvedTarget.owner,
+        targetClassName: resolvedTarget.owner,
+        generated: this.getGeneratedFunction(method),
+      };
+      const invoke = this.getPositionalGeneratedInvoker(site, target);
+      linked = {method, lookupClass: resolvedTarget.owner, site, target, invoke};
+      callState.jitReferenceHelperTarget = linked;
+    }
+    if (typeof linked.invoke !== "function") return false;
+    const result = this.tryInvokeFramePositional(
+      linked.site, linked.invoke, frame, thread);
+    if (result === ASYNC_INVOKE) return false;
+    this.framePositionalCallCount += 1;
+    return true;
+  }
+
   tryInvokeSync(op, frame, instruction, thread) {
     const [, declaredClassName, [methodName, descriptor]] = instruction.arg;
     const key = `${op}\0${declaredClassName}\0${methodName}\0${descriptor}`;

@@ -1257,6 +1257,26 @@ public class ReferenceCursorHarness {
     'generated cleanup clears its second reference field');
   t.equal(classData.staticFields.get('diagnostic:I'), 41,
     'generated cleanup preserves its primitive static side effect');
+  receiver.fields['ReferenceCursorHarness.head'] = head;
+  receiver.fields['ReferenceCursorHarness.cursor'] = value;
+  classData.staticFields.set('diagnostic:I', 0);
+  const parent = new Frame(method);
+  parent.className = 'ReferenceCursorHarness';
+  parent.stack.items.push(receiver, 1);
+  thread.callStack.items.length = 0;
+  thread.callStack.push(parent);
+  const depth = thread.callStack.size();
+  invokeHandlers.invokevirtualSync(parent, {
+    arg: ['Method', 'ReferenceCursorHarness', ['clear', '(I)V']],
+  }, jvm, thread);
+  t.equal(thread.callStack.size(), depth,
+    'the synchronous interpreter invokes the positional helper without a child frame');
+  t.equal(receiver.fields['ReferenceCursorHarness.head'], null,
+    'the interpreter positional edge preserves the first field clear');
+  t.equal(receiver.fields['ReferenceCursorHarness.cursor'], null,
+    'the interpreter positional edge preserves the second field clear');
+  t.equal(classData.staticFields.get('diagnostic:I'), 41,
+    'the interpreter positional edge preserves the static effect');
   t.end();
 });
 
