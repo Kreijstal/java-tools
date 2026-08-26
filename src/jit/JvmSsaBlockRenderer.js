@@ -8304,7 +8304,7 @@ class JvmSsaBlockRenderer {
       items.length + methodInvokeCount * 32 + methodAllocationCount * 16);
     const maxPollBudget = this.jit.structuredLoopSafePointMaxBudget;
     const methodPollBudget = hasAtomicUnsafeOperation
-      ? Math.max(32, Math.min(maxPollBudget,
+      ? Math.max(64, Math.min(maxPollBudget,
         Math.floor(16384 / methodLoopWorkEstimate)))
       : maxPollBudget;
     const naturalBlocksByLoop = new Map([...structured.loopHeaders].map(
@@ -8339,7 +8339,7 @@ class JvmSsaBlockRenderer {
       loopWorkEstimates.set(header, work);
       loopPollBudgets.set(header, this.perLoopPollBudgetsEnabled &&
         hasAtomicUnsafeOperation
-        ? Math.max(32, Math.min(maxPollBudget, Math.floor(16384 / work)))
+        ? Math.max(64, Math.min(maxPollBudget, Math.floor(16384 / work)))
         : methodPollBudget);
     }
     const loopWorkEstimate = Math.max(1, ...loopWorkEstimates.values());
