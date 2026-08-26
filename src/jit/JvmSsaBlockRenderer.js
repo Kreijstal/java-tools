@@ -12073,7 +12073,7 @@ class JvmSsaBlockRenderer {
       const compiledCallChain = useContinuations && callSites.size > 0 &&
         !hasSelfRecursiveCall && this.jit.compiledCallChainsEnabled;
       if (useContinuations && (callSites.size === 0 || compiledCallChain ||
-          regionCallGraphCandidate) &&
+          regionCallGraphCandidate || ordinaryAdaptiveCanonical) &&
           this.jit.adaptiveFramelessPositionalEnabled) {
         const adaptiveBudgetMultiplier = regionCallGraphCandidate
           ? Math.max(this.jit.adaptiveFramelessBudgetMultiplier,

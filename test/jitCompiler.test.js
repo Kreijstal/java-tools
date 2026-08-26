@@ -6122,6 +6122,7 @@ public final class RecursiveSchedulerHandoffHarness {
   const jvm = new JVM({ classpath, jit: {
     warmupThreshold: 0,
     structuredSsa: true,
+    ordinaryAdaptiveFramelessPositional: true,
     guestKernelOracles: false,
   } });
   await jvm.loadClassByName(className);
@@ -6143,6 +6144,10 @@ public final class RecursiveSchedulerHandoffHarness {
     'the loop retains its cooperative structured continuation');
   t.equal(generated.jvmStructuredCanonicalNestedCalls, true,
     'mixed recursive scheduler handoffs keep nested calls canonical');
+  t.equal(generated.jvmAdaptivePositionalOrdinary, true,
+    'mixed recursive calls can use an ordinary deoptimizing entry');
+  t.equal(typeof generated.jvmAdaptivePositionalBody, 'function',
+    'the ordinary entry is published without retaining a generator');
   t.match(generated.jvmStructuredSource,
     /let ssaFastPositional\d+ = null;/,
     'the generated continuation cannot enter a positional child');
