@@ -4303,30 +4303,6 @@ class JvmSsaBlockRenderer {
                 ...materializeLines(callStack, index).map((line) => `  ${line}`),
                 `  throw ${caught};`, "}");
             }
-          } else if (site.directIntrinsic?.kind === "opaqueIntBlit" &&
-              site.directIntrinsic.paramCount === 8 &&
-              site.directIntrinsic.returnsVoid) {
-            const callStack = [...stack];
-            const args = new Array(8);
-            for (let argument = args.length - 1; argument >= 0; argument -= 1) {
-              args[argument] = pop();
-              if (args[argument] === null) valid = false;
-            }
-            if (valid) {
-              const caught = value();
-              if (site.directIntrinsic.initializationOwner) {
-                lines.push(`if (helpers.jvm.classInitializationState.get(${
-                  JSON.stringify(site.directIntrinsic.initializationOwner)
-                }) !== "INITIALIZED") {`,
-                ...materializeLines(callStack, index).map((line) => `  ${line}`),
-                "  helpers.skipJitOnce(frame);",
-                "  return { deopt: true, transient: true, reason: 'class initialization in direct opaque int blit' };",
-                "}");
-              }
-              lines.push(`try { helpers.opaqueIntBlitDirect(${args.join(", ")}); } catch (${caught}) {`,
-                ...materializeLines(callStack, index).map((line) => `  ${line}`),
-                `  throw ${caught};`, "}");
-            }
           } else if (!site.selfRecursive && site.directFused &&
               site.directFused.returnsVoid &&
               site.directFused.paramCount === site.argumentCount) {

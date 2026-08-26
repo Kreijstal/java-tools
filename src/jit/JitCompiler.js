@@ -215,7 +215,6 @@ class JitCompiler {
         process.env.JVM_ENABLE_GUEST_KERNEL_ORACLES === "1");
     this.transparentIntBlitRunCount = 0;
     this.transparentIntBlitSlowPathCount = 0;
-    this.opaqueIntBlitRunCount = 0;
     this.clippedGradientRunCount = 0;
     this.clippedGradientSlowPathCount = 0;
     this.alphaMaskedColorBlitRunCount = 0;
@@ -7891,21 +7890,6 @@ class JitCompiler {
       return intrinsic;
     }
 
-    if (descriptor === "([I[IIIIIII)V") {
-      const exceptionTable = code?.code?.exceptionTable || [];
-      const codeVerified =
-        (!exceptionTable.length ||
-          this.hasOnlyNoOpExceptionHandlers(method, codeItems)) &&
-        Boolean(this.computeStackDepths(
-          codeItems, buildLabelMap(codeItems), method));
-      if (!codeVerified || !matchesJavacJsOpaqueIntBlit(rawOps)) return null;
-      const intrinsic = (stack, base) => this.opaqueIntBlitDirect(
-        stack[base], stack[base + 1], stack[base + 2], stack[base + 3],
-        stack[base + 4], stack[base + 5], stack[base + 6], stack[base + 7]);
-      intrinsic.jvmDirectKind = "opaqueIntBlit";
-      return intrinsic;
-    }
-
     if (descriptor === "([I[IIIIIIIII)V") {
       // Transparent-source alpha rectangle. Match the complete loop and its
       // packed-channel constants; owner/member names are intentionally absent.
@@ -8673,58 +8657,6 @@ class JitCompiler {
       destinationIndex = (destinationIndex + destinationRowSkip) | 0;
       sourceIndex = (sourceIndex + sourceRowSkip) | 0;
       row += 1;
-    }
-    return RETURN_VOID;
-  }
-
-  opaqueIntBlitDirect(destination, source, sourceIndex, destinationIndex,
-    width, height, destinationRowSkip, sourceRowSkip) {
-    sourceIndex |= 0;
-    destinationIndex |= 0;
-    width |= 0;
-    height |= 0;
-    destinationRowSkip |= 0;
-    sourceRowSkip |= 0;
-    this.opaqueIntBlitRunCount += 1;
-    if (height <= 0 || width <= 0) return RETURN_VOID;
-    const destinationData = this.arrayData(destination);
-    const sourceData = this.arrayData(source);
-    if (destinationData === null || sourceData === null) {
-      throw { type: "java/lang/NullPointerException", message: null };
-    }
-    const destinationLength = destination?.length ?? 0;
-    const sourceLength = source?.length ?? 0;
-    const sourceStep = (width + sourceRowSkip) | 0;
-    const destinationStep = (width + destinationRowSkip) | 0;
-    const lastSource = sourceIndex + (height - 1) * sourceStep;
-    const lastDestination = destinationIndex + (height - 1) * destinationStep;
-    const validRanges = !(lastSource < -2147483648 || lastSource > 2147483647 ||
-        lastDestination < -2147483648 || lastDestination > 2147483647 ||
-        Math.min(sourceIndex, lastSource) < 0 ||
-        Math.max(sourceIndex, lastSource) + width > sourceLength ||
-        Math.min(destinationIndex, lastDestination) < 0 ||
-        Math.max(destinationIndex, lastDestination) + width > destinationLength);
-    if (!validRanges) {
-      for (let row = 0; row < height; row += 1) {
-        for (let column = 0; column < width; column += 1) {
-          if (sourceIndex < 0 || sourceIndex >= sourceLength ||
-              destinationIndex < 0 || destinationIndex >= destinationLength) {
-            throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: null };
-          }
-          destinationData[destinationIndex++] = sourceData[sourceIndex++] | 0;
-        }
-        sourceIndex = (sourceIndex + sourceRowSkip) | 0;
-        destinationIndex = (destinationIndex + destinationRowSkip) | 0;
-      }
-      return RETURN_VOID;
-    }
-    for (let row = 0; row < height; row += 1) {
-      const end = sourceIndex + width;
-      while (sourceIndex < end) {
-        destinationData[destinationIndex++] = sourceData[sourceIndex++] | 0;
-      }
-      sourceIndex = (sourceIndex + sourceRowSkip) | 0;
-      destinationIndex = (destinationIndex + destinationRowSkip) | 0;
     }
     return RETURN_VOID;
   }
@@ -9533,7 +9465,6 @@ class JitCompiler {
     // guard and falls back before any pixel effect until publication.
     if (!classInitialized &&
         intrinsic.jvmDirectKind !== "transparentIntBlit" &&
-        intrinsic.jvmDirectKind !== "opaqueIntBlit" &&
         intrinsic.jvmDirectKind !== "alphaMaskedColorBlit") return null;
     const direct = {
       kind: intrinsic.jvmDirectKind,
@@ -10233,22 +10164,6 @@ function matchesJavacJsTransparentIntBlit(ops) {
   return Object.entries(expected).every(([op, count]) => counts[op] === count);
 }
 
-function matchesJavacJsOpaqueIntBlit(ops) {
-  if (!Array.isArray(ops) || ops.length !== 119) return false;
-  const expected = {
-    iconst_0: 13, istore: 25, iload: 18, ineg: 1, if_icmpge: 3,
-    iload_3: 9, iadd: 4, iconst_3: 2, isub: 1, iinc: 11,
-    iload_2: 6, aload_0: 5, aload_1: 5, iaload: 5, iastore: 5,
-    goto: 3, istore_3: 1, istore_2: 1, return: 1,
-  };
-  const counts = Object.create(null);
-  for (const op of ops) {
-    if (!Object.prototype.hasOwnProperty.call(expected, op)) return false;
-    counts[op] = (counts[op] || 0) + 1;
-  }
-  return Object.entries(expected).every(([op, count]) => counts[op] === count);
-}
-
 function jsLiteral(value) {
   if (typeof value === "bigint") return `${value}n`;
   return JSON.stringify(value);
@@ -10296,6 +10211,5 @@ module.exports._test = {
   normalizeIntrinsicCompilerIdioms,
   stripProvenDeadEntryInitializers,
   matchesJavacJsTransparentIntBlit,
-  matchesJavacJsOpaqueIntBlit,
   buildLabelMap,
 };
