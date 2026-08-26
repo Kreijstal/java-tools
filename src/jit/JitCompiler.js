@@ -7358,7 +7358,8 @@ class JitCompiler {
     // and the method's Wasm state remains permanently cold. A partial exit
     // keeps the materialized child on the stack and hands scheduling back to
     // the verified parent continuation.
-    if (this.wasmJit.enabled && this.isOversizedLoopMethod(method)) {
+    if (this.wasmJit.enabled && this.isOversizedLoopMethod(method) &&
+        !this.hasWasmExitStorm(method)) {
       const wasmResult = this.wasmJit.runNested(child, thread);
       if (wasmResult.returned) {
         target.freeFrame = child;
@@ -9486,7 +9487,7 @@ class JitCompiler {
       // Contended: leave the child pushed and let the scheduler resume it.
       return { deopt: true, reason: "synchronized monitor contended" };
     }
-    if (this.wasmJit.enabled) {
+    if (this.wasmJit.enabled && !this.hasWasmExitStorm(method)) {
       // Ask the Wasm tier before rejecting the child on JS-JIT policy. Wasm
       // can prove numeric loops covered by a wrap-and-rethrow diagnostic
       // handler even when the whole-method JS tier conservatively rejects the
