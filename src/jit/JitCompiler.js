@@ -175,7 +175,7 @@ class JitCompiler {
     // but bound the amount of unobserved generated work independently of any
     // application-specific method identity.
     this.structuredLoopSafePointMaxBudget = Math.max(32, Math.floor(
-      Number(options.structuredLoopSafePointMaxBudget ?? 128) || 128));
+      Number(options.structuredLoopSafePointMaxBudget ?? 256) || 256));
     // Positional adapters are code-shape templates. Many independent call
     // sites reach the same method and used to parse an identical Function for
     // every site during asset loading. Cache the unbound template by resolved
