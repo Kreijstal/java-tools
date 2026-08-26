@@ -11937,6 +11937,11 @@ public class SynchronousExecuteHarness {
   t.equal(typeof jvm.jit.getPositionalGeneratedInvoker(
     linkedSite, linkedTarget), 'function',
   'an exit-storm child can republish its complete JavaScript edge');
+  linkedSite.fastStaticTarget = linkedTarget;
+  t.ok(jvm.jit.republishWasmDemotedPositional(linkedSite),
+    'the call site republishes the JavaScript edge after Wasm starts exiting');
+  t.equal(typeof linkedSite.fastPositional?.invoke, 'function',
+    'future calls bypass generic resolution after the Wasm exit storm');
   const stormFrame = new Frame(method);
   stormFrame.className = 'SynchronousExecuteHarness';
   stormFrame.locals[0] = out;
