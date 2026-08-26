@@ -9207,7 +9207,18 @@ class JvmSsaBlockRenderer {
             ...indent(fastLoopBody), "}",
             ...(countedLoop ? countedLoop.exit : []),
           ];
-          if (directPositional && rangeBailout && !checkedLeafOnly &&
+          // A failed array-range specialization used to reconstruct the frame
+          // and deopt here. That is only correct, never cheap: the guard is a
+          // property of the *arguments*, so a kernel whose real arrays never
+          // satisfy it deopts on essentially every invocation, and each deopt
+          // costs a frame restore, one canonical interpreter bytecode, and --
+          // because canRun then declines the frame -- a handoff of the rest of
+          // the loop to whatever other tier claims it. The slow arm below is
+          // an ordinary polled JavaScript loop that executes the same guest
+          // semantics, so prefer it and keep the invocation in one tier.
+          // (`restoringRangeGuardDeoptCount` stays exported at 0 for the
+          // published-metadata consumers.)
+          if (coarse && directPositional && rangeBailout && !checkedLeafOnly &&
               this.restoringRangeGuardDeoptEnabled) {
             restoringRangeGuardDeoptCount += 1;
             return [

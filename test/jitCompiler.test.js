@@ -4821,22 +4821,23 @@ public final class GenericSpanShape {
         ?.includes('ssaArrayRangeGuard'),
     'generic span SSA hoists stable statics and versions its affine store range');
   const spanSource = genericSpan.jvmRestoringDirectPositionalSource;
+  // A runtime-bounded range guard selects between two ordinary JavaScript
+  // loops. It must NOT deopt: the guard is a property of the arguments, so a
+  // kernel whose real arrays never satisfy it would reconstruct its frame on
+  // every invocation and finish through canonical dispatch.
   const fastArmMatch =
-    /if \(!\(ssaRuntimeCoarseLoop\d+ && ssaArrayRangeGuard\d+\)\)/.exec(
+    /if \(ssaRuntimeCoarseLoop\d+ && ssaArrayRangeGuard\d+\)/.exec(
       spanSource);
   const fastArmStart = fastArmMatch?.index ?? -1;
   const fastStoreMatch = /ssaEntryStaticArrayData\d+\[[^\n]+\] =/
     .exec(spanSource.slice(fastArmStart));
   const fastStore = fastStoreMatch
     ? fastArmStart + fastStoreMatch.index : -1;
-  const rangeDeopt = spanSource.indexOf(
-    "reason: 'structured SSA range guard'", fastArmStart);
   t.ok(fastArmStart >= 0 && fastStore > fastArmStart &&
-      rangeDeopt > fastArmStart && rangeDeopt < fastStore,
-    'the restoring entry deopts at a failed guard then runs one direct-store loop');
-  t.notOk(/if \(!ssaArrayRangeGuard\d+ &&/.test(
-    spanSource.slice(fastStore)),
-  'the restoring function does not duplicate a checked slow loop');
+      !spanSource.includes("reason: 'structured SSA range guard'"),
+    'the restoring entry runs one direct-store loop under a non-deopting guard');
+  t.ok(spanSource.slice(fastStore).includes('} else {'),
+    'the failed guard falls back to a polled slow loop in the same tier');
   const checkedLeaf = genericSpan.jvmCheckedLeafDirectPositionalBody;
   const checkedLeafSource =
     genericSpan.jvmCheckedLeafDirectPositionalSource || '';
@@ -6357,14 +6358,20 @@ public final class NestedRasterShape {
   const source = generated?.jvmRestoringDirectPositionalSource || '';
   t.ok(generated?.jvmStructuredSsa,
     'the nested raster selects the generic structured SSA tier');
-  t.ok(/if \(!\(ssaRuntimeCoarseLoop\d+ && ssaArrayRangeGuard\d+\)\)/.test(source) &&
-      source.includes("reason: 'structured SSA range guard'"),
-    'the call-free inner pixel loop deopts before its range-proven fast arm');
-  const pollCount = (source.match(/--safePointBudget <= 0/g) || []).length;
+  t.ok(/if \(ssaRuntimeCoarseLoop\d+ && ssaArrayRangeGuard\d+\)/.test(source) &&
+      !source.includes("reason: 'structured SSA range guard'"),
+    'the call-free inner pixel loop guards its range-proven fast arm without deopting');
   t.equal(generated.jvmStructuredRestoringCoarseLoopDeoptCount, 1,
     'the helper-containing outer loop versions its trip-count proof');
+  // Only the unproven slow arm polls; the outer loop still restores at its
+  // header rather than charging the scheduler once per row.
+  const fastArmIndex = source.search(
+    /if \(ssaRuntimeCoarseLoop\d+ && ssaArrayRangeGuard\d+\)/);
+  const fastArmPolls = (source.slice(fastArmIndex,
+    source.indexOf('} else {', fastArmIndex)).match(
+    /--safePointBudget <= 0/g) || []).length;
   t.ok(source.includes("reason: 'structured SSA coarse loop guard'") &&
-      pollCount === 0,
+      fastArmPolls === 0,
     'an oversized outer loop restores at its header instead of polling every row');
   const fastArm = source.indexOf('&& ssaArrayRangeGuard');
   const fastStore = source.indexOf('] =', fastArm);

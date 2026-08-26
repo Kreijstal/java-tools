@@ -454,6 +454,10 @@ class JitCompiler {
     // Diagnostic: why a JS-preferred imported-array method reached the Wasm
     // gate anyway. Enabled by setting the Map from a debugging session.
     this.jsPreferredWasmEntryTrace = null;
+    // Diagnostic: which generated body deopted, at which entry pc, with which
+    // reason. Enabled by setting the Map from a debugging session; null (the
+    // default) costs one property load on the generated-entry fast path.
+    this.generatedDeoptTrace = null;
     this.importedArrayJsClosureMethods = new WeakMap();
     this.referenceFieldHelperJsMethods = new WeakMap();
     this.dynamicArrayStructuredFirstMethods = new WeakMap();
@@ -1715,7 +1719,15 @@ class JitCompiler {
             : generated.jvmSynchronous ? "generated-sync" : "generated-async")
       : null;
     if (!timingKey && !exclusiveTiming) {
-      return generated(frame, thread, this, initialBytecodeChecks);
+      if (!this.generatedDeoptTrace) {
+        return generated(frame, thread, this, initialBytecodeChecks);
+      }
+      const entryPc = frame.pc;
+      const traced = generated(frame, thread, this, initialBytecodeChecks);
+      if (traced && traced.deopt) {
+        this.recordGeneratedDeoptTrace(frame, entryPc, traced);
+      }
+      return traced;
     }
     let result;
     try {
@@ -1741,6 +1753,16 @@ class JitCompiler {
       this.monotonicNow() - timingStarted, generated);
     this.endExclusiveTiming(exclusiveTiming);
     return result;
+  }
+
+  recordGeneratedDeoptTrace(frame, entryPc, result) {
+    const trace = this.generatedDeoptTrace;
+    if (!trace) return;
+    const key = `${this.getFrameClassName(frame)}.${frame.method.name}` +
+      `${frame.method.descriptor}|entry=${entryPc}|exit=${frame.pc}` +
+      `|transient=${Boolean(result.transient)}` +
+      `|${result.reason || "unspecified"}`;
+    trace.set(key, (trace.get(key) || 0) + 1);
   }
 
   beginExclusiveTiming(methodKey, tier) {
@@ -7045,6 +7067,7 @@ class JitCompiler {
       "}",
       traceResult,
       "if (result && result.deopt) {",
+      "  if (jit.generatedDeoptTrace) jit.recordGeneratedDeoptTrace(child, 0, result);",
       "  if (useFrameless) {",
       "    plan.restoreFrame(thread, baseDepth, child);",
       "    if (adaptiveFrameless) {",
