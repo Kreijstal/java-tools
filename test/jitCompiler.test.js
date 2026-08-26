@@ -1166,6 +1166,38 @@ test('dense nested array kernels select Wasm without guest-name matching', (t) =
   t.end();
 });
 
+test('small reference-field cursors stay in positional JavaScript', async (t) => {
+  const classpath = compileJavaFixture(t, 'ReferenceCursorHarness', `
+public class ReferenceCursorHarness {
+  ReferenceCursorHarness head;
+  ReferenceCursorHarness cursor;
+  ReferenceCursorHarness step(int mode) {
+    if (mode != 1) return null;
+    ReferenceCursorHarness value = cursor;
+    if (value == head) {
+      cursor = null;
+      return null;
+    }
+    cursor = value.cursor;
+    return value;
+  }
+}
+`);
+  const jvm = new JVM({classpath, jit: {warmupThreshold: 0}});
+  const classData = await jvm.loadClassByName('ReferenceCursorHarness');
+  const method = jvm.findMethod(classData, 'step',
+    '(I)LReferenceCursorHarness;');
+  t.ok(jvm.jit.isReferenceFieldCursorJsPreferred(method),
+    'structure selects an arbitrary acyclic reference cursor');
+  jvm.jit.wasmJit.enabled = true;
+  jvm.jit.wasmJit.state.set(method, {
+    status: 'ready', meta: {fullyCompiled: true},
+  });
+  t.notOk(jvm.jit.hasReadyFullWasm(method),
+    'ready Wasm cannot withdraw the positional cursor body');
+  t.end();
+});
+
 test('large dynamic primitive-array loops select structured JavaScript first',
   (t) => {
     const jvm = new JVM({ jit: { profileMethods: false } });

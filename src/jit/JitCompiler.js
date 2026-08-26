@@ -436,6 +436,7 @@ class JitCompiler {
         process.env.JVM_ENABLE_ARRAY_KERNEL_WASM_FIRST === "1");
     this.importedArrayLoopJsMethods = new WeakMap();
     this.importedArrayJsClosureMethods = new WeakMap();
+    this.referenceFieldCursorJsMethods = new WeakMap();
     this.dynamicArrayStructuredFirstMethods = new WeakMap();
     this.dynamicArrayStructuredFirstMethodCount = 0;
     this.dynamicArrayStructuredFirstEnabled =
@@ -700,7 +701,8 @@ class JitCompiler {
         this.wasmJit.probeFullCoverage(frame));
     const wholeMethodPreferred = wasmExitStorm ||
       (this.prefersWholeMethodJs(frame.method) ||
-        this.isDynamicArrayStructuredFirstMethod(frame.method)) &&
+        this.isDynamicArrayStructuredFirstMethod(frame.method) ||
+        this.isReferenceFieldCursorJsPreferred(frame.method)) &&
       !wasmPriorityLoop;
     if (wholeMethodPreferred && canProbeGenerated) {
       const publishedStructured = this.codegenCache.get(frame.method);
@@ -787,7 +789,8 @@ class JitCompiler {
   }
 
   hasReadyFullWasm(method) {
-    if (this.isImportedArrayJsClosurePreferred(method)) return false;
+    if (this.isImportedArrayJsClosurePreferred(method) ||
+        this.isReferenceFieldCursorJsPreferred(method)) return false;
     const state = this.wasmJit.enabled && method
       ? this.wasmJit.state.get(method) : null;
     if (!state || state.status !== "ready" ||
@@ -1046,6 +1049,55 @@ class JitCompiler {
     }
     active.delete(method);
     this.importedArrayJsClosureMethods.set(method, preferred);
+    return preferred;
+  }
+
+  hasReferenceFieldCursorShape(method) {
+    if (!method || method.name === "<init>" || method.name === "<clinit>" ||
+        (method.flags || []).includes("static")) return false;
+    if (this.referenceFieldCursorJsMethods.has(method)) {
+      return this.referenceFieldCursorJsMethods.get(method);
+    }
+    let parsed;
+    try { parsed = parseDescriptor(method.descriptor); } catch (_) {
+      this.referenceFieldCursorJsMethods.set(method, false);
+      return false;
+    }
+    const referenceReturn = parsed.returnType.endsWith("[]") ||
+      parsed.returnType.startsWith("L") ||
+      (!/^(void|boolean|byte|char|short|int|long|float|double)$/.test(
+        parsed.returnType));
+    const items = this.getCodeItems(method);
+    let fieldReads = 0;
+    let fieldWrites = 0;
+    let rejected = items.length === 0 || items.length > 64;
+    for (const item of items) {
+      const op = getOp(item?.instruction);
+      if (op === "getfield") fieldReads += 1;
+      else if (op === "putfield") fieldWrites += 1;
+      if (op?.startsWith("invoke") || op === "new" || op === "newarray" ||
+          op === "anewarray" || op === "multianewarray" ||
+          op === "getstatic" || op === "putstatic" || op === "athrow" ||
+          op === "monitorenter" || op === "monitorexit" ||
+          PRIMITIVE_ARRAY_ACCESS_OPCODES.has(op)) rejected = true;
+    }
+    // Small acyclic cursor/accessor methods manipulate only an object's
+    // reference links. Running each as a scheduled Wasm frame costs much more
+    // than its useful work; generated positional JS keeps the receiver and
+    // return reference in one representation and call tier.
+    return referenceReturn && fieldReads > 0 && fieldWrites > 0 &&
+      !rejected && !this.hasBackwardBranch(method);
+  }
+
+  isReferenceFieldCursorJsPreferred(method) {
+    if (!method || method.name === "<init>" || method.name === "<clinit>" ||
+        (method.flags || []).includes("static")) return false;
+    if (this.referenceFieldCursorJsMethods.has(method)) {
+      return this.referenceFieldCursorJsMethods.get(method);
+    }
+    const preferred = this.hasReferenceFieldCursorShape(method) &&
+      this.isCodegenSupported(method);
+    this.referenceFieldCursorJsMethods.set(method, preferred);
     return preferred;
   }
 
@@ -2011,6 +2063,7 @@ class JitCompiler {
       );
     });
     const supported = (safeConstructor || hasNumericHotPath ||
+      this.hasReferenceFieldCursorShape(method) ||
       this.hasBackwardBranch(method) ||
       this.hasCallDenseComputeShape(method, codeItems) ||
       this.isShortSupportedHelper(method)) &&
