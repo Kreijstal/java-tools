@@ -2422,7 +2422,19 @@ class JitCompiler {
     if (debug && (debug.debugMode || debug.breakpoints.size > 0)) return false;
     if (jvm.clock && jvm.clock.enabled && !jvm.clock.realtime) return false;
     const wallNow = Date.now();
-    if (!(wallNow < jvm._nextEventLoopYieldAt)) return false;
+    if (wallNow < jvm._nextEventLoopYieldAt) {
+      // A renderer that is already slower than the ordinary scheduler slice
+      // must not repeatedly spill and reconstruct one frame. Give only the
+      // AWT producer a bounded atomic window; 100 ms preserves the requested
+      // 10-FPS responsiveness floor and all other threads retain the normal
+      // event-loop deadline.
+      if (thread === jvm._awtFrameProducerThread) {
+        jvm._nextAwtStructuredYieldAt = wallNow + 100;
+      }
+    } else if (thread !== jvm._awtFrameProducerThread ||
+        !(wallNow < Number(jvm._nextAwtStructuredYieldAt || 0))) {
+      return false;
+    }
     const schedulerNow = jvm.clock ? jvm.clock.millis() : wallNow;
     const threads = jvm.threads || [];
     for (let index = 0; index < threads.length; index += 1) {
