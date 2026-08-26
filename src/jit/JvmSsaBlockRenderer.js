@@ -5193,7 +5193,7 @@ class JvmSsaBlockRenderer {
     // names—are the only rewrite targets.
     let coalescedSsaCopyCount = 0;
     const aliases = new Map();
-    const removedDeclarationLinesByPlan = new Map();
+    const removedDeclarationsByPlan = new Map();
     const resolveAlias = (name) => {
       const visited = new Set();
       let current = name;
@@ -5205,37 +5205,37 @@ class JvmSsaBlockRenderer {
     };
     for (const plan of plans) {
       if (!plan?.lines?.length) continue;
-      const removedLines = new Set();
-      for (let lineIndex = 0; lineIndex < plan.lines.length; lineIndex += 1) {
-        // Plan lines are compiler-owned statements. An unindented exact
-        // declaration is necessarily in the plan's outer lexical scope; a
-        // nested declaration carries indentation and remains untouched. This
-        // recognizes the same narrow `const SSA = SSA` shape as the previous
-        // Acorn walk without parsing every basic block once merely to find it.
-        const declaration = /^const (ssaValue\d+) = (ssaValue\d+);$/
-          .exec(plan.lines[lineIndex]);
-        if (!declaration || !ssaValueNames.has(declaration[1]) ||
-            !ssaValueNames.has(declaration[2])) continue;
-        aliases.set(declaration[1], resolveAlias(declaration[2]));
-        removedLines.add(lineIndex);
+      const parsedPlan = parseGeneratedStatements(plan.lines.join("\n"));
+      const removedDeclarations = [];
+      for (const statement of parsedPlan.statements) {
+        if (statement.type !== "VariableDeclaration" ||
+            statement.kind !== "const" || statement.declarations.length !== 1) {
+          continue;
+        }
+        const declaration = statement.declarations[0];
+        if (declaration.id?.type !== "Identifier" ||
+            declaration.init?.type !== "Identifier" ||
+            !ssaValueNames.has(declaration.id.name) ||
+            !ssaValueNames.has(declaration.init.name)) continue;
+        aliases.set(declaration.id.name, resolveAlias(declaration.init.name));
+        removedDeclarations.push(statement);
         coalescedSsaCopyCount += 1;
       }
-      if (removedLines.size) {
-        removedDeclarationLinesByPlan.set(plan, removedLines);
+      if (removedDeclarations.length) {
+        removedDeclarationsByPlan.set(plan, removedDeclarations);
       }
     }
     if (aliases.size) {
-      const rewriteStatements = (lines, removed = null) =>
+      const rewriteStatements = (lines, removed = []) =>
         rewriteGeneratedJavaScript(
-          (removed ? lines.filter((_line, index) => !removed.has(index))
-            : lines).join("\n"), resolveAlias,
+          lines.join("\n"), resolveAlias, removed,
         ).split("\n").filter(Boolean);
       const rewriteExpression = (expression) =>
         rewriteGeneratedExpression(expression, resolveAlias);
       for (const plan of plans) {
         if (!plan?.lines?.length) continue;
         plan.lines = rewriteStatements(
-          plan.lines, removedDeclarationLinesByPlan.get(plan));
+          plan.lines, removedDeclarationsByPlan.get(plan) || []);
         plan.condition = rewriteExpression(plan.condition);
         plan.returnValue = rewriteExpression(plan.returnValue);
         if (plan.stack) plan.stack = plan.stack.map(rewriteExpression);
