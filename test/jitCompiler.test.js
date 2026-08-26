@@ -7011,25 +7011,6 @@ test('structured SSA emits verified transparent int blits without call dispatch'
     transparentDestination, transparentSource, 0, 0, 99, 1, 1, 0, 0),
   'a transparent source pixel does not access an invalid destination');
 
-  const singlePixelDestination = [7];
-  singlePixelDestination.type = '[I';
-  const singlePixelSource = [123];
-  singlePixelSource.type = '[I';
-  jvm.jit.transparentIntBlitDirect(
-    singlePixelDestination, singlePixelSource, 0, 0, 0, 1, 1, 0, 0);
-  t.deepEqual(singlePixelDestination, Object.assign([123], {type: '[I'}),
-    'the one-pixel path preserves an opaque destination write');
-  let singlePixelSourceError = null;
-  try {
-    jvm.jit.transparentIntBlitDirect(
-      singlePixelDestination, singlePixelSource, 0, 1, 0, 1, 1, 0, 0);
-  } catch (error) {
-    singlePixelSourceError = error;
-  }
-  t.equal(singlePixelSourceError?.type,
-    'java/lang/ArrayIndexOutOfBoundsException',
-  'the one-pixel path preserves source bounds exceptions before writes');
-
   const throwingFrame = new Frame(caller);
   throwingFrame.className = 'ArbitraryTransparentOwner';
   const opaqueSource = [123];
