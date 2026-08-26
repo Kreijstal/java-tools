@@ -8554,19 +8554,42 @@ class JitCompiler {
       (destinationData && destinationData.length) ?? 0;
     const sourceLength = source?.length ?? (sourceData && sourceData.length) ?? 0;
     if (width > 0 && destinationData !== null && sourceData !== null) {
-      let checkedSource = sourceIndex;
-      let checkedDestination = destinationIndex;
-      let validRanges = true;
-      for (let row = 0; row < height; row += 1) {
-        if (checkedSource < 0 || checkedSource + width > sourceLength ||
-            checkedDestination < 0 ||
-            checkedDestination + width > destinationLength) {
-          validRanges = false;
-          break;
+      const sourceStep = (width + sourceRowSkip) | 0;
+      const destinationStep = (width + destinationRowSkip) | 0;
+      const lastSourceNumber = sourceIndex + (height - 1) * sourceStep;
+      const lastDestinationNumber =
+        destinationIndex + (height - 1) * destinationStep;
+      const noIndexWrap = lastSourceNumber >= -2147483648 &&
+        lastSourceNumber <= 2147483647 &&
+        lastDestinationNumber >= -2147483648 &&
+        lastDestinationNumber <= 2147483647;
+      const lastSource = lastSourceNumber | 0;
+      const lastDestination = lastDestinationNumber | 0;
+      const sourceMinimum = Math.min(sourceIndex, lastSource);
+      const sourceMaximum = Math.max(sourceIndex, lastSource);
+      const destinationMinimum = Math.min(destinationIndex, lastDestination);
+      const destinationMaximum = Math.max(destinationIndex, lastDestination);
+      // Row starts form an arithmetic progression. Its extrema are therefore
+      // the first and last row, making this proof equivalent to checking every
+      // row while avoiding a redundant height-sized loop per sprite.
+      let validRanges = noIndexWrap && sourceMinimum >= 0 &&
+        sourceMaximum + width <= sourceLength &&
+        destinationMinimum >= 0 &&
+        destinationMaximum + width <= destinationLength;
+      if (!noIndexWrap) {
+        let checkedSource = sourceIndex;
+        let checkedDestination = destinationIndex;
+        validRanges = true;
+        for (let row = 0; row < height; row += 1) {
+          if (checkedSource < 0 || checkedSource + width > sourceLength ||
+              checkedDestination < 0 ||
+              checkedDestination + width > destinationLength) {
+            validRanges = false;
+            break;
+          }
+          checkedSource = (checkedSource + sourceStep) | 0;
+          checkedDestination = (checkedDestination + destinationStep) | 0;
         }
-        checkedSource = (checkedSource + width + sourceRowSkip) | 0;
-        checkedDestination =
-          (checkedDestination + width + destinationRowSkip) | 0;
       }
       if (validRanges) {
         for (let row = 0; row < height; row += 1) {
