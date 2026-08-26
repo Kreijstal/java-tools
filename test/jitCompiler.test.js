@@ -2083,6 +2083,16 @@ test('structured SSA renders verified lookup switches', (t) => {
   const gated = gatedJvm.jit.getGeneratedFunction(method);
   t.notOk(gated?.jvmStructuredSsa,
     'the comparison gate retains the prior non-SSA tier');
+  const baseline = gatedJvm.jit.compileBaselineMethod(method);
+  t.ok(baseline, 'the continuation fallback compiles the lookup switch');
+  for (const [selector, expected] of [[1, 10], [5, 20], [0, -1]]) {
+    const frame = new Frame(method);
+    frame.locals[0] = selector;
+    const thread = {status: 'runnable', callStack: new Stack()};
+    thread.callStack.push(frame);
+    t.equal(baseline(frame, thread, gatedJvm.jit, false).value, expected,
+      `legacy generated lookup selector ${selector} preserves its target`);
+  }
   t.end();
 });
 

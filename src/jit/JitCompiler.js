@@ -4708,6 +4708,23 @@ class JitCompiler {
             op, instruction, callerMethod, index);
           return `{ helpers.materializeCached(frame, locals, stack, sp, ${next}); let value = helpers.tryInvokeSyncAt(${callSiteId}, frame, thread); if (value === helpers.asyncInvokeSentinel()) value = await helpers.invoke(${JSON.stringify(op)}, frame, ${JSON.stringify(instruction)}, thread, ${index}); if (value && value.deopt) return value; sp = stack.length; if (value !== helpers.returnVoid()) stack[sp++] = value; if (thread.status !== "runnable") { helpers.materializeCached(frame, locals, stack, sp, ${next}); return { deopt: true, reason: "thread yielded in generated ${op}" }; } } ${goNext}`;
         }
+      case "tableswitch": {
+        const low = Number(instruction.low) | 0;
+        const switchTargets = (instruction.labels || []).map((label) =>
+          target(label));
+        const defaultTarget = target(instruction.defaultLbl);
+        return `{ const selector = stack[--sp] | 0; const offset = selector - ${low}; ` +
+          `pc = offset >= 0 && offset < ${switchTargets.length} ? ` +
+          `[${switchTargets.join(",")}][offset] : ${defaultTarget}; } break;`;
+      }
+      case "lookupswitch": {
+        const pairs = (instruction.arg?.pairs || []).filter(Array.isArray);
+        const defaultTarget = target(instruction.arg?.defaultLabel);
+        const cases = pairs.map(([value, label]) =>
+          `case ${Number(value) | 0}: pc = ${target(label)}; break;`).join(" ");
+        return `{ const selector = stack[--sp] | 0; switch (selector) { ` +
+          `${cases} default: pc = ${defaultTarget}; } } break;`;
+      }
       case "goto": return `pc = ${target(instruction.arg)}; break;`;
       case "ifeq": return `if (stack[--sp] === 0) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
       case "ifne": return `if (stack[--sp] !== 0) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
