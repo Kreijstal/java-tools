@@ -729,6 +729,10 @@ class JVM {
       mainThread.callStack.push(mainFrame);
     }
 
+    if (options.precompileInitializedClasses === true) {
+      await this.precompileInitializedClasses(options.onPrecompileProgress);
+    }
+
     if (!this.debugManager.debugMode || !this.debugManager.isPaused) {
       await this.execute();
     }
@@ -1071,6 +1075,28 @@ class JVM {
     }
 
     return { paused: true, completed: false };
+  }
+
+  async precompileInitializedClasses(onProgress = null) {
+    const methods = [];
+    for (const [className, classData] of Object.entries(this.classes)) {
+      if (this.classInitializationState.get(className) !== "INITIALIZED") {
+        continue;
+      }
+      for (const item of classData?.ast?.classes?.[0]?.items || []) {
+        if (item?.type === "method" && item.method) methods.push(item.method);
+      }
+    }
+    let completed = 0;
+    for (const method of methods) {
+      this.jit.getGeneratedFunction(method);
+      completed += 1;
+      if (typeof onProgress === "function") {
+        onProgress({ completed, total: methods.length });
+      }
+      await yieldToEventLoop(0, this.eventLoopYieldStrategy);
+    }
+    return { methods: completed };
   }
 
   enqueueAwtEventInvocation(listener, methodName, descriptor, event, coalesce = false) {
