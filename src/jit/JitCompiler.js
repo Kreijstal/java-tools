@@ -8748,21 +8748,6 @@ class JitCompiler {
       if (validRanges) {
         for (let row = 0; row < height; row += 1) {
           const rowEnd = (sourceIndex + width) | 0;
-          const groupedEnd = (rowEnd - 3) | 0;
-          while (sourceIndex < groupedEnd) {
-            let pixel = sourceData[sourceIndex++] | 0;
-            if (pixel !== 0) destinationData[destinationIndex] = pixel;
-            destinationIndex += 1;
-            pixel = sourceData[sourceIndex++] | 0;
-            if (pixel !== 0) destinationData[destinationIndex] = pixel;
-            destinationIndex += 1;
-            pixel = sourceData[sourceIndex++] | 0;
-            if (pixel !== 0) destinationData[destinationIndex] = pixel;
-            destinationIndex += 1;
-            pixel = sourceData[sourceIndex++] | 0;
-            if (pixel !== 0) destinationData[destinationIndex] = pixel;
-            destinationIndex += 1;
-          }
           while (sourceIndex < rowEnd) {
             const pixel = sourceData[sourceIndex++] | 0;
             if (pixel !== 0) destinationData[destinationIndex] = pixel;

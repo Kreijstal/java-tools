@@ -7003,13 +7003,6 @@ test('structured SSA emits verified transparent int blits without call dispatch'
   t.equal(jvm.jit.transparentIntBlitSlowPathCount, 0,
     'valid rectangles use the prevalidated raw-array path');
 
-  const overlapping = [1, 2, 3, 4, 0, 0];
-  overlapping.type = '[I';
-  jvm.jit.transparentIntBlitDirect(
-    overlapping, overlapping, 0, 0, 1, 4, 1, 0, 0);
-  t.deepEqual(overlapping.slice(), [1, 1, 1, 1, 1, 0],
-    'four-pixel groups preserve sequential reads and writes for aliased arrays');
-
   const transparentDestination = [7];
   transparentDestination.type = '[I';
   const transparentSource = [0];
