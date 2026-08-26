@@ -8707,6 +8707,21 @@ class JitCompiler {
     const destinationLength = destination?.length ??
       (destinationData && destinationData.length) ?? 0;
     const sourceLength = source?.length ?? (sourceData && sourceData.length) ?? 0;
+    // Tiny glyph/sprite particles commonly arrive as one-pixel rectangles.
+    // Preserve the bytecode's source-read-before-conditional-store order, but
+    // avoid constructing a general row-range proof and entering two loops for
+    // that exact shape. An invalid or opaque-destination case falls through to
+    // the existing precise slow path without performing any effect here.
+    if (width === 1 && height === 1 && sourceData !== null &&
+        sourceIndex >= 0 && sourceIndex < sourceLength) {
+      const pixel = sourceData[sourceIndex] | 0;
+      if (pixel === 0) return RETURN_VOID;
+      if (destinationData !== null && destinationIndex >= 0 &&
+          destinationIndex < destinationLength) {
+        destinationData[destinationIndex] = pixel;
+        return RETURN_VOID;
+      }
+    }
     if (width > 0 && destinationData !== null && sourceData !== null) {
       const sourceStep = (width + sourceRowSkip) | 0;
       const destinationStep = (width + destinationRowSkip) | 0;
