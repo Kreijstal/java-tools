@@ -496,6 +496,13 @@ class JitCompiler {
     if (options.wasmDirectInstanceLink === true) {
       this.wasmJit.directInstanceLinkEnabled = true;
     }
+    // A shared linear heap makes primitive arrays and fields directly visible
+    // to every structured module. Keep eligible calls in that same engine so
+    // the heap does not merely move data while leaving call boundaries in JS.
+    if (jvm.wasmHeap && jvm.wasmFields) {
+      this.wasmJit.directStaticLinkEnabled = true;
+      this.wasmJit.directInstanceLinkEnabled = true;
+    }
     const regionOptions = this.rendererPipelineEnabled
       ? { ...options, structuredSsa: true }
       : options;
@@ -1014,7 +1021,7 @@ class JitCompiler {
   }
 
   isImportedArrayJsClosurePreferred(method, visiting = null) {
-    if (!method) return false;
+    if (!method || this.jvm.wasmHeap) return false;
     if (this.importedArrayJsClosureMethods.has(method)) {
       return this.importedArrayJsClosureMethods.get(method);
     }

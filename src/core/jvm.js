@@ -213,7 +213,10 @@ class JVM {
       configuredMaxStackDepth > 0 ? configuredMaxStackDepth : 1024;
     // Linear heap for primitive arrays: TypedArray views over one wasm
     // memory, so compiled code can access elements without import crossings.
-    const wasmHeapEnabled = options.wasmHeap ?? env.JVM_WASM_HEAP === '1';
+    const browserRuntime = typeof window !== 'undefined' &&
+      typeof WebAssembly !== 'undefined';
+    const wasmHeapEnabled = options.wasmHeap ??
+      (env.JVM_WASM_HEAP === '1' || browserRuntime);
     const wasmHeapMb = Number(options.wasmHeapMb ?? env.JVM_WASM_HEAP_MB) || 256;
     this.wasmHeap = wasmHeapEnabled
       ? new (require('./wasmHeap').WasmHeap)(wasmHeapMb)
@@ -221,7 +224,7 @@ class JVM {
     // Primitive instance fields in that same memory at static per-class
     // offsets (see core/objectModel.js). Requires the heap; off by default.
     this.wasmFields = !!this.wasmHeap &&
-      (options.wasmFields ?? env.JVM_WASM_FIELDS === '1');
+      (options.wasmFields ?? (env.JVM_WASM_FIELDS === '1' || browserRuntime));
     this.clock = options.clock || createClock({
       fakeTime: options.fakeTime ?? env.JVM_FAKE_TIME,
       fakeTimeStep: options.fakeTimeStep ?? env.JVM_FAKE_TIME_STEP,

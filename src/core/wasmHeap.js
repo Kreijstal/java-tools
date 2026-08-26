@@ -37,7 +37,7 @@ class WasmHeap {
     if (base + bytes > this.limit) {
       if (!this.exhausted) {
         this.exhausted = true;
-        process.stderr.write(`[wasmheap] exhausted at ${this.limit} bytes; falling back to plain typed arrays\n`);
+        this.reportExhaustion();
       }
       return -1;
     }
@@ -57,7 +57,7 @@ class WasmHeap {
     if (base + bytes > this.limit) {
       if (!this.exhausted) {
         this.exhausted = true;
-        process.stderr.write(`[wasmheap] exhausted at ${this.limit} bytes; falling back to plain typed arrays\n`);
+        this.reportExhaustion();
       }
       return new Ctor(count);
     }
@@ -65,6 +65,16 @@ class WasmHeap {
     const view = new Ctor(this.memory.buffer, base, count);
     view.wasmBase = base;
     return view;
+  }
+
+  reportExhaustion() {
+    const message = `[wasmheap] exhausted at ${this.limit} bytes; ` +
+      'falling back to plain typed arrays';
+    if (typeof process !== 'undefined' && process.stderr?.write) {
+      process.stderr.write(`${message}\n`);
+    } else if (typeof console !== 'undefined' && console.warn) {
+      console.warn(message);
+    }
   }
 }
 
