@@ -1188,6 +1188,11 @@ public class ReferenceCursorHarness {
     cursor.cursor = null;
     cursor = null;
   }
+  void clear(int mode) {
+    head = null;
+    cursor = null;
+    if (mode != 0) diagnostic = 41;
+  }
 }
 `);
   const jvm = new JVM({classpath, jit: {warmupThreshold: 0}});
@@ -1239,6 +1244,19 @@ public class ReferenceCursorHarness {
     'generated void helper clears the receiver link');
   t.equal(value.fields['ReferenceCursorHarness.cursor'], null,
     'generated void helper preserves the nested link update');
+  const clear = jvm.findMethod(classData, 'clear', '(I)V');
+  t.ok(jvm.jit.isReferenceFieldHelperJsPreferred(clear),
+    'bounded reference-field cleanup needs no preceding field read');
+  receiver.fields['ReferenceCursorHarness.head'] = head;
+  receiver.fields['ReferenceCursorHarness.cursor'] = value;
+  await invoke(jvm, thread, 'ReferenceCursorHarness', 'clear', '(I)V',
+    [receiver, 1]);
+  t.equal(receiver.fields['ReferenceCursorHarness.head'], null,
+    'generated cleanup clears its first reference field');
+  t.equal(receiver.fields['ReferenceCursorHarness.cursor'], null,
+    'generated cleanup clears its second reference field');
+  t.equal(classData.staticFields.get('diagnostic:I'), 41,
+    'generated cleanup preserves its primitive static side effect');
   t.end();
 });
 

@@ -1071,14 +1071,19 @@ class JitCompiler {
     const items = this.getCodeItems(method);
     const methodOwner = this.jvm.findClassNameForMethod?.(method) ||
       method.className || "";
-    let fieldReads = 0;
-    let fieldWrites = 0;
+    let referenceFieldReads = 0;
+    let referenceFieldWrites = 0;
     let primitiveOwnStaticWrites = 0;
     let rejected = items.length === 0 || items.length > 64;
     for (const item of items) {
       const op = getOp(item?.instruction);
-      if (op === "getfield") fieldReads += 1;
-      else if (op === "putfield") fieldWrites += 1;
+      const fieldDescriptor = Array.isArray(item?.instruction?.arg) &&
+        Array.isArray(item.instruction.arg[2])
+        ? item.instruction.arg[2][1] : "";
+      const referenceField = fieldDescriptor.startsWith("L") ||
+        fieldDescriptor.startsWith("[");
+      if (op === "getfield" && referenceField) referenceFieldReads += 1;
+      else if (op === "putfield" && referenceField) referenceFieldWrites += 1;
       else if (op === "putstatic") {
         const field = item?.instruction?.arg;
         const descriptor = Array.isArray(field) && Array.isArray(field[2])
@@ -1100,7 +1105,12 @@ class JitCompiler {
     // reference links. Running each as a scheduled Wasm frame costs much more
     // than its useful work; generated positional JS keeps the receiver and
     // return reference in one representation and call tier.
-    return referenceOrVoidReturn && fieldReads > 0 && fieldWrites > 0 &&
+    const referenceLinkShape = referenceFieldReads > 0 &&
+      referenceFieldWrites > 0;
+    const referenceClearShape = parsed.returnType === "void" &&
+      referenceFieldWrites >= 2;
+    return referenceOrVoidReturn &&
+      (referenceLinkShape || referenceClearShape) &&
       primitiveOwnStaticWrites <= 1 && !rejected &&
       !this.hasBackwardBranch(method);
   }
