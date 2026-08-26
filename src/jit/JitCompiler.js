@@ -6206,7 +6206,6 @@ class JitCompiler {
     this.hotCallGraphRegions.recordGenericCallSite(id, frame);
     const site = this.syncCallSites[id];
     if (!site) return ASYNC_INVOKE;
-    this.republishWasmDemotedPositional(site);
     if (this.debugNonTopInvoke) {
       const items = thread?.callStack?.items || [];
       const top = items[items.length - 1];
@@ -6370,24 +6369,6 @@ class JitCompiler {
       }
     }
     return this.tryInvokeSyncSite(site, frame, thread);
-  }
-
-  republishWasmDemotedPositional(site) {
-    if (site.fastPositional) return false;
-    const target = site.op === "invokestatic"
-      ? site.fastStaticTarget
-      : site.op === "invokespecial" ? site.fastSpecialTarget : null;
-    if (!target?.method || this.hasReadyFullWasm(target.method)) return false;
-    const positional = this.getPositionalGeneratedInvoker(site, target);
-    if (!positional) return false;
-    site.fastPositional = {
-      invoke: positional,
-      rawInvoke: positional.jvmRawInvoke || null,
-      lookupClass: target.lookupClass,
-      receiverType: null,
-      debugGuarded: positional.jvmDebugGuarded === true,
-    };
-    return true;
   }
 
   tryInvokeFramePositional(site, invoke, frame, thread) {
@@ -7377,9 +7358,8 @@ class JitCompiler {
     // and the method's Wasm state remains permanently cold. A partial exit
     // keeps the materialized child on the stack and hands scheduling back to
     // the verified parent continuation.
-    if (this.wasmJit.enabled &&
-        (this.hasReadyFullWasm(method) ||
-          this.isOversizedLoopMethod(method) && !this.hasWasmExitStorm(method))) {
+    if (this.wasmJit.enabled && this.isOversizedLoopMethod(method) &&
+        !this.hasWasmExitStorm(method)) {
       const wasmResult = this.wasmJit.runNested(child, thread);
       if (wasmResult.returned) {
         target.freeFrame = child;
