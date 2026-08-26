@@ -8661,46 +8661,6 @@ class JitCompiler {
     return RETURN_VOID;
   }
 
-  transparentIntBlitNoThrow(destination, source, _pixel, sourceIndex,
-    destinationIndex, width, height, destinationRowSkip, sourceRowSkip) {
-    sourceIndex |= 0;
-    destinationIndex |= 0;
-    width |= 0;
-    height |= 0;
-    destinationRowSkip |= 0;
-    sourceRowSkip |= 0;
-    this.transparentIntBlitRunCount += 1;
-    if (height <= 0 || width === 0) return true;
-    const destinationData = this.arrayData(destination);
-    const sourceData = this.arrayData(source);
-    if (width <= 0 || destinationData === null || sourceData === null) return false;
-    const destinationLength = destination?.length ?? destinationData.length;
-    const sourceLength = source?.length ?? sourceData.length;
-    const sourceStep = (width + sourceRowSkip) | 0;
-    const destinationStep = (width + destinationRowSkip) | 0;
-    const lastSource = sourceIndex + (height - 1) * sourceStep;
-    const lastDestination = destinationIndex + (height - 1) * destinationStep;
-    if (lastSource < -2147483648 || lastSource > 2147483647 ||
-        lastDestination < -2147483648 || lastDestination > 2147483647 ||
-        Math.min(sourceIndex, lastSource) < 0 ||
-        Math.max(sourceIndex, lastSource) + width > sourceLength ||
-        Math.min(destinationIndex, lastDestination) < 0 ||
-        Math.max(destinationIndex, lastDestination) + width > destinationLength) {
-      return false;
-    }
-    for (let row = 0; row < height; row += 1) {
-      const rowEnd = sourceIndex + width;
-      while (sourceIndex < rowEnd) {
-        const pixel = sourceData[sourceIndex++] | 0;
-        if (pixel !== 0) destinationData[destinationIndex] = pixel;
-        destinationIndex += 1;
-      }
-      destinationIndex = (destinationIndex + destinationRowSkip) | 0;
-      sourceIndex = (sourceIndex + sourceRowSkip) | 0;
-    }
-    return true;
-  }
-
   alphaMaskedColorBlitDirect(destination, source, _pixel, sourceIndex,
     destinationIndex, width, height, destinationRowSkip, sourceRowSkip, alpha) {
     sourceIndex |= 0;
