@@ -289,15 +289,22 @@ module.exports = {
       return 0;
     },
     
-    'getLocationOnScreen()Ljava/awt/Point;': (jvm, obj) => ({
-      type: 'java/awt/Point',
-      x: obj.x || 0,
-      y: obj.y || 0,
-    }),
+    'getLocationOnScreen()Ljava/awt/Point;': (jvm, obj) => {
+      const element = obj._canvasElement || obj._awtElement;
+      const rect = element?.getBoundingClientRect?.();
+      return {
+        type: 'java/awt/Point',
+        // Browser Robot defines its screen as the page viewport. This keeps
+        // Component.getLocationOnScreen() + local coordinates round-trippable
+        // through synthetic DOM events without browser-chrome coordinates.
+        x: rect ? Math.floor(rect.left) : obj._x || 0,
+        y: rect ? Math.floor(rect.top) : obj._y || 0,
+      };
+    },
     'getLocation()Ljava/awt/Point;': (jvm, obj) => ({
       type: 'java/awt/Point',
-      x: obj.x || 0,
-      y: obj.y || 0,
+      x: obj._x || 0,
+      y: obj._y || 0,
     }),
     'getX()I': (jvm, obj, args) => {
       return obj._x || 0;

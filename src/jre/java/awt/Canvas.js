@@ -11,9 +11,11 @@ const { postMouseEvent } = require('./legacyEvents');
 function attachMouseInteraction(jvm, obj, canvas) {
   const toLocal = (e) => {
     const rect = canvas.getBoundingClientRect();
+    const scaleX = rect.width ? canvas.width / rect.width : 1;
+    const scaleY = rect.height ? canvas.height / rect.height : 1;
     return {
-      x: Math.floor(e.clientX - rect.left),
-      y: Math.floor(e.clientY - rect.top),
+      x: Math.floor((e.clientX - rect.left) * scaleX),
+      y: Math.floor((e.clientY - rect.top) * scaleY),
       modifiers: ((e.shiftKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.metaKey ? 4 : 0) | (e.altKey ? 8 : 0)),
     };
   };
