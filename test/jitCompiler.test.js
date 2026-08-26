@@ -1146,6 +1146,11 @@ test('dense nested array kernels select Wasm without guest-name matching', (t) =
   });
   t.notOk(jvm.jit.hasReadyFullWasm(wrapper),
     'Wasm readiness cannot split a wrapper from its imported-array callee');
+  const wasmLocalityJvm = new JVM({
+    jit: { warmupThreshold: 0, importedArrayJsLocality: false },
+  });
+  t.notOk(wasmLocalityJvm.jit.isImportedArrayJsClosurePreferred(rasterKernel),
+    'embedders can retain complete Wasm when its engine wins the locality tradeoff');
   t.notOk(jvm.jit.isArrayKernelWasmFirstMethod(
     shape('anotherName', { primitiveArrayAccesses: 23 })),
   'a sparse array body retains the ordinary generated tier');
