@@ -8302,10 +8302,11 @@ class JvmSsaBlockRenderer {
     }
     const methodLoopWorkEstimate = Math.max(1,
       items.length + methodInvokeCount * 32 + methodAllocationCount * 16);
+    const maxPollBudget = this.jit.structuredLoopSafePointMaxBudget;
     const methodPollBudget = hasAtomicUnsafeOperation
-      ? Math.max(64, Math.min(10000,
+      ? Math.max(32, Math.min(maxPollBudget,
         Math.floor(16384 / methodLoopWorkEstimate)))
-      : 10000;
+      : maxPollBudget;
     const naturalBlocksByLoop = new Map([...structured.loopHeaders].map(
       (header) => [header,
         naturalLoopBlocksFor(header) || new Set([header])],
@@ -8338,11 +8339,11 @@ class JvmSsaBlockRenderer {
       loopWorkEstimates.set(header, work);
       loopPollBudgets.set(header, this.perLoopPollBudgetsEnabled &&
         hasAtomicUnsafeOperation
-        ? Math.max(64, Math.min(10000, Math.floor(16384 / work)))
+        ? Math.max(32, Math.min(maxPollBudget, Math.floor(16384 / work)))
         : methodPollBudget);
     }
     const loopWorkEstimate = Math.max(1, ...loopWorkEstimates.values());
-    const structuralPollBudget = Math.min(10000,
+    const structuralPollBudget = Math.min(maxPollBudget,
       ...loopPollBudgets.values());
     // Keep the shared counter in guest-iteration units. Each admitted coarse
     // loop charges its verified trip count once; unrelated later loops must not

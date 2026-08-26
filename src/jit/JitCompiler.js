@@ -167,6 +167,15 @@ class JitCompiler {
       options.positionalCallSafePointPolling === true;
     this.positionalCallSafePointPollBudget = Math.max(32, Math.floor(
       Number(options.positionalCallSafePointPollBudget ?? 256) || 256));
+    // A wall-clock deadline is useful only if generated loops return to it
+    // often enough. Ten thousand backedges can represent hundreds of
+    // milliseconds when an iteration contains generated calls or raster
+    // work, preventing browsers from painting even though the outer scheduler
+    // nominally yields every eventLoopYieldMs. Keep the polling counter cheap,
+    // but bound the amount of unobserved generated work independently of any
+    // application-specific method identity.
+    this.structuredLoopSafePointMaxBudget = Math.max(32, Math.floor(
+      Number(options.structuredLoopSafePointMaxBudget ?? 256) || 256));
     // Positional adapters are code-shape templates. Many independent call
     // sites reach the same method and used to parse an identical Function for
     // every site during asset loading. Cache the unbound template by resolved
