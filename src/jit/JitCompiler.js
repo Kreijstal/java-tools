@@ -264,6 +264,17 @@ class JitCompiler {
     this.referenceFramelessPositionalRunCount = 0;
     this.framePositionalCallCount = 0;
     this.framePositionalFallbackCount = 0;
+    // A ready, fully compiled Wasm module withholds a callee's direct
+    // positional link. Release that veto once the module is proven never to
+    // run while its JavaScript body serves this many generated child calls.
+    this.readyWasmPositionalReleaseEnabled =
+      options.readyWasmPositionalRelease !== false &&
+      !(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DISABLE_READY_WASM_POSITIONAL_RELEASE === "1");
+    this.readyWasmPositionalReleaseThreshold = Number.isInteger(
+      options.readyWasmPositionalReleaseThreshold)
+      ? options.readyWasmPositionalReleaseThreshold : 64;
+    this.readyWasmPositionalReleaseCount = 0;
     this.framePositionalCallsEnabled =
       options.framePositionalCalls === true ||
       Boolean(typeof process !== "undefined" && process.env &&
@@ -6759,6 +6770,25 @@ class JitCompiler {
     return this.tryInvokeSyncAt(site.id, frame, thread);
   }
 
+  // The ready-Wasm veto in getPositionalGeneratedInvoker assumes the child
+  // Frame it forces the caller to materialize will reach a scheduler entry
+  // that selects Wasm. A callee reached only through generated callers never
+  // reaches one: tryInvokeResolvedTarget runs its JavaScript body inline, the
+  // module stays at zero runs, and every call keeps paying for a Frame that
+  // buys nothing. Release the veto only on that proof -- enough JavaScript
+  // child runs through this exact target while the module has still never
+  // executed a single time. A module that does run (even once, nested) keeps
+  // its veto, so this never takes a frame away from a live Wasm body.
+  readyWasmProvenUnusedForTarget(target, method) {
+    if (!this.readyWasmPositionalReleaseEnabled || !target || !method) {
+      return false;
+    }
+    if ((target.readyWasmJsChildRuns || 0) <
+        this.readyWasmPositionalReleaseThreshold) return false;
+    const state = this.wasmJit.enabled ? this.wasmJit.state.get(method) : null;
+    return Boolean(state) && (Number(state.runs) || 0) === 0;
+  }
+
   getPositionalGeneratedInvoker(site, target) {
     if (!this.positionalGeneratedCallsEnabled) return null;
     if (!target || target.positionalInvoker === null) return null;
@@ -6768,8 +6798,11 @@ class JitCompiler {
     // Wasm body; returning null makes the caller materialize the canonical
     // child Frame, whose next scheduler entry selects Wasm. If that module
     // later proves to be an exit storm, hasReadyFullWasm() becomes false and
-    // this same target may publish its JavaScript positional entry normally.
-    if (method && this.hasReadyFullWasm(method)) return null;
+    // this same target may publish its JavaScript positional entry normally,
+    // and so may a target whose module has been proven never to run at all
+    // (see readyWasmProvenUnusedForTarget).
+    if (method && this.hasReadyFullWasm(method) &&
+        !this.readyWasmProvenUnusedForTarget(target, method)) return null;
     if (target.positionalInvoker) return target.positionalInvoker;
     const positionalTracePattern = typeof process !== "undefined" && process.env
       ? process.env.JVM_TRACE_POSITIONAL_GENERATED || "" : "";
@@ -7332,6 +7365,9 @@ class JitCompiler {
         lookupClass,
         targetClassName,
         intrinsic: structuralIntrinsic,
+        // Declared here so the hot generic-call path never transitions this
+        // object's shape when it starts counting JavaScript child runs.
+        readyWasmJsChildRuns: 0,
         inlineIntegerRegion: normallySupported &&
           (op === "invokestatic" || op === "invokevirtual" || op === "invokeinterface")
           ? this.getInlineIntegerRegion(method, params, returnType)
@@ -7726,6 +7762,21 @@ class JitCompiler {
             `${method.name}${descriptor}`,
         };
       }
+    }
+    // This is the JavaScript child run that the ready-Wasm positional veto
+    // assumed would be a Wasm scheduler entry. Count it, and once the module
+    // has been proven unused often enough, republish this target's links so
+    // later calls can take the positional entry instead of a Frame.
+    const jsChildRuns = (target.readyWasmJsChildRuns || 0) + 1;
+    target.readyWasmJsChildRuns = jsChildRuns;
+    if (this.readyWasmPositionalReleaseEnabled &&
+        !target.readyWasmPositionalReleased &&
+        jsChildRuns >= this.readyWasmPositionalReleaseThreshold &&
+        this.hasReadyFullWasm(method) &&
+        this.readyWasmProvenUnusedForTarget(target, method)) {
+      target.readyWasmPositionalReleased = true;
+      this.readyWasmPositionalReleaseCount += 1;
+      this.publishGeneratedTargetUpgrade(method, generated);
     }
     const result = this.runGeneratedFrame(generated, child, thread, false);
     if (result && typeof result.then === "function") {

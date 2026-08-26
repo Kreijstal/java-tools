@@ -12156,6 +12156,35 @@ public class SynchronousExecuteHarness {
     'a complete Wasm child withdraws an existing direct JavaScript edge');
   t.equal(jvm.jit.getPositionalGeneratedInvoker(linkedSite, linkedTarget), null,
     'new callers retain the canonical child Frame for Wasm tier selection');
+  // The veto above is a bet that the materialized child Frame reaches a
+  // scheduler entry that selects Wasm. A callee reached only from generated
+  // callers never reaches one, so the module stays at zero runs while every
+  // call pays for a Frame. Release the veto on that proof, and only that one.
+  linkedTarget.readyWasmJsChildRuns =
+    jvm.jit.readyWasmPositionalReleaseThreshold - 1;
+  t.equal(jvm.jit.getPositionalGeneratedInvoker(linkedSite, linkedTarget), null,
+    'a ready Wasm child keeps its veto below the proven-unused threshold');
+  linkedTarget.readyWasmJsChildRuns =
+    jvm.jit.readyWasmPositionalReleaseThreshold;
+  t.ok(jvm.jit.readyWasmProvenUnusedForTarget(linkedTarget, method),
+    'enough JavaScript child runs with zero Wasm runs prove the module unused');
+  t.equal(typeof jvm.jit.getPositionalGeneratedInvoker(
+    linkedSite, linkedTarget), 'function',
+  'a ready Wasm module proven never to run releases its positional link');
+  jvm.jit.wasmJit.state.set(method, {
+    status: 'ready', meta: { fullyCompiled: true }, runs: 1,
+  });
+  t.notOk(jvm.jit.readyWasmProvenUnusedForTarget(linkedTarget, method),
+    'a single observed Wasm run is enough to disprove an unused module');
+  t.equal(jvm.jit.getPositionalGeneratedInvoker(linkedSite, linkedTarget), null,
+    'a module that does run keeps the canonical child Frame');
+  jvm.jit.wasmJit.state.set(method, {
+    status: 'ready', meta: { fullyCompiled: true },
+  });
+  linkedTarget.readyWasmJsChildRuns = 0;
+  linkedTarget.positionalInvoker = undefined;
+  t.equal(jvm.jit.getPositionalGeneratedInvoker(linkedSite, linkedTarget), null,
+    'a fresh target starts back under the ready-Wasm veto');
   jvm.jit.wasmJit.tryRunFrame = (candidateFrame, candidateThread) => {
     wasmEntries += 1;
     out[0] = 777;
