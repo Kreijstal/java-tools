@@ -220,8 +220,7 @@ class JVM {
     // Keep Node opt-in and preserve an explicit false override for embedders.
     const wasmHeapEnabled = options.wasmHeap ??
       (env.JVM_WASM_HEAP === '1' || browserRuntime);
-    const wasmHeapMb = Number(options.wasmHeapMb ?? env.JVM_WASM_HEAP_MB) ||
-      (browserRuntime ? 64 : 256);
+    const wasmHeapMb = Number(options.wasmHeapMb ?? env.JVM_WASM_HEAP_MB) || 256;
     this.wasmHeap = wasmHeapEnabled
       ? new (require('./wasmHeap').WasmHeap)(wasmHeapMb)
       : null;
