@@ -436,7 +436,7 @@ class JitCompiler {
         process.env.JVM_ENABLE_ARRAY_KERNEL_WASM_FIRST === "1");
     this.importedArrayLoopJsMethods = new WeakMap();
     this.importedArrayJsClosureMethods = new WeakMap();
-    this.referenceFieldCursorJsMethods = new WeakMap();
+    this.referenceFieldHelperJsMethods = new WeakMap();
     this.dynamicArrayStructuredFirstMethods = new WeakMap();
     this.dynamicArrayStructuredFirstMethodCount = 0;
     this.dynamicArrayStructuredFirstEnabled =
@@ -702,7 +702,7 @@ class JitCompiler {
     const wholeMethodPreferred = wasmExitStorm ||
       (this.prefersWholeMethodJs(frame.method) ||
         this.isDynamicArrayStructuredFirstMethod(frame.method) ||
-        this.isReferenceFieldCursorJsPreferred(frame.method)) &&
+        this.isReferenceFieldHelperJsPreferred(frame.method)) &&
       !wasmPriorityLoop;
     if (wholeMethodPreferred && canProbeGenerated) {
       const publishedStructured = this.codegenCache.get(frame.method);
@@ -790,7 +790,7 @@ class JitCompiler {
 
   hasReadyFullWasm(method) {
     if (this.isImportedArrayJsClosurePreferred(method) ||
-        this.isReferenceFieldCursorJsPreferred(method)) return false;
+        this.isReferenceFieldHelperJsPreferred(method)) return false;
     const state = this.wasmJit.enabled && method
       ? this.wasmJit.state.get(method) : null;
     if (!state || state.status !== "ready" ||
@@ -1052,18 +1052,19 @@ class JitCompiler {
     return preferred;
   }
 
-  hasReferenceFieldCursorShape(method) {
+  hasReferenceFieldHelperShape(method) {
     if (!method || method.name === "<init>" || method.name === "<clinit>" ||
         (method.flags || []).includes("static")) return false;
-    if (this.referenceFieldCursorJsMethods.has(method)) {
-      return this.referenceFieldCursorJsMethods.get(method);
+    if (this.referenceFieldHelperJsMethods.has(method)) {
+      return this.referenceFieldHelperJsMethods.get(method);
     }
     let parsed;
     try { parsed = parseDescriptor(method.descriptor); } catch (_) {
-      this.referenceFieldCursorJsMethods.set(method, false);
+      this.referenceFieldHelperJsMethods.set(method, false);
       return false;
     }
-    const referenceReturn = parsed.returnType.endsWith("[]") ||
+    const referenceOrVoidReturn = parsed.returnType === "void" ||
+      parsed.returnType.endsWith("[]") ||
       parsed.returnType.startsWith("L") ||
       (!/^(void|boolean|byte|char|short|int|long|float|double)$/.test(
         parsed.returnType));
@@ -1095,24 +1096,24 @@ class JitCompiler {
           op === "monitorenter" || op === "monitorexit" ||
           PRIMITIVE_ARRAY_ACCESS_OPCODES.has(op)) rejected = true;
     }
-    // Small acyclic cursor/accessor methods manipulate only an object's
+    // Small acyclic cursor/link methods manipulate only an object's
     // reference links. Running each as a scheduled Wasm frame costs much more
     // than its useful work; generated positional JS keeps the receiver and
     // return reference in one representation and call tier.
-    return referenceReturn && fieldReads > 0 && fieldWrites > 0 &&
+    return referenceOrVoidReturn && fieldReads > 0 && fieldWrites > 0 &&
       primitiveOwnStaticWrites <= 1 && !rejected &&
       !this.hasBackwardBranch(method);
   }
 
-  isReferenceFieldCursorJsPreferred(method) {
+  isReferenceFieldHelperJsPreferred(method) {
     if (!method || method.name === "<init>" || method.name === "<clinit>" ||
         (method.flags || []).includes("static")) return false;
-    if (this.referenceFieldCursorJsMethods.has(method)) {
-      return this.referenceFieldCursorJsMethods.get(method);
+    if (this.referenceFieldHelperJsMethods.has(method)) {
+      return this.referenceFieldHelperJsMethods.get(method);
     }
-    const preferred = this.hasReferenceFieldCursorShape(method) &&
+    const preferred = this.hasReferenceFieldHelperShape(method) &&
       this.isCodegenSupported(method);
-    this.referenceFieldCursorJsMethods.set(method, preferred);
+    this.referenceFieldHelperJsMethods.set(method, preferred);
     return preferred;
   }
 
@@ -2078,7 +2079,7 @@ class JitCompiler {
       );
     });
     const supported = (safeConstructor || hasNumericHotPath ||
-      this.hasReferenceFieldCursorShape(method) ||
+      this.hasReferenceFieldHelperShape(method) ||
       this.hasBackwardBranch(method) ||
       this.hasCallDenseComputeShape(method, codeItems) ||
       this.isShortSupportedHelper(method)) &&

@@ -1183,13 +1183,18 @@ public class ReferenceCursorHarness {
     if (mode != 0) diagnostic = -122;
     return value;
   }
+  void unlink(boolean keep) {
+    if (keep || cursor == null) return;
+    cursor.cursor = null;
+    cursor = null;
+  }
 }
 `);
   const jvm = new JVM({classpath, jit: {warmupThreshold: 0}});
   const classData = await jvm.loadClassByName('ReferenceCursorHarness');
   const method = jvm.findMethod(classData, 'step',
     '(I)LReferenceCursorHarness;');
-  t.ok(jvm.jit.isReferenceFieldCursorJsPreferred(method),
+  t.ok(jvm.jit.isReferenceFieldHelperJsPreferred(method),
     'structure selects an arbitrary acyclic reference cursor');
   jvm.jit.wasmJit.enabled = true;
   jvm.jit.wasmJit.state.set(method, {
@@ -1223,6 +1228,17 @@ public class ReferenceCursorHarness {
     'generated cursor execution advances the reference link');
   t.equal(classData.staticFields.get('diagnostic:I'), -122,
     'the admitted primitive static side effect is preserved');
+  const unlink = jvm.findMethod(classData, 'unlink', '(Z)V');
+  t.ok(jvm.jit.isReferenceFieldHelperJsPreferred(unlink),
+    'the same structural rule selects a bounded void link mutator');
+  receiver.fields['ReferenceCursorHarness.cursor'] = value;
+  value.fields['ReferenceCursorHarness.cursor'] = tail;
+  await invoke(jvm, thread, 'ReferenceCursorHarness', 'unlink', '(Z)V',
+    [receiver, 0]);
+  t.equal(receiver.fields['ReferenceCursorHarness.cursor'], null,
+    'generated void helper clears the receiver link');
+  t.equal(value.fields['ReferenceCursorHarness.cursor'], null,
+    'generated void helper preserves the nested link update');
   t.end();
 });
 
