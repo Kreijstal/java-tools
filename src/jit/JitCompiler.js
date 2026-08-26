@@ -1097,9 +1097,15 @@ class JitCompiler {
       }
       if (op?.startsWith("invoke") || op === "new" || op === "newarray" ||
           op === "anewarray" || op === "multianewarray" ||
-          op === "getstatic" || op === "athrow" ||
+          op === "getstatic" ||
           op === "monitorenter" || op === "monitorexit" ||
           PRIMITIVE_ARRAY_ACCESS_OPCODES.has(op)) rejected = true;
+    }
+    // Some bytecode producers retain an athrow sentinel after an unconditional
+    // return. It has no semantic path and must not poison an otherwise bounded
+    // helper; a reachable throw still requires canonical frame restoration.
+    if (normalFlowContains(items, (_instruction, op) => op === "athrow")) {
+      rejected = true;
     }
     // Small acyclic cursor/link methods manipulate only an object's
     // reference links. Running each as a scheduled Wasm frame costs much more

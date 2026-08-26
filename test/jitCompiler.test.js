@@ -1289,6 +1289,13 @@ public class ReferenceCursorHarness {
     'the resolved-target path also avoids a child frame');
   t.equal(receiver.fields['ReferenceCursorHarness.cursor'], null,
     'the resolved-target positional edge preserves cleanup effects');
+  const clearCode = clear.attributes.find(attribute => attribute.type === 'code')
+    .code.codeItems;
+  clearCode.push({instruction: 'athrow'});
+  jvm.jit.referenceFieldHelperJsMethods.delete(clear);
+  jvm.jit.codegenSupportCache.delete(clear);
+  t.ok(jvm.jit.isReferenceFieldHelperJsPreferred(clear),
+    'an unreachable throw sentinel after return does not reject cleanup');
   t.end();
 });
 
