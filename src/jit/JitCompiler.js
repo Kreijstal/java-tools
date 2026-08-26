@@ -434,6 +434,7 @@ class JitCompiler {
       options.arrayKernelWasmFirst === true ||
       Boolean(typeof process !== "undefined" && process.env &&
         process.env.JVM_ENABLE_ARRAY_KERNEL_WASM_FIRST === "1");
+    this.importedArrayLoopJsMethods = new WeakMap();
     this.dynamicArrayStructuredFirstMethods = new WeakMap();
     this.dynamicArrayStructuredFirstMethodCount = 0;
     this.dynamicArrayStructuredFirstEnabled =
@@ -690,6 +691,7 @@ class JitCompiler {
     // JVM_WASM_PREFER_FULL_COVERAGE=1.
     const wasmExitStorm = this.hasWasmExitStorm(frame.method);
     const wasmPriorityLoop = this.wasmJit.enabled && !wasmExitStorm &&
+      !this.isImportedArrayLoopJsPreferred(frame.method) &&
       (this.isOversizedLoopMethod(frame.method) ||
         this.isLongArithmeticLoopMethod(frame.method) ||
         this.isArrayKernelWasmFirstMethod(frame.method) ||
@@ -784,6 +786,7 @@ class JitCompiler {
   }
 
   hasReadyFullWasm(method) {
+    if (this.isImportedArrayLoopJsPreferred(method)) return false;
     const state = this.wasmJit.enabled && method
       ? this.wasmJit.state.get(method) : null;
     if (!state || state.status !== "ready" ||
@@ -975,6 +978,38 @@ class JitCompiler {
     this.arrayKernelWasmFirstMethods.set(method, selected);
     if (selected) this.arrayKernelWasmFirstMethodCount += 1;
     return selected;
+  }
+
+  isImportedArrayLoopJsPreferred(method) {
+    if (!method || method.name === "<init>" || method.name === "<clinit>") {
+      return false;
+    }
+    if (!Array.isArray(method.attributes) ||
+        !method.attributes.some((attribute) => attribute.type === "code")) {
+      return false;
+    }
+    if (this.importedArrayLoopJsMethods.has(method)) {
+      return this.importedArrayLoopJsMethods.get(method);
+    }
+    let primitiveArrayAccesses = 0;
+    let nativeLongOps = 0;
+    let calls = 0;
+    for (const item of this.getCodeItems(method)) {
+      const op = getOp(item && item.instruction);
+      if (PRIMITIVE_ARRAY_ACCESS_OPCODES.has(op) || op === "arraylength") {
+        primitiveArrayAccesses += 1;
+      }
+      if (WASM_NATIVE_LONG_OPS.has(op)) nativeLongOps += 1;
+      if (op && op.startsWith("invoke")) calls += 1;
+    }
+    // Primitive Java arrays live in JavaScript. Wasm imports every element
+    // access, so a raster loop pays an engine crossing for every pixel while
+    // structured JavaScript accesses the same backing arrays directly.
+    const preferred = primitiveArrayAccesses >= 2 && nativeLongOps === 0 &&
+      calls === 0 && this.hasBackwardBranch(method) &&
+      this.isCodegenSupported(method);
+    this.importedArrayLoopJsMethods.set(method, preferred);
+    return preferred;
   }
 
   isDynamicArrayStructuredFirstMethod(method) {

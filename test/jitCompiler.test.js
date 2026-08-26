@@ -1112,6 +1112,15 @@ test('dense nested array kernels select Wasm without guest-name matching', (t) =
   };
   t.ok(jvm.jit.isArrayKernelWasmFirstMethod(shape('renamedArchiveKernel')),
     'bytecode size, array density, and a backedge select the Wasm policy');
+  const rasterKernel = shape('renamedRasterKernel');
+  t.ok(jvm.jit.isImportedArrayLoopJsPreferred(rasterKernel),
+    'call-free imported-array loops prefer direct structured JavaScript');
+  jvm.jit.wasmJit.enabled = true;
+  jvm.jit.wasmJit.state.set(rasterKernel, {
+    status: 'ready', meta: {fullyCompiled: true},
+  });
+  t.notOk(jvm.jit.hasReadyFullWasm(rasterKernel),
+    'full bytecode coverage does not override per-element import locality');
   t.notOk(jvm.jit.isArrayKernelWasmFirstMethod(
     shape('anotherName', { primitiveArrayAccesses: 23 })),
   'a sparse array body retains the ordinary generated tier');
