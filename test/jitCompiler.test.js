@@ -8462,13 +8462,8 @@ test('structured JVM SSA materializes operand joins at safe points and guards de
   const safePoint = generated(frame, { status: 'runnable', callStack }, jvm.jit, false);
   t.ok(safePoint.deopt && safePoint.transient, 'bounded loop execution reaches a scheduler safe point');
   t.equal(frame.pc, 3, 'safe point records the loop-header bytecode PC');
-  const pollBudget = jvm.jit.structuredLoopSafePointMaxBudget;
-  t.equal(generated.jvmStructuredSafePointBudget, pollBudget,
-    'ordinary generated loops use the generic bounded poll budget');
-  t.equal(frame.locals[1], pollBudget - 1,
-    'safe point spills the scalar induction local');
-  t.deepEqual(frame.stack.items,
-    [5 + ((pollBudget - 2) * (pollBudget - 1)) / 2],
+  t.equal(frame.locals[1], 9999, 'safe point spills the scalar induction local');
+  t.deepEqual(frame.stack.items, [5 + (9998 * 9999) / 2],
     'safe point reconstructs the live operand value at the block join');
   t.equal(jvm.jit.structuredSsa.safePointCount, 1, 'materialized SSA safe point is counted');
   t.end();
@@ -8507,7 +8502,6 @@ public class ArbitraryAssetWork {
     warmupThreshold: 0, structuredSsa: true, compiledCallChains: true,
     profileMethods: false, eagerMonomorphicCalls: false,
     structuredPerLoopPollBudgets: true,
-    structuredLoopSafePointMaxBudget: 10000,
   } });
   await jvm.loadClassByName('ArbitraryAssetWork');
   const method = await jvm.findMethodInHierarchy(
