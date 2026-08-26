@@ -694,15 +694,14 @@ class JitCompiler {
     const wasmExitStorm = this.hasWasmExitStorm(frame.method);
     const wasmPriorityLoop = this.wasmJit.enabled && !wasmExitStorm &&
       !this.isImportedArrayJsClosurePreferred(frame.method) &&
+      !this.isCallGraphStructuredFirstMethod(frame.method) &&
       (this.isOversizedLoopMethod(frame.method) ||
         this.isLongArithmeticLoopMethod(frame.method) ||
         this.isArrayKernelWasmFirstMethod(frame.method) ||
         readyFullWasm ||
         this.wasmJit.probeFullCoverage(frame));
     const wholeMethodPreferred = wasmExitStorm ||
-      (this.prefersWholeMethodJs(frame.method) ||
-        this.isDynamicArrayStructuredFirstMethod(frame.method) ||
-        this.isReferenceFieldHelperJsPreferred(frame.method)) &&
+      this.isWholeMethodJsEntryPreferred(frame.method) &&
       !wasmPriorityLoop;
     if (wholeMethodPreferred && canProbeGenerated) {
       const publishedStructured = this.codegenCache.get(frame.method);
@@ -1201,6 +1200,13 @@ class JitCompiler {
   prefersWholeMethodJs(method) {
     return this.preferWholeMethodJs ||
       this.adaptiveCodegenMethods.has(method);
+  }
+
+  isWholeMethodJsEntryPreferred(method) {
+    return this.prefersWholeMethodJs(method) ||
+      this.isDynamicArrayStructuredFirstMethod(method) ||
+      this.isReferenceFieldHelperJsPreferred(method) ||
+      this.isCallGraphStructuredFirstMethod(method);
   }
 
   shouldCompileHotCallGraphRegion(method) {

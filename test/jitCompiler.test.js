@@ -130,6 +130,8 @@ test('substantial call-bearing loops prefer whole call-graph lowering', (t) => {
   const jvm = new JVM({jit: {hotCallGraphRegions: true}});
   t.ok(jvm.jit.isCallGraphStructuredFirstMethod(method),
     'bytecode size, call density, and a backedge select the complete CFG');
+  t.ok(jvm.jit.isWholeMethodJsEntryPreferred(method),
+    'the selected call graph reaches whole-method entry policy');
   const shortMethod = {
     ...method,
     attributes: [{type: 'code', code: {
