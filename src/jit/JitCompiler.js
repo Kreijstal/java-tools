@@ -436,14 +436,6 @@ class JitCompiler {
         process.env.JVM_ENABLE_ARRAY_KERNEL_WASM_FIRST === "1");
     this.importedArrayLoopJsMethods = new WeakMap();
     this.importedArrayJsClosureMethods = new WeakMap();
-    const browserUserAgent = typeof navigator !== "undefined"
-      ? navigator.userAgent || "" : "";
-    // V8 optimizes the generated direct array loops much better than a Wasm
-    // module that imports every Java-array access. SpiderMonkey shows the
-    // inverse tradeoff for these large raster bodies, so retain its complete
-    // Wasm tier. Keep an explicit option for embedders and deterministic A/Bs.
-    this.importedArrayJsLocalityEnabled =
-      options.importedArrayJsLocality ?? !/Firefox\//.test(browserUserAgent);
     this.dynamicArrayStructuredFirstMethods = new WeakMap();
     this.dynamicArrayStructuredFirstMethodCount = 0;
     this.dynamicArrayStructuredFirstEnabled =
@@ -1022,7 +1014,7 @@ class JitCompiler {
   }
 
   isImportedArrayJsClosurePreferred(method, visiting = null) {
-    if (!this.importedArrayJsLocalityEnabled || !method) return false;
+    if (!method) return false;
     if (this.importedArrayJsClosureMethods.has(method)) {
       return this.importedArrayJsClosureMethods.get(method);
     }
