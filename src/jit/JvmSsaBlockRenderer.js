@@ -4892,7 +4892,34 @@ class JvmSsaBlockRenderer {
                     "  }",
                     "}",
                   ],
-                  ordinary: [],
+                  // Ordinary compiled call chains cannot suspend a lexical
+                  // iterator, but this boundary is still before the child
+                  // call and therefore before any of its effects. Spill the
+                  // exact invoke state and return to the scheduler when the
+                  // accumulated child-work charge reaches an expired browser
+                  // deadline. The next turn resumes canonically at the call;
+                  // no child work is repeated or partially committed.
+                  ordinary: [
+                    `safePointBudget = Math.min(safePointBudget, ${
+                      this.jit.positionalCallSafePointPollBudget});`,
+                    `safePointBudget -= ((${positionalRawInvoke} || ` +
+                      `${positionalInvoke}).jvmSafePointCharge || 0);`,
+                    "if (safePointBudget <= 0) {",
+                    "  if (helpers.continueStructuredQuantum(thread)) {",
+                    `    safePointBudget = ${
+                      this.jit.positionalCallSafePointPollBudget};`,
+                    "  } else {",
+                    ...materializeLines(callStack, index)
+                      .map((line) => `    ${line}`),
+                    "    helpers.structuredSsa.safePointCount += 1;",
+                    `    safePointBudget = ${
+                      this.jit.positionalCallSafePointPollBudget};`,
+                    "    helpers.skipJitOnce(frame);",
+                    "    return { deopt: true, transient: true, " +
+                      "reason: 'structured SSA positional quantum' };",
+                    "  }",
+                    "}",
+                  ],
                   checkedLeaf: [],
                 });
               }

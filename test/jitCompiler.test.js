@@ -12621,7 +12621,7 @@ public final class PositionalQuantumPollHarness {
     'safePointBudget = Math.min(safePointBudget, 256);'),
   'the child-work poll clamps an inherited long parent quantum');
   t.notOk(generated.jvmRestoringDirectPositionalSource?.includes(
-    "reason: 'structured SSA positional quantum'"),
+    "yield { deopt: true, transient: true, reason: 'structured SSA positional quantum'"),
   'ordinary restoring entries do not acquire an invalid generator yield');
 
   cursor[0] = 0;
@@ -12638,6 +12638,53 @@ public final class PositionalQuantumPollHarness {
   t.ok(cursor[0] > 0 && cursor[0] < 19999,
     'the quantum yields after real progress but before completion');
   jvm.jit.continueStructuredQuantum = continueStructuredQuantum;
+
+  const ordinaryJvm = new JVM({ classpath, jit: {
+    warmupThreshold: 0,
+    preferWholeMethodJs: true,
+    structuredSsa: true,
+    compiledCallChains: true,
+    positionalCallSafePointPolling: true,
+    profileMethods: false,
+  } });
+  await ordinaryJvm.loadClassByName(className);
+  ordinaryJvm.classInitializationState.set(className, 'INITIALIZED');
+  const ordinaryCaller = await ordinaryJvm.findMethodInHierarchy(
+    className, 'accumulate', '(I[I)I');
+  const ordinaryGenerated = ordinaryJvm.jit.structuredSsa.compile(
+    ordinaryCaller);
+  t.ok(ordinaryGenerated?.jvmAdaptivePositionalOrdinary,
+    'a compiled call chain selects the ordinary adaptive body');
+  t.ok(ordinaryGenerated.jvmAdaptivePositionalSource.includes(
+    "reason: 'structured SSA positional quantum'"),
+  'ordinary compiled chains retain an exact pre-child scheduler boundary');
+
+  const ordinaryCursor = [0];
+  ordinaryCursor.type = '[I';
+  const ordinaryFrame = new Frame(ordinaryCaller);
+  ordinaryFrame.className = className;
+  ordinaryFrame.locals[0] = 20000;
+  ordinaryFrame.locals[1] = ordinaryCursor;
+  const ordinaryThread = {
+    id: 1, name: 'ordinary-positional-quantum', status: 'runnable',
+    pendingException: null, callStack: new Stack(),
+  };
+  ordinaryThread.callStack.push(ordinaryFrame);
+  ordinaryJvm.threads = [ordinaryThread];
+  ordinaryJvm._nextEventLoopYieldAt = 0;
+  const ordinaryYield = ordinaryGenerated(
+    ordinaryFrame, ordinaryThread, ordinaryJvm.jit, false);
+  t.ok(ordinaryYield?.deopt && ordinaryYield.transient,
+    'ordinary call chains return to the scheduler after charged child work');
+  t.equal(ordinaryYield.reason, 'structured SSA positional quantum',
+    'ordinary call-chain handoff reports the positional boundary');
+  t.ok(ordinaryCursor[0] > 0 && ordinaryCursor[0] < 19999,
+    'ordinary call-chain handoff preserves completed child progress');
+  const invokeIndex = ordinaryFrame.instructions.findIndex((item) =>
+    (typeof item.instruction === 'string'
+      ? item.instruction : item.instruction?.op) === 'invokestatic');
+  t.equal(ordinaryFrame.pc, invokeIndex,
+    'ordinary call-chain handoff records the exact pending invoke PC');
   t.end();
 });
 
