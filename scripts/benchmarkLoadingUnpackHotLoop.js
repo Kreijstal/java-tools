@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 
-// Minimal reproducer harness for the Tomb Racer LOADING slowdown.
+// Minimal reproducer harness for an archive-unpacking slowdown.
 //
 // Loading is JS-region-tier bound (~20:1 region-tier runs vs wasm runs), so
 // unlike benchmarkCallBoundaryHotLoop.js (which isolates the wasm-tier call

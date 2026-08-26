@@ -2714,7 +2714,7 @@ class WasmJit {
   }
 
   // Does wasm cover this method END TO END? The JS tier is consulted first,
-  // so a method it can compile never reaches the gate at all — on Tomb Racer
+  // so a method it can compile never reaches the gate at all; in the regression
   // that is over half of guest-compiled time, and it is why relaxing gate
   // rules (the reference-return test) measured flat: the relaxed rule sits
   // downstream of a gate nothing asks. Order matters, so ask once here.

@@ -21,7 +21,7 @@ function toOutputOptions(formatFields, bufferSize) {
 // Neither backend can report buffer occupancy: MockAudioOutput discards the
 // payload and node's `speaker` is a plain stream. Without a model of the drain,
 // available() reports a permanently empty buffer, the guest's own throttle
-// never engages, and the audio pump spins -- on Tomb Racer that inflated the
+// never engages, and the audio pump spins, inflating the
 // pump from 5.7k to 920k calls and post-logo loading by 2.4x. Model the line
 // draining at its own sample rate so the producer sees real backpressure while
 // the samples still reach the device.

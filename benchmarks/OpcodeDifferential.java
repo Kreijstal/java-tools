@@ -4,7 +4,7 @@
  * The structured backend (StructuredWasmCompiler.emitNode) and the dispatcher
  * backend (WasmJit) are SEPARATE emitters for the same bytecode, so a lowering
  * bug in one is invisible to the other -- and invisible to the whole test
- * suite, which never compares them against a real JVM. Tomb Racer's kr.e is
+ * suite, which never compares them against a real JVM. The original regression is
  * miscompiled by the structured backend and compiled correctly by the
  * dispatcher, with 516 wasm tests passing either way; this exists so that
  * class of bug fails a test instead of corrupting a guest array index.
@@ -206,7 +206,7 @@ public class OpcodeDifferential {
   }
 
   /*
-   * The shape of a bytecode-stream decoder, which is what Tomb Racer's kr.e
+   * The shape of a bytecode-stream decoder from the original regression
    * is: a loop of static helper calls that each advance a position field on
    * the receiver and return a byte, with the decoded values then used as
    * array indices. The interesting part is the interaction, not any one
@@ -302,7 +302,7 @@ public class OpcodeDifferential {
    * values back into frame.locals, and it only writes the slots the SSA
    * builder recorded as reaching that block. Any live slot it misses keeps its
    * method-entry value when the interpreter resumes, so a loop bound can come
-   * back stale and overrun its array by one. Tomb Racer's kr.e has 35 locals;
+   * back stale and overrun its array by one. The regression has 35 locals;
    * the other shapes here have under ten, which is not enough pressure.
    * Run with a small JVM_WASM_FUEL to force the spill path repeatedly.
    */
@@ -339,7 +339,7 @@ public class OpcodeDifferential {
    * single RPO pass over the phis merges that to "no kind" because the body's
    * value is not kinded yet. Consumers read an unkinded phi as a dead slot, so
    * the fuel-exit spill used to drop it and the interpreter resumed on the
-   * stale entry value -- which is how Tomb Racer's kr.e lost the byte[6] in
+   * stale entry value -- which is how the regression lost the byte[6] in
    * slot 27 and indexed past its end. Reference slots matter most: a dropped
    * array reference means the next access uses the wrong array entirely.
    * Run with a small JVM_WASM_FUEL so the spill path actually executes.

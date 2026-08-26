@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 
-// Minimal reproducer harness for the Tomb Racer post-logo ~11x gap.
+// Minimal reproducer harness for an approximately 11x call-boundary gap.
 //
 // Runs benchmarks/CallBoundaryHotLoop.java on HotSpot and on the JS JVM's
 // production wasm tier (JVM_WASM_JIT=1), and prints per-shape slowdowns.

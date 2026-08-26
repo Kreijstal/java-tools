@@ -83,7 +83,7 @@ class JitCompiler {
       Number(process.env.JVM_JIT_WARMUP || 2);
     // A method containing a backward branch bypasses the warmup threshold and
     // compiles on its FIRST invocation, because one call can run a long loop.
-    // Unconditionally, though, that is why Tomb Racer compiles 597 guest
+    // Unconditionally, though, that is why the regression compiles 597 guest
     // methods to service the 41 that hold 90% of guest time, at ~30s of
     // synchronous codegen. Set this to also require N invocations before a
     // loop-bearing method is compiled. Unset keeps the immediate-compile
@@ -137,7 +137,7 @@ class JitCompiler {
     this.legacySyncCallSites = new Map();
     this.generatedTargetsByMethod = new WeakMap();
     this.generatedTargetUpgradePublicationCount = 0;
-    // OFF BY DEFAULT: this miscompiles. On Tomb Racer it corrupts a reference
+    // OFF BY DEFAULT: this miscompiles by corrupting a reference
     // local in dj.b(IIIIII)V -- slot 10 holds the hr returned by an invoke, and
     // with eager linking on it instead reads back a raw int, which faults at
     // that local's first use as "Unsupported invokevirtual ... declared hr".
@@ -1929,7 +1929,7 @@ class JitCompiler {
     const codeItems = this.getCodeItems(method);
     // NOTE: no opaque-control rejection here, deliberately. Unlike isSupported,
     // this tier has always accepted those methods once they pass warmup, and
-    // they are among the largest hot bodies in a Tomb Racer boot — adding the
+    // they are among the largest hot bodies in the regression boot; adding the
     // restriction here costs the boot >70 s.
     const safeConstructor = this.hotLoopConstructorsEnabled &&
       this.isJitSafeConstructor(method, codeItems);
@@ -4965,7 +4965,7 @@ class JitCompiler {
       // module when prep.osr is set. execute() picks the module from its osr
       // flag, so dropping it here ran the STRUCTURED PRIMARY at the
       // companion's block id — a wrong entry point that silently corrupted
-      // state (kr.e's bzip2 selector on Tomb Racer, AIOOBE 6/6 downstream).
+      // state (a bzip2 selector in the regression, AIOOBE 6/6 downstream).
       result = this.wasmJit.execute(
         frame, thread, prep.st, prep.blk, true, prep.osr === true);
     } catch (error) {

@@ -494,7 +494,7 @@ function fillPhiArgs(blocks, rpo, isJoin, makeValue, paramSlots) {
   // That is not cosmetic. Consumers treat a null-kinded phi as a dead slot:
   // StructuredWasmCompiler's fuel-exit spill skips it, so the value the wasm
   // module computed is never written back to frame.locals and the interpreter
-  // resumes on the stale entry value. On Tomb Racer's kr.e that dropped slot
+  // resumes on the stale entry value. In the regression that dropped slot
   // 27 (a byte[6]) and slots 30-34, and the guest died with an index past the
   // end of the array those slots held.
   //

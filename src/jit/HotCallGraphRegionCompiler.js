@@ -1509,7 +1509,7 @@ class HotCallGraphRegionCompiler {
     this.compactClosedInternalCalls =
       environment.JVM_DISABLE_HOT_CALL_GRAPH_COMPACT_INTERNAL_CALLS !== "1";
     // Post-render outlining is retained as a differential experiment. The
-    // Tomb Racer measurement showed that even a positional live-in/live-out
+    // Regression measurement showed that even a positional live-in/live-out
     // ABI does not recover the cost of already-expanded cold JVM paths. The
     // production refactor must split verified CFG/SSA before source emission.
     this.loopOutliningEnabled =
@@ -2260,7 +2260,7 @@ class HotCallGraphRegionCompiler {
       // thread yield) after restoring its omitted frames onto the call stack.
       // A bare-call lowering discards that result, so the root would keep
       // executing past the call while the suspended child chain sits on the
-      // stack — on Tomb Racer this ran dh.a before ck.a's scatter and read a
+      // stack; the regression ran a consumer before its producer and read a
       // stale pq.f/aia.t (596-face leftovers against a 124-face model). Only
       // atomic children (or exceptional-inline edges, whose guarded fallback
       // re-runs the original checked span) may lose the scaffold; everyone

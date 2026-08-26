@@ -1,5 +1,5 @@
 /**
- * Minimal hot-loop reproducer for the Tomb Racer LOADING slowdown.
+ * Minimal hot-loop reproducer for an archive-unpacking slowdown.
  *
  * Loading is bound on the JS region tier (~3.7M region-tier runs vs ~180k
  * wasm runs during one boot), and its hot methods are buffer unpackers:

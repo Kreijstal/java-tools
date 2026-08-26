@@ -11107,7 +11107,7 @@ class JvmSsaBlockRenderer {
         // nothing withdrew the restored frame, so a normal return stranded a
         // pc-0 Frame on the call stack. The scheduler would later run that
         // frame from scratch (re-executing the method) while the real caller
-        // had already continued — on Tomb Racer this re-ran nm.a after gga.b
+        // had already continued; the regression re-ran a completed callee
         // moved on and desynchronized the render pipeline. Withdraw the frame
         // as soon as a call block completes normally; any later throwing or
         // spilling site re-restores it through its own `frame === null`

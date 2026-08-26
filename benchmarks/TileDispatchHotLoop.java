@@ -1,5 +1,5 @@
 /**
- * Reduced hot loop for the Tomb Racer post-logo loading gap.
+ * Reduced hot loop for a dispatch-heavy loading gap.
  *
  * Derived from a boot CPU profile of tombracer on jvm.js. The single largest
  * guest-attributed cost in that profile is a tile-grid layout method whose

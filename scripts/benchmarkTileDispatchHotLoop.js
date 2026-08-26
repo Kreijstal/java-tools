@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 
-// Reduced-hot-loop harness for the Tomb Racer post-logo loading gap.
+// Reduced-hot-loop harness for a dispatch-heavy loading gap.
 //
 // Runs benchmarks/TileDispatchHotLoop.java on HotSpot and on jvm.js and prints
 // a per-shape slowdown. The shapes isolate the call-boundary kinds that

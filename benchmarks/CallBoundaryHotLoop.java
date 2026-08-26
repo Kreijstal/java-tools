@@ -1,5 +1,5 @@
 /**
- * Minimal hot-loop reproducer for the Tomb Racer post-logo slowdown.
+ * Minimal hot-loop reproducer for a call-boundary slowdown.
  *
  * Three loops isolate the blend that produces the whole-app ~11x gap on the
  * production wasm tier:
