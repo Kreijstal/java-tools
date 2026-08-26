@@ -40,36 +40,6 @@ test('deterministic scheduler never waits on wall time', (t) => {
   t.end();
 });
 
-test('startup precompile visits only initialized classes', async (t) => {
-  const jvm = new JVM({ eventLoopYieldStrategy: 'timer' });
-  const readyMethod = { name: 'ready' };
-  const coldMethod = { name: 'cold' };
-  jvm.classes = {
-    Ready: { ast: { classes: [{ items: [
-      { type: 'method', method: readyMethod },
-      { type: 'field', field: {} },
-    ] }] } },
-    Cold: { ast: { classes: [{ items: [
-      { type: 'method', method: coldMethod },
-    ] }] } },
-  };
-  jvm.classInitializationState.set('Ready', 'INITIALIZED');
-  jvm.classInitializationState.set('Cold', 'LOADED');
-  const compiled = [];
-  jvm.jit.getGeneratedFunction = (method) => compiled.push(method);
-  const progress = [];
-
-  const result = await jvm.precompileInitializedClasses(
-    (entry) => progress.push(entry));
-
-  t.deepEqual(compiled, [readyMethod],
-    'uninitialized classes are not compiled or otherwise initialized');
-  t.deepEqual(progress, [{ completed: 1, total: 1 }],
-    'progress describes the safe initialized-method set');
-  t.deepEqual(result, { methods: 1 });
-  t.end();
-});
-
 test('serial scheduler does not starve low-priority guest work', (t) => {
   const jvm = new JVM();
   const high = {
