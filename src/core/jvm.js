@@ -673,12 +673,6 @@ class JVM {
     this.threads = [];
     this.currentThreadIndex = 0;
 
-    if (Array.isArray(options.precompileClasses) &&
-        options.precompileClasses.length > 0) {
-      await this.precompileClasses(options.precompileClasses,
-        options.onPrecompileProgress);
-    }
-
     const classData = await this.loadClassByName(mainClassName);
     if (!classData || !classData.ast) {
       throw new Error(`Class not found: ${mainClassName}`);
@@ -1077,36 +1071,6 @@ class JVM {
     }
 
     return { paused: true, completed: false };
-  }
-
-  async precompileClasses(classFiles, onProgress = null) {
-    const classNames = [...new Set(classFiles.map((entry) => {
-      let value = String(entry || "").replace(/\\/g, "/");
-      value = value.replace(/^.*?\/classes\//, "").replace(/^\/+/, "");
-      return value.endsWith(".class") ? value.slice(0, -6) : value;
-    }).filter(Boolean))];
-    const loaded = [];
-    for (const className of classNames) {
-      const classData = await this.loadClassByName(className).catch(() => null);
-      if (classData?.ast?.classes?.[0]) loaded.push(classData);
-    }
-    let completed = 0;
-    const methods = loaded.flatMap((classData) =>
-      classData.ast.classes[0].items
-        .filter((item) => item?.type === "method" && item.method)
-        .map((item) => item.method));
-    for (const method of methods) {
-      this.jit.getGeneratedFunction(method);
-      completed += 1;
-      if (typeof onProgress === "function") {
-        onProgress({ completed, total: methods.length });
-      }
-      // Parsing and validating a large generated body can be expensive. This
-      // phase deliberately runs before guest execution, but still yields so a
-      // browser can update its startup UI instead of reporting a hung page.
-      await yieldToEventLoop(0, this.eventLoopYieldStrategy);
-    }
-    return { classes: loaded.length, methods: methods.length };
   }
 
   enqueueAwtEventInvocation(listener, methodName, descriptor, event, coalesce = false) {

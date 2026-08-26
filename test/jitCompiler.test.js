@@ -162,35 +162,6 @@ test('substantial call-bearing loops prefer whole call-graph lowering', (t) => {
   t.end();
 });
 
-test('run can precompile an explicit class set before guest execution', async (t) => {
-  const classpath = compileJavaFixture(t, 'ArbitraryPrecompileHarness', `
-public class ArbitraryPrecompileHarness {
-  static int unused(int[] values) {
-    int sum = 0;
-    for (int value : values) sum += value;
-    return sum;
-  }
-  public static void main(String[] args) {}
-}
-`);
-  const progress = [];
-  const jvm = new JVM({ classpath, jit: {
-    warmupThreshold: 0, structuredSsa: true, profileMethods: false,
-  } });
-  await jvm.run('ArbitraryPrecompileHarness', {
-    precompileClasses: ['/classes/ArbitraryPrecompileHarness.class'],
-    onPrecompileProgress: value => progress.push(value),
-  });
-  const method = await jvm.findMethodInHierarchy(
-    'ArbitraryPrecompileHarness', 'unused', '([I)I');
-  t.ok(jvm.jit.codegenCache.get(method),
-    'an otherwise uncalled eligible method is compiled before main runs');
-  t.ok(progress.length > 0 &&
-    progress.at(-1).completed === progress.at(-1).total,
-  'precompile progress reaches the complete generic method set');
-  t.end();
-});
-
 test('operand-stack clearing preserves generated backing-array aliases', (t) => {
   const stack = new Stack();
   const generatedAlias = stack.items;
