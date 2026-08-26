@@ -1169,6 +1169,7 @@ test('dense nested array kernels select Wasm without guest-name matching', (t) =
 test('small reference-field cursors stay in positional JavaScript', async (t) => {
   const classpath = compileJavaFixture(t, 'ReferenceCursorHarness', `
 public class ReferenceCursorHarness {
+  static int diagnostic;
   ReferenceCursorHarness head;
   ReferenceCursorHarness cursor;
   ReferenceCursorHarness step(int mode) {
@@ -1179,6 +1180,7 @@ public class ReferenceCursorHarness {
       return null;
     }
     cursor = value.cursor;
+    if (mode != 0) diagnostic = -122;
     return value;
   }
 }
@@ -1195,6 +1197,32 @@ public class ReferenceCursorHarness {
   });
   t.notOk(jvm.jit.hasReadyFullWasm(method),
     'ready Wasm cannot withdraw the positional cursor body');
+  classData.staticFieldsInitialized = true;
+  classData.staticFields.set('diagnostic:I', 0);
+  jvm.classInitializationState.set('ReferenceCursorHarness', 'INITIALIZED');
+  const tail = {type: 'ReferenceCursorHarness', fields: {
+    'ReferenceCursorHarness.cursor': null,
+  }};
+  const value = {type: 'ReferenceCursorHarness', fields: {
+    'ReferenceCursorHarness.cursor': tail,
+  }};
+  const head = {type: 'ReferenceCursorHarness', fields: {}};
+  const receiver = {type: 'ReferenceCursorHarness', fields: {
+    'ReferenceCursorHarness.head': head,
+    'ReferenceCursorHarness.cursor': value,
+  }};
+  const thread = {
+    id: 0, name: 'reference-cursor', callStack: new Stack(),
+    status: 'runnable', pendingException: null,
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+  await invoke(jvm, thread, 'ReferenceCursorHarness', 'step',
+    '(I)LReferenceCursorHarness;', [receiver, 1]);
+  t.equal(receiver.fields['ReferenceCursorHarness.cursor'], tail,
+    'generated cursor execution advances the reference link');
+  t.equal(classData.staticFields.get('diagnostic:I'), -122,
+    'the admitted primitive static side effect is preserved');
   t.end();
 });
 

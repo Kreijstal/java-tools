@@ -1068,16 +1068,30 @@ class JitCompiler {
       (!/^(void|boolean|byte|char|short|int|long|float|double)$/.test(
         parsed.returnType));
     const items = this.getCodeItems(method);
+    const methodOwner = this.jvm.findClassNameForMethod?.(method) ||
+      method.className || "";
     let fieldReads = 0;
     let fieldWrites = 0;
+    let primitiveOwnStaticWrites = 0;
     let rejected = items.length === 0 || items.length > 64;
     for (const item of items) {
       const op = getOp(item?.instruction);
       if (op === "getfield") fieldReads += 1;
       else if (op === "putfield") fieldWrites += 1;
+      else if (op === "putstatic") {
+        const field = item?.instruction?.arg;
+        const descriptor = Array.isArray(field) && Array.isArray(field[2])
+          ? field[2][1] : null;
+        if (field?.[1] === methodOwner &&
+            /^(?:Z|B|C|S|I|J|F|D)$/.test(descriptor || "")) {
+          primitiveOwnStaticWrites += 1;
+        } else {
+          rejected = true;
+        }
+      }
       if (op?.startsWith("invoke") || op === "new" || op === "newarray" ||
           op === "anewarray" || op === "multianewarray" ||
-          op === "getstatic" || op === "putstatic" || op === "athrow" ||
+          op === "getstatic" || op === "athrow" ||
           op === "monitorenter" || op === "monitorexit" ||
           PRIMITIVE_ARRAY_ACCESS_OPCODES.has(op)) rejected = true;
     }
@@ -1086,7 +1100,8 @@ class JitCompiler {
     // than its useful work; generated positional JS keeps the receiver and
     // return reference in one representation and call tier.
     return referenceReturn && fieldReads > 0 && fieldWrites > 0 &&
-      !rejected && !this.hasBackwardBranch(method);
+      primitiveOwnStaticWrites <= 1 && !rejected &&
+      !this.hasBackwardBranch(method);
   }
 
   isReferenceFieldCursorJsPreferred(method) {
