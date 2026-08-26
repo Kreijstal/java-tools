@@ -435,6 +435,7 @@ class JitCompiler {
       Boolean(typeof process !== "undefined" && process.env &&
         process.env.JVM_ENABLE_ARRAY_KERNEL_WASM_FIRST === "1");
     this.importedArrayLoopJsMethods = new WeakMap();
+    this.importedArrayJsClosureMethods = new WeakMap();
     this.dynamicArrayStructuredFirstMethods = new WeakMap();
     this.dynamicArrayStructuredFirstMethodCount = 0;
     this.dynamicArrayStructuredFirstEnabled =
@@ -691,7 +692,7 @@ class JitCompiler {
     // JVM_WASM_PREFER_FULL_COVERAGE=1.
     const wasmExitStorm = this.hasWasmExitStorm(frame.method);
     const wasmPriorityLoop = this.wasmJit.enabled && !wasmExitStorm &&
-      !this.isImportedArrayLoopJsPreferred(frame.method) &&
+      !this.isImportedArrayJsClosurePreferred(frame.method) &&
       (this.isOversizedLoopMethod(frame.method) ||
         this.isLongArithmeticLoopMethod(frame.method) ||
         this.isArrayKernelWasmFirstMethod(frame.method) ||
@@ -786,7 +787,7 @@ class JitCompiler {
   }
 
   hasReadyFullWasm(method) {
-    if (this.isImportedArrayLoopJsPreferred(method)) return false;
+    if (this.isImportedArrayJsClosurePreferred(method)) return false;
     const state = this.wasmJit.enabled && method
       ? this.wasmJit.state.get(method) : null;
     if (!state || state.status !== "ready" ||
@@ -1009,6 +1010,42 @@ class JitCompiler {
       calls === 0 && this.hasBackwardBranch(method) &&
       this.isCodegenSupported(method);
     this.importedArrayLoopJsMethods.set(method, preferred);
+    return preferred;
+  }
+
+  isImportedArrayJsClosurePreferred(method, visiting = null) {
+    if (!method) return false;
+    if (this.importedArrayJsClosureMethods.has(method)) {
+      return this.importedArrayJsClosureMethods.get(method);
+    }
+    if (this.isImportedArrayLoopJsPreferred(method)) {
+      this.importedArrayJsClosureMethods.set(method, true);
+      return true;
+    }
+    const active = visiting || new Set();
+    if (active.has(method)) return false;
+    active.add(method);
+    const owner = this.jvm.findClassNameForMethod?.(method) ||
+      method.className || "";
+    const classData = owner && this.jvm.classes[owner];
+    let preferred = false;
+    if (classData) {
+      for (const item of this.getCodeItems(method)) {
+        const instruction = item && item.instruction;
+        if (getOp(instruction) !== "invokestatic" ||
+            !Array.isArray(instruction.arg) ||
+            instruction.arg[1] !== owner ||
+            !Array.isArray(instruction.arg[2])) continue;
+        const target = this.jvm.findMethod(classData,
+          instruction.arg[2][0], instruction.arg[2][1]);
+        if (target && this.isImportedArrayJsClosurePreferred(target, active)) {
+          preferred = true;
+          break;
+        }
+      }
+    }
+    active.delete(method);
+    this.importedArrayJsClosureMethods.set(method, preferred);
     return preferred;
   }
 

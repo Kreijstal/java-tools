@@ -1121,6 +1121,31 @@ test('dense nested array kernels select Wasm without guest-name matching', (t) =
   });
   t.notOk(jvm.jit.hasReadyFullWasm(rasterKernel),
     'full bytecode coverage does not override per-element import locality');
+  const wrapper = {
+    name: 'renamedRasterWrapper', descriptor: '(II)V',
+    flags: ['private'],
+    attributes: [{ type: 'code', code: { codeItems: [{
+      labelDef: 'Lentry:', instruction: { op: 'invokestatic',
+        arg: ['Method', 'ArbitraryRasterOwner',
+          ['renamedRasterKernel', '([[I[I)V']] },
+    }, { labelDef: 'Lreturn:', instruction: 'return' }],
+    exceptionTable: [] } }],
+  };
+  rasterKernel.className = 'ArbitraryRasterOwner';
+  wrapper.className = 'ArbitraryRasterOwner';
+  jvm.classes.ArbitraryRasterOwner = { ast: { classes: [{
+    className: 'ArbitraryRasterOwner', items: [
+      { type: 'method', method: rasterKernel },
+      { type: 'method', method: wrapper },
+    ],
+  }] } };
+  t.ok(jvm.jit.isImportedArrayJsClosurePreferred(wrapper),
+    'a same-class static wrapper remains in JavaScript with its array loop');
+  jvm.jit.wasmJit.state.set(wrapper, {
+    status: 'ready', meta: {fullyCompiled: true},
+  });
+  t.notOk(jvm.jit.hasReadyFullWasm(wrapper),
+    'Wasm readiness cannot split a wrapper from its imported-array callee');
   t.notOk(jvm.jit.isArrayKernelWasmFirstMethod(
     shape('anotherName', { primitiveArrayAccesses: 23 })),
   'a sparse array body retains the ordinary generated tier');
