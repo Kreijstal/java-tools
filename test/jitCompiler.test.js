@@ -1277,6 +1277,18 @@ public class ReferenceCursorHarness {
     'the interpreter positional edge preserves the second field clear');
   t.equal(classData.staticFields.get('diagnostic:I'), 41,
     'the interpreter positional edge preserves the static effect');
+  receiver.fields['ReferenceCursorHarness.head'] = head;
+  receiver.fields['ReferenceCursorHarness.cursor'] = value;
+  classData.staticFields.set('diagnostic:I', 0);
+  parent.stack.items.push(receiver, 1);
+  const resolvedDepth = thread.callStack.size();
+  jvm.jit.tryInvokeSync('invokevirtual', parent, {
+    arg: ['Method', 'ReferenceCursorHarness', ['clear', '(I)V']],
+  }, thread);
+  t.equal(thread.callStack.size(), resolvedDepth,
+    'the resolved-target path also avoids a child frame');
+  t.equal(receiver.fields['ReferenceCursorHarness.cursor'], null,
+    'the resolved-target positional edge preserves cleanup effects');
   t.end();
 });
 

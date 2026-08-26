@@ -7475,6 +7475,26 @@ class JitCompiler {
     }
     if (!generated || !generated.jvmSynchronous) return ASYNC_INVOKE;
 
+    // A generated caller can reach a small reference cleanup through the
+    // generic resolved-target path before its emitted call-site closure has
+    // captured a positional entry. Do not materialize one child Frame per
+    // cleanup: the same verified positional body used by linked callers can
+    // consume the parent's operands directly and reconstruct a child only on
+    // its guarded deopt/exception path.
+    if (returnType === "void" &&
+        this.isReferenceFieldHelperJsPreferred(method)) {
+      const positional = this.getPositionalGeneratedInvoker(site, target);
+      if (typeof positional === "function") {
+        const positionalResult = this.tryInvokeFramePositional(
+          site, positional, frame, thread);
+        if (positionalResult !== ASYNC_INVOKE) {
+          this.framePositionalCallCount += 1;
+          return positionalResult;
+        }
+        this.framePositionalFallbackCount += 1;
+      }
+    }
+
     const argumentBase = frame.stack.items.length - params.length;
     let memoKey = NO_MEMO_KEY;
     if (memoizedIntegralLeaf && !this.needsBytecodeChecks()) {
