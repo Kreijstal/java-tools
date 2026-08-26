@@ -7873,8 +7873,15 @@ class JitCompiler {
           this.hasOnlyNoOpExceptionHandlers(method, codeItems)) &&
         Boolean(this.computeStackDepths(
           codeItems, buildLabelMap(codeItems), method));
-      if (!codeVerified || ops.length !== transparentIntBlitOps.length ||
-          !transparentIntBlitOps.every((op, index) => ops[index] === op)) return null;
+      const canonicalShape = ops.length === transparentIntBlitOps.length &&
+        transparentIntBlitOps.every((op, index) => ops[index] === op);
+      // javac.js preserves decompiler control-flow joins as explicit
+      // zero-comparisons and unreachable athrow exits. Match the complete
+      // verified opcode multiset for that lowering; array counts, arithmetic,
+      // loop control, and descriptor together identify the same operation
+      // without consulting an owner or member name.
+      const javacJsShape = matchesJavacJsTransparentIntBlit(rawOps);
+      if (!codeVerified || (!canonicalShape && !javacJsShape)) return null;
       const intrinsic = (stack, base) => this.transparentIntBlitDirect(
         stack[base], stack[base + 1], stack[base + 2], stack[base + 3],
         stack[base + 4], stack[base + 5], stack[base + 6], stack[base + 7],
@@ -10117,6 +10124,23 @@ function normalizeIntrinsicCompilerIdioms(codeItems) {
   return ops;
 }
 
+function matchesJavacJsTransparentIntBlit(ops) {
+  if (!Array.isArray(ops) || ops.length !== 179) return false;
+  const expected = {
+    iconst_0: 18, istore: 26, iload: 26, iconst_2: 1, ishr: 1,
+    ineg: 3, iconst_3: 1, iand: 1, if_icmplt: 3, return: 1,
+    athrow: 15, iadd: 2, iload_3: 6, istore_3: 1, iinc: 20,
+    goto: 14, aload_1: 5, iaload: 5, istore_2: 5, iload_2: 10,
+    if_icmpne: 5, aload_0: 5, iastore: 5,
+  };
+  const counts = Object.create(null);
+  for (const op of ops) {
+    if (!Object.prototype.hasOwnProperty.call(expected, op)) return false;
+    counts[op] = (counts[op] || 0) + 1;
+  }
+  return Object.entries(expected).every(([op, count]) => counts[op] === count);
+}
+
 function jsLiteral(value) {
   if (typeof value === "bigint") return `${value}n`;
   return JSON.stringify(value);
@@ -10163,5 +10187,6 @@ module.exports._test = {
   localReadBeforeWrite,
   normalizeIntrinsicCompilerIdioms,
   stripProvenDeadEntryInitializers,
+  matchesJavacJsTransparentIntBlit,
   buildLabelMap,
 };

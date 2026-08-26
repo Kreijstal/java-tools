@@ -6758,6 +6758,20 @@ test('structured SSA emits verified masked color blits without call dispatch', (
 });
 
 test('structured SSA emits verified transparent int blits without call dispatch', (t) => {
+  const javacJsCounts = {
+    iconst_0: 18, istore: 26, iload: 26, iconst_2: 1, ishr: 1,
+    ineg: 3, iconst_3: 1, iand: 1, if_icmplt: 3, return: 1,
+    athrow: 15, iadd: 2, iload_3: 6, istore_3: 1, iinc: 20,
+    goto: 14, aload_1: 5, iaload: 5, istore_2: 5, iload_2: 10,
+    if_icmpne: 5, aload_0: 5, iastore: 5,
+  };
+  const javacJsOps = Object.entries(javacJsCounts)
+    .flatMap(([op, count]) => Array(count).fill(op));
+  t.ok(jitCompilerTest.matchesJavacJsTransparentIntBlit(javacJsOps),
+    'the complete javac.js transparent-blit lowering is recognized');
+  javacJsOps[0] = 'iconst_1';
+  t.notOk(jitCompilerTest.matchesJavacJsTransparentIntBlit(javacJsOps),
+    'an altered javac.js lowering is rejected');
   const ops = [
     'iload', 'iconst_2', 'ishr', 'ineg', 'istore',
     'iload', 'iconst_3', 'iand', 'ineg', 'istore',
