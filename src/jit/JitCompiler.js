@@ -60,6 +60,12 @@ const EXTENDED_TIER_OPCODES = EXTENDED_TIER_OPCODES_ENABLED ? [
   "lload", "lload_0", "lload_1", "lload_2", "lload_3", "lneg", "lor", "lrem", "lshl",
   "lstore", "lstore_0", "lstore_1", "lstore_2", "lstore_3", "lsub", "lushr",
 ] : [];
+function isPureMathIntrinsicCall(instruction) {
+  return Boolean(instruction) && typeof instruction === "object" &&
+    instruction.op === "invokestatic" && Array.isArray(instruction.arg) &&
+    instruction.arg[1] === "java/lang/Math";
+}
+
 const PRIMITIVE_ARRAY_ACCESS_OPCODES = new Set([
   "baload", "bastore", "caload", "castore", "daload", "dastore",
   "faload", "fastore", "iaload", "iastore", "laload", "lastore",
@@ -444,6 +450,10 @@ class JitCompiler {
       Boolean(typeof process !== "undefined" && process.env &&
         process.env.JVM_ENABLE_ARRAY_KERNEL_WASM_FIRST === "1");
     this.importedArrayLoopJsMethods = new WeakMap();
+    this.importedArrayLeafHelperMethods = new WeakMap();
+    // Diagnostic: why a JS-preferred imported-array method reached the Wasm
+    // gate anyway. Enabled by setting the Map from a debugging session.
+    this.jsPreferredWasmEntryTrace = null;
     this.importedArrayJsClosureMethods = new WeakMap();
     this.referenceFieldHelperJsMethods = new WeakMap();
     this.dynamicArrayStructuredFirstMethods = new WeakMap();
@@ -726,6 +736,18 @@ class JitCompiler {
     }
 
     if (!canRunGenerated && this.wasmJit.enabled && !this.runningFrames.has(frame)) {
+      if (this.jsPreferredWasmEntryTrace &&
+          this.isImportedArrayJsClosurePreferred(frame.method)) {
+        const key = `${this.getFrameClassName(frame)}.${frame.method.name}` +
+          `${frame.method.descriptor}|pc=${frame.pc}|canRun=${canRunGenerated}` +
+          `|probe=${canProbeGenerated}|whole=${wholeMethodPreferred}` +
+          `|disabled=${Boolean(frame.jitJsDisabled)}` +
+          `|awaiting=${awaitingAdaptivePromotion}` +
+          `|generated=${Boolean(this.codegenCache.get(frame.method))}` +
+          `|stable=${this.stableGeneratedEntries.has(frame.method)}`;
+        this.jsPreferredWasmEntryTrace.set(key,
+          (this.jsPreferredWasmEntryTrace.get(key) || 0) + 1);
+      }
       const wasmResult = this.wasmJit.tryRunFrame(frame, thread);
       if (wasmResult.handled) {
         if (wasmResult.returned) return HANDLED_RESULT;
@@ -1012,16 +1034,83 @@ class JitCompiler {
         primitiveArrayAccesses += 1;
       }
       if (WASM_NATIVE_LONG_OPS.has(op)) nativeLongOps += 1;
-      if (op && op.startsWith("invoke")) calls += 1;
+      if (op && op.startsWith("invoke") &&
+          !isPureMathIntrinsicCall(item.instruction)) {
+        if (this.isImportedArrayLeafHelperCall(method, item.instruction)) {
+          // The helper performs the element access on the caller's behalf.
+          primitiveArrayAccesses += 1;
+        } else {
+          calls += 1;
+        }
+      }
     }
     // Primitive Java arrays live in JavaScript. Wasm imports every element
     // access, so a raster loop pays an engine crossing for every pixel while
     // structured JavaScript accesses the same backing arrays directly.
+    // java.lang.Math statics are side-effect-free intrinsics in every tier
+    // and do not change that locality argument (rotated-sprite rasterizers
+    // compute sin/cos/floor once per call, then loop over pixels). A
+    // same-class call-free plotting helper that itself touches primitive
+    // arrays is the same locality argument one call deeper: from Wasm it
+    // costs a nested-call import per pixel on top of the element imports.
     const preferred = primitiveArrayAccesses >= 2 && nativeLongOps === 0 &&
       calls === 0 && this.hasBackwardBranch(method) &&
       this.isCodegenSupported(method);
     this.importedArrayLoopJsMethods.set(method, preferred);
     return preferred;
+  }
+
+  isImportedArrayLeafHelperCall(caller, instruction) {
+    if (!instruction || typeof instruction !== "object" ||
+        !Array.isArray(instruction.arg) || !Array.isArray(instruction.arg[2])) {
+      return false;
+    }
+    const op = instruction.op;
+    if (op !== "invokestatic" && op !== "invokespecial" &&
+        op !== "invokevirtual") {
+      return false;
+    }
+    const owner = this.jvm.findClassNameForMethod?.(caller) ||
+      caller.className || "";
+    if (!owner || instruction.arg[1] !== owner) return false;
+    const classData = this.jvm.classes[owner];
+    if (!classData) return false;
+    const target = this.jvm.findMethod(classData,
+      instruction.arg[2][0], instruction.arg[2][1]);
+    if (!target || target === caller || target.name === "<init>") return false;
+    // Virtual dispatch must not leave this class: only private, static, or
+    // final targets (or a final class) are guaranteed to bind here.
+    const flags = Array.isArray(target.flags) ? target.flags : [];
+    const classFlags = Array.isArray(classData.ast?.classes?.[0]?.flags)
+      ? classData.ast.classes[0].flags : [];
+    if (op === "invokevirtual" && !flags.includes("private") &&
+        !flags.includes("final") && !classFlags.includes("final")) {
+      return false;
+    }
+    if (this.importedArrayLeafHelperMethods.has(target)) {
+      return this.importedArrayLeafHelperMethods.get(target);
+    }
+    let primitiveArrayAccesses = 0;
+    let rejected = !Array.isArray(target.attributes) ||
+      !target.attributes.some((attribute) => attribute.type === "code");
+    if (!rejected) {
+      for (const item of this.getCodeItems(target)) {
+        const targetOp = getOp(item && item.instruction);
+        if (PRIMITIVE_ARRAY_ACCESS_OPCODES.has(targetOp)) {
+          primitiveArrayAccesses += 1;
+        }
+        if (WASM_NATIVE_LONG_OPS.has(targetOp) ||
+            (targetOp && targetOp.startsWith("invoke") &&
+              !isPureMathIntrinsicCall(item.instruction))) {
+          rejected = true;
+          break;
+        }
+      }
+    }
+    const helper = !rejected && primitiveArrayAccesses >= 1 &&
+      this.isCodegenSupported(target);
+    this.importedArrayLeafHelperMethods.set(target, helper);
+    return helper;
   }
 
   isImportedArrayJsClosurePreferred(method, visiting = null) {
@@ -9755,7 +9844,15 @@ class JitCompiler {
       // Contended: leave the child pushed and let the scheduler resume it.
       return { deopt: true, reason: "synchronized monitor contended" };
     }
-    if (this.wasmJit.enabled && !this.hasWasmExitStorm(method)) {
+    // A JS-supported child whose loops touch imported primitive arrays must
+    // keep the same JavaScript locality it gets as a scheduler entry
+    // (tryRunFrame consults the same predicate). Routing it through Wasm here
+    // pays one engine crossing per element access while the generated caller
+    // could have invoked a direct JavaScript body.
+    const importedArrayJsChild = jsChildSupported &&
+      this.isImportedArrayJsClosurePreferred(method);
+    if (this.wasmJit.enabled && !this.hasWasmExitStorm(method) &&
+        !importedArrayJsChild) {
       // Ask the Wasm tier before rejecting the child on JS-JIT policy. Wasm
       // can prove numeric loops covered by a wrap-and-rethrow diagnostic
       // handler even when the whole-method JS tier conservatively rejects the

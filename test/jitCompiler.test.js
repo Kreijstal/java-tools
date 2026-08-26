@@ -1168,6 +1168,68 @@ test('dense nested array kernels select Wasm without guest-name matching', (t) =
   t.end();
 });
 
+test('imported-array raster loops keep JavaScript across intrinsic and plotter calls', (t) => {
+  const jvm = new JVM({ jit: { warmupThreshold: 0 } });
+  const loopWith = (name, call, { arrayAccesses = 2 } = {}) => ({
+    name, descriptor: '(IIIIII)V', flags: ['final'],
+    className: 'ArbitraryRotatedBlitOwner',
+    attributes: [{ type: 'code', code: { exceptionTable: [], codeItems: [
+      { labelDef: 'Lentry:', instruction: 'nop' },
+      ...Array.from({ length: arrayAccesses }, (_unused, index) => ({
+        labelDef: `Larray${index}:`, instruction: index % 2 ? 'iastore' : 'iaload',
+      })),
+      ...[].concat(call).map((instruction, index) => ({
+        labelDef: `Lcall${index}:`, instruction,
+      })),
+      { labelDef: 'Lloop:', instruction: { op: 'goto', arg: 'Lentry' } },
+      { labelDef: 'Lreturn:', instruction: 'return' },
+    ] } }],
+  });
+  const leaf = (name, items) => ({
+    name, descriptor: '(IIIII)V', flags: ['private', 'final'],
+    className: 'ArbitraryRotatedBlitOwner',
+    attributes: [{ type: 'code', code: { exceptionTable: [], codeItems: [
+      ...items.map((instruction, index) => ({ labelDef: `L${index}:`, instruction })),
+      { labelDef: 'Lreturn:', instruction: 'return' },
+    ] } }],
+  });
+  const plotter = leaf('renamedPlotter', ['iaload', 'iastore']);
+  const callingPlotter = leaf('renamedCallingPlotter', ['iastore',
+    { op: 'invokevirtual', arg: ['Method', 'ArbitraryReceiver', ['leaf', '()V']] }]);
+  const mathLoop = loopWith('renamedRotatedBlit',
+    { op: 'invokestatic', arg: ['Method', 'java/lang/Math', ['sin', '(D)D']] });
+  const plotterCall = { op: 'invokespecial',
+    arg: ['Method', 'ArbitraryRotatedBlitOwner', ['renamedPlotter', '(IIIII)V']] };
+  const plotterLoop = loopWith('renamedPlotterLoop',
+    [plotterCall, plotterCall], { arrayAccesses: 0 });
+  const singlePlotterLoop = loopWith('renamedSinglePlotterLoop',
+    plotterCall, { arrayAccesses: 0 });
+  const impurePlotterLoop = loopWith('renamedImpurePlotterLoop',
+    { op: 'invokespecial', arg: ['Method', 'ArbitraryRotatedBlitOwner',
+      ['renamedCallingPlotter', '(IIIII)V']] });
+  const foreignCallLoop = loopWith('renamedForeignCallLoop',
+    { op: 'invokevirtual', arg: ['Method', 'ArbitraryReceiver', ['leaf', '()V']] });
+  jvm.classes.ArbitraryRotatedBlitOwner = { ast: { classes: [{
+    className: 'ArbitraryRotatedBlitOwner', flags: ['super'], items: [
+      plotter, callingPlotter, mathLoop, plotterLoop, singlePlotterLoop,
+      impurePlotterLoop, foreignCallLoop,
+    ].map((method) => ({ type: 'method', method })),
+  }] } };
+  t.ok(jvm.jit.isImportedArrayLoopJsPreferred(mathLoop),
+    'java.lang.Math intrinsics do not break imported-array locality');
+  t.ok(jvm.jit.isImportedArrayLoopJsPreferred(plotterLoop),
+    'a same-class call-free plotter carries the element access for its loop');
+  t.notOk(jvm.jit.isImportedArrayLoopJsPreferred(singlePlotterLoop),
+    'one plotter call site does not reach the element-access density');
+  t.notOk(jvm.jit.isImportedArrayLoopJsPreferred(impurePlotterLoop),
+    'a plotter that calls out is an ordinary call boundary');
+  t.notOk(jvm.jit.isImportedArrayLoopJsPreferred(foreignCallLoop),
+    'an arbitrary call keeps the existing single-tier policy');
+  t.notOk(jvm.jit.isImportedArrayLoopJsPreferred(plotter),
+    'the acyclic plotter itself is not a loop');
+  t.end();
+});
+
 test('small reference-field cursors stay in positional JavaScript', async (t) => {
   const classpath = compileJavaFixture(t, 'ReferenceCursorHarness', `
 public class ReferenceCursorHarness {
