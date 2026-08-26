@@ -213,8 +213,15 @@ class JVM {
       configuredMaxStackDepth > 0 ? configuredMaxStackDepth : 1024;
     // Linear heap for primitive arrays: TypedArray views over one wasm
     // memory, so compiled code can access elements without import crossings.
-    const wasmHeapEnabled = options.wasmHeap ?? env.JVM_WASM_HEAP === '1';
-    const wasmHeapMb = Number(options.wasmHeapMb ?? env.JVM_WASM_HEAP_MB) || 256;
+    const browserRuntime = typeof window !== 'undefined' &&
+      typeof WebAssembly !== 'undefined';
+    // Browser Wasm otherwise imports every primitive-array element access
+    // from JavaScript. That is catastrophic for raster loops in SpiderMonkey.
+    // Keep Node opt-in and preserve an explicit false override for embedders.
+    const wasmHeapEnabled = options.wasmHeap ??
+      (env.JVM_WASM_HEAP === '1' || browserRuntime);
+    const wasmHeapMb = Number(options.wasmHeapMb ?? env.JVM_WASM_HEAP_MB) ||
+      (browserRuntime ? 64 : 256);
     this.wasmHeap = wasmHeapEnabled
       ? new (require('./wasmHeap').WasmHeap)(wasmHeapMb)
       : null;
