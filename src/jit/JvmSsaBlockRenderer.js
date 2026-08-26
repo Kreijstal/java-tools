@@ -74,6 +74,7 @@ function parseGeneratedStatements(source) {
   const prefix = "function* __jvmSsaAstWrapper() {\n";
   const program = parseJavaScript(`${prefix}${source}\n}`, {
     ecmaVersion: "latest",
+    ranges: true,
   });
   return {
     offset: prefix.length,
