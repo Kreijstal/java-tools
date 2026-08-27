@@ -238,6 +238,12 @@ function markSoftSurfaceDirty(jvm, comp, thread = null) {
   }
   if (comp._presentScheduled) {
     if (stats) stats.coalesced += 1;
+    // A completed frame that is superseded before the host presented it is
+    // raster work nobody ever sees. Publish the backlog so the scheduler can
+    // give the host a rendering opportunity instead of another guest frame.
+    if (jvm) {
+      jvm._awtDroppedFrameBacklog = (jvm._awtDroppedFrameBacklog || 0) + 1;
+    }
     return;
   }
   comp._presentScheduled = true;
@@ -253,6 +259,17 @@ function markSoftSurfaceDirty(jvm, comp, thread = null) {
     if (fallbackTimer !== null) clearTimeout(fallbackTimer);
     if (fallback && stats) stats.presentationFallbacks += 1;
     presentSoftSurface(jvm, comp);
+    if (jvm) {
+      jvm._awtDroppedFrameBacklog = 0;
+      // A scheduler that parked the guest until this frame reached the screen
+      // resumes here, so production is paced by presentation instead of
+      // racing ahead of it.
+      const waiters = jvm._awtPresentationWaiters;
+      if (waiters && waiters.length) {
+        jvm._awtPresentationWaiters = [];
+        for (let index = 0; index < waiters.length; index += 1) waiters[index]();
+      }
+    }
   };
   requestAnimationFrame(() => present(false));
   // Firefox can indefinitely defer requestAnimationFrame while a JVM keeps a

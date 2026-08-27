@@ -85,10 +85,24 @@ class ClassInitializationStateMap extends Map {
 let browserYieldChannel = null;
 const browserYieldQueue = [];
 
+// A rendering host paints between task-queue turns, so which task the JVM
+// resumes from decides whether the browser ever gets a rendering opportunity.
+// Node has no such distinction and keeps its immediate resumption.
+function hostPaintsBetweenTasks() {
+  return typeof requestAnimationFrame === "function" &&
+    typeof document !== "undefined";
+}
+
 function yieldToEventLoop(delayMs = 0, strategy = "message-channel") {
   return new Promise((resolve) => {
     if (delayMs > 0) {
       setTimeout(resolve, delayMs);
+    } else if (strategy === "timer" && hostPaintsBetweenTasks()) {
+      // Bundled polyfills install a global setImmediate that resumes from a
+      // postMessage task, which is exactly the continuously runnable queue a
+      // caller asking for the timer strategy is trying to leave. Take the
+      // rendering opportunity the caller asked for.
+      setTimeout(resolve, 0);
     } else if (typeof setImmediate === "function") {
       setImmediate(resolve);
     } else if (strategy === "timer" || typeof MessageChannel !== "function") {
@@ -234,6 +248,22 @@ class JVM {
     this.eventLoopYieldStrategy =
       configuredYieldStrategy === "message-channel"
         ? "message-channel" : "timer";
+    // Frame-production backpressure. A MessageChannel yield keeps the host
+    // task queue continuously runnable, which lets a browser defer its
+    // rendering opportunity (and therefore requestAnimationFrame, paint and
+    // the AWT presentation that rides on them) for as long as the guest keeps
+    // producing. When the guest has completed frames that were superseded
+    // before the host ever presented them, that raster work is being thrown
+    // away, so the next scheduler yield is taken as a timer task instead: a
+    // real rendering opportunity. A guest that produces no faster than the
+    // host presents never reaches the threshold and keeps the fast yield.
+    const configuredBackpressure = options.awtPresentationBackpressureFrames ??
+      env.JVM_AWT_PRESENTATION_BACKPRESSURE;
+    const backpressureFrames = Number(configuredBackpressure);
+    this.awtPresentationBackpressureFrames =
+      Number.isFinite(backpressureFrames) && backpressureFrames >= 0
+        ? backpressureFrames : 2;
+    this._awtDroppedFrameBacklog = 0;
     const configuredBurst = options.interpreterBurst ??
       env.JVM_INTERPRETER_BURST;
     this.interpreterBurst = Math.max(1, Number(configuredBurst) || 1024);
@@ -756,7 +786,7 @@ class JVM {
       // generated safe point does not see one permanently expired deadline
       // and repeatedly materialize the rest of a lifecycle method.
       if (Date.now() >= this._nextEventLoopYieldAt) {
-        await yieldToEventLoop(0, this.eventLoopYieldStrategy);
+        await this._yieldHostTurn();
         this._nextEventLoopYieldAt = Date.now() + this.eventLoopYieldMs;
       }
     }
@@ -990,6 +1020,50 @@ class JVM {
     }
   }
 
+  // Hands the host its scheduler turn, taking the backpressured form when the
+  // guest has been completing frames the host never got to present.
+  _yieldHostTurn() {
+    const strategy = this._hostYieldStrategy();
+    if (strategy === "presentation") return this._awaitPresentation();
+    return yieldToEventLoop(0, strategy);
+  }
+
+  // Selects the host yield task for the next scheduler boundary. See
+  // awtPresentationBackpressureFrames: a guest that has dropped completed
+  // frames because the host never got to present them waits for the pending
+  // presentation (or, on a host that does not paint, yields through a timer
+  // task) rather than through the continuously runnable message queue.
+  _hostYieldStrategy() {
+    const strategy = this.eventLoopYieldStrategy;
+    if (strategy !== "message-channel") return strategy;
+    const limit = this.awtPresentationBackpressureFrames;
+    if (!(limit > 0)) return strategy;
+    if ((this._awtDroppedFrameBacklog || 0) < limit) return strategy;
+    this._awtDroppedFrameBacklog = 0;
+    // Only a host that paints between tasks has a presentation to wait for.
+    return hostPaintsBetweenTasks() ? "presentation" : "timer";
+  }
+
+  // Frame-production backpressure, strong form: when the guest has dropped
+  // completed frames because the host never presented them, park the guest at
+  // its scheduler yield until the pending presentation actually lands. The
+  // host is idle for that window, which is the rendering opportunity the
+  // presenter's requestAnimationFrame is waiting for. A timer bounds the wait
+  // so a hidden tab (no animation frames at all) still makes progress.
+  _awaitPresentation() {
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      if (!this._awtPresentationWaiters) this._awtPresentationWaiters = [];
+      this._awtPresentationWaiters.push(finish);
+      setTimeout(finish, Math.max(24, this.eventLoopYieldMs + 12));
+    });
+  }
+
   async execute() {
     this.debugManager.resume();
 
@@ -1061,7 +1135,7 @@ class JVM {
         // regions. A wall-clock budget keeps timers and I/O responsive without
         // making fast bytecodes pay excessive scheduler overhead.
         if (Date.now() >= this._nextEventLoopYieldAt) {
-          await yieldToEventLoop(0, this.eventLoopYieldStrategy);
+          await this._yieldHostTurn();
           this._nextEventLoopYieldAt = Date.now() + this.eventLoopYieldMs;
         }
       }
@@ -4031,4 +4105,4 @@ class JVM {
   }
 }
 
-module.exports = { JVM };
+module.exports = { JVM, yieldToEventLoop };

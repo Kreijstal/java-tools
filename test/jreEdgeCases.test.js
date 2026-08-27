@@ -1133,6 +1133,10 @@ test('AWT producer blits coalesce dirty presentation on animation frames', (t) =
     'a second dirty frame is accepted before presentation');
   t.equal(callbacks.length, 1, 'dirty frames share one pending animation callback');
   t.equal(jvm._awtPresentationStats.coalesced, 1, 'coalesced frame is counted');
+  t.equal(jvm._awtDroppedFrameBacklog, 1,
+    'a superseded completed frame is published as presentation backpressure');
+  const resumed = [];
+  jvm._awtPresentationWaiters = [() => resumed.push('parked scheduler')];
   t.notEqual(target._pixels, sourcePixels, 'full-frame publication snapshots the producer buffer');
   sourcePixels[0] = 0xffffff;
   t.equal(target._pixels[0], 0x112233, 'published frame is stable while producer renders the next frame');
@@ -1142,6 +1146,10 @@ test('AWT producer blits coalesce dirty presentation on animation frames', (t) =
   t.deepEqual(uploads[0], [0x11, 0x22, 0x33, 0xff, 0xaa, 0xbb, 0xcc, 0xff],
     'RGB producer pixels are converted to RGBA ImageData');
   t.equal(jvm._awtPresentationStats.presented, 1, 'completed upload is counted');
+  t.equal(jvm._awtDroppedFrameBacklog, 0,
+    'presenting the newest surface clears the dropped-frame backlog');
+  t.deepEqual(resumed, ['parked scheduler'],
+    'a scheduler parked on the presentation is released by the upload');
 
   if (previousRaf === undefined) delete global.requestAnimationFrame;
   else global.requestAnimationFrame = previousRaf;

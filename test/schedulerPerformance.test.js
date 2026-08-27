@@ -33,6 +33,112 @@ test('idle scheduler waits instead of spinning zero-delay tasks', (t) => {
   t.end();
 });
 
+test('dropped guest frames convert a scheduler yield into a paint opportunity',
+  (t) => {
+    const jvm = new JVM({ eventLoopYieldStrategy: 'message-channel' });
+    t.equal(jvm.awtPresentationBackpressureFrames, 2,
+      'frame-production backpressure is on by default');
+    t.equal(jvm._hostYieldStrategy(), 'message-channel',
+      'a guest that keeps up with the presenter keeps the fast yield');
+    jvm._awtDroppedFrameBacklog = 1;
+    t.equal(jvm._hostYieldStrategy(), 'message-channel',
+      'a single superseded frame is ordinary coalescing, not over-production');
+    jvm._awtDroppedFrameBacklog = 2;
+    t.equal(jvm._hostYieldStrategy(), 'timer',
+      'a backlog of dropped frames yields through a rendering opportunity');
+    t.equal(jvm._awtDroppedFrameBacklog, 0,
+      'each rendering opportunity consumes the backlog that earned it');
+    t.equal(jvm._hostYieldStrategy(), 'message-channel',
+      'the fast yield resumes until the guest drops more frames');
+
+    const disabled = new JVM({
+      eventLoopYieldStrategy: 'message-channel',
+      awtPresentationBackpressureFrames: 0,
+    });
+    disabled._awtDroppedFrameBacklog = 99;
+    t.equal(disabled._hostYieldStrategy(), 'message-channel',
+      'backpressure is switchable off without touching the yield strategy');
+
+    const timerJvm = new JVM({ eventLoopYieldStrategy: 'timer' });
+    timerJvm._awtDroppedFrameBacklog = 99;
+    t.equal(timerJvm._hostYieldStrategy(), 'timer',
+      'a caller already yielding through timers is unaffected');
+
+    const previousRaf = global.requestAnimationFrame;
+    const previousDocument = global.document;
+    global.requestAnimationFrame = () => 1;
+    global.document = {};
+    const painting = new JVM({ eventLoopYieldStrategy: 'message-channel' });
+    painting._awtDroppedFrameBacklog = 4;
+    t.equal(painting._hostYieldStrategy(), 'presentation',
+      'a painting host parks the guest until the pending frame is presented');
+    if (previousRaf === undefined) delete global.requestAnimationFrame;
+    else global.requestAnimationFrame = previousRaf;
+    if (previousDocument === undefined) delete global.document;
+    else global.document = previousDocument;
+    t.end();
+  });
+
+test('a parked guest resumes on the presentation, and on a bounded timer',
+  (t) => {
+    const jvm = new JVM({ eventLoopYieldMs: 16 });
+    const startedAt = Date.now();
+    jvm._awaitPresentation().then(() => {
+      t.ok(Date.now() - startedAt < 20,
+        'the presentation itself releases the guest, not the safety timer');
+      t.deepEqual(jvm._awtPresentationWaiters, [],
+        'a released waiter is not retained across presentations');
+      const withoutPresentation = Date.now();
+      return jvm._awaitPresentation().then(() => {
+        t.ok(Date.now() - withoutPresentation >= 20,
+          'a host that never presents still resumes on the bounded timer');
+        t.end();
+      });
+    });
+    // Stand in for the AWT presenter completing an upload.
+    setTimeout(() => {
+      const waiters = jvm._awtPresentationWaiters;
+      jvm._awtPresentationWaiters = [];
+      waiters.forEach((resume) => resume());
+    }, 1);
+  });
+
+test('a rendering host resumes a timer yield from a real timer task', (t) => {
+  const { yieldToEventLoop } = require('../src/core/jvm');
+  const previousRaf = global.requestAnimationFrame;
+  const previousDocument = global.document;
+  const previousImmediate = global.setImmediate;
+  const previousTimeout = global.setTimeout;
+  const used = [];
+  global.requestAnimationFrame = () => 1;
+  global.document = {};
+  global.setImmediate = (callback) => {
+    used.push('immediate');
+    return previousImmediate(callback);
+  };
+  global.setTimeout = (callback, ms) => {
+    used.push(`timeout:${ms}`);
+    return previousTimeout(callback, ms);
+  };
+  const restore = () => {
+    global.setTimeout = previousTimeout;
+    global.setImmediate = previousImmediate;
+    if (previousRaf === undefined) delete global.requestAnimationFrame;
+    else global.requestAnimationFrame = previousRaf;
+    if (previousDocument === undefined) delete global.document;
+    else global.document = previousDocument;
+  };
+  yieldToEventLoop(0, 'timer')
+    .then(() => yieldToEventLoop(0, 'message-channel'))
+    .then(() => {
+      restore();
+      t.deepEqual(used, ['timeout:0', 'immediate'],
+        'only the timer strategy leaves the continuously runnable task queue');
+      t.end();
+    })
+    .catch((error) => { restore(); t.fail(error); t.end(); });
+});
+
 test('deterministic scheduler never waits on wall time', (t) => {
   const jvm = new JVM({ fakeTime: 1000, eventLoopYieldMs: 16 });
   jvm.threads = [{ status: 'SLEEPING', sleepUntil: 2000 }];
