@@ -99,6 +99,9 @@ const { expandWideInstruction } = require('../instructions');
 // whose module is not compiled yet, an uninitialized class at a `new`, or an
 // unresolved static owner. Permanent reasons (an unsupported opcode, a disabled
 // feature) never match, so a module demoted only for those is never rebuilt.
+const nowMs = () => (typeof performance !== 'undefined' && performance.now
+  ? performance.now() : Date.now());
+
 const DEFERRABLE_DEMOTE =
   /unresolved|not ready|not initialized|no ready impl|vetoed|not fully compiled/;
 
@@ -2319,6 +2322,14 @@ class WasmJit {
     // Loop-bearing methods compile on first sight: warmup by invocation count
     // never fires for methods invoked once with a multi-minute loop (va.d).
     this.warmupThreshold = Number(env.JVM_WASM_JIT_WARMUP || 1);
+    // A deferred compile is not retried (blockers unresolved) until this many
+    // times its own failed wall time has elapsed. 0 disables the budget.
+    this.failedCompileRetryFactor = env.JVM_WASM_FAILED_RETRY_FACTOR === undefined
+      ? 20 : Number(env.JVM_WASM_FAILED_RETRY_FACTOR);
+    // Only failures at least this expensive are budgeted: cheap ones are not
+    // the waste this bounds, and synchronous retries must stay immediate.
+    this.failedCompileRetryMinMs = env.JVM_WASM_FAILED_RETRY_MIN_MS === undefined
+      ? 50 : Number(env.JVM_WASM_FAILED_RETRY_MIN_MS);
     this.retryBackoffMax = Math.max(1, Number(env.JVM_WASM_JIT_RETRY_BACKOFF_MAX || 4096));
     this.structuredEnabled = env.JVM_WASM_STRUCTURED === '1';
     this.instanceLinkEnabled = env.JVM_WASM_DEVIRT !== '0';
@@ -2534,14 +2545,27 @@ class WasmJit {
       // next call after each successful compile elsewhere (GeoBlox
       // ua.c()Lgd;: 12,527 identical failures, ~30 s of the START GAME
       // stall on Firefox).
-      if (st.deferredEpoch !== undefined && st.deferredBlockerSig !== undefined &&
-          st.blockers && st.blockers.length &&
-          this.blockerSignature(st.blockers) === st.deferredBlockerSig) {
-        if (this.census) this._censusNote(frame, 'blocked-deferral');
+      // A deferred module retries immediately once a named blocker moved;
+      // otherwise only after a geometrically growing number of epochs (a
+      // compile elsewhere may help, but not every one of them), and failing
+      // that after the entry backoff. Retrying on every epoch bump made a
+      // hot method that keeps failing rebuild once per module compiled
+      // during a transition (GeoBlox START GAME: ua.c()Lgd; 12,527 identical
+      // failures, kc.b(I)V 11 x 350 ms).
+      const blockersResolved = st.deferredEpoch !== undefined &&
+        st.deferredBlockerSig !== undefined && st.blockers && st.blockers.length &&
+        this.blockersResolved(st.blockers, st.deferredBlockerSig);
+      // A failed compile of a large method costs hundreds of ms; unless its
+      // blockers are all resolved, do not spend more than ~5% of wall time
+      // failing it again (retryNotBeforeMs, stamped by compile()).
+      if (!blockersResolved && st.retryNotBeforeMs !== undefined &&
+          nowMs() < st.retryNotBeforeMs) {
+        if (this.census) this._censusNote(frame, 'retry-budget');
         return null;
       }
-      const dependencyChanged = st.deferredEpoch !== undefined &&
-        st.deferredEpoch !== this.compileEpoch;
+      const dependencyChanged = blockersResolved || (st.deferredEpoch !== undefined &&
+        st.deferredEpoch !== this.compileEpoch &&
+        this.compileEpoch - st.deferredEpoch >= (st.deferredEpochGap || 1));
       const threshold = dependencyChanged ? 1 : (st.retryAfter || this.warmupThreshold);
       // hasBackwardBranch is eligibility-aware and already excludes
       // opaque-control methods; see the note on it in JitCompiler.
@@ -2814,10 +2838,18 @@ class WasmJit {
       const ms = now() - t0;
       const nested = this._compileNestedMs || 0;
       this._compileNestedMs = parentNested + ms;
+      if (st) {
+        const selfMs = Math.max(0, ms - nested);
+        st.retryNotBeforeMs = (st.status === 'ready' ||
+            selfMs < this.failedCompileRetryMinMs) ? undefined
+          : now() + selfMs * this.failedCompileRetryFactor;
+      }
       if (!this.compileStats) this.compileStats = new Map();
       const key = st && st.key ? st.key : String(frame && frame.method && frame.method.name);
       const e = this.compileStats.get(key) || { ms: 0, selfMs: 0, count: 0, callee: 0, st: null, method: null, outcomes: {} };
       e.ms += ms; e.selfMs += ms - nested; e.count += 1; if (options.asCallee === true) e.callee += 1;
+      const tEnd = now(); if (e.firstAt === undefined) e.firstAt = t0; e.lastAt = tEnd;
+      if (!e.windowMs) e.windowMs = []; e.windowMs.push([Math.round(t0), Math.round(ms - nested)]);
       e.st = st; e.method = frame && frame.method;
       const outcome = `${statusBefore}->${st && st.status}:${(st && st.status !== 'ready' && st.lastCompileError) || ''}`;
       e.outcomes[outcome] = (e.outcomes[outcome] || 0) + 1;
@@ -2997,7 +3029,22 @@ class WasmJit {
               .map(([block, reason]) => `${block}:${reason}`).join(', ');
             console.error(`[wasmjit] no compiled loop ${st.key}: ${details}`);
           }
-          throw new Unsupported('no compiled loop');
+          // Name what has to change before a retry could compile a loop:
+          // when every demotion in both modules is a deferrable dependency,
+          // the entry gate waits for exactly those blockers instead of
+          // retrying after every unrelated compile (kc.b(I)V: 11 identical
+          // 350 ms failures inside one GeoBlox START GAME).
+          const loopReasons = [];
+          const loopBlockers = new Set();
+          for (const m of [meta, structuredMeta]) {
+            if (!m) continue;
+            loopReasons.push(...(m.demoteReasons || new Map()).values());
+            for (const b of (m.demoteBlockers || [])) loopBlockers.add(b);
+          }
+          const loopDependencyOnly = loopReasons.length > 0 && loopBlockers.size > 0 &&
+            loopReasons.every((reason) => DEFERRABLE_DEMOTE.test(reason));
+          throw new Unsupported('no compiled loop',
+            loopDependencyOnly ? [...loopBlockers] : null);
         }
       }
       validatingBytes = primary.bytes;
@@ -3045,6 +3092,7 @@ class WasmJit {
       st.deferredEpoch = undefined;
       st.calleeDeferredEpoch = undefined;
       st.deferredBlockerSig = undefined;
+      st.deferredEpochGap = undefined;
       st.calleeBlockers = null;
       st.calleeBlockerSig = undefined;
       st.calleeRetryEpoch = undefined;
@@ -3129,13 +3177,13 @@ class WasmJit {
         if (calleeBlockers.length) {
           st.calleeBlockers = [...calleeBlockers].sort();
           st.calleeBlockerSig = this.blockerSignature(st.calleeBlockers);
-          st.calleeRetryEpoch = undefined;
         } else {
           st.calleeBlockers = null;
-          st.calleeRetryAfter = Math.min(this.retryBackoffMax,
-            (st.calleeRetryAfter || 1) * 2);
-          st.calleeRetryEpoch = this.compileEpoch + st.calleeRetryAfter;
+          st.calleeBlockerSig = undefined;
         }
+        st.calleeRetryAfter = Math.min(this.retryBackoffMax,
+          (st.calleeRetryAfter || 1) * 2);
+        st.calleeRetryEpoch = this.compileEpoch + st.calleeRetryAfter;
         st.status = 'cold';
         st.entries = 0;
         if (this.debug) console.error(`[wasmjit] deferred callee ${st.key}: ${err.message}`);
@@ -3149,6 +3197,16 @@ class WasmJit {
         const previous = st.retryAfter || Math.max(1, this.warmupThreshold);
         st.retryAfter = Math.min(this.retryBackoffMax, previous * 2);
         st.deferredEpoch = this.compileEpoch;
+        const loopBlockers = blockedNames(err);
+        if (loopBlockers.length) {
+          st.blockers = [...loopBlockers].sort();
+          st.deferredBlockerSig = this.blockerSignature(st.blockers);
+        } else {
+          st.blockers = null;
+          st.deferredBlockerSig = undefined;
+        }
+        st.deferredEpochGap = Math.min(this.retryBackoffMax,
+          (st.deferredEpochGap || 2) * 2);
         st.status = 'cold';
         st.entries = 0;
         if (this.debug) console.error(`[wasmjit] deferred ${st.key}: no compiled loop yet ` +
@@ -3158,8 +3216,11 @@ class WasmJit {
       if (err instanceof Unsupported &&
           err.message.startsWith('partial module has a reference return') &&
           blockedNames(err).length) {
-        st.retryAfter = 1;
+        st.retryAfter = Math.min(this.retryBackoffMax,
+          (st.retryAfter || Math.max(1, this.warmupThreshold)) * 2);
         st.deferredEpoch = this.compileEpoch;
+        st.deferredEpochGap = Math.min(this.retryBackoffMax,
+          (st.deferredEpochGap || 2) * 2);
         st.blockers = blockedNames(err).sort();
         st.deferredBlockerSig = this.blockerSignature(st.blockers);
         st.status = 'cold';
@@ -3466,13 +3527,22 @@ class WasmJit {
   calleeRetryAllowed(st) {
     if (st.calleeDeferredEpoch === undefined) return true;
     if (st.calleeDeferredEpoch === this.compileEpoch) return false;
-    if (st.calleeBlockers && st.calleeBlockers.length) {
-      return this.blockerSignature(st.calleeBlockers) !== st.calleeBlockerSig;
+    if (st.calleeBlockers && st.calleeBlockers.length &&
+        this.blockersResolved(st.calleeBlockers, st.calleeBlockerSig)) {
+      return true;
     }
+    if (st.retryNotBeforeMs !== undefined && nowMs() < st.retryNotBeforeMs) return false;
     if (st.calleeRetryEpoch !== undefined) {
       return this.compileEpoch >= st.calleeRetryEpoch;
     }
     return true;
+  }
+
+  // Every named blocker is now ready/initialized/resolved, and at least one
+  // of them was not when the deferral was recorded.
+  blockersResolved(blockers, recordedSig) {
+    const sig = this.blockerSignature(blockers);
+    return sig !== recordedSig && !/[01]/.test(sig);
   }
 
   findReadyStatic(className, name, descriptor, allowPartial = false) {
