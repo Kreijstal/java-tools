@@ -2683,6 +2683,19 @@ class JitCompiler {
   }
 
   compileMethod(method) {
+    const t0 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+    try {
+      return this._compileMethodUntimed(method);
+    } finally {
+      const ms = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0;
+      if (!this.codegenStats) this.codegenStats = new Map();
+      const e = this.codegenStats.get(method) || { ms: 0, count: 0 };
+      e.ms += ms; e.count += 1;
+      this.codegenStats.set(method, e);
+    }
+  }
+
+  _compileMethodUntimed(method) {
     const tracePattern = typeof process !== "undefined" && process.env
       ? process.env.JVM_TRACE_JIT_METHOD || "" : "";
     const traceIdentity = tracePattern

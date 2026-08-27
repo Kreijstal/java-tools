@@ -549,3 +549,30 @@ test('a constructor that cannot fully compile refuses the link and stays correct
   }
   t.end();
 });
+
+test('a deferred callee is retried only when its blockers move or after backoff', (t) => {
+  const WasmJit = require('../src/jit/WasmJit');
+  const readyKeys = new Set();
+  const jit = {
+    compileEpoch: 10,
+    retryBackoffMax: 8,
+    blockerSignature: (blockers) => blockers.map((b) => (readyKeys.has(b) ? '2' : '0')).join(''),
+    calleeRetryAllowed: WasmJit.prototype.calleeRetryAllowed,
+  };
+  // Never deferred: always eligible.
+  t.ok(jit.calleeRetryAllowed({}), 'fresh callee compiles');
+  // Deferred this epoch: never retried in the same epoch.
+  const named = { calleeDeferredEpoch: 10, calleeBlockers: ['x.y(I)V'], calleeBlockerSig: '0' };
+  t.notOk(jit.calleeRetryAllowed(named), 'same epoch: no retry');
+  jit.compileEpoch = 11;
+  t.notOk(jit.calleeRetryAllowed(named), 'epoch moved but blocker did not: no retry');
+  readyKeys.add('x.y(I)V');
+  t.ok(jit.calleeRetryAllowed(named), 'blocker became ready: retry');
+  // No named blockers: exponential epoch backoff.
+  const anon = { calleeDeferredEpoch: 11, calleeBlockers: null, calleeRetryEpoch: 11 + 4 };
+  jit.compileEpoch = 12;
+  t.notOk(jit.calleeRetryAllowed(anon), 'before backoff epoch: no retry');
+  jit.compileEpoch = 15;
+  t.ok(jit.calleeRetryAllowed(anon), 'at backoff epoch: retry');
+  t.end();
+});

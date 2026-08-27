@@ -2527,6 +2527,19 @@ class WasmJit {
 
     if (st.status === 'cold') {
       st.entries += 1;
+      // A deferral that named its blockers (reference-return dependency)
+      // is retried only once one of them actually moved; any other epoch
+      // bump cannot change its outcome. Retrying on every bump made a
+      // reference-returning getter called from everywhere recompile on its
+      // next call after each successful compile elsewhere (GeoBlox
+      // ua.c()Lgd;: 12,527 identical failures, ~30 s of the START GAME
+      // stall on Firefox).
+      if (st.deferredEpoch !== undefined && st.deferredBlockerSig !== undefined &&
+          st.blockers && st.blockers.length &&
+          this.blockerSignature(st.blockers) === st.deferredBlockerSig) {
+        if (this.census) this._censusNote(frame, 'blocked-deferral');
+        return null;
+      }
       const dependencyChanged = st.deferredEpoch !== undefined &&
         st.deferredEpoch !== this.compileEpoch;
       const threshold = dependencyChanged ? 1 : (st.retryAfter || this.warmupThreshold);
@@ -2788,6 +2801,31 @@ class WasmJit {
   }
 
   compile(frame, st, options = {}) {
+    // Diagnostic: accumulate wall time per module compile (JVM_JIT_COMPILE_STATS
+    // census reads `compileStats`). Cheap enough to stay on.
+    const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+    const t0 = now();
+    const parentNested = this._compileNestedMs || 0;
+    this._compileNestedMs = 0;
+    const statusBefore = st && st.status;
+    try {
+      return this._compileUntimed(frame, st, options);
+    } finally {
+      const ms = now() - t0;
+      const nested = this._compileNestedMs || 0;
+      this._compileNestedMs = parentNested + ms;
+      if (!this.compileStats) this.compileStats = new Map();
+      const key = st && st.key ? st.key : String(frame && frame.method && frame.method.name);
+      const e = this.compileStats.get(key) || { ms: 0, selfMs: 0, count: 0, callee: 0, st: null, method: null, outcomes: {} };
+      e.ms += ms; e.selfMs += ms - nested; e.count += 1; if (options.asCallee === true) e.callee += 1;
+      e.st = st; e.method = frame && frame.method;
+      const outcome = `${statusBefore}->${st && st.status}:${(st && st.status !== 'ready' && st.lastCompileError) || ''}`;
+      e.outcomes[outcome] = (e.outcomes[outcome] || 0) + 1;
+      this.compileStats.set(key, e);
+    }
+  }
+
+  _compileUntimed(frame, st, options = {}) {
     // Callee compiles reach this without going through prepare(), so a denied
     // class would still be inlined into another method's module.
     if (this.jit.jitDenied(frame.method)) {
@@ -3006,6 +3044,11 @@ class WasmJit {
       st.retryAfter = undefined;
       st.deferredEpoch = undefined;
       st.calleeDeferredEpoch = undefined;
+      st.deferredBlockerSig = undefined;
+      st.calleeBlockers = null;
+      st.calleeBlockerSig = undefined;
+      st.calleeRetryEpoch = undefined;
+      st.calleeRetryAfter = undefined;
       // Remember whether this module lost anything for a reason that a later
       // class load can undo — a demoted block, or the structured tier itself
       // declining. The entry gate rebuilds such a module once the world that
@@ -3063,6 +3106,7 @@ class WasmJit {
         try { require('fs').writeFileSync(file, Buffer.from(validatingBytes)); } catch { /* dump only */ }
         if (this.debug) console.error(`[wasmjit] dumped rejected module to ${file}`);
       }
+      st.lastCompileError = err && err.message ? String(err.message).slice(0, 80) : String(err);
       if (isRecompile) {
         // keep the previous working module
         st.status = 'ready';
@@ -3072,8 +3116,26 @@ class WasmJit {
       if (asCallee && err instanceof Unsupported) {
         // Callee linking is stricter than standalone execution. A failed link
         // must not blacklist the method from later standalone compilation.
-        // Reconsider it as a callee after some other dependency compiles.
+        // Reconsider it as a callee only once something that could change the
+        // outcome has changed: the named blockers (a reference-returning
+        // callee waits for exactly the methods its demoted blocks depend on),
+        // or — when nothing is named — after an exponentially growing number
+        // of epochs. Re-arming on every epoch bump made a callee referenced
+        // from many sites recompile once per site per successful compile
+        // anywhere (measured: ua.c()Lgd; 12,527 identical failures, 30 s of
+        // the GeoBlox START GAME stall on Firefox).
         st.calleeDeferredEpoch = this.compileEpoch;
+        const calleeBlockers = blockedNames(err);
+        if (calleeBlockers.length) {
+          st.calleeBlockers = [...calleeBlockers].sort();
+          st.calleeBlockerSig = this.blockerSignature(st.calleeBlockers);
+          st.calleeRetryEpoch = undefined;
+        } else {
+          st.calleeBlockers = null;
+          st.calleeRetryAfter = Math.min(this.retryBackoffMax,
+            (st.calleeRetryAfter || 1) * 2);
+          st.calleeRetryEpoch = this.compileEpoch + st.calleeRetryAfter;
+        }
         st.status = 'cold';
         st.entries = 0;
         if (this.debug) console.error(`[wasmjit] deferred callee ${st.key}: ${err.message}`);
@@ -3099,6 +3161,7 @@ class WasmJit {
         st.retryAfter = 1;
         st.deferredEpoch = this.compileEpoch;
         st.blockers = blockedNames(err).sort();
+        st.deferredBlockerSig = this.blockerSignature(st.blockers);
         st.status = 'cold';
         st.entries = 0;
         if (this.debug) console.error(
@@ -3398,6 +3461,20 @@ class WasmJit {
     return keys.size ? keys : EMPTY_WRITE_SET;
   }
 
+  // Whether a callee whose last as-callee compile was deferred should be
+  // tried again now. See the deferral in compile().
+  calleeRetryAllowed(st) {
+    if (st.calleeDeferredEpoch === undefined) return true;
+    if (st.calleeDeferredEpoch === this.compileEpoch) return false;
+    if (st.calleeBlockers && st.calleeBlockers.length) {
+      return this.blockerSignature(st.calleeBlockers) !== st.calleeBlockerSig;
+    }
+    if (st.calleeRetryEpoch !== undefined) {
+      return this.compileEpoch >= st.calleeRetryEpoch;
+    }
+    return true;
+  }
+
   findReadyStatic(className, name, descriptor, allowPartial = false) {
     const cd = this.jvm.classes[className];
     const clsAst = cd && cd.ast && cd.ast.classes[0];
@@ -3412,7 +3489,7 @@ class WasmJit {
     let st = this.state.get(method);
     if (!st) st = this.methodState({ method });
     if (!st.method) st.method = method; // partial-link deopts materialize a Frame
-    if (st.status === 'cold' && st.calleeDeferredEpoch !== this.compileEpoch) {
+    if (st.status === 'cold' && this.calleeRetryAllowed(st)) {
       const hasClassInitializer = clsAst.items
         .filter((i) => i.type === 'method')
         .some((i) => i.method.name === '<clinit>');
@@ -3454,7 +3531,7 @@ class WasmJit {
     if (!st) st = this.methodState({ method });
     if (!st.method) st.method = method;
     st.targetClassName = className;
-    if (st.status === 'cold' && st.calleeDeferredEpoch !== this.compileEpoch) {
+    if (st.status === 'cold' && this.calleeRetryAllowed(st)) {
       this.compile({ method, className }, st, { asCallee: true });
     }
     if (!st || st.status !== 'ready') return null;
