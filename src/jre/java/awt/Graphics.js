@@ -283,6 +283,49 @@ function markSoftSurfaceDirty(jvm, comp, thread = null) {
   }
 }
 
+function installIncrementalPresenter(jvm) {
+  if (!jvm || jvm._awtPresentIntermediate) return;
+  jvm._awtPresentIntermediate = () => {
+    if (!jvm._softCanvases) return;
+    for (const comp of jvm._softCanvases) {
+      const frame = comp && comp._lastFrame;
+      const pixels = frame && frame.pixels;
+      const count = pixels && pixels.length;
+      if (!count || comp._presentScheduled) continue;
+
+      // Rotate through bounded sample sets. Each phase is compared only with
+      // its own preceding signature, so an unchanged idle surface never
+      // produces synthetic presentations while active broad raster changes
+      // are detected without copying the complete framebuffer.
+      const phase = ((comp._incrementalSamplePhase || 0) + 1) & 7;
+      comp._incrementalSamplePhase = phase;
+      let signature = (count ^ phase) | 0;
+      const samples = Math.min(256, count);
+      const stride = Math.max(1, Math.floor(count / samples));
+      let index = phase;
+      for (let sample = 0; sample < samples; sample += 1) {
+        signature = Math.imul(signature ^ (pixels[index % count] | 0),
+          0x45d9f3b) | 0;
+        index += stride;
+      }
+      const signatures = comp._incrementalSignatures ||
+        (comp._incrementalSignatures = new Int32Array(8));
+      const initialized = comp._incrementalSignatureInitialized || 0;
+      const bit = 1 << phase;
+      const changed = (initialized & bit) !== 0 &&
+        signatures[phase] !== signature;
+      signatures[phase] = signature;
+      comp._incrementalSignatureInitialized = initialized | bit;
+      if (!changed) continue;
+
+      comp._pixels = pixels;
+      comp._pixelsWidth = frame.width;
+      comp._pixelsHeight = frame.height;
+      markSoftSurfaceDirty(jvm, comp, jvm._awtFrameProducerThread || null);
+    }
+  };
+}
+
 function colorToRgb(colorObj) {
   if (!colorObj) return 0;
   const v = colorObj.value !== undefined ? colorObj.value : colorObj;
@@ -434,6 +477,7 @@ module.exports = {
       const raster = imageObj._raster;
       const pixels = raster && raster._dataBuffer && raster._dataBuffer._data;
       if (pixels && imageObj._width && imageObj._height) {
+        if (jvm.awtIncrementalPresentation) installIncrementalPresenter(jvm);
         let target = obj._component;
         if (!target && graphicsContext && graphicsContext.ctx && graphicsContext.ctx.canvas) {
           const canvas = graphicsContext.ctx.canvas;

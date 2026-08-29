@@ -263,6 +263,8 @@ class JVM {
     this.awtPresentationBackpressureFrames =
       Number.isFinite(backpressureFrames) && backpressureFrames >= 0
         ? backpressureFrames : 2;
+    this.awtIncrementalPresentation = options.awtIncrementalPresentation === true ||
+      env.JVM_AWT_INCREMENTAL_PRESENTATION === '1';
     this._awtDroppedFrameBacklog = 0;
     const configuredBurst = options.interpreterBurst ??
       env.JVM_INTERPRETER_BURST;
@@ -1023,6 +1025,10 @@ class JVM {
   // Hands the host its scheduler turn, taking the backpressured form when the
   // guest has been completing frames the host never got to present.
   _yieldHostTurn() {
+    if (this.awtIncrementalPresentation &&
+        typeof this._awtPresentIntermediate === "function") {
+      this._awtPresentIntermediate();
+    }
     const strategy = this._hostYieldStrategy();
     if (strategy === "presentation") return this._awaitPresentation();
     return yieldToEventLoop(0, strategy);
