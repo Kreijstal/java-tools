@@ -3194,10 +3194,29 @@ class WasmJit {
       // method. A successful compilation elsewhere retries it immediately;
       // otherwise use bounded exponential entry backoff.
       if (err instanceof Unsupported && err.message === 'no compiled loop') {
+        const loopBlockers = blockedNames(err);
+        // With no named dependency, the rejection is structural: neither
+        // lowering produced a compiled loop and the compiler has no state
+        // change that could make a later attempt differ. Retrying such a hot
+        // method periodically can spend hundreds of milliseconds rebuilding
+        // the identical rejected graph during every application transition.
+        // Keep the correct JS/interpreter fallback instead.
+        if (!loopBlockers.length) {
+          st.status = 'failed';
+          st.failReason = 'no-compiled-loop';
+          st.entries = 0;
+          st.retryAfter = undefined;
+          st.deferredEpoch = undefined;
+          st.deferredEpochGap = undefined;
+          st.blockers = null;
+          st.deferredBlockerSig = undefined;
+          if (this.debug) console.error(
+            `[wasmjit] permanently rejected ${st.key}: no compiled loop and no blockers`);
+          return;
+        }
         const previous = st.retryAfter || Math.max(1, this.warmupThreshold);
         st.retryAfter = Math.min(this.retryBackoffMax, previous * 2);
         st.deferredEpoch = this.compileEpoch;
-        const loopBlockers = blockedNames(err);
         if (loopBlockers.length) {
           st.blockers = [...loopBlockers].sort();
           st.deferredBlockerSig = this.blockerSignature(st.blockers);

@@ -1153,6 +1153,37 @@ class JVM {
     return { paused: true, completed: false };
   }
 
+  // Compile methods only after their declaring classes have completed Java
+  // initialization, so generated static-array caches cannot capture default
+  // values. Browser launchers may run this during an explicit preparation
+  // phase to move first-use compiler work out of interactive transitions.
+  async precompileInitializedClasses(options = {}) {
+    const loopsOnly = options.loopsOnly === true;
+    const methods = [];
+    for (const [className, classData] of Object.entries(this.classes)) {
+      if (this.classInitializationState.get(className) !== "INITIALIZED") {
+        continue;
+      }
+      for (const item of classData?.ast?.classes?.[0]?.items || []) {
+        const method = item?.type === "method" && item.method;
+        if (!method || (loopsOnly && !this.jit.hasBackwardBranch(method))) {
+          continue;
+        }
+        methods.push(method);
+      }
+    }
+    let completed = 0;
+    for (const method of methods) {
+      this.jit.getGeneratedFunction(method);
+      completed += 1;
+      if (typeof options.onProgress === "function") {
+        options.onProgress({completed, total: methods.length});
+      }
+      await yieldToEventLoop(0, this.eventLoopYieldStrategy);
+    }
+    return {methods: completed};
+  }
+
   enqueueAwtEventInvocation(listener, methodName, descriptor, event, coalesce = false) {
     if (!listener || !listener.type || !methodName || !descriptor) return;
     if (!this._awtEventQueue) this._awtEventQueue = [];
