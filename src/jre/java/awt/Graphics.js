@@ -19,7 +19,15 @@ let colorSwizzleWasm;
 
 function swizzleRgbToImageData(output, pixels, count) {
   const source = pixels && pixels.elements ? pixels.elements : pixels;
-  if (!source || count < 65536 || typeof WebAssembly === 'undefined') return false;
+  // Wasm only wins when its staging copy can consume an existing typed view.
+  // Converting a large JavaScript Array with Array.from().slice() allocated
+  // two full framebuffer copies per presentation and caused periodic GC
+  // stalls. Plain Java arrays use the single-pass output loop below instead.
+  const typedSource = ArrayBuffer.isView(source) &&
+    typeof source.subarray === 'function';
+  if (!typedSource || count < 65536 || typeof WebAssembly === 'undefined') {
+    return false;
+  }
   try {
     if (colorSwizzleWasm === undefined) {
       const instance = new WebAssembly.Instance(
@@ -33,8 +41,7 @@ function swizzleRgbToImageData(output, pixels, count) {
       memory.grow(Math.ceil((requiredBytes - memory.buffer.byteLength) / 65536));
     }
     const staging = new Uint32Array(memory.buffer, 0, count);
-    staging.set(source.length === count ? source : source.subarray
-      ? source.subarray(0, count) : Array.from(source).slice(0, count));
+    staging.set(source.length === count ? source : source.subarray(0, count));
     colorSwizzleWasm.swizzle(count);
     output.set(staging);
     return true;
@@ -157,6 +164,7 @@ function presentationStats(jvm) {
       wasmSwizzles: 0,
       jsSwizzles: 0,
       presentationFallbacks: 0,
+      incrementalDirectPresentations: 0,
     };
   }
   return jvm._awtPresentationStats;
@@ -211,12 +219,37 @@ function presentSoftSurface(jvm, comp) {
   return true;
 }
 
-function markSoftSurfaceDirty(jvm, comp, thread = null) {
+function markSoftSurfaceDirty(jvm, comp, thread = null, immediate = false) {
   if (!comp) return;
   if (jvm && thread) jvm._awtFrameProducerThread = thread;
   comp._pixelsVersion = (comp._pixelsVersion || 0) + 1;
   const stats = presentationStats(jvm);
   if (stats) stats.dirtyMarks += 1;
+  // An exact tracked raster mutation is observed only at a cooperative JVM
+  // yield, after the mutating compiled region has materialized its effects.
+  // Upload that stable intermediate surface now instead of waiting for a
+  // requestAnimationFrame callback that Firefox may defer behind other task
+  // queues. The scheduler follows it with one timer-task yield so the browser
+  // still receives a rendering opportunity before guest execution resumes.
+  if (immediate && comp._canvasElement &&
+      typeof requestAnimationFrame === 'function' &&
+      !comp._presentScheduled && presentSoftSurface(jvm, comp)) {
+    if (stats) {
+      stats.scheduled += 1;
+      stats.incrementalDirectPresentations += 1;
+    }
+    if (jvm) {
+      jvm._awtIncrementalPresentationPending = false;
+      jvm._awtDirectPresentationPendingYield = true;
+      jvm._awtDroppedFrameBacklog = 0;
+      const waiters = jvm._awtPresentationWaiters;
+      if (waiters && waiters.length) {
+        jvm._awtPresentationWaiters = [];
+        for (let index = 0; index < waiters.length; index += 1) waiters[index]();
+      }
+    }
+    return;
+  }
   if (!comp._canvasElement || typeof requestAnimationFrame !== 'function') {
     // Headless jvm.js has no browser upload, but a completed software frame is
     // still an observable presentation boundary. Coalesce all publications in
@@ -260,6 +293,7 @@ function markSoftSurfaceDirty(jvm, comp, thread = null) {
     if (fallback && stats) stats.presentationFallbacks += 1;
     presentSoftSurface(jvm, comp);
     if (jvm) {
+      jvm._awtIncrementalPresentationPending = false;
       jvm._awtDroppedFrameBacklog = 0;
       // A scheduler that parked the guest until this frame reached the screen
       // resumes here, so production is paced by presentation instead of
@@ -292,6 +326,18 @@ function installIncrementalPresenter(jvm) {
       const pixels = frame && frame.pixels;
       const count = pixels && pixels.length;
       if (!count || comp._presentScheduled) continue;
+
+      const mutationTracker = pixels._jvmAwtRasterMutationTracker;
+      if (mutationTracker?.dirty) {
+        mutationTracker.dirty = false;
+        comp._pixels = pixels;
+        comp._pixelsWidth = frame.width;
+        comp._pixelsHeight = frame.height;
+        jvm._awtIncrementalPresentationPending = true;
+        markSoftSurfaceDirty(jvm, comp,
+          jvm._awtFrameProducerThread || null, true);
+        continue;
+      }
 
       // Rotate through bounded sample sets. Each phase is compared only with
       // its own preceding signature, so an unchanged idle surface never
@@ -490,6 +536,14 @@ module.exports = {
         }
         let presentedBySoftwareSurface = false;
         if (target) {
+          let mutationTracker = pixels._jvmAwtRasterMutationTracker;
+          if (!mutationTracker) {
+            mutationTracker = {dirty: false};
+            Object.defineProperty(pixels, '_jvmAwtRasterMutationTracker', {
+              value: mutationTracker,
+              configurable: true,
+            });
+          }
           target._lastFrame = {
             pixels,
             width: imageObj._width,
@@ -543,6 +597,7 @@ module.exports = {
             target._canvasElement = jvm._awtCanvasElement;
           }
           if (presentedBySoftwareSurface) markSoftSurfaceDirty(jvm, target, thread);
+          mutationTracker.dirty = false;
           if (stats && presentedBySoftwareSurface) stats.softwareBlits += 1;
         }
         dumpFrame(pixels, imageObj._width, imageObj._height, jvm);

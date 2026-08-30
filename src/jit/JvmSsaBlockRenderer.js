@@ -771,7 +771,14 @@ class JvmSsaBlockRenderer {
 
   registerClassInitializationGuard(owners) {
     const guard = {
-      owners: [...new Set(owners)],
+      // A cold owner has no direct initialized state to preserve. Its
+      // generated getstatic/putstatic/invokestatic site retains the exact
+      // initialization-token check and materializing fallback at that
+      // bytecode. Guarding it at method entry would reject unrelated paths
+      // and make safe class preloading useless. Owners whose initialized
+      // storage or links were observed while compiling remain guarded.
+      owners: [...new Set(owners)].filter((owner) =>
+        this.jit.jvm.classInitializationState.get(owner) === "INITIALIZED"),
       classEpoch: -1,
       initializationEpoch: -1,
     };
@@ -891,6 +898,13 @@ class JvmSsaBlockRenderer {
       this.lastRejectionReason = reason;
       return null;
     };
+    const compiledMethodIdentity =
+      `${this.jit.jvm.findClassNameForMethod?.(method) || method.className || "?"}.` +
+      `${method.name}${method.descriptor}`;
+    const guardedStaticBooleanSpecializationEnabled =
+      this.guardedStaticBooleansEnabled &&
+      !this.jit.effectfulPreparationActive &&
+      !this.jit.nonSpeculativeStaticBooleanMethods?.has(method);
     const normalizeJvmScalarExpression = (expression, type) => ({
       Z: `((Number(${expression})) ? 1 : 0)`,
       boolean: `((Number(${expression})) ? 1 : 0)`,
@@ -973,7 +987,7 @@ class JvmSsaBlockRenderer {
     let prunedBooleanCfgBranches = 0;
     const prunedBooleanBranchTargets = new Map();
     const prunedBooleanReadIndexes = new Set();
-    if (this.guardedStaticBooleansEnabled) {
+    if (guardedStaticBooleanSpecializationEnabled) {
       const instructionOp = (instruction) => !instruction ? null
         : typeof instruction === "string" ? instruction : instruction.op;
       const localSlot = (instruction, op) => {
@@ -1294,7 +1308,7 @@ class JvmSsaBlockRenderer {
     const writtenStaticTargets = [...directStaticSites.values()]
       .filter((direct) => direct.op === "putstatic");
     const guardedStaticBooleanSites = new Map();
-    if (this.guardedStaticBooleansEnabled) {
+    if (guardedStaticBooleanSpecializationEnabled) {
       for (const [index, direct] of directStaticSites) {
         if (direct.op !== "getstatic" || direct.descriptor !== "Z" ||
             this.jit.jvm.classInitializationState.get(direct.className) !== "INITIALIZED" ||
@@ -1400,6 +1414,8 @@ class JvmSsaBlockRenderer {
     };
     const opOf = (instruction) => !instruction ? null :
       (typeof instruction === "string" ? instruction : instruction.op);
+    const hasReachableIntArrayStore = items.some((item, index) =>
+      normalReachableItems.has(index) && opOf(item?.instruction) === "iastore");
     const arrayIndexOutOfBounds = (index, length) =>
       this.unsignedArrayBoundsEnabled
         ? `((${index} >>> 0) >= ${length})`
@@ -1526,6 +1542,28 @@ class JvmSsaBlockRenderer {
       idempotentStaticReferenceStores.add(getDirect.key);
     }
     const entryStaticReadCaches = new Map();
+    // A nullable static array can be a guest control flag: javac commonly
+    // lowers `array == null` to getstatic, aconst_null, if_acmp*. Its raw data
+    // view may still be cached at entry, but null must reach the guest branch
+    // instead of tripping an unconditional "non-canonical storage" guard.
+    const nullComparedStaticArrayLocations = new Set();
+    for (const [index, direct] of directStaticSites) {
+      if (direct.op !== "getstatic" ||
+          !direct.descriptor?.startsWith("[")) continue;
+      const previousOp = opOf(items[index - 1]?.instruction);
+      const nextOp = opOf(items[index + 1]?.instruction);
+      const followingOp = opOf(items[index + 2]?.instruction);
+      const nullCompared =
+        nextOp === "ifnull" || nextOp === "ifnonnull" ||
+        nextOp === "aconst_null" &&
+          (followingOp === "if_acmpeq" || followingOp === "if_acmpne") ||
+        previousOp === "aconst_null" &&
+          (nextOp === "if_acmpeq" || nextOp === "if_acmpne");
+      if (nullCompared) {
+        nullComparedStaticArrayLocations.add(
+          `${direct.className}\0${direct.key}`);
+      }
+    }
     const entryStaticReadCacheEnabled =
       !(typeof process !== "undefined" && process.env &&
         process.env.JVM_DISABLE_ENTRY_STATIC_READ_CACHE === "1");
@@ -1547,8 +1585,11 @@ class JvmSsaBlockRenderer {
             value: `ssaEntryStaticValue${number}`,
             data: direct.descriptor?.startsWith("[")
               ? `ssaEntryStaticArrayData${number}` : null,
+            nullableTested: nullComparedStaticArrayLocations.has(key),
           };
           entryStaticReadCaches.set(key, cache);
+        } else if (nullComparedStaticArrayLocations.has(key)) {
+          cache.nullableTested = true;
         }
         direct.entryReadCache = cache;
       }
@@ -1611,6 +1652,8 @@ class JvmSsaBlockRenderer {
         lazy.entryReadCache = cache;
       }
     }
+    const hasNullableStaticArrayControl =
+      nullComparedStaticArrayLocations.size > 0;
     // A non-volatile field is stable for one synchronous generated entry when
     // the method contains neither an instance-field write nor a call that
     // could perform one. Cache repeated reads by symbolic field plus receiver
@@ -1693,7 +1736,8 @@ class JvmSsaBlockRenderer {
     const guardedEntryArrayData = new Set([
       ...[...entryArrayLocalSlots].map(entryArrayDataVariable),
       ...[...entryStaticReadCaches.values()]
-        .filter((cache) => !cache.lazy)
+        .filter((cache) => !cache.lazy &&
+          !hasNullableStaticArrayControl)
         .map((cache) => cache.data).filter(Boolean),
     ]);
     // These views are rejected by an unconditional generated-entry guard.
@@ -1705,6 +1749,7 @@ class JvmSsaBlockRenderer {
       new Set(guardedEntryArrayData);
     const entryStaticArrayData = new Set(
       [...entryStaticReadCaches.values()]
+        .filter(() => !hasNullableStaticArrayControl)
         .map((cache) => cache.data).filter(Boolean));
     const entryStaticArrayLocalViews = new Map();
     const entryStaticArrayLocalInitializers = new Map();
@@ -3778,6 +3823,14 @@ class JvmSsaBlockRenderer {
               );
               if (deferred) lines.push(`/*${deferred.marker}:end*/`);
             }
+            if (op === "iastore") {
+              // Remember a store only after its checked write completed. A
+              // later scheduler handoff can then publish the live AWT surface
+              // without racing the presenter ahead of guest effects. Keeping
+              // this as a scalar assignment avoids a host-helper call on each
+              // pixel; the tracker lookup remains batched at actual yields.
+              lines.push("awtRasterMutationObserved = true;");
+            }
           }
         } else if (op === "newarray") {
           const countInput = pop();
@@ -3998,7 +4051,6 @@ class JvmSsaBlockRenderer {
               }
               continue;
             }
-            const key = JSON.stringify(direct.key);
             const location = `${direct.className}\0${direct.key}`;
             const cached = directStaticBlockValues.get(location);
             if (cached) {
@@ -4013,6 +4065,7 @@ class JvmSsaBlockRenderer {
               }
             } else {
               const emissionStart = lines.length;
+              const key = JSON.stringify(direct.key);
               lines.push(`const ${out} = ${direct.kind === "map"
                 ? `${direct.variable}.get(${key})` : `${direct.variable}[${key}]`};`);
               stack.push(out);
@@ -8815,6 +8868,8 @@ class JvmSsaBlockRenderer {
       }
       return output;
     };
+    const awtRasterCompletionMarker = "__JVM_AWT_RASTER_COMPLETION__";
+    const awtRasterSafePointMarker = "__JVM_AWT_RASTER_SAFE_POINT__";
     const render = (
       node, continuationMode = useContinuations, directPositional = false,
       loopSafePointBudget = safePointInitialBudget,
@@ -8854,6 +8909,9 @@ class JvmSsaBlockRenderer {
         const lines = expandLines(specializeDeferredStaticArrayAccessLines(
           plan.lines, directPositional && rangeBailout));
         if (plan.returnKind && plan.returnKind !== "throw") {
+          if (hasReachableIntArrayStore) {
+            lines.push(awtRasterCompletionMarker);
+          }
           if (directPositional) {
             lines.push(plan.returnKind === "void"
               ? "return helpers.returnVoid();"
@@ -9019,6 +9077,8 @@ class JvmSsaBlockRenderer {
           // restoration in the node, but charge/yield at the root boundary.
           `if (${directPositional ? "nestedEntryGuarded === 2 || " : ""}helpers.continueStructuredQuantum(thread)) { safePointBudget = ${currentLoopSafePointBudget}; } else {`,
           ...indent([
+            ...(hasReachableIntArrayStore
+              ? [awtRasterSafePointMarker] : []),
             "spillLocals();",
             ...restoreLines,
             "helpers.structuredSsa.safePointCount += 1;",
@@ -9733,7 +9793,7 @@ class JvmSsaBlockRenderer {
           : `${direct.variable}[${JSON.stringify(direct.key)}]`} ? 1 : 0) !== ${
         direct.guardedBooleanValue})`).join(" || ")}) { helpers.structuredSsa.guardedBooleanFallbackCount += 1; helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'structured SSA static boolean guard' }; }`
       : null;
-    const renderedTree = expandContinuationFallbacks(
+    let renderedTree = expandContinuationFallbacks(
       render(structured.tree), useContinuations);
     const renderedLocalSlots = new Set();
     const renderedAssignedLocalSlots = new Set();
@@ -9780,6 +9840,44 @@ class JvmSsaBlockRenderer {
         renderedTreeSource.includes(entryArrayDataVariable(slot)))
       .map((slot) =>
         `const ${entryArrayDataVariable(slot)} = helpers.arrayData(local${slot});`);
+    // Signal a tracked AWT surface only after this generated method finishes.
+    // Signalling at entry lets the presenter race ahead of the stores and turns
+    // one render call into a stale partial frame plus an avoidable rAF wait.
+    // The helper ignores ordinary int arrays, while the structural iastore gate
+    // keeps non-raster generated methods free of the extra completion work.
+    const completionAwtRasterMutationLines = hasReachableIntArrayStore
+      ? [
+        ...[...entryStaticReadCaches.values()]
+          .filter((cache) => cache.data)
+          .map((cache) =>
+            `helpers.markAwtRasterMutation(${cache.value}, ${cache.data});`),
+        ...[...entryArrayLocalSlots]
+          .filter((slot) => entryArrayDataDeclarations.some((line) =>
+            line.includes(` ${entryArrayDataVariable(slot)} =`)))
+          .map((slot) =>
+            `helpers.markAwtRasterMutation(local${slot}, ${
+              entryArrayDataVariable(slot)});`),
+      ] : [];
+    const expandAwtRasterCompletionLines = (lines) => lines.flatMap((line) => {
+      const marker = new RegExp(`^(\\s*)${awtRasterCompletionMarker}$`).exec(line);
+      if (marker) {
+        return completionAwtRasterMutationLines.map((completionLine) =>
+          `${marker[1]}${completionLine}`);
+      }
+      const safePoint = new RegExp(`^(\\s*)${awtRasterSafePointMarker}$`).exec(line);
+      if (!safePoint) return [line];
+      if (!completionAwtRasterMutationLines.length) return [];
+      return [
+        `${safePoint[1]}if (awtRasterMutationObserved) {`,
+        ...completionAwtRasterMutationLines.map((completionLine) =>
+          `${safePoint[1]}  ${completionLine}`),
+        `${safePoint[1]}  awtRasterMutationObserved = false;`,
+        `${safePoint[1]}}`,
+      ];
+    });
+    const awtRasterMutationObservedDeclaration = hasReachableIntArrayStore
+      ? "let awtRasterMutationObserved = false;" : null;
+    renderedTree = expandAwtRasterCompletionLines(renderedTree);
     const persistentStaticArrayDataDeclarations =
       [...persistentStaticArrayLocalViews.values(),
         ...persistentProducedArrayLocalViews.values()].map((view) =>
@@ -9788,7 +9886,8 @@ class JvmSsaBlockRenderer {
       ...entryArrayDataDeclarations.map((line) =>
         /^const ([A-Za-z0-9_$]+)/.exec(line)?.[1]).filter(Boolean),
       ...[...entryStaticReadCaches.values()]
-        .filter((cache) => !cache.lazy)
+        .filter((cache) => !cache.lazy &&
+          !hasNullableStaticArrayControl)
         .map((cache) => cache.data).filter(Boolean),
     ];
     const guardedArrayDataCondition = guardedArrayDataVariables.length
@@ -9797,7 +9896,8 @@ class JvmSsaBlockRenderer {
     const framedArrayDataGuard = guardedArrayDataCondition
       ? `if (${guardedArrayDataCondition}) { helpers.skipJitOnce(frame); ` +
         "return { deopt: true, transient: true, reason: " +
-        "'non-canonical primitive array storage' }; }"
+        `${JSON.stringify(`non-canonical primitive array storage in ${
+          compiledMethodIdentity}`)} }; }`
       : null;
     const directGuardedArrayDataCondition = [
       ...guardedArrayDataVariables,
@@ -10642,6 +10742,7 @@ class JvmSsaBlockRenderer {
       this.runCountersEnabled
         ? "helpers.structuredSsa.runCount += 1;" : null,
       `let safePointBudget = ${entrySafePointBudget};`,
+      awtRasterMutationObservedDeclaration,
       ...declaredLocals.map((i) => {
         const initial = entryLocalInitialValues.has(i)
           ? entryLocalInitialValues.get(i) : `locals[${i}]`;
@@ -10767,7 +10868,8 @@ class JvmSsaBlockRenderer {
             "return helpers.asyncInvokeSentinel(); }"
           : null;
         const directRenderedTree = expandContinuationFallbacks(
-          render(structured.tree, false, true), false);
+          expandAwtRasterCompletionLines(
+            render(structured.tree, false, true)), false);
         if (directPositionalEligible) {
           directPositionalSource = specializeSelfRecursiveCalls([
             "'use strict';",
@@ -10786,6 +10888,7 @@ class JvmSsaBlockRenderer {
             `let safePointBudget = ${regionCallGraphCandidate
               ? this.jit.hotCallGraphRegions.directSafePointBudget
               : safePointInitialBudget};`,
+            awtRasterMutationObservedDeclaration,
             ...declaredLocals.map((index) =>
               `${immutableEntryLocals.has(index) ? "const" : "let"} local${index} = ${
                 entryLocalInitialValues.has(index)
@@ -10811,6 +10914,7 @@ class JvmSsaBlockRenderer {
               ? this.jit.hotCallGraphRegions.directSafePointBudget
               : safePointInitialBudget};`
             : null,
+          awtRasterMutationObservedDeclaration,
           ...declaredLocals.map((index) =>
             `${immutableEntryLocals.has(index) ? "const" : "let"} local${index} = ${
               entryLocalInitialValues.has(index)
@@ -10952,8 +11056,9 @@ class JvmSsaBlockRenderer {
           "plan.restoreFrame(thread, frame, restorationDepth);",
         ];
         const restoringRendered = expandContinuationFallbacks(
-          render(structured.tree, false, true,
-            restoringDirectSafePointBudget, false, true), false);
+          expandAwtRasterCompletionLines(
+            render(structured.tree, false, true,
+              restoringDirectSafePointBudget, false, true)), false);
         restoringSpillCallCount = restoringRendered.reduce(
           (count, line) => count +
             (/spillLocals\(\);$/.test(line) ||
@@ -11166,6 +11271,7 @@ class JvmSsaBlockRenderer {
                 "helpers.structuredSsa.restoringDirectRunCount += 1;"
               : "helpers.structuredSsa.restoringDirectRunCount += 1;" : null,
           `let safePointBudget = ${restoringDirectSafePointBudget};`,
+          awtRasterMutationObservedDeclaration,
           ...declaredLocals.map((index) =>
             `${immutableEntryLocals.has(index) ? "const" : "let"} local${index} = ${
               entryLocalInitialValues.has(index)
@@ -11513,6 +11619,10 @@ class JvmSsaBlockRenderer {
           let checkedLeafRenderedTree = render(
             structured.tree, false, true,
             restoringDirectSafePointBudget, true, true);
+          checkedLeafRenderedTree = recursiveArrayPartitionLeaf
+            ? checkedLeafRenderedTree.filter((line) =>
+              line.trim() !== awtRasterCompletionMarker)
+            : expandAwtRasterCompletionLines(checkedLeafRenderedTree);
           if (shrinkingArrayWindowLeaf) {
             const guard = shrinkingArrayWindowLeaf.variable;
             checkedLeafRenderedTree = checkedLeafRenderedTree.map((line) => {
@@ -11736,6 +11846,7 @@ class JvmSsaBlockRenderer {
           };
           if (recursiveArrayPartitionLeaf) {
             let workerBody = compactCheckedLeafEntryLocals([
+              awtRasterMutationObservedDeclaration,
               ...declaredLocals.map((index) =>
                 `${immutableEntryLocals.has(index) ? "const" : "let"} local${index} = ${
                   entryLocalInitialValues.has(index)
@@ -11823,6 +11934,7 @@ class JvmSsaBlockRenderer {
                   ? [] : [
                   `let safePointBudget = ${restoringDirectSafePointBudget};`,
                 ]),
+                awtRasterMutationObservedDeclaration,
                 ...declaredLocals.map((index) =>
                   `${immutableEntryLocals.has(index) ? "const" : "let"} local${index} = ${
                     entryLocalInitialValues.has(index)
@@ -12036,6 +12148,7 @@ class JvmSsaBlockRenderer {
                   ? [] : [
                   `let safePointBudget = ${restoringDirectSafePointBudget};`,
                 ]),
+                awtRasterMutationObservedDeclaration,
                 ...declaredLocals.map((index) =>
                   `${immutableEntryLocals.has(index) ? "const" : "let"} local${index} = ${
                     entryLocalInitialValues.has(index)
@@ -12109,8 +12222,9 @@ class JvmSsaBlockRenderer {
         ordinaryAdaptive = compiledCallChain || ordinaryAdaptiveCanonical;
         const adaptiveBody = buildBody(
           expandContinuationFallbacks(
-            render(structured.tree, !ordinaryAdaptive, false,
-              adaptiveSafePointBudget),
+            expandAwtRasterCompletionLines(
+              render(structured.tree, !ordinaryAdaptive, false,
+                adaptiveSafePointBudget)),
             !ordinaryAdaptive),
           adaptiveSafePointBudget,
         );
@@ -12454,6 +12568,13 @@ class JvmSsaBlockRenderer {
         arrayRangeCheckCandidates.length;
       generated.jvmStructuredEntryFieldArrayLocalViewCount =
         entryFieldArrayLocalViews.size;
+      generated.jvmStructuredNullableTestedStaticArrayCount =
+        [...entryStaticReadCaches.values()].filter(
+          (cache) => cache.data && cache.nullableTested).length;
+      generated.jvmStructuredNullableStaticArrayGuardExclusionCount =
+        hasNullableStaticArrayControl
+          ? [...entryStaticReadCaches.values()].filter(
+            (cache) => cache.data).length : 0;
       generated.jvmStructuredPersistentStaticArrayLocalViewCount =
         persistentStaticArrayLocalViews.size;
       generated.jvmStructuredPersistentProducedArrayLocalViewCount =

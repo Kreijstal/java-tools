@@ -1257,6 +1257,14 @@ public class ReferenceCursorHarness {
     cursor = null;
     if (mode != 0) diagnostic = 41;
   }
+  boolean empty(int mode) {
+    try {
+      if (mode != 13519) cursor = null;
+      return head == head.head;
+    } catch (RuntimeException error) {
+      throw error;
+    }
+  }
 }
 `);
   const jvm = new JVM({classpath, jit: {warmupThreshold: 0}});
@@ -1341,6 +1349,28 @@ public class ReferenceCursorHarness {
     'the interpreter positional edge preserves the second field clear');
   t.equal(classData.staticFields.get('diagnostic:I'), 41,
     'the interpreter positional edge preserves the static effect');
+  head.fields['ReferenceCursorHarness.head'] = head;
+  receiver.fields['ReferenceCursorHarness.head'] = head;
+  receiver.fields['ReferenceCursorHarness.cursor'] = value;
+  const empty = jvm.findMethod(classData, 'empty', '(I)Z');
+  t.ok(jvm.jit.isReferenceFieldHelperJsPreferred(empty),
+    'the structural rule selects a bounded scalar reference-field predicate');
+  jvm.jit.wasmJit.state.set(empty, {
+    status: 'ready', meta: {fullyCompiled: true}, runs: 1,
+  });
+  t.notOk(jvm.jit.hasReadyFullWasm(empty),
+    'ready Wasm does not withdraw a tiny positional field predicate');
+  parent.stack.items.push(receiver, 13519);
+  const emptyDepth = thread.callStack.size();
+  invokeHandlers.invokevirtualSync(parent, {
+    arg: ['Method', 'ReferenceCursorHarness', ['empty', '(I)Z']],
+  }, jvm, thread);
+  t.equal(thread.callStack.size(), emptyDepth,
+    'the interpreter field predicate avoids a child frame');
+  t.equal(parent.stack.pop(), 1,
+    'the interpreter positional edge returns the scalar result');
+  t.equal(receiver.fields['ReferenceCursorHarness.cursor'], value,
+    'the fast scalar path preserves untaken field effects');
   receiver.fields['ReferenceCursorHarness.head'] = head;
   receiver.fields['ReferenceCursorHarness.cursor'] = value;
   classData.staticFields.set('diagnostic:I', 0);
@@ -6325,6 +6355,67 @@ public final class ContinuationStaticRefreshHarness {
   t.end();
 });
 
+test('structured SSA lets nullable static arrays reach their guest branch',
+  async (t) => {
+  const className = 'NullableStaticArrayBranchHarness';
+  const classpath = compileJavaFixture(t, className, `
+public final class NullableStaticArrayBranchHarness {
+  static int[] optional;
+  static int[] paired;
+  static int[] fallback;
+  static int read(int index) {
+    if (optional == null) return fallback[index];
+    return optional[index] + paired[index];
+  }
+}
+`);
+  const jvm = new JVM({classpath, jit: {
+    warmupThreshold: 0,
+    structuredSsa: true,
+    guestKernelOracles: false,
+  }});
+  const classData = await jvm.loadClassByName(className);
+  jvm.classInitializationState.set(className, 'INITIALIZED');
+  const fallback = [11, 22];
+  fallback.type = '[I';
+  classData.staticFields.set('optional:[I', null);
+  classData.staticFields.set('paired:[I', null);
+  classData.staticFields.set('fallback:[I', fallback);
+  const method = await jvm.findMethodInHierarchy(
+    className, 'read', '(I)I');
+  const generated = jvm.jit.structuredSsa.compile(method);
+  t.ok(generated?.jvmStructuredSsa,
+    'the nullable static-array branch selects structured SSA');
+  t.equal(generated.jvmStructuredNullableTestedStaticArrayCount, 1,
+    'the renderer identifies the null-tested static array');
+  t.equal(generated.jvmStructuredNullableStaticArrayGuardExclusionCount, 3,
+    'paired branch arrays avoid an unconditional entry assumption too');
+
+  const run = (index) => {
+    const frame = new Frame(method);
+    frame.className = className;
+    frame.locals[0] = index;
+    const callStack = new Stack();
+    callStack.push(frame);
+    return generated(frame,
+      {status: 'runnable', pendingException: null, callStack},
+      jvm.jit, false);
+  };
+  const nullArm = run(1);
+  t.equal(nullArm?.value, 22,
+    'a null optional array reaches the valid fallback branch without deopt');
+  const optional = [33, 44];
+  optional.type = '[I';
+  const paired = [3, 4];
+  paired.type = '[I';
+  classData.staticFields.set('optional:[I', optional);
+  classData.staticFields.set('paired:[I', paired);
+  const presentArm = run(0);
+  t.equal(presentArm?.value, 36,
+    'a later non-null array reaches the alternate indexed branch');
+  t.end();
+});
+
 test('structured SSA coarsens a call-free inner loop independently of its caller loop',
   async (t) => {
   const className = 'NestedRasterShape';
@@ -6880,6 +6971,20 @@ public class ArbitraryAlphaSpanShape {
 });
 
 test('structured SSA emits verified masked color blits without call dispatch', (t) => {
+  const javacJsCounts = {
+    iconst_0: 18, istore: 26, iload: 26, iconst_2: 1, ishr: 1,
+    ineg: 3, iconst_3: 1, iand: 1, if_icmplt: 3, return: 1,
+    athrow: 15, iadd: 2, iload_3: 6, istore_3: 1, iinc: 20,
+    goto: 14, aload_1: 5, baload: 5, iload_2: 5, if_icmpne: 5,
+    aload_0: 5, iastore: 5,
+  };
+  const javacJsOps = Object.entries(javacJsCounts)
+    .flatMap(([op, count]) => Array(count).fill(op));
+  t.ok(jitCompilerTest.matchesJavacJsMaskedColorBlit(javacJsOps),
+    'the complete javac.js masked-color lowering is recognized');
+  javacJsOps[0] = 'iconst_1';
+  t.notOk(jitCompilerTest.matchesJavacJsMaskedColorBlit(javacJsOps),
+    'an altered javac.js masked-color lowering is rejected');
   const ops = [
     "iload", "iconst_2", "ishr", "ineg", "istore",
     "iload", "iconst_3", "iand", "ineg", "istore",
@@ -6954,6 +7059,77 @@ test('structured SSA emits verified masked color blits without call dispatch', (
     [0, 0, 0x345678, 0, 0x345678, 0x345678, 0, 0, 0,
       0x345678, 0, 0x345678, 0, 0x345678, 0, 0],
   'direct masked blit preserves mask indexing, destination strides, and writes');
+
+  const directDestination = new Array(16).fill(0);
+  directDestination.type = '[I';
+  const directFrame = new Frame(blit);
+  directFrame.className = 'ArbitraryMaskedOwner';
+  directFrame.locals.splice(0, 9,
+    directDestination, mask, 0x345678, 0, 1, 5, 2, 3, 1);
+  const directThread = {status: 'runnable', callStack: new Stack()};
+  directThread.callStack.push(directFrame);
+  const directEntry = jvm.jit.compileMethod(blit);
+  t.equal(directEntry?.jvmDirectIntrinsicKind, 'maskedColorBlit',
+    'a verified static kernel receives a direct scheduler-frame entry');
+  t.equal(typeof directEntry?.jvmRestoringDirectPositionalBody, 'function',
+    'the verified handler-free kernel exposes an allocation-free caller ABI');
+  const directResult = directEntry(directFrame, directThread, jvm.jit, false);
+  t.ok(directResult?.returned,
+    'the direct scheduler-frame entry completes synchronously');
+  t.equal(directThread.callStack.size(), 0,
+    'the direct scheduler-frame entry pops exactly its own frame');
+  t.deepEqual(directDestination.slice(), destination.slice(),
+    'direct frame entry preserves the verified intrinsic result');
+
+  const positionalDestination = new Array(16).fill(0);
+  positionalDestination.type = '[I';
+  const positionalPlan = {
+    Frame, method: blit, lookupClass: 'ArbitraryMaskedOwner',
+    restoreFrame: (activeThread, child, depth) => {
+      activeThread.callStack.items.splice(depth, 0, child);
+    },
+  };
+  const positionalThread = {status: 'runnable', callStack: new Stack()};
+  directEntry.jvmRestoringDirectPositionalBody(jvm.jit, positionalPlan,
+    positionalDestination, mask, 0x345678, 0, 1, 5, 2, 3, 1,
+    positionalThread, false);
+  t.deepEqual(positionalDestination.slice(), destination.slice(),
+    'the positional caller ABI preserves the intrinsic result without a Frame');
+  t.equal(positionalThread.callStack.size(), 0,
+    'the normal positional path allocates no scheduler-visible frame');
+
+  const throwingThread = {status: 'runnable', callStack: new Stack()};
+  const shortDestination = [];
+  shortDestination.type = '[I';
+  let positionalError = null;
+  try {
+    directEntry.jvmRestoringDirectPositionalBody(jvm.jit, positionalPlan,
+      shortDestination, [1], 1, 0, 0, 1, 1, 0, 0,
+      throwingThread, false);
+  } catch (error) {
+    positionalError = error;
+  }
+  t.equal(positionalError?.type, 'java/lang/ArrayIndexOutOfBoundsException',
+    'the positional intrinsic preserves the JVM array exception');
+  t.equal(throwingThread.callStack.size(), 1,
+    'the exceptional positional path restores the omitted JVM frame');
+  t.equal(throwingThread.callStack.peek().method, blit,
+    'the restored exceptional frame retains the exact method identity');
+
+  const resumedFrame = new Frame(blit);
+  resumedFrame.pc = 1;
+  const resumedThread = {status: 'runnable', callStack: new Stack()};
+  resumedThread.callStack.push(resumedFrame);
+  const resumedResult = directEntry(resumedFrame, resumedThread, jvm.jit, false);
+  t.ok(resumedResult?.deopt && resumedResult?.transient && resumedFrame.jitSkipOnce,
+    'a non-entry resume is routed once through canonical bytecode');
+  t.equal(resumedThread.callStack.peek(), resumedFrame,
+    'deoptimization leaves the resumed frame live');
+
+  blit.flags.push('synchronized');
+  t.equal(jvm.jit.compileDirectIntrinsicFrameEntry(blit), null,
+    'direct frame entry never bypasses an implicit synchronized-method monitor');
+  blit.flags.pop();
 
   blit.attributes[0].code.codeItems[2].instruction = 'iushr';
   t.equal(jvm.jit.getSynchronousIntrinsic(blit, blit.descriptor), null,
@@ -7071,6 +7247,14 @@ test('structured SSA emits verified transparent int blits without call dispatch'
     'the intrinsic exposes a method-name-independent run counter');
   t.equal(jvm.jit.transparentIntBlitSlowPathCount, 0,
     'valid rectangles use the prevalidated raw-array path');
+  const mutationTracker = {dirty: false};
+  Object.defineProperty(destination, '_jvmAwtRasterMutationTracker', {
+    value: mutationTracker,
+  });
+  jvm.jit.transparentIntBlitDirect(
+    destination, source, 0, 0, 1, 1, 1, 0, 0);
+  t.ok(mutationTracker.dirty,
+    'a tracked AWT int raster publishes one mutation signal per blit');
 
   const transparentDestination = [7];
   transparentDestination.type = '[I';
@@ -8190,6 +8374,111 @@ test('structured JVM SSA guards and folds initialized boolean static control flo
     'invalidation preserves the materialized scalar loop state');
   t.equal(jvm.jit.structuredSsa.guardedBooleanFallbackCount, 2,
     'resume-time guarded fallback is counted');
+
+  // A method can warm while a lifecycle flag still has its startup value,
+  // then enter an explicit ahead-of-time preparation phase. Preparation must
+  // replace that speculative body with one that remains valid after the flag
+  // changes instead of paying the same guard deopt on every future entry.
+  method.className = 'PreparedBooleanUser';
+  jvm.classes.PreparedBooleanUser = {
+    staticFields: new Map(),
+    ast: { classes: [{ superClassName: null, items: [
+      { type: 'method', method },
+    ] }] },
+  };
+  jvm.classInitializationState.set('PreparedBooleanUser', 'INITIALIZED');
+  jvm.jit.codegenCache.set(method, generated);
+  const prepared = jvm.jit.getGeneratedFunction(method, {
+    allowEffectfulCalls: true,
+  });
+  t.ok(prepared?.jvmStructuredSsa,
+    'explicit preparation recompiles the warmed method');
+  t.notEqual(prepared, generated,
+    'the lifecycle-sensitive speculative body is replaced');
+  t.equal(prepared.jvmStructuredGuardedBooleanSiteCount, 0,
+    'prepared code preserves both mutable static-boolean paths');
+  t.ok(jvm.jit.preparedCodegenMethods.has(method),
+    'the robust replacement retains prepared-tier ownership');
+
+  const runPrepared = (flag) => {
+    jvm.classes.ArbitraryFlags.staticFields.set('enabled:Z', flag);
+    const preparedFrame = new Frame(method);
+    preparedFrame.locals[0] = 4;
+    const preparedStack = new Stack();
+    preparedStack.push(preparedFrame);
+    return prepared(preparedFrame,
+      { status: 'runnable', callStack: preparedStack }, jvm.jit, false);
+  };
+  t.deepEqual(runPrepared(1), { returned: true, value: 100 },
+    'prepared code executes the enabled boolean arm');
+  t.deepEqual(runPrepared(0), { returned: true, value: 4 },
+    'the same prepared body executes the later disabled arm without deopt');
+
+  const coldPreparedMethod = {
+    ...method,
+    name: 'coldPreparedBooleanLoop',
+    attributes: method.attributes.map((attribute) => ({
+      ...attribute,
+      code: attribute.code && {
+        ...attribute.code,
+        codeItems: attribute.code.codeItems.map((item) => ({...item})),
+      },
+    })),
+  };
+  jvm.classes.PreparedBooleanUser.ast.classes[0].items.push(
+    { type: 'method', method: coldPreparedMethod });
+  const coldPrepared = jvm.jit.getGeneratedFunction(coldPreparedMethod, {
+    allowEffectfulCalls: true,
+  });
+  t.ok(coldPrepared?.jvmStructuredSsa,
+    'a cold method can compile for the first time during preparation');
+  t.equal(coldPrepared.jvmStructuredGuardedBooleanSiteCount, 0,
+    'first-time preparation also preserves mutable boolean paths');
+
+  const concurrentMethod = {
+    ...coldPreparedMethod,
+    name: 'concurrentPreparationBooleanLoop',
+    attributes: coldPreparedMethod.attributes.map((attribute) => ({
+      ...attribute,
+      code: attribute.code && {
+        ...attribute.code,
+        codeItems: attribute.code.codeItems.map((item) => ({...item})),
+      },
+    })),
+  };
+  jvm.classes.PreparedBooleanUser.ast.classes[0].items.push(
+    { type: 'method', method: concurrentMethod });
+  jvm.jit.effectfulPreparationActive = true;
+  const concurrentPrepared = jvm.jit.getGeneratedFunction(concurrentMethod);
+  jvm.jit.effectfulPreparationActive = false;
+  t.ok(concurrentPrepared?.jvmStructuredSsa,
+    'ordinary execution can compile while preparation yields');
+  t.equal(concurrentPrepared.jvmStructuredGuardedBooleanSiteCount, 0,
+    'concurrent foreground compilation inherits robust preparation mode');
+
+  const hiddenGuardMethod = {
+    ...coldPreparedMethod,
+    name: 'hiddenChildGuardBooleanLoop',
+    attributes: coldPreparedMethod.attributes.map((attribute) => ({
+      ...attribute,
+      code: attribute.code && {
+        ...attribute.code,
+        codeItems: attribute.code.codeItems.map((item) => ({...item})),
+      },
+    })),
+  };
+  jvm.classes.PreparedBooleanUser.ast.classes[0].items.push(
+    { type: 'method', method: hiddenGuardMethod });
+  const hiddenGuardWrapper = () => ({returned: true, value: 0});
+  hiddenGuardWrapper.jvmStructuredSsa = true;
+  jvm.jit.codegenCache.set(hiddenGuardMethod, hiddenGuardWrapper);
+  const hiddenGuardPrepared = jvm.jit.getGeneratedFunction(hiddenGuardMethod, {
+    allowEffectfulCalls: true,
+  });
+  t.notEqual(hiddenGuardPrepared, hiddenGuardWrapper,
+    'preparation rebuilds structured wrappers that can hide child guards');
+  t.equal(hiddenGuardPrepared.jvmStructuredGuardedBooleanSiteCount, 0,
+    'the rebuilt wrapper contains no hidden lifecycle boolean snapshot');
 
   const writingMethod = {
     ...method,
@@ -10363,6 +10652,19 @@ test('structured JVM SSA keeps a bounded wall-clock slice under thread contentio
   t.notOk(jvm.jit.continueStructuredQuantum(current),
     'the browser wall-clock deadline bounds the contended region');
 
+  jvm._awtFrameProducerThread = current;
+  jvm._nextEventLoopYieldAt = Date.now() + 60000;
+  const graceStarted = Date.now();
+  t.ok(jvm.jit.continueStructuredQuantum(current),
+    'the AWT producer starts a bounded scalar-state grace period');
+  t.ok(jvm._nextAwtStructuredYieldAt >= graceStarted &&
+    jvm._nextAwtStructuredYieldAt <= Date.now() + 2,
+  'the default AWT grace adds no time beyond the ordinary host deadline');
+  jvm._nextEventLoopYieldAt = 0;
+  jvm._nextAwtStructuredYieldAt = Date.now() - 1;
+  t.notOk(jvm.jit.continueStructuredQuantum(current),
+    'an expired AWT grace forces the browser scheduler safe point');
+
   t.end();
 });
 
@@ -10762,6 +11064,34 @@ test('structured JVM SSA covers double arithmetic and putfield', (t) => {
   t.equal(structured.receiver.fields['DoubleHolder.total'],
     baseline.receiver.fields['DoubleHolder.total'],
     'structured putfield stores the same narrowed value');
+  t.end();
+});
+
+test('baseline generated float comparisons preserve JVM NaN ordering', (t) => {
+  const run = (op, left, right) => {
+    const method = {
+      name: 'compare', descriptor: '(FF)I', flags: ['static'],
+      attributes: [{type: 'code', code: {
+        codeItems: ['fload_0', 'fload_1', op, 'ireturn']
+          .map((instruction, index) => ({labelDef: `L${index}:`, instruction})),
+        localsSize: '2', stackSize: '2', exceptionTable: [],
+      }}],
+    };
+    const jvm = new JVM({jit: {structuredSsa: false, scalarLoops: false}});
+    const generated = jvm.jit.compileBaselineMethod(method);
+    const frame = new Frame(method);
+    frame.className = 'FloatCompareHarness';
+    frame.locals[0] = Math.fround(left);
+    frame.locals[1] = Math.fround(right);
+    const callStack = new Stack();
+    callStack.push(frame);
+    return generated(frame, {status: 'runnable', callStack}, jvm.jit, false).value;
+  };
+  t.equal(run('fcmpg', Number.NaN, 1), 1, 'fcmpg maps NaN to positive one');
+  t.equal(run('fcmpl', Number.NaN, 1), -1, 'fcmpl maps NaN to negative one');
+  t.equal(run('fcmpg', 1, 2), -1, 'fcmpg preserves less-than ordering');
+  t.equal(run('fcmpl', 2, 1), 1, 'fcmpl preserves greater-than ordering');
+  t.equal(run('fcmpg', -0, 0), 0, 'float comparisons treat signed zero equally');
   t.end();
 });
 
@@ -15243,5 +15573,224 @@ public final class RestoringSyncFallbackHarness {
     'a normally completed call leaves no frame behind for the scheduler');
   t.equal(plan.target.freeFrame !== null, true,
     'the withdrawn frame returns to the plan for reuse');
+  t.end();
+});
+
+test('a transient deopt takes one canonical interpreter step before every JIT tier',
+  async (t) => {
+  const method = {
+    className: 'DeoptInterpreterStepHarness',
+    name: 'run', descriptor: '()V', flags: ['static'],
+    attributes: [{type: 'code', code: {
+      codeItems: [{instruction: 'return'}], exceptionTable: [],
+      localsSize: '0', stackSize: '0',
+    }}],
+  };
+  const jvm = new JVM({jit: {warmupThreshold: 0}});
+  const frame = new Frame(method);
+  const thread = {
+    id: 0, status: 'runnable', pendingException: null, callStack: new Stack(),
+  };
+  thread.callStack.push(frame);
+  frame.jitSkipOnce = true;
+  let wasmEntries = 0;
+  jvm.jit.wasmJit.enabled = true;
+  jvm.jit.wasmJit.tryRunFrame = () => {
+    wasmEntries += 1;
+    return {handled: true, returned: true};
+  };
+
+  const result = jvm.jit.tryRunFrame(frame, thread);
+  t.notOk(result.handled,
+    'the dispatcher returns the frame to the canonical interpreter');
+  t.equal(wasmEntries, 0,
+    'the one-bytecode fallback does not probe or compile Wasm');
+  t.notOk(frame.jitSkipOnce,
+    'the fallback request is consumed exactly once at the tier boundary');
+
+  const preparedFrame = new Frame(method);
+  const preparedThread = {
+    id: 1, status: 'runnable', pendingException: null, callStack: new Stack(),
+  };
+  preparedThread.callStack.push(preparedFrame);
+  jvm.jit.preparedCodegenMethods.add(method);
+  jvm.jit.codegenCache.set(method, (candidateFrame, candidateThread) => {
+    candidateThread.callStack.pop();
+    return {returned: true};
+  });
+  let wasmCoverageProbes = 0;
+  jvm.jit.wasmJit.probeFullCoverage = () => {
+    wasmCoverageProbes += 1;
+    return false;
+  };
+  const preparedResult = jvm.jit.tryRunFrame(preparedFrame, preparedThread);
+  t.ok(preparedResult.handled,
+    'the explicitly prepared JavaScript body executes');
+  t.equal(wasmCoverageProbes, 0,
+    'explicit preparation prevents a foreground Wasm coverage compile');
+  t.equal(wasmEntries, 0,
+    'Wasm execution remains behind the explicitly selected JavaScript tier');
+
+  const oversizedMethod = {
+    ...method, name: 'oversized',
+    attributes: [{type: 'code', code: {
+      codeItems: [
+        {labelDef: 'L0:', instruction: 'nop'},
+        {labelDef: 'L1:', instruction: {op: 'goto', arg: 'L0'}},
+      ], exceptionTable: [], localsSize: '0', stackSize: '0',
+    }}],
+  };
+  const oversizedFrame = new Frame(oversizedMethod);
+  const oversizedThread = {
+    id: 2, status: 'runnable', pendingException: null, callStack: new Stack(),
+  };
+  oversizedThread.callStack.push(oversizedFrame);
+  jvm.jit.oversizedWasmFirstCodeItems = 1;
+  jvm.jit.preparedCodegenMethods.add(oversizedMethod);
+  jvm.jit.importedArrayJsClosureMethods.set(oversizedMethod, true);
+  jvm.jit.codegenCache.set(oversizedMethod, () => {
+    throw new Error('prepared JavaScript must not beat ready full Wasm');
+  });
+  const staleStableEntry = {
+    jit: jvm.jit,
+    generated: jvm.jit.codegenCache.get(oversizedMethod),
+  };
+  jvm.jit.stableGeneratedEntries.set(oversizedMethod, staleStableEntry);
+  oversizedFrame.jitStableGeneratedEntry = staleStableEntry;
+  jvm.jit.wasmJit.state.set(oversizedMethod, {
+    status: 'ready', runs: 0, exits: 0,
+    meta: {fullyCompiled: true},
+  });
+  t.notOk(jvm.jit.hasReadyFullWasm(oversizedMethod),
+    'ordinary full-Wasm routing retains the imported-array locality veto');
+  t.ok(jvm.jit.hasPreparedFullWasmUpgrade(oversizedMethod),
+    'explicit preparation can promote a complete oversized module');
+  const preparedSite = {descriptor: '()V'};
+  const preparedTarget = {
+    method: oversizedMethod, lookupClass: 'PreparedNestedOwner',
+    generated: jvm.jit.codegenCache.get(oversizedMethod),
+    positionalInvoker: () => undefined,
+    readyWasmJsChildRuns: jvm.jit.readyWasmPositionalReleaseThreshold,
+  };
+  t.equal(jvm.jit.getPositionalGeneratedInvoker(
+    preparedSite, preparedTarget), null,
+  'a prepared full module withdraws a stale direct JavaScript child edge');
+  const upgradedResult = jvm.jit.tryRunFrame(oversizedFrame, oversizedThread);
+  t.ok(upgradedResult.handled,
+    'ready full Wasm upgrades an explicitly prepared oversized loop');
+  t.equal(wasmEntries, 1,
+    'the prepared oversized loop enters Wasm without a coverage probe');
+
+  oversizedMethod.className = 'PreparedNestedOwner';
+  jvm.classes.PreparedNestedOwner = {
+    staticFields: new Map(),
+    ast: {classes: [{superClassName: null,
+      items: [{type: 'method', method: oversizedMethod}]}]},
+  };
+  jvm.classInitializationState.set('PreparedNestedOwner', 'INITIALIZED');
+  const nestedParent = new Frame(method);
+  nestedParent.className = 'PreparedNestedCaller';
+  const nestedThread = {
+    id: 3, status: 'runnable', pendingException: null, callStack: new Stack(),
+  };
+  nestedThread.callStack.push(nestedParent);
+  let nestedWasmEntries = 0;
+  jvm.jit.wasmJit.runNested = (child, candidateThread) => {
+    nestedWasmEntries += 1;
+    candidateThread.callStack.pop();
+    return {returned: true, isVoid: true};
+  };
+  await jvm.jit.invoke('invokestatic', nestedParent, {
+    arg: [null, 'PreparedNestedOwner', ['oversized', '()V']],
+  }, nestedThread, 0);
+  t.equal(nestedWasmEntries, 1,
+    'a generated caller enters the same prepared full module through Wasm');
+  t.equal(nestedThread.callStack.peek(), nestedParent,
+    'the completed nested module returns ownership to its generated caller');
+  let wasmOsrPreparations = 0;
+  jvm.jit.wasmJit.prepare = () => {
+    wasmOsrPreparations += 1;
+    return null;
+  };
+  t.equal(jvm.jit.wasmOsrProbe(preparedFrame, preparedThread, 0, 0), null,
+    'a prepared JavaScript body declines Wasm OSR');
+  t.equal(wasmOsrPreparations, 0,
+    'declining Wasm OSR does not compile at a generated backedge');
+
+  const cachedMethod = {
+    ...method, name: 'cached',
+    attributes: method.attributes.map((attribute) => ({
+      ...attribute,
+      code: attribute.code && {...attribute.code,
+        codeItems: attribute.code.codeItems.slice()},
+    })),
+  };
+  const cachedGenerated = () => ({returned: true});
+  jvm.jit.codegenCache.set(cachedMethod, cachedGenerated);
+  t.equal(jvm.jit.getGeneratedFunction(cachedMethod,
+    {allowEffectfulCalls: true}), cachedGenerated,
+  'explicit preparation reuses an existing generated body');
+  t.ok(jvm.jit.preparedCodegenMethods.has(cachedMethod),
+    'a reused generated body still receives prepared-tier ownership');
+  t.end();
+});
+
+test('generated int raster methods signal tracked AWT mutation after stores and at yields', (t) => {
+  const owner = 'CompletionRasterSignalOwner';
+  const method = {
+    className: owner,
+    name: 'fill', descriptor: '([II)V', flags: ['static'],
+    attributes: [{type: 'code', code: {
+      codeItems: [
+        {labelDef: 'L0:', instruction: 'iconst_0'},
+        {labelDef: 'L1:', instruction: 'istore_2'},
+        {labelDef: 'L2:', instruction: 'iload_2'},
+        {labelDef: 'L3:', instruction: 'iload_1'},
+        {labelDef: 'L4:', instruction: {op: 'if_icmpge', arg: 'L11'}},
+        {labelDef: 'L5:', instruction: 'aload_0'},
+        {labelDef: 'L6:', instruction: 'iload_2'},
+        {labelDef: 'L7:', instruction: 'iload_2'},
+        {labelDef: 'L8:', instruction: 'iastore'},
+        {labelDef: 'L9:', instruction: {op: 'iinc', varnum: 2, incr: 1}},
+        {labelDef: 'L10:', instruction: {op: 'goto', arg: 'L2'}},
+        {labelDef: 'L11:', instruction: 'return'},
+      ],
+      exceptionTable: [], localsSize: '3', stackSize: '3',
+    }}],
+  };
+  const jvm = new JVM({jit: {warmupThreshold: 0, structuredSsa: true}});
+  jvm.classes[owner] = {
+    staticFields: new Map(),
+    ast: {classes: [{superClassName: null,
+      items: [{type: 'method', method}]}]},
+  };
+  jvm.classInitializationState.set(owner, 'INITIALIZED');
+  const generated = jvm.jit.structuredSsa.compile(method);
+  t.ok(generated?.jvmStructuredSsa,
+    'the arbitrary counted int-array store uses structured SSA');
+  const source = generated?.jvmStructuredSource || '';
+  const rasterWorkAt = source.indexOf('while (');
+  const storeAt = source.indexOf('awtRasterMutationObserved = true;');
+  const safePointAt = source.indexOf('if (awtRasterMutationObserved)');
+  const signalAt = source.lastIndexOf('helpers.markAwtRasterMutation');
+  t.ok(rasterWorkAt >= 0 && storeAt > rasterWorkAt &&
+      safePointAt >= 0 && signalAt > rasterWorkAt &&
+      !source.includes('__JVM_AWT_RASTER_COMPLETION__'),
+    'a completed store arms the safe-point signal and completion remains covered');
+
+  const pixels = [0, 0, 0, 0];
+  pixels.type = '[I';
+  const tracker = {dirty: false};
+  Object.defineProperty(pixels, '_jvmAwtRasterMutationTracker', {value: tracker});
+  const frame = new Frame(method);
+  frame.className = owner;
+  frame.locals.splice(0, 3, pixels, pixels.length, 0);
+  const thread = {status: 'runnable', callStack: new Stack()};
+  thread.callStack.push(frame);
+  generated(frame, thread, jvm.jit, false);
+  t.deepEqual(pixels.slice(), [0, 1, 2, 3],
+    'completion signaling preserves every generated store');
+  t.ok(tracker.dirty,
+    'the completed method publishes one tracked raster mutation');
   t.end();
 });

@@ -25,8 +25,8 @@ test('idle scheduler waits instead of spinning zero-delay tasks', (t) => {
   t.equal(timerJvm.eventLoopYieldStrategy, 'timer',
     'browser callers can select a paint-friendly timer yield');
   const defaultJvm = new JVM();
-  t.equal(defaultJvm.eventLoopYieldStrategy, 'timer',
-    'paint-friendly timer yielding is the default');
+  t.equal(defaultJvm.eventLoopYieldStrategy, 'message-channel',
+    'the default avoids repeatedly clamped browser timers');
   const messageJvm = new JVM({ eventLoopYieldStrategy: 'message-channel' });
   t.equal(messageJvm.eventLoopYieldStrategy, 'message-channel',
     'latency-sensitive callers can explicitly select MessageChannel yielding');
@@ -72,6 +72,16 @@ test('dropped guest frames convert a scheduler yield into a paint opportunity',
     painting._awtDroppedFrameBacklog = 4;
     t.equal(painting._hostYieldStrategy(), 'presentation',
       'a painting host parks the guest until the pending frame is presented');
+    painting._awtDroppedFrameBacklog = 0;
+    painting._awtIncrementalPresentationPending = true;
+    t.equal(painting._hostYieldStrategy(), 'presentation',
+      'an exact partial-frame signal also waits for its scheduled paint');
+    painting._awtIncrementalPresentationPending = false;
+    painting._awtDirectPresentationPendingYield = true;
+    t.equal(painting._hostYieldStrategy(), 'timer',
+      'an exact direct upload receives one browser-paint task boundary');
+    t.notOk(painting._awtDirectPresentationPendingYield,
+      'the direct-upload task boundary is consumed once');
     if (previousRaf === undefined) delete global.requestAnimationFrame;
     else global.requestAnimationFrame = previousRaf;
     if (previousDocument === undefined) delete global.document;
@@ -620,5 +630,44 @@ test('cached native call sites retain genuinely asynchronous results', async (t)
 
   while (thread.callStack.size() > 1) await jvm.executeTick({ allowBurst: true });
   t.equal(sink.stack.pop(), 41, 'Promise result is awaited and returned normally');
+  t.end();
+});
+
+test('explicit preparation can limit Wasm to prepared oversized upgrades',
+  async (t) => {
+  const ordinary = {name: 'ordinary', descriptor: '()V', flags: [],
+    attributes: [{type: 'code', code: {codeItems: [], exceptionTable: []}}]};
+  const oversized = {name: 'oversized', descriptor: '()V', flags: [],
+    attributes: [{type: 'code', code: {codeItems: [], exceptionTable: []}}]};
+  const jvm = new JVM();
+  jvm.classes.ArbitraryPreparedOwner = {
+    ast: {classes: [{items: [
+      {type: 'method', method: ordinary},
+      {type: 'method', method: oversized},
+    ]}]},
+    staticFields: new Map(),
+  };
+  jvm.classInitializationState.set('ArbitraryPreparedOwner', 'INITIALIZED');
+  jvm.jit.getGeneratedFunction = method => {
+    jvm.jit.preparedCodegenMethods.add(method);
+    return () => ({returned: true});
+  };
+  jvm.jit.hasBackwardBranch = () => true;
+  jvm.jit.isOversizedLoopMethod = method => method === oversized;
+  jvm.jit.jitDenied = () => false;
+  jvm.jit.wasmJit.enabled = true;
+  jvm.jit.wasmJit.methodState = ({method}) => ({status: 'cold', method});
+  const compiled = [];
+  jvm.jit.wasmJit.compile = ({method}) => compiled.push(method);
+
+  const result = await jvm.precompileInitializedClasses({
+    wasm: true, effectful: true, wasmPreparedUpgradesOnly: true,
+  });
+  t.equal(result.methods, 2,
+    'JavaScript preparation still covers every selected method');
+  t.deepEqual(compiled, [oversized],
+    'the Wasm pass compiles only a prepared oversized upgrade');
+  t.equal(result.wasmMethods, 1,
+    'progress reports only the selected Wasm upgrade');
   t.end();
 });

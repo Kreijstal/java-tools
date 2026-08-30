@@ -11,6 +11,7 @@ test("WebAudio unlocks before a delayed SourceDataLine open", async (t) => {
   let contextCreations = 0;
   let resumeCalls = 0;
   let stopCalls = 0;
+  let generationDisconnects = 0;
   let lastContext = null;
   const createdBuffers = [];
   class FakeAudioContext {
@@ -46,6 +47,13 @@ test("WebAudio unlocks before a delayed SourceDataLine open", async (t) => {
         connect() {},
         start() {},
         stop() { stopCalls += 1; },
+      };
+    }
+
+    createGain() {
+      return {
+        connect() {},
+        disconnect() { generationDisconnects += 1; },
       };
     }
   }
@@ -114,7 +122,10 @@ test("WebAudio unlocks before a delayed SourceDataLine open", async (t) => {
     "diagnostics include the duration of the audio gap");
   output.end();
   const closedDiagnostics = audioPlatform.getWebAudioDiagnostics();
-  t.equal(stopCalls, 2, "closing an output cancels queued browser audio");
+  t.equal(stopCalls, 0,
+    "closing an isolated output does not synchronously stop every source");
+  t.equal(generationDisconnects, 1,
+    "closing an output silences its complete source generation at once");
   t.equal(closedDiagnostics.activeOutputs, 0,
     "closed outputs no longer contribute to queue diagnostics");
   t.equal(closedDiagnostics.closedOutputs, 1, "closed outputs are counted");
@@ -214,6 +225,23 @@ test("WebAudio unlocks before a delayed SourceDataLine open", async (t) => {
     timedBuffersBefore + 1,
     "a short effect flushes even when it never fills a complete region");
   timed.end();
+
+  const oversized = factory({
+    channels: 2,
+    bitDepth: 16,
+    sampleRate: 22050,
+    signed: true,
+    bigEndian: false,
+    bufferSize: 65536,
+    coalesceFrames: 1,
+    coalesceDelayMs: 0,
+  });
+  t.equal(oversized.available(), 2205,
+    "oversized browser lines expose only a 25 ms producer window");
+  oversized.write(new Uint8Array(1024));
+  t.equal(oversized.available(), 2205,
+    "the producer window stays bounded while physical capacity remains larger");
+  oversized.end();
   t.end();
 });
 

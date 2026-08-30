@@ -231,7 +231,7 @@ function invokeBytecodeSync(frame, instruction, jvm, thread, kind) {
   if (target.native) {
     return invokeNativeSync(frame, thread, target, state, receiver, kind, jvm);
   }
-  if (jvm.jit && jvm.jit.tryInvokeInterpreterVoidReferenceHelper(
+  if (jvm.jit && jvm.jit.tryInvokeInterpreterReferenceFieldHelper(
     frame, thread, kind, target, state)) {
     return undefined;
   }

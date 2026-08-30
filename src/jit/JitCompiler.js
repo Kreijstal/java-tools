@@ -111,6 +111,17 @@ class JitCompiler {
     this.adaptiveCodegenDependencyPending = new WeakSet();
     this.adaptiveCodegenDependencyEpoch = new WeakMap();
     this.adaptiveCodegenMethods = new WeakSet();
+    // Explicit preparation may prove and compile an effectful method before
+    // runtime heat promotes it. Keep that structural proof separate from the
+    // adaptive heat policy so preparation does not alter global tier choices.
+    this.preparedCodegenMethods = new WeakSet();
+    this.preparedCodegenDeopts = new Map();
+    this.effectfulPreparationActive = false;
+    // Explicit preparation is intended to remain valid across later lifecycle
+    // transitions. Do not let those methods retain a compiled body whose CFG
+    // was pruned from the current value of a mutable static boolean: once the
+    // flag changes, that body can otherwise reject itself on every entry.
+    this.nonSpeculativeStaticBooleanMethods = new WeakSet();
     // Some hot loop bodies contain cold allocation/constructor islands. The
     // baseline generator cannot safely replay those boundaries after an
     // asynchronous handoff, while the structured renderer verifies and
@@ -700,13 +711,24 @@ class JitCompiler {
   }
 
   tryRunFrame(frame, thread) {
+    // A transient generated-code deopt requests one canonical bytecode before
+    // any compiled tier may try the frame again.  Consume that request at the
+    // dispatcher boundary: letting canRun() consume it later still leaves the
+    // Wasm gate above the interpreter, so a deopt can synchronously compile or
+    // re-enter Wasm instead of executing the promised bytecode.
+    if (frame?.jitSkipOnce) {
+      delete frame.jitSkipOnce;
+      return UNHANDLED_RESULT;
+    }
     // Ask the wasm gate before any JS tier can win, so the census can account
     // for methods the JS tier claims first. Diagnostic mode only; a no-op
     // unless JVM_WASM_CENSUS_SHADOW=1.
     if (this.wasmJit.censusShadow) this.wasmJit.censusProbe(frame);
     const readyFullWasm = this.hasReadyFullWasm(frame.method);
+    const preparedFullWasmUpgrade =
+      this.hasPreparedFullWasmUpgrade(frame.method);
     const stableResult = this.tryRunStableGeneratedFrame(
-      frame, thread, readyFullWasm);
+      frame, thread, readyFullWasm, preparedFullWasmUpgrade);
     if (stableResult) return stableResult;
 
     // SpiderMonkey pays a high cost for frequent Wasm -> JS -> Wasm exits.
@@ -725,21 +747,31 @@ class JitCompiler {
     // evidence rather than a guess, and cannot select the partial-module
     // shape the JS preference exists to avoid. Off unless
     // JVM_WASM_PREFER_FULL_COVERAGE=1.
+    const explicitlyPrepared = this.preparedCodegenMethods.has(frame.method);
     const wasmExitStorm = this.hasWasmExitStorm(frame.method);
-    const wasmPriorityLoop = this.wasmJit.enabled && !wasmExitStorm &&
-      !this.isImportedArrayJsClosurePreferred(frame.method) &&
-      !this.isCallGraphStructuredFirstMethod(frame.method) &&
-      (this.isOversizedLoopMethod(frame.method) ||
-        this.isLongArithmeticLoopMethod(frame.method) ||
-        this.isArrayKernelWasmFirstMethod(frame.method) ||
-        readyFullWasm ||
-        this.wasmJit.probeFullCoverage(frame));
-    const wholeMethodPreferred = wasmExitStorm ||
+    // Explicit preparation normally owns the foreground tier so a transition
+    // never compiles or probes again. A module already proven to cover an
+    // oversized loop end to end is a safe upgrade: it incurs no foreground
+    // compilation and cannot bounce through partial Wasm/JS exits.
+    const preparedJsOwned = explicitlyPrepared && !preparedFullWasmUpgrade;
+    const wasmPriorityLoop = preparedFullWasmUpgrade ||
+      !preparedJsOwned && this.wasmJit.enabled && !wasmExitStorm &&
+        !this.isImportedArrayJsClosurePreferred(frame.method) &&
+        !this.isCallGraphStructuredFirstMethod(frame.method) &&
+        (this.isOversizedLoopMethod(frame.method) ||
+          this.isLongArithmeticLoopMethod(frame.method) ||
+          this.isArrayKernelWasmFirstMethod(frame.method) ||
+          readyFullWasm ||
+          this.wasmJit.probeFullCoverage(frame));
+    const wholeMethodPreferred = preparedJsOwned ||
+      wasmExitStorm ||
       this.isWholeMethodJsEntryPreferred(frame.method) &&
       !wasmPriorityLoop;
     if (wholeMethodPreferred && canProbeGenerated) {
       const publishedStructured = this.codegenCache.get(frame.method);
       let codegenEligible = Boolean(publishedStructured?.jvmStructuredSsa) ||
+        Boolean(publishedStructured) &&
+          this.preparedCodegenMethods.has(frame.method) ||
         this.isCodegenSupported(frame.method);
       if (!codegenEligible && this.adaptiveConstructorCallersEnabled &&
           this.isCodegenSupported(frame.method, true)) {
@@ -747,7 +779,8 @@ class JitCompiler {
         awaitingAdaptivePromotion = !codegenEligible;
       }
       if (codegenEligible) canRunGenerated = this.canRun(frame, true,
-        Boolean(publishedStructured?.jvmStructuredSsa));
+        Boolean(publishedStructured?.jvmStructuredSsa) ||
+          this.preparedCodegenMethods.has(frame.method));
     }
 
     if (!canRunGenerated && this.wasmJit.enabled && !this.runningFrames.has(frame)) {
@@ -836,6 +869,10 @@ class JitCompiler {
   hasReadyFullWasm(method) {
     if (this.isImportedArrayJsClosurePreferred(method) ||
         this.isReferenceFieldHelperJsPreferred(method)) return false;
+    return this.hasReadyFullWasmModule(method);
+  }
+
+  hasReadyFullWasmModule(method) {
     const state = this.wasmJit.enabled && method
       ? this.wasmJit.state.get(method) : null;
     if (!state || state.status !== "ready" ||
@@ -847,6 +884,12 @@ class JitCompiler {
     // to take ownership instead of repeatedly crossing Wasm -> interpreter.
     if (this.hasWasmExitStorm(method)) return false;
     return true;
+  }
+
+  hasPreparedFullWasmUpgrade(method) {
+    return this.preparedCodegenMethods.has(method) &&
+      this.isOversizedLoopMethod(method) &&
+      this.hasReadyFullWasmModule(method);
   }
 
   hasWasmExitStorm(method) {
@@ -863,7 +906,8 @@ class JitCompiler {
     return runs >= 64 && nonFuelExits * 4 >= runs;
   }
 
-  tryRunStableGeneratedFrame(frame, thread, readyFullWasm = false) {
+  tryRunStableGeneratedFrame(frame, thread, readyFullWasm = false,
+    preparedFullWasmUpgrade = false) {
     if (!this.enabled || !frame || !frame.method || !frame.instructions ||
         frame.jitJsDisabled || this.runningFrames.has(frame) ||
         this._envInstrumented) return null;
@@ -873,7 +917,9 @@ class JitCompiler {
       return null;
     }
     if (this.wasmJit.enabled &&
-        (readyFullWasm || !this.prefersWholeMethodJs(frame.method))) {
+        (preparedFullWasmUpgrade ||
+          !this.preparedCodegenMethods.has(frame.method) &&
+          (readyFullWasm || !this.prefersWholeMethodJs(frame.method)))) {
       return null;
     }
     if (frame.jitSkipOnce) {
@@ -1063,7 +1109,7 @@ class JitCompiler {
     // access, so a raster loop pays an engine crossing for every pixel while
     // structured JavaScript accesses the same backing arrays directly.
     // java.lang.Math statics are side-effect-free intrinsics in every tier
-    // and do not change that locality argument (rotated-sprite rasterizers
+    // and do not change that locality argument (affine image rasterizers
     // compute sin/cos/floor once per call, then loop over pixels). A
     // same-class call-free plotting helper that itself touches primitive
     // arrays is the same locality argument one call deeper: from Wasm it
@@ -1175,7 +1221,8 @@ class JitCompiler {
       this.referenceFieldHelperJsMethods.set(method, false);
       return false;
     }
-    const referenceOrVoidReturn = parsed.returnType === "void" ||
+    const boundedFieldReturn = parsed.returnType === "void" ||
+      /^(boolean|byte|char|short|int)$/.test(parsed.returnType) ||
       parsed.returnType.endsWith("[]") ||
       parsed.returnType.startsWith("L") ||
       (!/^(void|boolean|byte|char|short|int|long|float|double)$/.test(
@@ -1187,17 +1234,20 @@ class JitCompiler {
     let referenceFieldWrites = 0;
     let primitiveOwnStaticWrites = 0;
     let rejected = items.length === 0 || items.length > 64;
-    for (const item of items) {
-      const op = getOp(item?.instruction);
-      const fieldDescriptor = Array.isArray(item?.instruction?.arg) &&
-        Array.isArray(item.instruction.arg[2])
-        ? item.instruction.arg[2][1] : "";
+    // Inspect the ordinary entry CFG only. Decompiler-preserved exception
+    // reporters can contain allocation and string-building calls that are
+    // unreachable until a guest exception; the restoring positional ABI
+    // materializes a precise child Frame before that cold handler executes.
+    normalFlowContains(items, (instruction, op) => {
+      const fieldDescriptor = Array.isArray(instruction?.arg) &&
+        Array.isArray(instruction.arg[2])
+        ? instruction.arg[2][1] : "";
       const referenceField = fieldDescriptor.startsWith("L") ||
         fieldDescriptor.startsWith("[");
       if (op === "getfield" && referenceField) referenceFieldReads += 1;
       else if (op === "putfield" && referenceField) referenceFieldWrites += 1;
       else if (op === "putstatic") {
-        const field = item?.instruction?.arg;
+        const field = instruction?.arg;
         const descriptor = Array.isArray(field) && Array.isArray(field[2])
           ? field[2][1] : null;
         if (field?.[1] === methodOwner &&
@@ -1212,22 +1262,24 @@ class JitCompiler {
           op === "getstatic" ||
           op === "monitorenter" || op === "monitorexit" ||
           PRIMITIVE_ARRAY_ACCESS_OPCODES.has(op)) rejected = true;
-    }
+      return false;
+    });
     // Some bytecode producers retain an athrow sentinel after an unconditional
     // return. It has no semantic path and must not poison an otherwise bounded
     // helper; a reachable throw still requires canonical frame restoration.
     if (normalFlowContains(items, (_instruction, op) => op === "athrow")) {
       rejected = true;
     }
-    // Small acyclic cursor/link methods manipulate only an object's
-    // reference links. Running each as a scheduled Wasm frame costs much more
-    // than its useful work; generated positional JS keeps the receiver and
-    // return reference in one representation and call tier.
+    // Small acyclic cursor/link methods and their scalar field predicates
+    // manipulate only an object's reference links. Running each as a
+    // scheduled Wasm frame costs much more than its useful work; generated
+    // positional JS keeps the receiver, fields, and result in one
+    // representation and call tier.
     const referenceLinkShape = referenceFieldReads > 0 &&
       referenceFieldWrites > 0;
     const referenceClearShape = parsed.returnType === "void" &&
       referenceFieldWrites >= 2;
-    return referenceOrVoidReturn &&
+    return boundedFieldReturn &&
       (referenceLinkShape || referenceClearShape) &&
       primitiveOwnStaticWrites <= 1 && !rejected &&
       !this.hasBackwardBranch(method);
@@ -1312,7 +1364,8 @@ class JitCompiler {
 
   prefersWholeMethodJs(method) {
     return this.preferWholeMethodJs ||
-      this.adaptiveCodegenMethods.has(method);
+      this.adaptiveCodegenMethods.has(method) ||
+      this.preparedCodegenMethods.has(method);
   }
 
   isWholeMethodJsEntryPreferred(method) {
@@ -1398,6 +1451,15 @@ class JitCompiler {
 
   finishTryRunFrame(frame, thread, methodKey, result) {
     if (result && result.deopt) {
+      if (this.preparedCodegenMethods.has(frame.method)) {
+        const reason = result.reason || "unspecified";
+        const preparedMethodKey = methodKey ||
+          `${this.getFrameClassName(frame)}.${frame.method.name}` +
+            `${frame.method.descriptor}`;
+        const key = `${preparedMethodKey}: ${reason}`;
+        this.preparedCodegenDeopts.set(
+          key, (this.preparedCodegenDeopts.get(key) || 0) + 1);
+      }
       this.lastMethodDeoptReasons.set(
         frame.method, result.reason || "unspecified");
       if (this.profileMethods) {
@@ -1484,12 +1546,40 @@ class JitCompiler {
     if (this.wasmJit.enabled) this.wasmJit.dumpStats();
   }
 
-  getGeneratedFunction(method) {
-    if (!this.codegenEnabled || this.codegenUnavailable || !this.isCodegenSupported(method)) {
+  getGeneratedFunction(method, options = {}) {
+    if (options.allowEffectfulCalls === true) {
+      this.nonSpeculativeStaticBooleanMethods.add(method);
+    }
+    const preparedEffectful = options.allowEffectfulCalls === true ||
+      this.preparedCodegenMethods.has(method);
+    if (!this.codegenEnabled || this.codegenUnavailable ||
+        !this.isCodegenSupported(method, preparedEffectful)) {
       return null;
     }
     if (this.codegenCache.has(method)) {
       const cached = this.codegenCache.get(method);
+      const lifecycleSensitiveStructuredBody = Boolean(cached &&
+        (cached.jvmStructuredSsa ||
+          cached.jvmRestoringDirectPositionalBody ||
+          cached.jvmDirectPositionalBody));
+      if (options.allowEffectfulCalls === true &&
+          (cached?.jvmStructuredGuardedBooleanSiteCount > 0 ||
+            lifecycleSensitiveStructuredBody)) {
+        // This method may have warmed before the explicit preparation phase,
+        // while a lifecycle flag still had a transient value. A positional
+        // child can contain a guarded branch without exposing that count on
+        // the top-level cached wrapper, so rebuild every structured body once
+        // with both boolean arms preserved. Plain cached bodies stay reusable.
+        this.nonSpeculativeStaticBooleanMethods.add(method);
+        this.codegenCache.delete(method);
+        const replacement = this.getGeneratedFunction(method, options);
+        if (replacement) {
+          this.publishGeneratedTargetUpgrade(method, replacement);
+        } else {
+          this.withdrawGeneratedTarget(method);
+        }
+        return replacement;
+      }
       // A verified loop constructor can initially retain its baseline Frame
       // entry while exposing a structured positional body to callers. Retry
       // that narrow structural case after additional invocation evidence;
@@ -1517,6 +1607,9 @@ class JitCompiler {
           this.structuredConstructorRetryState.set(method, state);
         }
       }
+      if (cached && options.allowEffectfulCalls === true) {
+        this.preparedCodegenMethods.add(method);
+      }
       return cached;
     }
     if (this.codegenCompiling.has(method)) return null;
@@ -1524,6 +1617,9 @@ class JitCompiler {
     try {
       const generated = this.compileMethod(method);
       this.codegenCache.set(method, generated);
+      if (generated && options.allowEffectfulCalls === true) {
+        this.preparedCodegenMethods.add(method);
+      }
       if (generated?.jvmHotCallGraphFramedSource &&
           this.shouldCompileHotCallGraphRegion(method)) {
         this.compileHotCallGraphRegion(method);
@@ -2647,11 +2743,11 @@ class JitCompiler {
     if (wallNow < jvm._nextEventLoopYieldAt) {
       // A renderer that is already slower than the ordinary scheduler slice
       // must not repeatedly spill and reconstruct one frame. Give only the
-      // AWT producer a bounded atomic window; 100 ms preserves the requested
-      // 10-FPS responsiveness floor and all other threads retain the normal
-      // event-loop deadline.
+      // AWT producer a configurable bounded grace period. The browser default
+      // adds none, so structured work retains the ordinary 8 ms host deadline.
       if (thread === jvm._awtFrameProducerThread) {
-        jvm._nextAwtStructuredYieldAt = wallNow + 100;
+        jvm._nextAwtStructuredYieldAt = wallNow +
+          jvm.awtStructuredYieldGraceMs;
       }
     } else if (thread !== jvm._awtFrameProducerThread ||
         !(wallNow < Number(jvm._nextAwtStructuredYieldAt || 0))) {
@@ -2695,6 +2791,83 @@ class JitCompiler {
     }
   }
 
+  compileDirectIntrinsicFrameEntry(method) {
+    const flags = method?.flags || [];
+    if (!method || !flags.includes("static") ||
+        flags.includes("synchronized")) {
+      return null;
+    }
+    let parsed;
+    try { parsed = parseDescriptor(method.descriptor); } catch (_) { return null; }
+    // Frame locals reserve a second slot for long/double.  The current direct
+    // raster/array intrinsics are category-one kernels; restrict the scheduler
+    // entry wrapper to that ABI rather than rebuilding an argument vector on
+    // every hot call.
+    if (parsed.params.some((type) => type === "long" || type === "double")) {
+      return null;
+    }
+    const intrinsic = this.getSynchronousIntrinsic(method, method.descriptor);
+    if (!intrinsic?.jvmDirectKind) return null;
+    const argumentCount = parsed.params.length;
+    const returnsVoid = parsed.returnType === "void";
+    const owner = this.jvm.findClassNameForMethod?.(method) ||
+      method.className || "";
+    const generated = (frame, thread, helpers) => {
+      if (frame.pc !== 0) {
+        helpers.skipJitOnce(frame);
+        return {deopt: true, transient: true,
+          reason: "direct intrinsic non-entry resume"};
+      }
+      const value = intrinsic(frame.locals, 0);
+      if (value === ASYNC_INVOKE) {
+        helpers.skipJitOnce(frame);
+        return {deopt: true, transient: true,
+          reason: "direct intrinsic dependency"};
+      }
+      thread.callStack.pop();
+      frame.pc = frame.instructions.length;
+      return {returned: true, value: returnsVoid ? RETURN_VOID : value};
+    };
+    generated.jvmSynchronous = true;
+    generated.jvmDirectIntrinsicKind = intrinsic.jvmDirectKind;
+    // Compiled callers can feed the verified intrinsic positionally without
+    // allocating one scheduler-visible Frame per tiny kernel call.  Preserve
+    // the canonical JVM frame on the exceptional path: every admitted shape
+    // has no guest handler (or only a proven no-op handler), so entry PC is a
+    // sufficient unwind location while normal calls remain allocation-free.
+    const exceptionTable = method.attributes
+      .find((attribute) => attribute.type === "code")?.code?.exceptionTable || [];
+    if (exceptionTable.length === 0) {
+      generated.jvmRestoringDirectPositionalBody =
+        (helpers, plan, ...values) => {
+          const thread = values[argumentCount];
+          const nestedEntryGuarded = values[argumentCount + 1];
+          if ((!nestedEntryGuarded && helpers.needsBytecodeChecks()) ||
+              (nestedEntryGuarded !== 2 && owner &&
+              helpers.jvm.classInitializationState.get(owner) !== "INITIALIZED")) {
+            return ASYNC_INVOKE;
+          }
+          const restorationDepth = thread?.callStack?.items?.length;
+          try {
+            return intrinsic(values, 0);
+          } catch (error) {
+            if (thread?.callStack && plan?.restoreFrame) {
+              const child = new plan.Frame(method);
+              child.className = owner || plan.lookupClass;
+              for (let index = 0; index < argumentCount; index += 1) {
+                child.locals[index] = values[index];
+              }
+              plan.restoreFrame(thread, child, restorationDepth);
+            }
+            throw error;
+          }
+        };
+      generated.jvmRestoringDirectPositionalBody.jvmDirectIntrinsicKind =
+        intrinsic.jvmDirectKind;
+    }
+    return generated;
+  }
+
   _compileMethodUntimed(method) {
     const tracePattern = typeof process !== "undefined" && process.env
       ? process.env.JVM_TRACE_JIT_METHOD || "" : "";
@@ -2702,6 +2875,8 @@ class JitCompiler {
       ? `${method?.className || this.jvm.findClassNameForMethod?.(method) ||
         "unknown"}.${method?.name || "unknown"}${method?.descriptor || ""}`
       : "";
+    const directIntrinsicEntry = this.compileDirectIntrinsicFrameEntry(method);
+    if (directIntrinsicEntry) return directIntrinsicEntry;
     // A structured-only method was admitted specifically because only the
     // complete CFG can preserve an allocation/call continuation. Extracting a
     // smaller baseline loop first would discard that proof and then reject
@@ -2857,6 +3032,29 @@ class JitCompiler {
       this.generatedTargetsByMethod.set(method, entries);
     }
     entries.add({ target, site });
+  }
+
+  withdrawGeneratedTarget(method) {
+    const stableEntry = this.stableGeneratedEntries.get(method);
+    if (stableEntry) stableEntry.generated = null;
+    this.hotCallGraphRegions?.markGeneratedTargetUpgrade(method);
+    const entries = this.generatedTargetsByMethod.get(method);
+    if (!entries) return;
+    for (const { target, site } of entries) {
+      const invoke = target.positionalInvoker;
+      target.generated = null;
+      target.positionalInvoker = undefined;
+      target.preferFrameless = false;
+      target.framelessRejected = false;
+      if (site.fastPositional?.invoke === invoke) site.fastPositional = null;
+      if (target.targetClassName && site.fastPositionalTargets?.[
+        target.targetClassName]?.invoke === invoke) {
+        delete site.fastPositionalTargets[target.targetClassName];
+      }
+      if (site.fastDynamicTarget?.target === target) {
+        site.fastDynamicTarget.positional = null;
+      }
+    }
   }
 
   publishGeneratedTargetUpgrade(method, generated, options = {}) {
@@ -4844,6 +5042,8 @@ class JitCompiler {
       case "iinc": return `locals[${Number(instruction.varnum)}] = (locals[${Number(instruction.varnum)}] + ${Number(instruction.incr)}) | 0; ${goNext}`;
       case "dcmpg": return `{ const b = stack[--sp]; stack[sp - 1] = helpers.compareDouble(b, stack[sp - 1], 1); } ${goNext}`;
       case "dcmpl": return `{ const b = stack[--sp]; stack[sp - 1] = helpers.compareDouble(b, stack[sp - 1], -1); } ${goNext}`;
+      case "fcmpg": return `{ const b = stack[--sp]; stack[sp - 1] = helpers.compareDouble(b, stack[sp - 1], 1); } ${goNext}`;
+      case "fcmpl": return `{ const b = stack[--sp]; stack[sp - 1] = helpers.compareDouble(b, stack[sp - 1], -1); } ${goNext}`;
       case "newarray": return `stack[sp - 1] = helpers.newPrimitiveArray(stack[sp - 1], ${JSON.stringify(instruction.arg)}); ${goNext}`;
       case "anewarray": return `stack[sp - 1] = helpers.newReferenceArray(stack[sp - 1], ${JSON.stringify(instruction.arg)}); ${goNext}`;
       case "arraylength": return `stack[sp - 1] = helpers.arrayLength(stack[sp - 1], frame); ${goNext}`;
@@ -5091,7 +5291,8 @@ class JitCompiler {
   // mid-method is only sound at a supported block leader with an empty
   // operand stack.
   wasmOsrProbe(frame, thread, pc, stackLength) {
-    if (!this.wasmJit.enabled) return null;
+    if (!this.wasmJit.enabled ||
+        this.preparedCodegenMethods.has(frame?.method)) return null;
     frame.pc = pc;
     const prep = this.wasmJit.prepare(frame);
     if (!prep || stackLength !== 0) return null;
@@ -5393,6 +5594,8 @@ class JitCompiler {
         }
         case "dcmpg": stack.push(compareDouble(stack.pop(), stack.pop(), 1)); break;
         case "dcmpl": stack.push(compareDouble(stack.pop(), stack.pop(), -1)); break;
+        case "fcmpg": stack.push(compareDouble(stack.pop(), stack.pop(), 1)); break;
+        case "fcmpl": stack.push(compareDouble(stack.pop(), stack.pop(), -1)); break;
         case "newarray": stack.push(this.newPrimitiveArray(stack.pop(), instruction.arg)); break;
         case "anewarray": stack.push(this.newReferenceArray(stack.pop(), instruction.arg)); break;
         case "multianewarray": stack.push(this.newMultiArray(instruction.arg, stack)); break;
@@ -5814,6 +6017,10 @@ class JitCompiler {
 
   normalizeArrayStore(value, kind, arrayRef) {
     return normalizeArrayStore(value, kind, arrayRef);
+  }
+
+  markAwtRasterMutation(arrayRef, arrayData = null) {
+    markTrackedAwtRasterMutation(arrayRef, arrayData);
   }
 
   // A generated region may keep this raw storage pointer in a scalar local.
@@ -6734,11 +6941,11 @@ class JitCompiler {
     return result;
   }
 
-  tryInvokeInterpreterVoidReferenceHelper(
+  tryInvokeInterpreterReferenceFieldHelper(
     frame, thread, op, resolvedTarget, callState,
   ) {
     const method = resolvedTarget?.method;
-    if (!method || callState?.returnType !== "void" ||
+    if (!method ||
         !this.isReferenceFieldHelperJsPreferred(method)) return false;
     let linked = callState.jitReferenceHelperTarget;
     if (!linked || linked.method !== method ||
@@ -6764,6 +6971,9 @@ class JitCompiler {
     const result = this.tryInvokeFramePositional(
       linked.site, linked.invoke, frame, thread);
     if (result === ASYNC_INVOKE) return false;
+    if (!(result && result.deopt) && callState.returnType !== "void") {
+      frame.stack.push(result);
+    }
     this.framePositionalCallCount += 1;
     return true;
   }
@@ -6814,7 +7024,9 @@ class JitCompiler {
     // this same target may publish its JavaScript positional entry normally,
     // and so may a target whose module has been proven never to run at all
     // (see readyWasmProvenUnusedForTarget).
-    if (method && this.hasReadyFullWasm(method) &&
+    const preparedFullWasmUpgrade = method &&
+      this.hasPreparedFullWasmUpgrade(method);
+    if (preparedFullWasmUpgrade || method && this.hasReadyFullWasm(method) &&
         !this.readyWasmProvenUnusedForTarget(target, method)) return null;
     if (target.positionalInvoker) return target.positionalInvoker;
     const positionalTracePattern = typeof process !== "undefined" && process.env
@@ -7757,7 +7969,11 @@ class JitCompiler {
     // and the method's Wasm state remains permanently cold. A partial exit
     // keeps the materialized child on the stack and hands scheduling back to
     // the verified parent continuation.
-    if (this.wasmJit.enabled && this.isOversizedLoopMethod(method) &&
+    if (this.wasmJit.enabled &&
+        this.isOversizedLoopMethod(method) &&
+        (!this.preparedCodegenMethods.has(method) ||
+          this.hasReadyFullWasm(method) ||
+          this.hasPreparedFullWasmUpgrade(method)) &&
         !this.hasWasmExitStorm(method)) {
       const wasmResult = this.wasmJit.runNested(child, thread);
       if (wasmResult.returned) {
@@ -8161,8 +8377,20 @@ class JitCompiler {
         "iinc", "goto", "iload", "iload", "iadd", "istore",
         "iload_3", "iload", "iadd", "istore_3", "iinc", "goto", "return",
       ];
-      if (ops.length !== maskedBlitOps.length ||
-          !maskedBlitOps.every((op, index) => ops[index] === op)) return null;
+      const exceptionTable = code?.code?.exceptionTable || [];
+      const codeVerified =
+        (!exceptionTable.length ||
+          this.hasOnlyNoOpExceptionHandlers(method, codeItems)) &&
+        Boolean(this.computeStackDepths(
+          codeItems, buildLabelMap(codeItems), method));
+      const canonicalShape = ops.length === maskedBlitOps.length &&
+        maskedBlitOps.every((op, index) => ops[index] === op);
+      // javac.js preserves decompiler control-flow joins as explicit
+      // zero-comparisons and unreachable athrow exits.  The descriptor,
+      // complete opcode multiset, and verifier proof identify the same
+      // five-lane masked rectangle kernel without owner/member names.
+      const javacJsShape = matchesJavacJsMaskedColorBlit(rawOps);
+      if (!canonicalShape && !(codeVerified && javacJsShape)) return null;
       const intrinsic = (stack, base) => this.maskedColorBlitDirect(
         stack[base], stack[base + 1], stack[base + 2], stack[base + 3],
         stack[base + 4], stack[base + 5], stack[base + 6], stack[base + 7],
@@ -8537,6 +8765,7 @@ class JitCompiler {
         sourceIndex + length > source.length || destinationIndex + length > destination.length) {
       throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: null };
     }
+    if (length > 0) markTrackedAwtRasterMutation(destination);
     if (source === destination && destinationIndex > sourceIndex &&
         destinationIndex < sourceIndex + length) {
       // Array.prototype.copyWithin carries generic property/holes/species
@@ -8573,6 +8802,7 @@ class JitCompiler {
     }
     const start = (x + Math.imul(y, surfaceWidth | 0)) | 0;
     const data = this.arrayData(pixels);
+    markTrackedAwtRasterMutation(pixels, data);
     if (start >= 0 && start + count <= pixels.length && data !== null) {
       for (let offset = 0; offset < count; offset += 1) data[start + offset] = color;
       return RETURN_VOID;
@@ -8619,6 +8849,7 @@ class JitCompiler {
     }
     const start = (x + Math.imul(y, surfaceWidth | 0)) | 0;
     const data = this.arrayData(pixels);
+    markTrackedAwtRasterMutation(pixels, data);
     const length = pixels.length ?? (data && data.length) ?? 0;
     const inverse = (256 - alpha) | 0;
     const sourceRed = Math.imul((color >> 16) & 255, alpha);
@@ -8696,6 +8927,7 @@ class JitCompiler {
     let pixelIndex = (x + Math.imul(y, surfaceWidth)) | 0;
     if (width <= 0 || height <= 0) return RETURN_VOID;
     const data = this.arrayData(pixels);
+    markTrackedAwtRasterMutation(pixels, data);
     const length = pixels?.length ?? (data && data.length) ?? 0;
     let rangesValid = data !== null;
     let checkedIndex = pixelIndex;
@@ -8785,6 +9017,9 @@ class JitCompiler {
     maskRowSkip |= 0;
     const destinationData = this.arrayData(destination);
     const maskData = this.arrayData(mask);
+    if (width > 0 && height > 0) {
+      markTrackedAwtRasterMutation(destination, destinationData);
+    }
     const destinationLength = destination?.length ??
       (destinationData && destinationData.length) ?? 0;
     const maskLength = mask?.length ?? (maskData && maskData.length) ?? 0;
@@ -8880,6 +9115,7 @@ class JitCompiler {
 
     const destinationData = this.arrayData(destination);
     const sourceData = this.arrayData(source);
+    markTrackedAwtRasterMutation(destination, destinationData);
     const destinationLength = destination?.length ??
       (destinationData && destinationData.length) ?? 0;
     const sourceLength = source?.length ?? (sourceData && sourceData.length) ?? 0;
@@ -9007,6 +9243,7 @@ class JitCompiler {
 
     const destinationData = this.arrayData(destination);
     const sourceData = this.arrayData(source);
+    markTrackedAwtRasterMutation(destination, destinationData);
     const destinationLength = destination?.length ??
       (destinationData && destinationData.length) ?? 0;
     const sourceLength = source?.length ?? (sourceData && sourceData.length) ?? 0;
@@ -9156,6 +9393,7 @@ class JitCompiler {
     if (index < 0 || index + count > dest.length) {
       throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: null };
     }
+    markTrackedAwtRasterMutation(dest);
     green |= 0;
     red |= 0;
     blue |= 0;
@@ -9186,6 +9424,7 @@ class JitCompiler {
     if (index < 0 || index + count > dest.length) {
       throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: null };
     }
+    markTrackedAwtRasterMutation(dest);
     green |= 0; red |= 0; blue |= 0;
     greenStep |= 0; redStep |= 0; blueStep |= 0;
     for (let offset = 0; offset < count; offset += 1) {
@@ -9209,6 +9448,7 @@ class JitCompiler {
     if (index < 0 || index + count > dest.length) {
       throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: null };
     }
+    markTrackedAwtRasterMutation(dest);
     for (let offset = 0; offset < count; offset += 1) {
       dest[index] = (color + ((dest[index] & 16711422) >> 1)) | 0;
       index += 1;
@@ -9938,8 +10178,11 @@ class JitCompiler {
     // could have invoked a direct JavaScript body.
     const importedArrayJsChild = jsChildSupported &&
       this.isImportedArrayJsClosurePreferred(method);
-    if (this.wasmJit.enabled && !this.hasWasmExitStorm(method) &&
-        !importedArrayJsChild) {
+    const preparedFullWasmUpgrade =
+      this.hasPreparedFullWasmUpgrade(method);
+    if (this.wasmJit.enabled && (preparedFullWasmUpgrade ||
+        !this.preparedCodegenMethods.has(method) &&
+          !this.hasWasmExitStorm(method) && !importedArrayJsChild)) {
       // Ask the Wasm tier before rejecting the child on JS-JIT policy. Wasm
       // can prove numeric loops covered by a wrap-and-rethrow diagnostic
       // handler even when the whole-method JS tier conservatively rejects the
@@ -10502,6 +10745,33 @@ function matchesJavacJsTransparentIntBlit(ops) {
   return Object.entries(expected).every(([op, count]) => counts[op] === count);
 }
 
+// A browser AWT producer may publish a live int[] as its framebuffer. Raster
+// intrinsics signal at most once between host presentations, avoiding both a
+// per-pixel callback and periodic full-surface polling. The property is a
+// host-only, non-enumerable marker installed by the generic AWT bridge.
+function markTrackedAwtRasterMutation(array, data = null) {
+  const tracker = array?._jvmAwtRasterMutationTracker ||
+    data?._jvmAwtRasterMutationTracker;
+  if (tracker && !tracker.dirty) tracker.dirty = true;
+}
+
+function matchesJavacJsMaskedColorBlit(ops) {
+  if (!Array.isArray(ops) || ops.length !== 169) return false;
+  const expected = {
+    iconst_0: 18, istore: 26, iload: 26, iconst_2: 1, ishr: 1,
+    ineg: 3, iconst_3: 1, iand: 1, if_icmplt: 3, return: 1,
+    athrow: 15, iadd: 2, iload_3: 6, istore_3: 1, iinc: 20,
+    goto: 14, aload_1: 5, baload: 5, iload_2: 5, if_icmpne: 5,
+    aload_0: 5, iastore: 5,
+  };
+  const counts = Object.create(null);
+  for (const op of ops) {
+    if (!Object.prototype.hasOwnProperty.call(expected, op)) return false;
+    counts[op] = (counts[op] || 0) + 1;
+  }
+  return Object.entries(expected).every(([op, count]) => counts[op] === count);
+}
+
 function jsLiteral(value) {
   if (typeof value === "bigint") return `${value}n`;
   return JSON.stringify(value);
@@ -10548,6 +10818,7 @@ module.exports._test = {
   localReadBeforeWrite,
   normalizeIntrinsicCompilerIdioms,
   stripProvenDeadEntryInitializers,
+  matchesJavacJsMaskedColorBlit,
   matchesJavacJsTransparentIntBlit,
   buildLabelMap,
 };

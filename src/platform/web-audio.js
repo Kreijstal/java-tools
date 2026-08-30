@@ -171,11 +171,31 @@ registerProcessor("jvm-source-data-line", JVMSourceDataLineProcessor);`;
       outputCount += 1;
       this.pendingSources = 0;
       this.sources = new Set();
+      // Fallback AudioBufferSourceNodes share one disposable route.  A Java
+      // SourceDataLine flush must silence all queued buffers immediately, but
+      // stopping hundreds of native nodes synchronously can monopolize a
+      // browser frame. Disconnecting their shared generation is constant-time;
+      // the detached nodes retire naturally and a later write gets a new route.
+      this.sourceGenerationGain = null;
       this.drainCallbacks = [];
       this.scheduledTime = this.context.currentTime;
       this.bufferSize = Math.max(1, Number(options.bufferSize) || 4096);
       this.bytesPerFrame = Math.max(1, options.channels || 1) *
         Math.max(1, (options.bitDepth || 16) / 8);
+      // Native SourceDataLine producers may fill a large device buffer on a
+      // dedicated Java thread. Browser JVM threads share the UI host thread,
+      // so advertising an empty 64 KiB line can make one producer decode and
+      // submit dozens of PCM regions before rendering runs again. Expose a
+      // bounded immediately-writable window while retaining the line's real
+      // occupancy and capacity underneath. Twenty-five milliseconds is enough
+      // to seed WebAudio without turning startup/catch-up into a long task;
+      // lines at or below 8 KiB preserve their exact negotiated behavior.
+      const bytesPerSecond = Math.max(1,
+        Number(options.sampleRate) || 44100) * this.bytesPerFrame;
+      this.producerWindowBytes = this.bufferSize <= 8192
+        ? this.bufferSize
+        : Math.min(this.bufferSize, Math.max(2048,
+          Math.ceil(bytesPerSecond * 0.025)));
       // SourceDataLine is a continuous stream. Scheduling every 256-frame
       // guest write as an independent 22.05 kHz AudioBufferSource makes the
       // browser restart its sample-rate converter at every tiny boundary.
@@ -527,7 +547,12 @@ registerProcessor("jvm-source-data-line", JVMSourceDataLineProcessor);`;
 
       const source = this.context.createBufferSource();
       source.buffer = audioBuffer;
-      source.connect(this.context.destination);
+      if (!this.sourceGenerationGain &&
+          typeof this.context.createGain === "function") {
+        this.sourceGenerationGain = this.context.createGain();
+        this.sourceGenerationGain.connect(this.context.destination);
+      }
+      source.connect(this.sourceGenerationGain || this.context.destination);
       this.pendingSources += 1;
       this.sources.add(source);
       this.scheduledBuffers += 1;
@@ -568,8 +593,9 @@ registerProcessor("jvm-source-data-line", JVMSourceDataLineProcessor);`;
         : Math.ceil(
           Math.max(0, this.scheduledTime - this.context.currentTime) * sampleRate,
         ) + this.stagedFrames;
-      return Math.max(0,
+      const physicallyAvailable = Math.max(0,
         this.bufferSize - queuedFrames * this.bytesPerFrame);
+      return Math.min(physicallyAvailable, this.producerWindowBytes);
     }
 
     once(event, callback) {
@@ -619,13 +645,22 @@ registerProcessor("jvm-source-data-line", JVMSourceDataLineProcessor);`;
           type: "flush", generation: this.workletGeneration,
         });
       }
-      for (const source of this.sources) {
-        source.onended = null;
-        if (typeof source.stop === "function") {
-          try {
-            source.stop();
-          } catch (error) {
-            // A source that ended between iteration and stop is already done.
+      if (this.sourceGenerationGain) {
+        try {
+          this.sourceGenerationGain.disconnect();
+        } catch (error) {
+          // A concurrently retired route is already silent.
+        }
+        this.sourceGenerationGain = null;
+      } else {
+        for (const source of this.sources) {
+          source.onended = null;
+          if (typeof source.stop === "function") {
+            try {
+              source.stop();
+            } catch (error) {
+              // A source that ended between iteration and stop is already done.
+            }
           }
         }
       }

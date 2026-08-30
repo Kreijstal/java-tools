@@ -2310,6 +2310,11 @@ class WasmJit {
     const browserDefault = typeof window !== 'undefined' && typeof document !== 'undefined';
     this.enabled = (env.JVM_WASM_JIT === '1' || browserDefault) && typeof WebAssembly !== 'undefined' &&
       !env.JVM_TRACE && env.JVM_PROFILE_HOT_METHODS !== '1';
+    // Browser launchers may explicitly finish an ahead-of-time preparation
+    // phase and then forbid monolithic compiler work in interactive frames.
+    // Ready modules continue to run; cold/dependency-invalidated methods use
+    // the existing JS/interpreter fallback until compilation is thawed.
+    this.compilationFrozen = false;
     this.debug = env.JVM_DEBUG_WASMJIT === '1';
     this.traceMethodPattern = env.JVM_TRACE_WASM_METHOD || '';
     this.traceExitsOnly = env.JVM_TRACE_WASM_EXITS_ONLY === '1';
@@ -2509,6 +2514,14 @@ class WasmJit {
     return st;
   }
 
+  freezeCompilation() {
+    this.compilationFrozen = true;
+  }
+
+  thawCompilation() {
+    this.compilationFrozen = false;
+  }
+
   // shared gating/warmup/compile; returns {st, blk} when the frame can run now
   prepare(frame) {
     if (!this.enabled || !frame || !frame.method || !frame.instructions) return null;
@@ -2570,6 +2583,10 @@ class WasmJit {
           this._censusNote(frame,
             st.entries < threshold ? 'below-warmup' : 'no-supported-backedge');
         }
+        return null;
+      }
+      if (this.compilationFrozen) {
+        if (this.census) this._censusNote(frame, 'compilation-frozen');
         return null;
       }
       this.compile(frame, st);

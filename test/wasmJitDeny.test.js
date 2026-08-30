@@ -109,6 +109,28 @@ test('an undenied class still reaches the Wasm tier', async (t) => {
   t.end();
 });
 
+test('a frozen Wasm compiler leaves cold methods on the canonical tier',
+  async (t) => {
+    const {jvm, thread} = await makeHarness(t, 'WasmDenyProbe', SOURCE);
+    jvm.jit.wasmJit.freezeCompilation();
+    const first = makeOut();
+    const method = await invoke(
+      jvm, thread, 'WasmDenyProbe', 'drive', '([II)I', [first, N]);
+    t.equal(first[0], reference(N),
+      'freezing compilation does not change interpreter semantics');
+    t.notEqual(jvm.jit.wasmJit.state.get(method)?.status, 'ready',
+      'a cold method does not synchronously compile while frozen');
+
+    jvm.jit.wasmJit.thawCompilation();
+    const second = makeOut();
+    await invoke(jvm, thread, 'WasmDenyProbe', 'drive', '([II)I', [second, N]);
+    t.equal(second[0], reference(N),
+      'thawing retains the same result');
+    t.equal(jvm.jit.wasmJit.state.get(method)?.status, 'ready',
+      'the same cold method may compile after an explicit thaw');
+    t.end();
+  });
+
 test('JVM_JIT_DENY keeps a denied class off the Wasm tier', async (t) => {
   const { jvm, thread } = await makeHarness(t, 'WasmDenyProbe', SOURCE);
   // Set the parsed cache directly rather than process.env so this cannot

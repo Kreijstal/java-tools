@@ -1156,6 +1156,61 @@ test('AWT producer blits coalesce dirty presentation on animation frames', (t) =
   t.end();
 });
 
+test('AWT incremental presentation consumes exact raster mutation signals', (t) => {
+  const previousRaf = global.requestAnimationFrame;
+  const callbacks = [];
+  global.requestAnimationFrame = (callback) => {
+    callbacks.push(callback);
+    return callbacks.length;
+  };
+  const uploads = [];
+  const context = {
+    createImageData(width, height) {
+      return {width, height, data: new Uint8ClampedArray(width * height * 4)};
+    },
+    putImageData(image) {
+      uploads.push(Array.from(image.data));
+    },
+  };
+  const target = {
+    _width: 2,
+    _height: 1,
+    _canvasElement: {width: 2, height: 1, getContext: () => context},
+  };
+  const jvm = {awtIncrementalPresentation: true};
+  const pixels = [0x112233, 0xaabbcc];
+  const image = {_producer: {width: 2, height: 1, pixels}};
+  const graphics = {_component: target};
+  const draw = Graphics.methods[
+    'drawImage(Ljava/awt/Image;IILjava/awt/image/ImageObserver;)Z'];
+
+  draw(jvm, graphics, [image, 0, 0, null]);
+  callbacks.shift()(0);
+  const tracker = pixels._jvmAwtRasterMutationTracker;
+  t.ok(tracker && !tracker.dirty,
+    'the completed producer frame installs a clean mutation tracker');
+  pixels[0] = 0xffffff;
+  tracker.dirty = true;
+  jvm._awtPresentIntermediate();
+  t.equal(callbacks.length, 0,
+    'an exact tracked mutation does not wait for an animation callback');
+  t.equal(uploads.length, 2,
+    'the stable intermediate framebuffer uploads at the JVM yield');
+  t.notOk(jvm._awtIncrementalPresentationPending,
+    'the immediate partial frame needs no presentation handoff');
+  t.ok(jvm._awtDirectPresentationPendingYield,
+    'the scheduler retains one host-paint yield after the direct upload');
+  t.equal(jvm._awtPresentationStats.incrementalDirectPresentations, 1,
+    'diagnostics distinguish exact direct intermediate uploads');
+  jvm._awtPresentIntermediate();
+  t.equal(callbacks.length, 0,
+    'a clean idle framebuffer does not invent another presentation');
+
+  if (previousRaf === undefined) delete global.requestAnimationFrame;
+  else global.requestAnimationFrame = previousRaf;
+  t.end();
+});
+
 test('AWT presentation recovers when an animation callback is starved', (t) => {
   const previousRaf = global.requestAnimationFrame;
   const callbacks = [];
@@ -1291,6 +1346,63 @@ test('AWT full-frame presentation uses exact Wasm RGB swizzle', (t) => {
     'large presentation records the Wasm swizzle path');
   t.equal(jvm._awtPresentationStats.jsSwizzles, 0,
     'large presentation does not execute the scalar JS converter');
+
+  if (previousRaf === undefined) delete global.requestAnimationFrame;
+  else global.requestAnimationFrame = previousRaf;
+  t.end();
+});
+
+test('AWT plain-array presentation avoids allocating Wasm staging copies', (t) => {
+  const previousRaf = global.requestAnimationFrame;
+  const callbacks = [];
+  global.requestAnimationFrame = (callback) => {
+    callbacks.push(callback);
+    return callbacks.length;
+  };
+  const width = 256;
+  const height = 256;
+  const count = width * height;
+  // javac.js framebuffers may retain one trailing sentinel element.
+  const sourcePixels = new Array(count + 1).fill(0);
+  sourcePixels[0] = 0x010203;
+  sourcePixels[count - 1] = 0xfedcba;
+  sourcePixels[count] = 0xffffff;
+  let uploaded = null;
+  const context = {
+    createImageData(w, h) {
+      return {width: w, height: h, data: new Uint8ClampedArray(w * h * 4)};
+    },
+    putImageData(image) {
+      uploaded = {
+        first: Array.from(image.data.subarray(0, 4)),
+        last: Array.from(image.data.subarray((count - 1) * 4, count * 4)),
+      };
+    },
+  };
+  const target = {
+    _width: width,
+    _height: height,
+    _canvasElement: {width, height, getContext: () => context},
+  };
+  const jvm = {};
+  const graphics = {_component: target};
+  const image = {_producer: {width, height, pixels: sourcePixels}};
+  const draw = Graphics.methods[
+    'drawImage(Ljava/awt/Image;IILjava/awt/image/ImageObserver;)Z'];
+
+  t.equal(draw(jvm, graphics, [image, 0, 0, null]), 1);
+  // The normal soft-surface constructor uses a typed buffer; replace it with
+  // the javac.js representation before the scheduled presentation callback.
+  target._pixels = sourcePixels;
+  callbacks.shift()(0);
+  t.deepEqual(uploaded, {
+    first: [0x01, 0x02, 0x03, 0xff],
+    last: [0xfe, 0xdc, 0xba, 0xff],
+  }, 'the allocation-free JS pass preserves the visible framebuffer');
+  t.equal(jvm._awtPresentationStats.wasmSwizzles, 0,
+    'plain arrays do not enter the Wasm staging path');
+  t.equal(jvm._awtPresentationStats.jsSwizzles, 1,
+    'plain arrays use one direct output pass');
 
   if (previousRaf === undefined) delete global.requestAnimationFrame;
   else global.requestAnimationFrame = previousRaf;

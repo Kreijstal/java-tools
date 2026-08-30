@@ -242,12 +242,19 @@ class JVM {
       fakeTimeRealtime: options.fakeTimeRealtime ?? env.JVM_FAKE_TIME_REALTIME === '1',
     });
     const configuredYieldMs = options.eventLoopYieldMs ?? env.JVM_EVENT_LOOP_YIELD_MS;
-    this.eventLoopYieldMs = Math.max(1, Number(configuredYieldMs) || 16);
+    this.eventLoopYieldMs = Math.max(1, Number(configuredYieldMs) || 8);
+    // Structured AWT loops may retain scalar state briefly after the ordinary
+    // host-yield deadline. The responsive browser default adds no grace;
+    // embedders can still opt into a larger scalar-state window.
+    const configuredAwtStructuredGrace = options.awtStructuredYieldGraceMs ??
+      env.JVM_AWT_STRUCTURED_YIELD_GRACE_MS;
+    this.awtStructuredYieldGraceMs = Math.max(0,
+      Number.isFinite(Number(configuredAwtStructuredGrace))
+        ? Number(configuredAwtStructuredGrace) : 0);
     const configuredYieldStrategy =
       options.eventLoopYieldStrategy ?? env.JVM_EVENT_LOOP_YIELD_STRATEGY;
-    this.eventLoopYieldStrategy =
-      configuredYieldStrategy === "message-channel"
-        ? "message-channel" : "timer";
+    this.eventLoopYieldStrategy = configuredYieldStrategy === "timer"
+      ? "timer" : "message-channel";
     // Frame-production backpressure. A MessageChannel yield keeps the host
     // task queue continuously runnable, which lets a browser defer its
     // rendering opportunity (and therefore requestAnimationFrame, paint and
@@ -275,6 +282,7 @@ class JVM {
       Math.min(256, Number(configuredGeneratedBurst) || 64));
     this.generatedSchedulerBurstFrames = 0;
     this.generatedSchedulerBurstBatches = 0;
+    this._explicitPreparationDepth = 0;
     this._nextEventLoopYieldAt = Date.now() + this.eventLoopYieldMs;
     this._hotMethodCounts = new Map();
     // process.env property reads go through libuv (~600ns for the set below);
@@ -1041,6 +1049,17 @@ class JVM {
   // task) rather than through the continuously runnable message queue.
   _hostYieldStrategy() {
     const strategy = this.eventLoopYieldStrategy;
+    if (this._awtDirectPresentationPendingYield && hostPaintsBetweenTasks()) {
+      this._awtDirectPresentationPendingYield = false;
+      return "timer";
+    }
+    // An exact mutation signal has just scheduled an in-progress AWT frame.
+    // Park this yield until that frame lands instead of immediately
+    // replenishing Firefox's MessageChannel queue ahead of its paint phase.
+    // The presenter's bounded timer still releases hidden/non-painting tabs.
+    if (this._awtIncrementalPresentationPending && hostPaintsBetweenTasks()) {
+      return "presentation";
+    }
     if (strategy !== "message-channel") return strategy;
     const limit = this.awtPresentationBackpressureFrames;
     if (!(limit > 0)) return strategy;
@@ -1075,6 +1094,14 @@ class JVM {
 
     try {
       while (!this.debugManager.isPaused) {
+        if (this._explicitPreparationDepth > 0) {
+          // Explicit ahead-of-time preparation owns the host thread. Let its
+          // compiler tasks advance without concurrently executing a stale
+          // guest activation or warming a second, lifecycle-sensitive body.
+          await yieldToEventLoop(0, this.eventLoopYieldStrategy);
+          this._nextEventLoopYieldAt = Date.now() + this.eventLoopYieldMs;
+          continue;
+        }
         const scheduled = this._prepareSchedulerTick();
         const timingSample = this._beginSchedulerTiming(scheduled);
         const fastResult = this._tryExecuteSynchronousJitTick(scheduled);
@@ -1158,10 +1185,35 @@ class JVM {
   // values. Browser launchers may run this during an explicit preparation
   // phase to move first-use compiler work out of interactive transitions.
   async precompileInitializedClasses(options = {}) {
+    const pauseGuest = options.effectful === true;
+    if (pauseGuest) this._explicitPreparationDepth += 1;
+    try {
+      return await this._precompileInitializedClasses(options);
+    } finally {
+      if (pauseGuest) {
+        this._explicitPreparationDepth = Math.max(
+          0, this._explicitPreparationDepth - 1);
+      }
+    }
+  }
+
+  async _precompileInitializedClasses(options = {}) {
+    let preloadedClasses = 0;
+    if (options.preloadClasspath === true) {
+      const preload = await this.preloadClasspathClasses(options.onProgress);
+      preloadedClasses = preload.classes;
+    }
     const loopsOnly = options.loopsOnly === true;
+    const compileWasm = options.wasm === true;
+    const wasmFallbackOnly = options.wasmFallbackOnly === true;
+    const wasmPreparedUpgradesOnly =
+      options.wasmPreparedUpgradesOnly === true;
+    const compileEffectful = options.effectful === true;
+    const initializedOnly = options.initializedOnly !== false;
     const methods = [];
     for (const [className, classData] of Object.entries(this.classes)) {
-      if (this.classInitializationState.get(className) !== "INITIALIZED") {
+      if (initializedOnly &&
+          this.classInitializationState.get(className) !== "INITIALIZED") {
         continue;
       }
       for (const item of classData?.ast?.classes?.[0]?.items || []) {
@@ -1169,19 +1221,119 @@ class JVM {
         if (!method || (loopsOnly && !this.jit.hasBackwardBranch(method))) {
           continue;
         }
-        methods.push(method);
+        methods.push({className, method});
+      }
+    }
+    if (compileEffectful) {
+      // Retire lifecycle-sensitive bodies first. They are already hot enough
+      // to have compiled before preparation and can otherwise keep paying a
+      // stale boolean-guard deopt while thousands of cold methods are handled
+      // ahead of them. The ordering is derived solely from compiler metadata;
+      // it does not change which methods preparation compiles.
+      methods.sort((left, right) => Number(Boolean(
+        this.jit.codegenCache.get(right.method)
+          ?.jvmStructuredGuardedBooleanSiteCount)) - Number(Boolean(
+        this.jit.codegenCache.get(left.method)
+          ?.jvmStructuredGuardedBooleanSiteCount)));
+    }
+    let completed = 0;
+    let wasmCompleted = 0;
+    const previousEffectfulPreparation = this.jit.effectfulPreparationActive;
+    if (compileEffectful) this.jit.effectfulPreparationActive = true;
+    try {
+      for (const {method} of methods) {
+        this.jit.getGeneratedFunction(method, {
+          allowEffectfulCalls: compileEffectful,
+        });
+        completed += 1;
+        if (typeof options.onProgress === "function") {
+          options.onProgress({completed, total: methods.length, tier: "javascript"});
+        }
+        await yieldToEventLoop(0, this.eventLoopYieldStrategy);
+      }
+      if (compileWasm && this.jit.wasmJit?.enabled) {
+        for (const {className, method} of methods) {
+          const flags = method.flags || [];
+          const preparedWasmUpgrade =
+            this.jit.preparedCodegenMethods.has(method) &&
+            this.jit.isOversizedLoopMethod(method);
+          if ((!wasmPreparedUpgradesOnly || preparedWasmUpgrade) &&
+              (this.jit.hasBackwardBranch(method) || wasmFallbackOnly) &&
+              (!wasmFallbackOnly ||
+                !this.jit.preparedCodegenMethods.has(method) ||
+                preparedWasmUpgrade) &&
+              method.name !== "<init>" && method.name !== "<clinit>" &&
+              !flags.includes("native") && !flags.includes("abstract") &&
+              !flags.includes("synchronized") && !this.jit.jitDenied(method)) {
+            const wasm = this.jit.wasmJit;
+            const state = wasm.methodState({method});
+            if (state.status === "cold") {
+              wasm.compile({className, method}, state);
+            }
+            wasmCompleted += 1;
+          }
+          if (typeof options.onProgress === "function") {
+            options.onProgress({completed: wasmCompleted, total: methods.length, tier: "wasm"});
+          }
+          await yieldToEventLoop(0, this.eventLoopYieldStrategy);
+        }
+      }
+    } finally {
+      this.jit.effectfulPreparationActive = previousEffectfulPreparation;
+    }
+    return {preloadedClasses, methods: completed, wasmMethods: wasmCompleted};
+  }
+
+  // Loading is deliberately separate from initialization in the JVM. An
+  // explicit preparation phase may parse every application class so its
+  // methods can be compiled without running <clinit> or changing Java-visible
+  // initialization order.
+  async preloadClasspathClasses(onProgress = null) {
+    const names = new Set();
+    const classFs = this.fs || fs;
+    const visitDirectory = async (root, relative = "") => {
+      const directory = relative ? path.join(root, relative) : root;
+      let entries;
+      try {
+        entries = await classFs.promises.readdir(directory, {withFileTypes: true});
+      } catch (_) {
+        return;
+      }
+      for (const entry of entries) {
+        const entryRelative = relative ? path.join(relative, entry.name) : entry.name;
+        if (entry.isDirectory()) {
+          await visitDirectory(root, entryRelative);
+        } else if (entry.name.endsWith(".class")) {
+          names.add(entryRelative.slice(0, -6).split(path.sep).join("/"));
+        }
+      }
+    };
+    for (const cp of this.classpath) {
+      const lower = String(cp).toLowerCase();
+      if (lower.endsWith(".jar") || lower.endsWith(".zip")) {
+        const resolved = path.resolve(cp);
+        let zip = this.jarCache.get(resolved);
+        if (!zip) {
+          zip = await JSZip.loadAsync(await classFs.promises.readFile(resolved));
+          this.jarCache.set(resolved, zip);
+        }
+        for (const name of Object.keys(zip.files)) {
+          if (name.endsWith(".class")) names.add(name.slice(0, -6));
+        }
+      } else {
+        await visitDirectory(cp);
       }
     }
     let completed = 0;
-    for (const method of methods) {
-      this.jit.getGeneratedFunction(method);
+    for (const name of names) {
+      await this.loadClassByName(name);
       completed += 1;
-      if (typeof options.onProgress === "function") {
-        options.onProgress({completed, total: methods.length});
+      if (typeof onProgress === "function") {
+        onProgress({completed, total: names.size, tier: "class-load"});
       }
       await yieldToEventLoop(0, this.eventLoopYieldStrategy);
     }
-    return {methods: completed};
+    return {classes: completed};
   }
 
   enqueueAwtEventInvocation(listener, methodName, descriptor, event, coalesce = false) {
@@ -1410,7 +1562,7 @@ class JVM {
     // AWT identifies the thread that publishes complete frames, let that
     // thread keep its CPU turn until it sleeps or blocks. Background loaders
     // still run while the animation thread sleeps between frames, matching
-    // native JVM concurrency without assigning a game-specific priority.
+    // native JVM concurrency without assigning a workload-specific priority.
     const frameProducer = this._awtFrameProducerThread;
     if (frameProducer && frameProducer.status === "runnable") {
       const producerIndex = this.threads.indexOf(frameProducer);
