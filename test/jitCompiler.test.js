@@ -15665,13 +15665,20 @@ test('a transient deopt takes one canonical interpreter step before every JIT ti
     'ordinary full-Wasm routing retains the imported-array locality veto');
   t.ok(jvm.jit.hasPreparedFullWasmUpgrade(oversizedMethod),
     'explicit preparation can promote a complete oversized module');
-  const preparedSite = {descriptor: '()V'};
+  const stalePreparedInvoke = () => undefined;
+  const preparedSite = {
+    descriptor: '()V', fastPositional: {invoke: stalePreparedInvoke},
+  };
   const preparedTarget = {
     method: oversizedMethod, lookupClass: 'PreparedNestedOwner',
     generated: jvm.jit.codegenCache.get(oversizedMethod),
-    positionalInvoker: () => undefined,
+    positionalInvoker: stalePreparedInvoke,
     readyWasmJsChildRuns: jvm.jit.readyWasmPositionalReleaseThreshold,
   };
+  jvm.jit.trackGeneratedTarget(oversizedMethod, preparedTarget, preparedSite);
+  jvm.jit.publishWasmTargetReady(oversizedMethod);
+  t.equal(preparedSite.fastPositional, null,
+    'late preparation withdraws an already-published JavaScript child edge');
   t.equal(jvm.jit.getPositionalGeneratedInvoker(
     preparedSite, preparedTarget), null,
   'a prepared full module withdraws a stale direct JavaScript child edge');
