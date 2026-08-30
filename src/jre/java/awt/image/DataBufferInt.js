@@ -1,7 +1,7 @@
 module.exports = {
   super: 'java/awt/image/DataBuffer',
   methods: {
-    // Shares the caller's int[] — the game writes pixels into it directly.
+    // DataBufferInt shares the caller-provided int[] as required by AWT.
     '<init>([II)V': (jvm, obj, args) => {
       obj._data = args[0];
       obj._size = args[1];

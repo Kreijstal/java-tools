@@ -46,7 +46,6 @@ function syncSiteState(instruction, descriptor) {
     params: parsed.params,
     returnType: parsed.returnType,
     epoch: -1,
-    fusedCandidate: undefined,
     staticTarget: undefined,
     receiverClass0: null,
     target0: undefined,
@@ -158,7 +157,6 @@ function invokeBytecodeSync(frame, instruction, jvm, thread, kind) {
   const state = syncSiteState(instruction, descriptor);
   if (state.epoch !== jvm.classEpoch) {
     state.epoch = jvm.classEpoch;
-    state.fusedCandidate = undefined;
     state.staticTarget = undefined;
     state.receiverClass0 = null;
     state.target0 = undefined;
@@ -183,24 +181,6 @@ function invokeBytecodeSync(frame, instruction, jvm, thread, kind) {
     if (!target) return SYNC_INVOKE_FALLBACK;
     if (target.native) {
       return invokeNativeSync(frame, thread, target, state, null, kind, jvm);
-    }
-    const fusedRegions = jvm.jit && jvm.jit.fusedRegions;
-    if (fusedRegions && fusedRegions.enabled) {
-      if (state.fusedCandidate === undefined) {
-        state.fusedCandidate = fusedRegions.mayFuse(target.method);
-      }
-      if (state.fusedCandidate) {
-        const fused = fusedRegions.tryInvoke({
-          op: 'invokestatic',
-          descriptor,
-          params: state.params,
-          returnType: state.returnType,
-        }, {
-          method: target.method,
-          lookupClass: target.owner,
-        }, frame, thread);
-        if (fused.handled) return undefined;
-      }
     }
     pushBytecodeInvokeFrame(frame, thread, target, state.params, null, true);
     return undefined;

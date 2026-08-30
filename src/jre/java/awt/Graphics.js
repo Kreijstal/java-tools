@@ -84,53 +84,6 @@ function dumpFrame(pixels, width, height, jvm) {
   }
 }
 
-// A game ImageProducer (e.g. the RS-style DrawingArea) keeps its framebuffer
-// as the largest int[] field on the producer object and its width/height as two
-// int fields whose product is that array's usable length (allocated as
-// `new int[1 + w*h]`). Recover them field-name-agnostically and expose the live
-// array as a DataBufferInt-style raster so drawImage can blit/dump it.
-function materializeProducerImage(imageObj) {
-  const producer = imageObj._producer;
-  if (!producer) return;
-  // java.awt.image.MemoryImageSource is implemented by the browser JRE and
-  // stores its constructor arguments directly on the host object.
-  if (producer.pixels && producer.width > 0 && producer.height > 0) {
-    imageObj._width = producer.width | 0;
-    imageObj._height = producer.height | 0;
-    imageObj._raster = { _dataBuffer: { _data: producer.pixels } };
-    return;
-  }
-  if (!producer.fields) return;
-  let pixels = null;
-  const ints = [];
-  for (const key of Object.keys(producer.fields)) {
-    const v = producer.fields[key];
-    if ((Array.isArray(v) || ArrayBuffer.isView(v)) && v.type === '[I') {
-      if (!pixels || v.length > pixels.length) pixels = v;
-    } else if (typeof v === 'number' && Number.isInteger(v) && v > 0 && v <= 8192) {
-      ints.push(v);
-    }
-  }
-  if (!pixels || pixels.length < 2) return;
-  const L = pixels.length;
-  let w = 0, h = 0;
-  // Prefer a (w,h) pair that are both actual int fields on the producer.
-  for (const a of ints) {
-    for (const target of [L - 1, L]) {
-      if (a > 0 && target % a === 0 && ints.includes(target / a)) { w = a; h = target / a; break; }
-    }
-    if (w) break;
-  }
-  // Fallback: any factor of L-1 drawn from the int fields.
-  if (!w) {
-    for (const a of ints) { if (a > 1 && (L - 1) % a === 0) { w = a; h = (L - 1) / a; break; } }
-  }
-  if (!w || !h) return;
-  imageObj._width = w;
-  imageObj._height = h;
-  imageObj._raster = { _dataBuffer: { _data: pixels } };
-}
-
 // Software raster for headless components: a Graphics with a _component but
 // no native context paints into component._pixels so frames can be dumped.
 function softSurface(jvm, obj) {
@@ -158,13 +111,11 @@ function presentationStats(jvm) {
       presented: 0,
       uploadMs: 0,
       drawImageCalls: 0,
-      producerImages: 0,
       softwareBlits: 0,
       blitCopyMs: 0,
       wasmSwizzles: 0,
       jsSwizzles: 0,
       presentationFallbacks: 0,
-      incrementalDirectPresentations: 0,
     };
   }
   return jvm._awtPresentationStats;
@@ -219,37 +170,12 @@ function presentSoftSurface(jvm, comp) {
   return true;
 }
 
-function markSoftSurfaceDirty(jvm, comp, thread = null, immediate = false) {
+function markSoftSurfaceDirty(jvm, comp, thread = null) {
   if (!comp) return;
   if (jvm && thread) jvm._awtFrameProducerThread = thread;
   comp._pixelsVersion = (comp._pixelsVersion || 0) + 1;
   const stats = presentationStats(jvm);
   if (stats) stats.dirtyMarks += 1;
-  // An exact tracked raster mutation is observed only at a cooperative JVM
-  // yield, after the mutating compiled region has materialized its effects.
-  // Upload that stable intermediate surface now instead of waiting for a
-  // requestAnimationFrame callback that Firefox may defer behind other task
-  // queues. The scheduler follows it with one timer-task yield so the browser
-  // still receives a rendering opportunity before guest execution resumes.
-  if (immediate && comp._canvasElement &&
-      typeof requestAnimationFrame === 'function' &&
-      !comp._presentScheduled && presentSoftSurface(jvm, comp)) {
-    if (stats) {
-      stats.scheduled += 1;
-      stats.incrementalDirectPresentations += 1;
-    }
-    if (jvm) {
-      jvm._awtIncrementalPresentationPending = false;
-      jvm._awtDirectPresentationPendingYield = true;
-      jvm._awtDroppedFrameBacklog = 0;
-      const waiters = jvm._awtPresentationWaiters;
-      if (waiters && waiters.length) {
-        jvm._awtPresentationWaiters = [];
-        for (let index = 0; index < waiters.length; index += 1) waiters[index]();
-      }
-    }
-    return;
-  }
   if (!comp._canvasElement || typeof requestAnimationFrame !== 'function') {
     // Headless jvm.js has no browser upload, but a completed software frame is
     // still an observable presentation boundary. Coalesce all publications in
@@ -293,7 +219,6 @@ function markSoftSurfaceDirty(jvm, comp, thread = null, immediate = false) {
     if (fallback && stats) stats.presentationFallbacks += 1;
     presentSoftSurface(jvm, comp);
     if (jvm) {
-      jvm._awtIncrementalPresentationPending = false;
       jvm._awtDroppedFrameBacklog = 0;
       // A scheduler that parked the guest until this frame reached the screen
       // resumes here, so production is paced by presentation instead of
@@ -315,61 +240,6 @@ function markSoftSurfaceDirty(jvm, comp, thread = null, immediate = false) {
     const fallbackMs = Math.max(17, Math.min(33, yieldMs + 4));
     fallbackTimer = setTimeout(() => present(true), fallbackMs);
   }
-}
-
-function installIncrementalPresenter(jvm) {
-  if (!jvm || jvm._awtPresentIntermediate) return;
-  jvm._awtPresentIntermediate = () => {
-    if (!jvm._softCanvases) return;
-    for (const comp of jvm._softCanvases) {
-      const frame = comp && comp._lastFrame;
-      const pixels = frame && frame.pixels;
-      const count = pixels && pixels.length;
-      if (!count || comp._presentScheduled) continue;
-
-      const mutationTracker = pixels._jvmAwtRasterMutationTracker;
-      if (mutationTracker?.dirty) {
-        mutationTracker.dirty = false;
-        comp._pixels = pixels;
-        comp._pixelsWidth = frame.width;
-        comp._pixelsHeight = frame.height;
-        jvm._awtIncrementalPresentationPending = true;
-        markSoftSurfaceDirty(jvm, comp,
-          jvm._awtFrameProducerThread || null, true);
-        continue;
-      }
-
-      // Rotate through bounded sample sets. Each phase is compared only with
-      // its own preceding signature, so an unchanged idle surface never
-      // produces synthetic presentations while active broad raster changes
-      // are detected without copying the complete framebuffer.
-      const phase = ((comp._incrementalSamplePhase || 0) + 1) & 7;
-      comp._incrementalSamplePhase = phase;
-      let signature = (count ^ phase) | 0;
-      const samples = Math.min(256, count);
-      const stride = Math.max(1, Math.floor(count / samples));
-      let index = phase;
-      for (let sample = 0; sample < samples; sample += 1) {
-        signature = Math.imul(signature ^ (pixels[index % count] | 0),
-          0x45d9f3b) | 0;
-        index += stride;
-      }
-      const signatures = comp._incrementalSignatures ||
-        (comp._incrementalSignatures = new Int32Array(8));
-      const initialized = comp._incrementalSignatureInitialized || 0;
-      const bit = 1 << phase;
-      const changed = (initialized & bit) !== 0 &&
-        signatures[phase] !== signature;
-      signatures[phase] = signature;
-      comp._incrementalSignatureInitialized = initialized | bit;
-      if (!changed) continue;
-
-      comp._pixels = pixels;
-      comp._pixelsWidth = frame.width;
-      comp._pixelsHeight = frame.height;
-      markSoftSurfaceDirty(jvm, comp, jvm._awtFrameProducerThread || null);
-    }
-  };
 }
 
 function colorToRgb(colorObj) {
@@ -508,22 +378,14 @@ module.exports = {
       if (!imageObj) {
         return 0;
       }
-      // An image created from the game's own ImageProducer carries a live
-      // reference to that producer. Pull its current int[] framebuffer into a
-      // raster so the shared blit/dump path below observes the real frame
-      // (mutated in place each render), not just the fillRect background.
-      if (imageObj._producer && !imageObj._raster) {
-        materializeProducerImage(imageObj);
-        if (stats && imageObj._raster) stats.producerImages += 1;
+      if (imageObj._producer && !imageObj._frameComplete) {
+        return 0;
       }
-
-      // Headless raster path: a BufferedImage over a DataBufferInt is the
-      // game's framebuffer — record it on the target component and optionally
-      // dump PNG frames (JVM_FRAME_DIR, JVM_FRAME_EVERY, JVM_FRAME_LIMIT).
+      // Software raster path: publish only a complete BufferedImage or
+      // ImageProducer frame and optionally dump it in headless runs.
       const raster = imageObj._raster;
       const pixels = raster && raster._dataBuffer && raster._dataBuffer._data;
       if (pixels && imageObj._width && imageObj._height) {
-        if (jvm.awtIncrementalPresentation) installIncrementalPresenter(jvm);
         let target = obj._component;
         if (!target && graphicsContext && graphicsContext.ctx && graphicsContext.ctx.canvas) {
           const canvas = graphicsContext.ctx.canvas;
@@ -536,14 +398,6 @@ module.exports = {
         }
         let presentedBySoftwareSurface = false;
         if (target) {
-          let mutationTracker = pixels._jvmAwtRasterMutationTracker;
-          if (!mutationTracker) {
-            mutationTracker = {dirty: false};
-            Object.defineProperty(pixels, '_jvmAwtRasterMutationTracker', {
-              value: mutationTracker,
-              configurable: true,
-            });
-          }
           target._lastFrame = {
             pixels,
             width: imageObj._width,
@@ -597,7 +451,6 @@ module.exports = {
             target._canvasElement = jvm._awtCanvasElement;
           }
           if (presentedBySoftwareSurface) markSoftSurfaceDirty(jvm, target, thread);
-          mutationTracker.dirty = false;
           if (stats && presentedBySoftwareSurface) stats.softwareBlits += 1;
         }
         dumpFrame(pixels, imageObj._width, imageObj._height, jvm);

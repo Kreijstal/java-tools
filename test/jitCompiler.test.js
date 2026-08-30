@@ -17,10 +17,6 @@ const {
   addTypedArrayStoreImports,
 } = require('../src/jit/wasmRuntimeImports');
 const { _test: structuredRendererTest } = require('../src/jit/JvmSsaBlockRenderer');
-const HandwrittenFusedGradient =
-  require('../scripts/oracles/FusedGradientOracle');
-const HandwrittenAffineSpriteRaster =
-  require('../scripts/oracles/AffineSpriteRasterOracle');
 const invokeHandlers = require('../src/instructions/invoke');
 const objectHandlers = require('../src/instructions/object');
 const controlHandlers = require('../src/instructions/control');
@@ -546,359 +542,6 @@ test('typed Wasm array-store imports preserve JVM narrowing and traps', (t) => {
   t.throws(() => imports.get('aset_iastore')([0], 1, 1),
     (error) => error?.type === 'java/lang/ArrayIndexOutOfBoundsException',
     'out-of-bounds stores retain the guest bounds exception');
-  t.end();
-});
-
-test('handwritten region fingerprints ignore guest class and method names', (t) => {
-  const shape = (owner, dependency, methodName, fieldName, constant = 7) => ({
-    descriptor: `(L${owner};)V`,
-    items: [
-      { instruction: { op: 'invokestatic', arg: ['Method', owner,
-        [methodName, `(L${dependency};I)V`]] } },
-      { instruction: { op: 'getstatic', arg: ['Field', dependency, [fieldName, 'I']] } },
-      { instruction: { op: 'new', arg: dependency } },
-      { instruction: { op: 'bipush', arg: String(constant) } },
-      { instruction: 'return' },
-    ],
-  });
-  const jit = { getCodeItems: (method) => method.items };
-  const original = HandwrittenFusedGradient.fingerprintMethods(jit,
-    [shape('game/A', 'game/B', 'draw', 'pixels')]);
-  const renamed = HandwrittenFusedGradient.fingerprintMethods(jit,
-    [shape('renamed/X', 'renamed/Y', 'method_17', 'field_42')]);
-  const altered = HandwrittenFusedGradient.fingerprintMethods(jit,
-    [shape('renamed/X', 'renamed/Y', 'method_17', 'field_42', 8)]);
-  t.equal(renamed, original,
-    'consistent owner, member, and descriptor renaming leaves the shape unchanged');
-  t.notEqual(altered, original, 'an altered bytecode constant changes the verified shape');
-  const longConstant = {
-    descriptor: '()J',
-    items: [
-      {instruction: {op: 'ldc2_w', arg: 0x1fffffffffffffn}},
-      {instruction: 'lreturn'},
-    ],
-  };
-  const otherLongConstant = {
-    ...longConstant,
-    items: [
-      {instruction: {op: 'ldc2_w', arg: 0x1ffffffffffffen}},
-      {instruction: 'lreturn'},
-    ],
-  };
-  const longFingerprint =
-    HandwrittenFusedGradient.fingerprintMethods(jit, [longConstant]);
-  t.equal(typeof longFingerprint, 'number',
-    'unrelated long constants cannot crash an opt-in oracle scan');
-  t.notEqual(longFingerprint,
-    HandwrittenFusedGradient.fingerprintMethods(jit, [otherLongConstant]),
-  'distinct long constants remain distinct in canonical fingerprints');
-  t.end();
-});
-
-test('complete guest-kernel substitutions are differential oracles, not a default tier', (t) => {
-  const flag = ['Field', 'ArbitraryFlags', ['enabled', 'Z']];
-  const codeItems = [
-    { instruction: { op: 'getstatic', arg: flag } },
-    ...[
-      'istore', 'iload_1', 'bipush', 'if_icmpeq', 'bipush', 'bipush',
-      'aconst_null', 'checkcast', 'bipush', 'bipush',
-    ].map((instruction) => ({ instruction })),
-    { instruction: {
-      op: 'invokestatic',
-      arg: ['Method', 'ArbitraryMasks', ['and', '(II)I']],
-    } },
-    ...['goto', 'athrow', 'iinc', 'iaload', 'iastore']
-      .map((instruction) => ({ instruction })),
-    ...[57, 16711422, -59233087]
-      .map((arg) => ({ instruction: { op: 'ldc', arg } })),
-  ];
-  const method = {
-    name: 'arbitraryPixelLoop',
-    descriptor: '(IB[III)V',
-    attributes: [{ type: 'code', code: { codeItems } }],
-  };
-  const genericJvm = new JVM({ jit: { warmupThreshold: 0 } });
-  t.notOk(genericJvm.jit.guestKernelOraclesEnabled,
-    'normal JIT configuration keeps complete guest algorithms disabled');
-  t.equal(genericJvm.jit.getSynchronousIntrinsic(method, method.descriptor), null,
-    'an exact historical fingerprint is not substituted in production');
-
-  const oracleJvm = new JVM({ jit: {
-    warmupThreshold: 0,
-    guestKernelOracles: true,
-  } });
-  t.equal(typeof oracleJvm.jit.getSynchronousIntrinsic(method, method.descriptor),
-    'function', 'the same replacement remains available for explicit differential tests');
-  t.end();
-});
-
-test('structured SSA derives packed pixel loops from bytecode values', (t) => {
-  const instructions = [
-    'iconst_0',
-    { op: 'istore', arg: 5 },
-    { op: 'iload', arg: 5 },
-    { op: 'iload', arg: 4 },
-    { op: 'if_icmpge', arg: 'Lreturn' },
-    'aload_2',
-    'iload_0',
-    'iload_3',
-    'aload_2',
-    'iload_0',
-    'iaload',
-    { op: 'ldc', arg: 16711422 },
-    'iand',
-    'iconst_1',
-    'ishr',
-    'iadd',
-    'iastore',
-    { op: 'iinc', varnum: 0, incr: 1 },
-    { op: 'iinc', varnum: 5, incr: 1 },
-    { op: 'goto', arg: 'Lloop' },
-    'return',
-  ];
-  const method = {
-    className: 'ArbitraryPixels',
-    name: 'arbitraryPackedLoop',
-    descriptor: '(IB[III)V',
-    flags: ['static'],
-    attributes: [{ type: 'code', code: {
-      codeItems: instructions.map((instruction, index) => ({
-        labelDef: index === 2 ? 'Lloop:'
-          : index === 20 ? 'Lreturn:' : `L${index}:`,
-        instruction,
-      })),
-      localsSize: '6',
-      stackSize: '5',
-      exceptionTable: [],
-    } }],
-  };
-  const jvm = new JVM({ jit: {
-    warmupThreshold: 0,
-    structuredSsa: true,
-  } });
-  t.equal(jvm.jit.getSynchronousIntrinsic(method, method.descriptor), null,
-    'the packed-pixel descriptor does not select a prewritten algorithm');
-  const generated = jvm.jit.structuredSsa.compile(method);
-  t.ok(generated?.jvmStructuredSsa,
-    'the generic CFG, stack, and array-loop analysis selects structured SSA');
-  t.notOk(generated.jvmStructuredSource.includes('packedColorScanlineDirect') ||
-      generated.jvmStructuredSource.includes('Handwritten'),
-    'generated source contains no guest-kernel call');
-
-  const pixels = [0x123456, 0xabcdef];
-  pixels.type = '[I';
-  const color = 0x010203;
-  const expected = pixels.map((pixel) =>
-    (color + ((pixel & 16711422) >> 1)) | 0);
-  const frame = new Frame(method);
-  frame.className = 'ArbitraryPixels';
-  frame.locals.splice(0, 6, 0, 57, pixels, color, pixels.length, 0);
-  const thread = { status: 'runnable', callStack: new Stack() };
-  thread.callStack.push(frame);
-  generated(frame, thread, jvm.jit, false);
-  t.deepEqual(pixels.slice(), expected,
-    'emitted arithmetic is derived from the bytecode operands and constant');
-  t.end();
-});
-
-test('affine sprite raster preserves Java sampling and rejects before writes', (t) => {
-  const { roundedFloorDivide, runRaster } = HandwrittenAffineSpriteRaster._test;
-  for (let numerator = -7; numerator <= 7; numerator += 1) {
-    t.equal(roundedFloorDivide(3, numerator), Math.floor(numerator / 3),
-      `verified division helper preserves floor semantics for ${numerator}`);
-  }
-
-  const base = {
-    width: 2,
-    height: 2,
-    source: Int32Array.from([10, 20, 30, 40]),
-    mask: null,
-    destination: new Int32Array(4),
-    clipOuterStart: 0,
-    clipOuterEnd: 2,
-    clipInnerStart: 0,
-    clipInnerEnd: 2,
-    surfaceStride: 2,
-  };
-  const args = [0, 2, 0, 0, 2, 2, 0, 0, 0, -1];
-  t.ok(runRaster(base, args), 'ordinary affine raster input is accepted');
-  t.deepEqual(Array.from(base.destination), [10, 20, 30, 40],
-    'column scan writes the same moving source coordinates');
-
-  const masked = {
-    ...base,
-    mask: Int8Array.from([1, 0, 1, 1]),
-    destination: new Int32Array(4),
-  };
-  t.ok(runRaster(masked, args), 'masked affine raster input is accepted');
-  t.deepEqual(Array.from(masked.destination), [10, 0, 30, 40],
-    'mask coordinates independently suppress source pixels');
-
-  const invalidDestination = Int32Array.from([101, 102, 103]);
-  const invalid = {
-    ...base,
-    destination: invalidDestination,
-  };
-  t.notOk(runRaster(invalid, args), 'short destination rejects the fast path');
-  t.deepEqual(Array.from(invalidDestination), [101, 102, 103],
-    'bounds rejection happens before the first destination write');
-
-  const negativeSourceX = {
-    ...base,
-    destination: Int32Array.from([201, 202, 203, 204]),
-  };
-  t.notOk(runRaster(negativeSourceX,
-    [0, 2, 0, 0, 2, 2, 0, 0, -4, -1]),
-  'unsupported negative remainder rejects the fast path');
-  t.deepEqual(Array.from(negativeSourceX.destination), [201, 202, 203, 204],
-    'source-coordinate rejection is also side-effect free');
-  t.end();
-});
-
-function referenceAffineSpriteRaster(data, inputArgs) {
-  const divide = (numerator, denominator) => (numerator / denominator) | 0;
-  const floorDivide = (denominator, numerator) => {
-    const sign = numerator >>> 31;
-    return (divide((numerator + sign) | 0, denominator) - sign) | 0;
-  };
-  const args = inputArgs.map(value => value | 0);
-  const [outerStart, outerEnd, leftStart, leftEnd, rightStart, rightEnd,
-    dim, blend, sourceOffset, maskOverride] = args;
-  const outerSpan = (outerEnd - outerStart) | 0;
-  let firstOuter = outerStart;
-  if (firstOuter < data.clipOuterStart) firstOuter = data.clipOuterStart;
-  let lastOuter = outerEnd;
-  if (lastOuter > data.clipOuterEnd) lastOuter = data.clipOuterEnd;
-  for (let outer = firstOuter; outer < lastOuter; outer += 1) {
-    let maskX = divide((
-      Math.imul(data.width, (outer - outerStart) | 0) +
-      (outerSpan >> 1)
-    ) | 0, outerSpan);
-    if (maskX >= data.width) maskX = (data.width - 1) | 0;
-    const sourceX = ((maskX + sourceOffset) | 0) % data.width;
-    if (maskOverride >= 0) maskX = maskOverride;
-    const leftDelta = (leftEnd - leftStart) | 0;
-    const rightDelta = (rightEnd - rightStart) | 0;
-    const left = (
-      Math.imul(leftStart, outerSpan) +
-      Math.imul(leftDelta, (outer - outerStart) | 0) +
-      (leftDelta >> 1)
-    ) | 0;
-    const right = (
-      Math.imul(rightStart, outerSpan) +
-      Math.imul(rightDelta, (outer - outerStart) | 0) +
-      (rightDelta >> 1)
-    ) | 0;
-    const innerSpan = (right - left) | 0;
-    let firstInner = floorDivide(
-      outerSpan, (left + (outerSpan >> 1)) | 0);
-    if (firstInner < data.clipInnerStart) firstInner = data.clipInnerStart;
-    let lastInner = floorDivide(
-      outerSpan, (right + (outerSpan >> 1)) | 0);
-    if (lastInner > data.clipInnerEnd) lastInner = data.clipInnerEnd;
-    if (lastInner <= firstInner) continue;
-    let sourceFixed = (
-      Math.imul(data.height,
-        (Math.imul(firstInner, outerSpan) - left) | 0) +
-      (innerSpan >> 1)
-    ) | 0;
-    let sourceFixedLast = (
-      Math.imul(data.height,
-        (Math.imul((lastInner - 1) | 0, outerSpan) - left) | 0) +
-      (innerSpan >> 1)
-    ) | 0;
-    if (sourceFixed <= -innerSpan) sourceFixed = (-innerSpan + 1) | 0;
-    const sourceLimit = Math.imul(data.height, innerSpan);
-    if (sourceFixed >= sourceLimit) sourceFixed = (sourceLimit - 1) | 0;
-    if (sourceFixedLast >= sourceLimit) {
-      sourceFixedLast = (sourceLimit - 1) | 0;
-    }
-    let sourceStep = 0;
-    if (sourceFixedLast > sourceFixed) {
-      sourceStep = divide(
-        (sourceFixedLast - sourceFixed) | 0,
-        (lastInner - firstInner - 1) | 0);
-    }
-    let destinationIndex =
-      (Math.imul(firstInner, data.surfaceStride) + outer) | 0;
-    for (let inner = firstInner; inner < lastInner; inner += 1) {
-      const sourceY = divide(sourceFixed, innerSpan);
-      const sourceRow = Math.imul(sourceY, data.width);
-      let color = data.source[(sourceRow + sourceX) | 0] | 0;
-      if (color !== 0 &&
-          (!data.mask || (data.mask[(sourceRow + maskX) | 0] | 0) !== 0)) {
-        if (dim) color = (color >> 1) & 8355711;
-        if (blend) {
-          color = (
-            color + ((data.destination[destinationIndex] >> 1) & 8355711)
-          ) | 0;
-        }
-        data.destination[destinationIndex] = color;
-      }
-      destinationIndex = (destinationIndex + data.surfaceStride) | 0;
-      sourceFixed = (sourceFixed + sourceStep) | 0;
-    }
-  }
-}
-
-test('affine sprite raster differentially matches 200 moving invocations', (t) => {
-  const { runRaster } = HandwrittenAffineSpriteRaster._test;
-  let randomState = 0x51f15e;
-  const random = () => {
-    randomState = (Math.imul(randomState, 1664525) + 1013904223) >>> 0;
-    return randomState;
-  };
-  const failures = [];
-  for (let invocation = 0; invocation < 200; invocation += 1) {
-    const width = 1 + random() % 6;
-    const height = 1 + random() % 6;
-    const source = Int32Array.from({ length: width * height }, () =>
-      random() % 5 === 0 ? 0 : random() & 0xffffff);
-    const mask = invocation % 3 === 0
-      ? Int8Array.from({ length: width * height }, () => random() & 1)
-      : null;
-    const initial = Int32Array.from({ length: 16 * 16 }, () =>
-      random() & 0xffffff);
-    const actual = initial.slice();
-    const expected = initial.slice();
-    const outerStart = random() % 4;
-    const outerSpan = 2 + random() % 8;
-    const leftStart = random() % 4;
-    const leftEnd = random() % 4;
-    const drawWidth = 1 + random() % 7;
-    const args = [
-      outerStart,
-      outerStart + outerSpan,
-      leftStart,
-      leftEnd,
-      leftStart + drawWidth,
-      leftEnd + drawWidth,
-      random() & 1,
-      random() & 1,
-      random() % width,
-      invocation % 4 === 0 ? random() % width : -1,
-    ];
-    const shared = {
-      width,
-      height,
-      source,
-      mask,
-      clipOuterStart: random() % 4,
-      clipOuterEnd: 12 + random() % 5,
-      clipInnerStart: random() % 4,
-      clipInnerEnd: 12 + random() % 5,
-      surfaceStride: 16,
-    };
-    referenceAffineSpriteRaster({ ...shared, destination: expected }, args);
-    const accepted = runRaster({ ...shared, destination: actual }, args);
-    if (!accepted ||
-        actual.some((value, index) => value !== expected[index])) {
-      failures.push({ invocation, accepted, args, actual, expected });
-      break;
-    }
-  }
-  t.equal(failures.length, 0,
-    'all moving, clipped, masked, dimmed, and blended surfaces are bit exact');
   t.end();
 });
 
@@ -1730,7 +1373,6 @@ test('monitor-bearing methods isolate scalar-bounded byte-copy regions', (t) => 
   };
   const jvm = new JVM({ jit: {
     structuredSsa: true,
-    fusedRegions: false,
     profileMethods: false,
     scalarBoundedInlineRegions: true,
   } });
@@ -4712,305 +4354,7 @@ test('structural primitive array-copy intrinsic preserves overlap semantics', (t
   t.end();
 });
 
-test('structured SSA emits verified clipped static spans without call dispatch',
-  async (t) => {
-  const jvm = new JVM({ jit: {
-    warmupThreshold: 0,
-    structuredSsa: true,
-    guestKernelOracles: true,
-  } });
-  const field = (name, descriptor = 'I') => [null, 'SpanShape', [name, descriptor]];
-  const top = field('top'), bottom = field('bottom'), left = field('left');
-  const right = field('right'), width = field('width'), pixelsField = field('pixels', '[I');
-  const spanOps = [
-    'iload_1', ['getstatic', top], 'if_icmplt', 'iload_1', ['getstatic', bottom],
-    'if_icmplt', 'return', 'iload_0', ['getstatic', left], 'if_icmpge', 'iload_2',
-    ['getstatic', left], 'iload_0', 'isub', 'isub', 'istore_2', ['getstatic', left],
-    'istore_0', 'iload_0', 'iload_2', 'iadd', ['getstatic', right], 'if_icmple',
-    ['getstatic', right], 'iload_0', 'isub', 'istore_2', 'iload_0', 'iload_1',
-    ['getstatic', width], 'imul', 'iadd', ['istore', 4], 'iconst_0', ['istore', 5],
-    ['iload', 5], 'iload_2', 'if_icmpge', ['getstatic', pixelsField], ['iload', 4],
-    ['iload', 5], 'iadd', 'iload_3', 'iastore', 'iinc', 'goto', 'return',
-  ];
-  const spanMethod = {
-    name: 'arbitrarySpan', descriptor: '(IIII)V', flags: ['static'],
-    attributes: [{ type: 'code', code: {
-      codeItems: spanOps.map((entry) => ({
-        instruction: Array.isArray(entry) ? { op: entry[0], arg: entry[1] } : entry,
-      })),
-      localsSize: '6', stackSize: '4', exceptionTable: [],
-    } }],
-  };
-  const call = { op: 'invokestatic',
-    arg: ['Method', 'SpanShape', ['arbitrarySpan', '(IIII)V']] };
-  const callerInstructions = [
-    'iconst_0', { op: 'istore', arg: 4 }, { op: 'iload', arg: 4 }, 'iconst_1',
-    { op: 'if_icmpge', arg: 'Lreturn' }, 'iload_0', 'iload_1', 'iload_2', 'iload_3',
-    call, { op: 'iinc', varnum: 4, incr: 1 }, { op: 'goto', arg: 'Lloop' }, 'return',
-  ];
-  const caller = {
-    name: 'arbitrarySpanLoop', descriptor: '(IIII)V', flags: ['static'],
-    attributes: [{ type: 'code', code: {
-      codeItems: callerInstructions.map((instruction, index) => ({
-        labelDef: index === 2 ? 'Lloop:' : index === 12 ? 'Lreturn:' : `L${index}:`,
-        instruction,
-      })),
-      localsSize: '5', stackSize: '4', exceptionTable: [],
-    } }],
-  };
-  const pixels = new Array(32).fill(0);
-  jvm.classes.SpanShape = {
-    staticFields: new Map([
-      ['top:I', 0], ['bottom:I', 4], ['left:I', 0], ['right:I', 8], ['width:I', 8],
-      ['pixels:[I', pixels],
-    ]),
-    ast: { classes: [{ superClassName: null,
-      items: [{ type: 'method', method: spanMethod }, { type: 'method', method: caller }] }] },
-  };
-  jvm.classInitializationState.set('SpanShape', 'INITIALIZED');
 
-  const intrinsic = jvm.jit.getSynchronousIntrinsic(spanMethod, '(IIII)V');
-  t.equal(intrinsic?.jvmDirectKind, 'clippedStaticSpan',
-    'descriptor, bytecodes, and repeated field identities recognize an arbitrary method name');
-  const generated = jvm.jit.structuredSsa.compile(caller);
-  t.ok(generated?.jvmStructuredSsa, 'verified span caller selects structured SSA');
-  t.ok(generated.jvmStructuredSource.includes('clippedStaticSpanDirectAt') &&
-      !generated.jvmStructuredSource.includes('tryInvokeSyncAt'),
-    'verified span is emitted positionally without generic call dispatch');
-
-  const thread = { status: 'runnable', callStack: new Stack() };
-  const frame = new Frame(caller);
-  frame.locals.splice(0, 4, -1, 1, 4, 0x123456);
-  thread.callStack.push(frame);
-  generated(frame, thread, jvm.jit, false);
-  t.deepEqual(pixels.slice(8, 16), [0x123456, 0x123456, 0x123456, 0, 0, 0, 0, 0],
-    'direct span preserves clipping and pixel writes');
-
-  const genericClass = 'GenericSpanShape';
-  const genericClasspath = compileJavaFixture(t, genericClass, `
-public final class GenericSpanShape {
-  static int top;
-  static int bottom;
-  static int left;
-  static int right;
-  static int width;
-  static int[] pixels;
-
-  static void span(int x, int y, int count, int color) {
-    if (y < top || y >= bottom) return;
-    if (x < left) {
-      count -= left - x;
-      x = left;
-    }
-    if (x + count > right) count = right - x;
-    int base = x + y * width;
-    for (int index = 0; index < count; index++) {
-      pixels[base + index] = color;
-    }
-  }
-
-  static void rows(int color) {
-    for (int y = 0; y < 2; y++) span(0, y, 2, color);
-  }
-
-  static void dynamicRows(int item, int color) {
-    for (int row = 0; row < 16; row++) {
-      int sample = item + row;
-      int x = sample * 17 % 80 - 8;
-      int y = sample & 63;
-      int count = 8 + sample * 13 % 56;
-      span(x, y, count, color + row * 0x10203);
-    }
-  }
-}
-`);
-  const genericJvm = new JVM({ classpath: genericClasspath, jit: {
-    warmupThreshold: 0,
-    structuredSsa: true,
-    guestKernelOracles: false,
-    checkedLeafDirectPositional: true,
-  } });
-  const genericClassData = await genericJvm.loadClassByName(genericClass);
-  genericJvm.classInitializationState.set(genericClass, 'INITIALIZED');
-  const genericFields = genericClassData.staticFields;
-  genericFields.set('top:I', 0);
-  genericFields.set('bottom:I', 4);
-  genericFields.set('left:I', 0);
-  genericFields.set('right:I', 8);
-  genericFields.set('width:I', 8);
-  const firstStaticPixels = new Array(32).fill(0);
-  firstStaticPixels.type = '[I';
-  genericFields.set('pixels:[I', firstStaticPixels);
-  const genericSpanMethod = await genericJvm.findMethodInHierarchy(
-    genericClass, 'span', '(IIII)V');
-  const genericSpan = genericJvm.jit.structuredSsa.compile(genericSpanMethod);
-  t.ok(genericSpan?.jvmStructuredSsa &&
-      genericSpan.jvmRestoringDirectPositionalSource
-        ?.includes('ssaEntryStaticValue') &&
-      genericSpan.jvmRestoringDirectPositionalSource
-        ?.includes('ssaArrayRangeGuard'),
-    'generic span SSA hoists stable statics and versions its affine store range');
-  const spanSource = genericSpan.jvmRestoringDirectPositionalSource;
-  // A runtime-bounded range guard selects between two ordinary JavaScript
-  // loops. It must NOT deopt: the guard is a property of the arguments, so a
-  // kernel whose real arrays never satisfy it would reconstruct its frame on
-  // every invocation and finish through canonical dispatch.
-  const fastArmMatch =
-    /if \(ssaRuntimeCoarseLoop\d+ && ssaArrayRangeGuard\d+\)/.exec(
-      spanSource);
-  const fastArmStart = fastArmMatch?.index ?? -1;
-  const fastStoreMatch = /ssaEntryStaticArrayData\d+\[[^\n]+\] =/
-    .exec(spanSource.slice(fastArmStart));
-  const fastStore = fastStoreMatch
-    ? fastArmStart + fastStoreMatch.index : -1;
-  t.ok(fastArmStart >= 0 && fastStore > fastArmStart &&
-      !spanSource.includes("reason: 'structured SSA range guard'"),
-    'the restoring entry runs one direct-store loop under a non-deopting guard');
-  t.ok(spanSource.slice(fastStore).includes('} else {'),
-    'the failed guard falls back to a polled slow loop in the same tier');
-  const checkedLeaf = genericSpan.jvmCheckedLeafDirectPositionalBody;
-  const checkedLeafSource =
-    genericSpan.jvmCheckedLeafDirectPositionalSource || '';
-  t.equal(typeof checkedLeaf, 'function',
-    'one bounded call-free loop publishes a compact checked leaf ABI');
-  t.notOk(checkedLeafSource.includes('helpers.materialize(') ||
-      checkedLeafSource.includes('helpers.arrayStore('),
-  'the checked leaf contains no successful-path Frame or array helper');
-  const genericRowsMethod = await genericJvm.findMethodInHierarchy(
-    genericClass, 'rows', '(I)V');
-  const genericRows = genericJvm.jit.structuredSsa.compile(genericRowsMethod);
-  t.equal(genericRows?.jvmStructuredCapturedCheckedLeafCallCount, 1,
-    'a generic caller snapshots one verified checked-child static capture set');
-  t.equal(genericRows?.jvmStructuredLexicalVoidFastPathCallCount, 1,
-    'a proven synchronous void child keeps fallback bookkeeping off its success path');
-  t.notOk(genericRows.jvmStructuredContinuation,
-    'captured child statics resume canonically rather than surviving a scheduler slice');
-  const runGenericRows = (color, debug = false) => {
-    const rowsThread = {
-      status: 'runnable', pendingException: null, callStack: new Stack(),
-    };
-    const rowsFrame = new Frame(genericRowsMethod);
-    rowsFrame.className = genericClass;
-    rowsFrame.locals[0] = color;
-    rowsThread.callStack.push(rowsFrame);
-    const result = genericRows(
-      rowsFrame, rowsThread, genericJvm.jit, debug, false);
-    return { result, frame: rowsFrame, thread: rowsThread };
-  };
-  firstStaticPixels.fill(0);
-  runGenericRows(17);
-  t.deepEqual(firstStaticPixels.slice(0, 10),
-    [17, 17, 0, 0, 0, 0, 0, 0, 17, 17],
-    'captured checked child preserves repeated generated caller stores');
-  const runGenericSpan = (x, y, count, color, debug = false) => {
-    const genericThread = {
-      status: 'runnable', pendingException: null, callStack: new Stack(),
-    };
-    const genericFrame = new Frame(genericSpanMethod);
-    genericFrame.className = genericClass;
-    genericFrame.locals.splice(0, 4, x, y, count, color);
-    genericThread.callStack.push(genericFrame);
-    let result;
-    let error;
-    try {
-      result = genericSpan(
-        genericFrame, genericThread, genericJvm.jit, debug);
-    } catch (thrownError) {
-      error = thrownError;
-    }
-    return { frame: genericFrame, thread: genericThread, result, error };
-  };
-  runGenericSpan(0, 1, 2, 11);
-  const reboundStaticPixels = new Array(32).fill(0);
-  reboundStaticPixels.type = '[I';
-  genericFields.set('pixels:[I', reboundStaticPixels);
-  runGenericSpan(2, 1, 2, 22);
-  t.deepEqual(firstStaticPixels.slice(8, 12), [11, 11, 0, 0],
-    'entry static cache leaves the previous surface untouched after rebinding');
-  t.deepEqual(reboundStaticPixels.slice(8, 12), [0, 0, 22, 22],
-    'the next generated entry reloads the rebound static surface');
-  reboundStaticPixels.fill(0);
-  runGenericRows(23);
-  t.deepEqual(reboundStaticPixels.slice(0, 10),
-    [23, 23, 0, 0, 0, 0, 0, 0, 23, 23],
-    'captured child reloads a rebound static surface at the next caller entry');
-
-  reboundStaticPixels.fill(0);
-  const checkedThread = {
-    status: 'runnable', pendingException: null, callStack: new Stack(),
-  };
-  checkedLeaf(genericJvm.jit, 1, 1, 2, 29, checkedThread, true);
-  t.deepEqual(reboundStaticPixels.slice(8, 12), [0, 29, 29, 0],
-    'the compact leaf preserves valid clipped stores');
-
-  const rejectedPixels = new Array(10).fill(0);
-  rejectedPixels.type = '[I';
-  genericFields.set('right:I', 20);
-  genericFields.set('pixels:[I', rejectedPixels);
-  t.equal(checkedLeaf(
-    genericJvm.jit, 7, 0, 5, 44, checkedThread, true),
-  genericJvm.jit.asyncInvokeSentinel(),
-  'a failed leaf range predicate returns to canonical invocation');
-  t.ok(rejectedPixels.every((value) => value === 0),
-    'checked-leaf rejection occurs before its first guest effect');
-  genericFields.set('right:I', 8);
-  genericFields.set('pixels:[I', reboundStaticPixels);
-
-  reboundStaticPixels.fill(0);
-  const debuggerFallback = runGenericSpan(0, 1, 2, 33, true);
-  t.ok(debuggerFallback.result?.deopt,
-    'generic span debugger guard uses the canonical fallback');
-  t.ok(reboundStaticPixels.every((value) => value === 0),
-    'debugger guard runs before cached static reads can cause a side effect');
-
-  const shortPixels = new Array(10).fill(0);
-  shortPixels.type = '[I';
-  genericFields.set('right:I', 20);
-  genericFields.set('pixels:[I', shortPixels);
-  const rangedBounds = runGenericSpan(7, 0, 5, 44);
-  const storePc = genericJvm.jit.getCodeItems(genericSpanMethod)
-    .findIndex((item) =>
-      (item.instruction?.op || item.instruction) === 'iastore');
-  t.equal(rangedBounds.error?.type, 'java/lang/ArrayIndexOutOfBoundsException',
-    'failed affine range guard retains the Java bounds exception');
-  t.deepEqual(shortPixels.slice(7), [44, 44, 44],
-    'failed affine range guard retains stores before the exceptional iteration');
-  t.equal(rangedBounds.frame.pc, storePc,
-    'range-versioned store records the exact throwing bytecode PC');
-  t.equal(rangedBounds.frame.locals[5], 3,
-    'range-versioned store materializes the exact induction value');
-  t.deepEqual(rangedBounds.frame.stack.items, [shortPixels, 10, 44],
-    'range-versioned store materializes its exact JVM operands');
-  genericFields.set('right:I', 8);
-
-  jvm.classes.SpanShape.staticFields.set('pixels:[I', null);
-  const throwingFrame = new Frame(caller);
-  throwingFrame.locals.splice(0, 4, 0, 1, 1, 7);
-  thread.callStack.push(throwingFrame);
-  let thrown;
-  try { generated(throwingFrame, thread, jvm.jit, false); } catch (error) { thrown = error; }
-  t.equal(thrown?.type, 'java/lang/NullPointerException',
-    'direct span preserves the JVM null exception');
-  t.equal(throwingFrame.pc, 9, 'direct span exception records the exact invoke PC');
-  t.deepEqual(throwingFrame.stack.items, [0, 1, 1, 7],
-    'direct span reconstructs call operands in JVM order');
-  thread.callStack.pop();
-
-  const untouched = new Array(32).fill(0);
-  jvm.classes.SpanShape.staticFields.set('pixels:[I', untouched);
-  jvm.classInitializationState.set('SpanShape', 'UNINITIALIZED');
-  const guardedFrame = new Frame(caller);
-  guardedFrame.locals.splice(0, 4, 0, 1, 1, 9);
-  thread.callStack.push(guardedFrame);
-  const guarded = generated(guardedFrame, thread, jvm.jit, false);
-  t.ok(guarded?.deopt, 'runtime class-initialization guard falls back');
-  t.equal(guardedFrame.pc, 9, 'guard falls back at the unexecuted call');
-  t.deepEqual(guardedFrame.stack.items, [0, 1, 1, 9],
-    'guard reconstructs the unconsumed call operands');
-  t.ok(untouched.every((value) => value === 0), 'guard runs before span side effects');
-  thread.callStack.pop();
-  t.end();
-});
 
 test('structured SSA hoists cold-linked loop statics per generated entry',
   async (t) => {
@@ -5030,7 +4374,6 @@ public final class ColdLinkedStaticLoopHarness {
     warmupThreshold: 0,
     profileMethods: false,
     structuredSsa: true,
-    guestKernelOracles: false,
   } });
   const classData = await jvm.loadClassByName(className);
   jvm.classInitializationState.set(className, 'INITIALIZED');
@@ -5127,7 +4470,6 @@ public final class CyclicArrayRangeHarness {
   const jvm = new JVM({ classpath, jit: {
     warmupThreshold: 0,
     structuredSsa: true,
-    guestKernelOracles: false,
   } });
   await jvm.loadClassByName(className);
   jvm.classInitializationState.set(className, 'INITIALIZED');
@@ -5251,7 +4593,6 @@ public final class NestedCyclicArrayRangeHarness {
   const jvm = new JVM({ classpath, jit: {
     warmupThreshold: 0,
     structuredSsa: true,
-    guestKernelOracles: false,
     checkedLeafDirectPositional: true,
   } });
   await jvm.loadClassByName(className);
@@ -5470,7 +4811,6 @@ public final class RenamedShrinkingWindowHarness {
   const jvm = new JVM({ classpath, jit: {
     warmupThreshold: 0,
     structuredSsa: true,
-    guestKernelOracles: false,
     checkedLeafDirectPositional: true,
   } });
   await jvm.loadClassByName(className);
@@ -5630,7 +4970,6 @@ public final class RenamedRecursivePartitionHarness {
   const jvm = new JVM({ classpath, jit: {
     warmupThreshold: 0,
     structuredSsa: true,
-    guestKernelOracles: false,
     checkedLeafDirectPositional: true,
   } });
   await jvm.loadClassByName(className);
@@ -5712,7 +5051,6 @@ public final class TransactionalAcyclicLeafHarness {
   const jvm = new JVM({ classpath, jit: {
     warmupThreshold: 0,
     structuredSsa: true,
-    guestKernelOracles: false,
     checkedLeafDirectPositional: true,
   } });
   const classData = await jvm.loadClassByName(className);
@@ -5791,7 +5129,7 @@ public final class CrossingDivisionHarness {
 }
 `);
     const jvm = new JVM({ classpath, jit: {
-      warmupThreshold: 0, structuredSsa: true, guestKernelOracles: false,
+      warmupThreshold: 0, structuredSsa: true,
     } });
     await jvm.loadClassByName(className);
     jvm.classInitializationState.set(className, 'INITIALIZED');
@@ -5843,7 +5181,6 @@ public final class ScaledCarriedArrayRangeHarness {
   const jvm = new JVM({ classpath, jit: {
     warmupThreshold: 0,
     structuredSsa: true,
-    guestKernelOracles: false,
   } });
   await jvm.loadClassByName(className);
   jvm.classInitializationState.set(className, 'INITIALIZED');
@@ -5914,7 +5251,6 @@ public final class CoalescedArrayRangeHarness {
   const jvm = new JVM({ classpath, jit: {
     warmupThreshold: 0,
     structuredSsa: true,
-    guestKernelOracles: false,
   } });
   await jvm.loadClassByName(className);
   jvm.classInitializationState.set(className, 'INITIALIZED');
@@ -5965,7 +5301,6 @@ public final class ArbitraryRecursivePartition {
   const jvm = new JVM({ classpath, jit: {
     warmupThreshold: 0,
     structuredSsa: true,
-    guestKernelOracles: false,
   } });
   await jvm.loadClassByName(className);
   jvm.classInitializationState.set(className, 'INITIALIZED');
@@ -6015,7 +5350,6 @@ public final class GenericPostIncrementReader {
   const jvm = new JVM({ classpath, jit: {
     warmupThreshold: 0,
     structuredSsa: true,
-    guestKernelOracles: false,
   } });
   await jvm.loadClassByName(className);
   jvm.classInitializationState.set(className, 'INITIALIZED');
@@ -6066,7 +5400,6 @@ public final class GenericReferenceArrayAssignment {
   const jvm = new JVM({ classpath, jit: {
     warmupThreshold: 0,
     structuredSsa: true,
-    guestKernelOracles: false,
   } });
   await jvm.loadClassByName(className);
   jvm.classInitializationState.set(className, 'INITIALIZED');
@@ -6129,7 +5462,6 @@ public final class InstanceRecursivePartition {
   const jvm = new JVM({ classpath, jit: {
     warmupThreshold: 0,
     structuredSsa: true,
-    guestKernelOracles: false,
   } });
   const cls = await jvm.loadClassByName(className);
   jvm.classInitializationState.set(className, 'INITIALIZED');
@@ -6215,7 +5547,6 @@ public final class RecursiveSchedulerHandoffHarness {
   const jvm = new JVM({ classpath, jit: {
     warmupThreshold: 0,
     structuredSsa: true,
-    guestKernelOracles: false,
   } });
   await jvm.loadClassByName(className);
   jvm.classInitializationState.set(className, 'INITIALIZED');
@@ -6266,7 +5597,6 @@ public final class HandledReturnHandoffHarness {
   const jvm = new JVM({ classpath, jit: {
     warmupThreshold: 0,
     structuredSsa: true,
-    guestKernelOracles: false,
   } });
   await jvm.loadClassByName(className);
   jvm.classInitializationState.set(className, 'INITIALIZED');
@@ -6309,7 +5639,6 @@ public final class ContinuationStaticRefreshHarness {
   const jvm = new JVM({ classpath, jit: {
     warmupThreshold: 0,
     structuredSsa: true,
-    guestKernelOracles: false,
   } });
   const classData = await jvm.loadClassByName(className);
   classData.staticFields.set('width:I', 1);
@@ -6372,7 +5701,6 @@ public final class NullableStaticArrayBranchHarness {
   const jvm = new JVM({classpath, jit: {
     warmupThreshold: 0,
     structuredSsa: true,
-    guestKernelOracles: false,
   }});
   const classData = await jvm.loadClassByName(className);
   jvm.classInitializationState.set(className, 'INITIALIZED');
@@ -6525,8 +5853,6 @@ public final class ReporterGuardedIntegerHelper {
   const generated = jvm.jit.structuredSsa.compile(method);
   t.equal(typeof generated?.jvmRestoringDirectPositionalBody, 'function',
     'the verified integer helper publishes a frame-free restoring ABI');
-  t.notOk(generated.jvmRestoringDirectPositionalSource.includes('Handwritten'),
-    'the helper body remains derived entirely from bytecode');
   t.end();
 });
 
@@ -6547,7 +5873,6 @@ public final class LateStaticLinkShape {
     const jvm = new JVM({ classpath, jit: {
       warmupThreshold: 0,
       structuredSsa: true,
-      guestKernelOracles: false,
     } });
     const classData = await jvm.loadClassByName(className);
     classData.staticFieldsInitialized = true;
@@ -6691,7 +6016,6 @@ public final class ArbitraryStaticSummaryLoop {
     const jvm = new JVM({ classpath, jit: {
       warmupThreshold: 0,
       structuredSsa: true,
-      guestKernelOracles: false,
     } });
     const classData = await jvm.loadClassByName(className);
     classData.staticFieldsInitialized = true;
@@ -6792,863 +6116,17 @@ public final class ArbitraryStaticSummaryLoop {
     t.end();
   });
 
-test('clipped gradient intrinsic preserves Java pixel and exception semantics', (t) => {
-  const jvm = new JVM({ jit: { warmupThreshold: 0, structuredSsa: true } });
-  const pixels = new Array(16).fill(-1);
-  jvm.jit.clippedGradientDirect(
-    0, 0, 4, 4, 0, 0xffffff, 1, 1, 4, 4, 4, pixels);
-  t.deepEqual(pixels, [
-    -1, -1, -1, -1,
-    -1, 0x3f3f3f, 0x3f3f3f, 0x3f3f3f,
-    -1, 0x7f7f7f, 0x7f7f7f, 0x7f7f7f,
-    -1, 0xbfbfbf, 0xbfbfbf, 0xbfbfbf,
-  ], 'clipping retains the original vertical interpolation phase');
-  t.equal(jvm.jit.clippedGradientRunCount, 1,
-    'the generic gradient path publishes an observable runtime counter');
 
-  let arithmetic;
-  try {
-    jvm.jit.clippedGradientDirect(
-      0, 0, 1, 0, 0, 1, 0, 0, 1, 1, 1, null);
-  } catch (error) {
-    arithmetic = error;
-  }
-  t.equal(arithmetic?.type, 'java/lang/ArithmeticException',
-    'division by zero occurs before the first array access');
 
-  t.doesNotThrow(() => jvm.jit.clippedGradientDirect(
-    0, 0, 0, 1, 0, 1, 0, 0, 1, 1, 1, null),
-  'an empty clipped width does not dereference the pixel array');
 
-  const shortPixels = new Array(3).fill(-1);
-  let bounds;
-  try {
-    jvm.jit.clippedGradientDirect(
-      0, 0, 2, 2, 0, 0xffffff, 0, 0, 2, 2, 2, shortPixels);
-  } catch (error) {
-    bounds = error;
-  }
-  t.equal(bounds?.type, 'java/lang/ArrayIndexOutOfBoundsException',
-    'an invalid raster retains the JVM bounds exception');
-  t.deepEqual(shortPixels, [0, 0, 0x7f7f7f],
-    'bounds failure retains all pixel writes before the throwing store');
-  t.end();
-});
 
-test('structured SSA emits verified alpha-blended static spans without call dispatch', async (t) => {
-  const classpath = compileJavaFixture(t, 'ArbitraryAlphaSpanShape', `
-public class ArbitraryAlphaSpanShape {
-  static int top, bottom, left, right, width;
-  static int[] pixels;
 
-  static void arbitraryBlend(int x, int y, int count, int color, int alpha) {
-    if (y >= top) {
-      if (y >= bottom) return;
-      if (x < left) {
-        count -= left - x;
-        x = left;
-      }
-      if (x + count > right) count = right - x;
-      int inverse = 256 - alpha;
-      int sourceRed = (color >> 16 & 255) * alpha;
-      int sourceGreen = (color >> 8 & 255) * alpha;
-      int sourceBlue = (color & 255) * alpha;
-      int index = x + y * width;
-      for (int offset = 0; offset < count; offset++) {
-        int red = (pixels[index] >> 16 & 255) * inverse;
-        int green = (pixels[index] >> 8 & 255) * inverse;
-        int blue = (pixels[index] & 255) * inverse;
-        int blended = (sourceRed + red >> 8 << 16)
-          + (sourceGreen + green >> 8 << 8) + (sourceBlue + blue >> 8);
-        pixels[index++] = blended;
-      }
-    }
-  }
 
-  static void arbitraryRecompiledBlend(int x, int y, int count, int color, int alpha) {
-    int inverse = 0;
-    int sourceRed = 0;
-    int sourceGreen = 0;
-    int sourceBlue = 0;
-    int index = 0;
-    int offset = 0;
-    int red = 0;
-    int green = 0;
-    int blue = 0;
-    int blended = 0;
-    int oldIndex = 0;
-    if (y >= top) {
-      if (y >= bottom) return;
-      if (x < left) {
-        count -= left - x;
-        x = left;
-      }
-      if (x + count > right) count = right - x;
-      inverse = 256 - alpha;
-      sourceRed = (color >> 16 & 255) * alpha;
-      sourceGreen = (color >> 8 & 255) * alpha;
-      sourceBlue = (color & 255) * alpha;
-      index = x + y * width;
-      for (offset = 0; offset < count; offset++) {
-        red = (pixels[index] >> 16 & 255) * inverse;
-        green = (pixels[index] >> 8 & 255) * inverse;
-        blue = (pixels[index] & 255) * inverse;
-        blended = (sourceRed + red >> 8 << 16)
-          + (sourceGreen + green >> 8 << 8) + (sourceBlue + blue >> 8);
-        oldIndex = index;
-        index++;
-        pixels[oldIndex] = blended;
-      }
-    }
-  }
 
-  public static void arbitraryCaller(int x, int y, int count, int color, int alpha) {
-    arbitraryBlend(x, y, count, color, alpha);
-  }
-}
-`);
-  const jvm = new JVM({
-    classpath,
-    jit: {
-      warmupThreshold: 0,
-      structuredSsa: true,
-      preferWholeMethodJs: true,
-      guestKernelOracles: true,
-    },
-  });
-  await jvm.loadClassByName('ArbitraryAlphaSpanShape');
-  const owner = jvm.classes.ArbitraryAlphaSpanShape;
-  jvm.classInitializationState.set('ArbitraryAlphaSpanShape', 'INITIALIZED');
-  const pixels = new Array(24).fill(0x204060);
-  pixels.type = '[I';
-  owner.staticFields.set('top:I', 0);
-  owner.staticFields.set('bottom:I', 3);
-  owner.staticFields.set('left:I', 1);
-  owner.staticFields.set('right:I', 7);
-  owner.staticFields.set('width:I', 8);
-  owner.staticFields.set('pixels:[I', pixels);
 
-  const blend = await jvm.findMethodInHierarchy(
-    'ArbitraryAlphaSpanShape', 'arbitraryBlend', '(IIIII)V');
-  const intrinsic = jvm.jit.getSynchronousIntrinsic(blend, '(IIIII)V');
-  t.equal(intrinsic?.jvmDirectKind, 'clippedStaticAlphaSpan',
-    'descriptor, full bytecode shape, constants, and field identities recognize the span');
-  const recompiledBlend = await jvm.findMethodInHierarchy(
-    'ArbitraryAlphaSpanShape', 'arbitraryRecompiledBlend', '(IIIII)V');
-  const recompiledIntrinsic =
-    jvm.jit.getSynchronousIntrinsic(recompiledBlend, '(IIIII)V');
-  t.equal(recompiledIntrinsic?.jvmDirectKind, 'clippedStaticAlphaSpan',
-    'proven-dead entry stores and a one-use javac post-increment temporary normalize to the same shape');
 
-  const caller = await jvm.findMethodInHierarchy(
-    'ArbitraryAlphaSpanShape', 'arbitraryCaller', '(IIIII)V');
-  const generated = jvm.jit.structuredSsa.compile(caller);
-  t.ok(generated?.jvmStructuredSsa, 'alpha-span caller selects structured SSA');
-  t.ok(generated.jvmStructuredSource.includes('clippedStaticAlphaSpanDirectAt') &&
-      !generated.jvmStructuredSource.includes('tryInvokeSyncAt'),
-    'verified alpha span is emitted positionally without generic call dispatch');
 
-  const frame = new Frame(caller);
-  frame.className = 'ArbitraryAlphaSpanShape';
-  frame.locals.splice(0, 5, -2, 1, 5, 0xc08040, 128);
-  const thread = { status: 'runnable', callStack: new Stack() };
-  thread.callStack.push(frame);
-  generated(frame, thread, jvm.jit, false);
-  const expected = 0x706050;
-  t.deepEqual(pixels.slice(8, 16),
-    [0x204060, expected, expected, 0x204060, 0x204060, 0x204060, 0x204060, 0x204060],
-    'direct alpha span preserves clipping and packed-channel arithmetic');
 
-  const constantItem = blend.attributes.find((attribute) => attribute.type === 'code')
-    .code.codeItems.find((item) =>
-      item.instruction?.op === 'sipush' && Number(item.instruction.arg) === 256);
-  const originalArg = constantItem.instruction.arg;
-  constantItem.instruction.arg = 255;
-  t.equal(jvm.jit.getSynchronousIntrinsic(blend, '(IIIII)V'), null,
-    'an altered arithmetic constant rejects the structural intrinsic');
-  constantItem.instruction.arg = originalArg;
-  t.end();
-});
-
-test('structured SSA emits verified masked color blits without call dispatch', (t) => {
-  const javacJsCounts = {
-    iconst_0: 18, istore: 26, iload: 26, iconst_2: 1, ishr: 1,
-    ineg: 3, iconst_3: 1, iand: 1, if_icmplt: 3, return: 1,
-    athrow: 15, iadd: 2, iload_3: 6, istore_3: 1, iinc: 20,
-    goto: 14, aload_1: 5, baload: 5, iload_2: 5, if_icmpne: 5,
-    aload_0: 5, iastore: 5,
-  };
-  const javacJsOps = Object.entries(javacJsCounts)
-    .flatMap(([op, count]) => Array(count).fill(op));
-  t.ok(jitCompilerTest.matchesJavacJsMaskedColorBlit(javacJsOps),
-    'the complete javac.js masked-color lowering is recognized');
-  javacJsOps[0] = 'iconst_1';
-  t.notOk(jitCompilerTest.matchesJavacJsMaskedColorBlit(javacJsOps),
-    'an altered javac.js masked-color lowering is rejected');
-  const ops = [
-    "iload", "iconst_2", "ishr", "ineg", "istore",
-    "iload", "iconst_3", "iand", "ineg", "istore",
-    "iload", "ineg", "istore", "iload", "ifge", "iload", "istore",
-    "iload", "ifge",
-    "aload_1", "iload_3", "iinc", "baload", "ifeq",
-    "aload_0", "iload", "iinc", "iload_2", "iastore", "goto", "iinc",
-    "aload_1", "iload_3", "iinc", "baload", "ifeq",
-    "aload_0", "iload", "iinc", "iload_2", "iastore", "goto", "iinc",
-    "aload_1", "iload_3", "iinc", "baload", "ifeq",
-    "aload_0", "iload", "iinc", "iload_2", "iastore", "goto", "iinc",
-    "aload_1", "iload_3", "iinc", "baload", "ifeq",
-    "aload_0", "iload", "iinc", "iload_2", "iastore", "goto", "iinc",
-    "iinc", "goto", "iload", "istore", "iload", "ifge",
-    "aload_1", "iload_3", "iinc", "baload", "ifeq",
-    "aload_0", "iload", "iinc", "iload_2", "iastore", "goto", "iinc",
-    "iinc", "goto", "iload", "iload", "iadd", "istore",
-    "iload_3", "iload", "iadd", "istore_3", "iinc", "goto", "return",
-  ];
-  const blit = {
-    name: 'arbitraryMaskedBlit', descriptor: '([I[BIIIIIII)V', flags: ['static'],
-    attributes: [{ type: 'code', code: {
-      codeItems: ops.map((instruction) => ({ instruction })),
-      localsSize: '12', stackSize: '4', exceptionTable: [],
-    } }],
-  };
-  const call = { op: 'invokestatic',
-    arg: ['Method', 'ArbitraryMaskedOwner', [blit.name, blit.descriptor]] };
-  const caller = {
-    name: 'arbitraryMaskedCaller', descriptor: blit.descriptor, flags: ['static'],
-    attributes: [{ type: 'code', code: {
-      codeItems: [
-        'aload_0', 'aload_1', 'iload_2', 'iload_3',
-        { op: 'iload', arg: 4 }, { op: 'iload', arg: 5 },
-        { op: 'iload', arg: 6 }, { op: 'iload', arg: 7 },
-        { op: 'iload', arg: 8 }, call, 'return',
-      ].map((instruction) => ({ instruction })),
-      localsSize: '9', stackSize: '9', exceptionTable: [],
-    } }],
-  };
-  const jvm = new JVM({ jit: {
-    warmupThreshold: 0,
-    structuredSsa: true,
-    guestKernelOracles: true,
-  } });
-  jvm.classes.ArbitraryMaskedOwner = {
-    staticFields: new Map(),
-    ast: { classes: [{ superClassName: null,
-      items: [{ type: 'method', method: blit }, { type: 'method', method: caller }] }] },
-  };
-  jvm.classInitializationState.set('ArbitraryMaskedOwner', 'INITIALIZED');
-  const intrinsic = jvm.jit.getSynchronousIntrinsic(blit, blit.descriptor);
-  t.equal(intrinsic?.jvmDirectKind, 'maskedColorBlit',
-    'descriptor and complete unrolled bytecode shape recognize an arbitrary method name');
-  const generated = jvm.jit.structuredSsa.compile(caller);
-  t.ok(generated?.jvmStructuredSsa, 'masked-blit caller selects structured SSA');
-  t.ok(generated.jvmStructuredSource.includes('maskedColorBlitDirect') &&
-      !generated.jvmStructuredSource.includes('tryInvokeSyncAt'),
-    'verified masked blit is emitted positionally without generic call dispatch');
-
-  const destination = new Array(16).fill(0);
-  destination.type = '[I';
-  const mask = [0, 1, 0, 1, 1, 99, 1, 0, 1, 0, 1];
-  mask.type = '[B';
-  const frame = new Frame(caller);
-  frame.className = 'ArbitraryMaskedOwner';
-  frame.locals.splice(0, 9, destination, mask, 0x345678, 0, 1, 5, 2, 3, 1);
-  const thread = { status: 'runnable', callStack: new Stack() };
-  thread.callStack.push(frame);
-  generated(frame, thread, jvm.jit, false);
-  t.deepEqual(destination.slice(),
-    [0, 0, 0x345678, 0, 0x345678, 0x345678, 0, 0, 0,
-      0x345678, 0, 0x345678, 0, 0x345678, 0, 0],
-  'direct masked blit preserves mask indexing, destination strides, and writes');
-
-  const directDestination = new Array(16).fill(0);
-  directDestination.type = '[I';
-  const directFrame = new Frame(blit);
-  directFrame.className = 'ArbitraryMaskedOwner';
-  directFrame.locals.splice(0, 9,
-    directDestination, mask, 0x345678, 0, 1, 5, 2, 3, 1);
-  const directThread = {status: 'runnable', callStack: new Stack()};
-  directThread.callStack.push(directFrame);
-  const directEntry = jvm.jit.compileMethod(blit);
-  t.equal(directEntry?.jvmDirectIntrinsicKind, 'maskedColorBlit',
-    'a verified static kernel receives a direct scheduler-frame entry');
-  t.equal(typeof directEntry?.jvmRestoringDirectPositionalBody, 'function',
-    'the verified handler-free kernel exposes an allocation-free caller ABI');
-  const directResult = directEntry(directFrame, directThread, jvm.jit, false);
-  t.ok(directResult?.returned,
-    'the direct scheduler-frame entry completes synchronously');
-  t.equal(directThread.callStack.size(), 0,
-    'the direct scheduler-frame entry pops exactly its own frame');
-  t.deepEqual(directDestination.slice(), destination.slice(),
-    'direct frame entry preserves the verified intrinsic result');
-
-  const positionalDestination = new Array(16).fill(0);
-  positionalDestination.type = '[I';
-  const positionalPlan = {
-    Frame, method: blit, lookupClass: 'ArbitraryMaskedOwner',
-    restoreFrame: (activeThread, child, depth) => {
-      activeThread.callStack.items.splice(depth, 0, child);
-    },
-  };
-  const positionalThread = {status: 'runnable', callStack: new Stack()};
-  directEntry.jvmRestoringDirectPositionalBody(jvm.jit, positionalPlan,
-    positionalDestination, mask, 0x345678, 0, 1, 5, 2, 3, 1,
-    positionalThread, false);
-  t.deepEqual(positionalDestination.slice(), destination.slice(),
-    'the positional caller ABI preserves the intrinsic result without a Frame');
-  t.equal(positionalThread.callStack.size(), 0,
-    'the normal positional path allocates no scheduler-visible frame');
-
-  const throwingThread = {status: 'runnable', callStack: new Stack()};
-  const shortDestination = [];
-  shortDestination.type = '[I';
-  let positionalError = null;
-  try {
-    directEntry.jvmRestoringDirectPositionalBody(jvm.jit, positionalPlan,
-      shortDestination, [1], 1, 0, 0, 1, 1, 0, 0,
-      throwingThread, false);
-  } catch (error) {
-    positionalError = error;
-  }
-  t.equal(positionalError?.type, 'java/lang/ArrayIndexOutOfBoundsException',
-    'the positional intrinsic preserves the JVM array exception');
-  t.equal(throwingThread.callStack.size(), 1,
-    'the exceptional positional path restores the omitted JVM frame');
-  t.equal(throwingThread.callStack.peek().method, blit,
-    'the restored exceptional frame retains the exact method identity');
-
-  const resumedFrame = new Frame(blit);
-  resumedFrame.pc = 1;
-  const resumedThread = {status: 'runnable', callStack: new Stack()};
-  resumedThread.callStack.push(resumedFrame);
-  const resumedResult = directEntry(resumedFrame, resumedThread, jvm.jit, false);
-  t.ok(resumedResult?.deopt && resumedResult?.transient && resumedFrame.jitSkipOnce,
-    'a non-entry resume is routed once through canonical bytecode');
-  t.equal(resumedThread.callStack.peek(), resumedFrame,
-    'deoptimization leaves the resumed frame live');
-
-  blit.flags.push('synchronized');
-  t.equal(jvm.jit.compileDirectIntrinsicFrameEntry(blit), null,
-    'direct frame entry never bypasses an implicit synchronized-method monitor');
-  blit.flags.pop();
-
-  blit.attributes[0].code.codeItems[2].instruction = 'iushr';
-  t.equal(jvm.jit.getSynchronousIntrinsic(blit, blit.descriptor), null,
-    'an altered shift rejects the structural intrinsic');
-  t.end();
-});
-
-test('structured SSA emits verified transparent int blits without call dispatch', (t) => {
-  const javacJsCounts = {
-    iconst_0: 18, istore: 26, iload: 26, iconst_2: 1, ishr: 1,
-    ineg: 3, iconst_3: 1, iand: 1, if_icmplt: 3, return: 1,
-    athrow: 15, iadd: 2, iload_3: 6, istore_3: 1, iinc: 20,
-    goto: 14, aload_1: 5, iaload: 5, istore_2: 5, iload_2: 10,
-    if_icmpne: 5, aload_0: 5, iastore: 5,
-  };
-  const javacJsOps = Object.entries(javacJsCounts)
-    .flatMap(([op, count]) => Array(count).fill(op));
-  t.ok(jitCompilerTest.matchesJavacJsTransparentIntBlit(javacJsOps),
-    'the complete javac.js transparent-blit lowering is recognized');
-  javacJsOps[0] = 'iconst_1';
-  t.notOk(jitCompilerTest.matchesJavacJsTransparentIntBlit(javacJsOps),
-    'an altered javac.js lowering is rejected');
-  const ops = [
-    'iload', 'iconst_2', 'ishr', 'ineg', 'istore',
-    'iload', 'iconst_3', 'iand', 'ineg', 'istore',
-    'iload', 'ineg', 'istore', 'iload', 'ifge',
-    'iload', 'istore', 'iload', 'ifge',
-    'aload_1', 'iload_3', 'iinc', 'iaload', 'istore_2', 'iload_2', 'ifeq',
-    'aload_0', 'iload', 'iinc', 'iload_2', 'iastore', 'goto', 'athrow', 'iinc',
-    'aload_1', 'iload_3', 'iinc', 'iaload', 'istore_2', 'iload_2', 'ifeq',
-    'aload_0', 'iload', 'iinc', 'iload_2', 'iastore', 'goto', 'athrow', 'iinc',
-    'aload_1', 'iload_3', 'iinc', 'iaload', 'istore_2', 'iload_2', 'ifeq',
-    'aload_0', 'iload', 'iinc', 'iload_2', 'iastore', 'goto', 'athrow', 'iinc',
-    'aload_1', 'iload_3', 'iinc', 'iaload', 'istore_2', 'iload_2', 'ifeq',
-    'aload_0', 'iload', 'iinc', 'iload_2', 'iastore', 'goto', 'athrow', 'iinc',
-    'iinc', 'goto',
-    'iload', 'istore', 'iload', 'ifge',
-    'aload_1', 'iload_3', 'iinc', 'iaload', 'istore_2', 'iload_2', 'ifeq',
-    'aload_0', 'iload', 'iinc', 'iload_2', 'iastore', 'goto', 'athrow', 'iinc',
-    'iinc', 'goto',
-    'iload', 'iload', 'iadd', 'istore',
-    'iload_3', 'iload', 'iadd', 'istore_3',
-    'iinc', 'goto', 'return',
-  ];
-  const branches = new Map([
-    [14, 112], [18, 81], [25, 33], [31, 34],
-    [40, 48], [46, 49], [55, 63], [61, 64],
-    [70, 78], [76, 79], [80, 17], [84, 102],
-    [91, 99], [97, 100], [101, 83], [111, 13],
-  ]);
-  const instructions = ops.map((op, index) => {
-    if (branches.has(index)) return { op, arg: `L${branches.get(index)}` };
-    if (op === 'iinc') return { op, varnum: 3, incr: 1 };
-    if (op === 'iload' || op === 'istore') return { op, arg: 3 };
-    return op;
-  });
-  const blit = {
-    name: 'arbitraryTransparentCopy', descriptor: '([I[IIIIIIII)V',
-    flags: ['private', 'static', 'final'],
-    attributes: [{ type: 'code', code: {
-      codeItems: instructions.map((instruction, index) => ({
-        labelDef: `L${index}:`, instruction,
-      })),
-      localsSize: '12', stackSize: '4', exceptionTable: [],
-    } }],
-  };
-  const call = { op: 'invokestatic',
-    arg: ['Method', 'ArbitraryTransparentOwner', [blit.name, blit.descriptor]] };
-  const caller = {
-    name: 'arbitraryTransparentCaller', descriptor: blit.descriptor,
-    flags: ['static'],
-    attributes: [{ type: 'code', code: {
-      codeItems: [
-        'aload_0', 'aload_1', 'iload_2', 'iload_3',
-        { op: 'iload', arg: 4 }, { op: 'iload', arg: 5 },
-        { op: 'iload', arg: 6 }, { op: 'iload', arg: 7 },
-        { op: 'iload', arg: 8 }, call, 'return',
-      ].map((instruction, index) => ({
-        labelDef: `C${index}:`, instruction,
-      })),
-      localsSize: '9', stackSize: '9', exceptionTable: [],
-    } }],
-  };
-  const jvm = new JVM({ jit: {
-    warmupThreshold: 0,
-    structuredSsa: true,
-    guestKernelOracles: true,
-  } });
-  jvm.classes.ArbitraryTransparentOwner = {
-    staticFields: new Map(),
-    ast: { classes: [{ superClassName: null,
-      items: [{ type: 'method', method: blit }, { type: 'method', method: caller }] }] },
-  };
-  jvm.classInitializationState.set('ArbitraryTransparentOwner', 'INITIALIZED');
-  const intrinsic = jvm.jit.getSynchronousIntrinsic(blit, blit.descriptor);
-  t.equal(intrinsic?.jvmDirectKind, 'transparentIntBlit',
-    'descriptor, verified CFG/stack, and complete bytecodes recognize an arbitrary name');
-  const generated = jvm.jit.structuredSsa.compile(caller);
-  t.ok(generated?.jvmStructuredSsa,
-    'transparent int blit caller selects structured SSA');
-  t.ok(generated.jvmStructuredSource.includes('transparentIntBlitDirect') &&
-      !generated.jvmStructuredSource.includes('tryInvokeSyncAt'),
-    'verified transparent int blit is positional and avoids generic dispatch');
-
-  const destination = new Array(12).fill(7);
-  destination.type = '[I';
-  const source = [0, 11, 99, 0, 33, 99];
-  source.type = '[I';
-  jvm.jit.transparentIntBlitDirect(
-    destination, source, 0, 0, 1, 2, 2, 2, 1);
-  t.deepEqual(destination.slice(),
-    [7, 7, 11, 7, 7, 7, 33, 7, 7, 7, 7, 7],
-  'direct copy preserves transparent pixels and both row strides');
-  t.equal(jvm.jit.transparentIntBlitRunCount, 1,
-    'the intrinsic exposes a method-name-independent run counter');
-  t.equal(jvm.jit.transparentIntBlitSlowPathCount, 0,
-    'valid rectangles use the prevalidated raw-array path');
-  const mutationTracker = {dirty: false};
-  Object.defineProperty(destination, '_jvmAwtRasterMutationTracker', {
-    value: mutationTracker,
-  });
-  jvm.jit.transparentIntBlitDirect(
-    destination, source, 0, 0, 1, 1, 1, 0, 0);
-  t.ok(mutationTracker.dirty,
-    'a tracked AWT int raster publishes one mutation signal per blit');
-
-  const transparentDestination = [7];
-  transparentDestination.type = '[I';
-  const transparentSource = [0];
-  transparentSource.type = '[I';
-  t.doesNotThrow(() => jvm.jit.transparentIntBlitDirect(
-    transparentDestination, transparentSource, 0, 0, 99, 1, 1, 0, 0),
-  'a transparent source pixel does not access an invalid destination');
-
-  const throwingFrame = new Frame(caller);
-  throwingFrame.className = 'ArbitraryTransparentOwner';
-  const opaqueSource = [123];
-  opaqueSource.type = '[I';
-  throwingFrame.locals.splice(0, 9,
-    transparentDestination, opaqueSource, 0, 0, 99, 1, 1, 0, 0);
-  const thread = { status: 'runnable', callStack: new Stack() };
-  thread.callStack.push(throwingFrame);
-  let thrown;
-  try {
-    generated(throwingFrame, thread, jvm.jit, false);
-  } catch (error) {
-    thrown = error;
-  }
-  t.equal(thrown?.type, 'java/lang/ArrayIndexOutOfBoundsException',
-    'the slow path preserves a destination bounds exception');
-  t.equal(throwingFrame.pc, 9,
-    'direct intrinsic failure records the exact invoke PC');
-  t.deepEqual(throwingFrame.stack.items,
-    [transparentDestination, opaqueSource, 0, 0, 99, 1, 1, 0, 0],
-    'direct intrinsic failure reconstructs all invoke operands');
-  thread.callStack.pop();
-
-  jvm.classInitializationState.set('ArbitraryTransparentOwner', 'LOADED');
-  const guardedGenerated = jvm.jit.structuredSsa.compile(caller);
-  t.ok(guardedGenerated?.jvmStructuredSource.includes(
-    'class initialization in direct transparent int blit'),
-  'a loaded target retains the intrinsic behind an initialization guard');
-  const guardedDestination = [0];
-  guardedDestination.type = '[I';
-  const guardedSource = [456];
-  guardedSource.type = '[I';
-  const guardedFrame = new Frame(caller);
-  guardedFrame.className = 'ArbitraryTransparentOwner';
-  guardedFrame.locals.splice(0, 9,
-    guardedDestination, guardedSource, 0, 0, 0, 1, 1, 0, 0);
-  thread.callStack.push(guardedFrame);
-  const guardedResult =
-    guardedGenerated(guardedFrame, thread, jvm.jit, false);
-  t.ok(guardedResult.deopt && guardedResult.transient,
-    'the initialization guard requests canonical execution');
-  t.equal(guardedDestination[0], 0,
-    'the initialization guard runs before pixel effects');
-  t.equal(guardedFrame.pc, 9,
-    'the initialization fallback records the unexecuted invoke PC');
-  thread.callStack.pop();
-
-  jvm.classInitializationState.set('ArbitraryTransparentOwner', 'INITIALIZED');
-  const initializedFrame = new Frame(caller);
-  initializedFrame.className = 'ArbitraryTransparentOwner';
-  initializedFrame.locals.splice(0, 9,
-    guardedDestination, guardedSource, 0, 0, 0, 1, 1, 0, 0);
-  thread.callStack.push(initializedFrame);
-  guardedGenerated(initializedFrame, thread, jvm.jit, false);
-  t.equal(guardedDestination[0], 456,
-    'the same compiled caller enters the intrinsic after initialization');
-
-  blit.attributes[0].code.codeItems[22].instruction = 'baload';
-  t.equal(jvm.jit.getSynchronousIntrinsic(blit, blit.descriptor), null,
-    'an altered array operation rejects the structural intrinsic');
-  blit.attributes[0].code.codeItems[22].instruction = 'iaload';
-  blit.attributes[0].code.exceptionTable = [{
-    startLbl: 'L0', endLbl: 'L1', handlerLbl: 'L33',
-    catch_type: 'java/lang/RuntimeException',
-  }];
-  t.equal(jvm.jit.getSynchronousIntrinsic(blit, blit.descriptor), null,
-    'an unsupported exception handler rejects the intrinsic');
-  t.end();
-});
-
-test('structured SSA emits verified alpha-masked color blits without call dispatch', (t) => {
-  const instructions = [
-    { op: 'iload', arg: 6 }, 'ineg', { op: 'istore', arg: 10 },
-    { op: 'iload', arg: 10 }, { op: 'ifge', arg: 'Lreturn' },
-    { op: 'iload', arg: 5 }, 'ineg', { op: 'istore', arg: 11 },
-    { op: 'iload', arg: 11 }, { op: 'ifge', arg: 'Lrow' },
-    'aload_1', 'iload_3', { op: 'iinc', varnum: 3, incr: 1 },
-    'iaload', 'istore_2', 'iload_2', { op: 'ifeq', arg: 'Ltransparent' },
-    'iload_2', { op: 'ldc', arg: 0x00ff00ff }, 'iand', { op: 'iload', arg: 9 },
-    'imul', { op: 'ldc', arg: 0xff00ff00 | 0 }, 'iand', { op: 'istore', arg: 12 },
-    'iload_2', { op: 'ldc', arg: 0x0000ff00 }, 'iand', { op: 'iload', arg: 9 },
-    'imul', { op: 'ldc', arg: 0x00ff0000 }, 'iand', { op: 'istore', arg: 13 },
-    'aload_0', { op: 'iload', arg: 4 }, { op: 'iinc', varnum: 4, incr: 1 },
-    { op: 'iload', arg: 12 }, { op: 'iload', arg: 13 }, 'ior',
-    { op: 'bipush', arg: 8 }, 'iushr', 'iastore', { op: 'goto', arg: 'Lafter' },
-    { op: 'iinc', varnum: 4, incr: 1 },
-    { op: 'iinc', varnum: 11, incr: 1 }, { op: 'goto', arg: 'Linner' },
-    { op: 'iload', arg: 4 }, { op: 'iload', arg: 7 }, 'iadd', { op: 'istore', arg: 4 },
-    'iload_3', { op: 'iload', arg: 8 }, 'iadd', 'istore_3',
-    { op: 'iinc', varnum: 10, incr: 1 }, { op: 'goto', arg: 'Louter' },
-    'return',
-  ];
-  const labels = new Map([
-    [3, 'Louter:'], [8, 'Linner:'], [43, 'Ltransparent:'],
-    [44, 'Lafter:'], [46, 'Lrow:'], [56, 'Lreturn:'],
-  ]);
-  const blit = {
-    name: 'arbitraryAlphaMaskedBlit', descriptor: '([I[IIIIIIIII)V',
-    flags: ['static'],
-    attributes: [{ type: 'code', code: {
-      codeItems: instructions.map((instruction, index) => ({
-        labelDef: labels.get(index) || `L${index}:`, instruction,
-      })),
-      localsSize: '14', stackSize: '4', exceptionTable: [],
-    } }],
-  };
-  const call = { op: 'invokestatic',
-    arg: ['Method', 'ArbitraryAlphaMaskedOwner', [blit.name, blit.descriptor]] };
-  const callerInstructions = [
-    'aload_0', 'aload_1', 'iload_2', 'iload_3',
-    { op: 'iload', arg: 4 }, { op: 'iload', arg: 5 },
-    { op: 'iload', arg: 6 }, { op: 'iload', arg: 7 },
-    { op: 'iload', arg: 8 }, { op: 'iload', arg: 9 }, call, 'return',
-  ];
-  const caller = {
-    name: 'arbitraryAlphaMaskedCaller', descriptor: blit.descriptor,
-    flags: ['static'],
-    attributes: [{ type: 'code', code: {
-      codeItems: callerInstructions.map((instruction, index) => ({
-        labelDef: `C${index}:`, instruction,
-      })),
-      localsSize: '10', stackSize: '10', exceptionTable: [],
-    } }],
-  };
-  const jvm = new JVM({ jit: {
-    warmupThreshold: 0,
-    structuredSsa: true,
-    guestKernelOracles: true,
-  } });
-  jvm.classes.ArbitraryAlphaMaskedOwner = {
-    staticFields: new Map(),
-    ast: { classes: [{ superClassName: null,
-      items: [{ type: 'method', method: blit }, { type: 'method', method: caller }] }] },
-  };
-  jvm.classInitializationState.set('ArbitraryAlphaMaskedOwner', 'INITIALIZED');
-  const intrinsic = jvm.jit.getSynchronousIntrinsic(blit, blit.descriptor);
-  t.equal(intrinsic?.jvmDirectKind, 'alphaMaskedColorBlit',
-    'descriptor, complete bytecodes, and packed constants recognize an arbitrary method');
-  const generated = jvm.jit.structuredSsa.compile(caller);
-  t.ok(generated?.jvmStructuredSsa,
-    'alpha-masked blit caller selects structured SSA');
-  t.ok(generated.jvmStructuredSource.includes('alphaMaskedColorBlitDirect') &&
-      !generated.jvmStructuredSource.includes('tryInvokeSyncAt'),
-    'verified alpha-masked blit is emitted positionally without generic dispatch');
-
-  const destination = new Array(12).fill(0x010203);
-  destination.type = '[I';
-  const source = [0, 0x804020, 99, 0, 0xabcdef, 99];
-  source.type = '[I';
-  const frame = new Frame(caller);
-  frame.className = 'ArbitraryAlphaMaskedOwner';
-  frame.locals.splice(0, 10,
-    destination, source, 0, 0, 1, 2, 2, 2, 1, 128);
-  const thread = { status: 'runnable', callStack: new Stack() };
-  thread.callStack.push(frame);
-  generated(frame, thread, jvm.jit, false);
-  t.deepEqual(destination.slice(),
-    [0x010203, 0x010203, 0x402010, 0x010203, 0x010203, 0x010203,
-      0x556677, 0x010203, 0x010203, 0x010203, 0x010203, 0x010203],
-  'direct alpha-masked blit preserves transparency, row strides, and packed arithmetic');
-  t.equal(jvm.jit.alphaMaskedColorBlitRunCount, 1,
-    'the structural intrinsic exposes a method-name-independent run counter');
-  t.equal(jvm.jit.alphaMaskedColorBlitSlowPathCount, 0,
-    'valid rectangles use the prevalidated raw-array path');
-
-  const transparentDestination = [7];
-  transparentDestination.type = '[I';
-  const transparentSource = [0];
-  transparentSource.type = '[I';
-  t.doesNotThrow(() => jvm.jit.alphaMaskedColorBlitDirect(
-    transparentDestination, transparentSource, 0, 0, 99, 1, 1, 0, 0, 128),
-  'a transparent source pixel does not access an invalid destination');
-
-  const throwingFrame = new Frame(caller);
-  throwingFrame.className = 'ArbitraryAlphaMaskedOwner';
-  const opaqueSource = [0xffffff];
-  opaqueSource.type = '[I';
-  throwingFrame.locals.splice(0, 10,
-    transparentDestination, opaqueSource, 0, 0, 99, 1, 1, 0, 0, 128);
-  thread.callStack.push(throwingFrame);
-  let thrown;
-  try {
-    generated(throwingFrame, thread, jvm.jit, false);
-  } catch (error) {
-    thrown = error;
-  }
-  t.equal(thrown?.type, 'java/lang/ArrayIndexOutOfBoundsException',
-    'the slow path preserves a destination bounds exception');
-  t.equal(throwingFrame.pc, 10,
-    'direct intrinsic failure records the exact invoke bytecode PC');
-  t.deepEqual(throwingFrame.stack.items,
-    [transparentDestination, opaqueSource, 0, 0, 99, 1, 1, 0, 0, 128],
-    'direct intrinsic failure reconstructs all invoke operands in JVM order');
-  thread.callStack.pop();
-
-  jvm.classInitializationState.set('ArbitraryAlphaMaskedOwner', 'LOADED');
-  const guardedGenerated = jvm.jit.structuredSsa.compile(caller);
-  t.ok(guardedGenerated?.jvmStructuredSource.includes(
-    'class initialization in direct alpha-masked blit'),
-  'a loaded target retains the intrinsic behind a runtime initialization guard');
-  const guardedDestination = [0];
-  guardedDestination.type = '[I';
-  const guardedSource = [0xffffff];
-  guardedSource.type = '[I';
-  const guardedFrame = new Frame(caller);
-  guardedFrame.className = 'ArbitraryAlphaMaskedOwner';
-  guardedFrame.locals.splice(0, 10,
-    guardedDestination, guardedSource, 0, 0, 0, 1, 1, 0, 0, 128);
-  thread.callStack.push(guardedFrame);
-  const guardedResult =
-    guardedGenerated(guardedFrame, thread, jvm.jit, false);
-  t.ok(guardedResult.deopt && guardedResult.transient,
-    'the initialization guard requests canonical execution');
-  t.deepEqual(guardedDestination, Object.assign([0], { type: '[I' }),
-    'the initialization guard runs before pixel side effects');
-  t.equal(guardedFrame.pc, 10,
-    'the initialization fallback records the unexecuted invoke PC');
-  thread.callStack.pop();
-
-  jvm.classInitializationState.set('ArbitraryAlphaMaskedOwner', 'INITIALIZED');
-  const initializedFrame = new Frame(caller);
-  initializedFrame.className = 'ArbitraryAlphaMaskedOwner';
-  initializedFrame.locals.splice(0, 10,
-    guardedDestination, guardedSource, 0, 0, 0, 1, 1, 0, 0, 128);
-  thread.callStack.push(initializedFrame);
-  guardedGenerated(initializedFrame, thread, jvm.jit, false);
-  t.equal(guardedDestination[0], 0x7f7f7f,
-    'the same compiled caller enters the intrinsic after initialization');
-
-  blit.attributes[0].code.codeItems[39].instruction.arg = 7;
-  t.equal(jvm.jit.getSynchronousIntrinsic(blit, blit.descriptor), null,
-    'an altered packed shift rejects the structural intrinsic');
-  t.end();
-});
-
-test('javac glyph wrappers are recognized structurally after arbitrary renaming', async (t) => {
-  const classpath = compileJavaFixture(t, 'ArbitraryGlyphWrapperFixture', `
-final class ArbitraryRasterState {
-  static int surfaceWidth;
-  static int clipTop;
-  static int clipBottom;
-  static int clipLeft;
-  static int clipRight;
-  static int[] scanlineClip;
-  static int[] pixels;
-  static int[] auxiliaryClip;
-}
-
-public final class ArbitraryGlyphWrapperFixture {
-  private byte[][] arbitraryMasks;
-
-  private static void arbitraryComplexRaster(int[] pixels, byte[] mask, int x, int y,
-      int width, int height, int color, int maskOffset, int destinationOffset,
-      int destinationSkip, int maskSkip, int[] scanlineClip, int[] auxiliaryClip) {
-  }
-
-  private static void arbitrarySimpleRaster(int[] pixels, byte[] mask, int color,
-      int maskOffset, int destinationOffset, int width, int height,
-      int destinationSkip, int maskSkip) {
-  }
-
-  final void arbitraryRender(int glyph, int x, int y, int width, int height,
-      int color, boolean ignored) {
-    int destinationOffset = 0;
-    int destinationSkip = 0;
-    int maskSkip = 0;
-    int maskOffset = 0;
-    int clipped = 0;
-    L0: {
-      destinationOffset = x + y * ArbitraryRasterState.surfaceWidth;
-      destinationSkip = ArbitraryRasterState.surfaceWidth - width;
-      maskSkip = 0;
-      maskOffset = 0;
-      if (y >= ArbitraryRasterState.clipTop) {
-        break L0;
-      } else {
-        clipped = ArbitraryRasterState.clipTop - y;
-        height = height - clipped;
-        y = ArbitraryRasterState.clipTop;
-        maskOffset = maskOffset + clipped * width;
-        destinationOffset =
-            destinationOffset + clipped * ArbitraryRasterState.surfaceWidth;
-        break L0;
-      }
-    }
-    L1: {
-      if (y + height <= ArbitraryRasterState.clipBottom) {
-        break L1;
-      } else {
-        height = height -
-            (y + height - ArbitraryRasterState.clipBottom);
-        break L1;
-      }
-    }
-    L2: {
-      if (x >= ArbitraryRasterState.clipLeft) {
-        break L2;
-      } else {
-        clipped = ArbitraryRasterState.clipLeft - x;
-        width = width - clipped;
-        x = ArbitraryRasterState.clipLeft;
-        maskOffset = maskOffset + clipped;
-        destinationOffset = destinationOffset + clipped;
-        maskSkip = maskSkip + clipped;
-        destinationSkip = destinationSkip + clipped;
-        break L2;
-      }
-    }
-    L3: {
-      if (x + width <= ArbitraryRasterState.clipRight) {
-        break L3;
-      } else {
-        clipped = x + width - ArbitraryRasterState.clipRight;
-        width = width - clipped;
-        maskSkip = maskSkip + clipped;
-        destinationSkip = destinationSkip + clipped;
-        break L3;
-      }
-    }
-    L4: {
-      if (width <= 0) {
-        break L4;
-      } else {
-        if (height > 0) {
-          L5: {
-            if (ArbitraryRasterState.scanlineClip == null) {
-              ArbitraryGlyphWrapperFixture.arbitrarySimpleRaster(
-                  ArbitraryRasterState.pixels, this.arbitraryMasks[glyph],
-                  color, maskOffset, destinationOffset, width, height,
-                  destinationSkip, maskSkip);
-              break L5;
-            } else {
-              ArbitraryGlyphWrapperFixture.arbitraryComplexRaster(
-                  ArbitraryRasterState.pixels, this.arbitraryMasks[glyph],
-                  x, y, width, height, color, maskOffset, destinationOffset,
-                  destinationSkip, maskSkip, ArbitraryRasterState.scanlineClip,
-                  ArbitraryRasterState.auxiliaryClip);
-              break L5;
-            }
-          }
-          return;
-        } else {
-          break L4;
-        }
-      }
-    }
-  }
-}
-`);
-  const jvm = new JVM({ classpath, jit: {
-    warmupThreshold: 0,
-    structuredSsa: true,
-    guestKernelOracles: true,
-  } });
-  await jvm.loadClassByName('ArbitraryGlyphWrapperFixture');
-  const method = await jvm.findMethodInHierarchy(
-    'ArbitraryGlyphWrapperFixture', 'arbitraryRender', '(IIIIIIZ)V');
-  const intrinsic = jvm.jit.getSynchronousIntrinsic(method, method.descriptor);
-  t.equal(intrinsic?.jvmDirectKind, 'maskedGlyph',
-    'the complete javac shape is recognized without owner, method, or field names');
-
-  const codeItems = method.attributes.find((attribute) => attribute.type === 'code')
-    .code.codeItems;
-  const calls = codeItems.filter((item) => item.instruction?.op === 'invokestatic');
-  const originalDescriptor = calls[0].instruction.arg[2][1];
-  calls[0].instruction.arg[2][1] = '([I[BIIIIII)V';
-  t.equal(jvm.jit.getSynchronousIntrinsic(method, method.descriptor), null,
-    'an altered raster descriptor rejects the wrapper');
-  calls[0].instruction.arg[2][1] = originalDescriptor;
-
-  const branches = codeItems.filter((item) => item.instruction?.op === 'if_icmplt');
-  branches[0].instruction.op = 'if_icmpge';
-  t.equal(jvm.jit.getSynchronousIntrinsic(method, method.descriptor), null,
-    'an altered clipping branch rejects the wrapper');
-  branches[0].instruction.op = 'if_icmplt';
-
-  const statics = codeItems.filter((item) => item.instruction?.op === 'getstatic');
-  const originalField = statics[15].instruction.arg;
-  statics[15].instruction.arg =
-    ['Field', 'ArbitraryRasterState', ['differentPixels', '[I']];
-  t.equal(jvm.jit.getSynchronousIntrinsic(method, method.descriptor), null,
-    'an altered repeated-field relationship rejects the wrapper');
-  statics[15].instruction.arg = originalField;
-  t.end();
-});
 
 test('generated callers memoize structurally pure integral leaves', async (t) => {
   const classpath = compileJavaFixture(t, 'ArbitraryPureIntegralLeaf', `
@@ -7741,158 +6219,11 @@ public class ArbitraryPureIntegralLeaf {
   t.end();
 });
 
-test('structural packed-color scanline intrinsic preserves pixel arithmetic', (t) => {
-  const jvm = new JVM({ jit: {
-    warmupThreshold: 0,
-    guestKernelOracles: true,
-  } });
-  jvm.classes.Flags = {
-    staticFields: new Map([['enabled:Z', 0]]),
-    ast: { classes: [{ superClassName: null }] },
-  };
-  jvm.classInitializationState.set('Flags', 'INITIALIZED');
-  const flag = ['Field', 'Flags', ['enabled', 'Z']];
-  const integerAnd = () => ({
-    instruction: { op: 'invokestatic', arg: ['Method', 'Masks', ['and', '(II)I']] },
-  });
-  const items = [
-    { instruction: { op: 'getstatic', arg: flag } },
-    ...['istore', 'iload', 'bipush', 'if_icmpeq', 'bipush'].map((instruction) => ({ instruction })),
-    integerAnd(),
-    ...['goto', 'athrow', 'iinc', 'iaload'].map((instruction) => ({ instruction })),
-    integerAnd(), integerAnd(),
-    { instruction: 'iastore' },
-    ...[
-      9, 8355711, -852264639, 65280, -1295343735,
-      1494704929, 16711680, 200866833, 255,
-    ].map((arg) => ({ instruction: { op: 'ldc', arg } })),
-  ];
-  const method = {
-    attributes: [{ type: 'code', code: { codeItems: items } }],
-  };
-  const intrinsic = jvm.jit.getSynchronousIntrinsic(method, '(IIIIIII[III)V');
-  t.equal(typeof intrinsic, 'function', 'packed-color scanline shape is recognized');
 
-  const pixels = [0x123456, 0xabcdef];
-  intrinsic([0x224400, 0, 0x200, 2, 0x6688aa, 2, 9, pixels, 0x336699, 0x20000], 0);
-  t.deepEqual(pixels, [0x3c2b44, 0x887791],
-    'native scanline loop matches generated integer shifts, masks, and overflow');
-  const directPixels = [0x123456, 0xabcdef];
-  jvm.classInitializationState.set('RasterLine', 'INITIALIZED');
-  jvm.jit.packedColorScanlineDirect(
-    0x224400, 0, 0x200, 2, 0x6688aa, 2, 9, directPixels, 0x336699, 0x20000, 0,
-    'RasterLine',
-  );
-  t.deepEqual(directPixels, pixels,
-    'stackless direct scanline path preserves intrinsic pixel arithmetic');
-  t.end();
-});
 
-test('structural constant-color scanline intrinsic preserves pixel arithmetic', (t) => {
-  const jvm = new JVM({ jit: {
-    warmupThreshold: 0,
-    guestKernelOracles: true,
-  } });
-  jvm.classes.Flags = {
-    staticFields: new Map([['enabled:Z', 0]]),
-    ast: { classes: [{ superClassName: null }] },
-  };
-  jvm.classInitializationState.set('Flags', 'INITIALIZED');
-  const flag = ['Field', 'Flags', ['enabled', 'Z']];
-  const prefix = [
-    { instruction: { op: 'getstatic', arg: flag } },
-    ...[
-      'istore', 'iload_1', 'bipush', 'if_icmpeq', 'bipush', 'bipush',
-      'aconst_null', 'checkcast', 'bipush', 'bipush',
-    ].map((instruction) => ({ instruction })),
-    { instruction: {
-      op: 'invokestatic', arg: ['Method', 'Masks', ['and', '(II)I']],
-    } },
-    ...['goto', 'athrow', 'iinc', 'iaload', 'iastore'].map((instruction) => ({ instruction })),
-    ...[57, 16711422, -59233087].map((arg) => ({ instruction: { op: 'ldc', arg } })),
-  ];
-  const method = {
-    attributes: [{ type: 'code', code: { codeItems: prefix } }],
-  };
-  const intrinsic = jvm.jit.getSynchronousIntrinsic(method, '(IB[III)V');
-  t.equal(typeof intrinsic, 'function', 'constant-color scanline shape is recognized');
 
-  const pixels = [0x123456, 0xabcdef];
-  intrinsic([0, 57, pixels, 0x10203, 2], 0);
-  t.deepEqual(pixels, [0x0a1c2e, 0x56687a],
-    'native constant-color loop matches generated mask, shift, and addition');
-  t.end();
-});
 
-test('stackless integer raster preserves operands across chained branches', (t) => {
-  const jvm = new JVM({ jit: { warmupThreshold: 0 } });
-  const codeItems = [
-    { labelDef: 'L0:', instruction: 'iload_0' },
-    { labelDef: 'L1:', instruction: 'iload_1' },
-    { labelDef: 'L2:', instruction: 'iload_2' },
-    { labelDef: 'L3:', instruction: { op: 'ifne', arg: 'Lnonzero' } },
-    { labelDef: 'L4:', instruction: { op: 'if_icmplt', arg: 'Lless' } },
-    { labelDef: 'L5:', instruction: 'iconst_0' },
-    { labelDef: 'L6:', instruction: { op: 'istore', arg: 17 } },
-    { labelDef: 'L7:', instruction: { op: 'goto', arg: 'Lreturn' } },
-    { labelDef: 'Lless:', instruction: 'iconst_1' },
-    { labelDef: 'L9:', instruction: { op: 'istore', arg: 17 } },
-    { labelDef: 'L10:', instruction: { op: 'goto', arg: 'Lreturn' } },
-    { labelDef: 'Lnonzero:', instruction: 'pop' },
-    { labelDef: 'L12:', instruction: 'pop' },
-    { labelDef: 'L13:', instruction: 'iconst_2' },
-    { labelDef: 'L14:', instruction: { op: 'istore', arg: 17 } },
-    { labelDef: 'Lreturn:', instruction: 'return' },
-  ];
-  for (let i = 0; i < 301; i += 1) {
-    codeItems.push({ labelDef: `LUload${i}:`, instruction: { op: 'iload', arg: 0 } });
-  }
-  for (let i = 0; i < 101; i += 1) {
-    codeItems.push({ labelDef: `LUstore${i}:`, instruction: { op: 'istore', arg: 20 } });
-  }
-  for (let i = 0; i < 5; i += 1) {
-    codeItems.push({
-      labelDef: `LUcall${i}:`,
-      instruction: {
-        op: 'invokestatic',
-        arg: ['Method', 'RasterLine', ['draw', '(IIIIIII[III)V']],
-      },
-    });
-  }
-  while (codeItems.length < 1000) {
-    codeItems.push({ labelDef: `LUnop${codeItems.length}:`, instruction: 'nop' });
-  }
-  const method = {
-    name: 'a',
-    descriptor: '(IIIIIIIBIIII[IIIII)V',
-    attributes: [{ type: 'code', code: { codeItems, exceptionTable: [] } }],
-  };
-  const generated = jvm.jit.compileStacklessIntegerRaster(method);
-  t.ok(generated && generated.jvmStacklessRaster,
-    'large structurally recognized raster selects stackless code generation');
 
-  const run = (left, right, bypass) => {
-    const frame = {
-      method,
-      instructions: codeItems,
-      locals: new Array(43).fill(null),
-      stack: { items: [] },
-      pc: 0,
-    };
-    frame.locals[0] = left;
-    frame.locals[1] = right;
-    frame.locals[2] = bypass;
-    const callStack = new Stack();
-    callStack.push(frame);
-    generated(frame, { status: 'runnable', callStack }, jvm.jit, false);
-    return frame.locals[17];
-  };
-  t.equal(run(5, 10, 0), 1,
-    'second branch sees the two values preserved by the first branch');
-  t.equal(run(10, 5, 0), 0, 'comparison false path remains correct');
-  t.equal(run(5, 10, 1), 2, 'first branch target retains and discards both values');
-  t.end();
-});
 
 function scalarIntegerLoopMethod(name = 'nameDoesNotMatter', exceptionTable = []) {
   const instructions = [
@@ -8113,15 +6444,6 @@ test('structured JVM SSA feeds operand values across block joins', (t) => {
   t.ok(combined.jit.scalarGuestBodiesEnabled &&
       combined.jit.structuredSsa.enabled,
     'renderer-pipeline composes the generic scalar and structured SSA tiers');
-  t.ok(combined.jit.fusedRegions.enabled,
-    'verified intermethod regions are enabled by default');
-  const explicitlyDisabledFused = new JVM({ jit: {
-    rendererPipeline: true,
-    fusedRegions: false,
-    profileMethods: false,
-  } });
-  t.notOk(explicitlyDisabledFused.jit.fusedRegions.enabled,
-    'the generic region tier remains controllable through its explicit switch');
   t.end();
 });
 
@@ -9377,7 +7699,6 @@ public final class StructuredRecurrenceRangeHarness {
   const jvm = new JVM({ classpath, jit: {
     warmupThreshold: 0,
     structuredSsa: true,
-    guestKernelOracles: false,
   } });
   await jvm.loadClassByName(className);
   jvm.classInitializationState.set(className, 'INITIALIZED');
@@ -9470,7 +7791,6 @@ public final class StructuredBitBoundedRangeHarness {
   const jvm = new JVM({ classpath, jit: {
     warmupThreshold: 0,
     structuredSsa: true,
-    guestKernelOracles: false,
   } });
   await jvm.loadClassByName(className);
   jvm.classInitializationState.set(className, 'INITIALIZED');
@@ -9546,7 +7866,6 @@ public final class StructuredConstantStepRangeHarness {
   const jvm = new JVM({ classpath, jit: {
     warmupThreshold: 0,
     structuredSsa: true,
-    guestKernelOracles: false,
   } });
   await jvm.loadClassByName(className);
   jvm.classInitializationState.set(className, 'INITIALIZED');
@@ -9613,7 +7932,6 @@ public final class StructuredPositiveStrideRangeHarness {
   const jvm = new JVM({ classpath, jit: {
     warmupThreshold: 0,
     structuredSsa: true,
-    guestKernelOracles: false,
   } });
   await jvm.loadClassByName(className);
   jvm.classInitializationState.set(className, 'INITIALIZED');
@@ -9684,7 +8002,6 @@ public final class StructuredFieldArrayRangeHarness {
   const jvm = new JVM({ classpath, jit: {
     warmupThreshold: 0,
     structuredSsa: true,
-    guestKernelOracles: false,
   } });
   const classData = await jvm.loadClassByName(className);
   jvm.classInitializationState.set(className, 'INITIALIZED');
@@ -9799,7 +8116,6 @@ public final class StructuredLateStaticArrayRangeHarness {
   const jvm = new JVM({ classpath, jit: {
     warmupThreshold: 0,
     structuredSsa: true,
-    guestKernelOracles: false,
   } });
   const classData = await jvm.loadClassByName(className);
   jvm.classInitializationState.set(className, 'INITIALIZED');
@@ -9899,7 +8215,6 @@ public final class StructuredProducedArrayLocalHarness {
     warmupThreshold: 0,
     structuredSsa: true,
     structuredProducedArrayLocalViews: true,
-    guestKernelOracles: false,
   } });
   await jvm.loadClassByName(className);
   jvm.classInitializationState.set(className, 'INITIALIZED');
@@ -9959,7 +8274,6 @@ public final class StructuredProducedArrayLocalHarness {
     warmupThreshold: 0,
     structuredSsa: true,
     structuredProducedArrayLocalViews: false,
-    guestKernelOracles: false,
   } });
   await disabledJvm.loadClassByName(className);
   disabledJvm.classInitializationState.set(className, 'INITIALIZED');
@@ -9996,7 +8310,6 @@ public final class LoopInvariantStaticArrayHarness {
     warmupThreshold: 0,
     structuredSsa: true,
     structuredLoopInvariantStaticArrayViews: true,
-    guestKernelOracles: false,
   }});
   for (const owner of [className, operationName]) {
     await jvm.loadClassByName(owner);
@@ -10058,7 +8371,6 @@ public final class LoopInvariantStaticArrayHarness {
   const disabledJvm = new JVM({classpath, jit: {
     warmupThreshold: 0,
     structuredSsa: true,
-    guestKernelOracles: false,
   }});
   for (const owner of [className, operationName]) {
     await disabledJvm.loadClassByName(owner);
@@ -10090,7 +8402,6 @@ public final class StructuredConsecutiveLoopRangeHarness {
   const jvm = new JVM({ classpath, jit: {
     warmupThreshold: 0,
     structuredSsa: true,
-    guestKernelOracles: false,
   } });
   await jvm.loadClassByName(className);
   jvm.classInitializationState.set(className, 'INITIALIZED');
@@ -10169,7 +8480,6 @@ public final class StructuredIndirectFieldArrayHarness {
   const jvm = new JVM({ classpath, jit: {
     warmupThreshold: 0,
     structuredSsa: true,
-    guestKernelOracles: false,
   } });
   await jvm.loadClassByName(className);
   jvm.classInitializationState.set(className, 'INITIALIZED');
@@ -10300,7 +8610,6 @@ public final class StructuredFieldArrayAliasHarness {
   const jvm = new JVM({ classpath, jit: {
     warmupThreshold: 0,
     structuredSsa: true,
-    guestKernelOracles: false,
   } });
   await jvm.loadClassByName(className);
   jvm.classInitializationState.set(className, 'INITIALIZED');
@@ -10369,7 +8678,6 @@ public final class StructuredAliasFallbackHarness {
   const jvm = new JVM({ classpath, jit: {
     warmupThreshold: 0,
     structuredSsa: true,
-    guestKernelOracles: false,
   } });
   await Promise.all([
     jvm.loadClassByName(className),
@@ -10475,7 +8783,6 @@ public final class StructuredInlineScopeHarness {
   const jvm = new JVM({ classpath, jit: {
     warmupThreshold: 0,
     structuredSsa: true,
-    guestKernelOracles: false,
   } });
   await jvm.loadClassByName(className);
   jvm.classInitializationState.set(className, 'INITIALIZED');
@@ -11191,612 +9498,25 @@ function fusedShapeMethod(name, descriptor, targetDescriptor, callCount, options
   };
 }
 
-test('fused bytecode-region verification is independent of descriptors and call counts', (t) => {
-  const jvm = new JVM({ jit: { warmupThreshold: 0 } });
-  const first = fusedShapeMethod('first', '(III)V', '(I[I)V', 3);
-  const second = fusedShapeMethod('second', '(IIIIIII)V', '(II[I)V', 7);
-  t.ok(jvm.jit.fusedRegions.verifyMethod(first),
-    'an arbitrary descriptor and three repeated calls verify');
-  t.ok(jvm.jit.fusedRegions.verifyMethod(second),
-    'a different descriptor and call count verify through the same path');
-  t.notOk(jvm.jit.fusedRegions.constructor.FAMILY_BY_WRAPPER,
-    'there is no descriptor-to-guest-family selection table');
 
-  const badStack = fusedShapeMethod('badStack', '(III)V', '(I[I)V', 3);
-  badStack.attributes[0].code.codeItems.shift();
-  t.notOk(jvm.jit.fusedRegions.verifyMethod(badStack),
-    'an invalid operand-stack shape is rejected');
-  const badHandler = fusedShapeMethod('badHandler', '(III)V', '(I[I)V', 3, {
-    exceptionTable: [{ handlerLbl: 'L0', catch_type: 'java/lang/Exception' }],
-  });
-  t.notOk(jvm.jit.fusedRegions.verifyMethod(badHandler),
-    'an unsupported exception handler is rejected');
-  t.end();
-});
 
-test('fused bytecode-region discovery follows repeated calls into an array-store loop', (t) => {
-  const jvm = new JVM({ jit: { warmupThreshold: 0, fusedRegions: true } });
-  const wrapper = fusedShapeMethod('wrapper', '(IIIIII)V', '(I[I)V', 4, {
-    targetOwner: 'RasterOwner', targetName: 'rasterTarget',
-  });
-  wrapper.flags = ['static'];
-  const raster = fusedShapeMethod('rasterTarget', '(I[I)V', '([IIII)V', 3, {
-    targetOwner: 'SpanOwner', targetName: 'spanTarget',
-  });
-  const span = {
-    name: 'spanTarget', descriptor: '([IIII)V', flags: ['static'],
-    attributes: [{ type: 'code', code: {
-      codeItems: [
-        { labelDef: 'L0:', instruction: 'aload_0' },
-        { instruction: 'iload_1' },
-        { instruction: 'iload_2' },
-        { instruction: 'iastore' },
-        { instruction: { op: 'iinc', varnum: 1, incr: 1 } },
-        { instruction: 'iload_1' },
-        { instruction: 'iload_3' },
-        { instruction: { op: 'if_icmplt', arg: 'L0' } },
-        { instruction: 'return' },
-      ], localsSize: '4', stackSize: '3', exceptionTable: [],
-    } }],
-  };
-  const install = (owner, method) => {
-    jvm.classes[owner] = {
-      ast: { classes: [{ superClassName: null, items: [{ type: 'method', method }] }] },
-      staticFields: new Map(),
-    };
-  };
-  install('RasterOwner', raster);
-  install('SpanOwner', span);
-  const discovered = jvm.jit.fusedRegions.discoverRegion(wrapper);
-  t.ok(discovered, 'the intermethod region is discovered from bytecode structure');
-  t.equal(discovered.family.wrapper, '(IIIIII)V', 'wrapper descriptor is derived');
-  t.equal(discovered.family.raster, '(I[I)V', 'raster descriptor is derived');
-  t.equal(discovered.family.scanline, '([IIII)V', 'scanline descriptor is derived');
-  t.equal(discovered.wrapper.calls.length, 4, 'non-six wrapper call count is retained');
-  t.equal(discovered.raster.calls.length, 3, 'non-six raster call count is retained');
-  t.ok(jvm.jit.fusedRegions.mayFuse(wrapper),
-    'the synchronous resolver recognizes the wrapper without a descriptor allowlist');
-  const unreachableCall = { instruction: {
-    op: 'invokestatic',
-    arg: ['Method', 'DeadOwner', ['deadHelper', '()V']],
-  }, labelDef: 'Ldead:' };
-  wrapper.attributes[0].code.codeItems.push(unreachableCall);
-  t.ok(jvm.jit.fusedRegions.mayFuse(wrapper),
-    'unreachable dead calls do not reject a structurally verified wrapper');
-  const mixedCalls = fusedShapeMethod('mixed', '(J)V', '(I[I)V', 4, {
-    targetOwner: 'RasterOwner', targetName: 'rasterTarget', integerNative: true,
-  });
-  mixedCalls.flags = ['static'];
-  t.notOk(jvm.jit.fusedRegions.mayFuse(mixedCalls),
-    'a mixed-call method does not enter the fused-only resolution path');
-  t.end();
-});
 
-test('lexical fused kernels hoist only stable read-only statics',
-  async (t) => {
-  const className = 'FusedStaticHoistHarness';
-  const classpath = compileJavaFixture(t, className, `
-public final class FusedStaticHoistHarness {
-  static int stable = 7;
-  static volatile int changing = 9;
 
-  static void readStable(int[] destination) {
-    destination[0] = stable + stable;
-  }
 
-  static void readVolatile(int[] destination) {
-    destination[0] = changing + changing;
-  }
 
-  static void readWrite(int[] destination) {
-    stable++;
-    destination[0] = stable;
-  }
-}
-`);
-  const jvm = new JVM({ classpath, jit: {
-    warmupThreshold: 0, fusedRegions: true,
-  } });
-  const classData = await jvm.loadClassByName(className);
-  classData.staticFieldsInitialized = true;
-  classData.staticFields.set('stable:I', 7);
-  classData.staticFields.set('changing:I', 9);
-  jvm.classInitializationState.set(className, 'INITIALIZED');
-  const compile = async (name) => {
-    const method = await jvm.findMethodInHierarchy(
-      className, name, '([I)V');
-    const verified = jvm.jit.fusedRegions.verifyMethod(method);
-    const region = {
-      family: { name: 'static-hoist-test' },
-      wrapperOwner: className,
-      rasterOwner: className,
-      scanlineOwner: className,
-      staticTargets: [],
-      staticSiteIds: [],
-      staticOwners: [],
-    };
-    t.ok(verified, `${name} verifies as a lexical integer kernel`);
-    const resolved = jvm.jit.fusedRegions.prepareStatics(
-      region, verified.staticRefs);
-    t.ok(resolved, `${name} resolves its static targets`);
-    if (!resolved) return '';
-    const generated = jvm.jit.fusedRegions.compileLexicalKernel(
-      method, verified, region, 'scanline');
-    t.ok(generated?.jvmLexicalFusedKernel,
-      `${name} compiles through the generic lexical renderer`);
-    return generated?.jvmLexicalFusedSource || '';
-  };
-  const stable = await compile('readStable');
-  const volatile = await compile('readVolatile');
-  const written = await compile('readWrite');
-  t.ok(/const s\d+=region\.staticTargets/.test(stable),
-    'a non-volatile read-only static is loaded once at kernel entry');
-  t.notOk(/const s\d+=region\.staticTargets/.test(volatile),
-    'a volatile static remains a distinct read at each bytecode');
-  t.notOk(/const s\d+=region\.staticTargets/.test(written),
-    'a static written by the method is never entry-hoisted');
-  t.end();
-});
 
-test('fused discovery retries linkage misses after class lifecycle advances', (t) => {
-  const jvm = new JVM({ jit: { warmupThreshold: 0, fusedRegions: true } });
-  const wrapper = fusedShapeMethod('candidate', '()V', '()V', 2);
-  const owner = 'DeferredRegionOwner';
-  const frame = new Frame(wrapper);
-  const callStack = new Stack();
-  callStack.push(frame);
-  const thread = { status: 'runnable', callStack };
-  const site = { op: 'invokestatic', params: [], returnType: 'void' };
-  const target = { method: wrapper, lookupClass: owner };
-  const fused = jvm.jit.fusedRegions;
-  let attempts = 0;
-  let executions = 0;
-  fused.compile = () => {
-    attempts += 1;
-    if (attempts === 1) return null;
-    return {
-      wrapperMethod: wrapper,
-      wrapperOwner: owner,
-      wrapperKernel: () => { executions += 1; },
-    };
-  };
-  fused.guard = () => true;
 
-  t.notOk(fused.tryInvoke(site, target, frame, thread).matched,
-    'an unresolved child is initially left to normal invocation');
-  t.notOk(fused.tryInvoke(site, target, frame, thread).matched,
-    'the unchanged linkage epoch does not repeatedly rediscover the method');
-  t.equal(attempts, 1, 'one discovery attempt is made per linkage epoch');
 
-  jvm.classEpoch += 1;
-  const retried = fused.tryInvoke(site, target, frame, thread);
-  t.ok(retried.handled, 'loading another class makes the candidate eligible again');
-  t.equal(attempts, 2, 'the advanced linkage epoch triggers rediscovery');
-  t.equal(executions, 1, 'the newly linked region executes');
 
-  fused.cache.delete(wrapper);
-  fused.rejected.set(wrapper,
-    `${jvm.classEpoch || 0}:${jvm.classInitializationEpoch || 0}`);
-  jvm.classInitializationEpoch += 1;
-  const initializedRetry = fused.tryInvoke(site, target, frame, thread);
-  t.ok(initializedRetry.handled,
-    'finishing class initialization also makes the candidate eligible again');
-  t.equal(attempts, 3, 'the initialization epoch triggers rediscovery');
-  t.end();
-});
 
-test('fused entry guards fall back before consuming operands or side effects', (t) => {
-  const jvm = new JVM({ jit: { warmupThreshold: 0, fusedRegions: true } });
-  const descriptor = '(IIIIIIII)V';
-  const wrapper = fusedShapeMethod('arbitraryWrapper', descriptor, '(IIIIIBII[I)V', 6);
-  const owner = 'ArbitraryRendererOwner';
-  jvm.classes[owner] = {
-    ast: { classes: [{ superClassName: null, items: [{ type: 'method', method: wrapper }] }] },
-    staticFields: new Map(),
-  };
-  const callerMethod = {
-    name: 'caller', descriptor: '()V',
-    attributes: [{ type: 'code', code: {
-      codeItems: [{ labelDef: 'L0:', instruction: 'return' }],
-      localsSize: '0', stackSize: '8', exceptionTable: [],
-    } }],
-  };
-  const caller = new Frame(callerMethod);
-  const callStack = new Stack();
-  callStack.push(caller);
-  const thread = { status: 'runnable', callStack };
-  caller.stack.items.push(1, 2, 3, 4, 5, 6, 7, 8);
-  let sideEffects = 0;
-  const codeItems = wrapper.attributes[0].code.codeItems;
-  const region = {
-    wrapperMethod: wrapper,
-    wrapperOwner: owner,
-    wrapperKernel: () => { sideEffects += 1; },
-    dependencies: [{ owner, method: wrapper, codeItems }],
-    staticOwners: [], falseGuardTargets: [],
-  };
-  jvm.jit.fusedRegions.cache.set(wrapper, region);
-  const site = {
-    op: 'invokestatic', descriptor,
-    params: new Array(8).fill('int'), returnType: 'void',
-  };
-  const target = { method: wrapper, lookupClass: owner };
 
-  let result = jvm.jit.fusedRegions.tryInvoke(site, target, caller, thread);
-  t.notOk(result.handled, 'an uninitialized participant uses the normal path');
-  t.equal(sideEffects, 0, 'class initialization guard runs before fused effects');
-  t.equal(caller.stack.items.length, 8, 'guarded fallback leaves caller operands intact');
 
-  jvm.classInitializationState.set(owner, 'INITIALIZED');
-  jvm.debugManager.enable();
-  result = jvm.jit.fusedRegions.tryInvoke(site, target, caller, thread);
-  t.notOk(result.handled, 'debug mode uses the normal path');
-  t.equal(sideEffects, 0, 'debug guard also precedes fused effects');
-  t.equal(caller.stack.items.length, 8, 'debug fallback leaves operands intact');
 
-  jvm.debugManager.disable();
-  const originalFindMethod = jvm.findMethod.bind(jvm);
-  let linkageLookups = 0;
-  jvm.findMethod = (...args) => {
-    linkageLookups += 1;
-    return originalFindMethod(...args);
-  };
-  result = jvm.jit.fusedRegions.tryInvoke(site, target, caller, thread);
-  t.ok(result.handled, 'the same structurally cached region runs after guards clear');
-  t.equal(sideEffects, 1, 'unguarded invocation enters the fused kernel once');
-  t.equal(caller.stack.items.length, 0, 'successful fused void call consumes its operands');
-  t.equal(linkageLookups, 1, 'the first successful entry verifies dependency linkage');
 
-  caller.stack.items.push(1, 2, 3, 4, 5, 6, 7, 8);
-  result = jvm.jit.fusedRegions.tryInvoke(site, target, caller, thread);
-  t.ok(result.handled, 'an unchanged lifecycle epoch reuses the linkage proof');
-  t.equal(linkageLookups, 1, 'the cached proof skips repeated dependency lookup');
 
-  caller.stack.items.push(1, 2, 3, 4, 5, 6, 7, 8);
-  jvm.debugManager.enable();
-  result = jvm.jit.fusedRegions.tryInvoke(site, target, caller, thread);
-  t.notOk(result.handled, 'live debugger guards still run with cached linkage');
-  t.equal(caller.stack.items.length, 8, 'a cached-linkage fallback preserves operands');
-  jvm.debugManager.disable();
 
-  wrapper.attributes[0].code.codeItems = codeItems.slice();
-  jvm.classEpoch += 1;
-  result = jvm.jit.fusedRegions.tryInvoke(site, target, caller, thread);
-  t.notOk(result.handled, 'a class lifecycle change revalidates bytecode identity');
-  t.equal(linkageLookups, 2, 'the advanced epoch performs dependency lookup again');
-  t.equal(sideEffects, 2, 'failed revalidation occurs before fused side effects');
-  t.equal(caller.stack.items.length, 8, 'failed revalidation preserves caller operands');
-  t.equal(jvm.jit.fusedRunCount, 2, 'successful fused executions are counted');
-  t.equal(jvm.jit.fusedGuardedFallbackCount, 4, 'all guarded fallbacks are counted');
-  t.end();
-});
 
-test('the synchronous interpreter enters verified fused static regions', (t) => {
-  const jvm = new JVM({ jit: { warmupThreshold: 0, fusedRegions: true } });
-  const descriptor = '(II)V';
-  const wrapper = fusedShapeMethod(
-    'shapeSelectedWrapper', descriptor, '(I[I)V', 3);
-  wrapper.flags = ['static'];
-  const owner = 'InterpreterFusedShapeOwner';
-  jvm.classes[owner] = {
-    ast: { classes: [{
-      className: owner,
-      superClassName: null,
-      items: [{ type: 'method', method: wrapper }],
-    }] },
-    staticFields: new Map(),
-  };
-  jvm.classInitializationState.set(owner, 'INITIALIZED');
 
-  const callerMethod = {
-    name: 'ordinaryCaller', descriptor: '()V',
-    attributes: [{ type: 'code', code: {
-      codeItems: [{ labelDef: 'L0:', instruction: 'return' }],
-      localsSize: '0', stackSize: '2', exceptionTable: [],
-    } }],
-  };
-  const caller = new Frame(callerMethod);
-  caller.className = 'UnrelatedCallerOwner';
-  caller.stack.items.push(17, 29);
-  const callStack = new Stack();
-  callStack.push(caller);
-  const thread = { id: 1, status: 'runnable', callStack };
-
-  let received = null;
-  const codeItems = wrapper.attributes[0].code.codeItems;
-  jvm.jit.fusedRegions.cache.set(wrapper, {
-    wrapperMethod: wrapper,
-    wrapperOwner: owner,
-    wrapperKernel: (_state, _region, _helpers, first, second) => {
-      received = [first, second];
-    },
-    dependencies: [{ owner, method: wrapper, codeItems }],
-    staticOwners: [],
-    falseGuardTargets: [],
-  });
-
-  const instruction = {
-    op: 'invokestatic',
-    arg: ['Method', owner, [wrapper.name, descriptor]],
-  };
-  const result = invokeHandlers.invokestaticSync(caller, instruction, jvm, thread);
-  t.equal(result, undefined, 'the warm synchronous invoke completes inline');
-  t.deepEqual(received, [17, 29], 'the fused kernel receives positional operands');
-  t.equal(callStack.size(), 1, 'no wrapper Frame is pushed');
-  t.equal(caller.stack.size(), 0, 'successful fused execution consumes operands');
-  t.equal(jvm.jit.fusedRunCount, 1, 'interpreter-entered fusion is counted');
-  t.end();
-});
-
-test('structured SSA feeds scalar operands directly into a verified fused region', (t) => {
-  const jvm = new JVM({ jit: {
-    warmupThreshold: 0, fusedRegions: true, structuredSsa: true,
-  } });
-  const callee = {
-    name: 'calleeWithNoFixedIdentity', descriptor: '(I)V', flags: ['static'],
-    attributes: [{ type: 'code', code: {
-      codeItems: [{ labelDef: 'L0:', instruction: 'return' }],
-      localsSize: '1', stackSize: '0', exceptionTable: [],
-    } }],
-  };
-  const owner = 'DirectFusedShapeOwner';
-  jvm.classes[owner] = {
-    ast: { classes: [{ superClassName: null, items: [{ type: 'method', method: callee }] }] },
-    staticFields: new Map(),
-  };
-  jvm.classInitializationState.set(owner, 'INITIALIZED');
-  const call = { op: 'invokestatic',
-    arg: ['Method', owner, [callee.name, callee.descriptor]] };
-  const caller = {
-    name: 'loopWithNoFixedIdentity', descriptor: '(I)V', flags: ['static'],
-    attributes: [{ type: 'code', code: {
-      codeItems: [
-        { instruction: 'iconst_0' },
-        { instruction: 'istore_1' },
-        { labelDef: 'Lloop:', instruction: 'iload_1' },
-        { instruction: 'iconst_1' },
-        { instruction: { op: 'if_icmpge', arg: 'Lreturn' } },
-        { instruction: 'iload_0' },
-        { instruction: call },
-        { instruction: { op: 'iinc', varnum: 1, incr: 1 } },
-        { instruction: { op: 'goto', arg: 'Lloop' } },
-        { labelDef: 'Lreturn:', instruction: 'return' },
-      ],
-      localsSize: '2', stackSize: '2', exceptionTable: [],
-    } }],
-  };
-  const observed = [];
-  const region = {
-    wrapperMethod: callee, wrapperOwner: owner,
-    wrapperKernel: (_state, _region, _jit, value) => observed.push(value),
-    executionState: {}, dependencies: [], staticOwners: [], falseGuardTargets: [],
-  };
-  jvm.jit.fusedRegions.directEntries[0] = {
-    id: 0, paramCount: 1, target: { method: callee, lookupClass: owner }, region,
-  };
-  jvm.jit.fusedRegions.getCompileTimeDirectCall = () =>
-    ({ id: 0, paramCount: 1, returnsVoid: true });
-  jvm.jit.fusedRegions.guard = () => true;
-  const generated = jvm.jit.structuredSsa.compile(caller);
-  t.ok(generated?.jvmStructuredSsa, 'loop caller selects structured SSA');
-  t.ok(generated.jvmStructuredSource.includes('tryInvokeDirectAt') &&
-      generated.jvmStructuredSource.includes('tryInvokeSyncAt'),
-  'scalar direct entry is emitted with the ordinary dispatch fallback retained');
-  const frame = new Frame(caller);
-  frame.locals[0] = 37;
-  const callStack = new Stack();
-  callStack.push(frame);
-  const thread = { status: 'runnable', callStack };
-  generated(frame, thread, jvm.jit, false);
-  t.deepEqual(observed, [37], 'the fused kernel receives the SSA operand positionally');
-  t.equal(jvm.jit.fusedDirectRunCount, 1, 'direct fused execution is counted');
-  t.equal(frame.stack.items.length, 0, 'successful direct entry does not materialize operands');
-  t.ok(callStack.isEmpty(), 'normal return removes the structured caller frame');
-
-  let sideEffects = 0;
-  region.wrapperKernel = () => { sideEffects += 1; };
-  jvm.jit.fusedRegions.guard = () => false;
-  const guardedFrame = new Frame(caller);
-  const guardedStack = new Stack();
-  guardedStack.push(guardedFrame);
-  const handled = jvm.jit.fusedRegions.tryInvokeDirectAt(
-    0, guardedFrame, { status: 'runnable', callStack: guardedStack }, 91);
-  t.notOk(handled, 'a failed entry guard requests the ordinary call path');
-  t.equal(sideEffects, 0, 'the direct guard falls back before fused side effects');
-  t.end();
-});
-
-test('structured fused sites resolve wrapper owners loaded after caller compilation', (t) => {
-  const jvm = new JVM({ jit: {
-    warmupThreshold: 0, fusedRegions: true, structuredSsa: true,
-  } });
-  const owner = 'LateLoadedDirectFusedOwner';
-  const descriptor = '(I)V';
-  const call = {
-    op: 'invokestatic',
-    arg: ['Method', owner, ['arbitraryMember', descriptor]],
-  };
-  const site = jvm.jit.fusedRegions.getCompileTimeDirectCall(call);
-  t.ok(site, 'a cold wrapper owner retains an unresolved positional site');
-  t.equal(jvm.jit.fusedRegions.directEntries[site.id].target, null,
-    'caller compilation does not invent a cold method identity');
-
-  const callee = {
-    name: 'arbitraryMember', descriptor, flags: ['static'],
-    attributes: [{ type: 'code', code: {
-      codeItems: [{ labelDef: 'L0:', instruction: 'return' }],
-      localsSize: '1', stackSize: '0', exceptionTable: [],
-    } }],
-  };
-  jvm.classes[owner] = {
-    ast: { classes: [{
-      className: owner, superClassName: null,
-      items: [{ type: 'method', method: callee }],
-    }] },
-    staticFields: new Map(),
-  };
-  jvm.classInitializationState.set(owner, 'INITIALIZED');
-  const observed = [];
-  const region = {
-    wrapperMethod: callee,
-    wrapperOwner: owner,
-    wrapperKernel: (_state, _region, _jit, value) => observed.push(value),
-    executionState: {},
-    dependencies: [],
-    staticOwners: [],
-    falseGuardTargets: [],
-  };
-  jvm.jit.fusedRegions.mayFuse = (method) => method === callee;
-  jvm.jit.fusedRegions.compile = (method, lookupClass) =>
-    method === callee && lookupClass === owner ? region : null;
-  jvm.jit.fusedRegions.guard = () => true;
-
-  const caller = new Frame({
-    name: 'caller', descriptor: '()V',
-    attributes: [{ type: 'code', code: {
-      codeItems: [{ labelDef: 'L0:', instruction: 'return' }],
-      localsSize: '0', stackSize: '1', exceptionTable: [],
-    } }],
-  });
-  const callStack = new Stack();
-  callStack.push(caller);
-  const handled = jvm.jit.fusedRegions.tryInvokeDirectAt(
-    site.id, caller, { status: 'runnable', callStack }, 73);
-  t.ok(handled, 'the same compiled site links after its owner loads');
-  t.deepEqual(observed, [73], 'resolved direct site feeds the scalar operand');
-  t.equal(jvm.jit.fusedRegions.directEntries[site.id].target.method, callee,
-    'runtime linkage retains the exact verified method identity');
-  t.equal(jvm.jit.fusedDirectRunCount, 1, 'late-linked direct execution is counted');
-  t.end();
-});
-
-test('structured callers retain continuations across cold fused void calls', (t) => {
-  const jvm = new JVM({ jit: {
-    warmupThreshold: 0, fusedRegions: true, structuredSsa: true,
-  } });
-  const owner = 'ColdContinuationFusedOwner';
-  const descriptor = '(I)V';
-  const call = {
-    op: 'invokestatic',
-    arg: ['Method', owner, ['shapeOnlyMember', descriptor]],
-  };
-  const caller = {
-    name: 'callerWithColdVoidSite', descriptor: '(I)I', flags: ['static'],
-    attributes: [{ type: 'code', code: {
-      codeItems: [
-        { instruction: 'iload_0' },
-        { instruction: call },
-        { instruction: 'iconst_0' },
-        { instruction: 'istore_1' },
-        { labelDef: 'Lloop:', instruction: 'iload_1' },
-        { instruction: 'iconst_1' },
-        { instruction: { op: 'if_icmpge', arg: 'Lreturn' } },
-        { instruction: { op: 'iinc', varnum: 1, incr: 1 } },
-        { instruction: { op: 'goto', arg: 'Lloop' } },
-        { labelDef: 'Lreturn:', instruction: 'iload_0' },
-        { instruction: 'iconst_1' },
-        { instruction: 'iadd' },
-        { instruction: 'ireturn' },
-      ],
-      localsSize: '2', stackSize: '2', exceptionTable: [],
-    } }],
-  };
-  jvm.jit.fusedRegions.mayFuse = () => true;
-  const generated = jvm.jit.structuredSsa.compile(caller);
-  t.ok(generated?.jvmStructuredContinuation,
-    'cold-call caller uses a resumable structured body');
-  const frame = new Frame(caller);
-  frame.locals[0] = 41;
-  const callStack = new Stack();
-  callStack.push(frame);
-  const thread = { status: 'runnable', callStack };
-
-  const first = generated(frame, thread, jvm.jit, false);
-  t.ok(first?.deopt && first.transient,
-    'cold owner requests the canonical invocation path');
-  t.equal(frame.pc, 1, 'cold call operands are materialized at the invoke PC');
-  t.ok(generated.jvmHasStructuredContinuation(frame),
-    'the post-call scalar continuation is retained');
-
-  frame.pc = 2;
-  frame.stack.items.length = 0;
-  delete frame.jitSkipOnce;
-  const resumed = generated(frame, thread, jvm.jit, false);
-  t.equal(resumed.value, 42, 'the exact post-call SSA continuation resumes');
-  t.notOk(generated.jvmHasStructuredContinuation(frame),
-    'normal return clears the retained continuation');
-  t.ok(callStack.isEmpty(), 'resumed return completes the caller frame');
-  t.end();
-});
-
-test('structured callers retain continuations while a void child is deoptimized', (t) => {
-  const jvm = new JVM({ jit: {
-    warmupThreshold: 0, fusedRegions: true, structuredSsa: true,
-  } });
-  const call = {
-    op: 'invokestatic',
-    arg: ['Method', 'ArbitraryDeoptimizingVoidOwner', ['member', '(I)V']],
-  };
-  const caller = {
-    name: 'callerWithDeoptimizingVoidChild', descriptor: '(I)I', flags: ['static'],
-    attributes: [{ type: 'code', code: {
-      codeItems: [
-        { instruction: 'iload_0' },
-        { instruction: call },
-        { instruction: 'iconst_0' },
-        { instruction: 'istore_1' },
-        { labelDef: 'LvoidLoop:', instruction: 'iload_1' },
-        { instruction: 'iconst_1' },
-        { instruction: { op: 'if_icmpge', arg: 'LvoidReturn' } },
-        { instruction: { op: 'iinc', varnum: 1, incr: 1 } },
-        { instruction: { op: 'goto', arg: 'LvoidLoop' } },
-        { labelDef: 'LvoidReturn:', instruction: 'iload_0' },
-        { instruction: 'iconst_1' },
-        { instruction: 'iadd' },
-        { instruction: 'ireturn' },
-      ],
-      localsSize: '2', stackSize: '2', exceptionTable: [],
-    } }],
-  };
-  jvm.jit.fusedRegions.getCompileTimeDirectCall = () => ({
-    id: 0, paramCount: 1, returnsVoid: true,
-  });
-  jvm.jit.fusedRegions.tryInvokeDirectAt = () => false;
-  const activeChild = new Frame(caller);
-  jvm.jit.tryInvokeSyncAt = (_id, frame, currentThread) => {
-    frame.stack.items.length = 0;
-    activeChild.jitGeneratedReturnParent = frame;
-    currentThread.callStack.push(activeChild);
-    return { deopt: true, transient: true, reason: 'deoptimized void child' };
-  };
-  const generated = jvm.jit.structuredSsa.compile(caller);
-  t.ok(generated?.jvmStructuredContinuation,
-    'the caller uses a resumable structured body');
-  const frame = new Frame(caller);
-  frame.locals[0] = 41;
-  const callStack = new Stack();
-  callStack.push(frame);
-  const thread = { status: 'runnable', callStack };
-
-  const first = generated(frame, thread, jvm.jit, false);
-  t.equal(first?.reason, 'deoptimized void child',
-    'the exact child deoptimization is propagated');
-  t.equal(frame.pc, 2, 'the completed void invoke records its post-call PC');
-  t.ok(generated.jvmHasStructuredContinuation(frame),
-    'the caller retains its scalar post-call continuation');
-  t.equal(activeChild.jitGeneratedReturnParent, frame,
-    'the deoptimized void child records its exact structured caller');
-  t.equal(activeChild.jitGeneratedReturnType, 'void',
-    'the deoptimized void child records its descriptor return type');
-
-  t.equal(callStack.pop(), activeChild,
-    'the scheduler-visible void child completes before its caller resumes');
-  const resumed = generated(frame, thread, jvm.jit, false);
-  t.equal(resumed.value, 42, 'execution resumes after the void child');
-  t.notOk(generated.jvmHasStructuredContinuation(frame),
-    'normal return clears the continuation');
-  t.end();
-});
 
 test('structured callers feed a deoptimized non-void child return into SSA', (t) => {
   const jvm = new JVM({ jit: {
@@ -11939,91 +9659,7 @@ test('frameless structured call exceptions retain invoke operands without a chil
   t.end();
 });
 
-test('fused exceptions restore omitted wrapper and raster frames', (t) => {
-  const jvm = new JVM({ jit: { warmupThreshold: 0, fusedRegions: true } });
-  const descriptor = '(IIIIIIII)V';
-  const wrapper = fusedShapeMethod('wrapperWithNoFixedName', descriptor, '(IIIIIBII[I)V', 6);
-  const raster = fusedShapeMethod('rasterWithNoFixedName', '(IIIIIBII[I)V', '(IB[III)V', 6,
-    { integerNative: true });
-  const owner = 'RestoredWrapperOwner';
-  const rasterOwner = 'RestoredRasterOwner';
-  jvm.classes[owner] = {
-    ast: { classes: [{ superClassName: null, items: [{ type: 'method', method: wrapper }] }] },
-    staticFields: new Map(),
-  };
-  jvm.classInitializationState.set(owner, 'INITIALIZED');
-  const callerMethod = {
-    name: 'caller', descriptor: '()V',
-    attributes: [{ type: 'code', code: {
-      codeItems: [{ labelDef: 'L0:', instruction: 'return' }],
-      localsSize: '0', stackSize: '8', exceptionTable: [],
-    } }],
-  };
-  const caller = new Frame(callerMethod);
-  caller.stack.items.push(1, 2, 3, 4, 5, 6, 7, 8);
-  const callStack = new Stack();
-  callStack.push(caller);
-  const thread = { status: 'runnable', callStack };
-  const thrown = { type: 'java/lang/ArrayIndexOutOfBoundsException', message: null };
-  const region = {
-    wrapperMethod: wrapper, wrapperOwner: owner,
-    rasterMethod: raster, rasterOwner,
-    dependencies: [{
-      owner, method: wrapper, codeItems: wrapper.attributes[0].code.codeItems,
-    }],
-    staticOwners: [], falseGuardTargets: [],
-    wrapperKernel: (state) => {
-      state.outerPc = 12;
-      state.outerExtra = 9;
-      state.method = 'raster';
-      state.pc = 37;
-      state.locals = [4, 5, 6];
-      state.stack = [null, 99];
-      throw thrown;
-    },
-  };
-  jvm.jit.fusedRegions.cache.set(wrapper, region);
-  const site = { op: 'invokestatic', descriptor,
-    params: new Array(8).fill('int'), returnType: 'void' };
-  const target = { method: wrapper, lookupClass: owner };
-  let observed;
-  try {
-    jvm.jit.fusedRegions.tryInvoke(site, target, caller, thread);
-  } catch (error) {
-    observed = error;
-  }
-  t.equal(observed, thrown, 'the original JVM exception is rethrown');
-  t.equal(callStack.size(), 3, 'caller plus both omitted frames are present');
-  t.equal(callStack.items[1].method, wrapper, 'wrapper is restored outside the raster');
-  t.equal(callStack.peek().method, raster, 'throwing raster is the innermost frame');
-  t.equal(callStack.peek().pc, 37, 'throwing bytecode PC is restored exactly');
-  t.deepEqual(callStack.peek().stack.items, [null, 99], 'throwing operands are restored');
-  t.equal(jvm.jit.fusedRestoredExceptionFrameCount, 2, 'restored frames are counted');
 
-  const directCaller = new Frame(callerMethod);
-  const directCallStack = new Stack();
-  directCallStack.push(directCaller);
-  const directThread = { status: 'runnable', callStack: directCallStack };
-  jvm.jit.fusedRegions.directEntries[0] = {
-    id: 0, paramCount: 8, target, region,
-  };
-  const directArguments = [11, 12, 13, 14, 15, 16, 17, 18];
-  observed = null;
-  try {
-    jvm.jit.fusedRegions.tryInvokeDirectAt(
-      0, directCaller, directThread, ...directArguments);
-  } catch (error) {
-    observed = error;
-  }
-  t.equal(observed, thrown, 'the scalar direct entry rethrows the original JVM exception');
-  t.equal(directCallStack.size(), 3,
-    'the scalar direct entry restores both omitted frames');
-  t.deepEqual(directCallStack.items[1].locals.slice(0, 8), directArguments,
-    'restored wrapper locals contain the positional caller operands');
-  t.equal(jvm.jit.fusedRestoredExceptionFrameCount, 4,
-    'direct-entry restored frames use the same accounting');
-  t.end();
-});
 
 test('JIT produces same PyramidApplet mock drawing operations as interpreter', async (t) => {
   const interpreted = await createPyramidHarness({ enabled: false });
@@ -12868,7 +10504,6 @@ test('large acyclic call decision trees enter generic structured SSA', (t) => {
   };
   const jvm = new JVM({ jit: {
     structuredSsa: true,
-    fusedRegions: false,
     profileMethods: false,
   } });
   t.ok(items.length >= 256,
@@ -15521,7 +13156,6 @@ public final class RestoringSyncFallbackHarness {
     warmupThreshold: 0,
     profileMethods: false,
     structuredSsa: true,
-    guestKernelOracles: false,
   } });
   const classData = await jvm.loadClassByName(className);
   await jvm.loadClassByName(`${className}$Doubler`);
@@ -15739,65 +13373,5 @@ test('a transient deopt takes one canonical interpreter step before every JIT ti
   'explicit preparation reuses an existing generated body');
   t.ok(jvm.jit.preparedCodegenMethods.has(cachedMethod),
     'a reused generated body still receives prepared-tier ownership');
-  t.end();
-});
-
-test('generated int raster methods signal tracked AWT mutation after stores and at yields', (t) => {
-  const owner = 'CompletionRasterSignalOwner';
-  const method = {
-    className: owner,
-    name: 'fill', descriptor: '([II)V', flags: ['static'],
-    attributes: [{type: 'code', code: {
-      codeItems: [
-        {labelDef: 'L0:', instruction: 'iconst_0'},
-        {labelDef: 'L1:', instruction: 'istore_2'},
-        {labelDef: 'L2:', instruction: 'iload_2'},
-        {labelDef: 'L3:', instruction: 'iload_1'},
-        {labelDef: 'L4:', instruction: {op: 'if_icmpge', arg: 'L11'}},
-        {labelDef: 'L5:', instruction: 'aload_0'},
-        {labelDef: 'L6:', instruction: 'iload_2'},
-        {labelDef: 'L7:', instruction: 'iload_2'},
-        {labelDef: 'L8:', instruction: 'iastore'},
-        {labelDef: 'L9:', instruction: {op: 'iinc', varnum: 2, incr: 1}},
-        {labelDef: 'L10:', instruction: {op: 'goto', arg: 'L2'}},
-        {labelDef: 'L11:', instruction: 'return'},
-      ],
-      exceptionTable: [], localsSize: '3', stackSize: '3',
-    }}],
-  };
-  const jvm = new JVM({jit: {warmupThreshold: 0, structuredSsa: true}});
-  jvm.classes[owner] = {
-    staticFields: new Map(),
-    ast: {classes: [{superClassName: null,
-      items: [{type: 'method', method}]}]},
-  };
-  jvm.classInitializationState.set(owner, 'INITIALIZED');
-  const generated = jvm.jit.structuredSsa.compile(method);
-  t.ok(generated?.jvmStructuredSsa,
-    'the arbitrary counted int-array store uses structured SSA');
-  const source = generated?.jvmStructuredSource || '';
-  const rasterWorkAt = source.indexOf('while (');
-  const storeAt = source.indexOf('awtRasterMutationObserved = true;');
-  const safePointAt = source.indexOf('if (awtRasterMutationObserved)');
-  const signalAt = source.lastIndexOf('helpers.markAwtRasterMutation');
-  t.ok(rasterWorkAt >= 0 && storeAt > rasterWorkAt &&
-      safePointAt >= 0 && signalAt > rasterWorkAt &&
-      !source.includes('__JVM_AWT_RASTER_COMPLETION__'),
-    'a completed store arms the safe-point signal and completion remains covered');
-
-  const pixels = [0, 0, 0, 0];
-  pixels.type = '[I';
-  const tracker = {dirty: false};
-  Object.defineProperty(pixels, '_jvmAwtRasterMutationTracker', {value: tracker});
-  const frame = new Frame(method);
-  frame.className = owner;
-  frame.locals.splice(0, 3, pixels, pixels.length, 0);
-  const thread = {status: 'runnable', callStack: new Stack()};
-  thread.callStack.push(frame);
-  generated(frame, thread, jvm.jit, false);
-  t.deepEqual(pixels.slice(), [0, 1, 2, 3],
-    'completion signaling preserves every generated store');
-  t.ok(tracker.dirty,
-    'the completed method publishes one tracked raster mutation');
   t.end();
 });

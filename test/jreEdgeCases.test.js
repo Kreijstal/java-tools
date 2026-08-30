@@ -24,6 +24,9 @@ const Toolkit = require('../src/jre/java/awt/Toolkit');
 const ImageClass = require('../src/jre/java/awt/Image');
 const PixelGrabber = require('../src/jre/java/awt/image/PixelGrabber');
 const Graphics = require('../src/jre/java/awt/Graphics');
+const ImageConsumer = require('../src/jre/java/awt/image/ImageConsumer');
+const Component = require('../src/jre/java/awt/Component');
+const MemoryImageSource = require('../src/jre/java/awt/image/MemoryImageSource');
 const { setAudioOutputFactory } = require('../src/platform/audio');
 const { encodePng } = require('../src/io/pngEncoder');
 const jpeg = require('jpeg-js');
@@ -40,6 +43,18 @@ const Collectors = require('../src/jre/java/util/stream/Collectors');
 const Stream = require('../src/jre/java/util/stream/Stream');
 const ActionEvent = require('../src/jre/java/awt/event/ActionEvent');
 const SoftReference = require('../src/jre/java/lang/ref/SoftReference');
+
+function completedConsumerImage(width, height, pixels) {
+  const image = {type: 'java/awt/Image'};
+  const consumer = {type: 'java/awt/image/ImageConsumer', _image: image};
+  ImageConsumer.methods['setDimensions(II)V'](
+    null, consumer, [width, height]);
+  ImageConsumer.methods[
+    'setPixels(IIIILjava/awt/image/ColorModel;[III)V'
+  ](null, consumer, [0, 0, width, height, null, pixels, 0, width]);
+  ImageConsumer.methods['imageComplete(I)V'](null, consumer, [2]);
+  return image;
+}
 
 test('SoftReference retains, returns, and clears its referent', (t) => {
   const reference = {};
@@ -1098,6 +1113,63 @@ test('Toolkit decodes JPEG dimensions and pixels', (t) => {
   t.end();
 });
 
+test('guest ImageProducer callbacks populate a browser AWT image', async (t) => {
+  if (!JAVAC_AVAILABLE) {
+    t.skip('javac is unavailable');
+    t.end();
+    return;
+  }
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(),
+    'jvm-awt-image-producer-'));
+  t.teardown(() => fs.rmSync(directory, {recursive: true, force: true}));
+  compileHarness(directory, 'ImageProducerHarness.java', `
+import java.awt.Canvas;
+import java.awt.Image;
+import java.awt.image.ColorModel;
+import java.awt.image.ImageConsumer;
+import java.awt.image.ImageProducer;
+import java.awt.image.PixelGrabber;
+
+public final class ImageProducerHarness {
+  static int result;
+
+  private static final class Producer implements ImageProducer {
+    private ImageConsumer consumer;
+    public void addConsumer(ImageConsumer value) { consumer = value; }
+    public boolean isConsumer(ImageConsumer value) { return consumer == value; }
+    public void removeConsumer(ImageConsumer value) {
+      if (consumer == value) consumer = null;
+    }
+    public void requestTopDownLeftRightResend(ImageConsumer value) {
+      startProduction(value);
+    }
+    public void startProduction(ImageConsumer value) {
+      consumer = value;
+      value.setDimensions(2, 1);
+      value.setPixels(0, 0, 2, 1, ColorModel.getRGBdefault(),
+        new int[] {0x00112233, 0x00aabbcc}, 0, 2);
+      value.imageComplete(ImageConsumer.SINGLEFRAMEDONE);
+    }
+  }
+
+  public static void main(String[] args) throws Exception {
+    Image image = new Canvas().createImage(new Producer());
+    int[] pixels = new int[2];
+    boolean complete = new PixelGrabber(
+      image, 0, 0, 2, 1, pixels, 0, 2).grabPixels();
+    result = complete && image.getWidth(null) == 2 &&
+      image.getHeight(null) == 1 && pixels[0] == 0x00112233 &&
+      pixels[1] == 0x00aabbcc ? 1 : 0;
+  }
+}
+`);
+  const jvm = new JVM({classpath: directory, jit: {enabled: false}});
+  await jvm.run('ImageProducerHarness');
+  t.equal(jvm.classes.ImageProducerHarness.staticFields.get('result:I'), 1,
+    'createImage runs the guest producer and exposes its completed pixels');
+  t.end();
+});
+
 test('AWT producer blits coalesce dirty presentation on animation frames', (t) => {
   const previousRaf = global.requestAnimationFrame;
   const callbacks = [];
@@ -1122,9 +1194,7 @@ test('AWT producer blits coalesce dirty presentation on animation frames', (t) =
   const jvm = {};
   const graphics = { _component: target };
   const sourcePixels = [0x112233, 0xaabbcc];
-  const image = {
-    _producer: { width: 2, height: 1, pixels: sourcePixels },
-  };
+  const image = completedConsumerImage(2, 1, sourcePixels);
   const draw = Graphics.methods['drawImage(Ljava/awt/Image;IILjava/awt/image/ImageObserver;)Z'];
 
   t.equal(draw(jvm, graphics, [image, 0, 0, null]), 1,
@@ -1156,58 +1226,41 @@ test('AWT producer blits coalesce dirty presentation on animation frames', (t) =
   t.end();
 });
 
-test('AWT incremental presentation consumes exact raster mutation signals', (t) => {
-  const previousRaf = global.requestAnimationFrame;
-  const callbacks = [];
-  global.requestAnimationFrame = (callback) => {
-    callbacks.push(callback);
-    return callbacks.length;
-  };
-  const uploads = [];
-  const context = {
-    createImageData(width, height) {
-      return {width, height, data: new Uint8ClampedArray(width * height * 4)};
-    },
-    putImageData(image) {
-      uploads.push(Array.from(image.data));
+test('AWT producer images publish only completed consumer frames', (t) => {
+  const producer = {type: 'java/awt/image/MemoryImageSource'};
+  const sourcePixels = [0x112233, 0xaabbcc];
+  MemoryImageSource.methods['<init>(II[III)V'](
+    null, producer, [2, 1, sourcePixels, 0, 2]);
+  const jvm = {
+    _jreFindMethod(className, methodName, descriptor) {
+      if (className !== 'java/awt/image/MemoryImageSource') return null;
+      return MemoryImageSource.methods[`${methodName}${descriptor}`] || null;
     },
   };
-  const target = {
-    _width: 2,
-    _height: 1,
-    _canvasElement: {width: 2, height: 1, getContext: () => context},
-  };
-  const jvm = {awtIncrementalPresentation: true};
-  const pixels = [0x112233, 0xaabbcc];
-  const image = {_producer: {width: 2, height: 1, pixels}};
-  const graphics = {_component: target};
+  const image = Component.methods[
+    'createImage(Ljava/awt/image/ImageProducer;)Ljava/awt/Image;'
+  ](jvm, {}, [producer], null);
+  t.ok(producer.consumers.has(image._consumer),
+    'createImage registers a real ImageConsumer with the producer');
+  t.ok(image._frameComplete,
+    'SINGLEFRAMEDONE makes the first producer frame drawable');
+  t.deepEqual(Array.from(image._pixels), sourcePixels,
+    'setPixels snapshots the producer data into the image');
+
+  ImageConsumer.methods[
+    'setPixels(IIIILjava/awt/image/ColorModel;[III)V'
+  ](null, image._consumer, [0, 0, 1, 1, null, [0xffffff], 0, 1]);
+  t.notOk(image._frameComplete,
+    'a new pixel delivery cannot expose an unfinished frame');
   const draw = Graphics.methods[
     'drawImage(Ljava/awt/Image;IILjava/awt/image/ImageObserver;)Z'];
-
-  draw(jvm, graphics, [image, 0, 0, null]);
-  callbacks.shift()(0);
-  const tracker = pixels._jvmAwtRasterMutationTracker;
-  t.ok(tracker && !tracker.dirty,
-    'the completed producer frame installs a clean mutation tracker');
-  pixels[0] = 0xffffff;
-  tracker.dirty = true;
-  jvm._awtPresentIntermediate();
-  t.equal(callbacks.length, 0,
-    'an exact tracked mutation does not wait for an animation callback');
-  t.equal(uploads.length, 2,
-    'the stable intermediate framebuffer uploads at the JVM yield');
-  t.notOk(jvm._awtIncrementalPresentationPending,
-    'the immediate partial frame needs no presentation handoff');
-  t.ok(jvm._awtDirectPresentationPendingYield,
-    'the scheduler retains one host-paint yield after the direct upload');
-  t.equal(jvm._awtPresentationStats.incrementalDirectPresentations, 1,
-    'diagnostics distinguish exact direct intermediate uploads');
-  jvm._awtPresentIntermediate();
-  t.equal(callbacks.length, 0,
-    'a clean idle framebuffer does not invent another presentation');
-
-  if (previousRaf === undefined) delete global.requestAnimationFrame;
-  else global.requestAnimationFrame = previousRaf;
+  t.equal(draw(jvm, {_component: {_width: 2, _height: 1}},
+    [image, 0, 0, null]), 0,
+  'drawImage reports an incomplete producer image instead of publishing it');
+  ImageConsumer.methods['imageComplete(I)V'](
+    null, image._consumer, [2]);
+  t.ok(image._frameComplete,
+    'the next imageComplete callback makes the updated frame drawable');
   t.end();
 });
 
@@ -1234,9 +1287,8 @@ test('AWT presentation recovers when an animation callback is starved', (t) => {
   };
   const jvm = { eventLoopYieldMs: 16 };
   const graphics = { _component: target };
-  const image = {
-    _producer: { width: 2, height: 1, pixels: [0x112233, 0xaabbcc] },
-  };
+  const image = completedConsumerImage(
+    2, 1, [0x112233, 0xaabbcc]);
   const draw = Graphics.methods[
     'drawImage(Ljava/awt/Image;IILjava/awt/image/ImageObserver;)Z'
   ];
@@ -1269,9 +1321,8 @@ test('headless AWT blits expose an uncapped coalesced presentation boundary', (t
   const target = { _width: 2, _height: 1 };
   const jvm = {};
   const graphics = { _component: target };
-  const image = {
-    _producer: { width: 2, height: 1, pixels: [0x112233, 0xaabbcc] },
-  };
+  const image = completedConsumerImage(
+    2, 1, [0x112233, 0xaabbcc]);
   const draw = Graphics.methods[
     'drawImage(Ljava/awt/Image;IILjava/awt/image/ImageObserver;)Z'
   ];
@@ -1330,7 +1381,7 @@ test('AWT full-frame presentation uses exact Wasm RGB swizzle', (t) => {
   };
   const jvm = {};
   const graphics = { _component: target };
-  const image = { _producer: { width, height, pixels: sourcePixels } };
+  const image = completedConsumerImage(width, height, sourcePixels);
   const draw = Graphics.methods['drawImage(Ljava/awt/Image;IILjava/awt/image/ImageObserver;)Z'];
 
   t.equal(draw(jvm, graphics, [image, 0, 0, null]), 1);
@@ -1386,7 +1437,7 @@ test('AWT plain-array presentation avoids allocating Wasm staging copies', (t) =
   };
   const jvm = {};
   const graphics = {_component: target};
-  const image = {_producer: {width, height, pixels: sourcePixels}};
+  const image = completedConsumerImage(width, height, sourcePixels);
   const draw = Graphics.methods[
     'drawImage(Ljava/awt/Image;IILjava/awt/image/ImageObserver;)Z'];
 

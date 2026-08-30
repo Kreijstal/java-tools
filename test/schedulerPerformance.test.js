@@ -73,15 +73,8 @@ test('dropped guest frames convert a scheduler yield into a paint opportunity',
     t.equal(painting._hostYieldStrategy(), 'presentation',
       'a painting host parks the guest until the pending frame is presented');
     painting._awtDroppedFrameBacklog = 0;
-    painting._awtIncrementalPresentationPending = true;
-    t.equal(painting._hostYieldStrategy(), 'presentation',
-      'an exact partial-frame signal also waits for its scheduled paint');
-    painting._awtIncrementalPresentationPending = false;
-    painting._awtDirectPresentationPendingYield = true;
-    t.equal(painting._hostYieldStrategy(), 'timer',
-      'an exact direct upload receives one browser-paint task boundary');
-    t.notOk(painting._awtDirectPresentationPendingYield,
-      'the direct-upload task boundary is consumed once');
+    t.equal(painting._hostYieldStrategy(), 'message-channel',
+      'no completed frame means there is no synthetic presentation wait');
     if (previousRaf === undefined) delete global.requestAnimationFrame;
     else global.requestAnimationFrame = previousRaf;
     if (previousDocument === undefined) delete global.document;

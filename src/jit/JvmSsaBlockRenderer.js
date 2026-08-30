@@ -1231,9 +1231,6 @@ class JvmSsaBlockRenderer {
             if (capture.className) directStaticOwners.add(capture.className);
           }
         }
-        const directFused = directJre || !isStatic || inline || directIntrinsic ||
-          directCheckedLeaf
-          ? null : this.jit.fusedRegions.getCompileTimeDirectCall(instruction);
         const callSiteId = directJre || inline || directIntrinsic
           ? null : this.jit.registerSyncCallSite(
             op, instruction, method, index);
@@ -1256,7 +1253,6 @@ class JvmSsaBlockRenderer {
           directIntrinsic,
           directCheckedLeaf,
           checkedLeafCaptureCacheId,
-          directFused,
           selfRecursive,
           identifiers: {
             site: positionalCallSiteVariable(index),
@@ -1272,7 +1268,7 @@ class JvmSsaBlockRenderer {
           },
         });
         if (callSiteId !== null && targetCannotOverride &&
-            resolvedCallMethod && !directCheckedLeaf && !directFused) {
+            resolvedCallMethod && !directCheckedLeaf) {
           this.jit.primeMonomorphicSyncCallSite(
             callSiteId, resolvedCallMethod, callOwner);
         }
@@ -3823,14 +3819,6 @@ class JvmSsaBlockRenderer {
               );
               if (deferred) lines.push(`/*${deferred.marker}:end*/`);
             }
-            if (op === "iastore") {
-              // Remember a store only after its checked write completed. A
-              // later scheduler handoff can then publish the live AWT surface
-              // without racing the presenter ahead of guest effects. Keeping
-              // this as a scalar assignment avoids a host-helper call on each
-              // pixel; the tracker lookup remains batched at actual yields.
-              lines.push("awtRasterMutationObserved = true;");
-            }
           }
         } else if (op === "newarray") {
           const countInput = pop();
@@ -4230,224 +4218,6 @@ class JvmSsaBlockRenderer {
               lines.push(`try { helpers.primitiveArrayCopyDirect(${args.join(", ")}); } catch (${caught}) {`,
                 ...materializeLines(callStack, index).map((line) => `  ${line}`),
                 `  throw ${caught};`, "}");
-            }
-          } else if (site.directIntrinsic?.kind === "clippedStaticSpan" &&
-              site.directIntrinsic.paramCount === 4 && site.directIntrinsic.returnsVoid &&
-              site.directIntrinsic.staticFieldSites?.length === 6) {
-            const callStack = [...stack];
-            const args = new Array(4);
-            for (let argument = args.length - 1; argument >= 0; argument -= 1) {
-              args[argument] = pop();
-              if (args[argument] === null) valid = false;
-            }
-            if (valid) {
-              const result = value(), caught = value();
-              const fields = site.directIntrinsic.staticFieldSites.join(", ");
-              lines.push(`let ${result};`,
-                `try { ${result} = helpers.clippedStaticSpanDirectAt(${args.join(", ")}, ${fields}); } catch (${caught}) {`,
-                ...materializeLines(callStack, index).map((line) => `  ${line}`),
-                `  throw ${caught};`, "}",
-                `if (${result} === helpers.staticDeopt()) {`,
-                ...materializeLines(callStack, index).map((line) => `  ${line}`),
-                "  helpers.skipJitOnce(frame);",
-                "  return { deopt: true, transient: true, reason: 'class initialization in direct structured span' };", "}");
-            }
-          } else if (site.directIntrinsic?.kind === "clippedStaticAlphaSpan" &&
-              site.directIntrinsic.paramCount === 5 && site.directIntrinsic.returnsVoid &&
-              site.directIntrinsic.staticFieldSites?.length === 6) {
-            const callStack = [...stack];
-            const args = new Array(5);
-            for (let argument = args.length - 1; argument >= 0; argument -= 1) {
-              args[argument] = pop();
-              if (args[argument] === null) valid = false;
-            }
-            if (valid) {
-              const result = value(), caught = value();
-              const fields = site.directIntrinsic.staticFieldSites.join(", ");
-              lines.push(`let ${result};`,
-                `try { ${result} = helpers.clippedStaticAlphaSpanDirectAt(${args.join(", ")}, ${fields}); } catch (${caught}) {`,
-                ...materializeLines(callStack, index).map((line) => `  ${line}`),
-                `  throw ${caught};`, "}",
-                `if (${result} === helpers.staticDeopt()) {`,
-                ...materializeLines(callStack, index).map((line) => `  ${line}`),
-                "  helpers.skipJitOnce(frame);",
-                "  return { deopt: true, transient: true, reason: 'class initialization in direct structured alpha span' };", "}");
-            }
-          } else if (site.directIntrinsic?.kind === "clippedStaticGradient" &&
-              site.directIntrinsic.paramCount === 6 && site.directIntrinsic.returnsVoid &&
-              site.directIntrinsic.staticFieldSites?.length === 6) {
-            const callStack = [...stack];
-            const args = new Array(6);
-            for (let argument = args.length - 1; argument >= 0; argument -= 1) {
-              args[argument] = pop();
-              if (args[argument] === null) valid = false;
-            }
-            if (valid) {
-              const result = value(), caught = value();
-              const fields = site.directIntrinsic.staticFieldSites.join(", ");
-              lines.push(`let ${result};`,
-                `try { ${result} = helpers.clippedStaticGradientDirectAt(${args.join(", ")}, ${fields}); } catch (${caught}) {`,
-                ...materializeLines(callStack, index).map((line) => `  ${line}`),
-                `  throw ${caught};`, "}",
-                `if (${result} === helpers.staticDeopt()) {`,
-                ...materializeLines(callStack, index).map((line) => `  ${line}`),
-                "  helpers.skipJitOnce(frame);",
-                "  return { deopt: true, transient: true, reason: 'class initialization in direct structured gradient' };", "}");
-            }
-          } else if (site.directIntrinsic?.kind === "maskedColorBlit" &&
-              site.directIntrinsic.paramCount === 9 && site.directIntrinsic.returnsVoid) {
-            const callStack = [...stack];
-            const args = new Array(9);
-            for (let argument = args.length - 1; argument >= 0; argument -= 1) {
-              args[argument] = pop();
-              if (args[argument] === null) valid = false;
-            }
-            if (valid) {
-              const caught = value();
-              lines.push(`try { helpers.maskedColorBlitDirect(${args.join(", ")}); } catch (${caught}) {`,
-                ...materializeLines(callStack, index).map((line) => `  ${line}`),
-                `  throw ${caught};`, "}");
-            }
-          } else if (site.directIntrinsic?.kind === "alphaMaskedColorBlit" &&
-              site.directIntrinsic.paramCount === 10 &&
-              site.directIntrinsic.returnsVoid) {
-            const callStack = [...stack];
-            const args = new Array(10);
-            for (let argument = args.length - 1; argument >= 0; argument -= 1) {
-              args[argument] = pop();
-              if (args[argument] === null) valid = false;
-            }
-            if (valid) {
-              const caught = value();
-              if (site.directIntrinsic.initializationOwner) {
-                lines.push(`if (helpers.jvm.classInitializationState.get(${
-                  JSON.stringify(site.directIntrinsic.initializationOwner)
-                }) !== "INITIALIZED") {`,
-                ...materializeLines(callStack, index).map((line) => `  ${line}`),
-                "  helpers.skipJitOnce(frame);",
-                "  return { deopt: true, transient: true, reason: 'class initialization in direct alpha-masked blit' };",
-                "}");
-              }
-              lines.push(`try { helpers.alphaMaskedColorBlitDirect(${args.join(", ")}); } catch (${caught}) {`,
-                ...materializeLines(callStack, index).map((line) => `  ${line}`),
-                `  throw ${caught};`, "}");
-            }
-          } else if (site.directIntrinsic?.kind === "transparentIntBlit" &&
-              site.directIntrinsic.paramCount === 9 &&
-              site.directIntrinsic.returnsVoid) {
-            const callStack = [...stack];
-            const args = new Array(9);
-            for (let argument = args.length - 1; argument >= 0; argument -= 1) {
-              args[argument] = pop();
-              if (args[argument] === null) valid = false;
-            }
-            if (valid) {
-              const caught = value();
-              if (site.directIntrinsic.initializationOwner) {
-                lines.push(`if (helpers.jvm.classInitializationState.get(${
-                  JSON.stringify(site.directIntrinsic.initializationOwner)
-                }) !== "INITIALIZED") {`,
-                ...materializeLines(callStack, index).map((line) => `  ${line}`),
-                "  helpers.skipJitOnce(frame);",
-                "  return { deopt: true, transient: true, reason: 'class initialization in direct transparent int blit' };",
-                "}");
-              }
-              lines.push(`try { helpers.transparentIntBlitDirect(${args.join(", ")}); } catch (${caught}) {`,
-                ...materializeLines(callStack, index).map((line) => `  ${line}`),
-                `  throw ${caught};`, "}");
-            }
-          } else if (!site.selfRecursive && site.directFused &&
-              site.directFused.returnsVoid &&
-              site.directFused.paramCount === site.argumentCount) {
-            const callStack = [...stack];
-            const args = new Array(site.argumentCount);
-            for (let argument = args.length - 1; argument >= 0; argument -= 1) {
-              args[argument] = pop();
-              if (args[argument] === null) valid = false;
-            }
-            if (valid) {
-              const handled = value(), out = value(), caught = value();
-              const callStackDepth = value();
-              const deferMaterialization = this.deferredCallMaterializationEnabled;
-              const asynchronousFallbackMarker =
-                `__JVM_ASYNC_FUSED_FALLBACK_${index}_${site.id}__`;
-              continuationFallbacks.set(asynchronousFallbackMarker, {
-                continuation: [
-                  ...materializeLines(callStack, index).map((line) => `  ${line}`),
-                  "  helpers.skipJitOnce(frame);",
-                  `  yield { deopt: true, transient: true, structuredResumePc: ${
-                    index + 1
-                  }, reason: 'asynchronous structured SSA callee' };`,
-                ],
-                ordinary: [
-                  ...materializeLines(callStack, index).map((line) => `  ${line}`),
-                  "  helpers.skipJitOnce(frame);",
-                  "  return { deopt: true, transient: true, reason: 'asynchronous structured SSA callee' };",
-                ],
-              });
-              const deoptFallbackMarker =
-                `__JVM_DEOPT_FUSED_FALLBACK_${index}_${site.id}__`;
-              continuationFallbacks.set(deoptFallbackMarker, {
-                continuation: [
-                  ...(deferMaterialization
-                    ? materializeLines(stack, index + 1).map((line) => `  ${line}`)
-                    : []),
-                  `  ${out}.structuredResumePc = ${index + 1};`,
-                  `  yield ${out};`,
-                ],
-                ordinary: [
-                  ...(deferMaterialization
-                    ? materializeLines(stack, index + 1).map((line) => `  ${line}`)
-                    : []),
-                  `  return ${out};`,
-                ],
-              });
-              const yieldedFallbackMarker =
-                `__JVM_YIELDED_FUSED_FALLBACK_${index}_${site.id}__`;
-              continuationFallbacks.set(yieldedFallbackMarker, {
-                continuation: [
-                  ...materializeLines(stack, index + 1).map((line) => `  ${line}`),
-                  `  yield { deopt: true, transient: true, structuredResumePc: ${
-                    index + 1
-                  }, reason: 'thread yielded in structured SSA callee' };`,
-                ],
-                ordinary: [
-                  ...materializeLines(stack, index + 1).map((line) => `  ${line}`),
-                  "  return { deopt: true, transient: true, reason: 'thread yielded in structured SSA callee' };",
-                ],
-              });
-              const fallbackLines = [
-                ...(deferMaterialization
-                  ? stageOperandLines(callStack) : materializeLines(callStack, index + 1)),
-                `let ${out};`,
-                `const ${callStackDepth} = thread.callStack.items.length;`,
-                `try { ${out} = helpers.tryInvokeSyncAt(${site.id}, frame, thread); } catch (${caught}) {`,
-                ...materializeCallExceptionLines(
-                  callStack, stack, index, callStackDepth)
-                  .map((line) => `  ${line}`),
-                `  throw ${caught};`, "}",
-                `if (${out} === helpers.asyncInvokeSentinel()) {`,
-                asynchronousFallbackMarker, "}",
-                `if (${out} && ${out}.deopt) {`,
-                `  if (thread.callStack.items.length <= ${callStackDepth}) {`,
-                ...materializeLines(callStack, index).map((line) => `    ${line}`),
-                "    helpers.skipJitOnce(frame);",
-                `    return ${out};`,
-                "  }",
-                `  helpers.linkStructuredCallChild(frame, thread, ${
-                  callStackDepth}, ${JSON.stringify(site.returnType)});`,
-                deoptFallbackMarker, "}",
-                "if (thread.status !== 'runnable') {",
-                yieldedFallbackMarker, "}",
-              ];
-              lines.push(`let ${handled};`,
-                `try { ${handled} = helpers.fusedRegions.tryInvokeDirectAt(${site.directFused.id}, frame, thread, ${args.join(", ")}); } catch (${caught}) {`,
-                ...materializeLines(callStack, index).map((line) => `  ${line}`),
-                `  throw ${caught};`, "}",
-                `if (!${handled}) {`,
-                ...fallbackLines.map((line) => `  ${line}`),
-                "}");
-              if (deferMaterialization) deferredCallMaterializationCount += 1;
             }
           } else {
             const callStack = [...stack];
@@ -8868,8 +8638,6 @@ class JvmSsaBlockRenderer {
       }
       return output;
     };
-    const awtRasterCompletionMarker = "__JVM_AWT_RASTER_COMPLETION__";
-    const awtRasterSafePointMarker = "__JVM_AWT_RASTER_SAFE_POINT__";
     const render = (
       node, continuationMode = useContinuations, directPositional = false,
       loopSafePointBudget = safePointInitialBudget,
@@ -8909,9 +8677,6 @@ class JvmSsaBlockRenderer {
         const lines = expandLines(specializeDeferredStaticArrayAccessLines(
           plan.lines, directPositional && rangeBailout));
         if (plan.returnKind && plan.returnKind !== "throw") {
-          if (hasReachableIntArrayStore) {
-            lines.push(awtRasterCompletionMarker);
-          }
           if (directPositional) {
             lines.push(plan.returnKind === "void"
               ? "return helpers.returnVoid();"
@@ -9077,8 +8842,6 @@ class JvmSsaBlockRenderer {
           // restoration in the node, but charge/yield at the root boundary.
           `if (${directPositional ? "nestedEntryGuarded === 2 || " : ""}helpers.continueStructuredQuantum(thread)) { safePointBudget = ${currentLoopSafePointBudget}; } else {`,
           ...indent([
-            ...(hasReachableIntArrayStore
-              ? [awtRasterSafePointMarker] : []),
             "spillLocals();",
             ...restoreLines,
             "helpers.structuredSsa.safePointCount += 1;",
@@ -9840,44 +9603,6 @@ class JvmSsaBlockRenderer {
         renderedTreeSource.includes(entryArrayDataVariable(slot)))
       .map((slot) =>
         `const ${entryArrayDataVariable(slot)} = helpers.arrayData(local${slot});`);
-    // Signal a tracked AWT surface only after this generated method finishes.
-    // Signalling at entry lets the presenter race ahead of the stores and turns
-    // one render call into a stale partial frame plus an avoidable rAF wait.
-    // The helper ignores ordinary int arrays, while the structural iastore gate
-    // keeps non-raster generated methods free of the extra completion work.
-    const completionAwtRasterMutationLines = hasReachableIntArrayStore
-      ? [
-        ...[...entryStaticReadCaches.values()]
-          .filter((cache) => cache.data)
-          .map((cache) =>
-            `helpers.markAwtRasterMutation(${cache.value}, ${cache.data});`),
-        ...[...entryArrayLocalSlots]
-          .filter((slot) => entryArrayDataDeclarations.some((line) =>
-            line.includes(` ${entryArrayDataVariable(slot)} =`)))
-          .map((slot) =>
-            `helpers.markAwtRasterMutation(local${slot}, ${
-              entryArrayDataVariable(slot)});`),
-      ] : [];
-    const expandAwtRasterCompletionLines = (lines) => lines.flatMap((line) => {
-      const marker = new RegExp(`^(\\s*)${awtRasterCompletionMarker}$`).exec(line);
-      if (marker) {
-        return completionAwtRasterMutationLines.map((completionLine) =>
-          `${marker[1]}${completionLine}`);
-      }
-      const safePoint = new RegExp(`^(\\s*)${awtRasterSafePointMarker}$`).exec(line);
-      if (!safePoint) return [line];
-      if (!completionAwtRasterMutationLines.length) return [];
-      return [
-        `${safePoint[1]}if (awtRasterMutationObserved) {`,
-        ...completionAwtRasterMutationLines.map((completionLine) =>
-          `${safePoint[1]}  ${completionLine}`),
-        `${safePoint[1]}  awtRasterMutationObserved = false;`,
-        `${safePoint[1]}}`,
-      ];
-    });
-    const awtRasterMutationObservedDeclaration = hasReachableIntArrayStore
-      ? "let awtRasterMutationObserved = false;" : null;
-    renderedTree = expandAwtRasterCompletionLines(renderedTree);
     const persistentStaticArrayDataDeclarations =
       [...persistentStaticArrayLocalViews.values(),
         ...persistentProducedArrayLocalViews.values()].map((view) =>
@@ -10742,7 +10467,6 @@ class JvmSsaBlockRenderer {
       this.runCountersEnabled
         ? "helpers.structuredSsa.runCount += 1;" : null,
       `let safePointBudget = ${entrySafePointBudget};`,
-      awtRasterMutationObservedDeclaration,
       ...declaredLocals.map((i) => {
         const initial = entryLocalInitialValues.has(i)
           ? entryLocalInitialValues.get(i) : `locals[${i}]`;
@@ -10868,8 +10592,7 @@ class JvmSsaBlockRenderer {
             "return helpers.asyncInvokeSentinel(); }"
           : null;
         const directRenderedTree = expandContinuationFallbacks(
-          expandAwtRasterCompletionLines(
-            render(structured.tree, false, true)), false);
+          render(structured.tree, false, true), false);
         if (directPositionalEligible) {
           directPositionalSource = specializeSelfRecursiveCalls([
             "'use strict';",
@@ -10888,7 +10611,6 @@ class JvmSsaBlockRenderer {
             `let safePointBudget = ${regionCallGraphCandidate
               ? this.jit.hotCallGraphRegions.directSafePointBudget
               : safePointInitialBudget};`,
-            awtRasterMutationObservedDeclaration,
             ...declaredLocals.map((index) =>
               `${immutableEntryLocals.has(index) ? "const" : "let"} local${index} = ${
                 entryLocalInitialValues.has(index)
@@ -10914,7 +10636,6 @@ class JvmSsaBlockRenderer {
               ? this.jit.hotCallGraphRegions.directSafePointBudget
               : safePointInitialBudget};`
             : null,
-          awtRasterMutationObservedDeclaration,
           ...declaredLocals.map((index) =>
             `${immutableEntryLocals.has(index) ? "const" : "let"} local${index} = ${
               entryLocalInitialValues.has(index)
@@ -11056,9 +10777,8 @@ class JvmSsaBlockRenderer {
           "plan.restoreFrame(thread, frame, restorationDepth);",
         ];
         const restoringRendered = expandContinuationFallbacks(
-          expandAwtRasterCompletionLines(
-            render(structured.tree, false, true,
-              restoringDirectSafePointBudget, false, true)), false);
+          render(structured.tree, false, true,
+            restoringDirectSafePointBudget, false, true), false);
         restoringSpillCallCount = restoringRendered.reduce(
           (count, line) => count +
             (/spillLocals\(\);$/.test(line) ||
@@ -11271,7 +10991,6 @@ class JvmSsaBlockRenderer {
                 "helpers.structuredSsa.restoringDirectRunCount += 1;"
               : "helpers.structuredSsa.restoringDirectRunCount += 1;" : null,
           `let safePointBudget = ${restoringDirectSafePointBudget};`,
-          awtRasterMutationObservedDeclaration,
           ...declaredLocals.map((index) =>
             `${immutableEntryLocals.has(index) ? "const" : "let"} local${index} = ${
               entryLocalInitialValues.has(index)
@@ -11619,10 +11338,6 @@ class JvmSsaBlockRenderer {
           let checkedLeafRenderedTree = render(
             structured.tree, false, true,
             restoringDirectSafePointBudget, true, true);
-          checkedLeafRenderedTree = recursiveArrayPartitionLeaf
-            ? checkedLeafRenderedTree.filter((line) =>
-              line.trim() !== awtRasterCompletionMarker)
-            : expandAwtRasterCompletionLines(checkedLeafRenderedTree);
           if (shrinkingArrayWindowLeaf) {
             const guard = shrinkingArrayWindowLeaf.variable;
             checkedLeafRenderedTree = checkedLeafRenderedTree.map((line) => {
@@ -11846,7 +11561,6 @@ class JvmSsaBlockRenderer {
           };
           if (recursiveArrayPartitionLeaf) {
             let workerBody = compactCheckedLeafEntryLocals([
-              awtRasterMutationObservedDeclaration,
               ...declaredLocals.map((index) =>
                 `${immutableEntryLocals.has(index) ? "const" : "let"} local${index} = ${
                   entryLocalInitialValues.has(index)
@@ -11934,7 +11648,6 @@ class JvmSsaBlockRenderer {
                   ? [] : [
                   `let safePointBudget = ${restoringDirectSafePointBudget};`,
                 ]),
-                awtRasterMutationObservedDeclaration,
                 ...declaredLocals.map((index) =>
                   `${immutableEntryLocals.has(index) ? "const" : "let"} local${index} = ${
                     entryLocalInitialValues.has(index)
@@ -12148,7 +11861,6 @@ class JvmSsaBlockRenderer {
                   ? [] : [
                   `let safePointBudget = ${restoringDirectSafePointBudget};`,
                 ]),
-                awtRasterMutationObservedDeclaration,
                 ...declaredLocals.map((index) =>
                   `${immutableEntryLocals.has(index) ? "const" : "let"} local${index} = ${
                     entryLocalInitialValues.has(index)
@@ -12222,9 +11934,8 @@ class JvmSsaBlockRenderer {
         ordinaryAdaptive = compiledCallChain || ordinaryAdaptiveCanonical;
         const adaptiveBody = buildBody(
           expandContinuationFallbacks(
-            expandAwtRasterCompletionLines(
-              render(structured.tree, !ordinaryAdaptive, false,
-                adaptiveSafePointBudget)),
+            render(structured.tree, !ordinaryAdaptive, false,
+              adaptiveSafePointBudget),
             !ordinaryAdaptive),
           adaptiveSafePointBudget,
         );
@@ -12506,7 +12217,7 @@ class JvmSsaBlockRenderer {
           exactTarget: site.exactTarget,
           dynamic: site.dynamic,
           directBoundary: Boolean(site.directJre || site.inline ||
-            site.directIntrinsic || site.directCheckedLeaf || site.directFused),
+            site.directIntrinsic || site.directCheckedLeaf),
           directFieldWriteKeys:
             Array.isArray(site.directJre?.fieldWriteKeys)
               ? [...site.directJre.fieldWriteKeys] : null,

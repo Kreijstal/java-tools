@@ -2,6 +2,47 @@
 const awtFramework = require('../../../platform/awt.js');
 const browserInput = require('../../../platform/browser-awt-input.js');
 
+function loadedGuestMethod(jvm, className, name, descriptor) {
+  let current = className;
+  while (current) {
+    const classData = jvm.classes && jvm.classes[current];
+    if (!classData) return null;
+    const method = jvm.findMethod(classData, name, descriptor);
+    if (method) return {method, className: current};
+    current = classData.ast?.classes?.[0]?.superClassName || null;
+  }
+  return null;
+}
+
+function startImageProduction(jvm, image, thread) {
+  const producer = image && image._producer;
+  if (!producer || image._productionStarted) return;
+  image._productionStarted = true;
+
+  const consumer = image._consumer;
+  const producerClass = producer._className || producer.type;
+  const descriptor = '(Ljava/awt/image/ImageConsumer;)V';
+  const native = producerClass && jvm._jreFindMethod(
+    producerClass, 'startProduction', descriptor);
+  if (native) {
+    native(jvm, producer, [consumer], thread);
+    return;
+  }
+
+  const target = producerClass && loadedGuestMethod(
+    jvm, producerClass, 'startProduction', descriptor);
+  if (!target || !thread?.callStack) {
+    image._productionStarted = false;
+    return;
+  }
+  const Frame = require('../../../core/frame');
+  const frame = new Frame(target.method);
+  frame.className = target.className;
+  frame.locals[0] = producer;
+  frame.locals[1] = consumer;
+  thread.callStack.push(frame);
+}
+
 module.exports = {
   super: 'java/lang/Object',
   interfaces: ['java/awt/image/ImageObserver'],
@@ -347,16 +388,20 @@ module.exports = {
 
     'getTreeLock()Ljava/lang/Object;': (jvm, obj) => obj._treeLock || obj,
 
-    'createImage(Ljava/awt/image/ImageProducer;)Ljava/awt/Image;': (jvm, obj, args) => {
-      // The game's own ImageProducer holds the live int[] framebuffer in one of
-      // its fields and pushes it via ImageConsumer.setPixels. Keep a reference
-      // so drawImage can materialise the current framebuffer on demand (see
-      // Graphics.drawImage / materializeProducerImage).
-      return { type: 'java/awt/Image', _producer: args[0] };
+    'createImage(Ljava/awt/image/ImageProducer;)Ljava/awt/Image;': (jvm, obj, args, thread) => {
+      const image = {type: 'java/awt/Image', _producer: args[0]};
+      image._consumer = {
+        type: 'java/awt/image/ImageConsumer',
+        _image: image,
+      };
+      startImageProduction(jvm, image, thread);
+      return image;
     },
 
-    'prepareImage(Ljava/awt/Image;Ljava/awt/image/ImageObserver;)Z': (jvm, obj, args) => {
-      return 1;
+    'prepareImage(Ljava/awt/Image;Ljava/awt/image/ImageObserver;)Z': (jvm, obj, args, thread) => {
+      const image = args[0];
+      startImageProduction(jvm, image, thread);
+      return image && image._frameComplete ? 1 : 0;
     },
 
     'imageUpdate(Ljava/awt/Image;IIIII)Z': (jvm, obj, args) => {
