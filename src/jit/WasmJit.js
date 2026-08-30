@@ -2540,18 +2540,14 @@ class WasmJit {
       st.entries += 1;
       // A deferral that named its blockers (reference-return dependency)
       // is retried only once one of them actually moved; any other epoch
-      // bump cannot change its outcome. Retrying on every bump made a
-      // reference-returning getter called from everywhere recompile on its
-      // next call after each successful compile elsewhere (GeoBlox
-      // ua.c()Lgd;: 12,527 identical failures, ~30 s of the START GAME
-      // stall on Firefox).
+      // bump cannot change its outcome. Retrying on every bump can make a
+      // widely used reference-returning getter recompile after every
+      // successful compile elsewhere.
       // A deferred module retries immediately once a named blocker moved;
       // otherwise only after a geometrically growing number of epochs (a
       // compile elsewhere may help, but not every one of them), and failing
-      // that after the entry backoff. Retrying on every epoch bump made a
-      // hot method that keeps failing rebuild once per module compiled
-      // during a transition (GeoBlox START GAME: ua.c()Lgd; 12,527 identical
-      // failures, kc.b(I)V 11 x 350 ms).
+      // that after the entry backoff. Retrying on every epoch bump can make a
+      // hot method that keeps failing rebuild once per newly compiled module.
       const blockersResolved = st.deferredEpoch !== undefined &&
         st.deferredBlockerSig !== undefined && st.blockers && st.blockers.length &&
         this.blockersResolved(st.blockers, st.deferredBlockerSig);
@@ -3032,8 +3028,7 @@ class WasmJit {
           // Name what has to change before a retry could compile a loop:
           // when every demotion in both modules is a deferrable dependency,
           // the entry gate waits for exactly those blockers instead of
-          // retrying after every unrelated compile (kc.b(I)V: 11 identical
-          // 350 ms failures inside one GeoBlox START GAME).
+          // retrying after every unrelated compile.
           const loopReasons = [];
           const loopBlockers = new Set();
           for (const m of [meta, structuredMeta]) {
@@ -3170,8 +3165,7 @@ class WasmJit {
         // or — when nothing is named — after an exponentially growing number
         // of epochs. Re-arming on every epoch bump made a callee referenced
         // from many sites recompile once per site per successful compile
-        // anywhere (measured: ua.c()Lgd; 12,527 identical failures, 30 s of
-        // the GeoBlox START GAME stall on Firefox).
+        // anywhere, producing a large retry storm.
         st.calleeDeferredEpoch = this.compileEpoch;
         const calleeBlockers = blockedNames(err);
         if (calleeBlockers.length) {
