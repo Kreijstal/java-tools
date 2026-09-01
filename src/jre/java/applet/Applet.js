@@ -165,10 +165,11 @@ module.exports = {
     'repaint()V': async (jvm, obj, args) => {
       // Trigger a repaint
       if (obj._awtComponent) {
-        const graphics = obj._awtComponent.getGraphics();
+        const graphics = jvm?.awtWebGlPresentation && obj._canvasElement
+          ? true : obj._awtComponent.getGraphics();
         if (graphics) {
           // Clear the canvas first
-          if (obj._canvasElement) {
+          if (obj._canvasElement && !jvm?.awtWebGlPresentation) {
             const ctx = obj._canvasElement.getContext('2d');
             if (ctx) {
               ctx.clearRect(0, 0, obj._canvasElement.width, obj._canvasElement.height);

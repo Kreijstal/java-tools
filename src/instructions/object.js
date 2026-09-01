@@ -3,6 +3,7 @@ const {
 } = require('./utils');
 const {
   newFields, loadHierarchy, makeObjectRef, hasField, enumerateFieldKeys,
+  readField, writeField,
 } = require('../core/objectModel');
 
 // Guest-object fast path first. `objRef instanceof String` is only ever true
@@ -296,7 +297,7 @@ module.exports = {
     const fieldKey = resolveInstanceFieldKeyAtSite(
       jvm, objRef, instruction, className, fieldName,
     );
-    const value = fieldKey ? objRef.fields[fieldKey] : undefined;
+    const value = fieldKey ? readField(objRef.fields, fieldKey) : undefined;
     if (jvm._debugGetfield && jvm._debugGetfield === `${className}.${fieldName}`) {
       const locals = (frame.locals || []).slice(0, 5).map((l) => (l !== null && typeof l === 'object' ? `<${l.type}${l.__dbgId ? '#' + l.__dbgId : ''}>` : String(l))).join(' ');
       let rendered;
@@ -340,7 +341,7 @@ module.exports = {
       }
       console.error(`[putfield] ${className}#${objRef.__dbgId}.${fieldName}:${descriptor} = ${rendered}${by}`);
     }
-    objRef.fields[fieldKey] = value;
+    writeField(objRef.fields, fieldKey, value);
   },
 
   getstatic: async (frame, instruction, jvm, thread) => {

@@ -43,6 +43,112 @@ function instanceFieldTemplate(jvm, className) {
   return fields;
 }
 
+// Dense guest-field metadata lives on the storage array itself. Symbols keep
+// it out of guest enumeration, snapshots, and the Java array surface while
+// allowing reflection/Unsafe and the interpreter to resolve a JVM field key
+// without installing string-key accessors on Array.prototype (or on a custom
+// array prototype). The latter shape was measurably hostile to SpiderMonkey.
+const DENSE_FIELD_KEYS = Symbol('jvm.denseFieldKeys');
+const DENSE_FIELD_SLOTS = Symbol('jvm.denseFieldSlots');
+
+function computeDenseLayout(jvm, className) {
+  const chain = [];
+  let current = className;
+  while (current) {
+    // JRE superclass state is represented by wrapper expandos, exactly as in
+    // instanceFieldTemplate. An exact JRE class keeps its existing field map
+    // because native shims intentionally use named auxiliary entries there.
+    if (jvm.jre && jvm.jre[current]) {
+      if (current === className) return null;
+      break;
+    }
+    const classData = jvm.classes[current];
+    const classAst = classData?.ast?.classes?.[0];
+    if (!classAst) return null;
+    const declared = [];
+    for (const item of classAst.items || []) {
+      if (item?.type !== 'field' || isStaticField(item)) continue;
+      declared.push({
+        key: `${current}.${item.field.name}`,
+        descriptor: item.field.descriptor,
+      });
+    }
+    chain.unshift(declared);
+    current = classAst.superClassName || null;
+  }
+  const entries = chain.flat();
+  const keys = entries.map((entry) => entry.key);
+  const slots = new Map(keys.map((key, index) => [key, index]));
+  return { entries, keys, slots };
+}
+
+function denseLayoutFor(jvm, className) {
+  if (!jvm.denseInstanceFields) return null;
+  const classData = jvm.classes[className];
+  if (!classData || jvm.jre && jvm.jre[className]) return null;
+  const epoch = jvm.classEpoch || 0;
+  if (classData._denseFieldLayout !== undefined &&
+      classData._denseFieldLayoutEpoch === epoch) {
+    return classData._denseFieldLayout;
+  }
+  classData._denseFieldLayoutEpoch = epoch;
+  classData._denseFieldLayout = computeDenseLayout(jvm, className);
+  return classData._denseFieldLayout;
+}
+
+function makeDenseFields(layout) {
+  const fields = layout.entries.map((entry) =>
+    defaultForDescriptor(entry.descriptor));
+  Object.defineProperties(fields, {
+    [DENSE_FIELD_KEYS]: { value: layout.keys },
+    [DENSE_FIELD_SLOTS]: { value: layout.slots },
+  });
+  return fields;
+}
+
+// Resolve the numeric slot of a declared field. Superclass-first layout makes
+// this slot identical in the declaring class and every dense guest subclass.
+function denseSlotFor(jvm, owner, fieldName, descriptor) {
+  if (!jvm.denseInstanceFields) return null;
+  let current = owner;
+  while (current) {
+    const classData = jvm.classes[current];
+    const classAst = classData?.ast?.classes?.[0];
+    if (!classAst) return null;
+    const declared = (classAst.items || []).some((item) =>
+      item?.type === 'field' && !isStaticField(item) &&
+      item.field?.name === fieldName &&
+      (!descriptor || item.field?.descriptor === descriptor));
+    if (declared) {
+      const layout = denseLayoutFor(jvm, current);
+      const slot = layout?.slots.get(`${current}.${fieldName}`);
+      return Number.isInteger(slot) ? slot : null;
+    }
+    current = classAst.superClassName || null;
+  }
+  return null;
+}
+
+function denseFieldSlot(fields, key) {
+  if (!Array.isArray(fields)) return null;
+  const slot = fields[DENSE_FIELD_SLOTS]?.get(key);
+  return Number.isInteger(slot) ? slot : null;
+}
+
+function readField(fields, key) {
+  const slot = denseFieldSlot(fields, key);
+  return slot === null ? fields[key] : fields[slot];
+}
+
+function writeField(fields, key, value) {
+  const slot = denseFieldSlot(fields, key);
+  if (slot !== null && value === undefined) {
+    throw new Error(`Cannot store undefined in JVM instance field ${key}`);
+  }
+  fields[slot === null ? key : slot] = value;
+  return value;
+}
+
 // Load the superclass chain so instanceFieldTemplate sees all of it. Only the
 // async allocation paths (interpreter `new`, createAppletInstance) can do this;
 // the compiled paths gate on the class being INITIALIZED, which implies its
@@ -281,6 +387,7 @@ function makeSlabFields(jvm, layout) {
 // slab prototypes are consulted beyond own properties, so a plain field map
 // can never accidentally match an Object.prototype member.
 function hasField(fields, key) {
+  if (denseFieldSlot(fields, key) !== null) return true;
   if (Object.prototype.hasOwnProperty.call(fields, key)) return key !== BASE_KEY;
   const proto = Object.getPrototypeOf(fields);
   return !!(proto && proto._slabKeys &&
@@ -289,6 +396,9 @@ function hasField(fields, key) {
 
 // Every field key on `fields`, slab-backed and plain alike.
 function enumerateFieldKeys(fields) {
+  if (Array.isArray(fields) && fields[DENSE_FIELD_KEYS]) {
+    return [...fields[DENSE_FIELD_KEYS]];
+  }
   const own = Object.keys(fields).filter((k) => k !== BASE_KEY);
   const proto = Object.getPrototypeOf(fields);
   const slabKeys = proto && proto !== Object.prototype && proto._slabKeys;
@@ -298,6 +408,8 @@ function enumerateFieldKeys(fields) {
 // The field map for a fresh instance: slab-backed when the class is eligible,
 // otherwise the plain defaulted map. Every allocation site calls this.
 function newFields(jvm, className) {
+  const denseLayout = denseLayoutFor(jvm, className);
+  if (denseLayout) return makeDenseFields(denseLayout);
   const layout = slabLayoutFor(jvm, className);
   if (layout) {
     const fields = makeSlabFields(jvm, layout);
@@ -319,5 +431,13 @@ module.exports = {
   makeSlabFields,
   hasField,
   enumerateFieldKeys,
+  denseLayoutFor,
+  denseSlotFor,
+  denseFieldSlot,
+  readField,
+  writeField,
+  makeDenseFields,
+  DENSE_FIELD_KEYS,
+  DENSE_FIELD_SLOTS,
   BASE_KEY,
 };

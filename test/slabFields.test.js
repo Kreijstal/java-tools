@@ -10,6 +10,7 @@ const test = require('tape');
 const { WasmHeap } = require('../src/core/wasmHeap');
 const {
   newFields, slabLayoutFor, hasField, enumerateFieldKeys, instanceFieldTemplate,
+  denseLayoutFor, denseSlotFor, readField, writeField,
 } = require('../src/core/objectModel');
 
 function fieldItem(name, descriptor, flags = []) {
@@ -45,6 +46,42 @@ function fakeJvm({ wasmFields = true } = {}) {
     },
   };
 }
+
+test('dense guest fields use stable superclass-first numeric slots', (t) => {
+  const jvm = fakeJvm({ wasmFields: false });
+  jvm.denseInstanceFields = true;
+  const base = denseLayoutFor(jvm, 'Base');
+  const sub = denseLayoutFor(jvm, 'Sub');
+  t.ok(base && sub, 'both guest classes have a dense layout');
+  t.equal(denseSlotFor(jvm, 'Base', 'count', 'I'), 1,
+    'declaring class resolves its numeric slot');
+  t.equal(sub.slots.get('Base.count'), base.slots.get('Base.count'),
+    'inherited field keeps the same slot in a subclass');
+  t.deepEqual(sub.keys, [
+    'Base.flag', 'Base.count', 'Sub.pos', 'Sub.total', 'Sub.scale', 'Sub.name',
+  ], 'layout is superclass-first and excludes static fields');
+  t.end();
+});
+
+test('dense guest fields preserve keyed read, write, presence, and enumeration', (t) => {
+  const jvm = fakeJvm({ wasmFields: false });
+  jvm.denseInstanceFields = true;
+  const first = newFields(jvm, 'Sub');
+  const second = newFields(jvm, 'Sub');
+  t.ok(Array.isArray(first), 'storage is an ordinary dense array');
+  t.equal(readField(first, 'Base.count'), 0, 'primitive default is readable');
+  t.equal(readField(first, 'Sub.name'), null, 'reference default is readable');
+  writeField(first, 'Base.count', 42);
+  writeField(first, 'Sub.name', 'dense');
+  t.equal(readField(first, 'Base.count'), 42, 'inherited primitive round-trips');
+  t.equal(readField(first, 'Sub.name'), 'dense', 'reference round-trips');
+  t.equal(readField(second, 'Base.count'), 0, 'instances do not share slots');
+  t.ok(hasField(first, 'Sub.pos'), 'declared key is present');
+  t.notOk(hasField(first, 'Sub.shared'), 'static key is absent');
+  t.deepEqual(enumerateFieldKeys(first), denseLayoutFor(jvm, 'Sub').keys,
+    'enumeration exposes Java keys, not numeric storage indexes');
+  t.end();
+});
 
 test('slab layout covers primitive instance fields across the guest chain', (t) => {
   const jvm = fakeJvm();

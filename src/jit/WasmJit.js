@@ -64,6 +64,9 @@
 
 const { resolveInstanceFieldKey, runtimeClassName } = require('../instructions/object');
 const {
+  denseSlotFor, readField, writeField,
+} = require('../core/objectModel');
+const {
   addMathImport, addTimeImport, addNewArrayImport, addANewArrayImport,
   addNewImport, addTypedArrayStoreImports, arrayTracer,
   addI32ArrayLoadImports,
@@ -499,6 +502,7 @@ class MethodTranslator {
       };
     }
     const name = `${isGet ? 'gf' : 'pf'}_${className}_${fieldName}`.replace(/[^\w]/g, '_');
+    const denseSlot = denseSlotFor(jvm, className, fieldName, descriptor);
     const keyCache = new Map();
     // Almost every site is monomorphic; keep the last class's key one
     // identity compare away instead of a Map lookup per access.
@@ -523,7 +527,10 @@ class MethodTranslator {
         }
         const key = resolveKey(obj);
         const value = obj.fields
-          ? obj.fields[key]
+          ? Array.isArray(obj.fields)
+            ? Number.isInteger(denseSlot)
+              ? obj.fields[denseSlot] : readField(obj.fields, key)
+            : obj.fields[key]
           : (obj[key] ?? obj[fieldName]);
         return typeof value === 'boolean' ? (value ? 1 : 0) : value;
       }
@@ -533,15 +540,24 @@ class MethodTranslator {
             throw { type: 'java/lang/NullPointerException', message: null };
           }
           const key = resolveKey(obj);
-          return obj.fields ? obj.fields[key] : (obj[key] ?? obj[fieldName]);
+          return obj.fields
+            ? Array.isArray(obj.fields)
+              ? Number.isInteger(denseSlot)
+                ? obj.fields[denseSlot] : readField(obj.fields, key)
+              : obj.fields[key]
+            : (obj[key] ?? obj[fieldName]);
         }
         : (obj) => {
           if (obj === null || obj === undefined) {
             throw { type: 'java/lang/NullPointerException', message: null };
           }
           const key = resolveKey(obj);
-          return toWasmValue(t,
-            obj.fields ? obj.fields[key] : (obj[key] ?? obj[fieldName]));
+          return toWasmValue(t, obj.fields
+            ? Array.isArray(obj.fields)
+              ? Number.isInteger(denseSlot)
+                ? obj.fields[denseSlot] : readField(obj.fields, key)
+              : obj.fields[key]
+            : (obj[key] ?? obj[fieldName]));
         };
     return {
       t,
@@ -553,7 +569,19 @@ class MethodTranslator {
             throw { type: 'java/lang/NullPointerException', message: null };
           }
           const key = resolveKey(obj);
-          if (obj.fields) obj.fields[key] = v;
+          if (obj.fields) {
+            if (Number.isInteger(denseSlot) && Array.isArray(obj.fields)) {
+              if (v === undefined) {
+                throw new Error(`Cannot store undefined in JVM instance field ` +
+                  `${className}.${fieldName}`);
+              }
+              obj.fields[denseSlot] = v;
+            } else if (Array.isArray(obj.fields)) {
+              writeField(obj.fields, key, v);
+            } else {
+              obj.fields[key] = v;
+            }
+          }
           else if (Object.prototype.hasOwnProperty.call(obj, key)) obj[key] = v;
           else obj[fieldName] = v;
         }),
@@ -583,11 +611,8 @@ class MethodTranslator {
     const calleeSt = this.wasmJit &&
       this.wasmJit.findReadyStatic(className, name, descriptor, true);
     if (!calleeSt || (calleeSt.callee || calleeSt).meta.boxedCount) {
-      // Name the callee METHOD, not its class: what has to change before a
-      // rebuild could link this site is that method owning a module, and its
-      // class is typically initialized already. See blockerSignature.
       throw new Unsupported(`invoke ${className}.${name} callee not ready`,
-        `${className}.${name}${descriptor}`);
+        this.wasmJit.methodLinkBlockers(className, name, descriptor));
     }
     const calleeMeta = (calleeSt.callee || calleeSt).meta;
     if (calleeMeta.usedEh) {
@@ -790,7 +815,7 @@ class MethodTranslator {
       const st = this.wasmJit.findReadyInstance(implClassName, name, descriptor);
       if (!st) {
         throw new Unsupported(`invoke ${owner}.${name} impl ${implClassName} not ready`,
-          implKey(implClassName));
+          this.wasmJit.methodLinkBlockers(implClassName, name, descriptor));
       }
       if (st.linkVetoed && !(st.callee || st).meta.fullyCompiled) {
         throw new Unsupported(`partial callee ${implClassName}.${name} vetoed`,
@@ -2347,6 +2372,11 @@ class WasmJit {
     // (invokevirtual/invokeinterface); every other receiver falls back to
     // the generic dispatch import.
     this.directInstanceLinkEnabled = env.JVM_WASM_DIRECT_INSTANCE_LINK === '1';
+    // Closed polymorphic sites can classify the externref once, then call the
+    // selected raw Wasm export directly. This removes the JS nested-call
+    // wrapper while retaining the generic import for null, late, partial, and
+    // otherwise unlinked targets.
+    this.importStatsEnabled = env.JVM_WASM_IMPORT_STATS === '1';
     this.lateInstanceTargetsEnabled = env.JVM_DISABLE_WASM_LATE_INSTANCE_TARGETS !== '1';
     this.checkcastEnabled = env.JVM_WASM_CHECKCAST === '1';
     // How many times a ready-but-partial module may be rebuilt after the class
@@ -3010,14 +3040,25 @@ class WasmJit {
           structured: primary === structuredMeta,
         };
         const reasons = [...(primary.demoteReasons || new Map()).values()];
-        const blockers = [...(primary.demoteBlockers || [])];
-        const dependencyOnly = reasons.length > 0 && blockers.length > 0 &&
+        const primaryBlockers = [...(primary.demoteBlockers || [])];
+        const dependencyOnly = reasons.length > 0 && primaryBlockers.length > 0 &&
           reasons.every((reason) => DEFERRABLE_DEMOTE.test(reason));
+        // Keep recoverable dependencies from every viable lowering, not just
+        // the currently selected module. The dispatcher may have a permanent
+        // CFG gap while the structured lowering is temporarily blocked on a
+        // class or callee; dropping the latter turns a recoverable factory
+        // into an anonymous/backoff retry and leaves its caller waiting only
+        // on the factory method. Candidate-specific causes are complementary:
+        // movement in either can make a complete reference-returning module.
+        const retryBlockers = new Set(dependencyOnly ? primaryBlockers : []);
+        if (structuredDeferred) {
+          for (const blocker of structuredBlockers) retryBlockers.add(blocker);
+        }
         throw new Unsupported('partial module has a reference return'
           + (this.debug
             ? ` [normalFlow=${primary.normalFlowFullyCompiled} full=${primary.fullyCompiled}`
               + ` demotes=${JSON.stringify([...(primary.demoteReasons || [])])}]` : ''),
-        dependencyOnly ? blockers : null);
+        retryBlockers.size ? [...retryBlockers] : null);
       }
       if (asCallee) {
         // A linked callee spills into a real scratch frame and unwinds via
@@ -3573,6 +3614,40 @@ class WasmJit {
   blockersResolved(blockers, recordedSig) {
     const sig = this.blockerSignature(blockers);
     return sig !== recordedSig && !/[01]/.test(sig);
+  }
+
+  // A call site waits on the callee method becoming linkable, but that is not
+  // always the root condition. An acyclic callee can only be compiled while a
+  // caller is being translated; if that attempt was deferred on class
+  // initialization, recording only the method key creates a cycle: the caller
+  // waits for the method, while no later caller translation is triggered to
+  // retry it. Preserve both layers in the dependency set. depsMoved() then
+  // observes the concrete class transition and rebuilds the caller; the
+  // retried translation asks for the callee again after its own blockers have
+  // cleared. This is dependency-driven and does not add a time/epoch retry.
+  methodLinkBlockers(className, name, descriptor) {
+    const methodKey = `${className}.${name}${descriptor}`;
+    const blockers = new Set([methodKey]);
+    const cd = this.jvm.classes[className];
+    const clsAst = cd && cd.ast && cd.ast.classes[0];
+    if (!clsAst) {
+      blockers.add(className);
+      return [...blockers];
+    }
+    const method = clsAst.items
+      .filter((item) => item.type === 'method')
+      .map((item) => item.method)
+      .find((candidate) => candidate.name === name && candidate.descriptor === descriptor);
+    const st = method && this.state.get(method);
+    for (const blocker of (st && st.calleeBlockers) || []) blockers.add(blocker);
+    const hasClassInitializer = clsAst.items
+      .filter((item) => item.type === 'method')
+      .some((item) => item.method.name === '<clinit>');
+    if (hasClassInitializer &&
+        this.jvm.classInitializationState.get(className) !== 'INITIALIZED') {
+      blockers.add(className);
+    }
+    return [...blockers];
   }
 
   findReadyStatic(className, name, descriptor, allowPartial = false) {

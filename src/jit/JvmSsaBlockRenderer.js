@@ -815,6 +815,7 @@ class JvmSsaBlockRenderer {
     if (frame === null) {
       frame = plan.target.freeFrame || new plan.Frame(plan.method);
       plan.target.freeFrame = null;
+      plan.clearStructuredContinuation?.(frame);
       frame.pc = 0;
       frame.stack.items.length = 0;
       delete frame.jitSkipOnce;
@@ -856,6 +857,7 @@ class JvmSsaBlockRenderer {
     if (frame === null) {
       frame = plan.target.freeFrame || new plan.Frame(plan.method);
       plan.target.freeFrame = null;
+      plan.clearStructuredContinuation?.(frame);
       frame.pc = 0;
       frame.stack.items.length = 0;
       delete frame.jitSkipOnce;
@@ -1680,6 +1682,7 @@ class JvmSsaBlockRenderer {
           descriptor: this.jit.fieldSites[site]?.descriptor || null,
           isArray: this.jit.fieldSites[site]?.descriptor?.startsWith("[") === true,
           directKey: this.jit.fieldSites[site]?.directInstanceKey || null,
+          denseSlot: this.jit.fieldSites[site]?.denseSlot ?? null,
           killKey: this.jit.fieldSites[site]
             ? `${this.jit.fieldSites[site].fieldName}:` +
               `${this.jit.fieldSites[site].descriptor}`
@@ -3926,10 +3929,21 @@ class JvmSsaBlockRenderer {
           else {
             const object = value(), out = value();
             const cache = fieldReadCacheSites.get(index);
-            const directKey = this.jit.fieldSites[site]?.directInstanceKey || null;
-            const directRead = directKey
-              ? `(${object}.fields && ${object}.fields[${JSON.stringify(directKey)}] !== undefined ? ` +
-                `${object}.fields[${JSON.stringify(directKey)}] : helpers.getFieldAt(${site}, ${object}))`
+            const fieldPlan = this.jit.fieldSites[site];
+            const directKey = fieldPlan?.directInstanceKey || null;
+            const denseSlot = fieldPlan?.denseSlot;
+            const directRead = Number.isInteger(denseSlot)
+              ? `(Array.isArray(${object}.fields) ? ` +
+                `${object}.fields[${denseSlot}] : ` +
+                `(${object}.fields && ` +
+                `${object}.fields[${JSON.stringify(directKey)}] !== undefined ? ` +
+                `${object}.fields[${JSON.stringify(directKey)}] : ` +
+                `helpers.getFieldAt(${site}, ${object})))`
+              : directKey
+              ? `(${object}.fields && ` +
+                `${object}.fields[${JSON.stringify(directKey)}] !== undefined ? ` +
+                `${object}.fields[${JSON.stringify(directKey)}] : ` +
+                `helpers.getFieldAt(${site}, ${object}))`
               : `helpers.getFieldAt(${site}, ${object})`;
             lines.push(`const ${object} = ${objectInput};`);
             if (cache?.eagerLocal !== null &&
@@ -3993,6 +4007,7 @@ class JvmSsaBlockRenderer {
             const object = value(), stored = value();
             const fieldPlan = this.jit.fieldSites[site];
             const directKey = fieldPlan?.directInstanceKey || null;
+            const denseSlot = fieldPlan?.denseSlot;
             const writeKeys = fieldPlan
               ? new Set([`${fieldPlan.fieldName}:${fieldPlan.descriptor}`])
               : null;
@@ -4001,7 +4016,15 @@ class JvmSsaBlockRenderer {
               `if (${object} === null || ${object} === undefined) {`,
               ...materializeLines([...stack, object, stored], index, true).map((line) => `  ${line}`),
               `  helpers.putFieldAt(${site}, ${object}, ${stored});`, "}",
-              ...(directKey ? [
+              ...(Number.isInteger(denseSlot) ? [
+                `if (Array.isArray(${object}.fields)) {`,
+                `  ${object}.fields[${denseSlot}] = ${stored};`,
+                `} else if (${object}.fields) {`,
+                `  ${object}.fields[${JSON.stringify(directKey)}] = ${stored};`,
+                "} else {",
+                `  helpers.putFieldAt(${site}, ${object}, ${stored});`,
+                "}",
+              ] : directKey ? [
                 `if (${object}.fields) {`,
                 `  ${object}.fields[${JSON.stringify(directKey)}] = ${stored};`,
                 "} else {",
@@ -4102,7 +4125,23 @@ class JvmSsaBlockRenderer {
                 `${prefix}  ${lazy.variable} = helpers.fieldSites[${site}].staticTarget;`,
                 `${prefix}  if (${lazy.variable}) helpers.structuredSsa.lazyStaticTargetLinkCount += 1;`,
                 `${prefix}}`);
-              if (cache) emitted.push("}");
+              if (cache) {
+                // A whole-class preparation can compile this method before
+                // the static owner initializes. Once the ordinary framed
+                // entry links the field, refresh every part of the entry
+                // cache together. Leaving the raw primitive-array companion
+                // at its pre-link null value makes a later proven store use
+                // stale storage even though the Java reference resolved.
+                emitted.push(
+                  `  ${cache.value} = ${normalizeJvmScalarExpression(
+                    out, cache.descriptor)};`,
+                  ...(cache.data
+                    ? [`  ${cache.data} = helpers.arrayData(${out});`]
+                    : []),
+                  `  ${cache.valid} = Boolean(${lazy.variable});`,
+                  "}",
+                );
+              }
               if (emitted !== lines) {
                 const marker =
                   `__JVM_DIRECT_ENTRY_STATIC_READ_${index}_${site}__`;
@@ -4258,7 +4297,8 @@ class JvmSsaBlockRenderer {
                 ...materializeLines(stack, index + 1).map((line) => `    ${line}`),
                 `    yield { deopt: true, transient: true, structuredResumePc: ${
                   index + 1
-                }, reason: 'active child in structured SSA callee' };`,
+                }, structuredResumeOwnsFrame: true, reason: 'active child in structured SSA callee' };`,
+                `    ${callStackDepth} = thread.callStack.items.length;`,
                 ...(site.returnsVoid ? [] : [
                   `    ${out} = frame.stack.items.pop();`,
                 ]),
@@ -4266,7 +4306,8 @@ class JvmSsaBlockRenderer {
               ordinary: [
                 ...materializeLines(stack, index + 1).map((line) => `    ${line}`),
                 "    return { deopt: true, transient: true, " +
-                  "reason: 'asynchronous structured SSA callee left active child' };",
+                  "reason: 'asynchronous structured SSA callee left active child', " +
+                  "jvmPositionalChild: frame };",
               ],
               checkedLeaf: ["    return helpers.asyncInvokeSentinel();"],
             });
@@ -4298,13 +4339,31 @@ class JvmSsaBlockRenderer {
                 .map((line) => `  ${line}`),
               `  throw ${caught};`, "}",
             ];
+            // A restoring-direct body begins without a physical caller
+            // Frame. A fast positional callee can suspend before the fallback
+            // above ever restores one, leaving only its child (or a visible
+            // descendant) on the scheduler stack. Linkage needs the real
+            // caller identity, and the caller must already describe the
+            // post-invoke state before that child can return a value into it.
+            // Materialize that state only on the cold active-child path. If
+            // linkage subsequently rejects the handoff, the ordinary replay
+            // arm below rewrites the same Frame to the invoke pc and operands.
+            const materializeOmittedCallerForChild = (indentation) => [
+              `${indentation}if (frame === null) {`,
+              ...materializeLines(stack, index + 1)
+                .map((line) => `${indentation}  ${line}`),
+              `${indentation}}`,
+            ];
             const asynchronousActiveChildLines = [
-              `if (${out} === helpers.asyncInvokeSentinel()) {`,
-              "  const activeChild = thread.callStack.items[thread.callStack.items.length - 1];",
-              "  if (activeChild !== frame && activeChild && " +
-                "activeChild.jitGeneratedReturnParent === frame) {",
+              `if (${out} === helpers.asyncInvokeSentinel() &&`,
+              `    thread.callStack.items.length > ${callStackDepth}) {`,
+              ...materializeOmittedCallerForChild("  "),
+              "}",
+              `if (${out} === helpers.asyncInvokeSentinel() &&`,
+              `    thread.callStack.items.length > ${callStackDepth} &&`,
+              `    helpers.linkStructuredCallChild(frame, thread, ${
+                callStackDepth}, ${JSON.stringify(site.returnType)}, ${site.id})) {`,
               activeChildCallMarker,
-              "  }",
               "}",
             ];
             const checkedAdmissionPlan = site.returnsVoid &&
@@ -4321,7 +4380,7 @@ class JvmSsaBlockRenderer {
               lines.push(`/*__SSA_SELF_RECURSIVE_REGION_START_${index}__*/`);
             }
             lines.push(`/*${site.regionMarkers.start}*/`, `let ${out};`,
-              `const ${callStackDepth} = thread.callStack.items.length;`);
+              `let ${callStackDepth} = thread.callStack.items.length;`);
             if (site.id !== null && site.id !== undefined) {
               const usedDirect = value();
               const runtimeSite = positionalCallSiteVariable(index);
@@ -4355,7 +4414,8 @@ class JvmSsaBlockRenderer {
                 `  if (ssaReceiverType${index} !== ${positionalReceiver}) {`,
                 `    const ssaPicTarget${index} = ` +
                   `${runtimeSite}.fastPositionalTargets && ` +
-                  `${runtimeSite}.fastPositionalTargets[ssaReceiverType${index}];`,
+                  `${runtimeSite}.fastPositionalTargets[` +
+                  `ssaReceiverType${index}];`,
                 `    if (ssaPicTarget${index} && ` +
                   `(ssaPicTarget${index}.debugGuarded || ` +
                   `!helpers.jvm.debugManager.isClassJitDeopted(` +
@@ -4364,8 +4424,7 @@ class JvmSsaBlockRenderer {
                 `      ${positionalInvoke} = ssaPicTarget${index}.invoke;`,
                 `      ${positionalRawInvoke} = ` +
                   `ssaPicTarget${index}.rawInvoke;`,
-                `      ${positionalReceiver} = ` +
-                  `ssaPicTarget${index}.receiverType;`,
+                `      ${positionalReceiver} = ssaPicTarget${index}.receiverType;`,
                 "    }",
                 "  }",
                 "}",
@@ -4712,6 +4771,13 @@ class JvmSsaBlockRenderer {
                       this.jit.positionalCallSafePointPollBudget};`,
                     "    yield { deopt: true, transient: true, " +
                       "reason: 'structured SSA positional quantum' };",
+                    // A frameless positional caller is restored onto the JVM
+                    // stack while this generator is suspended. The depth
+                    // captured before the safe point therefore no longer
+                    // describes the call boundary after resume. Refresh it
+                    // before invoking the child so the caller itself cannot
+                    // be mistaken for a scheduler-visible callee.
+                    `    ${callStackDepth} = thread.callStack.items.length;`,
                     "  }",
                     "}",
                   ],
@@ -4816,25 +4882,33 @@ class JvmSsaBlockRenderer {
               continuation: [
                 ...materializeLines(stack, index + 1).map((line) => `  ${line}`),
                 `  ${out}.structuredResumePc = ${index + 1};`,
+                `  ${out}.structuredResumeOwnsFrame = true;`,
                 `  yield ${out};`,
+                `  ${callStackDepth} = thread.callStack.items.length;`,
                 ...(site.returnsVoid ? [] : [
                   `  ${out} = frame.stack.items.pop();`,
                 ]),
               ],
               ordinary: [
                 ...materializeLines(stack, index + 1).map((line) => `  ${line}`),
+                `  if (frame) ${out}.jvmPositionalChild = frame;`,
                 `  return ${out};`,
               ],
               checkedLeaf: ["return helpers.asyncInvokeSentinel();"],
             });
             lines.push(`if (${out} && ${out}.deopt) {`,
-              `  if (thread.callStack.items.length <= ${callStackDepth}) {`,
+              `  if (frame === null && (${out}.jvmPositionalChild || ` +
+                `thread.callStack.items.length > ${callStackDepth})) {`,
+              ...materializeLines(stack, index + 1)
+                .map((line) => `    ${line}`),
+              "  }",
+              `  if (!helpers.linkStructuredCallChild(frame, thread, ${
+                callStackDepth}, ${JSON.stringify(site.returnType)}, ` +
+                `undefined, ${out}.jvmPositionalChild)) {`,
               ...materializeLines(callStack, index).map((line) => `    ${line}`),
               "    helpers.skipJitOnce(frame);",
               `    return ${out};`,
               "  }",
-              `  helpers.linkStructuredCallChild(frame, thread, ${
-                callStackDepth}, ${JSON.stringify(site.returnType)});`,
               deoptCallMarker, "}");
             // A callee that left a frame on the stack has not run to
             // completion, whatever it returned. The check above it is reached
@@ -4851,7 +4925,8 @@ class JvmSsaBlockRenderer {
                 ...materializeLines(stack, index + 1).map((line) => `    ${line}`),
                 `    yield { deopt: true, transient: true, structuredResumePc: ${
                   index + 1
-                }, reason: 'structured SSA callee left active child' };`,
+                }, structuredResumeOwnsFrame: true, reason: 'structured SSA callee left active child' };`,
+                `    ${callStackDepth} = thread.callStack.items.length;`,
                 ...(site.returnsVoid ? [] : [
                   `    ${out} = frame.stack.items.pop();`,
                 ]),
@@ -4859,13 +4934,19 @@ class JvmSsaBlockRenderer {
               ordinary: [
                 ...materializeLines(stack, index + 1).map((line) => `    ${line}`),
                 "    return { deopt: true, transient: true, " +
-                  "reason: 'structured SSA callee left active child' };",
+                  "reason: 'structured SSA callee left active child', " +
+                  "jvmPositionalChild: frame };",
               ],
               checkedLeaf: ["    return helpers.asyncInvokeSentinel();"],
             });
             lines.push(
               `/*__JVM_LEFT_ACTIVE_CHILD_WITHDRAW_${index}_${site.id}__*/`,
               `if (thread.callStack.items.length > ${callStackDepth}) {`,
+              ...materializeOmittedCallerForChild("  "),
+              "}",
+              `if (thread.callStack.items.length > ${callStackDepth} &&`,
+              `    helpers.linkStructuredCallChild(frame, thread, ${
+                callStackDepth}, ${JSON.stringify(site.returnType)})) {`,
               leftActiveChildMarker, "}");
             if (deferMaterialization) deferredCallMaterializationCount += 1;
             if (!site.returnsVoid) stack.push(out);
@@ -4880,7 +4961,9 @@ class JvmSsaBlockRenderer {
               ],
               ordinary: [
                 ...materializeLines(stack, index + 1).map((line) => `  ${line}`),
-                "  return { deopt: true, transient: true, reason: 'thread yielded in structured SSA callee' };",
+                "  return { deopt: true, transient: true, " +
+                  "reason: 'thread yielded in structured SSA callee', " +
+                  "jvmPositionalChild: frame };",
               ],
               checkedLeaf: ["return helpers.asyncInvokeSentinel();"],
             });
@@ -5148,6 +5231,9 @@ class JvmSsaBlockRenderer {
     };
     const readEagerArrayField = (cache, object) => {
       if (object === null || object === undefined) return undefined;
+      if (Number.isInteger(cache.denseSlot) && Array.isArray(object.fields)) {
+        return object.fields[cache.denseSlot];
+      }
       if (cache.directKey && object.fields &&
           object.fields[cache.directKey] !== undefined) {
         return object.fields[cache.directKey];
@@ -5167,6 +5253,18 @@ class JvmSsaBlockRenderer {
         ? target.fields.get(target.key) : target.fields[target.key];
       return { target, value };
     };
+    const directFieldValueExpression = (cache, object) =>
+      Number.isInteger(cache.denseSlot)
+        ? `(Array.isArray(${object}.fields) ? ` +
+          `${object}.fields[${cache.denseSlot}] : ` +
+          `${object}.fields[${JSON.stringify(cache.directKey)}])`
+        : `${object}.fields[${JSON.stringify(cache.directKey)}]`;
+    const guardedDirectFieldReadExpression = (cache, object) =>
+      `(${object}.fields && ` +
+        `(Array.isArray(${object}.fields) || ` +
+        `${object}.fields[${JSON.stringify(cache.directKey)}] !== undefined) ? ` +
+        `${directFieldValueExpression(cache, object)} : ` +
+        `helpers.getFieldAt(${cache.site}, ${object}))`;
     const fieldBackedArrayGuards = [
       ...[...fieldReadCaches.values()]
         .filter((cache) => cache.isArray &&
@@ -5217,10 +5315,8 @@ class JvmSsaBlockRenderer {
         `if (local${cache.eagerLocal} !== null && ` +
           `local${cache.eagerLocal} !== undefined) {`,
         `  ${cache.value} = ${cache.directKey
-          ? `(local${cache.eagerLocal}.fields && ` +
-            `local${cache.eagerLocal}.fields[${JSON.stringify(cache.directKey)}] !== undefined ? ` +
-            `local${cache.eagerLocal}.fields[${JSON.stringify(cache.directKey)}] : ` +
-            `helpers.getFieldAt(${cache.site}, local${cache.eagerLocal}))`
+          ? guardedDirectFieldReadExpression(
+            cache, `local${cache.eagerLocal}`)
           : `helpers.getFieldAt(${cache.site}, local${cache.eagerLocal})`};`,
         ...(cache.isArray ? [
           `  ${cache.data} = helpers.arrayData(${cache.value});`,
@@ -8643,12 +8739,14 @@ class JvmSsaBlockRenderer {
       loopSafePointBudget = safePointInitialBudget,
       checkedLeafOnly = false,
       rangeBailout = false,
+      loopSafePointBudgetOverrides = null,
     ) => {
       if (!node) return [];
       if (node.t === "seq") {
         return node.body.flatMap((child) =>
           render(child, continuationMode, directPositional,
-            loopSafePointBudget, checkedLeafOnly, rangeBailout));
+            loopSafePointBudget, checkedLeafOnly, rangeBailout,
+            loopSafePointBudgetOverrides));
       }
       if (node.t === "straight") {
         const plan = plans[node.block];
@@ -8720,12 +8818,14 @@ class JvmSsaBlockRenderer {
         const thenLines = specializeNonZeroBranch(plan, [
           ...edgeLines(plan.taken, plan.takenStack ?? plan.stack),
           ...render(node.then, continuationMode, directPositional,
-            loopSafePointBudget, checkedLeafOnly, rangeBailout),
+            loopSafePointBudget, checkedLeafOnly, rangeBailout,
+            loopSafePointBudgetOverrides),
         ]);
         const elseLines = [
           ...edgeLines(plan.fall, plan.fallStack ?? plan.stack),
           ...render(node.els, continuationMode, directPositional,
-            loopSafePointBudget, checkedLeafOnly, rangeBailout),
+            loopSafePointBudget, checkedLeafOnly, rangeBailout,
+            loopSafePointBudgetOverrides),
         ];
         if (plan.conditionConstant === true) {
           return ["{", ...indent(thenLines), "}"];
@@ -8787,7 +8887,8 @@ class JvmSsaBlockRenderer {
           const body = [
             ...edgeLines(target, plan.stack),
             ...render(entry.body, continuationMode, directPositional,
-              loopSafePointBudget, checkedLeafOnly, rangeBailout),
+              loopSafePointBudget, checkedLeafOnly, rangeBailout,
+              loopSafePointBudgetOverrides),
             "break;",
           ];
           output.push(`case ${JSON.stringify(entry.key)}: {`,
@@ -8796,7 +8897,8 @@ class JvmSsaBlockRenderer {
         const defaultBody = [
           ...edgeLines(plan.defaultTarget, plan.stack),
           ...render(node.dflt, continuationMode, directPositional,
-            loopSafePointBudget, checkedLeafOnly, rangeBailout),
+            loopSafePointBudget, checkedLeafOnly, rangeBailout,
+            loopSafePointBudgetOverrides),
           "break;",
         ];
         output.push("default: {", ...indent(defaultBody), "}", "}");
@@ -8805,6 +8907,7 @@ class JvmSsaBlockRenderer {
       if (node.t === "loop") {
         const header = Number(node.label.slice(1));
         const currentLoopSafePointBudget =
+          loopSafePointBudgetOverrides?.get(header) ||
           loopPollBudgets.get(header) || loopSafePointBudget;
         const headerBlock = cfg.blocks[header];
         if (!headerBlock) throw new Error(`unknown structured loop header ${node.label}`);
@@ -8875,9 +8978,11 @@ class JvmSsaBlockRenderer {
           ...(invariantDivisorGuard ? [invariantDivisorGuard.variable] : []),
         ];
         const loopBody = render(node.body, continuationMode, directPositional,
-          currentLoopSafePointBudget, checkedLeafOnly, rangeBailout);
+          currentLoopSafePointBudget, checkedLeafOnly, rangeBailout,
+          loopSafePointBudgetOverrides);
         const countedLoop = canonicalCountedLoop(header, node.label, loopBody) ||
           canonicalPostDecrementLoop(node.label, loopBody);
+        const emittedLoopBody = countedLoop ? countedLoop.body : loopBody;
         const entryBailoutGuards = directPositional && rangeBailout
           ? rangeBailoutGuardsByHeader.get(header) || [] : [];
         const prefix = [
@@ -8925,13 +9030,13 @@ class JvmSsaBlockRenderer {
               "--safePointBudget <= 0) {",
             ...indent(indent(materialize)), "  }",
           ]),
-          ...indent(countedLoop ? countedLoop.body : loopBody), "}",
+          ...indent(emittedLoopBody), "}",
           ...(countedLoop ? countedLoop.exit : []),
         ];
         const unpolledLoop = [
           `${node.label}: while (${countedLoop
             ? countedLoop.condition : "true"}) {`,
-          ...indent(countedLoop ? countedLoop.body : loopBody), "}",
+          ...indent(emittedLoopBody), "}",
           ...(countedLoop ? countedLoop.exit : []),
         ];
         // A restoring entry can transfer an unexpectedly large loop back to
@@ -8974,7 +9079,7 @@ class JvmSsaBlockRenderer {
             `${node.label}: while (${countedLoop
               ? countedLoop.condition : "true"}) {`,
             ...indent(specializeArrayRangeGuardedStores(
-              countedLoop ? countedLoop.body : loopBody,
+              emittedLoopBody,
               specializationGuards)),
             "}",
             ...(countedLoop ? countedLoop.exit : []),
@@ -8995,7 +9100,7 @@ class JvmSsaBlockRenderer {
             `${node.label}: while (${countedLoop
               ? countedLoop.condition : "true"}) {`,
             ...indent(specializeArrayRangeGuardedStores(
-              countedLoop ? countedLoop.body : loopBody,
+              emittedLoopBody,
               specializationGuards)),
             "}",
             ...(countedLoop ? countedLoop.exit : []),
@@ -9022,7 +9127,7 @@ class JvmSsaBlockRenderer {
             ...specializationGuards,
           ].join(" && ");
           const fastLoopBody = specializeArrayRangeGuardedStores(
-            countedLoop ? countedLoop.body : loopBody,
+            emittedLoopBody,
             specializationGuards);
           const specializedUnpolledLoop = [
             `${node.label}: while (${countedLoop
@@ -9086,7 +9191,8 @@ class JvmSsaBlockRenderer {
       if (node.t === "block") {
         const body = removeTerminalBreakTo(node.body, node.label);
         const rendered = render(body, continuationMode, directPositional,
-          loopSafePointBudget, checkedLeafOnly, rangeBailout);
+          loopSafePointBudget, checkedLeafOnly, rangeBailout,
+          loopSafePointBudgetOverrides);
         if (!rendered.some((line) =>
           line.trim() === `break ${node.label};`)) {
           eliminatedStructuredBlockCount += 1;
@@ -9425,10 +9531,8 @@ class JvmSsaBlockRenderer {
           `local${cache.eagerLocal} !== undefined) {`,
         `  ${cache.object} = local${cache.eagerLocal};`,
         `  ${cache.value} = ${cache.directKey
-          ? `(local${cache.eagerLocal}.fields && ` +
-            `local${cache.eagerLocal}.fields[${JSON.stringify(cache.directKey)}] !== undefined ? ` +
-            `local${cache.eagerLocal}.fields[${JSON.stringify(cache.directKey)}] : ` +
-            `helpers.getFieldAt(${cache.site}, local${cache.eagerLocal}))`
+          ? guardedDirectFieldReadExpression(
+            cache, `local${cache.eagerLocal}`)
           : `helpers.getFieldAt(${cache.site}, local${cache.eagerLocal})`};`,
         ...(cache.isArray ? [
           `  ${cache.data} = helpers.arrayData(${cache.value});`,
@@ -9456,13 +9560,14 @@ class JvmSsaBlockRenderer {
       restoringDirectFieldLayoutSlots.add(slot);
       restoringDirectFieldCacheInitializations.push(
         `if (local${slot} === null || local${slot} === undefined || ` +
-          `!local${slot}.fields) return helpers.asyncInvokeSentinel();`,
+          `!local${slot}.fields) ` +
+          `return helpers.asyncInvokeSentinel();`,
       );
       for (const cache of caches) {
         restoringDirectFieldCacheInitializations.push(
           `${cache.object} = local${slot};`,
           `${cache.value} = ` +
-            `local${slot}.fields[${JSON.stringify(cache.directKey)}];`,
+            `${directFieldValueExpression(cache, `local${slot}`)};`,
         );
       }
       // allocateObject may leave never-assigned Java fields absent from the
@@ -9506,10 +9611,8 @@ class JvmSsaBlockRenderer {
             `local${cache.eagerLocal} !== undefined) {`,
           `  ${cache.object} = local${cache.eagerLocal};`,
           `  ${cache.value} = ${cache.directKey
-            ? `(local${cache.eagerLocal}.fields && ` +
-              `local${cache.eagerLocal}.fields[${JSON.stringify(cache.directKey)}] !== undefined ? ` +
-              `local${cache.eagerLocal}.fields[${JSON.stringify(cache.directKey)}] : ` +
-              `helpers.getFieldAt(${cache.site}, local${cache.eagerLocal}))`
+            ? guardedDirectFieldReadExpression(
+              cache, `local${cache.eagerLocal}`)
             : `helpers.getFieldAt(${cache.site}, local${cache.eagerLocal})`};`,
           ...(cache.isArray
             ? [`  ${cache.data} = helpers.arrayData(${cache.value});`] : []),
@@ -9532,12 +9635,13 @@ class JvmSsaBlockRenderer {
         (cache) => cache.eagerLocal === slot);
       transactionalFieldReadCacheInitializations.push(
         `if (local${slot} === null || local${slot} === undefined || ` +
-          `!local${slot}.fields) return helpers.asyncInvokeSentinel();`,
+          `!local${slot}.fields) ` +
+          `return helpers.asyncInvokeSentinel();`,
       );
       for (const cache of caches) {
         transactionalFieldReadCacheInitializations.push(
           `const ${cache.value} = ` +
-            `local${slot}.fields[${JSON.stringify(cache.directKey)}];`,
+            `${directFieldValueExpression(cache, `local${slot}`)};`,
         );
         if (cache.isArray) {
           transactionalFieldReadCacheInitializations.push(
@@ -10756,6 +10860,7 @@ class JvmSsaBlockRenderer {
         const initializeFrame = [
           "frame = plan.target.freeFrame || new plan.Frame(plan.method);",
           "plan.target.freeFrame = null;",
+          "if (plan.clearStructuredContinuation) plan.clearStructuredContinuation(frame);",
           "frame.pc = 0;",
           "frame.stack.items.length = 0;",
           "delete frame.jitSkipOnce;",
@@ -11898,8 +12003,15 @@ class JvmSsaBlockRenderer {
       let adaptivePositionalBody = null;
       let adaptivePositionalSource = null;
       let ordinaryAdaptive = false;
-      const ordinaryAdaptiveCanonical =
-        this.jit.ordinaryAdaptiveFramelessPositionalEnabled;
+      // An ordinary adaptive body cannot preserve lexical SSA state when its
+      // wall-clock quantum expires. That is safe for a positional call (the
+      // caller receives the exact materialized deopt), and for a call-free
+      // scheduler entry whose work is locally bounded. A call-bearing entry can
+      // spend an unbounded amount of its host deadline in children; selecting
+      // the ordinary body there strands the Frame at a mid-method PC and every
+      // later scheduler turn falls through to the baseline resume body. Keep
+      // the ordinary ABI for compiled callers, but let canonical call-bearing
+      // Frames use the generator that retains their structured continuation.
       // Exact active-child continuations materialize the post-invoke parent
       // and restore it beneath a scheduler-visible child. Consequently a
       // verified non-recursive call graph may retain this Frame virtually and
@@ -11908,6 +12020,10 @@ class JvmSsaBlockRenderer {
       // compete for one child return owner.
       const compiledCallChain = useContinuations && callSites.size > 0 &&
         !hasSelfRecursiveCall && this.jit.compiledCallChainsEnabled;
+      const ordinaryAdaptiveCanonical =
+        this.jit.ordinaryAdaptiveFramelessPositionalEnabled &&
+        (callSites.size === 0 || compiledCallChain &&
+          this.jit.ordinaryAdaptiveCallChainSafePointBudget > 0);
       if (useContinuations && (callSites.size === 0 || compiledCallChain ||
           regionCallGraphCandidate) &&
           this.jit.adaptiveFramelessPositionalEnabled) {
@@ -11915,9 +12031,24 @@ class JvmSsaBlockRenderer {
           ? Math.max(this.jit.adaptiveFramelessBudgetMultiplier,
             this.restoringDirectBudgetMultiplier)
           : this.jit.adaptiveFramelessBudgetMultiplier;
-        const adaptiveSafePointBudget = Math.min(
-          1_000_000,
+        const configuredCallChainBudget = compiledCallChain
+          ? this.jit.ordinaryAdaptiveCallChainSafePointBudget : 0;
+        const adaptiveSafePointBudget = Math.min(100_000_000, Math.max(
           safePointInitialBudget * adaptiveBudgetMultiplier,
+          configuredCallChainBudget,
+        ));
+        // Per-loop work weighting normally clamps the shared counter on loop
+        // entry. Scale those exact loop budgets with the adaptive quantum;
+        // otherwise every loop immediately overwrites the enlarged entry
+        // budget with its canonical value and the multiplier is inert.
+        const adaptiveLoopBudgetScale =
+          adaptiveSafePointBudget / safePointInitialBudget;
+        const adaptiveLoopSafePointBudgets = new Map(
+          [...loopPollBudgets].map(([header, budget]) => [header,
+            Math.min(100_000_000,
+              Math.max(budget, Math.floor(
+                budget * adaptiveLoopBudgetScale))),
+          ]),
         );
         // A compiled call chain is valuable only if the host can optimize it
         // as an ordinary activation. Generator resumptions merely exchange a
@@ -11935,7 +12066,8 @@ class JvmSsaBlockRenderer {
         const adaptiveBody = buildBody(
           expandContinuationFallbacks(
             render(structured.tree, !ordinaryAdaptive, false,
-              adaptiveSafePointBudget),
+              adaptiveSafePointBudget, false, false,
+              adaptiveLoopSafePointBudgets),
             !ordinaryAdaptive),
           adaptiveSafePointBudget,
         );
@@ -12015,6 +12147,7 @@ class JvmSsaBlockRenderer {
               iterator,
               pc: Number.isInteger(step.value?.structuredResumePc)
                 ? step.value.structuredResumePc : frame.pc,
+              ownsFrame: step.value?.structuredResumeOwnsFrame === true,
               framelessEntry: true,
               fieldBackedArrayState: captureFieldBackedArrayState(frame),
             };
@@ -12094,6 +12227,7 @@ class JvmSsaBlockRenderer {
             iterator,
             pc: Number.isInteger(step.value?.structuredResumePc)
               ? step.value.structuredResumePc : frame.pc,
+            ownsFrame: step.value?.structuredResumeOwnsFrame === true,
             // A frameless adaptive iterator can require several ordinary
             // scheduler turns after it restores its child Frame. Preserve
             // that origin across every yield so the eventual completion pops
@@ -12157,6 +12291,7 @@ class JvmSsaBlockRenderer {
             iterator,
             pc: Number.isInteger(step.value?.structuredResumePc)
               ? step.value.structuredResumePc : frame.pc,
+            ownsFrame: step.value?.structuredResumeOwnsFrame === true,
             framelessEntry: false,
             fieldBackedArrayState: captureFieldBackedArrayState(frame),
           };
@@ -12167,6 +12302,15 @@ class JvmSsaBlockRenderer {
         generated.jvmSourceUrl = generatedBody.jvmSourceUrl;
         generated.jvmHasStructuredContinuation =
           (frame) => Boolean(frame?.[STRUCTURED_CONTINUATION]);
+        generated.jvmHasOwnedStructuredContinuation =
+          (frame) => frame?.[STRUCTURED_CONTINUATION]?.ownsFrame === true;
+        generated.jvmClearStructuredContinuation = (frame) => {
+          const continuation = frame?.[STRUCTURED_CONTINUATION];
+          if (!continuation) return false;
+          delete frame[STRUCTURED_CONTINUATION];
+          try { continuation.iterator.return(); } catch (_) {}
+          return true;
+        };
         generated.toString = () => generatedBody.toString();
       }
       generated.jvmSynchronous = true;
@@ -12181,6 +12325,8 @@ class JvmSsaBlockRenderer {
         ? wrapHotCallGraphGenerator : null;
       generated.jvmHotCallGraphHasContinuation = regionCallGraphCandidate
         ? (frame) => Boolean(frame?.[STRUCTURED_CONTINUATION]) : null;
+      generated.jvmHotCallGraphHasOwnedContinuation = regionCallGraphCandidate
+        ? (frame) => frame?.[STRUCTURED_CONTINUATION]?.ownsFrame === true : null;
       generated.jvmStructuredCanonicalNestedCalls = canonicalNestedCalls;
       // A call-bearing body may leave a scheduler-visible child Frame. The
       // positional wrapper can restore one omitted caller immediately beneath

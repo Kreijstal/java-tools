@@ -43,7 +43,7 @@ const JitCompiler = require("../jit/JitCompiler");
 const { encodeGraph, decodeGraph } = require("./stateCodec");
 const { createClock } = require('./fakeClock');
 const {
-  newFields, loadHierarchy, makeObjectRef,
+  newFields, loadHierarchy, makeObjectRef, enumerateFieldKeys, readField,
 } = require('./objectModel');
 
 class ClassInitializationStateMap extends Map {
@@ -236,6 +236,11 @@ class JVM {
     // offsets (see core/objectModel.js). Requires the heap; off by default.
     this.wasmFields = !!this.wasmHeap &&
       (options.wasmFields ?? env.JVM_WASM_FIELDS === '1');
+    // Optional uniform dense storage for fields declared by guest classes.
+    // JRE-native classes retain their named maps; guest inheritance layouts
+    // are superclass-first so compiled fieldrefs can embed one numeric slot.
+    this.denseInstanceFields = options.denseInstanceFields === true ||
+      env.JVM_DENSE_INSTANCE_FIELDS === '1';
     this.clock = options.clock || createClock({
       fakeTime: options.fakeTime ?? env.JVM_FAKE_TIME,
       fakeTimeStep: options.fakeTimeStep ?? env.JVM_FAKE_TIME_STEP,
@@ -270,7 +275,10 @@ class JVM {
     this.awtPresentationBackpressureFrames =
       Number.isFinite(backpressureFrames) && backpressureFrames >= 0
         ? backpressureFrames : 2;
+    this.awtWebGlPresentation = options.awtWebGlPresentation === true ||
+      env.JVM_ENABLE_AWT_WEBGL_PRESENTATION === "1";
     this._awtDroppedFrameBacklog = 0;
+    this._awtPendingPresentationCount = 0;
     const configuredBurst = options.interpreterBurst ??
       env.JVM_INTERPRETER_BURST;
     this.interpreterBurst = Math.max(1, Number(configuredBurst) || 1024);
@@ -304,8 +312,9 @@ class JVM {
       ? { rate: Math.max(1, Math.floor(schedulerTimingRate)), random: 0x9e3779b9,
         methods: new WeakMap(), samples: new Map() }
       : null;
-    this._envDebugThrow = !!env.JVM_DEBUG_THROW;
-    this._envDebugThrowType = env.JVM_DEBUG_THROW_TYPE || null;
+    this._envDebugThrow = options.debugThrow === true || !!env.JVM_DEBUG_THROW;
+    this._envDebugThrowType = options.debugThrowType ||
+      env.JVM_DEBUG_THROW_TYPE || null;
     this.jitOptions = options.jit || {};
     this.jit = new JitCompiler(this, this.jitOptions);
 
@@ -885,8 +894,10 @@ class JVM {
         }
       }
 
-      // If we found a canvas, create a proper graphics context
-      if (canvas) {
+      // A complete-frame WebGL presenter must claim the visible canvas before
+      // a mutually exclusive 2D context. Guest raster operations remain tied
+      // to the component's software surface below.
+      if (canvas && !this.awtWebGlPresentation) {
         const ctx = canvas.getContext('2d');
         if (ctx) {
           // Import the AWT framework to create CanvasGraphics
@@ -899,13 +910,14 @@ class JVM {
     // Create the Java Graphics object with proper connection
     const graphicsObj = {
       type: 'java/awt/Graphics',
-      _awtGraphics: awtGraphics
+      _awtGraphics: awtGraphics,
+      _component: appletObj,
     };
 
     if (awtGraphics) {
       // Connect to real canvas graphics context
       graphicsObj._awtGraphics = awtGraphics;
-    } else {
+    } else if (!canvas) {
       // Fallback to mock graphics for environments without DOM
       graphicsObj.isMock = true;
     }
@@ -1046,6 +1058,15 @@ class JVM {
     if (strategy !== "message-channel") return strategy;
     const limit = this.awtPresentationBackpressureFrames;
     if (!(limit > 0)) return strategy;
+    // Once AWT has submitted a complete browser frame, continuing to refill
+    // Firefox's MessageChannel queue can indefinitely postpone the animation
+    // opportunity that makes it visible. Park only at the next ordinary JVM
+    // safe point; computation before frame completion still uses the fast
+    // queue and hidden tabs retain the bounded wait in _awaitPresentation().
+    if ((this._awtPendingPresentationCount || 0) > 0 &&
+        hostPaintsBetweenTasks()) {
+      return "presentation";
+    }
     if ((this._awtDroppedFrameBacklog || 0) < limit) return strategy;
     this._awtDroppedFrameBacklog = 0;
     // Only a host that paints between tasks has a presentation to wait for.
@@ -1876,7 +1897,11 @@ class JVM {
         }
       }
     } catch (e) {
-      const currentFrame = thread.callStack.peek();
+      // Generated code can throw after a nested return or deoptimization has
+      // already retired the last frame. Do not let the diagnostic lookup mask
+      // the original guest exception with Stack.peek()'s host underflow.
+      const currentFrame = thread.callStack.isEmpty()
+        ? null : thread.callStack.peek();
       const currentInstructionItem = currentFrame && currentFrame.instructions
         ? currentFrame.instructions[currentFrame.pc]
         : null;
@@ -3098,7 +3123,8 @@ class JVM {
     // deepest guest location once, on the exceptional path only, so failures
     // such as an accidental BigInt/Number coercion identify the generated
     // method and bytecode PC that caused them.
-    if (exception instanceof Error && !exception.jvmGuestLocation) {
+    if (exception && (typeof exception === "object" ||
+        typeof exception === "function") && !exception.jvmGuestLocation) {
       const failingFrame = thread.callStack.isEmpty()
         ? null : thread.callStack.peek();
       if (failingFrame) {
@@ -3136,7 +3162,8 @@ class JVM {
         const fields = value.fields;
         if (fields && typeof fields === "object") {
           summary.fields = {};
-          for (const [name, fieldValue] of Object.entries(fields).slice(0, 24)) {
+          for (const name of enumerateFieldKeys(fields).slice(0, 24)) {
+            const fieldValue = readField(fields, name);
             if (fieldValue === null || fieldValue === undefined ||
                 typeof fieldValue === "number" || typeof fieldValue === "boolean" ||
                 typeof fieldValue === "string") {
@@ -3156,9 +3183,10 @@ class JVM {
             } else {
               let nestedName = null;
               if (fieldValue && fieldValue.fields) {
-                const namedField = Object.entries(fieldValue.fields).find(([fieldName]) =>
-                  fieldName.endsWith(".name"));
-                const namedValue = namedField && namedField[1];
+                const namedField = enumerateFieldKeys(fieldValue.fields).find(
+                  (fieldName) => fieldName.endsWith(".name"));
+                const namedValue = namedField === undefined
+                  ? undefined : readField(fieldValue.fields, namedField);
                 if (namedValue && namedValue.type === "java/lang/String" &&
                     (namedValue instanceof String ||
                      Object.prototype.hasOwnProperty.call(namedValue, "value"))) {

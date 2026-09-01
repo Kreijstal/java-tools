@@ -17,6 +17,125 @@ const COLOR_SWIZZLE_WASM = new Uint8Array([
 ]);
 let colorSwizzleWasm;
 
+function compileWebGlShader(gl, type, source) {
+  const shader = gl.createShader(type);
+  if (!shader) return null;
+  gl.shaderSource(shader, source);
+  gl.compileShader(shader);
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+    gl.deleteShader(shader);
+    return null;
+  }
+  return shader;
+}
+
+function createWebGlPresenter(width, height, targetCanvas = null) {
+  if (!targetCanvas && (typeof document === 'undefined' ||
+      typeof document.createElement !== 'function')) return null;
+  const canvas = targetCanvas || document.createElement('canvas');
+  const direct = Boolean(targetCanvas);
+  canvas.width = width;
+  canvas.height = height;
+  const gl = canvas.getContext('webgl', {
+    alpha: false,
+    antialias: false,
+    depth: false,
+    stencil: false,
+    preserveDrawingBuffer: true,
+    premultipliedAlpha: false,
+  });
+  if (!gl || typeof gl.texSubImage2D !== 'function') return null;
+  const vertex = compileWebGlShader(gl, gl.VERTEX_SHADER, `
+    attribute vec2 position;
+    varying vec2 uv;
+    void main() {
+      gl_Position = vec4(position, 0.0, 1.0);
+      uv = vec2((position.x + 1.0) * 0.5, (1.0 - position.y) * 0.5);
+    }
+  `);
+  const fragment = compileWebGlShader(gl, gl.FRAGMENT_SHADER, `
+    precision mediump float;
+    varying vec2 uv;
+    uniform sampler2D frame;
+    void main() {
+      vec4 bgra = texture2D(frame, uv);
+      gl_FragColor = vec4(bgra.b, bgra.g, bgra.r, 1.0);
+    }
+  `);
+  if (!vertex || !fragment) return null;
+  const program = gl.createProgram();
+  gl.attachShader(program, vertex);
+  gl.attachShader(program, fragment);
+  gl.linkProgram(program);
+  gl.deleteShader(vertex);
+  gl.deleteShader(fragment);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) return null;
+  const buffer = gl.createBuffer();
+  const texture = gl.createTexture();
+  if (!buffer || !texture) return null;
+  gl.useProgram(program);
+  gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+    -1, -1, 1, -1, -1, 1, 1, 1,
+  ]), gl.STATIC_DRAW);
+  const position = gl.getAttribLocation(program, 'position');
+  gl.enableVertexAttribArray(position);
+  gl.vertexAttribPointer(position, 2, gl.FLOAT, false, 0, 0);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.uniform1i(gl.getUniformLocation(program, 'frame'), 0);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+  let textureWidth = 0;
+  let textureHeight = 0;
+  let sourceBuffer = null;
+  let sourceOffset = -1;
+  let sourceLength = -1;
+  let sourceBytes = null;
+  return {
+    direct,
+    present(targetContext, source, count, nextWidth, nextHeight) {
+      if (!ArrayBuffer.isView(source) ||
+          (!direct && typeof targetContext?.drawImage !== 'function')) {
+        return false;
+      }
+      if (canvas.width !== nextWidth || canvas.height !== nextHeight) {
+        canvas.width = nextWidth;
+        canvas.height = nextHeight;
+      }
+      const byteLength = count * 4;
+      if (sourceBuffer !== source.buffer || sourceOffset !== source.byteOffset ||
+          sourceLength !== byteLength) {
+        sourceBuffer = source.buffer;
+        sourceOffset = source.byteOffset;
+        sourceLength = byteLength;
+        sourceBytes = new Uint8Array(sourceBuffer, sourceOffset, byteLength);
+      }
+      gl.viewport(0, 0, nextWidth, nextHeight);
+      gl.useProgram(program);
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      if (textureWidth !== nextWidth || textureHeight !== nextHeight) {
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, nextWidth, nextHeight, 0,
+          gl.RGBA, gl.UNSIGNED_BYTE, sourceBytes);
+        textureWidth = nextWidth;
+        textureHeight = nextHeight;
+      } else {
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, nextWidth, nextHeight,
+          gl.RGBA, gl.UNSIGNED_BYTE, sourceBytes);
+      }
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      gl.flush();
+      if (!direct) {
+        targetContext.drawImage(canvas, 0, 0, nextWidth, nextHeight);
+      }
+      return true;
+    },
+  };
+}
+
 function swizzleRgbToImageData(output, pixels, count) {
   const source = pixels && pixels.elements ? pixels.elements : pixels;
   // Wasm only wins when its staging copy can consume an existing typed view.
@@ -92,7 +211,11 @@ function softSurface(jvm, obj) {
   const width = comp._width || 800;
   const height = comp._height || 600;
   if (!comp._pixels || comp._pixelsWidth !== width || comp._pixelsHeight !== height) {
-    comp._pixels = new Array(width * height).fill(0);
+    // A Java software raster is an int surface. Keeping it typed from its
+    // first primitive draw also lets a complete-frame presenter consume the
+    // stable bytes directly; a transient plain Array would force the visible
+    // canvas into 2D mode before the first BufferedImage frame arrives.
+    comp._pixels = new Int32Array(width * height);
     comp._pixelsWidth = width;
     comp._pixelsHeight = height;
   }
@@ -115,10 +238,49 @@ function presentationStats(jvm) {
       blitCopyMs: 0,
       wasmSwizzles: 0,
       jsSwizzles: 0,
-      presentationFallbacks: 0,
+      webGlPresentations: 0,
+      webGlDirectPresentations: 0,
+      webGlFallbacks: 0,
+      lastCompletedAt: null,
+      recentCompletionGaps: [],
+      lastPresentedAt: null,
+      lastPresentedCompletionAt: null,
+      recentPresentationGaps: [],
+      recentFrameTimings: [],
     };
   }
   return jvm._awtPresentationStats;
+}
+
+function recordPresentation(stats, completedAt = null, uploadMs = 0) {
+  if (!stats) return;
+  const now = typeof performance !== 'undefined' && performance.now
+    ? performance.now() : Date.now();
+  const presentationGapMs = stats.lastPresentedAt === null
+    ? null : now - stats.lastPresentedAt;
+  if (stats.lastPresentedAt !== null) {
+    stats.recentPresentationGaps.push(presentationGapMs);
+    if (stats.recentPresentationGaps.length > 256) {
+      stats.recentPresentationGaps.shift();
+    }
+  }
+  const completionGapMs = completedAt === null ||
+      stats.lastPresentedCompletionAt === null
+    ? null : completedAt - stats.lastPresentedCompletionAt;
+  stats.recentFrameTimings.push({
+    completedAt,
+    presentedAt: now,
+    completionGapMs,
+    presentationGapMs,
+    queueMs: completedAt === null ? null : now - completedAt,
+    uploadMs,
+  });
+  if (stats.recentFrameTimings.length > 256) {
+    stats.recentFrameTimings.shift();
+  }
+  if (completedAt !== null) stats.lastPresentedCompletionAt = completedAt;
+  stats.lastPresentedAt = now;
+  stats.presented += 1;
 }
 
 function presentSoftSurface(jvm, comp) {
@@ -134,38 +296,83 @@ function presentSoftSurface(jvm, comp) {
     comp._presentImageData = null;
     comp._presentPixels32 = null;
   }
-  const context = canvas.getContext('2d');
-  if (!context) return false;
-  if (!comp._presentImageData || comp._presentImageData.width !== width ||
-      comp._presentImageData.height !== height) {
-    comp._presentImageData = context.createImageData(width, height);
-    comp._presentPixels32 = new Uint32Array(comp._presentImageData.data.buffer);
-  }
   const started = typeof performance !== 'undefined' && performance.now
     ? performance.now() : Date.now();
-  const output = comp._presentPixels32;
   const count = Math.min(width * height, pixels.length);
   const stats = presentationStats(jvm);
-  const usedWasmSwizzle = swizzleRgbToImageData(output, pixels, count);
-  if (usedWasmSwizzle) {
-    if (stats) stats.wasmSwizzles += 1;
-  } else {
-    if (stats) stats.jsSwizzles += 1;
-    for (let index = 0; index < count; index += 1) {
-      const rgb = Number(pixels[index]) >>> 0;
-      // ImageData is RGBA bytes. On little-endian browser platforms its
-      // Uint32 representation is AABBGGRR.
-      output[index] = (0xff000000 | (rgb & 0xff) << 16 |
-        rgb & 0xff00 | rgb >>> 16 & 0xff) >>> 0;
+  const source = pixels && pixels.elements ? pixels.elements : pixels;
+  let context = null;
+  let usedWebGl = false;
+  if (jvm?.awtWebGlPresentation && count === width * height &&
+      ArrayBuffer.isView(source)) {
+    if (comp._presentWebGl === undefined) {
+      // Claim the visible canvas before any 2D context does. This publishes
+      // the one complete software framebuffer directly, avoiding a second
+      // full-canvas GPU-to-2D copy after the texture upload.
+      comp._presentWebGl = createWebGlPresenter(width, height, canvas) || null;
+    }
+    try {
+      if (comp._presentWebGl && comp._presentWebGl.direct !== true) {
+        context = canvas.getContext('2d');
+      }
+      usedWebGl = Boolean(comp._presentWebGl?.present(
+        context, source, count, width, height));
+    } catch (_) {
+      comp._presentWebGl = null;
+    }
+
+    // A canvas that was already claimed by 2D cannot also host WebGL. Keep
+    // the exact prior offscreen presenter as a compatibility fallback.
+    if (!usedWebGl && comp._presentWebGl === null) {
+      context = context || canvas.getContext('2d');
+      if (context) {
+        comp._presentWebGl = createWebGlPresenter(width, height) || null;
+        try {
+          usedWebGl = Boolean(comp._presentWebGl?.present(
+            context, source, count, width, height));
+        } catch (_) {
+          comp._presentWebGl = null;
+        }
+      }
     }
   }
-  context.putImageData(comp._presentImageData, 0, 0);
+  if (usedWebGl) {
+    if (stats) stats.webGlPresentations += 1;
+    if (stats && comp._presentWebGl?.direct === true) {
+      stats.webGlDirectPresentations += 1;
+    }
+  } else {
+    if (jvm?.awtWebGlPresentation && stats) stats.webGlFallbacks += 1;
+    context = context || canvas.getContext('2d');
+    if (!context) return false;
+    if (!comp._presentImageData || comp._presentImageData.width !== width ||
+        comp._presentImageData.height !== height) {
+      comp._presentImageData = context.createImageData(width, height);
+      comp._presentPixels32 = new Uint32Array(comp._presentImageData.data.buffer);
+    }
+    const output = comp._presentPixels32;
+    const usedWasmSwizzle = swizzleRgbToImageData(output, pixels, count);
+    if (usedWasmSwizzle) {
+      if (stats) stats.wasmSwizzles += 1;
+    } else {
+      if (stats) stats.jsSwizzles += 1;
+      for (let index = 0; index < count; index += 1) {
+        const rgb = Number(pixels[index]) >>> 0;
+        // ImageData is RGBA bytes. On little-endian browser platforms its
+        // Uint32 representation is AABBGGRR.
+        output[index] = (0xff000000 | (rgb & 0xff) << 16 |
+          rgb & 0xff00 | rgb >>> 16 & 0xff) >>> 0;
+      }
+    }
+    context.putImageData(comp._presentImageData, 0, 0);
+  }
   comp._presentedVersion = comp._pixelsVersion;
   if (stats) {
     const ended = typeof performance !== 'undefined' && performance.now
       ? performance.now() : Date.now();
-    stats.presented += 1;
-    stats.uploadMs += ended - started;
+    const uploadMs = ended - started;
+    recordPresentation(stats, comp._lastCompletedAt ?? null, uploadMs);
+    stats.uploadMs += uploadMs;
   }
   return true;
 }
@@ -173,9 +380,21 @@ function presentSoftSurface(jvm, comp) {
 function markSoftSurfaceDirty(jvm, comp, thread = null) {
   if (!comp) return;
   if (jvm && thread) jvm._awtFrameProducerThread = thread;
+  const completedAt = typeof performance !== 'undefined' && performance.now
+    ? performance.now() : Date.now();
+  comp._lastCompletedAt = completedAt;
   comp._pixelsVersion = (comp._pixelsVersion || 0) + 1;
   const stats = presentationStats(jvm);
-  if (stats) stats.dirtyMarks += 1;
+  if (stats) {
+    if (stats.lastCompletedAt !== null) {
+      stats.recentCompletionGaps.push(completedAt - stats.lastCompletedAt);
+      if (stats.recentCompletionGaps.length > 256) {
+        stats.recentCompletionGaps.shift();
+      }
+    }
+    stats.lastCompletedAt = completedAt;
+    stats.dirtyMarks += 1;
+  }
   if (!comp._canvasElement || typeof requestAnimationFrame !== 'function') {
     // Headless jvm.js has no browser upload, but a completed software frame is
     // still an observable presentation boundary. Coalesce all publications in
@@ -191,7 +410,7 @@ function markSoftSurfaceDirty(jvm, comp, thread = null) {
     setImmediate(() => {
       comp._presentScheduled = false;
       comp._presentedVersion = comp._pixelsVersion;
-      if (stats) stats.presented += 1;
+      recordPresentation(stats, comp._lastCompletedAt ?? null);
     });
     return;
   }
@@ -206,17 +425,22 @@ function markSoftSurfaceDirty(jvm, comp, thread = null) {
     return;
   }
   comp._presentScheduled = true;
+  if (jvm) {
+    jvm._awtPendingPresentationCount =
+      (jvm._awtPendingPresentationCount || 0) + 1;
+  }
   const presentationToken = (comp._presentToken || 0) + 1;
   comp._presentToken = presentationToken;
   if (stats) stats.scheduled += 1;
-  let fallbackTimer = null;
-  const present = (fallback) => {
+  const present = () => {
     if (!comp._presentScheduled || comp._presentToken !== presentationToken) {
       return;
     }
     comp._presentScheduled = false;
-    if (fallbackTimer !== null) clearTimeout(fallbackTimer);
-    if (fallback && stats) stats.presentationFallbacks += 1;
+    if (jvm) {
+      jvm._awtPendingPresentationCount = Math.max(0,
+        (jvm._awtPendingPresentationCount || 0) - 1);
+    }
     presentSoftSurface(jvm, comp);
     if (jvm) {
       jvm._awtDroppedFrameBacklog = 0;
@@ -230,16 +454,11 @@ function markSoftSurfaceDirty(jvm, comp, thread = null) {
       }
     }
   };
-  requestAnimationFrame(() => present(false));
-  // Firefox can indefinitely defer requestAnimationFrame while a JVM keeps a
-  // MessageChannel queue continuously runnable. Never leave the coalescing
-  // latch stuck in that state: a timer task publishes the latest completed
-  // surface if the next animation opportunity does not arrive promptly.
-  if (typeof setTimeout === 'function') {
-    const yieldMs = Math.max(1, Number(jvm && jvm.eventLoopYieldMs) || 16);
-    const fallbackMs = Math.max(17, Math.min(33, yieldMs + 4));
-    fallbackTimer = setTimeout(() => present(true), fallbackMs);
-  }
+  // A browser-visible frame exists only at an animation opportunity. The JVM
+  // scheduler observes _awtPendingPresentationCount and parks at its next
+  // safe point, so Firefox gets that opportunity without a timer pretending
+  // that an upload was displayed.
+  requestAnimationFrame(present);
 }
 
 function colorToRgb(colorObj) {

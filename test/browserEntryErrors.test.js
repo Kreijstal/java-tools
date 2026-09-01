@@ -86,3 +86,43 @@ test('browser run errors retain host stacks and deepest guest locations', async 
   }
   t.end();
 });
+
+test('browser run preparation targets the reset JVM before guest entry',
+  async (t) => {
+  const events = [];
+  const resetJvm = {
+    async run(className, options) {
+      events.push(['run', className, options]);
+    },
+  };
+  const debug = Object.create(BrowserJVMDebug.prototype);
+  debug.isReady = true;
+  debug.debugController = {
+    executionState: 'stopped',
+    jvm: {stale: true},
+    reset() {
+      events.push(['reset']);
+      this.jvm = resetJvm;
+    },
+  };
+  const beforeRun = async ({jvm, debugController}) => {
+    events.push(['prepare', jvm, debugController]);
+  };
+
+  await debug.run('Prepared.class', {
+    classpath: ['/classes'],
+    beforeRun,
+  });
+
+  t.equal(events[0][0], 'reset', 'the session resets first');
+  t.equal(events[1][0], 'prepare', 'preparation runs before guest entry');
+  t.equal(events[1][1], resetJvm,
+    'preparation receives the JVM that will execute');
+  t.equal(events[1][2], debug.debugController,
+    'preparation receives its owning controller');
+  t.deepEqual(events[2], ['run', 'Prepared', {classpath: ['/classes']}],
+    'the lifecycle callback is not forwarded as a JVM run option');
+  t.equal(debug.debugController.executionState, 'stopped',
+    'successful execution restores the stopped state');
+  t.end();
+});

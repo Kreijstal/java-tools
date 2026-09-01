@@ -580,3 +580,39 @@ test('a deferred callee is retried only when its blockers move or after backoff'
   t.ok(jit.calleeRetryAllowed(anon), 'at backoff epoch: retry');
   t.end();
 });
+
+test('a call dependency retains the deferred callee root cause', (t) => {
+  const WasmJit = require('../src/jit/WasmJit');
+  const method = {
+    name: 'make',
+    descriptor: '()Ljava/lang/Object;',
+    flags: ['static'],
+  };
+  const state = new WeakMap([[method, {
+    status: 'cold',
+    calleeBlockers: ['example/Allocated'],
+  }]]);
+  const jit = {
+    jvm: {
+      classes: {
+        'example/Factory': {
+          ast: {classes: [{items: [
+            {type: 'method', method},
+            {type: 'method', method: {name: '<clinit>', descriptor: '()V'}},
+          ]}]},
+        },
+      },
+      classInitializationState: new Map([
+        ['example/Factory', 'INITIALIZED'],
+      ]),
+    },
+    state,
+  };
+  const blockers = WasmJit.prototype.methodLinkBlockers.call(
+    jit, 'example/Factory', 'make', '()Ljava/lang/Object;');
+  t.deepEqual(blockers, [
+    'example/Factory.make()Ljava/lang/Object;',
+    'example/Allocated',
+  ], 'the method identity and its concrete class dependency are both retained');
+  t.end();
+});

@@ -1,4 +1,8 @@
-const { hasField } = require('../../../core/objectModel');
+const {
+  hasField, enumerateFieldKeys,
+  readField: readObjectField,
+  writeField: writeObjectField,
+} = require('../../../core/objectModel');
 const unsafe = {
   type: 'sun/misc/Unsafe',
 };
@@ -90,15 +94,15 @@ function readField(base, offset) {
   for (const key of candidates) {
     if (base && Object.prototype.hasOwnProperty.call(base, key)) return base[key];
     if (base && base.fields && hasField(base.fields, key)) {
-      return base.fields[key];
+      return readObjectField(base.fields, key);
     }
   }
   if (base && base.fields) {
     const suffix = `.${field.data.name}`;
     const descriptorSuffix = `${suffix}:${field.data.descriptor}`;
-    const key = Object.keys(base.fields).find((candidate) =>
+    const key = enumerateFieldKeys(base.fields).find((candidate) =>
       candidate.endsWith(suffix) || candidate.endsWith(descriptorSuffix));
-    if (key !== undefined) return base.fields[key];
+    if (key !== undefined) return readObjectField(base.fields, key);
   }
   return undefined;
 }
@@ -119,16 +123,16 @@ function writeField(jvm, base, offset, value) {
       return;
     }
     if (base && base.fields && hasField(base.fields, key)) {
-      base.fields[key] = value;
+      writeObjectField(base.fields, key, value);
       return;
     }
   }
   if (base && base.fields) {
     const suffix = `.${field.data.name}`;
     const descriptorSuffix = `${suffix}:${field.data.descriptor}`;
-    const key = Object.keys(base.fields).find((candidate) =>
+    const key = enumerateFieldKeys(base.fields).find((candidate) =>
       candidate.endsWith(suffix) || candidate.endsWith(descriptorSuffix));
-    base.fields[key === undefined ? candidates[2] : key] = value;
+    writeObjectField(base.fields, key === undefined ? candidates[2] : key, value);
     return;
   }
   base[field.data.name] = value;

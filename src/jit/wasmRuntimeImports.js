@@ -21,6 +21,7 @@ const {
 const monoArray = require('./monoArray');
 const {
   instanceFieldTemplate, makeObjectRef, slabLayoutFor, makeSlabFields,
+  denseLayoutFor, denseSlotFor, makeDenseFields, readField, writeField,
 } = require('../core/objectModel');
 const {
   normalizeArrayLoad,
@@ -321,6 +322,7 @@ function addFieldImport(reg, jvm, ins, isStaticOp, isGet, elementOf = null) {
   }
   const name = `${isGet ? 'gf' : 'pf'}${elementOf ? 'at' : ''}_${className}_${fieldName}`
     .replace(/[^\w]/g, '_');
+  const denseSlot = denseSlotFor(jvm, className, fieldName, descriptor);
   const keyCache = new Map();
   // Storage key per receiver class, indexed by the object's dense class index
   // (see classIndexOf): an array read, no string leaves the guest object on
@@ -353,11 +355,25 @@ function addFieldImport(reg, jvm, ins, isStaticOp, isGet, elementOf = null) {
     }
   };
   const readInstance = (obj) => {
+    if (Array.isArray(obj.fields)) {
+      return Number.isInteger(denseSlot)
+        ? obj.fields[denseSlot]
+        : readField(obj.fields, resolveKey(obj));
+    }
     const key = resolveKey(obj);
     if (obj.fields) return obj.fields[key];
     return obj[key] ?? obj[fieldName];
   };
   const writeInstance = (obj, value) => {
+    if (Array.isArray(obj.fields)) {
+      if (value === undefined) {
+        throw new Error(`Cannot store undefined in JVM instance field ` +
+          `${className}.${fieldName}`);
+      }
+      if (Number.isInteger(denseSlot)) obj.fields[denseSlot] = value;
+      else writeField(obj.fields, resolveKey(obj), value);
+      return;
+    }
     const key = resolveKey(obj);
     if (obj.fields) {
       obj.fields[key] = value;
@@ -380,7 +396,11 @@ function addFieldImport(reg, jvm, ins, isStaticOp, isGet, elementOf = null) {
         const value = readInstance(obj);
         return typeof value === 'boolean' ? (value ? 1 : 0) : value;
       }
-      const value = fields[keyByIndex[obj.cidx] ?? resolveKey(obj)];
+      const value = Array.isArray(fields)
+        ? Number.isInteger(denseSlot)
+          ? fields[denseSlot]
+          : readField(fields, resolveKey(obj))
+        : fields[keyByIndex[obj.cidx] ?? resolveKey(obj)];
       return typeof value === 'boolean' ? (value ? 1 : 0) : value;
     }
     : t === T.ref
@@ -404,7 +424,11 @@ function addFieldImport(reg, jvm, ins, isStaticOp, isGet, elementOf = null) {
           const value = readInstance(obj);
           return typeof value === 'boolean' ? (value ? 1 : 0) : value;
         }
-        const value = fields[keyByIndex[obj.cidx] ?? resolveKey(obj)];
+        const value = Array.isArray(fields)
+          ? Number.isInteger(denseSlot)
+            ? fields[denseSlot]
+            : readField(fields, resolveKey(obj))
+          : fields[keyByIndex[obj.cidx] ?? resolveKey(obj)];
         return typeof value === 'boolean' ? (value ? 1 : 0) : value;
       };
     return {
@@ -485,13 +509,16 @@ function addNewImport(reg, jvm, className) {
   }
   // Default field map precomputed once at compile time (the hierarchy above
   // an initialized class is loaded and immutable); each allocation clones it.
-  const layout = slabLayoutFor(jvm, className);
-  const template = layout ? null : instanceFieldTemplate(jvm, className);
+  const denseLayout = denseLayoutFor(jvm, className);
+  const layout = denseLayout ? null : slabLayoutFor(jvm, className);
+  const template = denseLayout || layout ? null : instanceFieldTemplate(jvm, className);
   const name = `new_${className}`.replace(/[^\w]/g, '_');
   return reg.addImport(name, [], [T.ref], () => makeObjectRef(jvm, className,
-    layout
-      ? (makeSlabFields(jvm, layout) || instanceFieldTemplate(jvm, className))
-      : { ...template }));
+    denseLayout
+      ? makeDenseFields(denseLayout)
+      : layout
+        ? (makeSlabFields(jvm, layout) || instanceFieldTemplate(jvm, className))
+        : { ...template }));
 }
 
 // System time natives — like Math intrinsics they can never be compiled (JS

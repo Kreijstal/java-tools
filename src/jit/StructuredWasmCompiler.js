@@ -160,7 +160,7 @@ class StructuredWasmCompiler {
     if (this.importIndexByName.has(name)) return this.importIndexByName.get(name);
     const idx = this.importDecls.length;
     let wrapped = fn;
-    if (process.env.JVM_WASM_IMPORT_STATS === '1') {
+    if (this.wasmJit.importStatsEnabled) {
       if (!this.importStats) this.importStats = new Map();
       const stats = this.importStats;
       const inner = wrapped;
@@ -383,6 +383,7 @@ class StructuredWasmCompiler {
     const treeBlocks = collectTreeBlocks(structured.tree);
     this.demoted = new Map();
     this.demoteBlockers = new Set();
+    this.demoteBlockersByBlock = new Map();
     if (this.liveRanges.length && !this.ehMethod) {
       for (const id of treeBlocks) {
         const insns = cfg.blocks[id].insns;
@@ -402,7 +403,11 @@ class StructuredWasmCompiler {
       } catch (err) {
         if (!(err instanceof Unsupported)) throw err;
         this.demoted.set(id, err.message);
-        for (const blocker of blockedNames(err)) {
+        const blockBlockers = blockedNames(err);
+        if (blockBlockers.length) {
+          this.demoteBlockersByBlock.set(id, new Set(blockBlockers));
+        }
+        for (const blocker of blockBlockers) {
           this.demoteBlockers.add(blocker);
         }
       }
@@ -426,7 +431,13 @@ class StructuredWasmCompiler {
       }
     }
     if (this.demoted.has(cfg.entry)) {
-      throw new Unsupported(`entry demoted: ${this.demoted.get(cfg.entry)}`);
+      // The entry cannot become a partial exit stub, so the whole structured
+      // candidate is rejected. Preserve the entry block's dependency metadata
+      // with that rejection: retaining only its human-readable reason loses
+      // the class/method transition that can make a later translation work.
+      const blockers = this.demoteBlockersByBlock.get(cfg.entry);
+      throw new Unsupported(`entry demoted: ${this.demoted.get(cfg.entry)}`,
+        blockers && blockers.size ? [...blockers] : null);
     }
 
     const body = [];
@@ -1783,10 +1794,9 @@ class StructuredWasmCompiler {
     const calleeSt = this.wasmJit &&
       this.wasmJit.findReadyStatic(className, name, descriptor, true);
     const linked = calleeSt && (calleeSt.callee || calleeSt);
-    // Named by method key, not class: see the matching site in WasmJit.
     if (!linked) {
       throw new Unsupported(`invoke ${className}.${name} callee not ready`,
-        `${className}.${name}${descriptor}`);
+        this.wasmJit.methodLinkBlockers(className, name, descriptor));
     }
     // java arg slot -> position in the wasm arg list
     const argPosBySlot = new Map();
@@ -1902,7 +1912,7 @@ class StructuredWasmCompiler {
       const st = this.wasmJit.findReadyInstance(implClassName, name, descriptor);
       if (!st) {
         throw new Unsupported(`invoke ${owner}.${name} impl ${implClassName} not ready`,
-          implKey(implClassName));
+          this.wasmJit.methodLinkBlockers(implClassName, name, descriptor));
       }
       const m = (st.callee || st).meta;
       if (st.linkVetoed && !m.fullyCompiled) {

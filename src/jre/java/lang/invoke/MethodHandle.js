@@ -1,6 +1,9 @@
 const Frame = require("../../../../core/frame");
 const { ASYNC_METHOD_SENTINEL } = require("../../../../core/constants");
 const { withThrows } = require('../../../helpers');
+const {
+  hasField, readField, writeField,
+} = require('../../../../core/objectModel');
 
 function javaStringValue(value) {
   if (typeof value === "string") return value;
@@ -102,7 +105,7 @@ module.exports = {
           if (instance && instance.fields) {
             // Try to get field by name if available, otherwise use default
             if (methodHandle.targetFieldName) {
-              return instance.fields[methodHandle.targetFieldName] || 0;
+              return readField(instance.fields, methodHandle.targetFieldName) || 0;
             }
             return instance.fields.testField || 0;
           }
@@ -118,7 +121,7 @@ module.exports = {
           if (instance && instance.fields) {
             // Try to set field by name if available, otherwise use default
             if (methodHandle.targetFieldName) {
-              instance.fields[methodHandle.targetFieldName] = value;
+              writeField(instance.fields, methodHandle.targetFieldName, value);
             } else {
               instance.fields.testField = value;
             }
@@ -210,8 +213,8 @@ module.exports = {
 
       if (handle.kind === "getField") {
         const fieldKey = `${handle.targetClass}.${handle.targetFieldName}`;
-        const value = arg && arg.fields && Object.prototype.hasOwnProperty.call(arg.fields, fieldKey)
-          ? arg.fields[fieldKey]
+        const value = arg && arg.fields && hasField(arg.fields, fieldKey)
+          ? readField(arg.fields, fieldKey)
           : arg && arg.fields
             ? arg.fields[handle.targetFieldName]
             : undefined;

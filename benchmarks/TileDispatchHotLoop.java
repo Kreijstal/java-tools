@@ -147,6 +147,11 @@ public final class TileDispatchHotLoop {
     }
 
     static int sink;
+    // Machine-readable results for the browser harness. Console output stays
+    // unchanged for the Node/HotSpot benchmark, while the browser can inspect
+    // these fields without timing terminal rendering or parsing guest output.
+    static int[] measuredNanos;
+    static int[] measuredChecksums;
 
     public static int runArith(int iterations, int seed) {
         int value = seed;
@@ -227,6 +232,9 @@ public final class TileDispatchHotLoop {
         int rounds = args.length > 1 ? Integer.parseInt(args[1]) : 5;
         int warmups = args.length > 2 ? Integer.parseInt(args[2]) : 3;
         String[] names = {"arith", "iface", "poly", "tile"};
+        measuredNanos = new int[names.length * rounds];
+        measuredChecksums = new int[names.length * rounds];
+        int measured = 0;
         for (String name : names) {
             for (int round = 0; round < warmups + rounds; round++) {
                 long started = System.nanoTime();
@@ -239,6 +247,8 @@ public final class TileDispatchHotLoop {
                             : runTile(iterations, 12345);
                 long elapsed = System.nanoTime() - started;
                 if (round >= warmups) {
+                    measuredNanos[measured] = (int) elapsed;
+                    measuredChecksums[measured++] = checksum;
                     System.out.println("RESULT " + name + " " + round + " "
                         + elapsed + " " + checksum);
                 }

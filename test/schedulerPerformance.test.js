@@ -69,10 +69,10 @@ test('dropped guest frames convert a scheduler yield into a paint opportunity',
     global.requestAnimationFrame = () => 1;
     global.document = {};
     const painting = new JVM({ eventLoopYieldStrategy: 'message-channel' });
-    painting._awtDroppedFrameBacklog = 4;
+    painting._awtPendingPresentationCount = 1;
     t.equal(painting._hostYieldStrategy(), 'presentation',
       'a painting host parks the guest until the pending frame is presented');
-    painting._awtDroppedFrameBacklog = 0;
+    painting._awtPendingPresentationCount = 0;
     t.equal(painting._hostYieldStrategy(), 'message-channel',
       'no completed frame means there is no synthetic presentation wait');
     if (previousRaf === undefined) delete global.requestAnimationFrame;

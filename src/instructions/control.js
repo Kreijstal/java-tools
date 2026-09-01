@@ -37,8 +37,10 @@ function returnParentFor(frame, thread) {
   // or identity, and deleting them de-shapes a frame that the JIT recycles.
   frame.jitGeneratedReturnParent = undefined;
   frame.jitGeneratedReturnType = undefined;
-  const parent = explicit && thread.callStack.items.includes(explicit)
-    ? explicit : thread.callStack.isEmpty() ? null : thread.callStack.peek();
+  // Omitted generated parents remain the semantic operand owner even while a
+  // restoring positional path has them outside the physical call stack.
+  const parent = explicit ||
+    (thread.callStack.isEmpty() ? null : thread.callStack.peek());
   if (frame.jitFrameHandoffTrace) {
     console.error('[jvm-frame-handoff-return] ' + JSON.stringify({
       ...frame.jitFrameHandoffTrace, tier: 'interpreted',

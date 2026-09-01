@@ -1264,7 +1264,7 @@ test('AWT producer images publish only completed consumer frames', (t) => {
   t.end();
 });
 
-test('AWT presentation recovers when an animation callback is starved', (t) => {
+test('AWT presentation is counted only at an animation opportunity', (t) => {
   const previousRaf = global.requestAnimationFrame;
   const callbacks = [];
   global.requestAnimationFrame = (callback) => {
@@ -1297,24 +1297,26 @@ test('AWT presentation recovers when an animation callback is starved', (t) => {
   draw(jvm, graphics, [image, 0, 0, null]);
   t.equal(callbacks.length, 1,
     'one animation callback owns the coalesced frame');
-  setTimeout(() => {
-    t.equal(uploads.length, 1,
-      'the fallback timer uploads the latest completed surface');
-    t.equal(jvm._awtPresentationStats.presented, 1,
-      'the recovered upload is counted as a presentation');
-    t.equal(jvm._awtPresentationStats.presentationFallbacks, 1,
-      'diagnostics identify the starved-animation recovery');
-    t.notOk(target._presentScheduled,
-      'the fallback clears the coalescing latch');
-    // A late callback from the starved queue must not upload twice or clear a
-    // newer presentation token.
-    callbacks.shift()(0);
-    t.equal(uploads.length, 1,
-      'the late animation callback is harmless');
-    if (previousRaf === undefined) delete global.requestAnimationFrame;
-    else global.requestAnimationFrame = previousRaf;
-    t.end();
-  }, 60);
+  t.equal(uploads.length, 0,
+    'a timer does not claim that the browser displayed a frame');
+  t.equal(jvm._awtPendingPresentationCount, 1,
+    'the scheduler can observe the complete frame awaiting display');
+  callbacks.shift()(0);
+  t.equal(uploads.length, 1,
+    'the animation opportunity uploads the complete surface');
+  t.equal(jvm._awtPresentationStats.presented, 1,
+    'only the animation upload is counted as a presentation');
+  t.equal(jvm._awtPendingPresentationCount, 0,
+    'the displayed frame clears pending presentation backpressure');
+  t.equal(jvm._awtPresentationStats.recentFrameTimings.length, 1,
+    'the complete frame records its presentation timing');
+  t.ok(jvm._awtPresentationStats.recentFrameTimings[0].queueMs >= 0,
+    'the timing separates completed-frame queue time from upload time');
+  t.notOk(target._presentScheduled,
+    'the animation callback clears the coalescing latch');
+  if (previousRaf === undefined) delete global.requestAnimationFrame;
+  else global.requestAnimationFrame = previousRaf;
+  t.end();
 });
 
 test('headless AWT blits expose an uncapped coalesced presentation boundary', (t) => {
@@ -1397,6 +1399,120 @@ test('AWT full-frame presentation uses exact Wasm RGB swizzle', (t) => {
     'large presentation records the Wasm swizzle path');
   t.equal(jvm._awtPresentationStats.jsSwizzles, 0,
     'large presentation does not execute the scalar JS converter');
+
+  if (previousRaf === undefined) delete global.requestAnimationFrame;
+  else global.requestAnimationFrame = previousRaf;
+  t.end();
+});
+
+test('AWT can publish one complete typed frame through a GPU presenter', (t) => {
+  const previousRaf = global.requestAnimationFrame;
+  const callbacks = [];
+  global.requestAnimationFrame = (callback) => {
+    callbacks.push(callback);
+    return callbacks.length;
+  };
+  const width = 256;
+  const height = 256;
+  const count = width * height;
+  const sourcePixels = new Int32Array(count);
+  sourcePixels[0] = 0x010203;
+  sourcePixels[count - 1] = 0xfedcba;
+  let gpuInput = null;
+  let imageDataUploads = 0;
+  let draws = 0;
+  const context = {
+    createImageData(w, h) {
+      return {width: w, height: h, data: new Uint8ClampedArray(w * h * 4)};
+    },
+    putImageData() { imageDataUploads += 1; },
+    drawImage() { draws += 1; },
+  };
+  const target = {
+    _width: width,
+    _height: height,
+    _canvasElement: {width, height, getContext: () => context},
+    _presentWebGl: {
+      present(targetContext, source, presentedCount, w, h) {
+        gpuInput = {targetContext, source, presentedCount, w, h};
+        targetContext.drawImage({complete: true}, 0, 0, w, h);
+        return true;
+      },
+    },
+  };
+  const jvm = {awtWebGlPresentation: true};
+  const graphics = {_component: target};
+  const image = completedConsumerImage(width, height, sourcePixels);
+  const draw = Graphics.methods[
+    'drawImage(Ljava/awt/Image;IILjava/awt/image/ImageObserver;)Z'];
+
+  t.equal(draw(jvm, graphics, [image, 0, 0, null]), 1);
+  callbacks.shift()(0);
+  t.equal(gpuInput.source, target._pixels,
+    'the GPU receives the complete stable publication buffer');
+  t.equal(gpuInput.presentedCount, count,
+    'the GPU publication covers every framebuffer pixel');
+  t.equal(draws, 1, 'one completed GPU surface is copied to the visible canvas');
+  t.equal(imageDataUploads, 0,
+    'the GPU path avoids the CPU-swizzled ImageData upload');
+  t.equal(jvm._awtPresentationStats.webGlPresentations, 1,
+    'the completed GPU presentation is observable');
+  t.equal(jvm._awtPresentationStats.presented, 1,
+    'the GPU frame keeps the ordinary presentation boundary');
+
+  if (previousRaf === undefined) delete global.requestAnimationFrame;
+  else global.requestAnimationFrame = previousRaf;
+  t.end();
+});
+
+test('AWT direct GPU presentation leaves the visible canvas unclaimed by 2D', (t) => {
+  const previousDocument = global.document;
+  const contextRequests = [];
+  global.document = {};
+  const canvas = {
+    getContext(type) {
+      contextRequests.push(type);
+      return null;
+    },
+  };
+  const component = {_canvasElement: canvas};
+  const jvm = new JVM({
+    awtWebGlPresentation: true,
+    jit: {enabled: false},
+  });
+
+  const graphics = jvm.createGraphicsObject(component);
+  t.deepEqual(contextRequests, [],
+    'creating guest Graphics does not acquire the mutually exclusive 2D context');
+  t.equal(graphics._component, component,
+    'guest raster operations remain attached to the software surface');
+  t.notOk(graphics.isMock,
+    'a browser software surface is not mislabeled as a headless mock');
+
+  if (previousDocument === undefined) delete global.document;
+  else global.document = previousDocument;
+  t.end();
+});
+
+test('AWT primitive drawing starts with a Java int-compatible typed surface', (t) => {
+  const previousRaf = global.requestAnimationFrame;
+  global.requestAnimationFrame = () => 1;
+  const target = {
+    _width: 4,
+    _height: 3,
+    _canvasElement: {width: 4, height: 3},
+  };
+  const graphics = {_component: target};
+  Graphics.methods['setColor(Ljava/awt/Color;)V'](
+    {}, graphics, [{value: 0x123456}]);
+  Graphics.methods['fillRect(IIII)V']({}, graphics, [1, 1, 2, 1]);
+
+  t.ok(target._pixels instanceof Int32Array,
+    'the first software raster allocation has Java int[] storage');
+  t.equal(target._pixels[5], 0x123456,
+    'primitive drawing preserves integer RGB pixels');
+  t.equal(target._pixels[6], 0x123456,
+    'the typed surface covers the full primitive span');
 
   if (previousRaf === undefined) delete global.requestAnimationFrame;
   else global.requestAnimationFrame = previousRaf;

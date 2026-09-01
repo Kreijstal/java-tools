@@ -1,5 +1,7 @@
 const { withThrows } = require('../../../helpers');
-const { hasField } = require('../../../../core/objectModel');
+const {
+  hasField, readField, writeField,
+} = require('../../../../core/objectModel');
 
 function declaringClassName(fieldObj) {
   const declaringClass = fieldObj._declaringClass;
@@ -17,7 +19,7 @@ function instanceKey(fieldObj) {
 function getInstanceValue(fieldObj, obj) {
   const key = instanceKey(fieldObj);
   if (obj.fields && hasField(obj.fields, key)) {
-    return obj.fields[key];
+    return readField(obj.fields, key);
   }
   return obj[key] !== undefined ? obj[key] : obj[fieldObj._fieldData.name];
 }
@@ -25,7 +27,7 @@ function getInstanceValue(fieldObj, obj) {
 function setInstanceValue(fieldObj, obj, value) {
   const key = instanceKey(fieldObj);
   if (obj.fields) {
-    obj.fields[key] = value;
+    writeField(obj.fields, key, value);
   } else {
     obj[key] = value;
   }

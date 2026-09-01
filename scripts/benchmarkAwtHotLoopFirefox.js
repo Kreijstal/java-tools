@@ -3,6 +3,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { pathToFileURL } = require('url');
 const { execFileSync } = require('child_process');
 const { firefox } = require('playwright');
 
@@ -44,14 +45,16 @@ function phase(frames, nanos) {
     const page = await browser.newPage({ viewport: { width: 1000, height: 800 } });
     const browserErrors = [];
     page.on('pageerror', (error) => browserErrors.push(error.stack || error.message));
-    await page.setContent('<div id="awt-container"></div>');
-    await page.addScriptTag({ path: bundle });
+    // Loading the bundle as inline text makes webpack's automatic chunk path
+    // fail in Firefox. Use the built page so currentScript has a real URL and
+    // lazy runtime chunks resolve beside jvm-debug.js.
+    await page.goto(pathToFileURL(path.join(root, 'dist', 'index.html')).href);
     const jarBase64 = fs.readFileSync(fixture.jar).toString('base64');
     const started = Date.now();
     await page.evaluate(async (encoded) => {
       const bytes = Uint8Array.from(atob(encoded), (character) => character.charCodeAt(0));
       const file = new File([bytes], 'awt-hotloop.jar', { type: 'application/java-archive' });
-      const debug = new JVMDebug.BrowserJVMDebug();
+      const debug = new window.JVMDebug.BrowserJVMDebug();
       window.jvmDebug = debug;
       await debug.initialize();
       await debug.loadFile(file);

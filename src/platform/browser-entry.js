@@ -264,8 +264,21 @@ class BrowserJVMDebug {
         ? classPath.replace('.class', '')
         : classPath;
 
+      // Some browser applications deliberately spend more time preparing a
+      // freshly reset JVM before the first guest frame is allowed to run.
+      // Expose that lifecycle boundary without making the runtime aware of
+      // any application or workload. The hook receives the exact JVM that
+      // run() will enter; a second reset must never discard its preparation.
+      const { beforeRun, ...runtimeOptions } = options;
+      if (typeof beforeRun === 'function') {
+        await beforeRun({
+          jvm: this.debugController.jvm,
+          debugController: this.debugController,
+        });
+      }
+
       this.debugController.executionState = 'running';
-      await this.debugController.jvm.run(className, options);
+      await this.debugController.jvm.run(className, runtimeOptions);
       this.debugController.executionState = 'stopped';
       return { status: 'completed' };
     } catch (error) {

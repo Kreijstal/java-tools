@@ -637,7 +637,7 @@ test('oversized loop policy selects Wasm by structure, not guest identity', (t) 
     warmupThreshold: 0, oversizedWasmFirstCodeItems: 128,
     wasmRelaxedReferenceReturns: true, wasmStructured: true,
     wasmCheckcast: true, wasmDirectStaticLink: true,
-    wasmDirectInstanceLink: true,
+    wasmDirectInstanceLink: true, wasmImportStats: true,
   } });
   t.equal(lowered.jit.wasmJit.structuredEnabled, true,
     'browser integrations can explicitly enable structured Wasm');
@@ -649,6 +649,8 @@ test('oversized loop policy selects Wasm by structure, not guest identity', (t) 
     'browser integrations can explicitly enable direct static Wasm links');
   t.equal(lowered.jit.wasmJit.directInstanceLinkEnabled, true,
     'browser integrations can explicitly enable guarded instance Wasm links');
+  t.equal(lowered.jit.wasmJit.importStatsEnabled, true,
+    'browser integrations can explicitly enable Wasm import diagnostics');
   t.ok(lowered.jit.isOversizedLoopMethod(shape('loweredThreshold', 128)),
     'browser integrations can lower the structural threshold explicitly');
   t.notOk(lowered.jit.isOversizedLoopMethod(shape('belowLowered', 127)),
@@ -2605,6 +2607,34 @@ test('deoptimized generated children return to their recorded parent frame', (t)
   t.equal(restoredIntervening.stack.items.length, 0,
     'generated completion also ignores the unrelated top frame');
 
+  thread.callStack.items.splice(
+    thread.callStack.items.indexOf(expectedParent), 1);
+  const omittedGeneratedChild = new Frame(
+    method('omittedGeneratedChild', '()I'));
+  omittedGeneratedChild.className = 'GenericOmittedChild';
+  omittedGeneratedChild.jitGeneratedReturnParent = expectedParent;
+  omittedGeneratedChild.jitGeneratedReturnType = 'int';
+  jvm.jit.finishTryRunFrame(omittedGeneratedChild, thread,
+    'GenericOmittedChild.omittedGeneratedChild()I',
+    { returned: true, value: 13 });
+  t.equal(expectedParent.stack.pop(), 13,
+    'a generated return reaches its temporarily omitted explicit parent');
+  t.equal(restoredIntervening.stack.items.length, 0,
+    'the physical stack top cannot steal an omitted parent return');
+
+  const omittedInterpretedChild = new Frame(
+    method('omittedInterpretedChild', '()I'));
+  omittedInterpretedChild.stack.push(17);
+  omittedInterpretedChild.jitGeneratedReturnParent = expectedParent;
+  omittedInterpretedChild.jitGeneratedReturnType = 'int';
+  thread.callStack.push(omittedInterpretedChild);
+  controlHandlers.ireturn(omittedInterpretedChild, null, jvm, thread);
+  t.equal(expectedParent.stack.pop(), 17,
+    'an interpreted return also reaches an omitted explicit parent');
+  t.equal(restoredIntervening.stack.items.length, 0,
+    'interpreted completion does not use the unrelated physical top');
+  thread.callStack.items.unshift(expectedParent);
+
   for (const [op, value] of [
     ['lreturn', 11n], ['freturn', 1.25], ['dreturn', 2.5],
   ]) {
@@ -3072,6 +3102,22 @@ test('acyclic call-bearing structured bodies retain their scalar entry', (t) => 
   t.ok(observedChild, 'the call-bearing body receives a concrete child Frame');
   t.deepEqual(thread.callStack.items, [parent],
     'the scalar call leaves its parent stack unchanged');
+  observedChild.jitSkipOnce = true;
+  observedChild.jitJsDisabled = true;
+  observedChild.jitAdaptiveEntryCounted = true;
+  observedChild.jitGeneratedReturnParent = parent;
+  observedChild.jitGeneratedReturnType = 'int';
+  t.equal(positional(thread), 23,
+    'the recycled positional Frame remains reusable');
+  for (const property of [
+    'jitSkipOnce', 'jitJsDisabled', 'jitAdaptiveEntryCounted',
+    'jitGeneratedReturnParent', 'jitGeneratedReturnType',
+  ]) {
+    t.equal(Object.hasOwn(observedChild, property), true,
+      `${property} remains an own property to preserve the Frame shape`);
+    t.equal(observedChild[property], undefined,
+      `${property} is cleared without deleting it`);
+  }
   t.end();
 });
 
@@ -4368,6 +4414,12 @@ public final class ColdLinkedStaticLoopHarness {
       pixels[start + index] = color + width;
     }
   }
+  static void increment(int count) {
+    for (int index = 0; index < count; index++) {
+      int value = pixels[index];
+      pixels[index] = value + 1;
+    }
+  }
 }
 `);
   const jvm = new JVM({ classpath, jit: {
@@ -4376,17 +4428,42 @@ public final class ColdLinkedStaticLoopHarness {
     structuredSsa: true,
   } });
   const classData = await jvm.loadClassByName(className);
-  jvm.classInitializationState.set(className, 'INITIALIZED');
   const method = await jvm.findMethodInHierarchy(
     className, 'fill', '(III)V');
-  // Compile before the synthetic test performs <clinit>'s field writes. This
-  // reproduces a hot method discovered while its static targets are cold.
+  // Compile before the owner has initialized or performed <clinit>'s field
+  // writes. This is the lifecycle used by whole-class browser preparation.
   const generated = jvm.jit.structuredSsa.compile(method);
+  const incrementMethod = await jvm.findMethodInHierarchy(
+    className, 'increment', '(I)V');
+  const coldIncrement = jvm.jit.structuredSsa.compile(incrementMethod);
   const sourceText = generated?.jvmRestoringDirectPositionalSource || '';
   t.ok(sourceText.includes('helpers.getStaticSyncAt') &&
       sourceText.includes('ssaEntryStaticValue') &&
       !sourceText.includes('ssaEntryStaticValid'),
   'the scalar entry links cold statics before emitting unconditional uses');
+
+  jvm.classInitializationState.set(className, 'INITIALIZED');
+
+  const incrementPixels = new Array(16).fill(4);
+  incrementPixels.type = '[I';
+  classData.staticFields.set('pixels:[I', incrementPixels);
+  const incrementFrame = new Frame(incrementMethod);
+  incrementFrame.className = className;
+  incrementFrame.locals[0] = 3;
+  const incrementThread = {
+    status: 'runnable', pendingException: null, callStack: new Stack(),
+  };
+  incrementThread.callStack.push(incrementFrame);
+  let incrementError = null;
+  try {
+    coldIncrement(incrementFrame, incrementThread, jvm.jit, false);
+  } catch (error) {
+    incrementError = error;
+  }
+  t.equal(incrementError, null,
+    'a cold-linked array read refreshes storage for a later proven write');
+  t.deepEqual(incrementPixels.slice(0, 5), [5, 5, 5, 4, 4],
+    'the refreshed raw companion preserves every read-then-write result');
 
   const run = (pixels, start, count, color) => {
     classData.staticFields.set('width:I', 8);
@@ -5619,6 +5696,7 @@ public final class HandledReturnHandoffHarness {
     'tier selection does not retain an unsafe positional-only body');
   t.notOk(selected.jvmRestoringDirectPositionalBody,
     'baseline selection keeps the protected caller wholly frame-backed');
+
   t.end();
 });
 
@@ -7185,6 +7263,7 @@ public class ArbitraryAssetWork {
 `);
   const jvm = new JVM({ classpath, jit: {
     warmupThreshold: 0, structuredSsa: true, compiledCallChains: true,
+    ordinaryAdaptiveFramelessPositional: true,
     profileMethods: false, eagerMonomorphicCalls: false,
     structuredPerLoopPollBudgets: true,
     structuredLoopSafePointMaxBudget: 10000,
@@ -7211,6 +7290,24 @@ public class ArbitraryAssetWork {
   t.ok(generated.jvmCompiledCallChain &&
       typeof generated.jvmAdaptivePositionalBody === 'function',
     'non-recursive call-bearing continuations publish a virtual-frame chain ABI');
+  t.ok(generated.jvmAdaptivePositionalOrdinary,
+    'compiled callers retain the ordinary adaptive call-chain ABI');
+  jvm.classes.ArbitraryAssetWork.staticFields.set('sink:I', 0);
+  jvm.classInitializationState.set('ArbitraryAssetWork', 'INITIALIZED');
+  const yieldingFrame = new Frame(method);
+  yieldingFrame.className = 'ArbitraryAssetWork';
+  yieldingFrame.locals[0] = 3;
+  const yieldingStack = new Stack();
+  yieldingStack.push(yieldingFrame);
+  jvm._nextEventLoopYieldAt = 0;
+  const canonicalYield = generated(yieldingFrame, {
+    id: -1, status: 'runnable', callStack: yieldingStack,
+  }, jvm.jit, false);
+  t.ok(canonicalYield.deopt && canonicalYield.transient,
+    'a call-bearing canonical entry observes the expired host quantum');
+  t.ok(generated.jvmHasStructuredContinuation(yieldingFrame),
+    'the canonical entry retains structured state instead of stranding the frame in baseline resume code');
+  jvm._nextEventLoopYieldAt = Date.now() + 60000;
   t.notOk(generated.jvmStructuredSource.includes(
     'if (helpers.continueStructuredQuantum(thread)) { safePointBudget = 10000;'),
   'generated source does not retain the old fixed 10k-backedge deadline check');
@@ -7220,8 +7317,6 @@ public class ArbitraryAssetWork {
   };
   jvm.threads = [thread];
   jvm.currentThreadIndex = 0;
-  jvm.classes.ArbitraryAssetWork.staticFields.set('sink:I', 0);
-  jvm.classInitializationState.set('ArbitraryAssetWork', 'INITIALIZED');
   const originalTryInvoke = jvm.jit.tryInvokeSyncAt.bind(jvm.jit);
   let canonicalCalls = 0;
   jvm.jit.tryInvokeSyncAt = (...args) => {
@@ -7357,6 +7452,8 @@ public final class ArbitraryCompiledCallChain {
     warmupThreshold: 0,
     structuredSsa: true,
     compiledCallChains: true,
+    ordinaryAdaptiveFramelessPositional: true,
+    ordinaryAdaptiveCallChainSafePointBudget: 1000000,
     profileMethods: false,
   } });
   const classData = await jvm.loadClassByName(className);
@@ -7382,6 +7479,14 @@ public final class ArbitraryCompiledCallChain {
   const values = jvm.jit.newReferenceArray(4, 'java/lang/Object');
   values[0] = { type: 'java/lang/Object', fields: {} };
   values[2] = { type: 'java/lang/Object', fields: {} };
+  jvm._nextEventLoopYieldAt = Date.now() + 60000;
+  const ordinaryRunsBefore = jvm.jit.ordinaryAdaptiveFramelessRunCount;
+  const scanTicks = await invoke(jvm, thread, className, 'scan',
+    '([Ljava/lang/Object;I)I', [values, 2]);
+  t.equal(scanTicks, 1,
+    'a canonical compiled call chain completes in one ordinary activation');
+  t.ok(jvm.jit.ordinaryAdaptiveFramelessRunCount > ordinaryRunsBefore,
+    'the canonical Frame selected the bounded ordinary call-chain tier');
   await invoke(jvm, thread, className, 'repeat',
     '([Ljava/lang/Object;)I', [values]);
   await invoke(jvm, thread, className, 'repeat',
@@ -8947,8 +9052,15 @@ test('structured JVM SSA keeps a bounded wall-clock slice under thread contentio
   const competing = { status: 'runnable' };
   jvm.threads = [current, competing];
   jvm._nextEventLoopYieldAt = Date.now() + 60000;
+  let guestClockReads = 0;
+  jvm.clock.millis = () => {
+    guestClockReads += 1;
+    return Date.now();
+  };
   t.ok(jvm.jit.continueStructuredQuantum(current),
     'another runnable Java thread does not force scalar-state materialization');
+  t.equal(guestClockReads, 0,
+    'a disabled guest clock does not duplicate the wall-clock read');
 
   jvm.threads[1] = { status: 'SLEEPING', sleepUntil: Date.now() - 1 };
   t.notOk(jvm.jit.continueStructuredQuantum(current),
@@ -9586,6 +9698,268 @@ test('structured callers feed a deoptimized non-void child return into SSA', (t)
   t.end();
 });
 
+test('retained structured continuations precede stale interpreter-step requests',
+  (t) => {
+  const jvm = new JVM({ jit: {
+    warmupThreshold: 0, structuredSsa: true,
+  } });
+  const caller = {
+    name: 'callerWithRetainedContinuation', descriptor: '(I)I',
+    flags: ['static'],
+    attributes: [{ type: 'code', code: {
+      codeItems: [
+        { instruction: 'iload_0' },
+        { instruction: {
+          op: 'invokestatic',
+          arg: ['Method', 'ArbitraryContinuationOwner', ['member', '(I)I']],
+        } },
+        { instruction: 'istore_1' },
+        { instruction: 'iconst_0' },
+        { instruction: 'istore_2' },
+        { labelDef: 'LcontinuationLoop:', instruction: 'iload_2' },
+        { instruction: 'iconst_1' },
+        { instruction: { op: 'if_icmpge', arg: 'LcontinuationReturn' } },
+        { instruction: { op: 'iinc', varnum: 2, incr: 1 } },
+        { instruction: { op: 'goto', arg: 'LcontinuationLoop' } },
+        { labelDef: 'LcontinuationReturn:', instruction: 'iload_1' },
+        { instruction: 'iconst_1' },
+        { instruction: 'iadd' },
+        { instruction: 'ireturn' },
+      ],
+      localsSize: '3', stackSize: '2', exceptionTable: [],
+    } }],
+  };
+  const activeChild = new Frame(caller);
+  jvm.jit.tryInvokeSyncAt = (_id, frame, currentThread) => {
+    frame.stack.items.length = 0;
+    currentThread.callStack.push(activeChild);
+    return { deopt: true, transient: true, reason: 'retained child' };
+  };
+  const generated = jvm.jit.structuredSsa.compile(caller);
+  const stableEntry = {jit: jvm.jit, generated};
+  jvm.jit.stableGeneratedEntries.set(caller, stableEntry);
+  const frame = new Frame(caller);
+  frame.className = 'RetainedStructuredCaller';
+  frame.jitStableGeneratedEntry = stableEntry;
+  frame.locals[0] = 41;
+  const callStack = new Stack();
+  callStack.push(frame);
+  const thread = {status: 'runnable', callStack};
+
+  const first = generated(frame, thread, jvm.jit, false);
+  t.equal(first?.reason, 'retained child',
+    'the child suspends the exact structured continuation');
+  t.equal(callStack.pop(), activeChild,
+    'the scheduler-visible child leaves before its parent resumes');
+  frame.stack.push(82);
+  frame.jitSkipOnce = true;
+
+  jvm.jit.tryRunFrame(frame, thread);
+  t.notOk(generated.jvmHasStructuredContinuation(frame),
+    'dispatch resumes and completes the retained iterator');
+  t.ok(callStack.isEmpty(),
+    'the stale interpreter request cannot consume the child operand first');
+  t.notOk(frame.jitSkipOnce,
+    'the superseded one-step request is consumed at the continuation boundary');
+  t.end();
+});
+
+test('structured callers own non-void children left by ordinary call results',
+  (t) => {
+  const jvm = new JVM({ jit: {
+    warmupThreshold: 0, structuredSsa: true,
+  } });
+  const caller = {
+    name: 'callerWithOrdinaryValueAndActiveChild', descriptor: '(I)I',
+    flags: ['static'],
+    attributes: [{ type: 'code', code: {
+      codeItems: [
+        { instruction: 'iload_0' },
+        { instruction: {
+          op: 'invokestatic',
+          arg: ['Method', 'ArbitraryActiveChildOwner', ['member', '(I)I']],
+        } },
+        { instruction: 'istore_1' },
+        { instruction: 'iconst_0' },
+        { instruction: 'istore_2' },
+        { labelDef: 'LactiveChildLoop:', instruction: 'iload_2' },
+        { instruction: 'iconst_1' },
+        { instruction: { op: 'if_icmpge', arg: 'LactiveChildReturn' } },
+        { instruction: { op: 'iinc', varnum: 2, incr: 1 } },
+        { instruction: { op: 'goto', arg: 'LactiveChildLoop' } },
+        { labelDef: 'LactiveChildReturn:', instruction: 'iload_1' },
+        { instruction: 'iconst_1' },
+        { instruction: 'iadd' },
+        { instruction: 'ireturn' },
+      ],
+      localsSize: '3', stackSize: '2', exceptionTable: [],
+    } }],
+  };
+  const activeChild = new Frame(caller);
+  activeChild.className = 'ArbitrarySchedulerVisibleChild';
+  jvm.jit.tryInvokeSyncAt = (_id, frame, currentThread) => {
+    frame.stack.items.length = 0;
+    currentThread.callStack.push(activeChild);
+    return jvm.jit.returnVoid();
+  };
+  const generated = jvm.jit.structuredSsa.compile(caller);
+  t.ok(generated?.jvmStructuredContinuation,
+    'the caller retains a resumable structured body');
+  const frame = new Frame(caller);
+  frame.className = 'ArbitraryStructuredCaller';
+  frame.locals[0] = 41;
+  const callStack = new Stack();
+  callStack.push(frame);
+  const thread = { status: 'runnable', callStack };
+
+  const first = generated(frame, thread, jvm.jit, false);
+  t.equal(first?.reason, 'structured SSA callee left active child',
+    'the ordinary result cannot bypass its scheduler-visible child');
+  t.equal(activeChild.jitGeneratedReturnParent, frame,
+    'the active child records the retained structured caller');
+  t.equal(activeChild.jitGeneratedReturnType, 'int',
+    'the active child records its non-void return contract');
+
+  t.equal(callStack.pop(), activeChild,
+    'the scheduler-visible child completes before its caller resumes');
+  jvm.jit.finishTryRunFrame(activeChild, thread, null,
+    { returned: true, value: 82 });
+  const resumed = generated(frame, thread, jvm.jit, false);
+  t.equal(resumed.value, 83,
+    'the explicitly routed child result feeds the retained SSA expression');
+  t.ok(callStack.isEmpty(), 'resumed return completes the caller frame');
+  t.end();
+});
+
+test('structured child linking distinguishes a restored caller from its child',
+  (t) => {
+  const jvm = new JVM({ jit: { warmupThreshold: 0 } });
+  const method = {
+    name: 'restoredStructuredCaller', descriptor: '()V', flags: ['static'],
+    attributes: [{ type: 'code', code: {
+      codeItems: [{ instruction: 'return' }],
+      localsSize: '0', stackSize: '1', exceptionTable: [],
+    } }],
+  };
+  const caller = new Frame(method);
+  caller.className = 'ArbitraryRestoredCaller';
+  const child = new Frame(method);
+  child.className = 'ArbitraryStructuredChild';
+  const callStack = new Stack();
+  const thread = { status: 'runnable', callStack };
+  jvm.jit.syncCallSites[1] = {
+    methodName: method.name,
+    descriptor: method.descriptor,
+  };
+
+  callStack.push(child);
+  t.ok(jvm.jit.linkStructuredCallChild(
+    caller, thread, 0, 'int', 1),
+  'a child reached from a frameless caller is linked');
+  t.deepEqual(callStack.items, [caller, child],
+    'the omitted frameless caller is restored directly beneath its child');
+  t.equal(child.jitGeneratedReturnParent, caller,
+    'the restored caller owns the child return');
+
+  child.jitGeneratedReturnParent = undefined;
+  child.jitGeneratedReturnType = undefined;
+  callStack.items.length = 0;
+  const initializer = new Frame({
+    ...method, name: '<clinit>', descriptor: '()V',
+  });
+  initializer.className = 'ArbitraryInitializationOwner';
+  callStack.push(initializer);
+  t.notOk(jvm.jit.linkStructuredCallChild(
+    caller, thread, 0, 'int', 1),
+  'a class-initialization frame is not mistaken for the invoked method');
+  t.deepEqual(callStack.items, [initializer],
+    'a cold initialization handoff keeps the caller frameless for invoke replay');
+
+  callStack.items.length = 0;
+  callStack.push(caller);
+  t.notOk(jvm.jit.linkStructuredCallChild(
+    caller, thread, 0, 'int'),
+  'a caller restored at the captured frameless depth is not its own child');
+  callStack.push(child);
+  t.ok(jvm.jit.linkStructuredCallChild(
+    caller, thread, 0, 'int'),
+  'the child shifted above a restored frameless caller is linked');
+  t.equal(child.jitGeneratedReturnParent, caller,
+    'the shifted child returns to the restored caller');
+  t.equal(child.jitGeneratedReturnType, 'int',
+    'the shifted child retains its return contract');
+
+  const framedChild = new Frame(method);
+  framedChild.className = 'ArbitraryFramedChild';
+  callStack.items.length = 1;
+  callStack.push(framedChild);
+  t.ok(jvm.jit.linkStructuredCallChild(
+    caller, thread, 1, 'long'),
+  'a child of an already-framed caller remains at the captured entry depth');
+  t.equal(framedChild.jitGeneratedReturnParent, caller,
+    'the ordinary framed layout keeps its existing return routing');
+
+  const exactChild = new Frame(method);
+  exactChild.className = 'ArbitraryExactChild';
+  const unrelated = new Frame(method);
+  unrelated.className = 'ArbitraryUnrelatedFrame';
+  callStack.items.length = 0;
+  callStack.push(unrelated);
+  callStack.push(exactChild);
+  t.ok(jvm.jit.linkStructuredCallChild(
+    caller, thread, 9, 'double', undefined, exactChild),
+  'an exact positional child is linked even after its captured depth is stale');
+  t.deepEqual(callStack.items, [unrelated, caller, exactChild],
+    'the omitted caller is restored immediately below the exact child');
+  t.equal(exactChild.jitGeneratedReturnParent, caller,
+    'the exact child retains the intended return owner');
+
+  const omittedExactChild = new Frame(method);
+  omittedExactChild.className = 'ArbitraryOmittedExactChild';
+  const visibleDescendant = new Frame(method);
+  visibleDescendant.className = 'ArbitraryVisibleDescendant';
+  visibleDescendant.jitGeneratedReturnParent = omittedExactChild;
+  callStack.items.length = 0;
+  callStack.push(unrelated);
+  callStack.push(visibleDescendant);
+  t.ok(jvm.jit.linkStructuredCallChild(
+    caller, thread, 1, 'float', undefined, omittedExactChild),
+  'an omitted exact child is reconstructed below its visible descendant');
+  t.deepEqual(callStack.items,
+    [unrelated, caller, omittedExactChild, visibleDescendant],
+  'the complete caller-child-descendant ownership chain becomes schedulable');
+
+  const invokedMethod = {
+    ...method, name: 'invokedChild', descriptor: '(I)I',
+  };
+  const descendantMethod = {
+    ...method, name: 'visibleDescendant', descriptor: '()V',
+  };
+  const transitiveChild = new Frame(invokedMethod);
+  transitiveChild.className = 'ArbitraryTransitiveChild';
+  transitiveChild.jitGeneratedReturnParent = caller;
+  const transitiveDescendant = new Frame(descendantMethod);
+  transitiveDescendant.className = 'ArbitraryTransitiveDescendant';
+  transitiveDescendant.jitGeneratedReturnParent = transitiveChild;
+  jvm.jit.syncCallSites[2] = {
+    methodName: invokedMethod.name,
+    descriptor: invokedMethod.descriptor,
+  };
+  callStack.items.length = 0;
+  callStack.push(unrelated);
+  callStack.push(caller);
+  callStack.push(transitiveDescendant);
+  t.ok(jvm.jit.linkStructuredCallChild(
+    caller, thread, 1, 'int', 2),
+  'a visible descendant proves its omitted direct call-site child transitively');
+  t.deepEqual(callStack.items,
+    [unrelated, caller, transitiveChild, transitiveDescendant],
+  'the omitted direct child is restored between caller and descendant');
+  t.equal(transitiveChild.jitGeneratedReturnType, 'int',
+    'the descriptor return contract belongs to the direct child');
+  t.end();
+});
+
 test('frameless structured call exceptions retain invoke operands without a child', (t) => {
   const jvm = new JVM({ jit: {
     warmupThreshold: 0, structuredSsa: true,
@@ -10123,9 +10497,9 @@ public class SynchronousExecuteHarness {
   t.equal(jvm.jit.getPositionalGeneratedInvoker(linkedSite, linkedTarget), null,
     'new callers retain the canonical child Frame for Wasm tier selection');
   // The veto above is a bet that the materialized child Frame reaches a
-  // scheduler entry that selects Wasm. A callee reached only from generated
-  // callers never reaches one, so the module stays at zero runs while every
-  // call pays for a Frame. Release the veto on that proof, and only that one.
+  // scheduler entry that selects Wasm. Repeated JavaScript child execution on
+  // this exact generated target disproves that bet even if a different entry
+  // has run the same method's Wasm module.
   linkedTarget.readyWasmJsChildRuns =
     jvm.jit.readyWasmPositionalReleaseThreshold - 1;
   t.equal(jvm.jit.getPositionalGeneratedInvoker(linkedSite, linkedTarget), null,
@@ -10140,10 +10514,11 @@ public class SynchronousExecuteHarness {
   jvm.jit.wasmJit.state.set(method, {
     status: 'ready', meta: { fullyCompiled: true }, runs: 1,
   });
-  t.notOk(jvm.jit.readyWasmProvenUnusedForTarget(linkedTarget, method),
-    'a single observed Wasm run is enough to disprove an unused module');
-  t.equal(jvm.jit.getPositionalGeneratedInvoker(linkedSite, linkedTarget), null,
-    'a module that does run keeps the canonical child Frame');
+  t.ok(jvm.jit.readyWasmProvenUnusedForTarget(linkedTarget, method),
+    'a Wasm run through another entry does not erase target-local feedback');
+  t.equal(typeof jvm.jit.getPositionalGeneratedInvoker(
+    linkedSite, linkedTarget), 'function',
+  'a proven synchronous target publishes independently of global Wasm runs');
   jvm.jit.wasmJit.state.set(method, {
     status: 'ready', meta: { fullyCompiled: true },
   });
@@ -10621,6 +10996,110 @@ test('ordinary generated call sites reuse canonical positional adapters', (t) =>
   t.end();
 });
 
+test('canonical positional adapters never recycle frames with active children',
+  (t) => {
+  const jvm = new JVM({jit: {warmupThreshold: 0}});
+  const method = {
+    className: 'PositionalActiveChildTarget',
+    name: 'value', descriptor: '()I', flags: ['static'],
+    attributes: [{type: 'code', code: {
+      codeItems: [{instruction: 'iconst_1'}, {instruction: 'ireturn'}],
+      exceptionTable: [], localsSize: '0', stackSize: '1',
+    }}],
+  };
+  let nestedChild;
+  const generated = (frame, thread) => {
+    nestedChild = new Frame(method);
+    nestedChild.className = 'ArbitraryNestedSchedulerChild';
+    thread.callStack.push(nestedChild);
+    return {returned: true, value: 7};
+  };
+  generated.jvmSynchronous = true;
+  const target = {
+    method, lookupClass: method.className, generated, freeFrame: null,
+  };
+  const site = {
+    op: 'invokestatic', descriptor: '()I', params: [], returnType: 'int',
+    initializationToken: {initialized: true},
+  };
+  const invoke = jvm.jit.getPositionalGeneratedInvoker(site, target);
+  const thread = {status: 'runnable', callStack: new Stack()};
+
+  const result = invoke(thread);
+  t.ok(result?.deopt && result.transient,
+    'the positional boundary turns an incomplete return into a suspension');
+  t.equal(result.reason, 'positional generated callee left active child',
+    'the suspension identifies the violated scheduler ownership boundary');
+  t.equal(target.freeFrame, null,
+    'the still-active callee frame is not published for reuse');
+  t.equal(thread.callStack.items.length, 2,
+    'the materialized callee and its nested child remain scheduler-visible');
+  t.equal(thread.callStack.items[1], nestedChild,
+    'the nested child remains at the runnable stack top');
+  t.equal(result.jvmPositionalChild, thread.callStack.items[0],
+    'the suspension exposes the exact retained callee frame');
+  t.end();
+});
+
+test('resolved generated targets never recycle frames with active children',
+  (t) => {
+  const jvm = new JVM({jit: {warmupThreshold: 0}});
+  const method = {
+    className: 'ResolvedActiveChildTarget',
+    name: 'value', descriptor: '()I', flags: ['static'],
+    attributes: [{type: 'code', code: {
+      codeItems: [{instruction: 'iconst_1'}, {instruction: 'ireturn'}],
+      exceptionTable: [], localsSize: '0', stackSize: '1',
+    }}],
+  };
+  let nestedChild;
+  const generated = (frame, thread) => {
+    nestedChild = new Frame(method);
+    nestedChild.className = 'ArbitraryResolvedNestedChild';
+    thread.callStack.push(nestedChild);
+    return {returned: true, value: 7};
+  };
+  generated.jvmSynchronous = true;
+  const target = {
+    method, lookupClass: method.className, generated, freeFrame: null,
+  };
+  const site = {
+    op: 'invokestatic', descriptor: '()I', params: [], returnType: 'int',
+  };
+  const callerMethod = {
+    className: 'ResolvedActiveChildCaller', name: 'call', descriptor: '()I',
+    attributes: [{type: 'code', code: {
+      codeItems: [{instruction: 'iconst_0'}, {instruction: 'ireturn'}],
+      exceptionTable: [], localsSize: '0', stackSize: '1',
+    }}],
+  };
+  const caller = new Frame(callerMethod);
+  caller.className = callerMethod.className;
+  const thread = {status: 'runnable', callStack: new Stack()};
+  thread.callStack.push(caller);
+
+  const result = jvm.jit.tryInvokeResolvedTarget(
+    site, target, caller, thread);
+  t.ok(result?.deopt && result.transient,
+    'the resolved target turns an incomplete return into a suspension');
+  t.equal(result.reason, 'resolved generated callee left active child',
+    'the resolved path reports its scheduler ownership boundary');
+  t.equal(target.freeFrame, null,
+    'the retained resolved-target frame is not published for reuse');
+  t.equal(thread.callStack.items.length, 3,
+    'caller, generated callee, and nested child remain visible');
+  const retained = thread.callStack.items[1];
+  t.equal(result.jvmPositionalChild, retained,
+    'the resolved boundary exposes its direct child rather than a descendant');
+  t.equal(retained.jitGeneratedReturnParent, caller,
+    'the retained callee routes its eventual result to the caller');
+  t.equal(retained.jitGeneratedReturnType, 'int',
+    'the retained callee preserves its primitive return contract');
+  t.equal(thread.callStack.items[2], nestedChild,
+    'the nested child remains at the scheduler stack top');
+  t.end();
+});
+
 test('structured continuations poll after accumulated positional child work',
   async (t) => {
   const className = 'PositionalQuantumPollHarness';
@@ -10683,6 +11162,9 @@ public final class PositionalQuantumPollHarness {
   t.ok(generated.jvmStructuredSource.includes(
     'safePointBudget = Math.min(safePointBudget, 256);'),
   'the child-work poll clamps an inherited long parent quantum');
+  t.ok(/reason: 'structured SSA positional quantum' \};\n\s+ssaValue\d+ = thread\.callStack\.items\.length;/.test(
+    generated.jvmStructuredSource),
+  'a resumed pre-call quantum refreshes the scheduler depth after restoring a frameless caller');
   t.notOk(generated.jvmRestoringDirectPositionalSource?.includes(
     "reason: 'structured SSA positional quantum'"),
   'ordinary restoring entries do not acquire an invalid generator yield');
@@ -10731,8 +11213,143 @@ test('frame positional deoptimization links the canonical child return', (t) => 
     'the active canonical child returns to the invoking Frame');
   t.equal(child.jitGeneratedReturnType, 'int',
     'the child records the descriptor return type');
+  t.equal(deopt.jvmPositionalChild, child,
+    'the bridge preserves exact child identity for its generated caller');
   t.equal(parent.stack.items.length, 0,
     'a consumed deoptimizing call removes its parent operands');
+
+  const omittedChild = new Frame(method);
+  const descendant = new Frame(method);
+  descendant.jitGeneratedReturnParent = omittedChild;
+  thread.callStack.items.length = 0;
+  thread.callStack.push(parent);
+  parent.stack.push(7);
+  const omittedDeopt = {
+    deopt: true, transient: true, jvmPositionalChild: omittedChild,
+  };
+  const omittedResult = jvm.jit.tryInvokeFramePositional(
+    site, () => {
+      thread.callStack.push(descendant);
+      return omittedDeopt;
+    }, parent, thread);
+  t.equal(omittedResult, omittedDeopt,
+  'a consumed deopt is not converted into an async replay when its child is omitted');
+  t.deepEqual(thread.callStack.items,
+    [parent, omittedChild, descendant],
+  'the positional bridge restores the omitted child below its descendant');
+  t.equal(omittedChild.jitGeneratedReturnParent, parent,
+    'the restored child returns to the original positional caller');
+  t.equal(parent.stack.items.length, 0,
+    'the bridge consumes omitted-child call operands exactly once');
+  t.end();
+});
+
+test('restoring positional callers materialize post-call state before child return',
+  (t) => {
+  const owner = 'RestoringPositionalHandoffOwner';
+  const leaf = {
+    name: 'leaf', descriptor: '(I)I', flags: ['final'],
+    attributes: [{type: 'code', code: {
+      codeItems: [
+        {instruction: 'iload_1'},
+        {instruction: 'ireturn'},
+      ],
+      exceptionTable: [], localsSize: '2', stackSize: '1',
+    }}],
+  };
+  const caller = {
+    name: 'caller', descriptor: '()I', flags: ['final'],
+    attributes: [{type: 'code', code: {
+      codeItems: [
+        {instruction: 'aload_0'},
+        {instruction: {op: 'bipush', arg: 105}},
+        {instruction: {op: 'invokevirtual',
+          arg: ['Method', owner, [leaf.name, leaf.descriptor]]}},
+        {instruction: 'ireturn'},
+      ],
+      exceptionTable: [], localsSize: '1', stackSize: '2',
+    }}],
+  };
+  const jvm = new JVM({jit: {
+    warmupThreshold: 0, preferWholeMethodJs: true, structuredSsa: true,
+    profileMethods: false, profileTimings: false,
+  }});
+  jvm.classes[owner] = {
+    staticFields: new Map(),
+    ast: {classes: [{flags: ['final'], superClassName: null, items: [
+      {type: 'method', method: leaf},
+      {type: 'method', method: caller},
+    ]}]},
+  };
+  jvm.classInitializationState.set(owner, 'INITIALIZED');
+
+  const generated = jvm.jit.structuredSsa.compile(caller);
+  t.equal(typeof generated?.jvmRestoringDirectPositionalBody, 'function',
+    'the arbitrary acyclic caller exposes the restoring scalar ABI');
+  const nestedSite = jvm.jit.syncCallSites.find((site) =>
+    site?.callerMethod === caller && site.methodName === leaf.name);
+  t.ok(nestedSite, 'the nested call has a stable positional site');
+
+  const suspendedChild = new Frame(leaf);
+  suspendedChild.className = owner;
+  const deopt = {
+    deopt: true, transient: true, reason: 'arbitrary nested suspension',
+    jvmPositionalChild: suspendedChild,
+  };
+  let nestedCalls = 0;
+  const suspendedInvoke = (_receiver, _argument, thread) => {
+    nestedCalls += 1;
+    thread.callStack.push(suspendedChild);
+    return deopt;
+  };
+  suspendedInvoke.jvmDebugGuarded = true;
+  const runtimeReceiverType = `${owner}$Runtime`;
+  nestedSite.fastPositional = {
+    invoke: suspendedInvoke, rawInvoke: null, receiverType: runtimeReceiverType,
+    lookupClass: owner, debugGuarded: true,
+  };
+  nestedSite.fastPositionalTargets = Object.create(null);
+
+  const outerSite = {
+    op: 'invokevirtual', declaredClassName: owner,
+    methodName: caller.name, descriptor: caller.descriptor,
+    params: [], returnType: 'int',
+    initializationToken: {initialized: true},
+  };
+  const target = {
+    method: caller, lookupClass: owner, generated, freeFrame: null,
+  };
+  const positional = jvm.jit.getPositionalGeneratedInvoker(outerSite, target);
+  const parent = new Frame(caller);
+  parent.className = 'ArbitraryOuterOwner';
+  const thread = {status: 'runnable', callStack: new Stack()};
+  thread.callStack.push(parent);
+  const receiver = {type: runtimeReceiverType};
+
+  const result = positional(receiver, thread, true);
+  t.equal(result, deopt,
+    'the restoring entry propagates the nested suspension');
+  t.equal(nestedCalls, 1, 'the nested call executes exactly once');
+  t.equal(thread.callStack.items.length, 3,
+    'outer caller, restored caller, and child are scheduler-visible');
+  const restoredCaller = thread.callStack.items[1];
+  t.equal(restoredCaller.method, caller,
+    'the omitted direct caller is restored beneath its child');
+  t.equal(result.jvmPositionalChild, restoredCaller,
+    'the positional boundary exposes its direct caller, not the grandchild');
+  t.equal(restoredCaller.pc, 3,
+    'the restored caller records the instruction after the consumed call');
+  t.deepEqual(restoredCaller.stack.items, [],
+    'the consumed argument is absent before the child return arrives');
+  t.equal(suspendedChild.jitGeneratedReturnParent, restoredCaller,
+    'the child return is explicitly routed to the restored caller');
+
+  t.equal(thread.callStack.pop(), suspendedChild,
+    'the suspended child completes first');
+  jvm.jit.finishTryRunFrame(suspendedChild, thread, null,
+    {returned: true, value: 0});
+  t.deepEqual(restoredCaller.stack.items, [0],
+    'the result occupies the sole post-call operand slot');
   t.end();
 });
 
@@ -12973,10 +13590,19 @@ public class MonitorCallIslandHarness {
       for (int i = 0; i < out.length; i++) out[i] = opaque(out[i]) + i;
     }
   }
+
+  public static void one(int[] out) {
+    synchronized (out) {
+      out[0] = opaque(out[0]);
+    }
+  }
 }
 `);
 
-  const jvm = new JVM({ classpath, jit: { warmupThreshold: 0 } });
+  const jvm = new JVM({ classpath, jit: {
+    warmupThreshold: 0,
+    effectfulMonitorCodegen: true,
+  } });
   await jvm.loadClassByName('MonitorCallIslandHarness');
   jvm.classInitializationState.set('MonitorCallIslandHarness', 'INITIALIZED');
   const thread = {
@@ -13005,6 +13631,22 @@ public class MonitorCallIslandHarness {
   t.ok(jvm.jit.generatedMethodRunCounts.get('MonitorCallIslandHarness.compute([I)V') >= 2,
     'generated parent resumes after interpreted children');
   t.notOk(out.isLocked, 'resumed generated monitorexit releases the monitor');
+
+  const one = await jvm.findMethodInHierarchy(
+    'MonitorCallIslandHarness', 'one', '([I)V');
+  const generatedOne = jvm.jit.getGeneratedFunction(one, {
+    allowEffectfulCalls: true,
+  });
+  t.ok(generatedOne?.jvmSynchronous,
+    'safe non-loop monitor call islands receive adaptive generated code');
+  jvm.jit.codegenCache.set(one, generatedOne);
+  const single = [3];
+  single.type = '[I';
+  await invoke(jvm, thread, 'MonitorCallIslandHarness', 'one', '([I)V', [single]);
+  t.deepEqual(single.slice(), [13],
+    'the adaptive monitor parent resumes after its interpreted switch child');
+  t.notOk(single.isLocked,
+    'the adaptive monitor parent releases its monitor exactly once');
   t.end();
 });
 
@@ -13370,8 +14012,65 @@ test('a transient deopt takes one canonical interpreter step before every JIT ti
   jvm.jit.codegenCache.set(cachedMethod, cachedGenerated);
   t.equal(jvm.jit.getGeneratedFunction(cachedMethod,
     {allowEffectfulCalls: true}), cachedGenerated,
-  'explicit preparation reuses an existing generated body');
+    'preparation preserves a baseline when no stronger body is available');
   t.ok(jvm.jit.preparedCodegenMethods.has(cachedMethod),
-    'a reused generated body still receives prepared-tier ownership');
+    'the preserved body still receives prepared-tier ownership');
+  t.end();
+});
+
+test('effectful preparation upgrades a warmed baseline to whole-method SSA',
+  async (t) => {
+  const className = 'PreparedWholeMethodUpgradeHarness';
+  const classpath = compileJavaFixture(t, className, `
+public final class PreparedWholeMethodUpgradeHarness {
+  static int sum(int count) {
+    int total = 0;
+    for (int index = 0; index < count; index++) total += index;
+    return total;
+  }
+}
+`);
+  const jvm = new JVM({classpath, jit: {
+    warmupThreshold: 0,
+    profileMethods: false,
+    structuredSsa: true,
+  }});
+  await jvm.loadClassByName(className);
+  jvm.classInitializationState.set(className, 'INITIALIZED');
+  const method = await jvm.findMethodInHierarchy(className, 'sum', '(I)I');
+
+  // Model the real race: foreground execution publishes the general framed
+  // baseline before the explicit, longer-running preparation phase begins.
+  const warmedBaseline = jvm.jit.compileBaselineMethod(method);
+  t.ok(warmedBaseline && !warmedBaseline.jvmStructuredSsa,
+    'foreground warmup starts with a plain framed baseline');
+  jvm.jit.codegenCache.set(method, warmedBaseline);
+
+  const site = {
+    op: 'invokestatic', descriptor: '(I)I', params: ['int'],
+    returnType: 'int', fastPositional: null,
+  };
+  const target = {
+    method, lookupClass: className, generated: warmedBaseline,
+    positionalInvoker: undefined,
+  };
+  site.fastStaticTarget = target;
+  jvm.jit.trackGeneratedTarget(method, target, site);
+  const prepared = jvm.jit.getGeneratedFunction(method, {
+    allowEffectfulCalls: true,
+  });
+
+  t.notEqual(prepared, warmedBaseline,
+    'preparation replaces the warmed baseline');
+  t.ok(prepared?.jvmStructuredSsa,
+    'the replacement owns the complete CFG');
+  t.equal(typeof prepared.jvmRestoringDirectPositionalBody, 'function',
+    'the replacement exposes a direct positional call entry');
+  t.equal(target.generated, prepared,
+    'already-linked callers receive the replacement');
+  t.equal(typeof site.fastPositional?.invoke, 'function',
+    'already-linked callers leave the framed dispatcher');
+  t.ok(jvm.jit.preparedCodegenMethods.has(method),
+    'the replacement receives prepared-tier ownership');
   t.end();
 });

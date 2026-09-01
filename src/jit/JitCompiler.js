@@ -9,7 +9,7 @@ const JvmSsaBlockRenderer = require("./JvmSsaBlockRenderer");
 const HotCallGraphRegionCompiler = require("./HotCallGraphRegionCompiler");
 const monoArray = require("./monoArray");
 const {
-  newFields, makeObjectRef, hasField,
+  newFields, makeObjectRef, hasField, denseSlotFor, readField, writeField,
 } = require("../core/objectModel");
 const {
   normalizeArrayLoad,
@@ -256,6 +256,12 @@ class JitCompiler {
       options.ordinaryAdaptiveFramelessPositional === true ||
       Boolean(typeof process !== "undefined" && process.env &&
         process.env.JVM_ENABLE_ORDINARY_ADAPTIVE_FRAMELESS === "1");
+    this.ordinaryAdaptiveCallChainSafePointBudget = Math.max(0,
+      Math.min(100_000_000, Number(
+        options.ordinaryAdaptiveCallChainSafePointBudget ??
+        (typeof process !== "undefined" && process.env &&
+          process.env.JVM_ORDINARY_ADAPTIVE_CALL_CHAIN_SAFE_POINT_BUDGET),
+      ) || 0));
     this.ordinaryAdaptiveFramelessRunCount = 0;
     this.referenceFramelessPositionalRunCount = 0;
     this.framePositionalCallCount = 0;
@@ -332,6 +338,10 @@ class JitCompiler {
       options.adaptiveConstructorCallers ??
       (envAdaptiveConstructorCallers === "1" ? true
         : envAdaptiveConstructorCallers === "0" ? false : true);
+    this.effectfulMonitorCodegenEnabled =
+      options.effectfulMonitorCodegen === true ||
+      Boolean(typeof process !== "undefined" && process.env &&
+        process.env.JVM_ENABLE_EFFECTFUL_MONITOR_CODEGEN === "1");
     this.adaptiveCodegenThreshold = Math.max(2,
       Number(options.adaptiveCodegenThreshold) || 64);
     this.adaptiveCodegenTimeThresholdMs = Math.max(0,
@@ -523,6 +533,9 @@ class JitCompiler {
     if (options.wasmDirectInstanceLink === true) {
       this.wasmJit.directInstanceLinkEnabled = true;
     }
+    if (options.wasmImportStats === true) {
+      this.wasmJit.importStatsEnabled = true;
+    }
     const regionOptions = this.rendererPipelineEnabled
       ? { ...options, structuredSsa: true }
       : options;
@@ -697,8 +710,15 @@ class JitCompiler {
     // Wasm gate above the interpreter, so a deopt can synchronously compile or
     // re-enter Wasm instead of executing the promised bytecode.
     if (frame?.jitSkipOnce) {
+      const retainedEntry = frame.jitStableGeneratedEntry ||
+        this.stableGeneratedEntries.get(frame.method);
+      const retainedGenerated = retainedEntry?.jit === this
+        ? retainedEntry.generated : null;
+      const ownsStructuredContinuation = Boolean(
+        retainedGenerated?.jvmHasOwnedStructuredContinuation?.(frame) ||
+        retainedGenerated?.jvmHotCallGraphHasOwnedContinuation?.(frame));
       delete frame.jitSkipOnce;
-      return UNHANDLED_RESULT;
+      if (!ownsStructuredContinuation) return UNHANDLED_RESULT;
     }
     // Ask the wasm gate before any JS tier can win, so the census can account
     // for methods the JS tier claims first. Diagnostic mode only; a no-op
@@ -1472,11 +1492,13 @@ class JitCompiler {
           result.value === RETURN_VOID ? null : result.value,
         );
       } else if (result.value !== RETURN_VOID) {
-        const frames = thread.callStack.items;
-        const returnParent = explicitReturnParent &&
-            frames.includes(explicitReturnParent)
-          ? explicitReturnParent
-          : !thread.callStack.isEmpty() ? thread.callStack.peek() : null;
+        // A generated parent can be temporarily omitted from the physical
+        // call stack while one of its restored descendants runs. The explicit
+        // ownership edge remains authoritative across that interval; falling
+        // back to the current top frame sends the operand into an unrelated
+        // continuation and leaves the real parent to underflow when restored.
+        const returnParent = explicitReturnParent ||
+          (!thread.callStack.isEmpty() ? thread.callStack.peek() : null);
         if (returnParent) returnParent.stack.push(result.value);
         if (frame.jitFrameHandoffTrace) {
           console.error("[jvm-frame-handoff-return] " + JSON.stringify({
@@ -1542,17 +1564,36 @@ class JitCompiler {
         (cached.jvmStructuredSsa ||
           cached.jvmRestoringDirectPositionalBody ||
           cached.jvmDirectPositionalBody));
+      const plainCachedBody = Boolean(cached &&
+        !cached.jvmStructuredSsa &&
+        !cached.jvmRestoringDirectPositionalBody &&
+        !cached.jvmDirectPositionalBody);
       if (options.allowEffectfulCalls === true &&
           (cached?.jvmStructuredGuardedBooleanSiteCount > 0 ||
-            lifecycleSensitiveStructuredBody)) {
+            lifecycleSensitiveStructuredBody || plainCachedBody)) {
         // This method may have warmed before the explicit preparation phase,
         // while a lifecycle flag still had a transient value. A positional
         // child can contain a guarded branch without exposing that count on
         // the top-level cached wrapper, so rebuild every structured body once
-        // with both boolean arms preserved. Plain cached bodies stay reusable.
+        // with both boolean arms preserved. A plain baseline body must also be
+        // reconsidered: it may have won the initial race by extracting a local
+        // loop before whole-method preparation was active, permanently leaving
+        // every compiled call behind the framed dispatcher.
         this.nonSpeculativeStaticBooleanMethods.add(method);
         this.codegenCache.delete(method);
         const replacement = this.getGeneratedFunction(method, options);
+        const preparedWholeMethodUpgrade = Boolean(replacement &&
+          (replacement.jvmStructuredSsa ||
+            replacement.jvmRestoringDirectPositionalBody ||
+            replacement.jvmDirectPositionalBody));
+        if (plainCachedBody && !preparedWholeMethodUpgrade) {
+          // Preparation may spend more time looking for a whole-method tier,
+          // but it must not replace a working baseline with an equivalent or
+          // failed compile. Keep the proven entry when no stronger form exists.
+          this.codegenCache.set(method, cached);
+          this.preparedCodegenMethods.add(method);
+          return cached;
+        }
         if (replacement) {
           this.publishGeneratedTargetUpgrade(method, replacement);
         } else {
@@ -1595,7 +1636,9 @@ class JitCompiler {
     if (this.codegenCompiling.has(method)) return null;
     this.codegenCompiling.add(method);
     try {
-      const generated = this.compileMethod(method);
+      const generated = this.compileMethod(method, {
+        preparedWholeMethod: options.allowEffectfulCalls === true,
+      });
       this.codegenCache.set(method, generated);
       if (generated && options.allowEffectfulCalls === true) {
         this.preparedCodegenMethods.add(method);
@@ -2242,7 +2285,8 @@ class JitCompiler {
       return false;
     }
     if (hasMonitorBytecode(codeItems) &&
-        (allowEffectfulCalls || !this.hasJitSafeMonitorBody(codeItems))) {
+        (!this.hasJitSafeMonitorBody(codeItems) ||
+          allowEffectfulCalls && !this.effectfulMonitorCodegenEnabled)) {
       supportCache.set(method, false);
       return false;
     }
@@ -2662,16 +2706,24 @@ class JitCompiler {
     // clock deliberately uses a reproducible epoch which need not resemble
     // Date.now(), so comparing those deadlines with wall time makes every
     // parked thread appear overdue and spills every generated quantum.
-    const schedulerNow = jvm.clock ? jvm.clock.millis() : wallNow;
     const threads = jvm.threads || [];
+    let schedulerNow;
     for (let index = 0; index < threads.length; index += 1) {
       const other = threads[index];
       if (other === thread) continue;
       if (other.status === "runnable") return false;
-      if (other.status === "SLEEPING" && other.sleepUntil !== undefined &&
-          schedulerNow >= Number(other.sleepUntil)) return false;
-      if (other.status === "WAITING" && other.waitDeadline !== undefined &&
-          schedulerNow >= Number(other.waitDeadline)) return false;
+      const deadline = other.status === "SLEEPING"
+        ? other.sleepUntil : other.status === "WAITING"
+          ? other.waitDeadline : undefined;
+      if (deadline === undefined) continue;
+      if (schedulerNow === undefined) {
+        // Every JVM owns a RuntimeClock, including the disabled realtime
+        // facade whose millis() is another Date.now(). Reuse the wall sample
+        // in that normal mode and sample guest time only when its epoch can
+        // actually differ.
+        schedulerNow = jvm.clock?.enabled ? jvm.clock.millis() : wallNow;
+      }
+      if (schedulerNow >= Number(deadline)) return false;
     }
     return true;
   }
@@ -2733,15 +2785,19 @@ class JitCompiler {
         !(wallNow < Number(jvm._nextAwtStructuredYieldAt || 0))) {
       return false;
     }
-    const schedulerNow = jvm.clock ? jvm.clock.millis() : wallNow;
     const threads = jvm.threads || [];
+    let schedulerNow;
     for (let index = 0; index < threads.length; index += 1) {
       const other = threads[index];
       if (other === thread) continue;
-      if (other.status === "SLEEPING" && other.sleepUntil !== undefined &&
-          schedulerNow >= Number(other.sleepUntil)) return false;
-      if (other.status === "WAITING" && other.waitDeadline !== undefined &&
-          schedulerNow >= Number(other.waitDeadline)) return false;
+      const deadline = other.status === "SLEEPING"
+        ? other.sleepUntil : other.status === "WAITING"
+          ? other.waitDeadline : undefined;
+      if (deadline === undefined) continue;
+      if (schedulerNow === undefined) {
+        schedulerNow = jvm.clock?.enabled ? jvm.clock.millis() : wallNow;
+      }
+      if (schedulerNow >= Number(deadline)) return false;
     }
     return true;
   }
@@ -2758,10 +2814,10 @@ class JitCompiler {
     return index;
   }
 
-  compileMethod(method) {
+  compileMethod(method, options = {}) {
     const t0 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
     try {
-      return this._compileMethodUntimed(method);
+      return this._compileMethodUntimed(method, options);
     } finally {
       const ms = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0;
       if (!this.codegenStats) this.codegenStats = new Map();
@@ -2848,7 +2904,7 @@ class JitCompiler {
     return generated;
   }
 
-  _compileMethodUntimed(method) {
+  _compileMethodUntimed(method, options = {}) {
     const tracePattern = typeof process !== "undefined" && process.env
       ? process.env.JVM_TRACE_JIT_METHOD || "" : "";
     const traceIdentity = tracePattern
@@ -2872,7 +2928,7 @@ class JitCompiler {
       (this.isDynamicArrayStructuredFirstMethod(method) ||
         this.isCallGraphStructuredFirstMethod(method));
     const inlineLoopRegions = this.structuredOnlyCodegenMethods.has(method) ||
-      wholeGraphCandidate
+      wholeGraphCandidate || options.preparedWholeMethod === true
       ? [] : this.compileInlinePrimitiveLoopRegions(method);
     const structuredSsa = inlineLoopRegions.length
       ? null : this.structuredSsa.compile(method);
@@ -4693,6 +4749,13 @@ class JitCompiler {
       case "getfield": {
         const fieldSiteId = this.registerFieldSite(instruction.arg);
         const site = this.fieldSites[fieldSiteId];
+        if (Number.isInteger(site.denseSlot)) {
+          const key = JSON.stringify(site.directInstanceKey);
+          return `{ const object = stack[sp - 1]; const fields = object && object.fields; ` +
+            `stack[sp - 1] = Array.isArray(fields) ? fields[${site.denseSlot}] : ` +
+            `(fields && fields[${key}] !== undefined) ? fields[${key}] : ` +
+            `helpers.getFieldAt(${fieldSiteId}, object); } ${goNext}`;
+        }
         if (site.directInstanceKey) {
           const key = JSON.stringify(site.directInstanceKey);
           return `{ const object = stack[sp - 1]; stack[sp - 1] = ` +
@@ -4705,6 +4768,15 @@ class JitCompiler {
       case "putfield": {
         const fieldSiteId = this.registerFieldSite(instruction.arg);
         const site = this.fieldSites[fieldSiteId];
+        if (Number.isInteger(site.denseSlot)) {
+          const key = JSON.stringify(site.directInstanceKey);
+          const fieldName = JSON.stringify(site.fieldName);
+          return `{ const value = stack[--sp]; const object = stack[--sp]; ` +
+            `const fields = object && object.fields; if (Array.isArray(fields)) { ` +
+            `fields[${site.denseSlot}] = value; } else if (fields && ${key} in fields) { ` +
+            `fields[${key}] = value; object[${fieldName}] = value; ` +
+            `} else { helpers.putFieldAt(${fieldSiteId}, object, value); } } ${goNext}`;
+        }
         if (site.directInstanceKey) {
           const key = JSON.stringify(site.directInstanceKey);
           const fieldName = JSON.stringify(site.fieldName);
@@ -5711,6 +5783,9 @@ class JitCompiler {
       }
       declaringClassName = classAst.superClassName || null;
     }
+    const denseSlot = directInstanceKey
+      ? denseSlotFor(this.jvm, declaringClassName, fieldName, descriptor)
+      : null;
     const id = this.nextFieldSiteId++;
     this.fieldSites[id] = {
       arg,
@@ -5720,6 +5795,7 @@ class JitCompiler {
       initializationToken: this.jvm.getClassInitializationToken(className),
       directKey: `${className}.${fieldName}`,
       directInstanceKey,
+      denseSlot,
       instanceKeys: new Map(),
       staticTarget: null,
     };
@@ -5758,17 +5834,17 @@ class JitCompiler {
 
     const runtimeType = objRef._className || objRef.type || site.className;
     if (hasField(objRef.fields, site.directKey)) {
-      return objRef.fields[site.directKey];
+      return readField(objRef.fields, site.directKey);
     }
     const cachedKey = site.instanceKeys.get(runtimeType);
     if (cachedKey && hasField(objRef.fields, cachedKey)) {
-      return objRef.fields[cachedKey];
+      return readField(objRef.fields, cachedKey);
     }
     const fieldKey = resolveInstanceFieldKey(
       this.jvm, objRef, site.className, site.fieldName,
     );
     if (fieldKey) site.instanceKeys.set(runtimeType, fieldKey);
-    return fieldKey ? objRef.fields[fieldKey] : undefined;
+    return fieldKey ? readField(objRef.fields, fieldKey) : undefined;
   }
 
   putFieldAt(id, objRef, value) {
@@ -5787,7 +5863,7 @@ class JitCompiler {
         || site.directKey;
       site.instanceKeys.set(runtimeType, fieldKey);
     }
-    objRef.fields[fieldKey] = value;
+    writeField(objRef.fields, fieldKey, value);
   }
 
   resolveStaticFieldSite(site, forWrite = false) {
@@ -5800,13 +5876,15 @@ class JitCompiler {
           return { kind: "map", fields: classData.staticFields, key };
         }
         if (!forWrite && classData.staticFields.has(site.fieldName)) {
-          return { kind: "map", fields: classData.staticFields, key: site.fieldName };
+          return { kind: "map", fields: classData.staticFields,
+            key: site.fieldName };
         }
         if (!forWrite) {
           for (const candidate of classData.staticFields.keys()) {
             if (typeof candidate === "string" &&
                 candidate.split(":")[0].replace(/'/g, "") === site.fieldName) {
-              return { kind: "map", fields: classData.staticFields, key: candidate };
+              return { kind: "map", fields: classData.staticFields,
+                key: candidate };
             }
           }
         }
@@ -6265,21 +6343,112 @@ class JitCompiler {
     }));
   }
 
-  linkStructuredCallChild(frame, thread, entryDepth, returnType) {
+  linkStructuredCallChild(
+    frame, thread, entryDepth, returnType, callSiteId, explicitChild,
+  ) {
     const frames = thread?.callStack?.items;
+    let explicitChildIndex = Array.isArray(frames) && explicitChild
+      ? frames.indexOf(explicitChild) : -1;
     if (!frame || !Array.isArray(frames) ||
-        !Number.isInteger(entryDepth) || frames.length <= entryDepth) {
+        !Number.isInteger(entryDepth) ||
+        !explicitChild && frames.length <= entryDepth) {
       return false;
     }
-    const child = frames[entryDepth];
-    if (!child || child === frame) return false;
+    if (explicitChild && explicitChildIndex < 0) {
+      // A frameless direct child can itself have restored a visible
+      // descendant before its positional wrapper returns. Reconstruct the
+      // exact direct child immediately below the first such descendant. With
+      // no descendant, the deoptimization still proves that this activation
+      // must become scheduler-visible, so restore it at the original boundary.
+      const descendantIndex = frames.findIndex((candidate, index) => {
+        if (index < Math.min(entryDepth, frames.length)) return false;
+        const visited = new Set();
+        let parent = candidate?.jitGeneratedReturnParent;
+        while (parent && !visited.has(parent)) {
+          if (parent === explicitChild) return true;
+          visited.add(parent);
+          parent = parent.jitGeneratedReturnParent;
+        }
+        return false;
+      });
+      explicitChildIndex = descendantIndex >= 0
+        ? descendantIndex : Math.min(entryDepth, frames.length);
+      frames.splice(explicitChildIndex, 0, explicitChild);
+    }
+    // A frameless caller can be restored at its original insertion point
+    // while a suspended child is still above it. In that layout the frame at
+    // entryDepth is the caller and the child has shifted to entryDepth + 1.
+    // A framed caller was already present when entryDepth was captured, so
+    // its child remains exactly at entryDepth.
+    // A positional bridge already knows the exact child Frame that produced
+    // its deoptimization. Prefer that identity over a captured stack depth:
+    // nested frameless restoration can legitimately change the physical
+    // depth while the call is in progress. Guessing by the stale depth can
+    // reject a consumed call and replay it with its result still on the
+    // operand stack, or link an unrelated initializer/descendant.
+    let childIndex = explicitChildIndex >= 0
+      ? explicitChildIndex
+      : frames[entryDepth] === frame ? entryDepth + 1 : entryDepth;
+    const visibleChild = frames[childIndex];
+    if (!visibleChild || visibleChild === frame) {
+      return false;
+    }
+    let child = visibleChild;
+    if (!explicitChild && Number.isInteger(callSiteId)) {
+      const site = this.syncCallSites[callSiteId];
+      const ownershipPath = [];
+      const visited = new Set();
+      let candidate = visibleChild;
+      while (candidate && !visited.has(candidate)) {
+        ownershipPath.push(candidate);
+        visited.add(candidate);
+        if (candidate === frame) break;
+        candidate = candidate.jitGeneratedReturnParent;
+      }
+      const directChildIndex = ownershipPath.findIndex((owned) =>
+        site && owned?.method?.name === site.methodName &&
+        owned.method.descriptor === site.descriptor);
+      if (directChildIndex < 0) {
+        return false;
+      }
+      child = ownershipPath[directChildIndex];
+      // The scheduler may expose a descendant while one or more frameless
+      // owners between it and the direct invoked method exist only through
+      // explicit return edges. Reconstruct those owners in Java call order so
+      // each return has a runnable frame to resume. This is classification by
+      // the actual call-site descriptor and ownership chain, not by a guest
+      // identity or operand repair.
+      const schedulerChain = ownershipPath.slice(0, directChildIndex + 1)
+        .reverse();
+      let insertion = frames.indexOf(visibleChild);
+      for (const owner of schedulerChain.slice(0, -1)) {
+        const present = frames.indexOf(owner);
+        if (present >= 0) {
+          insertion = present + 1;
+        } else {
+          frames.splice(insertion, 0, owner);
+          insertion += 1;
+        }
+      }
+      childIndex = frames.indexOf(child);
+    }
     if (!child.jitGeneratedReturnParent) {
       child.jitGeneratedReturnParent = frame;
     }
     if (child.jitGeneratedReturnParent === frame) {
       child.jitGeneratedReturnType = returnType;
     }
-    return child.jitGeneratedReturnParent === frame;
+    const linked = child.jitGeneratedReturnParent === frame;
+    if (linked && !frames.includes(frame)) {
+      // A frameless generated caller stops being frameless as soon as one of
+      // its children becomes scheduler-visible. Restore the caller directly
+      // beneath that child at the handoff boundary. Leaving it reachable only
+      // through jitGeneratedReturnParent lets the child deliver an operand to
+      // an object that no runnable stack can ever resume, and also permits a
+      // positional free-frame pool to recycle that still-live activation.
+      frames.splice(childIndex, 0, frame);
+    }
+    return linked;
   }
 
   getCompileTimeDirectJre(op, instruction) {
@@ -6486,6 +6655,7 @@ class JitCompiler {
     const stack = frame.stack.items;
     const base = stack.length - argumentCount;
     if (base < 0) return ASYNC_INVOKE;
+    const entryDepth = thread.callStack.items.length;
     let result;
     switch (argumentCount) {
       case 0: result = invoke(thread); break;
@@ -6514,11 +6684,11 @@ class JitCompiler {
     if (result === ASYNC_INVOKE) return ASYNC_INVOKE;
     if (result && result.deopt) {
       const child = result.jvmPositionalChild || null;
-      delete result.jvmPositionalChild;
       if (!child || child === frame ||
-          !thread.callStack.items.includes(child)) return ASYNC_INVOKE;
-      child.jitGeneratedReturnParent = frame;
-      child.jitGeneratedReturnType = site.returnType;
+          !this.linkStructuredCallChild(
+            frame, thread, entryDepth, site.returnType, undefined, child)) {
+        return ASYNC_INVOKE;
+      }
     }
     stack.length = base;
     return result;
@@ -6578,13 +6748,13 @@ class JitCompiler {
 
   // The ready-Wasm veto in getPositionalGeneratedInvoker assumes the child
   // Frame it forces the caller to materialize will reach a scheduler entry
-  // that selects Wasm. A callee reached only through generated callers never
-  // reaches one: tryInvokeResolvedTarget runs its JavaScript body inline, the
-  // module stays at zero runs, and every call keeps paying for a Frame that
-  // buys nothing. Release the veto only on that proof -- enough JavaScript
-  // child runs through this exact target while the module has still never
-  // executed a single time. A module that does run (even once, nested) keeps
-  // its veto, so this never takes a frame away from a live Wasm body.
+  // that selects Wasm. A callee reached only through a synchronous generated
+  // target does not: tryInvokeResolvedTarget consumes that exact child inline
+  // in JavaScript. Repeated JavaScript child runs are therefore target-local
+  // proof that this edge cannot reach the scheduler's Wasm entry. A global
+  // Wasm run through some other Frame/edge does not invalidate that proof;
+  // using it as a permanent veto stranded hot nested targets behind generic
+  // dispatch even after tens of thousands of successful inline executions.
   readyWasmProvenUnusedForTarget(target, method) {
     if (!this.readyWasmPositionalReleaseEnabled || !target || !method) {
       return false;
@@ -6592,7 +6762,8 @@ class JitCompiler {
     if ((target.readyWasmJsChildRuns || 0) <
         this.readyWasmPositionalReleaseThreshold) return false;
     const state = this.wasmJit.enabled ? this.wasmJit.state.get(method) : null;
-    return Boolean(state) && (Number(state.runs) || 0) === 0;
+    return Boolean(state && state.status === "ready" && state.meta &&
+      state.meta.fullyCompiled);
   }
 
   getPositionalGeneratedInvoker(site, target) {
@@ -6605,7 +6776,8 @@ class JitCompiler {
     // child Frame, whose next scheduler entry selects Wasm. If that module
     // later proves to be an exit storm, hasReadyFullWasm() becomes false and
     // this same target may publish its JavaScript positional entry normally,
-    // and so may a target whose module has been proven never to run at all
+    // and so may a target whose materialized children have been proven not to
+    // reach that module
     // (see readyWasmProvenUnusedForTarget).
     const preparedFullWasmUpgrade = method &&
       this.hasPreparedFullWasmUpgrade(method);
@@ -6729,6 +6901,8 @@ class JitCompiler {
         Frame,
         method,
         lookupClass,
+        clearStructuredContinuation:
+          generated.jvmClearStructuredContinuation || null,
         semantic: generated.jvmRestoringDirectPositionalPlan || null,
         restoreFrame: (thread, child, restorationDepth) => {
           const frames = thread.callStack.items;
@@ -6823,13 +6997,19 @@ class JitCompiler {
       "if (target.freeFrame && jit.profileMethods) jit.syncReusedFrameCount += 1;",
       "const child = target.freeFrame || new plan.Frame(plan.method);",
       "target.freeFrame = null;",
+      "if (plan.clearStructuredContinuation) plan.clearStructuredContinuation(child);",
       "child.pc = 0;",
       "child.stack.items.length = 0;",
-      "delete child.jitSkipOnce;",
-      "delete child.jitJsDisabled;",
-      "delete child.jitAdaptiveEntryCounted;",
-      "delete child.jitGeneratedReturnParent;",
-      "delete child.jitGeneratedReturnType;",
+      // Preserve the recycled Frame's hidden class. Deleting these properties
+      // on every positional call puts hot Frames into dictionary mode in
+      // SpiderMonkey and creates substantial minor-GC pressure. Every reader
+      // tests truthiness or identity, so an own property holding undefined is
+      // semantically identical to an absent property.
+      "child.jitSkipOnce = undefined;",
+      "child.jitJsDisabled = undefined;",
+      "child.jitAdaptiveEntryCounted = undefined;",
+      "child.jitGeneratedReturnParent = undefined;",
+      "child.jitGeneratedReturnType = undefined;",
       "child.className = plan.lookupClass;",
       ...localAssignments,
       "const adaptiveFrameless = plan.framelessMode === 2;",
@@ -6922,6 +7102,22 @@ class JitCompiler {
       "  result.jvmPositionalChild = child;",
       "  return result;",
       "}",
+      // A successful generated return is valid only after the callee and all
+      // of its descendants have left the scheduler stack. Do not publish the
+      // callee Frame through target.freeFrame while a nested child can still
+      // return into it: another invocation would reset that same Frame and
+      // erase the retained continuation's operand stack.
+      "if (thread.callStack.items.length !== entryDepth) {",
+      "  if (useFrameless) plan.restoreFrame(thread, baseDepth, child);",
+      "  if (adaptiveFrameless) {",
+      "    target.preferFrameless = false;",
+      "    target.framelessRejected = true;",
+      "  }",
+      "  result = { deopt: true, transient: true,",
+      "    reason: 'positional generated callee left active child',",
+      "    jvmPositionalChild: child };",
+      "  return result;",
+      "}",
       "if (useFrameless && child.monitorEntered === true) {",
       "  jit.jvm.exitFrameMonitor(child);",
       "}",
@@ -6970,6 +7166,8 @@ class JitCompiler {
         method,
         methodKey,
         generated,
+        clearStructuredContinuation:
+          generated.jvmClearStructuredContinuation || null,
         canonicalGeneratedBody,
         exclusiveTier: generated.jvmStructuredSsa ? "structured"
           : generated.jvmScalarLoop ? "scalar" : "generated-sync",
@@ -7481,6 +7679,7 @@ class JitCompiler {
     const child = target.freeFrame || new Frame(method);
     if (target.freeFrame && this.profileMethods) this.syncReusedFrameCount += 1;
     target.freeFrame = null;
+    generated.jvmClearStructuredContinuation?.(child);
     child.pc = 0;
     // Verified bytecode cannot read a non-parameter local before storing it, so
     // normal execution does not need to erase every slot in a recycled frame.
@@ -7525,6 +7724,7 @@ class JitCompiler {
       localIndex += params[i] === "long" || params[i] === "double" ? 2 : 1;
     }
     frame.stack.items.length = argumentBase - receiverSlots;
+    const childEntryDepth = thread.callStack.items.length;
     thread.callStack.push(child);
     // See the positional emitter: a synchronized callee must hold its monitor
     // before its body runs, and a contended entry becomes an ordinary deopt so
@@ -7533,7 +7733,11 @@ class JitCompiler {
         !this.jvm.enterFrameMonitorIfNeeded(child, thread)) {
       child.jitGeneratedReturnParent = frame;
       child.jitGeneratedReturnType = returnType;
-      return { deopt: true, reason: "synchronized monitor contended" };
+      return {
+        deopt: true,
+        reason: "synchronized monitor contended",
+        jvmPositionalChild: child,
+      };
     }
     // A large loop selected for Wasm-first execution can be reached through
     // a synchronous generated call before it ever owns a scheduler tick.
@@ -7562,13 +7766,14 @@ class JitCompiler {
           transient: true,
           reason: `wasm-first synchronous callee exit ${lookupClass}.` +
             `${method.name}${descriptor}`,
+          jvmPositionalChild: child,
         };
       }
     }
     // This is the JavaScript child run that the ready-Wasm positional veto
-    // assumed would be a Wasm scheduler entry. Count it, and once the module
-    // has been proven unused often enough, republish this target's links so
-    // later calls can take the positional entry instead of a Frame.
+    // assumed would be a Wasm scheduler entry. Count it per target; once this
+    // exact edge has repeatedly disproved that assumption, republish its links
+    // so later calls can take the positional entry instead of a Frame.
     const jsChildRuns = (target.readyWasmJsChildRuns || 0) + 1;
     target.readyWasmJsChildRuns = jsChildRuns;
     if (this.readyWasmPositionalReleaseEnabled &&
@@ -7591,7 +7796,27 @@ class JitCompiler {
       // returns is the correct operand-stack recipient.
       child.jitGeneratedReturnParent = frame;
       child.jitGeneratedReturnType = returnType;
+      // A nested generated deopt can already carry its own descendant. At
+      // each synchronous call boundary replace that with this boundary's
+      // direct child, so the parent reconstructs one exact Java frame at a
+      // time instead of trying to adopt a grandchild whose return owner is
+      // correctly the intervening activation.
+      result.jvmPositionalChild = child;
       return result;
+    }
+    // A generated body that has not withdrawn all of its descendants has not
+    // completed, even if it returned an ordinary result object. Keep its Frame
+    // scheduler-visible and out of the per-target free pool so a later call
+    // cannot reset state that the nested child will resume into.
+    if (thread.callStack.items.length !== childEntryDepth) {
+      child.jitGeneratedReturnParent = frame;
+      child.jitGeneratedReturnType = returnType;
+      return {
+        deopt: true,
+        transient: true,
+        reason: "resolved generated callee left active child",
+        jvmPositionalChild: child,
+      };
     }
     target.freeFrame = child;
     if (memoKey !== NO_MEMO_KEY) {
@@ -8064,13 +8289,19 @@ class JitCompiler {
           if (!fieldSite.directInstanceKey) return null;
           if (fieldSite.descriptor !== "I" && fieldSite.descriptor !== "int") return null;
           const fieldKey = JSON.stringify(fieldSite.directInstanceKey);
+          const directValue = Number.isInteger(fieldSite.denseSlot)
+            ? `(Array.isArray(${objectExpression}.fields) ? ` +
+              `${objectExpression}.fields[${fieldSite.denseSlot}] : ` +
+              `${objectExpression}.fields[${fieldKey}])`
+            : `${objectExpression}.fields[${fieldKey}]`;
           // Same guarded direct read the ordinary generated tier emits; the
           // fallback resolves nonstandard layouts and throws the correct NPE.
           stack.push(materialize(
             `((${objectExpression} !== null && ${objectExpression} !== undefined && `
             + `${objectExpression}.fields !== undefined && `
-            + `${objectExpression}.fields[${fieldKey}] !== undefined) `
-            + `? ${objectExpression}.fields[${fieldKey}] `
+            + `(Array.isArray(${objectExpression}.fields) || `
+            + `${objectExpression}.fields[${fieldKey}] !== undefined)) `
+            + `? ${directValue} `
             + `: helpers.getFieldAt(${fieldSiteId}, ${objectExpression}))`));
           continue;
         }

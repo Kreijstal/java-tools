@@ -82,6 +82,9 @@ module.exports = {
     },
 
     'getGraphics()Ljava/awt/Graphics;': (jvm, obj, args) => {
+      if (jvm?.awtWebGlPresentation && obj._canvasElement) {
+        return { type: 'java/awt/Graphics', _component: obj };
+      }
       if (obj._awtGraphics) {
         return { type: 'java/awt/Graphics', _awtGraphics: obj._awtGraphics, _component: obj };
       }
@@ -118,7 +121,9 @@ module.exports = {
       // Guest classes do not expose JRE methods as object properties, so the
       // graphics context must be built here, bound to the component's canvas.
       let graphics = null;
-      if (typeof document !== 'undefined') {
+      if (jvm?.awtWebGlPresentation && obj._canvasElement) {
+        graphics = jvm.createGraphicsObject(obj);
+      } else if (typeof document !== 'undefined') {
         if (obj._canvasElement && obj._canvasElement.getContext) {
           const ctx = obj._canvasElement.getContext('2d');
           if (ctx) {
