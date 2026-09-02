@@ -3,6 +3,7 @@ const {parse} = require('acorn');
 const {
   partitionOversizedLinearBlocks, liftOversizedUnitLocalsToEnvironment,
   outlineLargeRegionLoops, regionUnit, rawRegionUnit, renderRegionUnit,
+  applyRegionStatementEdits, assembleInsertion,
 } =
   require('../src/jit/HotCallGraphRegionCompiler');
 
@@ -974,6 +975,203 @@ test('a segment is never cut around another segment\'s call site', (t) => {
       `the partitioned body agrees at ${input}`);
     t.deepEqual(cutLog, originalLog,
       `the partitioned body logs the same effects at ${input}`);
+  }
+  t.end();
+});
+
+// A composed body: a callee inserted lexically into a caller, the way
+// `rewriteCallBindings` inserts one. The insertion is published the way the
+// renderer publishes it -- an insertable source whose exits already assign one
+// result token and break one label token, the statement records behind that
+// source, and an assembler that binds the callee's parameters by declaration
+// inside a labeled block -- so these cases drive `assembleInsertion` and
+// `applyRegionStatementEdits` on the shape the region compiler really hands
+// them.
+
+const CALLEE_RESULT = 'ssaRegionInlineResult9';
+const CALLEE_LABEL = 'ssaRegionInlineBody9';
+
+function buildInsertion(bodyLines, argumentNames) {
+  // The exits break out of a label the *caller* declares, so the body only
+  // parses inside it. The fixture wraps it exactly as the renderer's own
+  // statement-IR verifier does, and keeps the records of the body alone.
+  const units = buildRegionUnits(
+    `function __callee() {\n${CALLEE_LABEL}: {\n${
+      bodyLines.join('\n')}\n}\n}`);
+  const all = units.find((unit) => unit.name === '__callee').statements;
+  const statements = all.slice(1, all.length - 1);
+  const published = {
+    serial: 9,
+    source: statements.map((statement) => statement.text).join('\n'),
+    statements,
+    exitCount: 2,
+    resultToken: CALLEE_RESULT,
+    labelToken: CALLEE_LABEL,
+    argumentNames: [...argumentNames],
+    entryGuardName: 'nestedEntryGuarded',
+    entryGuardValue: '2',
+  };
+  published.assemble = ({
+    source = published.source, argumentValues, resultName, exitLabel,
+    namespace, declareResult = true,
+  }) => {
+    const retargeted = source
+      .split(published.resultToken).join(resultName)
+      .split(published.labelToken).join(exitLabel);
+    return [
+      declareResult ? `let ${resultName};` : null,
+      ...argumentValues.map((value, index) =>
+        `const ${namespace}a${index} = ${value};`),
+      `${exitLabel}: {`,
+      ...published.argumentNames.map((name, index) =>
+        `  const ${name} = ${namespace}a${index};`),
+      `  const ${published.entryGuardName} = ${published.entryGuardValue};`,
+      ...retargeted.split('\n').map((line) => `  ${line}`),
+      '}',
+    ].filter((line) => line !== null).join('\n');
+  };
+  return published;
+}
+
+// Insert `insertion` in place of the caller statement that declares `at`,
+// exactly as `rewriteCallBindings` does: the assembled text is spliced into
+// the caller's source and the same edit is mapped onto its records.
+function composeCallee(callerModuleSource, insertion, at, argumentValues) {
+  const units = buildRegionUnits(callerModuleSource);
+  const unitIndex = units.findIndex((unit) =>
+    unit.statements.some((statement) => statement.def === at));
+  const unit = units[unitIndex];
+  const callIndex = unit.statements.findIndex(
+    (statement) => statement.def === at);
+  let offset = 0;
+  for (let index = 0; index < callIndex; index += 1) {
+    offset += unit.statements[index].text.length + 1;
+  }
+  const call = unit.statements[callIndex];
+  const start = offset + call.indent.length;
+  const end = offset + call.text.length;
+  const namespace = 'jvmRegionInline12_9_';
+  const assembled = assembleInsertion(insertion, {
+    source: insertion.source,
+    statements: insertion.statements,
+    argumentValues,
+    resultName: at,
+    exitLabel: `${namespace}return`,
+    namespace,
+    declareResult: true,
+  });
+  const bodySource = unit.statements
+    .map((statement) => statement.text).join('\n');
+  const composedSource = bodySource.slice(0, start) + assembled.source +
+    bodySource.slice(end);
+  const composed = applyRegionStatementEdits(unit.statements,
+    [{start, end, replacement: assembled.source,
+      statements: assembled.statements}],
+    composedSource);
+  const composedUnit = regionUnit({...unit, statements: composed});
+  return {
+    assembled,
+    composed,
+    unit,
+    units: units.map((entry, index) =>
+      index === unitIndex ? composedUnit : entry),
+    exitLabel: `${namespace}return`,
+  };
+}
+
+const composedCalleeBody = [
+  'let local0 = argument0 | 0;',
+  'let local1 = argument1 | 0;',
+  'log.push("callee-enter");',
+  ...Array.from({length: 400}, (_unused, index) =>
+    `local0 = (local0 + ${index + 1}) | 0;`),
+  'log.push("callee-middle");',
+  `if (local1 > 900) { ${CALLEE_RESULT} = local0; break ${CALLEE_LABEL}; }`,
+  ...Array.from({length: 400}, (_unused, index) =>
+    `local0 = (local0 ^ ${index + 17}) | 0;`),
+  'log.push("callee-exit");',
+  `{ ${CALLEE_RESULT} = (local0 + local1) | 0; break ${CALLEE_LABEL}; }`,
+];
+
+// The caller declares `local0` too, at its own top level. The callee's
+// `local0` shadows it inside the inserted block; a pass that resolved names
+// with one flat set would hand a relocated statement the wrong binding.
+const composedCallerSource = [
+  'function work(seed, log) {',
+  'let local0 = seed | 0;',
+  'let total = 0;',
+  ...Array.from({length: 200}, (_unused, index) =>
+    `total = (total + local0 + ${index + 1}) | 0;`),
+  'log.push("caller-before");',
+  'let out = 0;',
+  'log.push("caller-after");',
+  ...Array.from({length: 200}, (_unused, index) =>
+    `total = (total ^ out ^ ${index + 3}) | 0;`),
+  'return (total + out + local0) | 0;',
+  '}',
+  'return work;',
+].join('\n');
+
+test('a composed callee splices into the caller as records', (t) => {
+  const insertion = buildInsertion(composedCalleeBody,
+    ['argument0', 'argument1']);
+  const {assembled, composed, unit} = composeCallee(
+    composedCallerSource, insertion, 'out', ['local0', 'total']);
+  t.ok(assembled && assembled.statements,
+    'the assembler publishes records beside the text it produced');
+  t.equal(assembled.statements.map((statement) => statement.text).join('\n'),
+    assembled.source,
+    'the records reproduce the assembled body exactly');
+  t.equal(composed.length,
+    unit.statements.length - 1 + assembled.statements.length,
+    'the call statement is replaced by the whole inserted record list');
+  const opaque = composed.filter((statement) => statement.reads === null);
+  t.equal(opaque.length, 2,
+    'only the two argument staging declarations stay opaque');
+  t.ok(composed.some((statement) =>
+    statement.text.includes('callee-middle') && statement.reads !== null),
+  'the callee body arrives as records the passes can read');
+  t.end();
+});
+
+test('the partitioner cuts across a composed callee body', (t) => {
+  const insertion = buildInsertion(composedCalleeBody,
+    ['argument0', 'argument1']);
+  const {units, exitLabel} = composeCallee(
+    composedCallerSource, insertion, 'out', ['local0', 'total']);
+  const composedSource = renderUnits(units);
+  const partitioned = partitionOversizedLinearBlocks(units, OPTIONS);
+  const partitionedSource = renderUnits(partitioned.units);
+  t.ok(partitioned.attemptedRuns > 0,
+    'the composed body is walked for runs at all');
+  t.ok(partitioned.count > 0, 'the composed body is actually partitioned');
+  const helpers = partitioned.units.filter((entry) =>
+    entry.name && entry.name.startsWith('jvmRegionSegment'));
+  t.ok(helpers.some((helper) => helper.statements.some((statement) =>
+    statement.text.includes('callee-middle') ||
+    statement.text.includes('callee-exit'))),
+  'a segment helper carries statements from inside the inserted body');
+  // A run that carries one of the callee's exits carries a jump to a label
+  // the caller declares. It may only be extracted when the jump is
+  // re-established at the call site, which occupies the run's own block
+  // position and therefore sees that label.
+  const jumpedOut = helpers.filter((helper) =>
+    renderRegionUnit(helper).includes('[0] = 3;'));
+  if (jumpedOut.length) {
+    t.ok(partitionedSource.includes(`break ${exitLabel};`),
+      'an outward jump to the caller\'s exit label is re-established');
+  } else {
+    t.ok(true, 'no run carried an outward jump');
+  }
+  const original = compile(composedSource);
+  const transformed = compile(partitionedSource);
+  for (const seed of [0, 1, 7, 1000, -3]) {
+    const expected = [];
+    const actual = [];
+    t.equal(transformed(seed, actual), original(seed, expected),
+      `the partitioned composed body matches for seed=${seed}`);
+    t.deepEqual(actual, expected,
+      `the partitioned composed body's effect order matches for seed=${seed}`);
   }
   t.end();
 });
