@@ -355,6 +355,7 @@ function substituteRegionParts(parts, replacements) {
 
 const REGION_STATEMENT_DEFAULTS = {
   parts: null, kind: "regionOwned", def: null, write: null, delta: 0,
+  writes: null,
   label: null, jump: null, exit: null, yields: false, opens: null,
   continuesBlock: false, relocatable: true,
   // Extra names one emitted statement introduces beyond `def`: the call-site
@@ -379,6 +380,7 @@ function ownStatement(text, facts = {}) {
     text,
     indent: text.slice(0, trimmedStart),
     reads: facts.reads === null ? null : facts.reads || [],
+    writes: facts.writes || (facts.write ? [facts.write] : []),
   };
 }
 
@@ -456,10 +458,10 @@ function regionNames(statements, from, to) {
       seen.add(name);
       free.push(name);
     }
-    const write = statement.write;
-    if (!write || declared.has(write)) continue;
-    written.add(write);
-    if (!seen.has(write)) {
+    for (const write of statement.writes || []) {
+      if (declared.has(write)) continue;
+      written.add(write);
+      if (seen.has(write)) continue;
       seen.add(write);
       free.push(write);
     }
@@ -847,6 +849,7 @@ function outlineLargeRegionLoops(unit, options = {}) {
           ...body.map((statement) => ownStatement(
             `    ${statement.text}`, {
               reads: statement.reads, write: statement.write,
+              writes: statement.writes,
               def: statement.def, delta: statement.delta,
               label: statement.label, jump: statement.jump,
               opens: statement.opens, yields: statement.yields,
@@ -1006,7 +1009,8 @@ function liftOversizedUnitLocalsToEnvironment(units, options = {}) {
             : ";"}`, {
           reads: [...statement.reads.filter((name) => !slotIndex.has(name)),
             envName],
-          write: null,
+          writes: (statement.writes || []).filter(
+            (name) => !slotIndex.has(name)),
           delta: statement.delta,
         }));
         continue;
@@ -1029,6 +1033,8 @@ function liftOversizedUnitLocalsToEnvironment(units, options = {}) {
         } : null,
         def: statement.def,
         write: slotIndex.has(statement.write) ? null : statement.write,
+        writes: (statement.writes || []).filter(
+          (name) => !slotIndex.has(name)),
         reads: [...statement.reads.filter((name) => !slotIndex.has(name)),
           envName],
       });
@@ -1139,7 +1145,7 @@ function partitionOversizedLinearBlocks(units, options = {}) {
             const outside = statements[other];
             if (outside.reads === null) { escapes = true; break; }
             escapes = outside.reads.includes(statement.def) ||
-              outside.write === statement.def;
+              (outside.writes || []).includes(statement.def);
           }
           if (escapes) hoistNames.push(statement.def);
         }

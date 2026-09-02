@@ -229,6 +229,7 @@ function buildRegionUnits(moduleSource) {
       def,
       declares,
       write,
+      writes: write ? [write] : [],
       reads,
       delta,
       label: facts.labels.length ? facts.labels[0] : null,

@@ -671,6 +671,86 @@ function partsRelocationHostile(parts) {
   return false;
 }
 
+// The ambient names a statement assigns.
+//
+// An ambient name is declared by the tier's outermost scope rather than by
+// any statement, so it is not an operand and no `write` record names it -- but
+// a unit outlined out of the body still has to write it back. The assignment
+// is read off the statement's own skeleton: the name followed by `=`, by a
+// compound assignment operator, or by `++`/`--` on either side, and the
+// destructuring target the frame materialization writes
+// (`[frame, locals, stack] = ...`).
+function partsAmbientWrites(parts) {
+  const skeleton = partsSkeleton(parts);
+  const mask = skeletonCodeMask(skeleton);
+  const found = [];
+  // The one destructuring target the emitters write: a bracketed list at the
+  // head of the statement, assigned as a whole.
+  let destructuringEnd = -1;
+  const head = skeleton.length - skeleton.trimStart().length;
+  if (skeleton[head] === "[" && mask[head]) {
+    let depth = 0;
+    for (let index = head; index < skeleton.length; index += 1) {
+      if (!mask[index]) continue;
+      if (skeleton[index] === "[") depth += 1;
+      else if (skeleton[index] === "]") {
+        depth -= 1;
+        if (depth === 0) {
+          let after = index + 1;
+          while (skeleton[after] === " ") after += 1;
+          if (skeleton[after] === "=" && skeleton[after + 1] !== "=") {
+            destructuringEnd = index;
+          }
+          break;
+        }
+      }
+    }
+  }
+  const assignsAt = (position, length) => {
+    if (destructuringEnd > 0 && position > head &&
+        position + length <= destructuringEnd) return true;
+    let before = position - 1;
+    while (skeleton[before] === " ") before -= 1;
+    if (before >= 1 && (skeleton[before] === "+" || skeleton[before] === "-") &&
+        skeleton[before - 1] === skeleton[before]) return true;
+    let after = position + length;
+    while (skeleton[after] === " ") after += 1;
+    if ((skeleton[after] === "+" || skeleton[after] === "-") &&
+        skeleton[after + 1] === skeleton[after]) return true;
+    let operators = 0;
+    while (operators < 3 &&
+      "+-*/%&|^<>".includes(skeleton[after + operators])) operators += 1;
+    return skeleton[after + operators] === "=" &&
+      skeleton[after + operators + 1] !== "=" &&
+      (operators > 0 || skeleton[after + 1] !== ">");
+  };
+  for (const name of AMBIENT_GENERATED_NAMES) {
+    for (const position of skeletonKeywordPositions(skeleton, name, mask)) {
+      if (!assignsAt(position, name.length)) continue;
+      found.push(name);
+      break;
+    }
+  }
+  return found;
+}
+
+// Whether the statement declares an ambient name in its own scope
+// (`let frame = null;`). Such a statement may not be relocated: the unit it
+// would move into already receives that name as a parameter, and a
+// declaration of a parameter's name is not even legal there.
+function partsDeclaresAmbient(parts) {
+  const skeleton = partsSkeleton(parts).trimStart();
+  for (const keyword of ["let ", "const ", "var "]) {
+    if (!skeleton.startsWith(keyword)) continue;
+    let start = keyword.length;
+    while (skeleton[start] === " ") start += 1;
+    let end = start;
+    while (isPartsWordCharacter(skeleton[end])) end += 1;
+    return AMBIENT_GENERATED_NAMES.includes(skeleton.slice(start, end));
+  }
+  return false;
+}
+
 // Whether the statement continues the block it closes (`} else {`,
 // `} catch (error) {`, `} finally {`). Its nesting delta is zero, but a
 // consumer must not treat it as an ordinary statement: it belongs to the
@@ -2014,6 +2094,11 @@ class JvmSsaBlockRenderer {
         kind: record.kind,
         def: record.def || null,
         write: record.write || null,
+        // Every name the statement assigns in an enclosing scope: its operand
+        // target and the ambient names it writes.
+        writes: [...(record.write ? [record.write] : []),
+          ...partsAmbientWrites(parts).filter(
+            (name) => name !== record.write)],
         reads,
         delta,
         label: partsLabelName(parts),
@@ -2037,7 +2122,7 @@ class JvmSsaBlockRenderer {
           !(jump && !jump.recognized) && !(exit && !exit.recognized) &&
           !(jump && exit) &&
           named === null && !partsCarriesNestedFunction(parts) &&
-          !partsRelocationHostile(parts),
+          !partsRelocationHostile(parts) && !partsDeclaresAmbient(parts),
       };
     };
     // Statement-level fragments of an assembled positional body: an ordered
@@ -2075,16 +2160,18 @@ class JvmSsaBlockRenderer {
             seenRead.add(name);
             reads.push(name);
           }
-          const written = record.write;
-          if (!written || declared.has(written)) continue;
-          if (!seenWrite.has(written)) {
-            seenWrite.add(written);
-            writes.push(written);
-          }
-          // A unit that assigns an enclosing name still has to bind it.
-          if (!seenRead.has(written)) {
-            seenRead.add(written);
-            reads.push(written);
+          for (const written of [...(record.write ? [record.write] : []),
+            ...partsAmbientWrites(record.parts)]) {
+            if (declared.has(written)) continue;
+            if (!seenWrite.has(written)) {
+              seenWrite.add(written);
+              writes.push(written);
+            }
+            // A unit that assigns an enclosing name still has to bind it.
+            if (!seenRead.has(written)) {
+              seenRead.add(written);
+              reads.push(written);
+            }
           }
         }
         fragments.push({

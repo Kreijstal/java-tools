@@ -1,4 +1,5 @@
 const test = require('tape');
+const { parse } = require('acorn');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -162,5 +163,139 @@ public final class FragmentTryHarness {
       }
       t.equal(depth, 0, 'a try fragment is balanced');
     }
+    t.end();
+  });
+
+// An independent reading of a fragment's own text, used only to check the
+// published name sets. The renderer states them from the records its emitters
+// built; this oracle recovers them from the syntax, and the two have to
+// agree, or a consumer that outlines the fragment would leave a name unbound
+// or fail to write one back.
+function analyseFragment(text) {
+  let program;
+  try {
+    program = parse(`function* __unit(){\n${text}\n}`,
+      { ecmaVersion: 'latest', ranges: true, allowReturnOutsideFunction: true });
+  } catch (_error) {
+    return null;
+  }
+  const childrenOf = (node) => {
+    const children = [];
+    for (const [key, child] of Object.entries(node || {})) {
+      if (key === 'start' || key === 'end' || key === 'loc' ||
+          key === 'range') continue;
+      if (Array.isArray(child)) {
+        for (const entry of child) if (entry?.type) children.push(entry);
+      } else if (child?.type) {
+        children.push(child);
+      }
+    }
+    return children;
+  };
+  const isFunction = (node) => node && (
+    node.type === 'FunctionDeclaration' ||
+    node.type === 'FunctionExpression' ||
+    node.type === 'ArrowFunctionExpression');
+  const names = (pattern, into) => {
+    if (!pattern) return;
+    if (pattern.type === 'Identifier') into.add(pattern.name);
+    else if (pattern.type === 'RestElement') names(pattern.argument, into);
+    else if (pattern.type === 'AssignmentPattern') names(pattern.left, into);
+    else if (pattern.type === 'ArrayPattern') {
+      for (const element of pattern.elements) names(element, into);
+    } else if (pattern.type === 'ObjectPattern') {
+      for (const property of pattern.properties) {
+        names(property.value || property.argument, into);
+      }
+    }
+  };
+  const declared = new Set();
+  const read = new Set();
+  const written = new Set();
+  const labels = new Set();
+  const visit = (node, parent) => {
+    if (node.type === 'VariableDeclarator') names(node.id, declared);
+    else if (isFunction(node)) {
+      if (node.id) declared.add(node.id.name);
+      for (const parameter of node.params || []) names(parameter, declared);
+    } else if (node.type === 'CatchClause') names(node.param, declared);
+    else if (node.type === 'LabeledStatement') labels.add(node.label.name);
+    if (node.type === 'AssignmentExpression') names(node.left, written);
+    if (node.type === 'UpdateExpression' &&
+        node.argument?.type === 'Identifier') {
+      written.add(node.argument.name);
+    }
+    if (node.type === 'Identifier') {
+      const property = parent?.type === 'MemberExpression' &&
+        parent.property === node && !parent.computed ||
+        (parent?.type === 'Property' || parent?.type === 'MethodDefinition') &&
+          parent.key === node && !parent.computed && !parent.shorthand;
+      const label = (parent?.type === 'LabeledStatement' ||
+        parent?.type === 'BreakStatement' ||
+        parent?.type === 'ContinueStatement') && parent.label === node;
+      if (!property && !label) read.add(node.name);
+    }
+    for (const child of childrenOf(node)) visit(child, node);
+  };
+  visit(program.body[0].body, null);
+  return { declared, read, written, labels };
+}
+
+// Host globals and the module-level captures a generated body closes over.
+// Neither is a name an outlined unit has to receive.
+const AMBIENT_HOSTS = new Set(['Math', 'Number', 'Array', 'ArrayBuffer',
+  'JSON', 'Object', 'String', 'Boolean', 'undefined', 'NaN', 'Infinity',
+  'BigInt', 'Symbol', 'Error', 'isNaN', 'parseInt', 'parseFloat', 'Date',
+  'Map', 'Set', 'WeakMap', 'globalThis', 'Function', 'RegExp', 'Promise',
+  'ssaReturnVoid', 'ssaAsyncInvoke']);
+
+test('published fragment names agree with the fragment\'s own syntax',
+  async (t) => {
+    const className = 'FragmentNameHarness';
+    const repeated = Array.from({ length: 12 },
+      () => 'sum += data[index];').join('\n      ');
+    const generated = await compileMethod(t, className, `
+public final class ${className} {
+  static int scan(int[] data, int count) {
+    int sum = 0;
+    for (int index = 0; index < count; index++) {
+      ${repeated}
+      sum += 100 / data[index];
+      if (data[index] == 99) return sum;
+    }
+    return sum;
+  }
+}
+`, 'scan', '([II)I');
+    let checked = 0;
+    for (const [variant, list] of Object.entries(
+      generated.jvmStructuredRegionFragments || {})) {
+      for (const fragment of list) {
+        const analysis = analyseFragment(fragment.lines.join('\n'));
+        // A linear run need not be a complete program on its own (the
+        // restoring tier's wrapper opens in one); only self-contained
+        // fragments can be cross-checked.
+        if (!analysis) continue;
+        const declared = new Set(fragment.declares);
+        const free = [...analysis.read].filter((name) =>
+          !declared.has(name) && !analysis.labels.has(name) &&
+          !AMBIENT_HOSTS.has(name));
+        const missingReads = free.filter(
+          (name) => !fragment.reads.includes(name));
+        const missingWrites = [...analysis.written].filter((name) =>
+          !declared.has(name) && !AMBIENT_HOSTS.has(name) &&
+          !fragment.writes.includes(name));
+        t.deepEqual(missingReads, [],
+          `${variant} #${fragment.id} reports every free name it reads`);
+        t.deepEqual(missingWrites, [],
+          `${variant} #${fragment.id} reports every enclosing name it writes`);
+        for (const name of fragment.writes) {
+          t.ok(fragment.reads.includes(name),
+            `${variant} #${fragment.id} binds ${name} as well as writing it`);
+        }
+        checked += 1;
+      }
+    }
+    t.ok(checked > 0, 'the harness publishes fragments to cross-check');
     t.end();
   });
