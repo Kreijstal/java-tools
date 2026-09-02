@@ -1490,9 +1490,10 @@ class HotCallGraphRegionCompiler {
     // method sources. Cache each source's AST-derived binding index so an
     // evolving region does not parse and traverse the same large body for
     // every newly closed edge.
-    this.callBindingIndexes = new WeakMap();
-    this.callBindingIndexBuildCount = 0;
-    this.callBindingIndexReuseCount = 0;
+    // Call-site linking is driven by published emission data. Nothing in
+    // region composition parses a generated source; this stays at zero and is
+    // asserted by the suite so a regression cannot reintroduce a parse.
+    this.callBindingParseCount = 0;
     this.lastExpansionAttempts = new WeakMap();
     this.dependentRootsByMethod = new WeakMap();
     this.dirtyRoots = new WeakSet();
@@ -1944,31 +1945,23 @@ class HotCallGraphRegionCompiler {
     return components;
   }
 
+  /**
+   * Link one node's published positional source into the region module.
+   *
+   * Nothing here reads syntax out of generated JavaScript. Every call site
+   * the renderer emitted publishes a `regionLowering` record naming the
+   * result and depth it declared, the operand expressions it passed, its raw
+   * call in both nested-entry forms, and its catch parameter with that
+   * catch's restoring and rethrowing bodies. The region locates a site by the
+   * compiler-owned marker pair that brackets it and then *selects* between
+   * published forms; a call binding is replaced by the exact declaration text
+   * the renderer published for it. Both are late-bound compiler-owned tokens
+   * expanded by identity, not recovered structure.
+   */
   rewriteCallBindings(source, edges, functionNames, internalNode = false,
-    generatorSource = false, cacheOwner = null,
+    generatorSource = false, generated = null,
     compactClosedInternalCalls = false, inlineEdges = null,
     inlineSources = null, fallbackInlineEdges = null) {
-    const prefix = generatorSource
-      ? "function* __jvmRegionNode() {\n"
-      : "function __jvmRegionNode() {\n";
-    let ownerIndexes = cacheOwner && this.callBindingIndexes.get(cacheOwner);
-    const cachedIndex = ownerIndexes?.get(source);
-    let program;
-    const comments = [];
-    if (!cachedIndex) {
-      try {
-        program = parse(`${prefix}${source}\n}`, {
-          ecmaVersion: "latest",
-          ranges: true,
-          onComment: comments,
-        });
-      } catch (error) {
-        return {error: `region AST parse failed: ${error.message}`};
-      }
-      this.callBindingIndexBuildCount += 1;
-    } else {
-      this.callBindingIndexReuseCount += 1;
-    }
     const replacements = new Map();
     for (const edge of edges) {
       const identifiers = edge.site.identifiers || {};
@@ -1994,6 +1987,8 @@ class HotCallGraphRegionCompiler {
           runtimeDynamic ? edge.receiverType : null));
       }
     }
+    const bindingDeclarations =
+      generated?.jvmStructuredRegionCallBindingDeclarations || {};
     const edits = [];
     const replaced = new Set();
     const loweredRanges = [];
@@ -2004,162 +1999,110 @@ class HotCallGraphRegionCompiler {
     const inlineFailureReasons = [];
     const elidedFieldCacheInvalidations = 0;
     const eliminatedBindingNames = new Set();
-    const memberPath = (node) => {
-      const parts = [];
-      let current = node;
-      while (current?.type === "MemberExpression" && !current.computed &&
-          current.property?.type === "Identifier") {
-        parts.unshift(current.property.name);
-        current = current.object;
+    const claimed = [];
+    const claim = (start, end) => {
+      for (const range of claimed) {
+        if (start < range.end && end > range.start) return false;
       }
-      if (current?.type === "Identifier") parts.unshift(current.name);
-      return parts.join(".");
+      claimed.push({start, end});
+      return true;
     };
-    // Index the large generated AST once. Region roots can contain hundreds
-    // of call edges; walking the whole tree independently for every marker is
-    // quadratic and can monopolize a Node/browser event loop for minutes.
-    let commentsByValue = cachedIndex?.commentsByValue;
-    let callsByCallee = cachedIndex?.callsByCallee;
-    const edgesByRawCallee = new Map(edges.map((edge) =>
-      [edge.site.identifiers?.rawInvoke, edge]));
-    let assignmentExpressions = cachedIndex?.assignmentExpressions;
-    let assignmentStatements = cachedIndex?.assignmentStatements;
-    let variableDeclarators = cachedIndex?.variableDeclarators;
-    let callExpressions = cachedIndex?.callExpressions;
-    let tryStatements = cachedIndex?.tryStatements;
-    if (!cachedIndex) {
-      commentsByValue = new Map();
-      for (const comment of comments) {
-        const value = comment.value.trim();
-        const entries = commentsByValue.get(value) || [];
-        entries.push({start: comment.start, end: comment.end});
-        commentsByValue.set(value, entries);
+    const editEveryOccurrence = (text, replacement) => {
+      if (!text) return 0;
+      let cursor = 0;
+      let count = 0;
+      for (;;) {
+        const start = source.indexOf(text, cursor);
+        if (start < 0) return count;
+        const end = start + text.length;
+        cursor = end;
+        if (!claim(start, end)) continue;
+        edits.push({start, end, replacement});
+        count += 1;
       }
-      callsByCallee = new Map();
-      assignmentExpressions = [];
-      assignmentStatements = [];
-      variableDeclarators = [];
-      callExpressions = [];
-      tryStatements = [];
-      walkAst(program, (node, parent) => {
-        if (node.type === "CallExpression") {
-          const call = {
-            start: node.start,
-            end: node.end,
-            calleeName: node.callee?.type === "Identifier"
-              ? node.callee.name : null,
-            arguments: node.arguments.map((argument) => ({
-              start: argument.start,
-              end: argument.end,
-              type: argument.type,
-              value: argument.type === "Literal"
-                ? argument.value : undefined,
-            })),
-          };
-          callExpressions.push(call);
-          if (node.callee?.type === "Identifier") {
-            const entries = callsByCallee.get(node.callee.name) || [];
-            entries.push(call);
-            callsByCallee.set(node.callee.name, entries);
-          }
-        } else if (node.type === "AssignmentExpression") {
-          assignmentExpressions.push({
-            start: node.start,
-            end: node.end,
-            leftName: node.left?.type === "Identifier"
-              ? node.left.name : null,
-            rightStart: node.right.start,
-            rightEnd: node.right.end,
-          });
-        } else if (node.type === "ExpressionStatement" &&
-            node.expression?.type === "AssignmentExpression") {
-          assignmentStatements.push({
-            start: node.start,
-            end: node.end,
-            operator: node.expression.operator,
-            leftPath: memberPath(node.expression.left),
-          });
-        } else if (node.type === "VariableDeclarator") {
-          variableDeclarators.push({
-            name: node.id?.type === "Identifier" ? node.id.name : null,
-            initStart: node.init?.start,
-            initEnd: node.init?.end,
-            statementStart: parent?.type === "VariableDeclaration" &&
-              parent.declarations.length === 1 ? parent.start : null,
-            statementEnd: parent?.type === "VariableDeclaration" &&
-              parent.declarations.length === 1 ? parent.end : null,
-            initPath: node.init ? memberPath(node.init) : null,
-          });
-        } else if (node.type === "TryStatement" && node.handler?.body) {
-          const handlerStatements = node.handler.body.body || [];
-          const restoringBranch = handlerStatements.find((statement) =>
-            statement.type === "IfStatement" &&
-              statement.alternate?.type === "BlockStatement");
-          const rethrow = handlerStatements.find((statement) =>
-            statement.type === "ThrowStatement");
-          tryStatements.push({
-            blockStart: node.block?.start,
-            blockEnd: node.block?.end,
-            parameter: node.handler.param?.type === "Identifier"
-              ? node.handler.param.name : null,
-            handlerStart: node.handler?.body?.start,
-            handlerEnd: node.handler?.body?.end,
-            restoringStart: restoringBranch?.alternate?.start,
-            restoringEnd: restoringBranch?.alternate?.end,
-            throwStart: rethrow?.start,
-            throwEnd: rethrow?.end,
-          });
-        }
-      });
-      if (cacheOwner) {
-        if (!ownerIndexes) {
-          ownerIndexes = new Map();
-          this.callBindingIndexes.set(cacheOwner, ownerIndexes);
-        }
-        ownerIndexes.set(source, {
-          commentsByValue,
-          callsByCallee,
-          assignmentExpressions,
-          assignmentStatements,
-          variableDeclarators,
-          callExpressions,
-          tryStatements,
-        });
+    };
+    // Every occurrence of a call's raw invocation, wherever the emitted body
+    // finally carried it.
+    const rawCallSuffixPositions = (lowering) => {
+      const positions = [];
+      let scan = 0;
+      for (;;) {
+        const at = source.indexOf(lowering.rawCallPrefix, scan);
+        if (at < 0) return positions;
+        const suffix = source.indexOf(
+          lowering.rawCallSuffix, at + lowering.rawCallPrefix.length);
+        if (suffix < 0) return positions;
+        positions.push(suffix);
+        scan = suffix + lowering.rawCallSuffix.length;
       }
-    }
+    };
     if (internalNode) {
-      for (const node of assignmentStatements) {
-        if (node.operator !== "+=") continue;
-        if (node.leftPath !== "helpers.structuredSsa.runCount" &&
-            node.leftPath !==
-              "helpers.structuredSsa.restoringDirectRunCount") continue;
-        edits.push({
-          start: node.start - prefix.length,
-          end: node.end - prefix.length,
-          replacement: "",
-        });
+      // A fused graph is one scheduler execution unit. Member entries must
+      // not each record an independent run; the renderer publishes the exact
+      // accounting statements it emitted, longest form first so a guarded
+      // statement is claimed before its bare assignment.
+      for (const statement of
+        generated?.jvmStructuredRegionRunCounterStatements || []) {
+        editEveryOccurrence(statement, "");
       }
     }
     for (const edge of edges) {
       const markers = edge.site.regionMarkers;
+      const lowering = edge.site.regionLowering;
       const rawName = edge.site.identifiers?.rawInvoke;
-      if (!markers?.start || !markers?.end || !rawName) continue;
-      const startComment = commentsByValue.get(markers.start)?.[0];
-      const endComment = commentsByValue.get(markers.end)?.find(
-        (comment) => !startComment || comment.start > startComment.end);
-      if (!startComment || !endComment) continue;
-      const rawCall = (callsByCallee.get(rawName) || []).find((node) =>
-        node.start >= startComment.end && node.end <= endComment.start);
-      const assignments = assignmentExpressions.filter((node) =>
-        node.start >= startComment.end && node.end <= endComment.start &&
-        node.leftName);
-      if (!rawCall || rawCall.arguments.length < 3) continue;
-      const assignment = assignments
-        .filter((candidate) => candidate.rightStart <= rawCall.start &&
-          candidate.rightEnd >= rawCall.end)
-        .sort((left, right) =>
-          (left.end - left.start) - (right.end - right.start))[0];
-      if (!assignment) continue;
+      if (!markers?.start || !markers?.end || !rawName || !lowering) continue;
+      const startToken = `/*${markers.start}*/`;
+      const endToken = `/*${markers.end}*/`;
+      const markerStart = source.indexOf(startToken);
+      if (markerStart < 0) continue;
+      const markerEnd = source.indexOf(
+        endToken, markerStart + startToken.length);
+      if (markerEnd < 0) continue;
+      const range = {start: markerStart, end: markerEnd + endToken.length};
+      const regionText = source.slice(range.start, range.end);
+      // A source this node publishes may have been specialized after the call
+      // was emitted (self-recursive direct calls, partitioning). Its tokens
+      // are then gone; leave the site canonical rather than guessing, which
+      // is exactly the outcome the previous AST search produced when it could
+      // not match the call shape.
+      const prefixAt = regionText.indexOf(lowering.rawCallPrefix);
+      if (prefixAt < 0) continue;
+      const suffixAt = regionText.indexOf(
+        lowering.rawCallSuffix, prefixAt + lowering.rawCallPrefix.length);
+      if (suffixAt < 0) continue;
+      const operandTokens = lowering.operandTokens || [];
+      const operandStarts = [];
+      let operandScan = prefixAt + lowering.rawCallPrefix.length;
+      for (const token of operandTokens) {
+        const at = regionText.indexOf(token, operandScan);
+        if (at < 0 || at >= suffixAt) break;
+        operandScan = at + token.length;
+        operandStarts.push(operandScan);
+      }
+      if (operandStarts.length !== operandTokens.length) continue;
+      // Each operand runs from its own token to the ", " in front of the next
+      // token, or in front of the call's trailing `thread, <guard>)`.
+      const callArguments = operandStarts.map((start, position) =>
+        regionText.slice(start, (position + 1 < operandStarts.length
+          ? operandStarts[position + 1] - operandTokens[position + 1].length
+          : suffixAt) - 2));
+      const resultName = lowering.resultName;
+      const blockBetween = (markers) => {
+        if (!markers?.start || !markers?.end) return null;
+        const open = `/*${markers.start}*/`;
+        const close = `/*${markers.end}*/`;
+        const at = regionText.indexOf(open);
+        if (at < 0) return null;
+        const to = regionText.indexOf(close, at + open.length);
+        if (to < 0) return null;
+        return regionText.slice(at + open.length, to);
+      };
+      const restoringSource = lowering.fastCall
+        ? blockBetween(lowering.fastCall.restoreMarkers) : null;
+      const handlerSource = lowering.fastCall
+        ? blockBetween(lowering.fastCall.handlerMarkers) : null;
+      const fastCall = lowering.fastCall && restoringSource !== null &&
+        handlerSource !== null ? lowering.fastCall : null;
       const guardedRuntimeTarget = edge.proof === "runtime-monomorphic" &&
         typeof edge.receiverType === "string" && edge.receiverType.length > 0;
       const compactInternal = Boolean(
@@ -2167,75 +2110,56 @@ class HotCallGraphRegionCompiler {
         (edge.site.exactTarget || guardedRuntimeTarget) && !edge.node?.atomic &&
         !hasRestoringTransientDeopt(edge.node?.generated) &&
         Number.isInteger(edge.site.id));
-      if (compactInternal) {
-        const fastTry = tryStatements
-          .filter((candidate) =>
-            candidate.blockStart <= rawCall.start &&
-              candidate.blockEnd >= rawCall.end &&
-              Number.isInteger(candidate.restoringStart) &&
-              Number.isInteger(candidate.restoringEnd) &&
-              candidate.parameter)
-          .sort((left, right) =>
-            (left.blockEnd - left.blockStart) -
-              (right.blockEnd - right.blockStart))[0];
-        if (fastTry) {
-          const callArguments = rawCall.arguments.slice(1, -2).map(
-            (argument) => source.slice(
-              argument.start - prefix.length,
-              argument.end - prefix.length));
-          const functionName = functionNames.get(edge.method);
-          // The alternate branch of the generated fast-call catch is the
-          // exact call-PC restoration path. Reuse that AST-selected block for
-          // the cold exception/deopt arms while the normal path becomes one
-          // local scalar call. Closed graphs have no canonical child boundary,
-          // and nested-entry marker 2 suppresses independent scheduler yields.
-          const restoring = source.slice(
-            fastTry.restoringStart + 1 - prefix.length,
-            fastTry.restoringEnd - 1 - prefix.length);
-          const receiver = edge.site.dynamic ? callArguments[0] : null;
-          const coldResult = `jvmRegionColdResult${edge.pc}`;
-          const admission = receiver
-            ? `${receiver} !== null && ${receiver} !== undefined && ` +
-              `((${receiver}.type || ${JSON.stringify(
-                edge.site.declaredOwner || "")}) === ${JSON.stringify(
-                edge.receiverType)})`
-            : "true";
-          const replacement = [
-            `let ${assignment.leftName};`,
-            `if (${admission}) {`,
-            `try { ${assignment.leftName} = ${functionName}(` +
-              `helpers${callArguments.length
-                ? `,${callArguments.join(",")}` : ""},thread,2); } ` +
-              `catch (${fastTry.parameter}) {`,
-            restoring,
-            `throw ${fastTry.parameter};`,
-            "}",
-            "} else {",
-            `${assignment.leftName} = ssaAsyncInvoke;`,
-            "}",
-            `if (${assignment.leftName} === ssaAsyncInvoke) {`,
-            restoring,
-            `const ${coldResult} = helpers.tryInvokeSyncAt(` +
-              `${edge.site.id}, frame, thread);`,
-            `if (${coldResult} === ssaAsyncInvoke || (` +
-              `${coldResult} && ${coldResult}.deopt)) {`,
-            "return {deopt: true, transient: true, " +
-              "reason: 'closed region canonical child'};",
-            "}",
-            "thread.callStack.items.splice(restorationDepth, 1);",
-            "plan.target.freeFrame = frame;",
-            "frame = null; locals = null; stack = null;",
-            `${assignment.leftName} = ${coldResult};`,
-            "}",
-            `if (${assignment.leftName} && ${assignment.leftName}.deopt) {`,
-            restoring,
-            `return ${assignment.leftName};`,
-            "}",
-          ].filter(Boolean).join("\n");
-          const range = {
-            start: startComment.start - prefix.length,
-            end: endComment.end - prefix.length,
-          };
+      if (compactInternal && fastCall) {
+        const functionName = functionNames.get(edge.method);
+        // The restoring arm of the generated fast-call catch is the exact
+        // call-PC restoration path. Reuse that bracketed block for the cold
+        // exception/deopt arms while the normal path becomes one local scalar
+        // call. Closed graphs have no canonical child boundary, and
+        // nested-entry marker 2 suppresses independent scheduler yields.
+        const restoring = restoringSource;
+        const caught = fastCall.caught;
+        const receiver = edge.site.dynamic ? callArguments[0] : null;
+        const coldResult = `jvmRegionColdResult${edge.pc}`;
+        const admission = receiver
+          ? `${receiver} !== null && ${receiver} !== undefined && ` +
+            `((${receiver}.type || ${JSON.stringify(
+              edge.site.declaredOwner || "")}) === ${JSON.stringify(
+              edge.receiverType)})`
+          : "true";
+        const replacement = [
+          `let ${resultName};`,
+          `if (${admission}) {`,
+          `try { ${resultName} = ${functionName}(` +
+            `helpers${callArguments.length
+              ? `,${callArguments.join(",")}` : ""},thread,2); } ` +
+            `catch (${caught}) {`,
+          restoring,
+          `throw ${caught};`,
+          "}",
+          "} else {",
+          `${resultName} = ssaAsyncInvoke;`,
+          "}",
+          `if (${resultName} === ssaAsyncInvoke) {`,
+          restoring,
+          `const ${coldResult} = helpers.tryInvokeSyncAt(` +
+            `${edge.site.id}, frame, thread);`,
+          `if (${coldResult} === ssaAsyncInvoke || (` +
+            `${coldResult} && ${coldResult}.deopt)) {`,
+          "return {deopt: true, transient: true, " +
+            "reason: 'closed region canonical child'};",
+          "}",
+          "thread.callStack.items.splice(restorationDepth, 1);",
+          "plan.target.freeFrame = frame;",
+          "frame = null; locals = null; stack = null;",
+          `${resultName} = ${coldResult};`,
+          "}",
+          `if (${resultName} && ${resultName}.deopt) {`,
+          restoring,
+          `return ${resultName};`,
+          "}",
+        ].filter(Boolean).join("\n");
+        if (claim(range.start, range.end)) {
           loweredRanges.push(range);
           edits.push({...range, replacement});
           replaced.add(rawName);
@@ -2267,9 +2191,6 @@ class HotCallGraphRegionCompiler {
       // else keeps the full result-checked call, still direct via the
       // rawInvoke -> region-node redirection.
       if (!edge.node?.atomic && !fallbackInlineEdges?.has(edge)) continue;
-      const callArguments = rawCall.arguments.slice(1, -2).map((argument) =>
-        source.slice(argument.start - prefix.length,
-          argument.end - prefix.length));
       const functionName = functionNames.get(edge.method);
       const inlineDiagnostic = {};
       const inlineSource = inlineEdges?.has(edge)
@@ -2277,7 +2198,7 @@ class HotCallGraphRegionCompiler {
           inlineSources?.get(edge) ||
             edge.node.generated.jvmInternalRegionPositionalSource,
           callArguments,
-          assignment.leftName,
+          resultName,
           `jvmRegionInline${edge.pc}_`, true, inlineDiagnostic)
         : null;
       if (inlineEdges?.has(edge) && !inlineSource) {
@@ -2290,57 +2211,31 @@ class HotCallGraphRegionCompiler {
       if (inlineSource && needsInlineFallback &&
           (edge.proof !== "runtime-monomorphic" ||
             callArguments.length > 0)) {
-        const resultDeclaration = variableDeclarators.find((declaration) =>
-          declaration.name === assignment.leftName &&
-          Number.isInteger(declaration.statementStart) &&
-          declaration.statementStart >= startComment.end &&
-          declaration.statementEnd <= endComment.start);
-        if (resultDeclaration) {
-          const regionStart = startComment.start - prefix.length;
-          const regionEnd = endComment.end - prefix.length;
-          const declarationStart = resultDeclaration.statementStart -
-            prefix.length;
-          const declarationEnd = resultDeclaration.statementEnd -
-            prefix.length;
-          const originalWithoutDeclaration = source.slice(
-            regionStart, declarationStart) + source.slice(
-            declarationEnd, regionEnd);
+        const declarationAt = regionText.indexOf(lowering.resultDeclaration);
+        if (declarationAt >= 0) {
+          const originalWithoutDeclaration =
+            regionText.slice(0, declarationAt) +
+            regionText.slice(
+              declarationAt + lowering.resultDeclaration.length);
           const guardedBody = inlineAtomicPositionalSource(
             inlineSources?.get(edge) ||
               edge.node.generated.jvmInternalRegionPositionalSource,
-            callArguments, assignment.leftName,
+            callArguments, resultName,
             `jvmRegionInline${edge.pc}_`, false);
           let guardedExecution = guardedBody;
           if (fallbackInlineEdges?.has(edge)) {
-            const throwingTry = tryStatements
-              .filter((candidate) => candidate.blockStart <= rawCall.start &&
-                candidate.blockEnd >= rawCall.end && candidate.parameter &&
-                Number.isInteger(candidate.handlerStart) &&
-                Number.isInteger(candidate.handlerEnd))
-              .sort((left, right) =>
-                (left.blockEnd - left.blockStart) -
-                  (right.blockEnd - right.blockStart))[0];
-            const depthDeclaration = variableDeclarators.find(
-              (declaration) => declaration.initPath ===
-                  "thread.callStack.items.length" &&
-                Number.isInteger(declaration.statementStart) &&
-                declaration.statementStart >= startComment.end &&
-                declaration.statementEnd <= endComment.start);
-            if (!throwingTry || !depthDeclaration) {
+            if (!fastCall || !lowering.depthName) {
               inlineFailureReasons.push({edge,
                 reason: "missing-exception-restoration-ast"});
               guardedExecution = null;
             } else {
-              const handler = source.slice(
-                throwingTry.handlerStart + 1 - prefix.length,
-                throwingTry.handlerEnd - 1 - prefix.length);
               guardedExecution = [
-                `const ${depthDeclaration.name} = ` +
+                `const ${lowering.depthName} = ` +
                   "thread.callStack.items.length;",
                 "try {",
                 guardedBody,
-                `} catch (${throwingTry.parameter}) {`,
-                handler,
+                `} catch (${fastCall.caught}) {`,
+                handlerSource,
                 "}",
               ].join("\n");
             }
@@ -2354,12 +2249,12 @@ class HotCallGraphRegionCompiler {
             : "true";
           const completed = `jvmRegionInline${edge.pc}_completed`;
           guardedFallbackInline = guardedExecution && [
-            `let ${assignment.leftName};`,
+            `let ${resultName};`,
             `let ${completed} = false;`,
             `if (${admission}) {`,
             guardedExecution,
-            `${completed} = ${assignment.leftName} !== ssaAsyncInvoke && ` +
-              `!(${assignment.leftName} && ${assignment.leftName}.deopt);`,
+            `${completed} = ${resultName} !== ssaAsyncInvoke && ` +
+              `!(${resultName} && ${resultName}.deopt);`,
             "}",
             `if (!${completed}) {`,
             originalWithoutDeclaration,
@@ -2370,17 +2265,14 @@ class HotCallGraphRegionCompiler {
       const effectiveInlineSource = needsInlineFallback
         ? guardedFallbackInline : inlineSource;
       const replacement = effectiveInlineSource ||
-        `let ${assignment.leftName} = ${functionName}(` +
+        `let ${resultName} = ${functionName}(` +
           `helpers${callArguments.length
             ? `,${callArguments.join(",")}` : ""},thread,2);`;
+      if (!claim(range.start, range.end)) continue;
       if (effectiveInlineSource) {
         lexicallyInlinedEdges += 1;
         if (fallbackInlineEdges?.has(edge)) exceptionalInlinedEdges += 1;
       }
-      const range = {
-        start: startComment.start - prefix.length,
-        end: endComment.end - prefix.length,
-      };
       loweredRanges.push(range);
       edits.push({...range, replacement});
       replaced.add(rawName);
@@ -2390,34 +2282,26 @@ class HotCallGraphRegionCompiler {
         }
       }
     }
-    for (const node of callExpressions) {
-      if (node.calleeName) {
-        const edge = edgesByRawCallee.get(node.calleeName);
-        const nested = node.arguments[node.arguments.length - 1];
-        const start = nested?.start - prefix.length;
-        const end = nested?.end - prefix.length;
-        if (edge && nested?.type === "Literal" && nested.value === true &&
-            !loweredRanges.some((range) =>
-              start >= range.start && end <= range.end)) {
-          edits.push({start, end, replacement: "2"});
-        }
+    // A site the region did not lower keeps its published call, but its
+    // callee is now a region-local node function entered under the region's
+    // own scheduler marker: select the nested-entry form of the same call.
+    for (const edge of edges) {
+      const lowering = edge.site.regionLowering;
+      if (!lowering?.rawCallPrefix || !lowering.nestedRawCallSuffix) continue;
+      for (const position of rawCallSuffixPositions(lowering)) {
+        const end = position + lowering.rawCallSuffix.length;
+        if (!claim(position, end)) continue;
+        edits.push({start: position, end,
+          replacement: lowering.nestedRawCallSuffix});
       }
     }
-    for (const node of variableDeclarators) {
-      if (!node.name || !Number.isInteger(node.initStart) ||
-          !Number.isInteger(node.initEnd)) continue;
-      const replacement = replacements.get(node.name);
-      if (replacement === undefined) continue;
-      const start = node.initStart - prefix.length;
-      const end = node.initEnd - prefix.length;
-      if (loweredRanges.some((range) =>
-        start >= range.start && end <= range.end)) continue;
-      edits.push({
-        start,
-        end,
-        replacement,
-      });
-      replaced.add(node.name);
+    for (const [name, replacement] of replacements) {
+      for (const declaration of bindingDeclarations[name] || []) {
+        if (editEveryOccurrence(declaration.text,
+          `${declaration.kind} ${name} = ${replacement};`) > 0) {
+          replaced.add(name);
+        }
+      }
     }
     for (const edge of edges) {
       if (!replaced.has(edge.site.identifiers.rawInvoke)) {
