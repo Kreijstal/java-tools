@@ -8,13 +8,6 @@ function browserAvailable() {
   return typeof document !== 'undefined' && typeof MouseEvent !== 'undefined';
 }
 
-function unsupported() {
-  throw {
-    type: 'java/lang/UnsupportedOperationException',
-    message: 'java.awt.Robot native input is not configured for Node.js',
-  };
-}
-
 function state(obj) {
   if (!obj._robotState) {
     obj._robotState = { x: 0, y: 0, buttons: 0, autoDelay: 0,
@@ -47,14 +40,14 @@ function mouseInit(robot, button = 0) {
 }
 
 function dispatchMouse(jvm, obj, type, button = 0) {
-  if (!browserAvailable()) unsupported();
+  if (!browserAvailable()) return;
   const robot = state(obj);
   const target = visibleCanvas(jvm, robot.x, robot.y);
   if (target) target.dispatchEvent(new MouseEvent(type, mouseInit(robot, button)));
 }
 
 function dispatchWheel(jvm, obj, amount) {
-  if (!browserAvailable() || typeof WheelEvent === 'undefined') unsupported();
+  if (!browserAvailable() || typeof WheelEvent === 'undefined') return;
   const robot = state(obj);
   const target = visibleCanvas(jvm, robot.x, robot.y);
   if (target) target.dispatchEvent(new WheelEvent('wheel', {
@@ -102,7 +95,7 @@ function keyDescription(code) {
 }
 
 function dispatchKey(jvm, obj, type, keyCode) {
-  if (!browserAvailable() || typeof KeyboardEvent === 'undefined') unsupported();
+  if (!browserAvailable() || typeof KeyboardEvent === 'undefined') return;
   const robot = state(obj);
   const description = keyDescription(keyCode);
   const target = document.activeElement?._jvmAwtInputAttached
@@ -139,12 +132,14 @@ function checkedDelay(value) {
 module.exports = {
   super: 'java/lang/Object',
   methods: {
+    // Applets construct a Robot at startup for mouse warping and idle
+    // simulation. Construction must succeed on every host; without a browser
+    // the Robot is headless and its input simulation is a no-op, which is the
+    // pre-existing Node contract that the applet launchers rely on.
     '<init>()V': (jvm, obj) => {
-      if (!browserAvailable()) unsupported();
       state(obj);
     },
     '<init>(Ljava/awt/GraphicsDevice;)V': (jvm, obj) => {
-      if (!browserAvailable()) unsupported();
       state(obj);
     },
     'mouseMove(II)V': async (jvm, obj, args) => {
@@ -193,7 +188,6 @@ module.exports = {
       await new Promise(resolve => setTimeout(resolve, checkedDelay(args[0])));
     },
     'waitForIdle()V': async () => {
-      if (!browserAvailable()) unsupported();
       await new Promise(resolve => setTimeout(resolve, 0));
     },
   },

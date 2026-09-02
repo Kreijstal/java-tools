@@ -87,13 +87,22 @@ test('browser Robot dispatches keyboard events and retains delay settings', asyn
   t.end();
 });
 
-test('Node Robot remains explicitly unsupported without an optional backend', (t) => {
+test('Node Robot constructs headlessly and simulates input as a no-op', async (t) => {
   const previousDocument = global.document;
   const previousMouseEvent = global.MouseEvent;
   delete global.document;
   delete global.MouseEvent;
-  t.throws(() => Robot.methods['<init>()V']({}, {}, []),
-    error => error?.type === 'java/lang/UnsupportedOperationException');
+  const robot = {};
+  t.doesNotThrow(() => Robot.methods['<init>()V']({}, robot, []),
+    'applets construct a Robot at startup on every host');
+  await Robot.methods['mouseMove(II)V']({}, robot, [12, 34]);
+  await Robot.methods['mousePress(I)V']({}, robot, [16]);
+  await Robot.methods['mouseRelease(I)V']({}, robot, [16]);
+  await Robot.methods['keyPress(I)V']({}, robot, [65]);
+  await Robot.methods['keyRelease(I)V']({}, robot, [65]);
+  await Robot.methods['waitForIdle()V']({}, robot, []);
+  t.deepEqual([robot._robotState.x, robot._robotState.y], [12, 34],
+    'headless input simulation records state and dispatches nothing');
   global.document = previousDocument;
   global.MouseEvent = previousMouseEvent;
   t.end();
