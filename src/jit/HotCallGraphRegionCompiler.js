@@ -823,9 +823,11 @@ function outlineLargeRegionLoops(unit, options = {}) {
       const outputName = `jvmRegionOutlinedOutput${namespace}_${id}`;
       // Generated SSA names are unique within the containing function, so a
       // positional live-in ABI is exact: every free name becomes a parameter
-      // and every free name the range assigns is written back.
-      const freeNames = names.free.filter((name) =>
-        !helperNames.has(name) && name !== sharedStateName);
+      // and every free name the range assigns is written back. The helpers
+      // this pass emits are module-level and need no parameter; the shared
+      // state array is declared inside the body, so an outer loop that
+      // encloses an earlier helper's call site does receive it.
+      const freeNames = names.free.filter((name) => !helperNames.has(name));
       const liveOutNames = freeNames.filter((name) => names.written.has(name));
       const body = rewriteRegionExits(statements, candidate.start,
         candidate.end, (argument) => [

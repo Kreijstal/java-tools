@@ -752,6 +752,55 @@ return work;`;
   t.end();
 });
 
+test('nested loop outlining threads the shared state array inward', (t) => {
+  // The inner loop is outlined first; the next round outlines the outer loop,
+  // whose body now calls that helper through the body-scoped state array. The
+  // array is declared inside the unit, so the outer helper has to receive it.
+  const inner = Array.from({length: 60}, (_unused, index) =>
+    `      acc = (acc + ${index + 1} + j) | 0;`).join('\n');
+  const outer = Array.from({length: 60}, (_unused, index) =>
+    `    total = (total + acc + ${index + 1}) | 0;`).join('\n');
+  const moduleSource = `'use strict';\n${[
+    'function work(n, log) {',
+    '  let total = 0;',
+    '  for (let i = 0; i < n; i++) {',
+    '    let acc = 0;',
+    '    for (let j = 0; j < n; j++) {',
+    inner,
+    `      ${pad('inner')}`,
+    '      if (acc === 123456789) return -1;',
+    '    }',
+    outer,
+    `    ${pad('outer')}`,
+    '    if (total === 987654321) return -2;',
+    '  }',
+    '  return total;',
+    '}',
+  ].join('\n')}\nreturn work;`;
+  const units = buildRegionUnits(moduleSource);
+  const work = units.find((unit) => unit.name === 'work');
+  const outlined = outlineLargeRegionLoops(work, {
+    minimumSourceBytes: 1024, maximumOutlines: 8, namespace: 7,
+  });
+  t.ok(outlined.count >= 2, 'both the inner and the outer loop are outlined');
+  const source = renderUnits(units.flatMap((unit) =>
+    unit === work ? [outlined.unit, ...outlined.helpers] : [unit]));
+  t.ok(/function jvmRegionOutlinedLoop7_1\([^)]*jvmRegionOutlinedState7/
+    .test(source),
+  'the outer helper receives the body-scoped state array as a parameter');
+  const original = compile(moduleSource);
+  const transformed = compile(source);
+  for (let n = 0; n < 6; n += 1) {
+    const expectedLog = [];
+    const actualLog = [];
+    t.equal(transformed(n, actualLog), original(n, expectedLog),
+      `nested outlining result matches for n=${n}`);
+    t.deepEqual(actualLog, expectedLog,
+      `nested outlining effect order matches for n=${n}`);
+  }
+  t.end();
+});
+
 test('standalone generator bodies partition with exact source offsets', (t) => {
   const body = [
     'let value = seed | 0;',
