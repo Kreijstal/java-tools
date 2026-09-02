@@ -275,6 +275,15 @@ function renderParts(parts) {
 // interpolates is an opaque literal chunk. The renderer compiles one method at
 // a time, exactly like `currentMaterializationLocalValues` below.
 let activeEmittedNames = null;
+// Names every generated tier declares in its outermost scope. They are never
+// operands of a statement: no pass renames, propagates or removes one, and an
+// outlined unit always receives them.
+const AMBIENT_GENERATED_NAMES = [
+  "helpers", "frame", "locals", "stack", "thread", "plan",
+  "restorationDepth", "safePointBudget", "nestedEntryGuarded",
+  "framelessEntry",
+];
+
 // Composite operands the simulator stages on the bytecode operand stack stay
 // strings, because the simulator compares and keys them by identity. Their
 // parts list is remembered here so an emitter that interpolates one keeps its
@@ -1362,13 +1371,14 @@ class JvmSsaBlockRenderer {
     // missing entry costs an optimization, never correctness: an interpolated
     // name the registry does not know stays inside a literal chunk and the
     // statement is then treated as opaque by every pass.
-    const emittedNames = new Set([
-      "frame", "locals", "stack", "thread", "helpers", "plan",
-      "restorationDepth", "safePointBudget", "nestedEntryGuarded",
-      "framelessEntry", "inlineValue0", "inlineValue1", "inlineValue2",
-      "inlineValue3",
-      checkedLeafResultVariable,
-    ]);
+    // `frame`, `locals`, `stack`, `thread`, `helpers`, `plan`,
+    // `restorationDepth`, `safePointBudget`, `nestedEntryGuarded` and
+    // `framelessEntry` are ambient: every generated tier declares them in its
+    // outermost scope and no pass ever renames, propagates or eliminates one.
+    // They are deliberately not operands. `AMBIENT_GENERATED_NAMES` records
+    // them for the published fragments, whose consumer needs the free-variable
+    // set of an outlined unit.
+    const emittedNames = new Set([checkedLeafResultVariable]);
     for (let slot = 0; slot < localCount; slot += 1) {
       emittedNames.add(`local${slot}`);
     }
@@ -2311,8 +2321,8 @@ class JvmSsaBlockRenderer {
         .filter((cache) => !writeKeys ||
           !cache.killKey || writeKeys.has(cache.killKey))
         .flatMap((cache) => [
-        `${cache.valid} = false;`,
-        ...(cache.isArray ? [`${cache.data} = null;`] : []),
+        st`${cache.valid} = false;`,
+        ...(cache.isArray ? [st`${cache.data} = null;`] : []),
       ]);
     // javac has to give source-level temporaries a value before the first
     // structured try/loop join.  Decompiled methods can consequently start
@@ -2534,11 +2544,15 @@ class JvmSsaBlockRenderer {
         // slots; dispatcher chain blocks carry nothing.
         const targetDepth = synthetic.kind === "set" ? synthetic.depth : 0;
         if (targetDepth !== stack.length) return null;
-        return stack.map((expression, slot) => `${synthetic.transfer}${slot} = ${expression};`);
+        return stack.map((expression, slot) => stmt(
+          e`${named(`${synthetic.transfer}${slot}`)} = ${expression};`,
+          {kind: "assign", write: `${synthetic.transfer}${slot}`}));
       }
       const targetDepth = depths[cfg.blocks[target].insns[0]];
       if (targetDepth !== stack.length) return null;
-      return stack.map((expression, slot) => `ssaStack${target}_${slot} = ${expression};`);
+      return stack.map((expression, slot) => stmt(
+          e`${named(`ssaStack${target}_${slot}`)} = ${expression};`,
+          {kind: "assign", write: `ssaStack${target}_${slot}`}));
     };
     // Frame reconstruction repeats at hundreds of sites in large bodies; the
     // locals copy is hoisted into one closure so emitted source stays small
@@ -2597,11 +2611,11 @@ class JvmSsaBlockRenderer {
       lastMaterializeWasUnwindCompact = false;
       if (!this.materializeOutliningEnabled) {
         return [
-          "spillLocals();",
+          st`spillLocals();`,
           ...operandValues.map((expression, index) =>
-            `stack[${index}] = ${expression};`),
-          `stack.length = ${operandValues.length};`,
-          `helpers.materialize(frame, locals, stack, ${pc});`,
+            stmt(e`stack[${index}] = ${expression};`, {kind: "spillStack"})),
+          st`stack.length = ${operandValues.length};`,
+          st`helpers.materialize(frame, locals, stack, ${pc});`,
         ];
       }
       // The expansion regex splits marker operands on commas, so compaction
@@ -2611,15 +2625,19 @@ class JvmSsaBlockRenderer {
         materializeUnwindDepths.add(operandValues.length);
         lastMaterializeWasUnwindCompact = true;
         return [
-          `ssaMaterializeUnwind${operandValues.length}(${
-            [pc, ...operandValues].join(", ")});`,
+          stmt(exprConcat(e`ssaMaterializeUnwind${operandValues.length}(`,
+            argumentListExpression([pc, ...operandValues]), e`);`),
+          {kind: "materialize", unwind: true, pc,
+            operands: operandValues.map((expression) => e`${expression}`)}),
         ];
       }
       lastMaterializeWasUnwindCompact = false;
       materializeDepths.add(operandValues.length);
       return [
-        `ssaMaterialize${operandValues.length}(${
-          [pc, ...operandValues].join(", ")});`,
+        stmt(exprConcat(e`ssaMaterialize${operandValues.length}(`,
+          argumentListExpression([pc, ...operandValues]), e`);`),
+        {kind: "materialize", unwind: false, pc,
+          operands: operandValues.map((expression) => e`${expression}`)}),
       ];
     };
     // Placed after the helper call of a compacted arm; expands to nothing in
@@ -2628,7 +2646,8 @@ class JvmSsaBlockRenderer {
     // output can reference the marker without its declaration.
     const materializeUnwindReleaseLines = (indentation) =>
       lastMaterializeWasUnwindCompact
-        ? [`${indentation}ssaMaterializeUnwindRelease();`] : [];
+        ? [stmt(e`${indentation}ssaMaterializeUnwindRelease();`,
+          {kind: "materializeRelease"})] : [];
     // A synchronous guest call can throw after installing its child Frame.
     // If that child catches the exception, its eventual return must resume
     // this frame after the invoke with only the operands below the arguments.
@@ -2639,23 +2658,24 @@ class JvmSsaBlockRenderer {
       preCallValues, postCallValues, pc, callStackDepth,
       childCanResume = "true", restoreMarkers = null,
     ) => [
-      `if (${childCanResume} && thread.callStack.items.length > ${
-        callStackDepth}) {`,
+      stmt(e`if (${childCanResume} && thread.callStack.items.length > ${
+        callStackDepth}) {`),
       ...materializeLines(postCallValues, pc + 1).map((line) => `  ${line}`),
-      "} else {",
+      st`} else {`,
       // A caller that lowers this call into a region reuses the exact
       // call-pc restoration arm. Bracket it with a compiler-owned token pair
       // so the arm can be taken by identity from whatever this body was
       // finally emitted as, rather than located by parsing the result.
-      ...(restoreMarkers ? [`  /*${restoreMarkers.start}*/`] : []),
+      ...(restoreMarkers ? [st`  /*${restoreMarkers.start}*/`] : []),
       ...materializeLines(preCallValues, pc).map((line) => `  ${line}`),
-      ...(restoreMarkers ? [`  /*${restoreMarkers.end}*/`] : []),
-      "}",
+      ...(restoreMarkers ? [st`  /*${restoreMarkers.end}*/`] : []),
+      st`}`,
     ];
     const stageOperandLines = (operandValues) => [
-      "if (frame === null) spillLocals();",
-      ...operandValues.map((expression, i) => `stack[${i}] = ${expression};`),
-      `stack.length = ${operandValues.length};`,
+      st`if (frame === null) spillLocals();`,
+      ...operandValues.map((expression, i) =>
+        stmt(e`stack[${i}] = ${expression};`, {kind: "spillStack"})),
+      st`stack.length = ${operandValues.length};`,
     ];
 
     // Forward constant dataflow supplies block-entry local values after a
@@ -4577,54 +4597,54 @@ class JvmSsaBlockRenderer {
             let inlineCheckedLeafVoidFastPath = false;
             const deferMaterialization = this.deferredCallMaterializationEnabled;
             const resumableVoidCall = site.returnsVoid;
-            const activeChildCallMarker =
-              `__JVM_ACTIVE_CHILD_CALL_${index}_${site.id}__`;
+            const activeChildCallMarker = named(
+              `__JVM_ACTIVE_CHILD_CALL_${index}_${site.id}__`);
             continuationFallbacks.set(activeChildCallMarker, {
               continuation: [
                 ...materializeLines(stack, index + 1).map((line) => `    ${line}`),
-                `    yield { deopt: true, transient: true, structuredResumePc: ${
+                st`    yield { deopt: true, transient: true, structuredResumePc: ${
                   index + 1
                 }, structuredResumeOwnsFrame: true, reason: 'active child in structured SSA callee' };`,
-                `    ${callStackDepth} = thread.callStack.items.length;`,
+                st`    ${callStackDepth} = thread.callStack.items.length;`,
                 ...(site.returnsVoid ? [] : [
-                  `    ${out} = frame.stack.items.pop();`,
+                  st`    ${out} = frame.stack.items.pop();`,
                 ]),
               ],
               ordinary: [
                 ...materializeLines(stack, index + 1).map((line) => `    ${line}`),
-                "    return { deopt: true, transient: true, " +
-                  "reason: 'asynchronous structured SSA callee left active child', " +
-                  "jvmPositionalChild: frame };",
+                stmt(exprConcat(e`    return { deopt: true, transient: true, `,
+                  e`reason: 'asynchronous structured SSA callee left active child', `,
+                  e`jvmPositionalChild: frame };`)),
               ],
-              checkedLeaf: ["    return helpers.asyncInvokeSentinel();"],
+              checkedLeaf: [st`    return helpers.asyncInvokeSentinel();`],
             });
-            const asynchronousCallMarker =
-              `__JVM_ASYNC_VOID_CALL_${index}_${site.id}__`;
+            const asynchronousCallMarker = named(
+              `__JVM_ASYNC_VOID_CALL_${index}_${site.id}__`);
             if (resumableVoidCall) {
               continuationFallbacks.set(asynchronousCallMarker, {
                 continuation: [
                   ...materializeLines(callStack, index).map((line) => `  ${line}`),
-                  "  helpers.skipJitOnce(frame);",
-                  `  yield { deopt: true, transient: true, structuredResumePc: ${
+                  st`  helpers.skipJitOnce(frame);`,
+                  st`  yield { deopt: true, transient: true, structuredResumePc: ${
                     index + 1
                   }, reason: 'asynchronous structured SSA callee' };`,
                 ],
                 ordinary: [
                   ...materializeLines(callStack, index).map((line) => `  ${line}`),
-                  "  helpers.skipJitOnce(frame);",
-                  "  return { deopt: true, transient: true, reason: 'asynchronous structured SSA callee' };",
+                  st`  helpers.skipJitOnce(frame);`,
+                  st`  return { deopt: true, transient: true, reason: 'asynchronous structured SSA callee' };`,
                 ],
-                checkedLeaf: ["return helpers.asyncInvokeSentinel();"],
+                checkedLeaf: [st`return helpers.asyncInvokeSentinel();`],
               });
             }
             const fallbackLines = [
               ...(deferMaterialization
                 ? stageOperandLines(callStack) : materializeLines(callStack, index + 1)),
-              `try { ${out} = helpers.tryInvokeSyncAt(${site.id}, frame, thread); } catch (${caught}) {`,
+              st`try { ${out} = helpers.tryInvokeSyncAt(${site.id}, frame, thread); } catch (${caught}) {`,
               ...materializeCallExceptionLines(
                 callStack, stack, index, callStackDepth)
                 .map((line) => `  ${line}`),
-              `  throw ${caught};`, "}",
+              st`  throw ${caught};`, st`}`,
             ];
             // A restoring-direct body begins without a physical caller
             // Frame. A fast positional callee can suspend before the fallback
@@ -4636,22 +4656,22 @@ class JvmSsaBlockRenderer {
             // linkage subsequently rejects the handoff, the ordinary replay
             // arm below rewrites the same Frame to the invoke pc and operands.
             const materializeOmittedCallerForChild = (indentation) => [
-              `${indentation}if (frame === null) {`,
+              st`${indentation}if (frame === null) {`,
               ...materializeLines(stack, index + 1)
                 .map((line) => `${indentation}  ${line}`),
-              `${indentation}}`,
+              st`${indentation}}`,
             ];
             const asynchronousActiveChildLines = [
-              `if (${out} === helpers.asyncInvokeSentinel() &&`,
-              `    thread.callStack.items.length > ${callStackDepth}) {`,
+              st`if (${out} === helpers.asyncInvokeSentinel() &&`,
+              st`    thread.callStack.items.length > ${callStackDepth}) {`,
               ...materializeOmittedCallerForChild("  "),
-              "}",
-              `if (${out} === helpers.asyncInvokeSentinel() &&`,
-              `    thread.callStack.items.length > ${callStackDepth} &&`,
-              `    helpers.linkStructuredCallChild(frame, thread, ${
+              st`}`,
+              st`if (${out} === helpers.asyncInvokeSentinel() &&`,
+              st`    thread.callStack.items.length > ${callStackDepth} &&`,
+              st`    helpers.linkStructuredCallChild(frame, thread, ${
                 callStackDepth}, ${JSON.stringify(site.returnType)}, ${site.id})) {`,
-              activeChildCallMarker,
-              "}",
+              st`${activeChildCallMarker}`,
+              st`}`,
             ];
             const checkedAdmissionPlan = site.returnsVoid &&
               site.directCheckedLeaf?.noThrow === true &&
@@ -4659,15 +4679,15 @@ class JvmSsaBlockRenderer {
                 site.directCheckedLeaf?.admissionPlan?.kind)
               ? site.directCheckedLeaf.admissionPlan : null;
             const checkedAdmissionStart = checkedAdmissionPlan
-              ? `/*__SSA_CHECKED_ADMISSION_START_${index}__*/` : null;
+              ? st`/*__SSA_CHECKED_ADMISSION_START_${index}__*/` : null;
             const checkedAdmissionEnd = checkedAdmissionPlan
-              ? `/*__SSA_CHECKED_ADMISSION_END_${index}__*/` : null;
+              ? st`/*__SSA_CHECKED_ADMISSION_END_${index}__*/` : null;
             if (checkedAdmissionStart) lines.push(checkedAdmissionStart);
             if (site.selfRecursive) {
-              lines.push(`/*__SSA_SELF_RECURSIVE_REGION_START_${index}__*/`);
+              lines.push(st`/*__SSA_SELF_RECURSIVE_REGION_START_${index}__*/`);
             }
-            lines.push(`/*${site.regionMarkers.start}*/`, `let ${out};`,
-              `let ${callStackDepth} = thread.callStack.items.length;`);
+            lines.push(st`/*${site.regionMarkers.start}*/`, letDecl(out),
+              letDecl(callStackDepth, e`thread.callStack.items.length`));
             if (site.id !== null && site.id !== undefined) {
               const usedDirect = value();
               const runtimeSite = positionalCallSiteVariable(index);
@@ -4682,9 +4702,9 @@ class JvmSsaBlockRenderer {
                     for (let earlier = 0; earlier < captureIndex; earlier += 1) {
                       offset += captures[earlier].data ? 2 : 1;
                     }
-                    const values = [`ssaCallCapture${index}_${offset}`];
+                    const values = [named(`ssaCallCapture${index}_${offset}`)];
                     if (capture.data) {
-                      values.push(`ssaCallCapture${index}_${offset + 1}`);
+                      values.push(named(`ssaCallCapture${index}_${offset + 1}`));
                     }
                     return values;
                   });
@@ -4693,29 +4713,35 @@ class JvmSsaBlockRenderer {
               const positionalLateLink =
                 positionalCallLateLinkVariable(index);
               const polymorphicPositionalLinkLines = site.dynamic &&
-                site.argumentCount > 0 && !site.selfRecursive ? [
-                `if (!helpers.profileMethods && ${args[0]} !== null && ` +
-                  `${args[0]} !== undefined && ${runtimeSite}) {`,
-                `  const ssaReceiverType${index} = ` +
-                  `(${args[0]}.type || ${runtimeSite}.declaredClassName);`,
-                `  if (ssaReceiverType${index} !== ${positionalReceiver}) {`,
-                `    const ssaPicTarget${index} = ` +
-                  `${runtimeSite}.fastPositionalTargets && ` +
-                  `${runtimeSite}.fastPositionalTargets[` +
-                  `ssaReceiverType${index}];`,
-                `    if (ssaPicTarget${index} && ` +
-                  `(ssaPicTarget${index}.debugGuarded || ` +
-                  `!helpers.jvm.debugManager.isClassJitDeopted(` +
-                  `ssaPicTarget${index}.lookupClass))) {`,
-                `      ${positionalTarget} = ssaPicTarget${index};`,
-                `      ${positionalInvoke} = ssaPicTarget${index}.invoke;`,
-                `      ${positionalRawInvoke} = ` +
-                  `ssaPicTarget${index}.rawInvoke;`,
-                `      ${positionalReceiver} = ssaPicTarget${index}.receiverType;`,
-                "    }",
-                "  }",
-                "}",
-              ] : [];
+                site.argumentCount > 0 && !site.selfRecursive ? (() => {
+                const receiverType = named(`ssaReceiverType${index}`);
+                const picTarget = named(`ssaPicTarget${index}`);
+                return [
+                  stmt(exprConcat(
+                    e`if (!helpers.profileMethods && ${args[0]} !== null && `,
+                    e`${args[0]} !== undefined && ${runtimeSite}) {`)),
+                  stmt(exprConcat(e`  const ${receiverType} = `,
+                    e`(${args[0]}.type || ${runtimeSite}.declaredClassName);`),
+                  {kind: "const", def: receiverType}),
+                  st`  if (${receiverType} !== ${positionalReceiver}) {`,
+                  stmt(exprConcat(e`    const ${picTarget} = `,
+                    e`${runtimeSite}.fastPositionalTargets && `,
+                    e`${runtimeSite}.fastPositionalTargets[`,
+                    e`${receiverType}];`), {kind: "const", def: picTarget}),
+                  stmt(exprConcat(e`    if (${picTarget} && `,
+                    e`(${picTarget}.debugGuarded || `,
+                    e`!helpers.jvm.debugManager.isClassJitDeopted(`,
+                    e`${picTarget}.lookupClass))) {`)),
+                  st`      ${positionalTarget} = ${picTarget};`,
+                  st`      ${positionalInvoke} = ${picTarget}.invoke;`,
+                  stmt(exprConcat(e`      ${positionalRawInvoke} = `,
+                    e`${picTarget}.rawInvoke;`)),
+                  st`      ${positionalReceiver} = ${picTarget}.receiverType;`,
+                  st`    }`,
+                  st`  }`,
+                  st`}`,
+                ];
+              })() : [];
               // A long-lived structured activation can enter before a cold
               // child site has linked its monomorphic positional target. The
               // canonical first call publishes that target, but an immutable
@@ -4725,17 +4751,18 @@ class JvmSsaBlockRenderer {
               // locals for the rest of this activation.
               const latePositionalLinkLines =
                 site.directCheckedLeaf || site.selfRecursive ? [] : [
-                `if (${positionalLateLink} && !(${positionalRawInvoke} || ` +
-                  `${positionalInvoke}) && !helpers.profileMethods && ` +
-                  `${runtimeSite} && ${runtimeSite}.fastPositional && ` +
-                  `(${runtimeSite}.fastPositional.debugGuarded || ` +
-                  `!helpers.jvm.debugManager.isClassJitDeopted(` +
-                  `${runtimeSite}.fastPositional.lookupClass))) {`,
-                `  ${positionalTarget} = ${runtimeSite}.fastPositional;`,
-                `  ${positionalInvoke} = ${positionalTarget}.invoke;`,
-                `  ${positionalRawInvoke} = ${positionalTarget}.rawInvoke;`,
-                `  ${positionalReceiver} = ${positionalTarget}.receiverType;`,
-                `}`,
+                stmt(exprConcat(
+                  e`if (${positionalLateLink} && !(${positionalRawInvoke} || `,
+                  e`${positionalInvoke}) && !helpers.profileMethods && `,
+                  e`${runtimeSite} && ${runtimeSite}.fastPositional && `,
+                  e`(${runtimeSite}.fastPositional.debugGuarded || `,
+                  e`!helpers.jvm.debugManager.isClassJitDeopted(`,
+                  e`${runtimeSite}.fastPositional.lookupClass))) {`)),
+                st`  ${positionalTarget} = ${runtimeSite}.fastPositional;`,
+                st`  ${positionalInvoke} = ${positionalTarget}.invoke;`,
+                st`  ${positionalRawInvoke} = ${positionalTarget}.rawInvoke;`,
+                st`  ${positionalReceiver} = ${positionalTarget}.receiverType;`,
+                st`}`,
               ];
               const invariantPositionalRaw =
                 !site.selfRecursive &&
@@ -4753,8 +4780,8 @@ class JvmSsaBlockRenderer {
               inlineCheckedLeafVoidFastPath = inlineCheckedLeafVoid;
               const inlineCheckedLeafLabel =
                 `ssaInlineCheckedLeaf${compileSerial}_${index}`;
-              const inlineCheckedLeafFallbackMarker =
-                `__JVM_INLINE_CHECKED_LEAF_FALLBACK_${index}_${site.id}__`;
+              const inlineCheckedLeafFallbackMarker = named(
+                `__JVM_INLINE_CHECKED_LEAF_FALLBACK_${index}_${site.id}__`);
               // Lexical insertion binds by declaration. The caller stages its
               // operands, captures, and array views into caller-unique names
               // before the inserted scope opens; inside that scope the child's
@@ -4762,7 +4789,7 @@ class JvmSsaBlockRenderer {
               // without reading through a temporal dead zone, and the child
               // leaves its result in the slot its labeled body owns.
               const inlineCheckedLeafStage = (kind, position) =>
-                `ssaInline${compileSerial}_${index}_${kind}${position}`;
+                named(`ssaInline${compileSerial}_${index}_${kind}${position}`);
               const inlineCheckedLeafLinesFor = (provenGuards) => {
                 if (!inlineCheckedLeafBody ||
                     inlineCheckedLeafBody.argumentNames.length !==
@@ -4784,28 +4811,34 @@ class JvmSsaBlockRenderer {
                 return {
                   bails: assembled.bails,
                   lines: [
-                    ...args.map((argument, position) =>
-                      `const ${inlineCheckedLeafStage("a", position)} = ` +
-                      `${argument};`),
+                    ...args.map((argument, position) => constDecl(
+                      inlineCheckedLeafStage("a", position), e`${argument}`,
+                      {pure: true, pinned: true})),
                     ...positionalRawCaptures.map((capture, position) =>
-                      `const ${inlineCheckedLeafStage("c", position)} = ` +
-                      `${capture};`),
-                    ...[...feeds.keys()].map((argument) =>
-                      `const ${inlineCheckedLeafStage("v", argument)} = ` +
-                      `${positionalArgumentArrayData[argument].data};`),
-                    "{",
+                      constDecl(inlineCheckedLeafStage("c", position),
+                        e`${capture}`, {pure: true, pinned: true})),
+                    ...[...feeds.keys()].map((argument) => constDecl(
+                      inlineCheckedLeafStage("v", argument),
+                      e`${positionalArgumentArrayData[argument].data}`,
+                      {pure: true, pinned: true})),
+                    st`{`,
                     ...inlineCheckedLeafBody.argumentNames.map(
-                      (name, position) =>
+                      (name, position) => stmt(
                         `  const ${name} = ${
-                          inlineCheckedLeafStage("a", position)};`),
+                          inlineCheckedLeafStage("a", position)};`,
+                        {foreign: true})),
                     ...inlineCheckedLeafBody.captureArguments.map(
-                      (name, position) =>
+                      (name, position) => stmt(
                         `  const ${name} = ${
-                          inlineCheckedLeafStage("c", position)};`),
-                    "  const nestedEntryGuarded = true;",
-                    ...assembled.lines.map((line) => `  ${line}`),
-                    `  ${out} = ${inlineCheckedLeafBody.result};`,
-                    "}",
+                          inlineCheckedLeafStage("c", position)};`,
+                        {foreign: true})),
+                    stmt("  const nestedEntryGuarded = true;",
+                      {foreign: true}),
+                    ...assembled.lines.map((line) =>
+                      stmt(`  ${line}`, {foreign: true})),
+                    stmt(`  ${out} = ${inlineCheckedLeafBody.result};`,
+                      {foreign: true}),
+                    st`}`,
                   ],
                 };
               };
@@ -4828,13 +4861,13 @@ class JvmSsaBlockRenderer {
                       return null;
                     }
                     const trusted = [];
-                    const x = `ssaClippedX${index}`;
-                    const y = `ssaClippedY${index}`;
-                    const count = `ssaClippedCount${index}`;
-                    const pixel = `ssaClippedPixel${index}`;
-                    const end = `ssaClippedEnd${index}`;
+                    const x = named(`ssaClippedX${index}`);
+                    const y = named(`ssaClippedY${index}`);
+                    const count = named(`ssaClippedCount${index}`);
+                    const pixel = named(`ssaClippedPixel${index}`);
+                    const end = named(`ssaClippedEnd${index}`);
                     const argument = (position) =>
-                      `(${args[position]})`;
+                      operand(e`(${args[position]})`);
                     const specializedCache =
                       this.jit.checkedLeafCaptureCaches[
                         site.checkedLeafCaptureCacheId];
@@ -4869,7 +4902,7 @@ class JvmSsaBlockRenderer {
                             checkedAdmissionPlan.arrayDataCapture
                           ? specializedCheckedCapture(
                             site.checkedLeafCaptureCacheId, position)
-                          : `(${positionalRawCaptures[position]})`;
+                          : operand(e`(${positionalRawCaptures[position]})`);
                     const top = capture(checkedAdmissionPlan.topCapture);
                     const bottom = capture(
                       checkedAdmissionPlan.bottomCapture);
@@ -4881,53 +4914,56 @@ class JvmSsaBlockRenderer {
                     const destination = capture(
                       checkedAdmissionPlan.arrayDataCapture);
                     trusted.push(
-                      `let ${x} = ${argument(
-                        checkedAdmissionPlan.xArgument)};`,
-                      `const ${y} = ${argument(
-                        checkedAdmissionPlan.yArgument)};`,
-                      `let ${count} = ${argument(
-                        checkedAdmissionPlan.countArgument)};`,
-                      `if (${y} >= ${top} && ${y} < ${bottom}) {`,
-                      `  if (${x} < ${left}) {`,
-                      `    ${count} = (${count} - ` +
-                        `(${left} - ${x}));`,
-                      `    ${x} = ${left};`,
-                      "  }",
-                      `  if ((${x} + ${count}) > ${right}) ` +
-                        `${count} = ${right} - ${x};`,
-                      `  let ${pixel} = (${y} * ${width}) + ${x};`,
-                      `  const ${end} = ${pixel} + ${count};`,
-                      `  while (${pixel} < ${end}) {`,
-                      `    ${destination}[${pixel}] = ${argument(
+                      letDecl(x, e`${argument(
+                        checkedAdmissionPlan.xArgument)}`),
+                      constDecl(y, e`${argument(
+                        checkedAdmissionPlan.yArgument)}`, {pure: true}),
+                      letDecl(count, e`${argument(
+                        checkedAdmissionPlan.countArgument)}`),
+                      st`if (${y} >= ${top} && ${y} < ${bottom}) {`,
+                      st`  if (${x} < ${left}) {`,
+                      stmt(exprConcat(e`    ${count} = (${count} - `,
+                        e`(${left} - ${x}));`), {kind: "assign", write: count}),
+                      st`    ${x} = ${left};`,
+                      st`  }`,
+                      stmt(exprConcat(e`  if ((${x} + ${count}) > ${right}) `,
+                        e`${count} = ${right} - ${x};`)),
+                      letDecl(pixel, e`(${y} * ${width}) + ${x}`),
+                      constDecl(end, e`${pixel} + ${count}`, {pure: true}),
+                      st`  while (${pixel} < ${end}) {`,
+                      stmt(e`    ${destination}[${pixel}] = ${argument(
                         checkedAdmissionPlan.valueArgument)};`,
-                      `    ${pixel} += 1;`,
-                      "  }",
-                      "}",
+                      {kind: "arrayStore"}),
+                      st`    ${pixel} += 1;`,
+                      st`  }`,
+                      st`}`,
                     );
                     return trusted;
                   })() : null;
               const receiverGuard = site.dynamic && site.argumentCount > 0
-                ? `${args[0]} !== null && ${args[0]} !== undefined && ` +
-                  `(${args[0]}.type || ${runtimeSite}.declaredClassName) === ` +
-                  positionalReceiver
+                ? operand(exprConcat(
+                  e`${args[0]} !== null && ${args[0]} !== undefined && `,
+                  e`(${args[0]}.type || ${runtimeSite}.declaredClassName) === `,
+                  e`${positionalReceiver}`))
                 : site.hasReceiver && site.argumentCount > 0
-                  ? `${args[0]} !== null && ${args[0]} !== undefined && ` +
-                    `${positionalReceiver} === null`
+                  ? operand(exprConcat(
+                    e`${args[0]} !== null && ${args[0]} !== undefined && `,
+                    e`${positionalReceiver} === null`))
                   : "true";
               if (inlineCheckedLeafLines) {
                 continuationFallbacks.set(inlineCheckedLeafFallbackMarker, {
                   continuation: fallbackLines,
                   ordinary: [
                     ...materializeLines(callStack, index),
-                    "helpers.skipJitOnce(frame);",
-                    "return { deopt: true, transient: true, " +
-                      "reason: 'checked leaf admission' };",
+                    st`helpers.skipJitOnce(frame);`,
+                    stmt(exprConcat(e`return { deopt: true, transient: true, `,
+                      e`reason: 'checked leaf admission' };`)),
                   ],
                   // The lexically inserted child is proven non-throwing and
                   // performs no effect before its own entry bailout. A
                   // wrapper checked leaf can therefore reject directly and
                   // let its canonical caller execute the original bytecode.
-                  checkedLeaf: ["return helpers.asyncInvokeSentinel();"],
+                  checkedLeaf: [st`return helpers.asyncInvokeSentinel();`],
                 });
               }
               // Rendered against the nested-entry argument so a region that
@@ -4942,15 +4978,19 @@ class JvmSsaBlockRenderer {
                 .map((_operand, position) =>
                   `/*__JVM_CALL_ARG_${index}_${position}__*/`);
               const regionMarkedOperands = [...args, ...positionalRawCaptures]
-                .map((operand, position) =>
-                  `${regionOperandTokens[position]}${operand}`);
+                .map((value, position) =>
+                  e`${regionOperandTokens[position]}${value}`);
               const positionalRawCallFor = (nestedEntryGuarded) =>
-                `${positionalRawInvoke} ? ` +
-                `${positionalRawInvoke}(helpers, ${regionMarkedOperands.length
-                  ? `${regionMarkedOperands.join(", ")}, ` : ""
-                }thread, ${nestedEntryGuarded}) : ` +
-                `${positionalInvoke}(${args.join(", ")}${
-                  args.length ? ", " : ""}thread, true)`;
+                operand(exprConcat(
+                  e`${positionalRawInvoke} ? `,
+                  e`${positionalRawInvoke}(helpers, `,
+                  regionMarkedOperands.length
+                    ? exprConcat(argumentListExpression(regionMarkedOperands),
+                      ", ") : "",
+                  e`thread, ${nestedEntryGuarded}) : `,
+                  e`${positionalInvoke}(`,
+                  argumentListExpression(args),
+                  args.length ? ", " : "", e`thread, true)`));
               const positionalRawCall = positionalRawCallFor("true");
               const regionRestoreMarkers = {
                 start: `__JVM_CALL_RESTORE_START_${index}__`,
@@ -4961,22 +5001,28 @@ class JvmSsaBlockRenderer {
                 end: `__JVM_CALL_HANDLER_END_${index}__`,
               };
               const invariantPositionalRawCall = invariantPositionalRaw
-                ? `${invariantPositionalRaw}(helpers${
-                  args.length ? ", " : ""}${args.join(", ")})`
+                ? operand(exprConcat(
+                  e`${invariantPositionalRaw}(helpers`,
+                  args.length ? ", " : "",
+                  argumentListExpression(args), e`)`))
                 : null;
               if (checkedAdmissionPlan) {
-                const provenRawCall =
-                  `${positionalRawInvoke}(helpers${args.length ? ", " : ""}` +
-                  `${args.join(", ")}${positionalRawCaptures.length
-                    ? `${args.length ? ", " : ""}${positionalRawCaptures.join(", ")}`
-                    : ""}${args.length || positionalRawCaptures.length
-                    ? ", " : ", "}thread, true);`;
+                const provenRawCall = stmt(exprConcat(
+                  e`${positionalRawInvoke}(helpers`,
+                  args.length ? ", " : "",
+                  argumentListExpression(args),
+                  positionalRawCaptures.length
+                    ? exprConcat(args.length ? ", " : "",
+                      argumentListExpression(positionalRawCaptures))
+                    : "",
+                  args.length || positionalRawCaptures.length ? ", " : ", ",
+                  e`thread, true);`));
                 const replacement = provenInlineCheckedLeafLines
                   ? [
-                    `${inlineCheckedLeafLabel}: {`,
+                    st`${inlineCheckedLeafLabel}: {`,
                     ...provenInlineCheckedLeafLines.map(
                       (line) => `  ${line}`),
-                    "}",
+                    st`}`,
                   ] : [provenRawCall];
                 checkedCallAdmissionCandidates.push({
                   block: block.id,
@@ -4991,42 +5037,44 @@ class JvmSsaBlockRenderer {
                   argumentArrays: positionalArgumentArrayData,
                   captureExpressions: [...positionalRawCaptures],
                   captureCacheId: site.checkedLeafCaptureCacheId,
-                  captureCacheVariable: `ssaCallCaptureCache${index}`,
+                  captureCacheVariable: named(`ssaCallCaptureCache${index}`),
                 });
               }
               const selfRecursiveMarker = site.selfRecursive
                 ? `/*__SSA_SELF_RECURSIVE_CALL_${index}__*/` : "";
-              const positionalQuantumMarker =
-                `__JVM_POSITIONAL_QUANTUM_${index}_${site.id}__`;
+              const positionalQuantumMarker = named(
+                `__JVM_POSITIONAL_QUANTUM_${index}_${site.id}__`);
               if (this.jit.positionalCallSafePointPollingEnabled &&
                   structured.loopHeaders.size > 0) {
                 continuationFallbacks.set(positionalQuantumMarker, {
                   continuation: [
-                    `safePointBudget = Math.min(safePointBudget, ${
+                    st`safePointBudget = Math.min(safePointBudget, ${
                       this.jit.positionalCallSafePointPollBudget});`,
-                    `safePointBudget -= ((${positionalRawInvoke} || ` +
-                      `${positionalInvoke}).jvmSafePointCharge || 0);`,
-                    "if (safePointBudget <= 0) {",
-                    "  if (helpers.continueStructuredQuantum(thread)) {",
-                    `    safePointBudget = ${
+                    stmt(exprConcat(
+                      e`safePointBudget -= ((${positionalRawInvoke} || `,
+                      e`${positionalInvoke}).jvmSafePointCharge || 0);`)),
+                    st`if (safePointBudget <= 0) {`,
+                    st`  if (helpers.continueStructuredQuantum(thread)) {`,
+                    st`    safePointBudget = ${
                       this.jit.positionalCallSafePointPollBudget};`,
-                    "  } else {",
+                    st`  } else {`,
                     ...materializeLines(callStack, index)
                       .map((line) => `    ${line}`),
-                    "    helpers.structuredSsa.safePointCount += 1;",
-                    `    safePointBudget = ${
+                    st`    helpers.structuredSsa.safePointCount += 1;`,
+                    st`    safePointBudget = ${
                       this.jit.positionalCallSafePointPollBudget};`,
-                    "    yield { deopt: true, transient: true, " +
-                      "reason: 'structured SSA positional quantum' };",
+                    stmt(exprConcat(
+                      e`    yield { deopt: true, transient: true, `,
+                      e`reason: 'structured SSA positional quantum' };`)),
                     // A frameless positional caller is restored onto the JVM
                     // stack while this generator is suspended. The depth
                     // captured before the safe point therefore no longer
                     // describes the call boundary after resume. Refresh it
                     // before invoking the child so the caller itself cannot
                     // be mistaken for a scheduler-visible callee.
-                    `    ${callStackDepth} = thread.callStack.items.length;`,
-                    "  }",
-                    "}",
+                    st`    ${callStackDepth} = thread.callStack.items.length;`,
+                    st`  }`,
+                    st`}`,
                   ],
                   ordinary: [],
                   checkedLeaf: [],
@@ -5041,14 +5089,14 @@ class JvmSsaBlockRenderer {
                   args: [...args],
                   result: out,
                 });
-                const ordinaryGuard =
-                  `if ((${positionalRawInvoke} || ${positionalInvoke}) && ` +
-                  `${receiverGuard}) {`;
+                const ordinaryGuard = stmt(exprConcat(
+                  e`if ((${positionalRawInvoke} || ${positionalInvoke}) && `,
+                  e`${receiverGuard}) {`));
                 selfRecursiveGuardLine = ordinaryGuard;
                 directPositionalLineAlternatives.set(ordinaryGuard,
                   site.hasReceiver
-                    ? `if (${args[0]} !== null && ${args[0]} !== undefined) {`
-                    : "if (true) {");
+                    ? st`if (${args[0]} !== null && ${args[0]} !== undefined) {`
+                    : st`if (true) {`);
               }
               lines.push(...latePositionalLinkLines);
               lines.push(...polymorphicPositionalLinkLines);
@@ -5061,61 +5109,65 @@ class JvmSsaBlockRenderer {
                 // sole fallback predicate, preserving exact canonical
                 // execution when an assumption is not satisfied.
                 lines.push(
-                  `${inlineCheckedLeafLabel}: {`,
+                  st`${inlineCheckedLeafLabel}: {`,
                   ...inlineCheckedLeafLines.map((line) => `  ${line}`),
-                  "}",
-                  `if (${inlineCheckedLeafVoid
-                    ? `!${out}`
-                    : `${out} === helpers.asyncInvokeSentinel()`}) {`,
-                  inlineCheckedLeafFallbackMarker,
-                  ...(inlineCheckedLeafVoid ? [] : ["}"]));
+                  st`}`,
+                  stmt(e`if (${inlineCheckedLeafVoid
+                    ? e`!${out}`
+                    : e`${out} === helpers.asyncInvokeSentinel()`}) {`),
+                  st`${inlineCheckedLeafFallbackMarker}`,
+                  ...(inlineCheckedLeafVoid ? [] : [st`}`]));
               } else lines.push(
-                `let ${usedDirect} = false;`,
+                letDecl(usedDirect, e`false`),
                 ...(invariantPositionalRaw ? [
-                  `if (${invariantPositionalRaw}) {`,
-                  `  ${usedDirect} = true;`,
-                  `  ${out} = ${invariantPositionalRawCall};`,
-                  `} else if (${inlineCheckedLeafLines
-                    ? receiverGuard
-                    : `(${positionalRawInvoke} || ${positionalInvoke}) && ${receiverGuard}`}) {`,
+                  st`if (${invariantPositionalRaw}) {`,
+                  st`  ${usedDirect} = true;`,
+                  stmt(e`  ${out} = ${invariantPositionalRawCall};`,
+                    {kind: "assign", write: out}),
+                  stmt(e`} else if (${inlineCheckedLeafLines
+                    ? e`${receiverGuard}`
+                    : e`(${positionalRawInvoke} || ${positionalInvoke}) && ${
+                      receiverGuard}`}) {`),
                 ] : [
                   selfRecursiveGuardLine ||
-                    `if (${inlineCheckedLeafLines
-                      ? receiverGuard
-                      : `(${positionalRawInvoke} || ${positionalInvoke}) && ${receiverGuard}`}) {`,
+                    stmt(e`if (${inlineCheckedLeafLines
+                      ? e`${receiverGuard}`
+                      : e`(${positionalRawInvoke} || ${positionalInvoke}) && ${
+                        receiverGuard}`}) {`),
                 ]),
-                `  ${usedDirect} = true;`,
+                st`  ${usedDirect} = true;`,
                 ...(this.jit.positionalCallSafePointPollingEnabled &&
                     structured.loopHeaders.size > 0
-                  ? [positionalQuantumMarker] : []),
+                  ? [st`${positionalQuantumMarker}`] : []),
                 ...(inlineCheckedLeafLines ? [
-                  `  ${inlineCheckedLeafLabel}: {`,
+                  st`  ${inlineCheckedLeafLabel}: {`,
                   ...inlineCheckedLeafLines.map((line) => `    ${line}`),
-                  "  }",
+                  st`  }`,
                 ] : directCheckedLeafNoThrow ? [
-                  `  ${out} = ${selfRecursiveMarker}${positionalRawCall};`,
+                  stmt(e`  ${out} = ${selfRecursiveMarker}${
+                    positionalRawCall};`, {kind: "assign", write: out}),
                 ] : [
-                  `  try { ${out} = ${selfRecursiveMarker}${
-                    positionalRawCall}; } catch (${caught}) {`,
-                  `    /*${regionHandlerMarkers.start}*/`,
+                  stmt(e`  try { ${out} = ${selfRecursiveMarker}${
+                    positionalRawCall}; } catch (${caught}) {`),
+                  st`    /*${regionHandlerMarkers.start}*/`,
                   ...materializeCallExceptionLines(
                     callStack, stack, index,
                     callStackDepth,
                     site.selfRecursive ? "false" :
-                      `!${positionalInvoke}.jvmRestoresExceptionFrames`,
+                      operand(e`!${positionalInvoke}.jvmRestoresExceptionFrames`),
                     regionRestoreMarkers,
                   ).map((line) => `    ${line}`),
-                  `    throw ${caught};`,
-                  `    /*${regionHandlerMarkers.end}*/`, "  }",
+                  st`    throw ${caught};`,
+                  st`    /*${regionHandlerMarkers.end}*/`, st`  }`,
                 ]),
-                "}",
-                `if (!${usedDirect} || ${inlineCheckedLeafVoid
-                  ? `!${out}`
-                  : `${out} === helpers.asyncInvokeSentinel()`}) {`,
+                st`}`,
+                stmt(e`if (!${usedDirect} || ${inlineCheckedLeafVoid
+                  ? e`!${out}`
+                  : e`${out} === helpers.asyncInvokeSentinel()`}) {`),
                 ...(inlineCheckedLeafLines
-                  ? [inlineCheckedLeafFallbackMarker]
+                  ? [st`${inlineCheckedLeafFallbackMarker}`]
                   : fallbackLines.map((line) => `  ${line}`)),
-                ...(inlineCheckedLeafVoid ? [] : ["}"]));
+                ...(inlineCheckedLeafVoid ? [] : [st`}`]));
               // Publish what a fused hot call-graph region needs in order to
               // link this call site, as compiler-owned tokens rather than as
               // structure to be recovered from the emitted JavaScript. The
@@ -5126,7 +5178,7 @@ class JvmSsaBlockRenderer {
               if (!(inlineCheckedLeafLines && receiverGuard === "true")) {
                 site.regionLowering = {
                   resultName: out,
-                  resultDeclaration: `let ${out};`,
+                  resultDeclaration: letDecl(out),
                   depthName: callStackDepth,
                   rawCallPrefix: `${positionalRawInvoke}(helpers, `,
                   rawCallSuffix: "thread, true)",
@@ -5144,46 +5196,48 @@ class JvmSsaBlockRenderer {
               lines.push(...fallbackLines);
             }
             lines.push(...asynchronousActiveChildLines,
-              `if (${out} === helpers.asyncInvokeSentinel()) {`,
-              ...(resumableVoidCall ? [asynchronousCallMarker] : [
+              st`if (${out} === helpers.asyncInvokeSentinel()) {`,
+              ...(resumableVoidCall ? [st`${asynchronousCallMarker}`] : [
                 ...materializeLines(callStack, index).map((line) => `  ${line}`),
-                "  helpers.skipJitOnce(frame);",
-                "  return { deopt: true, transient: true, reason: 'asynchronous structured SSA callee' };",
-              ]), "}");
-            const deoptCallMarker =
-              `__JVM_DEOPT_CALL_${index}_${site.id}__`;
+                st`  helpers.skipJitOnce(frame);`,
+                st`  return { deopt: true, transient: true, reason: 'asynchronous structured SSA callee' };`,
+              ]), st`}`);
+            const deoptCallMarker = named(
+              `__JVM_DEOPT_CALL_${index}_${site.id}__`);
             continuationFallbacks.set(deoptCallMarker, {
               continuation: [
                 ...materializeLines(stack, index + 1).map((line) => `  ${line}`),
-                `  ${out}.structuredResumePc = ${index + 1};`,
-                `  ${out}.structuredResumeOwnsFrame = true;`,
-                `  yield ${out};`,
-                `  ${callStackDepth} = thread.callStack.items.length;`,
+                st`  ${out}.structuredResumePc = ${index + 1};`,
+                st`  ${out}.structuredResumeOwnsFrame = true;`,
+                st`  yield ${out};`,
+                st`  ${callStackDepth} = thread.callStack.items.length;`,
                 ...(site.returnsVoid ? [] : [
-                  `  ${out} = frame.stack.items.pop();`,
+                  st`  ${out} = frame.stack.items.pop();`,
                 ]),
               ],
               ordinary: [
                 ...materializeLines(stack, index + 1).map((line) => `  ${line}`),
-                `  if (frame) ${out}.jvmPositionalChild = frame;`,
-                `  return ${out};`,
+                st`  if (frame) ${out}.jvmPositionalChild = frame;`,
+                st`  return ${out};`,
               ],
-              checkedLeaf: ["return helpers.asyncInvokeSentinel();"],
+              checkedLeaf: [st`return helpers.asyncInvokeSentinel();`],
             });
-            lines.push(`if (${out} && ${out}.deopt) {`,
-              `  if (frame === null && (${out}.jvmPositionalChild || ` +
-                `thread.callStack.items.length > ${callStackDepth})) {`,
+            lines.push(st`if (${out} && ${out}.deopt) {`,
+              stmt(exprConcat(
+                e`  if (frame === null && (${out}.jvmPositionalChild || `,
+                e`thread.callStack.items.length > ${callStackDepth})) {`)),
               ...materializeLines(stack, index + 1)
                 .map((line) => `    ${line}`),
-              "  }",
-              `  if (!helpers.linkStructuredCallChild(frame, thread, ${
-                callStackDepth}, ${JSON.stringify(site.returnType)}, ` +
-                `undefined, ${out}.jvmPositionalChild)) {`,
+              st`  }`,
+              stmt(exprConcat(
+                e`  if (!helpers.linkStructuredCallChild(frame, thread, ${
+                  callStackDepth}, ${JSON.stringify(site.returnType)}, `,
+                e`undefined, ${out}.jvmPositionalChild)) {`)),
               ...materializeLines(callStack, index).map((line) => `    ${line}`),
-              "    helpers.skipJitOnce(frame);",
-              `    return ${out};`,
-              "  }",
-              deoptCallMarker, "}");
+              st`    helpers.skipJitOnce(frame);`,
+              st`    return ${out};`,
+              st`  }`,
+              st`${deoptCallMarker}`, st`}`);
             // A callee that left a frame on the stack has not run to
             // completion, whatever it returned. The check above it is reached
             // only for the async sentinel and the one before that only for an
@@ -5192,62 +5246,62 @@ class JvmSsaBlockRenderer {
             // on and pushed its next call on top of the untouched child, which
             // then ran against state the later call had already overwritten.
             // The synchronous tier has always checked this unconditionally.
-            const leftActiveChildMarker =
-              `__JVM_LEFT_ACTIVE_CHILD_${index}_${site.id}__`;
+            const leftActiveChildMarker = named(
+              `__JVM_LEFT_ACTIVE_CHILD_${index}_${site.id}__`);
             continuationFallbacks.set(leftActiveChildMarker, {
               continuation: [
                 ...materializeLines(stack, index + 1).map((line) => `    ${line}`),
-                `    yield { deopt: true, transient: true, structuredResumePc: ${
+                st`    yield { deopt: true, transient: true, structuredResumePc: ${
                   index + 1
                 }, structuredResumeOwnsFrame: true, reason: 'structured SSA callee left active child' };`,
-                `    ${callStackDepth} = thread.callStack.items.length;`,
+                st`    ${callStackDepth} = thread.callStack.items.length;`,
                 ...(site.returnsVoid ? [] : [
-                  `    ${out} = frame.stack.items.pop();`,
+                  st`    ${out} = frame.stack.items.pop();`,
                 ]),
               ],
               ordinary: [
                 ...materializeLines(stack, index + 1).map((line) => `    ${line}`),
-                "    return { deopt: true, transient: true, " +
-                  "reason: 'structured SSA callee left active child', " +
-                  "jvmPositionalChild: frame };",
+                stmt(exprConcat(e`    return { deopt: true, transient: true, `,
+                  e`reason: 'structured SSA callee left active child', `,
+                  e`jvmPositionalChild: frame };`)),
               ],
-              checkedLeaf: ["    return helpers.asyncInvokeSentinel();"],
+              checkedLeaf: [st`    return helpers.asyncInvokeSentinel();`],
             });
             lines.push(
-              `/*__JVM_LEFT_ACTIVE_CHILD_WITHDRAW_${index}_${site.id}__*/`,
-              `if (thread.callStack.items.length > ${callStackDepth}) {`,
+              st`/*__JVM_LEFT_ACTIVE_CHILD_WITHDRAW_${index}_${site.id}__*/`,
+              st`if (thread.callStack.items.length > ${callStackDepth}) {`,
               ...materializeOmittedCallerForChild("  "),
-              "}",
-              `if (thread.callStack.items.length > ${callStackDepth} &&`,
-              `    helpers.linkStructuredCallChild(frame, thread, ${
+              st`}`,
+              st`if (thread.callStack.items.length > ${callStackDepth} &&`,
+              st`    helpers.linkStructuredCallChild(frame, thread, ${
                 callStackDepth}, ${JSON.stringify(site.returnType)})) {`,
-              leftActiveChildMarker, "}");
+              st`${leftActiveChildMarker}`, st`}`);
             if (deferMaterialization) deferredCallMaterializationCount += 1;
             if (!site.returnsVoid) stack.push(out);
-            const yieldedCallMarker =
-              `__JVM_YIELDED_CALL_${index}_${site.id}__`;
+            const yieldedCallMarker = named(
+              `__JVM_YIELDED_CALL_${index}_${site.id}__`);
             continuationFallbacks.set(yieldedCallMarker, {
               continuation: [
                 ...materializeLines(stack, index + 1).map((line) => `  ${line}`),
-                `  yield { deopt: true, transient: true, structuredResumePc: ${
+                st`  yield { deopt: true, transient: true, structuredResumePc: ${
                   index + 1
                 }, reason: 'thread yielded in structured SSA callee' };`,
               ],
               ordinary: [
                 ...materializeLines(stack, index + 1).map((line) => `  ${line}`),
-                "  return { deopt: true, transient: true, " +
-                  "reason: 'thread yielded in structured SSA callee', " +
-                  "jvmPositionalChild: frame };",
+                stmt(exprConcat(e`  return { deopt: true, transient: true, `,
+                  e`reason: 'thread yielded in structured SSA callee', `,
+                  e`jvmPositionalChild: frame };`)),
               ],
-              checkedLeaf: ["return helpers.asyncInvokeSentinel();"],
+              checkedLeaf: [st`return helpers.asyncInvokeSentinel();`],
             });
-            lines.push("if (thread.status !== 'runnable') {",
-              yieldedCallMarker, "}");
-            lines.push(`/*${site.regionMarkers.end}*/`);
-            if (inlineCheckedLeafVoidFastPath) lines.push("}");
+            lines.push(st`if (thread.status !== 'runnable') {`,
+              st`${yieldedCallMarker}`, st`}`);
+            lines.push(st`/*${site.regionMarkers.end}*/`);
+            if (inlineCheckedLeafVoidFastPath) lines.push(st`}`);
             if (checkedAdmissionEnd) lines.push(checkedAdmissionEnd);
             if (site.selfRecursive) {
-              lines.push(`/*__SSA_SELF_RECURSIVE_REGION_END_${index}__*/`);
+              lines.push(st`/*__SSA_SELF_RECURSIVE_REGION_END_${index}__*/`);
             }
           }
         } else if (op === "tableswitch" || op === "lookupswitch") {
@@ -5332,7 +5386,8 @@ class JvmSsaBlockRenderer {
           const thrown = pop();
           if (thrown === null) valid = false;
           else {
-            lines.push(...materializeLines([...stack, thrown], index), `throw ${thrown};`);
+            lines.push(...materializeLines([...stack, thrown], index),
+              st`throw ${thrown};`);
             returnKind = "throw";
           }
         } else if (op === "ireturn" || op === "areturn" || op === "dreturn" ||
