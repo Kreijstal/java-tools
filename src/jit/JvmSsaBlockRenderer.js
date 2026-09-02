@@ -7,7 +7,8 @@ const {
 } = require("../decompiler/structurer");
 const { splitIrreducibleTerms } = require("../decompiler/exceptionStructurer");
 const { parseDescriptor } = require("../parsing/typeParser");
-const { arrayDataExpression, matchEntryArrayDataLine } = require("./arrayDataExpression");
+const { arrayDataExpression } = require("./arrayDataExpression");
+const { inlineIntegerArgumentName } = require("./inlineIntegerNames");
 const { buildSsa } = require("../analysis/opgraph/ssa");
 const { kindWidth } = require("../analysis/opgraph/ssaTypes");
 const { parse: parseJavaScript } = require("acorn");
@@ -389,52 +390,22 @@ function runtimeClassNameExpression(value) {
     `? "java/lang/String" : (${value}._className || ${value}.type))`;
 }
 
-function compactOneUseGuardTemporaries(sourceLines) {
-  let lines = [...sourceLines];
-  const namePattern =
-    "ssa(?:RuntimeCoarse(?:Trips|Loop)|ArrayRangeGuard)\\d+";
-  for (;;) {
-    const counts = new Map();
-    for (const line of lines) {
-      for (const match of line.matchAll(
-        new RegExp(`\\b${namePattern}\\b`, "g"))) {
-        counts.set(match[0], (counts.get(match[0]) || 0) + 1);
-      }
-    }
-    let changed = false;
-    for (let declarationIndex = 0;
-      declarationIndex < lines.length; declarationIndex += 1) {
-      const declaration = new RegExp(
-        `^(\\s*)const (${namePattern}) = (.+);$`,
-      ).exec(lines[declarationIndex]);
-      if (!declaration || counts.get(declaration[2]) !== 2 ||
-          /\bhelpers\.|\bnew\b/.test(declaration[3])) continue;
-      const usePattern = new RegExp(`\\b${declaration[2]}\\b`);
-      let useIndex = -1;
-      for (let index = declarationIndex + 1; index < lines.length; index += 1) {
-        if (usePattern.test(lines[index])) {
-          useIndex = index;
-          break;
-        }
-      }
-      if (useIndex < 0) continue;
-      const referencedLocals = [
-        ...declaration[3].matchAll(/\blocal(\d+)\b/g),
-      ].map((match) => Number(match[1]));
-      const localChanged = referencedLocals.some((slot) => {
-        const assignment = new RegExp(`\\blocal${slot}\\s*=(?!=)`);
-        return lines.slice(declarationIndex + 1, useIndex)
-          .some((line) => assignment.test(line));
-      });
-      if (localChanged) continue;
-      lines[useIndex] = lines[useIndex].replace(
-        usePattern, `(${declaration[3]})`);
-      lines[declarationIndex] = "";
-      changed = true;
-    }
-    if (!changed) return lines;
-    lines = lines.filter(Boolean);
-  }
+// A checked leaf leaves its body through one compiler-owned statement. When
+// the body is inserted lexically into a caller, that statement is late-bound
+// to the caller-visible result slot and exit label of the inserted scope.
+const CHECKED_LEAF_BAIL = "return helpers.asyncInvokeSentinel();";
+
+function retargetCheckedLeafBails(lines, target) {
+  const replacement = `{ ${target.result} = ${
+    target.returnsVoid ? "false" : "helpers.asyncInvokeSentinel()"}; ` +
+    `break ${target.label}; }`;
+  let bails = 0;
+  const retargeted = lines.map((line) => {
+    if (!line.includes(CHECKED_LEAF_BAIL)) return line;
+    bails += 1;
+    return line.split(CHECKED_LEAF_BAIL).join(replacement);
+  });
+  return { lines: retargeted, bails };
 }
 
 // Makes one multiple-entry strongly connected component reducible by routing
@@ -904,6 +875,14 @@ class JvmSsaBlockRenderer {
     const compiledMethodIdentity =
       `${this.jit.jvm.findClassNameForMethod?.(method) || method.className || "?"}.` +
       `${method.name}${method.descriptor}`;
+    // Every compile owns a serial. The names a checked-leaf body exposes to a
+    // lexical caller (its result slot and exit label) and the names a caller
+    // stages for an inserted body carry it, so no insertion collides with the
+    // enclosing body or with another inserted body at any nesting depth.
+    this.compileSerial = (this.compileSerial || 0) + 1;
+    const compileSerial = this.compileSerial;
+    const checkedLeafResultVariable = `ssaInlineResult${compileSerial}`;
+    const checkedLeafBodyLabel = `ssaInlineBody${compileSerial}`;
     const guardedStaticBooleanSpecializationEnabled =
       this.guardedStaticBooleansEnabled &&
       !this.jit.effectfulPreparationActive &&
@@ -1215,7 +1194,7 @@ class JvmSsaBlockRenderer {
           targetCannotOverride;
         const directJre = this.jit.getCompileTimeDirectJre(op, instruction);
         const inline = directJre || !isStatic
-          ? null : this.jit.getCompileTimeIntegerLeaf(instruction);
+          ? null : this.jit.getCompileTimeIntegerLeaf(instruction, true);
         if (inline?.className) directStaticOwners.add(inline.className);
         const directIntrinsic = directJre || !isStatic || inline
           ? null : this.jit.getCompileTimeSynchronousIntrinsic(instruction);
@@ -1361,6 +1340,14 @@ class JvmSsaBlockRenderer {
     const directEntryStaticReadFallbacks = new Map();
     const directCheckedAdmissionFallbacks = new Map();
     const directEntryCheckedAdmissionDeclarations = [];
+    // Lines a lexical insertion may omit are recorded by identity as they are
+    // emitted: the caller either proves a guard or owns the safe-point budget,
+    // and the inserted body then drops exactly those lines.
+    const checkedLeafOmittableLines = new Map();
+    const recordCheckedLeafLine = (kind, line, guards = null) => {
+      checkedLeafOmittableLines.set(line, { kind, guards });
+      return line;
+    };
     const materializeDepths = new Set();
     const materializeUnwindDepths = new Set();
     let deferredCallMaterializationCount = 0;
@@ -4227,14 +4214,14 @@ class JvmSsaBlockRenderer {
             }
             if (valid) {
               const out = value();
-              const substitute = (source) => source.replace(/stack\[base \+ (\d+)\]/g,
-                (_match, argument) => `(${args[Number(argument)]})`);
+              // The plan is rendered once against fixed parameter names;
+              // each site binds those names to its operands inside the block.
               lines.push(`let ${out};`, "{",
-                ...site.inline.statements.map((statement) => `  ${substitute(statement)}`));
+                ...args.map((argument, position) =>
+                  `  const ${inlineIntegerArgumentName(position)} = ${argument};`),
+                ...site.inline.statements.map((statement) => `  ${statement}`));
               if (site.inline.guards?.length) {
-                const guard = site.inline.guards
-                  .map((condition) => substitute(condition))
-                  .join(" && ");
+                const guard = site.inline.guards.join(" && ");
                 lines.push(`  if (!(${guard})) {`,
                   ...materializeLines(callStack, index)
                     .map((line) => `    ${line}`),
@@ -4242,7 +4229,7 @@ class JvmSsaBlockRenderer {
                   "    return { deopt: true, transient: true, reason: 'guarded inline integer leaf' };",
                   "  }");
               }
-              lines.push(`  ${out} = ${substitute(site.inline.result)};`, "}");
+              lines.push(`  ${out} = ${site.inline.result};`, "}");
               stack.push(out);
             }
           } else if (site.directIntrinsic?.kind === "primitiveArrayCopy" &&
@@ -4457,229 +4444,168 @@ class JvmSsaBlockRenderer {
                   ? invariantPositionalRawVariable(index) : null;
               const directCheckedLeafNoThrow =
                 site.directCheckedLeaf?.noThrow === true;
-              const inlineCheckedLeafSource =
-                directCheckedLeafNoThrow &&
-                typeof site.directCheckedLeaf?.inlineSource === "string"
-                  ? site.directCheckedLeaf.inlineSource : null;
-              const inlineCheckedLeafReturnExpressions = inlineCheckedLeafSource
-                ? [...inlineCheckedLeafSource.matchAll(/\breturn\s+([^;]+);/g)]
-                  .map((match) => match[1].trim()) : [];
+              const inlineCheckedLeafBody =
+                directCheckedLeafNoThrow && site.directCheckedLeaf?.inlineBody
+                  ? site.directCheckedLeaf.inlineBody : null;
               const inlineCheckedLeafVoid = Boolean(
-                inlineCheckedLeafSource && site.returnsVoid &&
-                inlineCheckedLeafReturnExpressions.length > 0 &&
-                inlineCheckedLeafReturnExpressions.every((expression) =>
-                  expression === "helpers.returnVoid()" ||
-                  expression === "helpers.asyncInvokeSentinel()"),
-              );
+                inlineCheckedLeafBody && site.returnsVoid &&
+                inlineCheckedLeafBody.returnsVoid);
               if (inlineCheckedLeafVoid) lexicalVoidFastPathSites.add(index);
               inlineCheckedLeafVoidFastPath = inlineCheckedLeafVoid;
               const inlineCheckedLeafLabel =
-                `ssaInlineCheckedLeaf${index}`;
+                `ssaInlineCheckedLeaf${compileSerial}_${index}`;
               const inlineCheckedLeafFallbackMarker =
                 `__JVM_INLINE_CHECKED_LEAF_FALLBACK_${index}_${site.id}__`;
-              const inlineCheckedLeafLines = inlineCheckedLeafSource
-                ? (() => {
-                  let childLines = inlineCheckedLeafSource.split("\n")
-                    .filter((line) => line.trim() !== "'use strict';");
-                  // The caller's initialization guard covers the child owner
-                  // and every captured static owner. Avoid repeating the same
-                  // epoch/debug predicate on each lexical call inside a loop.
-                  if (/^const ssaRestoringClassInitializationGuard =/.test(
-                    childLines[0] || "") &&
-                      /^if \(.+ssaRestoringClassInitializationGuard/.test(
-                        childLines[1] || "")) {
-                    childLines = childLines.slice(2);
-                  }
-                  // Child JVM locals occupy a separate frame namespace. Give
-                  // them distinct JavaScript identifiers before substituting
-                  // caller arguments, so parent locals introduced by those
-                  // expressions are not accidentally renamed and host SSA
-                  // analysis does not have to reason about shadowed names.
-                  childLines = childLines.map((line) => line.replace(
-                    /\blocal(\d+)\b/g,
-                    (_name, slot) => `ssaInlineLocal${index}_${slot}`));
-                  const fedNonNullEntryArrays = new Set();
-                  childLines = childLines.map((line) => {
-                    let rewritten = line;
-                    const entryArray = matchEntryArrayDataLine(rewritten);
-                    if (entryArray) {
-                      const view =
-                        positionalArgumentArrayData[entryArray.argument];
-                      if (view) {
-                        rewritten = entryArray.variable === view.data
-                          ? ""
-                          : `${entryArray.indent}const ${entryArray.variable} = ${view.data};`;
-                        if (view.nonNull) {
-                          fedNonNullEntryArrays.add(entryArray.variable);
-                        }
-                      }
-                    }
-                    if (!rewritten) return "";
-                    const nullGuard = /^\s*if \((ssaEntryArrayData\d+) === null\) \{ return helpers\.asyncInvokeSentinel\(\); \}$/.exec(
-                      rewritten);
-                    if (nullGuard &&
-                        fedNonNullEntryArrays.has(nullGuard[1])) return "";
-                    for (let argument = args.length - 1;
-                      argument >= 0; argument -= 1) {
-                      rewritten = rewritten.replace(
-                        new RegExp(`\\bargument${argument}\\b`, "g"),
-                        `(${args[argument]})`);
-                    }
-                    for (let capture = positionalRawCaptures.length - 1;
-                      capture >= 0; capture -= 1) {
-                      rewritten = rewritten.replace(
-                        new RegExp(`\\bssaCapturedStatic${capture}\\b`, "g"),
-                        `(${positionalRawCaptures[capture]})`);
-                    }
-                    rewritten = rewritten.replace(
-                      /\bnestedEntryGuarded\b/g, "true");
-                    return rewritten.replace(
-                      /\breturn\s+([^;]+);/g,
-                      (_return, expression) => {
-                        if (!inlineCheckedLeafVoid) {
-                          return `{ ${out} = ${expression}; ` +
-                            `break ${inlineCheckedLeafLabel}; }`;
-                        }
-                        const success = expression.trim() ===
-                          "helpers.returnVoid()";
-                        return `{ ${out} = ${success}; ` +
-                          `break ${inlineCheckedLeafLabel}; }`;
-                      });
-                  }).filter(Boolean);
-                  // Captured values already have caller-local SSA names.
-                  // Substitute the child's entry aliases, and remove
-                  // per-entry accounting/safe-point bookkeeping: a lexical
-                  // inline is part of the parent entry and its checked loop
-                  // has already been bounded before publication.
-                  const aliases = new Map();
-                  childLines = childLines.filter((line) => {
-                    const alias = /^const (ssaEntryStatic(?:ArrayData|Value)\d+) = (.+);$/.exec(
-                      line.trim());
-                    if (!alias) return true;
-                    aliases.set(alias[1], alias[2]);
-                    return false;
+              // Lexical insertion binds by declaration. The caller stages its
+              // operands, captures, and array views into caller-unique names
+              // before the inserted scope opens; inside that scope the child's
+              // own parameter, capture, and local names shadow the caller's
+              // without reading through a temporal dead zone, and the child
+              // leaves its result in the slot its labeled body owns.
+              const inlineCheckedLeafStage = (kind, position) =>
+                `ssaInline${compileSerial}_${index}_${kind}${position}`;
+              const inlineCheckedLeafLinesFor = (provenGuards) => {
+                if (!inlineCheckedLeafBody ||
+                    inlineCheckedLeafBody.argumentNames.length !==
+                      args.length ||
+                    inlineCheckedLeafBody.captureArguments.length !==
+                      positionalRawCaptures.length) return null;
+                const feeds = new Map();
+                positionalArgumentArrayData.forEach((view, argument) => {
+                  if (!view) return;
+                  feeds.set(argument, {
+                    expression: inlineCheckedLeafStage("v", argument),
+                    nonNull: view.nonNull,
                   });
-                  if (aliases.size) {
-                    childLines = childLines.map((line) => line.replace(
-                      /\bssaEntryStatic(?:ArrayData|Value)\d+\b/g,
-                      (name) => aliases.get(name) || name));
-                  }
-                  childLines = childLines.filter((line) =>
-                    !line.includes(
-                      "helpers.structuredSsa.restoringDirectRunCount += 1;") &&
-                    !/^let safePointBudget = \d+;$/.test(line.trim()) &&
-                    !/^if \(.+\) safePointBudget -= .+;$/.test(line.trim()));
-                  return compactOneUseGuardTemporaries(childLines);
-                })() : null;
+                });
+                const assembled = inlineCheckedLeafBody.assemble({
+                  feeds, provenGuards, exitLabel: inlineCheckedLeafLabel,
+                });
+                if (!assembled) return null;
+                return {
+                  bails: assembled.bails,
+                  lines: [
+                    ...args.map((argument, position) =>
+                      `const ${inlineCheckedLeafStage("a", position)} = ` +
+                      `${argument};`),
+                    ...positionalRawCaptures.map((capture, position) =>
+                      `const ${inlineCheckedLeafStage("c", position)} = ` +
+                      `${capture};`),
+                    ...[...feeds.keys()].map((argument) =>
+                      `const ${inlineCheckedLeafStage("v", argument)} = ` +
+                      `${positionalArgumentArrayData[argument].data};`),
+                    "{",
+                    ...inlineCheckedLeafBody.argumentNames.map(
+                      (name, position) =>
+                        `  const ${name} = ${
+                          inlineCheckedLeafStage("a", position)};`),
+                    ...inlineCheckedLeafBody.captureArguments.map(
+                      (name, position) =>
+                        `  const ${name} = ${
+                          inlineCheckedLeafStage("c", position)};`),
+                    "  const nestedEntryGuarded = true;",
+                    ...assembled.lines.map((line) => `  ${line}`),
+                    `  ${out} = ${inlineCheckedLeafBody.result};`,
+                    "}",
+                  ],
+                };
+              };
+              const inlineCheckedLeafLines =
+                inlineCheckedLeafLinesFor(new Set())?.lines || null;
               const provenInlineCheckedLeafLines =
                 checkedAdmissionPlan && inlineCheckedLeafLines
                   ? (() => {
-                    const trusted = [...inlineCheckedLeafLines];
                     if (checkedAdmissionPlan.kind === "record-window") {
                       const guard = checkedAdmissionPlan.guardVariable;
                       if (typeof guard !== "string") return null;
-                      const guardDeclaration = trusted.findIndex((line) =>
-                        new RegExp(`\\b(?:let|const) ${guard} = `).test(line));
-                      const guardFailure = trusted.findIndex((line, lineIndex) =>
-                        lineIndex > guardDeclaration &&
-                        line.includes(`if (!${guard})`) &&
-                        line.includes(`${out} = false`));
-                      if (guardDeclaration < 0 || guardFailure < 0) return null;
-                      let admissionStart = guardDeclaration;
-                      if (guardDeclaration > 0 &&
-                          /Threshold = /.test(trusted[guardDeclaration - 1])) {
-                        admissionStart -= 1;
-                      }
-                      trusted.splice(
-                        admissionStart, guardFailure - admissionStart + 1);
-                    } else if (checkedAdmissionPlan.kind ===
-                        "clipped-affine-fill") {
-                      trusted.length = 0;
-                      const x = `ssaClippedX${index}`;
-                      const y = `ssaClippedY${index}`;
-                      const count = `ssaClippedCount${index}`;
-                      const pixel = `ssaClippedPixel${index}`;
-                      const end = `ssaClippedEnd${index}`;
-                      const argument = (position) =>
-                        `(${args[position]})`;
-                      const specializedCache =
-                        this.jit.checkedLeafCaptureCaches[
-                          site.checkedLeafCaptureCacheId];
-                      if (specializedCache?.dirty &&
-                          specializedCache.specializationInitialized) {
-                        this.jit.refreshCheckedLeafCaptureCache(
-                          site.checkedLeafCaptureCacheId);
-                      }
-                      const specialized = Boolean(
-                        specializedCache?.specializationInitialized &&
-                        specializedCache.specializedMatches === true &&
-                        [
-                          checkedAdmissionPlan.topCapture,
-                          checkedAdmissionPlan.bottomCapture,
-                          checkedAdmissionPlan.leftCapture,
-                          checkedAdmissionPlan.rightCapture,
-                          checkedAdmissionPlan.widthCapture,
-                        ].every((position) => Number.isInteger(
-                          specializedCache[`specializedValue${position}`])) &&
-                        specializedCache[`specializedValue${
-                          checkedAdmissionPlan.arrayDataCapture}`] !== null);
-                      const capture = (position) =>
-                        specialized && Number.isInteger(
-                          specializedCache[`specializedValue${position}`])
-                          ? String(specializedCache[
-                            `specializedValue${position}`] | 0)
-                          // The version match proves that the ordinary entry
-                          // array snapshot is the specialized array. Keep its
-                          // scalar alias in the loop so the JS engine does not
-                          // have to rediscover/hoist a mutable cache property.
-                          : specialized && position ===
-                              checkedAdmissionPlan.arrayDataCapture
-                            ? specializedCheckedCapture(
-                              site.checkedLeafCaptureCacheId, position)
-                            : `(${positionalRawCaptures[position]})`;
-                      const top = capture(checkedAdmissionPlan.topCapture);
-                      const bottom = capture(
-                        checkedAdmissionPlan.bottomCapture);
-                      const left = capture(checkedAdmissionPlan.leftCapture);
-                      const right = capture(
-                        checkedAdmissionPlan.rightCapture);
-                      const width = capture(
-                        checkedAdmissionPlan.widthCapture);
-                      const destination = capture(
-                        checkedAdmissionPlan.arrayDataCapture);
-                      trusted.push(
-                        `let ${x} = ${argument(
-                          checkedAdmissionPlan.xArgument)};`,
-                        `const ${y} = ${argument(
-                          checkedAdmissionPlan.yArgument)};`,
-                        `let ${count} = ${argument(
-                          checkedAdmissionPlan.countArgument)};`,
-                        `if (${y} >= ${top} && ${y} < ${bottom}) {`,
-                        `  if (${x} < ${left}) {`,
-                        `    ${count} = (${count} - ` +
-                          `(${left} - ${x}));`,
-                        `    ${x} = ${left};`,
-                        "  }",
-                        `  if ((${x} + ${count}) > ${right}) ` +
-                          `${count} = ${right} - ${x};`,
-                        `  let ${pixel} = (${y} * ${width}) + ${x};`,
-                        `  const ${end} = ${pixel} + ${count};`,
-                        `  while (${pixel} < ${end}) {`,
-                        `    ${destination}[${pixel}] = ${argument(
-                          checkedAdmissionPlan.valueArgument)};`,
-                        `    ${pixel} += 1;`,
-                        "  }",
-                        "}",
-                      );
-                    } else {
+                      const proven =
+                        inlineCheckedLeafLinesFor(new Set([guard]));
+                      // The caller's admission proof must have removed every
+                      // exit; a body that can still reject is not proven.
+                      if (!proven || proven.bails > 0) return null;
+                      return proven.lines;
+                    }
+                    if (checkedAdmissionPlan.kind !== "clipped-affine-fill") {
                       return null;
                     }
-                    if (trusted.some((line) =>
-                      line.includes(`${out} = false`))) return null;
-                    return trusted.map((line) => line.replace(
-                      new RegExp(`\\{ ${out} = true; break ` +
-                        `${inlineCheckedLeafLabel}; \\}`, "g"),
-                      `{ break ${inlineCheckedLeafLabel}; }`));
+                    const trusted = [];
+                    const x = `ssaClippedX${index}`;
+                    const y = `ssaClippedY${index}`;
+                    const count = `ssaClippedCount${index}`;
+                    const pixel = `ssaClippedPixel${index}`;
+                    const end = `ssaClippedEnd${index}`;
+                    const argument = (position) =>
+                      `(${args[position]})`;
+                    const specializedCache =
+                      this.jit.checkedLeafCaptureCaches[
+                        site.checkedLeafCaptureCacheId];
+                    if (specializedCache?.dirty &&
+                        specializedCache.specializationInitialized) {
+                      this.jit.refreshCheckedLeafCaptureCache(
+                        site.checkedLeafCaptureCacheId);
+                    }
+                    const specialized = Boolean(
+                      specializedCache?.specializationInitialized &&
+                      specializedCache.specializedMatches === true &&
+                      [
+                        checkedAdmissionPlan.topCapture,
+                        checkedAdmissionPlan.bottomCapture,
+                        checkedAdmissionPlan.leftCapture,
+                        checkedAdmissionPlan.rightCapture,
+                        checkedAdmissionPlan.widthCapture,
+                      ].every((position) => Number.isInteger(
+                        specializedCache[`specializedValue${position}`])) &&
+                      specializedCache[`specializedValue${
+                        checkedAdmissionPlan.arrayDataCapture}`] !== null);
+                    const capture = (position) =>
+                      specialized && Number.isInteger(
+                        specializedCache[`specializedValue${position}`])
+                        ? String(specializedCache[
+                          `specializedValue${position}`] | 0)
+                        // The version match proves that the ordinary entry
+                        // array snapshot is the specialized array. Keep its
+                        // scalar alias in the loop so the JS engine does not
+                        // have to rediscover/hoist a mutable cache property.
+                        : specialized && position ===
+                            checkedAdmissionPlan.arrayDataCapture
+                          ? specializedCheckedCapture(
+                            site.checkedLeafCaptureCacheId, position)
+                          : `(${positionalRawCaptures[position]})`;
+                    const top = capture(checkedAdmissionPlan.topCapture);
+                    const bottom = capture(
+                      checkedAdmissionPlan.bottomCapture);
+                    const left = capture(checkedAdmissionPlan.leftCapture);
+                    const right = capture(
+                      checkedAdmissionPlan.rightCapture);
+                    const width = capture(
+                      checkedAdmissionPlan.widthCapture);
+                    const destination = capture(
+                      checkedAdmissionPlan.arrayDataCapture);
+                    trusted.push(
+                      `let ${x} = ${argument(
+                        checkedAdmissionPlan.xArgument)};`,
+                      `const ${y} = ${argument(
+                        checkedAdmissionPlan.yArgument)};`,
+                      `let ${count} = ${argument(
+                        checkedAdmissionPlan.countArgument)};`,
+                      `if (${y} >= ${top} && ${y} < ${bottom}) {`,
+                      `  if (${x} < ${left}) {`,
+                      `    ${count} = (${count} - ` +
+                        `(${left} - ${x}));`,
+                      `    ${x} = ${left};`,
+                      "  }",
+                      `  if ((${x} + ${count}) > ${right}) ` +
+                        `${count} = ${right} - ${x};`,
+                      `  let ${pixel} = (${y} * ${width}) + ${x};`,
+                      `  const ${end} = ${pixel} + ${count};`,
+                      `  while (${pixel} < ${end}) {`,
+                      `    ${destination}[${pixel}] = ${argument(
+                        checkedAdmissionPlan.valueArgument)};`,
+                      `    ${pixel} += 1;`,
+                      "  }",
+                      "}",
+                    );
+                    return trusted;
                   })() : null;
               const receiverGuard = site.dynamic && site.argumentCount > 0
                 ? `${args[0]} !== null && ${args[0]} !== undefined && ` +
@@ -5766,7 +5692,7 @@ class JvmSsaBlockRenderer {
         Boolean(callSites.get(index)?.inline);
       const emittedCheckedLeaf = op?.startsWith("invoke") &&
         callSites.get(index)?.directCheckedLeaf?.noThrow === true &&
-        typeof callSites.get(index)?.directCheckedLeaf?.inlineSource === "string";
+        Boolean(callSites.get(index)?.directCheckedLeaf?.inlineBody);
       return op && ((!emittedIntegerLeaf && !emittedCheckedLeaf &&
         op.startsWith("invoke")) ||
         op === "monitorenter" ||
@@ -7428,7 +7354,10 @@ class JvmSsaBlockRenderer {
       candidate.rangeGuardVariable = variable;
       const declarations =
         arrayRangeGuardDeclarations.get(declarationHeader) || [];
-      declarations.push(...preamble, `const ${variable} = ${condition};`);
+      declarations.push(...preamble.map((line) =>
+        recordCheckedLeafLine("guardDeclaration", line, [variable])),
+      recordCheckedLeafLine("guardDeclaration",
+        `const ${variable} = ${condition};`, [variable]));
       arrayRangeGuardDeclarations.set(declarationHeader, declarations);
       if (declarationHeader !== info.header) {
         hoistedArrayRangeGuardCount += 1;
@@ -7994,8 +7923,9 @@ class JvmSsaBlockRenderer {
             directCheckedAdmissionFallbacks.size}`;
           const declarations = arrayRangeGuardDeclarations.get(
             capacityFact.declarationHeader) || [];
-          declarations.push(`const ${guard} = ` +
-            `${capacityFact.tripsVariable} <= ${maximumRecords};`);
+          declarations.push(recordCheckedLeafLine("guardDeclaration",
+            `const ${guard} = ` +
+            `${capacityFact.tripsVariable} <= ${maximumRecords};`, [guard]));
           arrayRangeGuardDeclarations.set(
             capacityFact.declarationHeader, declarations);
           const bailouts = rangeBailoutGuardsByHeader.get(
@@ -8780,6 +8710,15 @@ class JvmSsaBlockRenderer {
           plan.lines, directPositional && rangeBailout));
         if (plan.returnKind && plan.returnKind !== "throw") {
           if (directPositional) {
+            if (checkedLeafOnly && !recursiveArrayPartitionLeaf) {
+              // A checked leaf completes through its labeled body, so the
+              // same lines serve the standalone entry and a lexical
+              // insertion without rewriting any return statement.
+              lines.push(`{ ${checkedLeafResultVariable} = ${
+                plan.returnKind === "void" ? "true" : plan.returnValue}; ` +
+                `break ${checkedLeafBodyLabel}; }`);
+              return lines;
+            }
             lines.push(plan.returnKind === "void"
               ? "return helpers.returnVoid();"
               : `return ${plan.returnValue};`);
@@ -8991,8 +8930,9 @@ class JvmSsaBlockRenderer {
           ? rangeBailoutGuardsByHeader.get(header) || [] : [];
         const prefix = [
           ...(!coarse && currentLoopSafePointBudget !== loopSafePointBudget
-            ? [`safePointBudget = Math.min(safePointBudget, ` +
-              `${currentLoopSafePointBudget});`]
+            ? [recordCheckedLeafLine("safePoint",
+              `safePointBudget = Math.min(safePointBudget, ` +
+              `${currentLoopSafePointBudget});`)]
             : []),
           ...[...(loopInvariantStaticArrayViewsByHeader.get(header)
             ?.values() || [])].flatMap((view) => {
@@ -9009,8 +8949,9 @@ class JvmSsaBlockRenderer {
           ...(invariantDivisorGuard
             ? [invariantDivisorGuard.declaration] : []),
           ...(entryBailoutGuards.length
-            ? [`if (!(${entryBailoutGuards.join(" && ")})) ` +
-              "return helpers.asyncInvokeSentinel();"]
+            ? [recordCheckedLeafLine("rangeBailout",
+              `if (!(${entryBailoutGuards.join(" && ")})) ` +
+              CHECKED_LEAF_BAIL, [...entryBailoutGuards])]
             : []),
           ...(coarse && !checkedLeafOnly
             ? [`safePointBudget -= ${coarseCountedLoops.get(header)};`]
@@ -9020,8 +8961,9 @@ class JvmSsaBlockRenderer {
               `const ${runtimeCoarse.tripsVariable} = ` +
                 `${runtimeCoarse.tripsExpression};`,
               `const ${runtimeCoarse.variable} = ${runtimeCoarse.condition};`,
-              `if (${runtimeCoarse.variable}) safePointBudget -= ` +
-                `${runtimeCoarse.tripsVariable};`,
+              recordCheckedLeafLine("safePoint",
+                `if (${runtimeCoarse.variable}) safePointBudget -= ` +
+                `${runtimeCoarse.tripsVariable};`),
             ]
             : []),
         ];
@@ -9713,12 +9655,14 @@ class JvmSsaBlockRenderer {
       ...spillSlots.filter((slot) => !immutableEntryLocals.has(slot)),
     ])].sort((a, b) => a - b);
     const renderedTreeSource = renderedTree.join("\n");
-    const entryArrayDataDeclarations = [...entryArrayLocalSlots]
+    const entryArrayDataSlots = [...entryArrayLocalSlots]
       .filter((slot) =>
         declaredLocals.includes(slot) &&
-        renderedTreeSource.includes(entryArrayDataVariable(slot)))
-      .map((slot) =>
-        `const ${entryArrayDataVariable(slot)} = ${arrayDataExpression(`local${slot}`)};`);
+        renderedTreeSource.includes(entryArrayDataVariable(slot)));
+    const entryArrayDataDeclarationFor = (slot) =>
+      `const ${entryArrayDataVariable(slot)} = ${arrayDataExpression(`local${slot}`)};`;
+    const entryArrayDataDeclarations = entryArrayDataSlots.map(
+      entryArrayDataDeclarationFor);
     const persistentStaticArrayDataDeclarations =
       [...persistentStaticArrayLocalViews.values(),
         ...persistentProducedArrayLocalViews.values()].map((view) =>
@@ -10785,6 +10729,9 @@ class JvmSsaBlockRenderer {
       let capturedCheckedLeafDirectPositionalBody = null;
       let capturedCheckedLeafDirectPositionalSource = null;
       let capturedCheckedLeafDirectPositionalPlan = null;
+      let checkedLeafInlineBody = null;
+      let capturedCheckedLeafCaptureArguments = null;
+      let capturedCheckedLeafBodyFor = null;
       let recursiveArrayWorkerBody = null;
       let recursiveArrayWorkerSource = null;
       let nestedRuntimeCountedRegion = false;
@@ -11405,7 +11352,7 @@ class JvmSsaBlockRenderer {
           [...callSites.values()].every((site) =>
             site.returnsVoid &&
             site.directCheckedLeaf?.noThrow === true &&
-            typeof site.directCheckedLeaf.inlineSource === "string") &&
+            Boolean(site.directCheckedLeaf.inlineBody)) &&
           items.every((item, index) => {
             const op = opOf(item?.instruction);
             if (!op || !normalReachableItems.has(index)) return true;
@@ -11419,7 +11366,7 @@ class JvmSsaBlockRenderer {
           provenCheckedCallAdmissionCount === callSites.size &&
           [...callSites.values()].every((site) =>
             site.returnsVoid && site.directCheckedLeaf?.noThrow === true &&
-            typeof site.directCheckedLeaf.inlineSource === "string");
+            Boolean(site.directCheckedLeaf.inlineBody));
         const checkedLeafShape =
           (this.checkedLeafDirectPositionalEnabled ||
             this.jit.hotCallGraphRegions?.enabled) &&
@@ -11455,6 +11402,16 @@ class JvmSsaBlockRenderer {
           let checkedLeafRenderedTree = render(
             structured.tree, false, true,
             restoringDirectSafePointBudget, true, true);
+          if (!recursiveArrayPartitionLeaf) {
+            // The labeled body is part of the rendered tree from the start,
+            // so every later pass sees a complete statement list and the
+            // same lines serve the standalone entry and a lexical insertion.
+            checkedLeafRenderedTree = [
+              `${checkedLeafBodyLabel}: {`,
+              ...checkedLeafRenderedTree,
+              "}",
+            ];
+          }
           if (shrinkingArrayWindowLeaf) {
             const guard = shrinkingArrayWindowLeaf.variable;
             checkedLeafRenderedTree = checkedLeafRenderedTree.map((line) => {
@@ -11711,10 +11668,57 @@ class JvmSsaBlockRenderer {
               }
             }
           }
+          // Fragments whose form depends on whether the body stands alone or
+          // is inserted lexically into a caller. An insertion receives its
+          // caller's array views as feeds, drops the guards the caller has
+          // proven and the safe-point accounting the caller owns, and leaves
+          // its result in the labeled body's slot instead of returning.
+          const entryArrayArgumentIndex = (slot) =>
+            argumentNames.indexOf(entryArguments.get(slot));
+          const checkedLeafEntryArrayDeclarationsFor = (inline) => inline
+            ? entryArrayDataSlots.map((slot) => {
+              const feed = inline.feeds.get(entryArrayArgumentIndex(slot));
+              return feed
+                ? `const ${entryArrayDataVariable(slot)} = ${feed.expression};`
+                : entryArrayDataDeclarationFor(slot);
+            })
+            : entryArrayDataDeclarations;
+          const checkedLeafArrayDataGuardFor = (inline) => {
+            if (!inline) return directArrayDataGuard;
+            const fed = new Set(entryArrayDataSlots
+              .filter((slot) =>
+                inline.feeds.get(entryArrayArgumentIndex(slot))?.nonNull)
+              .map(entryArrayDataVariable));
+            const guarded = guardedArrayDataVariables
+              .filter((data) => !fed.has(data));
+            return guarded.length
+              ? `if (${guarded.map((data) => `${data} === null`)
+                .join(" || ")}) { ${CHECKED_LEAF_BAIL} }`
+              : null;
+          };
+          const checkedLeafFramedTreeFor = (inline) => {
+            const treeLines = inline
+              ? checkedLeafTree.filter((line) => {
+                const omittable = checkedLeafOmittableLines.get(line.trim());
+                if (!omittable) return true;
+                if (omittable.kind === "safePoint") return false;
+                return !omittable.guards.every((guard) =>
+                  inline.provenGuards.has(guard));
+              })
+              : checkedLeafTree;
+            if (recursiveArrayPartitionLeaf || inline) return treeLines;
+            return [
+              ...treeLines,
+              directMethodDescriptor.returnType === "void"
+                ? "return helpers.returnVoid();"
+                : `return ${checkedLeafResultVariable};`,
+            ];
+          };
           const checkedLeafBodyFor = ({
             includeCallerOwnedChecks,
             includeRunCounter,
             tier,
+            inline = null,
           }) => {
             let body = recursiveArrayWorkerBody
               ? [
@@ -11739,6 +11743,9 @@ class JvmSsaBlockRenderer {
                 ].join(", ")});`,
               ].filter(Boolean)
               : compactCheckedLeafEntryLocals([
+                // The result slot precedes every guard: a lexical insertion
+                // routes its prologue exits to this slot as well.
+                `let ${checkedLeafResultVariable};`,
                 ...directStaticDeclarations,
                 ...lazyStaticDeclarations,
                 ...directEntryStaticReadDeclarations,
@@ -11755,13 +11762,14 @@ class JvmSsaBlockRenderer {
                 ...(includeCallerOwnedChecks
                   ? checkedLeafSafeArithmeticGuards : []),
                 directBooleanGuard,
-                includeRunCounter && this.runCountersEnabled
+                includeRunCounter && !inline && this.runCountersEnabled
                   ? "helpers.structuredSsa.restoringDirectRunCount += 1;"
                   : null,
                 ...(atomicBoundedLoops || nestedRuntimeCountedRegion ||
                   shrinkingArrayWindowLeaf ||
                   recursiveArrayPartitionLeaf ||
-                  transactionalAcyclicShape || lexicalCheckedLeafWrapperShape
+                  transactionalAcyclicShape || lexicalCheckedLeafWrapperShape ||
+                  inline
                   ? [] : [
                   `let safePointBudget = ${restoringDirectSafePointBudget};`,
                 ]),
@@ -11771,15 +11779,15 @@ class JvmSsaBlockRenderer {
                       ? entryLocalInitialValues.get(index)
                       : entryArgumentValue(index) || "undefined"};`),
                 ...invariantPositionalCallDeclarations,
-                ...entryArrayDataDeclarations,
+                ...checkedLeafEntryArrayDeclarationsFor(inline),
                 ...persistentStaticArrayDataDeclarations,
                 ...(transactionalAcyclicShape ? [
                   ...transactionalFieldReadCacheInitializations,
                 ] : []),
-                directArrayDataGuard,
+                checkedLeafArrayDataGuardFor(inline),
                 ...checkedLeafTripDeclarations,
                 ...declarations,
-                ...checkedLeafTree,
+                ...checkedLeafFramedTreeFor(inline),
               ].filter(Boolean));
             // Admission and constant/static specialization can render the
             // original capture aliases dead. Remove only compiler-owned pure
@@ -11945,6 +11953,7 @@ class JvmSsaBlockRenderer {
               const captureArguments = [];
               const captureDeclarations = [];
               const captures = [];
+              capturedCheckedLeafCaptureArguments = captureArguments;
               for (const cache of capturedCaches) {
                 const valueArgument =
                   `ssaCapturedStatic${captureArguments.length}`;
@@ -11968,30 +11977,35 @@ class JvmSsaBlockRenderer {
                 }
                 captures.push(capture);
               }
-              const capturedBody = compactCheckedLeafEntryLocals([
-                ...captureDeclarations,
-                this.runCountersEnabled
-                  ? "helpers.structuredSsa.restoringDirectRunCount += 1;" : null,
-                ...(nestedRuntimeCountedRegion || shrinkingArrayWindowLeaf ||
-                  recursiveArrayPartitionLeaf ||
-                  transactionalAcyclicShape || lexicalCheckedLeafWrapperShape
-                  ? [] : [
-                  `let safePointBudget = ${restoringDirectSafePointBudget};`,
-                ]),
-                ...declaredLocals.map((index) =>
-                  `${immutableEntryLocals.has(index) ? "const" : "let"} local${index} = ${
-                    entryLocalInitialValues.has(index)
-                      ? entryLocalInitialValues.get(index)
-                      : entryArgumentValue(index) || "undefined"};`),
-                ...entryArrayDataDeclarations,
-                ...persistentStaticArrayDataDeclarations,
-                ...(transactionalAcyclicShape
-                  ? transactionalFieldReadCacheInitializations : []),
-                directArrayDataGuard,
-                ...checkedLeafTripDeclarations,
-                ...declarations,
-                ...checkedLeafTree,
-              ].filter(Boolean));
+              capturedCheckedLeafBodyFor = (inline = null) =>
+                compactCheckedLeafEntryLocals([
+                  `let ${checkedLeafResultVariable};`,
+                  ...captureDeclarations,
+                  !inline && this.runCountersEnabled
+                    ? "helpers.structuredSsa.restoringDirectRunCount += 1;"
+                    : null,
+                  ...(nestedRuntimeCountedRegion || shrinkingArrayWindowLeaf ||
+                    recursiveArrayPartitionLeaf ||
+                    transactionalAcyclicShape ||
+                    lexicalCheckedLeafWrapperShape || inline
+                    ? [] : [
+                    `let safePointBudget = ${restoringDirectSafePointBudget};`,
+                  ]),
+                  ...declaredLocals.map((index) =>
+                    `${immutableEntryLocals.has(index) ? "const" : "let"} local${index} = ${
+                      entryLocalInitialValues.has(index)
+                        ? entryLocalInitialValues.get(index)
+                        : entryArgumentValue(index) || "undefined"};`),
+                  ...checkedLeafEntryArrayDeclarationsFor(inline),
+                  ...persistentStaticArrayDataDeclarations,
+                  ...(transactionalAcyclicShape
+                    ? transactionalFieldReadCacheInitializations : []),
+                  checkedLeafArrayDataGuardFor(inline),
+                  ...checkedLeafTripDeclarations,
+                  ...declarations,
+                  ...checkedLeafFramedTreeFor(inline),
+                ].filter(Boolean));
+              const capturedBody = capturedCheckedLeafBodyFor();
               capturedCheckedLeafDirectPositionalSource = [
                 "'use strict';",
                 restoringInitializationGuardDeclaration,
@@ -12009,6 +12023,45 @@ class JvmSsaBlockRenderer {
                 captures,
               };
             }
+            // The body a lexical caller inserts. It is assembled from the same
+            // fragments as the standalone entries under the caller's feeds
+            // and proofs; the caller binds the parameter and capture names by
+            // declaration around it and reads the result slot afterwards.
+            checkedLeafInlineBody = recursiveArrayPartitionLeaf ||
+              !checkedLeafDirectPositionalBody ? null : {
+                serial: compileSerial,
+                result: checkedLeafResultVariable,
+                label: checkedLeafBodyLabel,
+                returnsVoid: directMethodDescriptor.returnType === "void",
+                argumentNames: [...argumentNames],
+                captured: Boolean(capturedCheckedLeafDirectPositionalBody),
+                captureArguments: capturedCheckedLeafDirectPositionalBody
+                  ? [...capturedCheckedLeafCaptureArguments] : [],
+                assemble: ({ feeds, provenGuards, exitLabel }) => {
+                  const inline = { feeds, provenGuards };
+                  const body = capturedCheckedLeafDirectPositionalBody
+                    ? capturedCheckedLeafBodyFor(inline)
+                    : checkedLeafBodyFor({
+                      includeCallerOwnedChecks: true,
+                      includeRunCounter: false,
+                      tier: "ssa-inline-checked-leaf",
+                      inline,
+                    });
+                  if (!body) return null;
+                  // Exits precede the labeled tree as well as occur inside
+                  // it, so they leave through the caller's enclosing label.
+                  const retargeted = retargetCheckedLeafBails(body, {
+                    result: checkedLeafResultVariable,
+                    label: exitLabel,
+                    returnsVoid: directMethodDescriptor.returnType === "void",
+                  });
+                  // Every exit must have been routed to the result slot; an
+                  // unexpected return would leave the caller's activation.
+                  if (retargeted.lines.some((line) =>
+                    line.trim().startsWith("return "))) return null;
+                  return retargeted;
+                },
+              };
           }
         }
       }
@@ -12406,6 +12459,7 @@ class JvmSsaBlockRenderer {
         capturedCheckedLeafDirectPositionalSource;
       generated.jvmCapturedCheckedLeafDirectPositionalPlan =
         capturedCheckedLeafDirectPositionalPlan;
+      generated.jvmCheckedLeafInlineBody = checkedLeafInlineBody;
       // The region compiler also publishes an ordinary scalar module for
       // bounded invocations and differential tests. Keep the adaptive entry
       // available alongside it: callers of a continuation root need this
@@ -12477,7 +12531,7 @@ class JvmSsaBlockRenderer {
           site.directCheckedLeaf.captures.length > 0).length;
       generated.jvmStructuredLexicalCheckedLeafCallCount =
         [...callSites.values()].filter((site) =>
-          typeof site.directCheckedLeaf?.inlineSource === "string").length;
+          Boolean(site.directCheckedLeaf?.inlineBody)).length;
       generated.jvmStructuredLexicalVoidFastPathCallCount =
         lexicalVoidFastPathSites.size;
       generated.jvmStructuredLexicalCheckedLeafWrapper = Boolean(

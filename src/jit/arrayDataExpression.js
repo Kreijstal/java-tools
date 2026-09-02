@@ -17,30 +17,4 @@ function arrayDataExpression(operand) {
     `(Array.isArray(${text}) || ArrayBuffer.isView(${text}) ? ${text} : null))`;
 }
 
-const ENTRY_ARRAY_DATA_LINE = /^(\s*)const (ssaEntryArrayData\d+) = (.+);$/;
-
-// Recognizes a rendered positional entry-array line
-// (`const ssaEntryArrayDataN = <arrayData(argumentM)>;`) in either the helper
-// form or the inline form emitted by arrayDataExpression, so lexical inlining
-// can feed the caller's already-extracted operand instead of re-extracting.
-function matchEntryArrayDataLine(line) {
-  const match = ENTRY_ARRAY_DATA_LINE.exec(line);
-  if (!match) return null;
-  const expression = match[3];
-  let operand = null;
-  const helperForm = /^helpers\.arrayData\((argument\d+)\)$/.exec(expression);
-  if (helperForm) {
-    operand = helperForm[1];
-  } else {
-    const head = /^\((argument\d+) === null/.exec(expression);
-    if (head && expression === arrayDataExpression(head[1])) operand = head[1];
-  }
-  if (!operand) return null;
-  return {
-    indent: match[1],
-    variable: match[2],
-    argument: Number(operand.slice("argument".length)),
-  };
-}
-
-module.exports = { arrayDataExpression, matchEntryArrayDataLine };
+module.exports = { arrayDataExpression };

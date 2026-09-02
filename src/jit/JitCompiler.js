@@ -1,4 +1,5 @@
 const { arrayDataExpression } = require("./arrayDataExpression");
+const { inlineIntegerArgumentName } = require("./inlineIntegerNames");
 const Frame = require("../core/frame");
 const { ASYNC_METHOD_SENTINEL } = require("../core/constants");
 const { parseDescriptor } = require("../parsing/typeParser");
@@ -320,6 +321,7 @@ class JitCompiler {
     this.inlineIntegerRegionCache = new WeakMap();
     this.directInlineIntegerRegionCache = new WeakMap();
     this.inlineIntegerPlanCache = new WeakMap();
+    this.inlineIntegerPositionalPlanCache = new WeakMap();
     this.memoizedIntegralLeafCache = new WeakMap();
     this.memoizedIntegralLeavesEnabled =
       options.memoizedIntegralLeaves === true &&
@@ -8071,19 +8073,23 @@ class JitCompiler {
     return direct;
   }
 
-  getInlineIntegerPlan(method, params, returnType) {
-    if (this.inlineIntegerPlanCache.has(method)) {
-      return this.inlineIntegerPlanCache.get(method);
-    }
+  // The baseline emitter evaluates the plan against the live operand stack;
+  // a structured (positional) caller binds fixed parameter names to its own
+  // operands by declaration. Each form is rendered once per callee.
+  getInlineIntegerPlan(method, params, returnType, positional = false) {
+    const cache = positional
+      ? this.inlineIntegerPositionalPlanCache : this.inlineIntegerPlanCache;
+    if (cache.has(method)) return cache.get(method);
     if (returnType !== "int" || !params.every((type) => type === "int")) return null;
     const isStatic = (method.flags || []).includes("static");
     const receiverSlots = isStatic ? 0 : 1;
     const args = new Array(params.length + receiverSlots);
     for (let index = 0; index < args.length; index += 1) {
-      args[index] = `stack[base + ${index}]`;
+      args[index] = positional
+        ? inlineIntegerArgumentName(index) : `stack[base + ${index}]`;
     }
     const plan = this.buildInlineIntegerPlan(method, params, returnType, args);
-    this.inlineIntegerPlanCache.set(method, plan);
+    cache.set(method, plan);
     return plan;
   }
 
@@ -8455,7 +8461,7 @@ class JitCompiler {
     return { method, ...parsed };
   }
 
-  getCompileTimeIntegerLeaf(instruction) {
+  getCompileTimeIntegerLeaf(instruction, positional = false) {
     if (!instruction || !Array.isArray(instruction.arg) ||
         !Array.isArray(instruction.arg[2])) return null;
     const [, className, [methodName, descriptor]] = instruction.arg;
@@ -8465,7 +8471,8 @@ class JitCompiler {
     const method = this.jvm.findMethod(classData, methodName, descriptor);
     if (!method || !(method.flags || []).includes("static")) return null;
     const { params, returnType } = parseDescriptor(descriptor);
-    const plan = this.getInlineIntegerPlan(method, params, returnType);
+    const plan = this.getInlineIntegerPlan(
+      method, params, returnType, positional);
     if (!plan || plan.receiverSlots) return null;
     return {
       statements: plan.statements,
@@ -8494,9 +8501,6 @@ class JitCompiler {
       generated?.jvmCapturedCheckedLeafDirectPositionalBody;
     const capturedPlan =
       generated?.jvmCapturedCheckedLeafDirectPositionalPlan;
-    const capturedSource =
-      generated?.jvmCapturedCheckedLeafDirectPositionalSource;
-    const ordinarySource = generated?.jvmCheckedLeafDirectPositionalSource;
     const rawAdmissionPlan =
       generated?.jvmStructuredCheckedLeafAdmissionPlan;
     let admissionPlan = null;
@@ -8557,10 +8561,8 @@ class JitCompiler {
       paramCount: parsed.params.length,
       returnsVoid: parsed.returnType === "void",
       noThrow: true,
-      inlineSource: generated.jvmStructuredRecursiveArrayPartitionCheckedLeaf
-        ? null : typeof capturedBody === "function" &&
-        typeof capturedSource === "string" ? capturedSource :
-        typeof ordinarySource === "string" ? ordinarySource : null,
+      inlineBody: generated.jvmStructuredRecursiveArrayPartitionCheckedLeaf
+        ? null : generated.jvmCheckedLeafInlineBody || null,
       captures: typeof capturedBody === "function" &&
         Array.isArray(capturedPlan?.captures)
         ? capturedPlan.captures : [],
