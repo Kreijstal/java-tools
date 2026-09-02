@@ -265,7 +265,11 @@ function renderParts(parts) {
   let text = "";
   for (let index = 0; index < parts.length; index += 1) {
     const part = parts[index];
-    text += typeof part === "string" ? part : part.ref;
+    // A reference may render as something other than its name while a later
+    // stage still owns it: an array-range access token renders as
+    // `false /*token*/` until a proof replaces the whole reference by a guard.
+    text += typeof part === "string" ? part
+      : part.text !== undefined ? part.text : part.ref;
   }
   return text;
 }
@@ -1470,6 +1474,57 @@ class JvmSsaBlockRenderer {
       if (!existing) statementRecords.set(key, record);
       return text;
     };
+    // Indentation is applied by the assembler and is not part of a
+    // statement's identity; `recordOf` looks a rendered line up by that
+    // identity and `indentationOf` recovers the prefix to re-apply.
+    const indentationOf = (line) =>
+      line.slice(0, line.length - line.trimStart().length);
+    const recordOf = (line) => statementRecords.get(line.trim());
+    // Re-emit a recorded statement with some of its operand references
+    // replaced. This is the only way a pass may rewrite a statement: the
+    // operands are substituted in the parts list and the statement is
+    // rendered again through the same recording path, so the result carries
+    // the same kind and metadata as the original.
+    const substituteExpressionMeta = (value, replacements) => {
+      if (value instanceof Expr) {
+        return new Expr(substituteParts(value.parts, replacements));
+      }
+      if (Array.isArray(value)) {
+        return value.map((entry) =>
+          substituteExpressionMeta(entry, replacements));
+      }
+      if (typeof value === "string" && replacements.has(value)) {
+        const replacement = replacements.get(value);
+        return renderParts(replacement instanceof Expr
+          ? replacement.parts : replacement);
+      }
+      return value;
+    };
+    const rerenderStatement = (record, replacements) => {
+      const meta = {};
+      for (const key of Object.keys(record)) {
+        if (key === "key" || key === "parts" || key === "reads") continue;
+        meta[key] = substituteExpressionMeta(record[key], replacements);
+      }
+      if (record.exprParts) {
+        meta.exprParts = substituteParts(record.exprParts, replacements);
+      }
+      return recordStatement(
+        substituteParts(record.parts, replacements), meta);
+    };
+    // Replace operand references throughout a rendered line list.
+    const substituteInLines = (lines, replacements) => lines.map((line) => {
+      const record = recordOf(line);
+      if (!record || record.foreign) return line;
+      if (!partsReferences(record.parts)
+        .some((name) => replacements.has(name))) return line;
+      // `indentationOf` already covers the statement's own leading spaces,
+      // so the re-rendered statement contributes its trimmed identity.
+      return `${indentationOf(line)}${
+        rerenderStatement(record, replacements).trim()}`;
+    });
+    const spillStatement = () =>
+      recordStatement(["spillLocals();"], {kind: "spill"});
     // Generic statement: operand references are the interpolations the
     // registry recognizes; the rest of the template is opaque text.
     const st = (strings, ...values) =>
@@ -2612,7 +2667,7 @@ class JvmSsaBlockRenderer {
       lastMaterializeWasUnwindCompact = false;
       if (!this.materializeOutliningEnabled) {
         return [
-          st`spillLocals();`,
+          spillStatement(),
           ...operandValues.map((expression, index) =>
             stmt(e`stack[${index}] = ${expression};`, {kind: "spillStack"})),
           st`stack.length = ${operandValues.length};`,
@@ -2673,7 +2728,8 @@ class JvmSsaBlockRenderer {
       st`}`,
     ];
     const stageOperandLines = (operandValues) => [
-      st`if (frame === null) spillLocals();`,
+      recordStatement(["if (frame === null) spillLocals();"],
+        {kind: "conditionalSpill"}),
       ...operandValues.map((expression, i) =>
         stmt(e`stack[${i}] = ${expression};`, {kind: "spillStack"})),
       st`stack.length = ${operandValues.length};`,
@@ -3877,7 +3933,8 @@ class JvmSsaBlockRenderer {
           else {
             const array = stagedValue(arrayInput, lines);
             const out = value();
-            lines.push(st`if (${array} === null || ${array} === undefined) {`,
+            lines.push(stmt(e`if (${array} === null || ${array} === undefined) {`,
+              {kind: "nullCheck", value: array}),
               ...materializeLines([...stack, array], index, true).map((line) => `  ${line}`),
               st`  helpers.arrayLength(${array}, frame);`, st`}`,
               constDecl(out, e`${array}.length`, {pure: true}));
@@ -4238,13 +4295,15 @@ class JvmSsaBlockRenderer {
                 if (cache.isArray && cache.data) {
                   eagerFieldReceiverNullChecks.set(object, cache.data);
                 }
-                lines.push(st`if (${object} === null || ${object} === undefined) {`,
+                lines.push(stmt(e`if (${object} === null || ${object} === undefined) {`,
+              {kind: "nullCheck", value: object}),
                   ...materializeLines([...stack, object], index, true).map((line) => `  ${line}`),
                   st`  helpers.getFieldAt(${site}, ${object});`, st`}`);
               }
               lines.push(constDecl(out, e`${cache.value}`, {pure: true}));
             } else {
-              lines.push(st`if (${object} === null || ${object} === undefined) {`,
+              lines.push(stmt(e`if (${object} === null || ${object} === undefined) {`,
+              {kind: "nullCheck", value: object}),
                 ...materializeLines([...stack, object], index, true).map((line) => `  ${line}`),
                 st`  helpers.getFieldAt(${site}, ${object});`, st`}`);
             }
@@ -4303,7 +4362,8 @@ class JvmSsaBlockRenderer {
             const object = stagedValue(objectInput, lines);
             const stored = stagedValue(storedInput, lines);
             lines.push(
-              st`if (${object} === null || ${object} === undefined) {`,
+              stmt(e`if (${object} === null || ${object} === undefined) {`,
+              {kind: "nullCheck", value: object}),
               ...materializeLines([...stack, object, stored], index, true).map((line) => `  ${line}`),
               st`  helpers.putFieldAt(${site}, ${object}, ${stored});`, st`}`,
               ...(Number.isInteger(denseSlot) ? [
@@ -5269,7 +5329,8 @@ class JvmSsaBlockRenderer {
               checkedLeaf: [st`    return helpers.asyncInvokeSentinel();`],
             });
             lines.push(
-              st`/*__JVM_LEFT_ACTIVE_CHILD_WITHDRAW_${index}_${site.id}__*/`,
+              stmt(e`/*__JVM_LEFT_ACTIVE_CHILD_WITHDRAW_${index}_${site.id}__*/`,
+                {kind: "leftActiveChildWithdraw", pc: index}),
               st`if (thread.callStack.items.length > ${callStackDepth}) {`,
               ...materializeOmittedCallerForChild("  "),
               st`}`,
@@ -5298,7 +5359,8 @@ class JvmSsaBlockRenderer {
             });
             lines.push(st`if (thread.status !== 'runnable') {`,
               st`${yieldedCallMarker}`, st`}`);
-            lines.push(st`/*${site.regionMarkers.end}*/`);
+            lines.push(stmt(e`/*${site.regionMarkers.end}*/`,
+              {kind: "regionCallEnd", pc: index}));
             if (inlineCheckedLeafVoidFastPath) lines.push(st`}`);
             if (checkedAdmissionEnd) lines.push(checkedAdmissionEnd);
             if (site.selfRecursive) {
@@ -7957,8 +8019,8 @@ class JvmSsaBlockRenderer {
             !compactingCursorRelation(fact, access)) continue;
         for (const candidatePlan of plans) {
           if (!candidatePlan?.lines) continue;
-          candidatePlan.lines = candidatePlan.lines.map((line) =>
-            line.split(access.marker).join(fact.guardVariable));
+          candidatePlan.lines = substituteInLines(candidatePlan.lines,
+            new Map([[access.marker, [{ref: fact.guardVariable}]]]));
         }
         access.structuralGuard = fact.guardVariable;
         if (access.rangeCandidate) {
@@ -8368,29 +8430,28 @@ class JvmSsaBlockRenderer {
           minimumOffset < -2147483648 || maximumOffset > 2147483647) {
         continue;
       }
-      const variable = `ssaBlockArrayRangeGuard${
-        blockCoalescedArrayRangeAccessCount}`;
+      const variable = named(`ssaBlockArrayRangeGuard${
+        blockCoalescedArrayRangeAccessCount}`);
       let applied = false;
       for (const candidatePlan of plans) {
         if (!candidatePlan?.lines) continue;
         const markerIndexes = group.map((access) =>
           candidatePlan.lines.findIndex((line) =>
-            line.includes(access.marker)));
+            partsReferences(recordOf(line)?.parts || [])
+              .includes(access.marker)));
         if (markerIndexes.some((lineIndex) => lineIndex < 0)) continue;
         const declarationIndex = Math.min(...markerIndexes);
         const base = first.indexAffine.baseExpression;
-        const minimum = `(((${base}) + ${minimumOffset}) | 0)`;
-        const maximum = `(((${base}) + ${maximumOffset}) | 0)`;
+        const minimum = e`(((${base}) + ${minimumOffset}) | 0)`;
+        const maximum = e`(((${base}) + ${maximumOffset}) | 0)`;
         candidatePlan.lines.splice(declarationIndex, 0,
-          `const ${variable} = (${minimum} >= 0 && ${maximum} >= ` +
-            `${minimum} && ${maximum} < ${first.arrayData}.length);`);
-        candidatePlan.lines = candidatePlan.lines.map((line) => {
-          let rewritten = line;
-          for (const access of group) {
-            rewritten = rewritten.split(access.marker).join(variable);
-          }
-          return rewritten;
-        });
+          constDecl(variable, exprConcat(
+            e`(${minimum} >= 0 && ${maximum} >= `,
+            e`${minimum} && ${maximum} < ${first.arrayData}.length)`),
+          {pure: true}));
+        candidatePlan.lines = substituteInLines(candidatePlan.lines,
+          new Map(group.map((access) =>
+            [access.marker, [{ref: variable}]])));
         applied = true;
       }
       if (applied) {
@@ -8398,12 +8459,16 @@ class JvmSsaBlockRenderer {
       }
     }
     for (const candidate of primitiveArrayAccessCandidates) {
+      // An access with a structural guard keeps its token: it renders as
+      // `false` for now, and a later proof replaces the whole reference with
+      // its guard variable.
       const fallback = candidate.structuralGuard
-        ? `false /*${candidate.marker}*/` : "false";
+        ? [{ref: candidate.marker, text: `false /*${candidate.marker}*/`}]
+        : ["false"];
       for (const plan of plans) {
         if (!plan?.lines) continue;
-        plan.lines = plan.lines.map((line) =>
-          line.split(candidate.marker).join(fallback));
+        plan.lines = substituteInLines(plan.lines,
+          new Map([[candidate.marker, fallback]]));
       }
     }
     // A fully verified, call-free counted kernel has a finite upper bound and
@@ -9040,7 +9105,7 @@ class JvmSsaBlockRenderer {
           // canonical Frame spill/pop/result protocol below.
           lines.push(st`if (framelessEntry) {`);
           if (method.jvmStructuredRegionSpillOnReturn) {
-            lines.push(st`  spillLocals();`);
+            lines.push(`  ${spillStatement()}`);
           }
           lines.push(plan.returnKind === "void"
             ? st`  return helpers.returnVoid();`
@@ -9054,7 +9119,7 @@ class JvmSsaBlockRenderer {
           lines.push(st`  helpers.skipJitOnce(frame);`);
           lines.push(st`  return { deopt: true, transient: true, reason: 'structured SSA return with active child' };`);
           lines.push(st`}`);
-          lines.push(st`spillLocals();`);
+          lines.push(spillStatement());
           lines.push(st`stack.length = 0;`);
           lines.push(st`frame.pc = ${items.length};`);
           lines.push(st`thread.callStack.pop();`);
@@ -9208,7 +9273,7 @@ class JvmSsaBlockRenderer {
           // restoration in the node, but charge/yield at the root boundary.
           st`if (${directPositional ? "nestedEntryGuarded === 2 || " : ""}helpers.continueStructuredQuantum(thread)) { safePointBudget = ${currentLoopSafePointBudget}; } else {`,
           ...indent([
-            st`spillLocals();`,
+            spillStatement(),
             ...restoreLines,
             st`helpers.structuredSsa.safePointCount += 1;`,
             ...(continuationMode ? [
@@ -9326,7 +9391,7 @@ class JvmSsaBlockRenderer {
             ...prefix,
             st`if (nestedEntryGuarded !== 2 && !${runtimeCoarse.variable}) {`,
             ...indent([
-              st`spillLocals();`,
+              spillStatement(),
               ...restoreLines,
               st`helpers.skipJitOnce(frame);`,
               stmt(exprConcat(e`return { deopt: true, transient: true, `,
@@ -9420,7 +9485,7 @@ class JvmSsaBlockRenderer {
               ...prefix,
               st`if (!(${fastLoopCondition})) {`,
               ...indent([
-                st`spillLocals();`,
+                spillStatement(),
                 ...restoreLines,
                 st`helpers.skipJitOnce(frame);`,
                 stmt(exprConcat(e`return { deopt: true, transient: true, `,
@@ -10352,21 +10417,18 @@ class JvmSsaBlockRenderer {
     ];
     const inlineMaterializeCalls = (lines) =>
       lines.flatMap((line) => {
-        if (/^\s*ssaMaterializeUnwindRelease\(\);$/.test(line)) return [];
-        const match =
-          /^(\s*)ssaMaterialize(?:Unwind)?(\d+)\((.*)\);$/.exec(line);
-        if (!match) return [line];
-        const prefix = match[1];
-        const depth = Number(match[2]);
-        const values = match[3].split(",").map((value) => value.trim());
-        if (values.length !== depth + 1) return [line];
-        const [pc, ...operands] = values;
+        const record = recordOf(line);
+        if (record?.kind === "materializeRelease") return [];
+        if (record?.kind !== "materialize") return [line];
+        const prefix = indentationOf(line);
         return [
-          `${prefix}spillLocals();`,
-          ...operands.map((operand, index) =>
-            `${prefix}stack[${index}] = ${operand};`),
-          `${prefix}stack.length = ${depth};`,
-          `${prefix}helpers.materialize(frame, locals, stack, ${pc});`,
+          `${prefix}${spillStatement()}`,
+          ...record.operands.map((operandExpression, index) =>
+            `${prefix}${stmt(e`stack[${index}] = ${operandExpression};`,
+              {kind: "spillStack"})}`),
+          `${prefix}${st`stack.length = ${record.operands.length};`}`,
+          `${prefix}${st`helpers.materialize(frame, locals, stack, ${
+            record.pc});`}`,
         ];
       });
     const eliminatedCheckedLeafLocalSlots = new Set();
@@ -11155,36 +11217,40 @@ class JvmSsaBlockRenderer {
             "return helpers.asyncInvokeSentinel(); }"
           : null;
         const initializeFrame = [
-          "frame = plan.target.freeFrame || new plan.Frame(plan.method);",
-          "plan.target.freeFrame = null;",
-          "if (plan.clearStructuredContinuation) plan.clearStructuredContinuation(frame);",
-          "frame.pc = 0;",
-          "frame.stack.items.length = 0;",
-          "delete frame.jitSkipOnce;",
-          "delete frame.jitJsDisabled;",
-          "delete frame.jitAdaptiveEntryCounted;",
-          "frame.className = plan.lookupClass;",
-          "locals = frame.locals;",
-          "stack = frame.stack.items;",
+          st`frame = plan.target.freeFrame || new plan.Frame(plan.method);`,
+          st`plan.target.freeFrame = null;`,
+          st`if (plan.clearStructuredContinuation) plan.clearStructuredContinuation(frame);`,
+          st`frame.pc = 0;`,
+          st`frame.stack.items.length = 0;`,
+          st`delete frame.jitSkipOnce;`,
+          st`delete frame.jitJsDisabled;`,
+          st`delete frame.jitAdaptiveEntryCounted;`,
+          st`frame.className = plan.lookupClass;`,
+          st`locals = frame.locals;`,
+          st`stack = frame.stack.items;`,
           ...[...entryArguments].map(([index]) =>
-            `locals[${index}] = ${entryArgumentValue(index)};`),
+            stmt(e`locals[${index}] = ${entryArgumentValue(index)};`,
+              {kind: "spillLocal", slot: index})),
         ];
         const restoringSpillLines = [
-          "if (frame === null) {",
+          st`if (frame === null) {`,
           ...initializeFrame.map((line) => `  ${line}`),
-          "}",
-          ...spillSlots.map((index) => `locals[${index}] = ${
+          st`}`,
+          ...spillSlots.map((index) => stmt(e`locals[${index}] = ${
             immutableEntryLocals.has(index)
-              ? entryLocalInitialValues.get(index) : `local${index}`};`),
-          "plan.restoreFrame(thread, frame, restorationDepth);",
+              ? entryLocalInitialValues.get(index) : localName(index)};`,
+          {kind: "spillLocal", slot: index})),
+          st`plan.restoreFrame(thread, frame, restorationDepth);`,
         ];
         const restoringRendered = expandContinuationFallbacks(
           render(structured.tree, false, true,
             restoringDirectSafePointBudget, false, true), false);
         restoringSpillCallCount = restoringRendered.reduce(
-          (count, line) => count +
-            (/spillLocals\(\);$/.test(line) ||
-             /^\s*ssaMaterialize(?:Unwind)?\d+\(.*\);$/.test(line) ? 1 : 0), 0);
+          (count, line) => {
+            const kind = recordOf(line)?.kind;
+            return count + (kind === "spill" || kind === "conditionalSpill" ||
+              kind === "materialize" ? 1 : 0);
+          }, 0);
         // Outlining a spill helper makes every scalar local escape into its
         // closure context, including successful loop iterations that never
         // reconstruct a Frame. Duplicate the cold restoration statements
@@ -11234,84 +11300,76 @@ class JvmSsaBlockRenderer {
         const restoringFrameLayoutId = captureFreeRestoringSpills
           ? this.restoringFrameLayouts.push(restoringFrameSlots) - 1 : -1;
         const restoreCaptureFreeFrame = (indentation) => [
-          `${indentation}[frame, locals, stack] = ` +
-            `helpers.structuredSsa.restoreDirectFrame(` +
-            `${restoringFrameLayoutId}, plan, thread, restorationDepth, ` +
-            `frame, [${restoringFrameValues.join(", ")}]);`,
+          `${indentation}${stmt(exprConcat(
+            e`[frame, locals, stack] = `,
+            e`helpers.structuredSsa.restoreDirectFrame(`,
+            e`${restoringFrameLayoutId}, plan, thread, restorationDepth, `,
+            e`frame, [`, argumentListExpression(restoringFrameValues),
+            e`]);`))}`,
         ];
         const inlineRestoringSpillCalls = (lines) =>
           !(inlinedRestoringSpills || outlinedCaptureFreeRestoringSpills)
             ? lines : lines.flatMap((line) => {
-            const conditional = /^(\s*)if \(frame === null\) spillLocals\(\);$/.exec(line);
-            if (conditional) {
+            const record = recordOf(line);
+            const prefix = indentationOf(line);
+            if (record?.kind === "conditionalSpill") {
               if (captureFreeRestoringSpills) {
                 return [
-                  `${conditional[1]}if (frame === null) {`,
-                  ...restoreCaptureFreeFrame(`${conditional[1]}  `),
-                  `${conditional[1]}}`,
+                  `${prefix}${st`if (frame === null) {`}`,
+                  ...restoreCaptureFreeFrame(`${prefix}  `),
+                  `${prefix}${st`}`}`,
                 ];
               }
               return [
-                `${conditional[1]}if (frame === null) {`,
+                `${prefix}${st`if (frame === null) {`}`,
                 ...restoringSpillLines.map(
-                  (spill) => `${conditional[1]}  ${spill}`),
-                `${conditional[1]}}`,
+                  (spill) => `${prefix}  ${spill}`),
+                `${prefix}${st`}`}`,
               ];
             }
-            const match = /^(\s*)spillLocals\(\);$/.exec(line);
-            if (!match) return [line];
+            if (record?.kind !== "spill") return [line];
             if (captureFreeRestoringSpills) {
-              return restoreCaptureFreeFrame(match[1]);
+              return restoreCaptureFreeFrame(prefix);
             }
-            return restoringSpillLines.map((spill) => `${match[1]}${spill}`);
+            return restoringSpillLines.map((spill) => `${prefix}${spill}`);
           });
         let restoringRenderedTree = inlineRestoringSpillCalls(
           restoringRenderedWithSpills);
         if (captureFreeRestoringSpills) {
           restoringRenderedTree = restoringRenderedTree.flatMap((line) => {
-            const releaseMatch =
-              /^(\s*)ssaMaterializeUnwindRelease\(\);$/.exec(line);
-            if (releaseMatch) {
+            const record = recordOf(line);
+            const prefix = indentationOf(line);
+            if (record?.kind === "materializeRelease") {
               return [
-                `${releaseMatch[1]}frame = ` +
-                  "helpers.structuredSsa.releaseUnwindFrame(" +
-                  "plan, thread, frame);",
-                `${releaseMatch[1]}locals = null;`,
-                `${releaseMatch[1]}stack = null;`,
+                `${prefix}${stmt(exprConcat(e`frame = `,
+                  e`helpers.structuredSsa.releaseUnwindFrame(`,
+                  e`plan, thread, frame);`))}`,
+                `${prefix}${st`locals = null;`}`,
+                `${prefix}${st`stack = null;`}`,
               ];
             }
-            const unwindMatch =
-              /^(\s*)ssaMaterializeUnwind(\d+)\((.*)\);$/.exec(line);
-            if (unwindMatch) {
-              const depth = Number(unwindMatch[2]);
-              const values = unwindMatch[3].split(",")
-                .map((value) => value.trim());
-              if (values.length !== depth + 1) return [line];
-              const [pc, ...operands] = values;
+            if (record?.kind !== "materialize") return [line];
+            if (record.unwind) {
               return [
-                `${unwindMatch[1]}[frame, locals, stack] = ` +
-                  "helpers.structuredSsa.materializeUnwindFrame(" +
-                  "plan, thread, restorationDepth, " +
-                  `frame, ${pc}, [${operands.join(", ")}]);`,
+                `${prefix}${stmt(exprConcat(
+                  e`[frame, locals, stack] = `,
+                  e`helpers.structuredSsa.materializeUnwindFrame(`,
+                  e`plan, thread, restorationDepth, `,
+                  e`frame, ${record.pc}, [`,
+                  argumentListExpression(record.operands), e`]);`))}`,
               ];
             }
-            const match = /^(\s*)ssaMaterialize(\d+)\((.*)\);$/.exec(line);
-            if (!match) return [line];
-            const depth = Number(match[2]);
-            const values = match[3].split(",").map((value) => value.trim());
-            if (values.length !== depth + 1) return [line];
-            const [pc, ...operands] = values;
-            const numericPc = Number(pc);
-            const frameValues = Number.isInteger(numericPc)
-              ? restoringFrameValuesAt(numericPc)
+            const frameValues = Number.isInteger(record.pc)
+              ? restoringFrameValuesAt(record.pc)
               : restoringFrameValues;
-            const indentation = match[1];
             return [
-              `${indentation}[frame, locals, stack] = ` +
-                `helpers.structuredSsa.materializeDirectFrame(` +
-                `${restoringFrameLayoutId}, plan, thread, restorationDepth, ` +
-                `frame, [${frameValues.join(", ")}], ${pc}, ` +
-                `[${operands.join(", ")}]);`,
+              `${prefix}${stmt(exprConcat(
+                e`[frame, locals, stack] = `,
+                e`helpers.structuredSsa.materializeDirectFrame(`,
+                e`${restoringFrameLayoutId}, plan, thread, restorationDepth, `,
+                e`frame, [`, argumentListExpression(frameValues),
+                e`], ${record.pc}, `,
+                e`[`, argumentListExpression(record.operands), e`]);`))}`,
             ];
           });
         }
@@ -11319,11 +11377,10 @@ class JvmSsaBlockRenderer {
           restoringRenderedTree = (() => {
             const lines = [...restoringRenderedTree];
             for (let index = 0; index < lines.length; index += 1) {
-              const opening = /^([\s]*)if \((ssaValue\d+) === null \|\| (ssaValue\d+) === undefined\) \{$/.exec(
-                lines[index]);
-              if (!opening || opening[2] !== opening[3]) continue;
-              const slot = entryReferenceLoads.get(opening[2]) ??
-                localLoads.get(opening[2]);
+              const record = recordOf(lines[index]);
+              if (record?.kind !== "nullCheck") continue;
+              const slot = entryReferenceLoads.get(record.value) ??
+                localLoads.get(record.value);
               if (!restoringDirectFieldLayoutSlots.has(slot)) continue;
               let depth = 1;
               let close = index + 1;
@@ -11360,21 +11417,21 @@ class JvmSsaBlockRenderer {
         // deopts. Withdrawing twice is a no-op: the second is behind the same
         // `frame !== null`.
         const withdrawRestoredFrame = (indent) => [
-          `${indent}if (frame !== null) {`,
-          `${indent}  frame = helpers.structuredSsa` +
-            ".releaseUnwindFrame(plan, thread, frame);",
-          `${indent}  locals = null;`,
-          `${indent}  stack = null;`,
-          `${indent}}`,
+          `${indent}${st`if (frame !== null) {`}`,
+          `${indent}  ${stmt(exprConcat(e`frame = helpers.structuredSsa`,
+            e`.releaseUnwindFrame(plan, thread, frame);`))}`,
+          `${indent}  ${st`locals = null;`}`,
+          `${indent}  ${st`stack = null;`}`,
+          `${indent}${st`}`}`,
         ];
         restoringRenderedTree = restoringRenderedTree.flatMap((line) => {
-          const endMarker =
-            /^(\s*)\/\*__JVM_REGION_CALL_END_\d+__\*\/$/.exec(line);
-          if (endMarker) return [line, ...withdrawRestoredFrame(endMarker[1])];
-          const withdrawMarker =
-            /^(\s*)\/\*__JVM_LEFT_ACTIVE_CHILD_WITHDRAW_\d+_[^*]*__\*\/$/
-              .exec(line);
-          if (withdrawMarker) return withdrawRestoredFrame(withdrawMarker[1]);
+          const kind = recordOf(line)?.kind;
+          if (kind === "regionCallEnd") {
+            return [line, ...withdrawRestoredFrame(indentationOf(line))];
+          }
+          if (kind === "leftActiveChildWithdraw") {
+            return withdrawRestoredFrame(indentationOf(line));
+          }
           return [line];
         });
         restoringRenderedTree = compactCheckedLeafLines(
@@ -11745,34 +11802,27 @@ class JvmSsaBlockRenderer {
             // so every later pass sees a complete statement list and the
             // same lines serve the standalone entry and a lexical insertion.
             checkedLeafRenderedTree = [
-              `${checkedLeafBodyLabel}: {`,
+              recordStatement([`${checkedLeafBodyLabel}: {`],
+                {kind: "blockLabel", label: checkedLeafBodyLabel}),
               ...checkedLeafRenderedTree,
-              "}",
+              st`}`,
             ];
           }
           if (shrinkingArrayWindowLeaf) {
             const guard = shrinkingArrayWindowLeaf.variable;
-            checkedLeafRenderedTree = checkedLeafRenderedTree.map((line) => {
-              let rewritten = line;
-              for (const access of shrinkingArrayWindowLeaf.accesses) {
-                rewritten = rewritten.split(
-                  `false /*${access.marker}*/`).join(guard);
-              }
-              return rewritten;
-            });
+            checkedLeafRenderedTree = substituteInLines(
+              checkedLeafRenderedTree,
+              new Map(shrinkingArrayWindowLeaf.accesses.map((access) =>
+                [access.marker, [{ref: guard}]])));
             checkedLeafRenderedTree = specializeArrayRangeGuardedStores(
               checkedLeafRenderedTree, [guard]);
           }
           if (recursiveArrayPartitionLeaf) {
             const guard = recursiveArrayPartitionLeaf.variable;
-            checkedLeafRenderedTree = checkedLeafRenderedTree.map((line) => {
-              let rewritten = line;
-              for (const access of recursiveArrayPartitionLeaf.accesses) {
-                rewritten = rewritten.split(
-                  `false /*${access.marker}*/`).join(guard);
-              }
-              return rewritten;
-            });
+            checkedLeafRenderedTree = substituteInLines(
+              checkedLeafRenderedTree,
+              new Map(recursiveArrayPartitionLeaf.accesses.map((access) =>
+                [access.marker, [{ref: guard}]])));
             checkedLeafRenderedTree = specializeArrayRangeGuardedStores(
               checkedLeafRenderedTree, [guard]);
           }
