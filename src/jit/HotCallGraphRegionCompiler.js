@@ -518,18 +518,212 @@ function variantNameOfSource(generated, source) {
   return null;
 }
 
+// `const plan = <planName>;` is a statement the region compiler emits in
+// front of a restoring body it inlines, so it states its own facts.
+function restoringInlinePlanStatement(planName) {
+  return ownStatement(`const plan = ${planName};`,
+    {kind: "const", def: "plan"});
+}
+
+/**
+ * One published insertion statement, retargeted onto the names a call site
+ * chose for this insertion.
+ *
+ * The text is produced the way the renderer's own assembler produces it: the
+ * two compiler-owned tokens the callee's exits carry -- both of which spell
+ * the callee's compile serial and occur nowhere else -- are expanded by exact
+ * identity. Everything else is a substitution over the record the emitter
+ * published: operand references, the label a jump names, and the parts a
+ * statement's exit or jump splits into.
+ *
+ * A label part loses its operand identity here. A label names a statement,
+ * not a value, so a relocated statement must never receive one as a helper
+ * parameter; the renderer keeps the operand identity because a compile-minted
+ * label is also a name its generated scope carries, and that is exactly what
+ * would make a partition helper take `jvmRegionInline7_3_return` as an
+ * argument the call site cannot supply.
+ */
+function retargetInsertionStatement(statement, indent, tokens) {
+  const {resultToken, resultName, labelToken, exitLabel} = tokens;
+  const labelNames = new Set();
+  const renameLabel = (label) => label === labelToken ? exitLabel : label;
+  const renameName = (name) => name === resultToken ? resultName : name;
+  const retargetParts = (parts) => {
+    if (!Array.isArray(parts)) return parts;
+    let changed = false;
+    const out = [];
+    for (const part of parts) {
+      if (typeof part === "string") { out.push(part); continue; }
+      if (part.label !== undefined) {
+        const label = renameLabel(part.label);
+        labelNames.add(label);
+        if (label !== part.label || part.ref !== undefined) changed = true;
+        out.push({label});
+        continue;
+      }
+      if (part.ref === resultToken) {
+        changed = true;
+        out.push({...part, ref: resultName});
+        continue;
+      }
+      out.push(part);
+    }
+    return changed ? out : parts;
+  };
+  const parts = retargetParts(statement.parts);
+  const jump = statement.jump ? {
+    kind: statement.jump.kind,
+    label: statement.jump.label ? renameLabel(statement.jump.label) : null,
+    before: retargetParts(statement.jump.before),
+    after: retargetParts(statement.jump.after),
+  } : null;
+  const exit = statement.exit ? {
+    before: retargetParts(statement.exit.before),
+    value: statement.exit.value
+      ? retargetParts(statement.exit.value) : statement.exit.value,
+    after: retargetParts(statement.exit.after),
+  } : null;
+  return {
+    ...statement,
+    text: `${indent}${statement.text.split(resultToken).join(resultName)
+      .split(labelToken).join(exitLabel)}`,
+    indent: `${indent}${statement.indent}`,
+    parts,
+    def: statement.def ? renameName(statement.def) : statement.def,
+    write: statement.write ? renameName(statement.write) : statement.write,
+    writes: (statement.writes || []).map(renameName),
+    reads: statement.reads === null ? null : statement.reads
+      .map(renameName).filter((name) => !labelNames.has(name)),
+    declares: statement.declares
+      ? statement.declares.map(renameName) : statement.declares,
+    label: statement.label ? renameLabel(statement.label) : statement.label,
+    jump,
+    exit,
+  };
+}
+
+/**
+ * The statement records behind one assembled insertion.
+ *
+ * The scaffold -- the result declaration, the argument staging, the labeled
+ * block and the declarations that bind the callee's parameters and entry
+ * guard inside it -- is emitted by this compiler, so it states its own facts.
+ * The body is the callee's own published records, retargeted and indented the
+ * way the assembler indents its text.
+ *
+ * The argument staging declarations are the one opaque part. An operand comes
+ * out of the caller's emitted call, where the renderer's own line passes may
+ * have rewritten it, so the region compiler never learned which names it
+ * mentions; a run that would contain one is declined, while everything the
+ * insertion introduces around it stays a record.
+ */
+function insertionStatements(insertion, options) {
+  const bodyStatements = options.statements;
+  if (!Array.isArray(bodyStatements) || !bodyStatements.length) return null;
+  const {argumentValues, resultName, exitLabel, namespace} = options;
+  const tokens = {
+    resultToken: insertion.resultToken, resultName,
+    labelToken: insertion.labelToken, exitLabel,
+  };
+  const out = [];
+  if (options.declareResult !== false) {
+    out.push(ownStatement(`let ${resultName};`,
+      {kind: "letUninitialized", def: resultName}));
+  }
+  argumentValues.forEach((value, index) => {
+    out.push(ownStatement(`const ${namespace}a${index} = ${value};`,
+      {kind: "const", def: `${namespace}a${index}`,
+        reads: null, relocatable: false}));
+  });
+  out.push(ownStatement(`${exitLabel}: {`,
+    {delta: 1, opens: "block", label: exitLabel}));
+  insertion.argumentNames.forEach((name, index) => {
+    out.push(ownStatement(`  const ${name} = ${namespace}a${index};`,
+      {kind: "const", def: name, reads: [`${namespace}a${index}`]}));
+  });
+  out.push(ownStatement(
+    `  const ${insertion.entryGuardName} = ${insertion.entryGuardValue};`,
+    {kind: "const", def: insertion.entryGuardName}));
+  for (const statement of bodyStatements) {
+    out.push(retargetInsertionStatement(statement, "  ", tokens));
+  }
+  out.push(ownStatement("}", {kind: "blockEnd", delta: -1}));
+  return out;
+}
+
+/**
+ * Assemble one published insertion at a call site, as both the text the
+ * caller splices in and the statement records behind that text.
+ *
+ * The text *is* the renderer's own `assemble` call, so a module composed
+ * through this function is byte-identical to one composed before it existed.
+ * The records are returned only when their joined text reproduces that body
+ * exactly; a body whose records cannot is spliced as one opaque record, which
+ * is what every insertion was before.
+ */
+function assembleInsertion(insertion, options) {
+  const source = insertion.assemble(options);
+  if (typeof source !== "string") return null;
+  const statements = insertionStatements(insertion, options);
+  return {
+    source,
+    statements: statements &&
+      statements.map((statement) => statement.text).join("\n") === source
+      ? statements : null,
+  };
+}
+
+/**
+ * The records an edit contributes in place of the statements it replaced.
+ *
+ * An edit that carries its own records replaces whole statements: it starts
+ * where the first one's text starts -- the assembler owns the indentation in
+ * front of it, which is why the edit does not span it -- and ends where the
+ * last one ends. The first spliced record inherits that indentation, exactly
+ * as the text splice leaves it in front of the replacement. Returns null when
+ * any of that does not hold, and the caller falls back to one opaque record.
+ */
+function spliceEditStatements(edit, statements, first, last, starts, endOf) {
+  if (!Array.isArray(edit.statements) || !edit.statements.length) return null;
+  const head = statements[first];
+  if (edit.start !== starts[first] + head.indent.length) return null;
+  if (edit.end !== endOf(last)) return null;
+  let replacedDelta = 0;
+  for (let index = first; index <= last; index += 1) {
+    replacedDelta += statements[index].delta;
+  }
+  let splicedDelta = 0;
+  for (const statement of edit.statements) splicedDelta += statement.delta;
+  if (replacedDelta !== splicedDelta) return null;
+  const [firstStatement, ...rest] = edit.statements;
+  return [{
+    ...firstStatement,
+    text: `${head.indent}${firstStatement.text}`,
+    indent: `${head.indent}${firstStatement.indent}`,
+  }, ...rest];
+}
+
 /**
  * Keep a body's statement records in step with the edits that lowered its
  * call sites.
  *
  * `rewriteCallBindings` links a node by splicing text it built itself into
  * spans the renderer delimited with compiler-owned markers. The same edits
- * are applied here to the statement list: a statement an edit rewrote, and
- * every statement a multi-line edit spanned, become one opaque record whose
- * names are unknown, so no later pass relocates it or anything containing
- * it. An edit that deletes a statement outright -- an eliminated call binding
- * or a dropped run counter -- leaves an empty record instead, which is exactly
- * as relocatable as the blank line it emits.
+ * are applied here to the statement list.
+ *
+ * An edit that composed a callee's body into the caller carries the records
+ * behind the text it produced, and those are spliced in place of the
+ * statements the call span occupied: a composed body is therefore a flat
+ * sequence of real records, and the structural passes see inside it. Nested
+ * insertions come out flat too, because a composed callee's own records were
+ * spliced the same way before it was inserted.
+ *
+ * Every other edit -- a binding declaration replaced or dropped, a run
+ * counter removed, a call lowered to text this compiler wrote -- still merges
+ * the statements it touched into one opaque record whose names are unknown,
+ * so no later pass relocates it or anything containing it. An edit that
+ * deletes a statement outright leaves an empty record instead, which is
+ * exactly as relocatable as the blank line it emits.
  *
  * A merged record keeps the nesting delta of the statements it replaced: a
  * lowered call span and its replacement are both complete constructs. If that
@@ -576,8 +770,11 @@ function applyRegionStatementEdits(statements, edits, rewrittenSource) {
     if (previous && previous.last >= first) {
       previous.last = Math.max(previous.last, last);
       previous.growth += growth;
+      // Two edits landed in one span of statements, so neither one's records
+      // describe the whole span: the merged block stays opaque.
+      previous.edit = null;
     } else {
-      blocks.push({first, last, shift, growth});
+      blocks.push({first, last, shift, growth, edit});
     }
     shift += growth;
   }
@@ -589,6 +786,18 @@ function applyRegionStatementEdits(statements, edits, rewrittenSource) {
     const to = endOf(block.last) + block.shift + block.growth;
     if (from < 0 || to < from || to > rewrittenSource.length) return null;
     const text = rewrittenSource.slice(from, to);
+    const spliced = block.edit ? spliceEditStatements(
+      block.edit, statements, block.first, block.last, starts, endOf) : null;
+    // The spliced records have to reproduce the text this edit actually
+    // produced. They do by construction -- the assembler checked it -- and
+    // checking it again here is what keeps the record list and the source the
+    // same body rather than two that merely started out equal.
+    if (spliced &&
+        spliced.map((statement) => statement.text).join("\n") === text) {
+      for (const statement of spliced) output.push(statement);
+      index = block.last + 1;
+      continue;
+    }
     let delta = 0;
     for (let entry = block.first; entry <= block.last; entry += 1) {
       delta += statements[entry].delta;
@@ -2108,16 +2317,21 @@ class HotCallGraphRegionCompiler {
       // composed callee brings with it at the same call pc.
       const namespace = insertion
         ? `jvmRegionInline${edge.pc}_${insertion.serial}_` : null;
-      const insertBody = (declareResult) => insertion?.assemble ? (
-        insertion.assemble({
+      const insertBody = (declareResult) => insertion?.assemble
+        ? assembleInsertion(insertion, {
           source: insertion.source,
+          // The records behind that source, so the composed body is spliced
+          // into the caller's statement list as real statements instead of
+          // one opaque record.
+          statements: insertion.statements,
           argumentValues: callArguments,
           resultName,
           exitLabel: `${namespace}return`,
           namespace,
           declareResult,
-        })) : null;
-      const inlineSource = insertBody(true);
+        }) : null;
+      const inlineAssembly = insertBody(true);
+      const inlineSource = inlineAssembly?.source || null;
       if (inlineEdges?.has(edge) && !inlineSource) {
         inlineFailureReasons.push({edge, reason: insertion
           ? "insertion-assembly-rejected" : "missing-published-insertion"});
@@ -2134,7 +2348,7 @@ class HotCallGraphRegionCompiler {
             regionText.slice(0, declarationAt) +
             regionText.slice(
               declarationAt + lowering.resultDeclaration.length);
-          const guardedBody = insertBody(false);
+          const guardedBody = insertBody(false)?.source || null;
           let guardedExecution = guardedBody;
           if (fallbackInlineEdges?.has(edge)) {
             if (!fastCall || !lowering.depthName) {
@@ -2189,7 +2403,13 @@ class HotCallGraphRegionCompiler {
         linkedFunctionNames.add(functionName);
       }
       loweredRanges.push(range);
-      edits.push({...range, replacement});
+      // A plain lexical insertion contributes the records behind its own
+      // text. A guarded fallback does not: its `if (!completed)` arm is the
+      // original checked call span, text this lowering rebuilt and holds no
+      // records for, so the whole replacement stays opaque.
+      edits.push({...range, replacement,
+        statements: effectiveInlineSource === inlineSource
+          ? inlineAssembly?.statements || null : null});
       replaced.add(rawName);
       if (!needsInlineFallback && dropsBindings) {
         for (const identifier of Object.values(edge.site.identifiers || {})) {
@@ -2303,8 +2523,8 @@ class HotCallGraphRegionCompiler {
    * insertable by construction; when any callee has no insertable form, the
    * parent gets none either and is linked as a region function instead.
    */
-  composeInsertion(base, prefix, node, functionNames, insertions,
-    fallbackInlineEdges = null) {
+  composeInsertion(base, prefix, prefixStatements, node, functionNames,
+    insertions, fallbackInlineEdges = null) {
     if (!base) return null;
     const edgeInsertions = new Map();
     for (const edge of node.edges) {
@@ -2317,7 +2537,17 @@ class HotCallGraphRegionCompiler {
       node.generated, false, new Set(node.edges), edgeInsertions,
       fallbackInlineEdges);
     if (!rewritten.source) return null;
-    return {...base, source: rewritten.source};
+    // The composed body's own records, kept in step by the same edits that
+    // produced its text. A parent that inserts this body splices these, so a
+    // callee inlined into a callee inlined into a caller arrives flat.
+    const baseStatements = base.statements
+      ? [...prefixStatements, ...base.statements] : null;
+    return {
+      ...base,
+      source: rewritten.source,
+      statements: baseStatements ? applyRegionStatementEdits(
+        baseStatements, rewritten.appliedEdits, rewritten.source) : null,
+    };
   }
 
   compileModule(plan, framedRoot = false) {
@@ -2401,7 +2631,7 @@ class HotCallGraphRegionCompiler {
               ?.jvmInternalRegionPositionalSource),
           rewritten.appliedEdits, rewritten.source));
         composedInternalInsertions.set(node, this.composeInsertion(
-          node.generated.jvmInternalRegionPositionalInsertion, "",
+          node.generated.jvmInternalRegionPositionalInsertion, "", [],
           node, functionNames, composedInternalInsertions));
         composedInternalLinkedNames.set(node, unionLinkedNames(
           rewritten.linkedFunctionNames,
@@ -2421,8 +2651,8 @@ class HotCallGraphRegionCompiler {
         node.generated.jvmRestoringDirectPositionalSource,
         node.generated.jvmStructuredRegionFragments
           ?.jvmRestoringDirectPositionalSource);
-      return body ? [ownStatement(`const plan = ${planName};`,
-        {kind: "const", def: "plan"}), ...body] : null;
+      return body
+        ? [restoringInlinePlanStatement(planName), ...body] : null;
     };
     const exceptionalInlineSources = new Map();
     const exceptionalInlineStatements = new Map();
@@ -2454,6 +2684,9 @@ class HotCallGraphRegionCompiler {
       exceptionalInlineInsertions.set(node, restoringInsertion ? {
         ...restoringInsertion,
         source: `const plan = ${planName};\n${restoringInsertion.source}`,
+        statements: restoringInsertion.statements
+          ? [restoringInlinePlanStatement(planName),
+            ...restoringInsertion.statements] : null,
       } : null);
       exceptionalInlineLinkedNames.set(node, new Set());
       exceptionalInlineCosts.set(node, node.codeItems);
@@ -2502,6 +2735,7 @@ class HotCallGraphRegionCompiler {
         exceptionalInlineInsertions.set(node, this.composeInsertion(
           node.generated.jvmRestoringDirectPositionalInsertion,
           `const plan = ${planName};\n`,
+          [restoringInlinePlanStatement(planName)],
           node, functionNames, exceptionalInlineInsertions,
           new Set(node.edges)));
         exceptionalInlineLinkedNames.set(node, unionLinkedNames(

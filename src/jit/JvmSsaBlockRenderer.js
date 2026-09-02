@@ -2449,9 +2449,20 @@ class JvmSsaBlockRenderer {
     // temporal dead zone.
     const publishInsertion = (body, argumentNames) => {
       if (!body) return null;
+      // The records behind the insertable body's own lines, one per line and
+      // in order, in the shape §4's fragments carry. A consumer that composes
+      // this body into a caller splices these in place of the call's record
+      // instead of collapsing the whole insertion into an opaque one, so the
+      // composed body stays a flat list of real statements. Null when a line
+      // has no record -- the same fail-safe `regionFragmentsOf` uses -- and
+      // the consumer then falls back to the opaque record.
+      const insertedStatements = body.lines.map(
+        (line) => regionStatementOf(line));
       const published = {
         serial: compileSerial,
         source: body.lines.join("\n"),
+        statements: insertedStatements.every(Boolean)
+          ? insertedStatements : null,
         exitCount: body.exits,
         resultToken: regionInsertionResult,
         labelToken: regionInsertionLabel,
