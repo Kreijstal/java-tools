@@ -5229,7 +5229,8 @@ class JvmSsaBlockRenderer {
             const count = stagedValue(countInput, lines);
             const out = value(), caught = value();
             lines.push(letDecl(out),
-              st`try { ${out} = helpers.newPrimitiveArray(${count}, ${JSON.stringify(instruction.arg)}); } catch (${caught}) {`,
+              stmt(e`try { ${out} = helpers.newPrimitiveArray(${count}, ${JSON.stringify(instruction.arg)}); } catch (${caught}) {`,
+                {declares: [caught]}),
               ...materializeLines([...stack, count], index, true).map((line) => `  ${line}`),
               st`  throw ${caught};`, blockEnd(""));
             stack.push(out);
@@ -5241,7 +5242,8 @@ class JvmSsaBlockRenderer {
             const count = stagedValue(countInput, lines);
             const out = value(), caught = value();
             lines.push(letDecl(out),
-              st`try { ${out} = helpers.newReferenceArray(${count}, ${JSON.stringify(instruction.arg)}); } catch (${caught}) {`,
+              stmt(e`try { ${out} = helpers.newReferenceArray(${count}, ${JSON.stringify(instruction.arg)}); } catch (${caught}) {`,
+                {declares: [caught]}),
               ...materializeLines([...stack, count], index, true).map((line) => `  ${line}`),
               st`  throw ${caught};`, blockEnd(""));
             stack.push(out);
@@ -5261,7 +5263,7 @@ class JvmSsaBlockRenderer {
               stmt(exprConcat(e`    return { deopt: true, transient: true, `,
                 e`reason: 'contended structured SSA monitorenter' };`)),
               blockEnd("  "),
-              st`} catch (${caught}) {`,
+              stmt(e`} catch (${caught}) {`, {declares: [caught]}),
               ...materializeLines([...stack, monitor], index)
                 .map((line) => `  ${line}`),
               st`  throw ${caught};`,
@@ -5277,7 +5279,7 @@ class JvmSsaBlockRenderer {
             lines.push(
               st`try {`,
               st`  helpers.monitorExit(${monitor}, thread);`,
-              st`} catch (${caught}) {`,
+              stmt(e`} catch (${caught}) {`, {declares: [caught]}),
               ...materializeLines([...stack, monitor], index)
                 .map((line) => `  ${line}`),
               st`  throw ${caught};`,
@@ -5297,8 +5299,9 @@ class JvmSsaBlockRenderer {
                 runtimeClassNameExpression(castValue)};`,
               {kind: "const", def: source}),
               st`  if (${source} !== ${target}) {`,
-              st`    let ${checked};`,
-              st`    try { ${checked} = helpers.tryCheckCastSourceSync(${source}, ${target}); } catch (${caught}) {`,
+              `    ${letDecl(checked)}`,
+              `    ${stmt(e`try { ${checked} = helpers.tryCheckCastSourceSync(${source}, ${target}); } catch (${caught}) {`,
+                {declares: [caught]})}`,
               ...materializeLines(stack, index).map((line) => `  ${line}`),
               st`  throw ${caught};`, blockEnd(""),
               st`    if (${checked} === helpers.asyncInvokeSentinel()) {`,
@@ -5643,7 +5646,8 @@ class JvmSsaBlockRenderer {
               stmt(exprConcat(
                 e`try { ${out} = helpers.directJreIntrinsics[${
                   site.directJre.id}](`,
-                argumentListExpression(args), e`); } catch (${caught}) {`)),
+                argumentListExpression(args), e`); } catch (${caught}) {`),
+              {declares: [caught]}),
               ...materializeLines(callStack, index).map((line) => `  ${line}`),
               st`  throw ${caught};`, blockEnd(""));
               if (!site.returnsVoid) stack.push(out);
@@ -5694,7 +5698,8 @@ class JvmSsaBlockRenderer {
               const caught = value();
               lines.push(stmt(exprConcat(
                 e`try { helpers.primitiveArrayCopyDirect(`,
-                argumentListExpression(args), e`); } catch (${caught}) {`)),
+                argumentListExpression(args), e`); } catch (${caught}) {`),
+              {declares: [caught]}),
                 ...materializeLines(callStack, index).map((line) => `  ${line}`),
                 st`  throw ${caught};`, blockEnd(""));
             }
@@ -5773,7 +5778,8 @@ class JvmSsaBlockRenderer {
             const fallbackLines = [
               ...(deferMaterialization
                 ? stageOperandLines(callStack) : materializeLines(callStack, index + 1)),
-              st`try { ${out} = helpers.tryInvokeSyncAt(${site.id}, frame, thread); } catch (${caught}) {`,
+              stmt(e`try { ${out} = helpers.tryInvokeSyncAt(${site.id}, frame, thread); } catch (${caught}) {`,
+                {declares: [caught]}),
               ...materializeCallExceptionLines(
                 callStack, stack, index, callStackDepth)
                 .map((line) => `  ${line}`),
@@ -6286,7 +6292,7 @@ class JvmSsaBlockRenderer {
                 ] : [
                   stmt(e`  try { ${out} = ${selfRecursiveMarker}${
                     positionalRawCall}; } catch (${caught}) {`,
-                  {pinned: site.selfRecursive}),
+                  {pinned: site.selfRecursive, declares: [caught]}),
                   st`    /*${regionHandlerMarkers.start}*/`,
                   ...materializeCallExceptionLines(
                     callStack, stack, index,
@@ -12358,8 +12364,7 @@ class JvmSsaBlockRenderer {
       // way the positional variants do. When the renderer's own outlining or
       // partitioning rewrote the canonical body the published source is no
       // longer what the fragments describe, so none is published.
-      if (regionCallGraphCandidate && canonicalFragments &&
-          generatedSource === canonicalGeneratedSource) {
+      if (regionCallGraphCandidate && canonicalFragments) {
         regionFragments.jvmHotCallGraphFramedSource =
           fragmentsWithoutDirective(canonicalFragments);
       }
@@ -14309,8 +14314,14 @@ class JvmSsaBlockRenderer {
         requiresBaselineFramedEntry && !useContinuations;
       generated.jvmStructuredContinuation = useContinuations;
       generated.jvmCompiledCallChain = compiledCallChain;
+      // The hot call-graph region re-emits this body as a node function and
+      // splices into it by the markers the emitters wrote, so it receives the
+      // canonical body: a body the renderer's own outlining or partitioning
+      // has already split into several functions is no longer the one those
+      // markers describe, and the region compiler owns the same two passes
+      // behind its own flags.
       generated.jvmHotCallGraphFramedSource = regionCallGraphCandidate
-        ? generatedSource : null;
+        ? canonicalGeneratedSource : null;
       generated.jvmHotCallGraphWrapGenerator = regionCallGraphCandidate
         ? wrapHotCallGraphGenerator : null;
       generated.jvmHotCallGraphHasContinuation = regionCallGraphCandidate
@@ -14375,7 +14386,7 @@ class JvmSsaBlockRenderer {
         jvmInternalRegionPositionalSource: internalRegionPositionalSource,
         jvmRestoringDirectPositionalSource: restoringDirectPositionalSource,
         jvmHotCallGraphFramedSource: regionCallGraphCandidate
-          ? generatedSource : null,
+          ? canonicalGeneratedSource : null,
         jvmCheckedLeafDirectPositionalSource:
           checkedLeafDirectPositionalSource,
         jvmTrustedCheckedLeafDirectPositionalSource:

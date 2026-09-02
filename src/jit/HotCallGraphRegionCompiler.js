@@ -253,6 +253,30 @@ function statementGroups(statements, from = 0, to = statements.length) {
   return groups;
 }
 
+// The local-spill helpers a generated body declares once in its own prologue
+// (`spillLocals`, `ssaMaterialize<n>`) close over that body's `local<slot>`
+// bindings. A helper this pass extracts receives those bindings *by value*,
+// so a range that both calls one of them and assigns a JVM slot would spill
+// the enclosing body's stale copy at every materialization inside it -- and a
+// materialization is exactly the point at which the interpreter takes the
+// state over. Such a range is never extracted.
+function regionRangeSpillsStaleLocals(statements, from, to) {
+  let callsSpillHelper = false;
+  let assignsLocal = false;
+  for (let index = from; index < to; index += 1) {
+    const statement = statements[index];
+    for (const name of statement.reads || []) {
+      if (name === "spillLocals" || name.startsWith("ssaMaterialize")) {
+        callsSpillHelper = true;
+      }
+    }
+    for (const name of statement.writes || []) {
+      if (/^local\d+$/.test(name)) assignsLocal = true;
+    }
+  }
+  return callsSpillHelper && assignsLocal;
+}
+
 function statementBytes(statements, from, to) {
   let bytes = 0;
   for (let index = from; index < to; index += 1) {
@@ -695,6 +719,8 @@ function outlineLargeRegionLoops(unit, options = {}) {
       const outward = regionOutwardJumps(
         statements, candidate.start, candidate.end);
       if (outward.length) continue;
+      if (regionRangeSpillsStaleLocals(
+        statements, candidate.start, candidate.end)) continue;
       const hasYield = regionRangeCarriesYield(
         statements, candidate.start, candidate.end);
       if (hasYield && !generator) continue;
@@ -710,6 +736,16 @@ function outlineLargeRegionLoops(unit, options = {}) {
       // state array is declared inside the body, so an outer loop that
       // encloses an earlier helper's call site does receive it.
       const freeNames = names.free.filter((name) => !helperNames.has(name));
+      if (process.env.JVM_DEBUG_OUTLINE_NAMES) {
+        console.error("[outline]", helperName, "free=", freeNames.join(","));
+        for (let i = candidate.start; i < candidate.end; i += 1) {
+          const st = statements[i];
+          if ((st.reads || []).includes("ssaValue7") || st.def === "ssaValue7") {
+            console.error("   #" + i, "def=", st.def, "reads=",
+              (st.reads || []).join(","), "::", JSON.stringify(st.text));
+          }
+        }
+      }
       const liveOutNames = freeNames.filter((name) => names.written.has(name));
       const body = rewriteRegionExits(statements, candidate.start,
         candidate.end, (argument) => [
@@ -1038,6 +1074,7 @@ function partitionOversizedLinearBlocks(units, options = {}) {
         const outward = regionOutwardJumps(statements, from, to);
         const runHasYield = regionRangeCarriesYield(statements, from, to);
         if (runHasYield && !unit.generator) return;
+        if (regionRangeSpillsStaleLocals(statements, from, to)) return;
 
         // A run-level declaration whose binding is read after the run has to
         // survive the extraction: it is declared at the call site and written
