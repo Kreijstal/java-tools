@@ -247,33 +247,104 @@ function statementBytes(statements, from, to) {
 }
 
 /**
+ * The block scope each statement of a range sits in.
+ *
+ * A statement belongs to the scope that is open before it runs, and the
+ * nesting it opens or closes -- the delta its emitter recorded -- starts and
+ * ends the scopes inside it. A block continuation (`} else {`, `} catch (e)
+ * {`) ends one scope and starts a sibling of it, which its zero delta does
+ * not say on its own.
+ *
+ * Returns null when the deltas do not balance over the range, which makes
+ * every caller decline it rather than guess at its structure.
+ */
+function regionScopes(statements, from, to) {
+  const parents = [null];
+  const scopeOf = [];
+  const stack = [0];
+  for (let index = from; index < to; index += 1) {
+    const statement = statements[index];
+    scopeOf.push(stack[stack.length - 1]);
+    const delta = statement.delta;
+    if (delta > 0) {
+      for (let step = 0; step < delta; step += 1) {
+        parents.push(stack[stack.length - 1]);
+        stack.push(parents.length - 1);
+      }
+    } else if (delta < 0) {
+      for (let step = 0; step < -delta; step += 1) {
+        if (stack.length <= 1) return null;
+        stack.pop();
+      }
+    } else if (statement.continuesBlock && stack.length > 1) {
+      // The arm this statement opens is a sibling of the one it closes, so a
+      // name the previous arm declared is not in scope in it.
+      const parent = parents[stack[stack.length - 1]];
+      stack.pop();
+      parents.push(parent);
+      stack.push(parents.length - 1);
+    }
+  }
+  if (stack.length !== 1) return null;
+  return {parents, scopeOf};
+}
+
+/**
  * The names a statement range introduces, reads from an enclosing scope and
  * assigns there, in first-appearance order.
  *
+ * Declarations are resolved by block scope, not by a flat name set. A body a
+ * composition spliced a callee into carries the callee's own `local<slot>` /
+ * `ssaValue<n>` declarations inside a nested block, where they *shadow* the
+ * caller's names of the same spelling rather than colliding with them; a flat
+ * set would report such a name as bound for the whole range and hand a
+ * relocated statement the wrong binding -- or, for a name the callee alone
+ * declares, hand the call site a parameter that does not exist there.
+ *
  * Returns null when the range contains a statement whose names are unknown or
- * that may not be relocated: a region whose free-variable set cannot be
- * stated exactly is never extracted.
+ * that may not be relocated, or when its nesting does not balance: a region
+ * whose free-variable set cannot be stated exactly is never extracted.
  */
 function regionNames(statements, from, to) {
-  const declared = new Set();
+  const scopes = regionScopes(statements, from, to);
+  if (!scopes) return null;
+  const declaredIn = new Map();
   for (let index = from; index < to; index += 1) {
     const statement = statements[index];
     if (!statement.relocatable || statement.reads === null) return null;
-    if (statement.def) declared.add(statement.def);
-    for (const name of statement.declares || []) declared.add(name);
+    const scope = scopes.scopeOf[index - from];
+    for (const name of [...(statement.def ? [statement.def] : []),
+      ...(statement.declares || [])]) {
+      if (!declaredIn.has(name)) declaredIn.set(name, new Set());
+      declaredIn.get(name).add(scope);
+    }
   }
+  // A name is bound where it is used when some scope enclosing that use
+  // declares it. The range's own scope is 0, so a name declared there is
+  // bound everywhere in the range, exactly as before.
+  const boundAt = (name, scope) => {
+    const sites = declaredIn.get(name);
+    if (!sites) return false;
+    for (let at = scope; at !== null; at = scopes.parents[at]) {
+      if (sites.has(at)) return true;
+    }
+    return false;
+  };
+  const declared = new Set(
+    [...declaredIn.keys()].filter((name) => declaredIn.get(name).has(0)));
   const free = [];
   const seen = new Set();
   const written = new Set();
   for (let index = from; index < to; index += 1) {
     const statement = statements[index];
+    const scope = scopes.scopeOf[index - from];
     for (const name of statement.reads) {
-      if (declared.has(name) || seen.has(name)) continue;
+      if (boundAt(name, scope) || seen.has(name)) continue;
       seen.add(name);
       free.push(name);
     }
     for (const write of statement.writes || []) {
-      if (declared.has(write)) continue;
+      if (boundAt(write, scope)) continue;
       written.add(write);
       if (seen.has(write)) continue;
       seen.add(write);
@@ -707,7 +778,7 @@ function outlineLargeRegionLoops(unit, options = {}) {
               reads: [sharedStateName],
               exit: {
                 before: [`if (${sharedStateName}[0] === 1) `],
-                argument: [`${sharedStateName}[1]`],
+                value: [`${sharedStateName}[1]`],
                 after: [],
               },
             }),
@@ -1113,7 +1184,7 @@ function partitionOversizedLinearBlocks(units, options = {}) {
             reads: [sharedStateName],
             exit: {
               before: [`if (${sharedStateName}[0] === 1) `],
-              argument: [`${sharedStateName}[1]`],
+              value: [`${sharedStateName}[1]`],
               after: [],
             },
           }));
