@@ -447,6 +447,68 @@ function partsWriteThrowOrTry(parts) {
   return skeleton.includes("throw ") || skeleton.includes("try {");
 }
 
+// The `return` a statement leaves its activation through, located in the
+// statement's own literal chunks. An operand reference contributes exactly one
+// placeholder character to the skeleton, so it can neither supply nor split the
+// keyword, and a `return` that only occurs inside a rendered string (a deopt
+// reason naming one) is not at a statement position and is not reported.
+function partsReturnPositions(parts) {
+  const skeleton = partsSkeleton(parts);
+  const positions = [];
+  for (let at = skeleton.indexOf("return"); at >= 0;
+    at = skeleton.indexOf("return", at + 1)) {
+    const next = skeleton[at + 6];
+    if (next !== " " && next !== ";") continue;
+    if (!/(?:^|[{};)])\s*$/.test(skeleton.slice(0, at))) continue;
+    positions.push(at);
+  }
+  return positions;
+}
+
+// One skeleton range of a parts list, as a parts list. A range boundary that
+// falls inside an operand reference has no parts representation, so the caller
+// gets null rather than a split name.
+function slicePartsRange(parts, start, end) {
+  const out = [];
+  let offset = 0;
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index];
+    const length = typeof part === "string" ? part.length : 1;
+    const partEnd = offset + length;
+    if (partEnd > start && offset < end) {
+      if (typeof part === "string") {
+        const chunk = part.slice(
+          Math.max(0, start - offset), Math.min(length, end - offset));
+        if (chunk !== "") out.push(chunk);
+      } else {
+        if (offset < start || partEnd > end) return null;
+        out.push(part);
+      }
+    }
+    offset = partEnd;
+  }
+  return out;
+}
+
+// Split `<before>return <value>;<after>` out of one statement's parts. Null
+// when the statement carries no return, more than one, or a return whose value
+// cannot be delimited -- the caller then keeps the statement or rejects the
+// whole insertable variant.
+function splitReturnParts(parts) {
+  const positions = partsReturnPositions(parts);
+  if (positions.length !== 1) return null;
+  const skeleton = partsSkeleton(parts);
+  const at = positions[0];
+  const end = skeleton.indexOf(";", at);
+  if (end < 0) return null;
+  const valueStart = skeleton[at + 6] === ";" ? end : at + 7;
+  const before = slicePartsRange(parts, 0, at);
+  const value = slicePartsRange(parts, valueStart, end);
+  const after = slicePartsRange(parts, end + 1, skeleton.length);
+  if (!before || !value || !after) return null;
+  return {before, value, after};
+}
+
 function partsWriteDivision(parts) {
   const skeleton = partsSkeleton(parts);
   return skeleton.includes(" / ") || skeleton.includes(" % ");
@@ -1826,6 +1888,160 @@ class JvmSsaBlockRenderer {
         kinds[record.def] = record.kind === "const" ? "const" : "let";
       }
       return {declared, kinds};
+    };
+    // A body a caller inserts lexically must not leave the caller's
+    // activation. Every statement through which a positional body returns is
+    // re-recorded as an assignment to one compiler-owned result slot followed
+    // by a break out of one compiler-owned labeled block; the caller
+    // late-binds both tokens, by exact identity, to the names it chose for
+    // this insertion. `compileSerial` makes them unique against the enclosing
+    // body and against any other insertion at any nesting depth, exactly as it
+    // does for the checked-leaf body's own result and label.
+    const regionInsertionResult =
+      named(`ssaRegionInlineResult${compileSerial}`);
+    const regionInsertionLabel = named(`ssaRegionInlineBody${compileSerial}`);
+    const insertableExitStatement = (before, value, after) => recordStatement([
+      ...before, "{ ", {ref: regionInsertionResult}, " = ",
+      ...(value.length ? value : ["undefined"]),
+      "; break ", {ref: regionInsertionLabel}, "; }", ...after,
+    ], {kind: "insertableExit"});
+    // The insertable form of an assembled body. Statements are examined as the
+    // records their emitters produced, never as characters: an exit is a
+    // statement whose own parts carry a `return`, and it is replaced by a
+    // statement recorded through the same recorder, so the result is statement
+    // IR like every other body and the audit covers it.
+    //
+    // The variant is rejected outright when a line was never recorded (a
+    // hand-assembled nested function, whose returns belong to it and not to
+    // this activation) or when an exit cannot be represented as one
+    // assignment-and-break. An emitter that grows a new exit form therefore
+    // loses inlining instead of escaping the caller.
+    const insertableBodyOf = (bodyLines) => {
+      const lines = [];
+      let exits = 0;
+      const veto = (why, line) => {
+        if (process.env.JVM_DEBUG_INSERTION_VETO) {
+          require("fs").appendFileSync(process.env.JVM_DEBUG_INSERTION_VETO,
+            `VETO ${why}: ${String(line).trim()}\n`);
+        }
+        return null;
+      };
+      // A guest loop or block label is named after its header pc, so two
+      // unrelated bodies routinely declare the same one and inserting one into
+      // the other would nest two identical labels. The inserted copy therefore
+      // renames every label it declares and every reference to it, keyed by
+      // this compile's serial. The rename is driven by the label each
+      // statement recorded; a statement that mentions one of these labels
+      // without having recorded it rejects the whole variant, because its
+      // reference would be left pointing at the caller's label.
+      const declaredLabels = new Set();
+      for (const line of bodyLines) {
+        const record = recordOf(line);
+        if (typeof record?.label === "string" && record.label) {
+          declaredLabels.add(record.label);
+        }
+      }
+      // A label is not an operand: it names a statement, not a value, so the
+      // renamed label stays a literal chunk of the statement that declares or
+      // jumps to it and is not registered as an emitted name.
+      const renamedLabel = (label) => `${label}_ssaInline${compileSerial}`;
+      const labelPattern = declaredLabels.size
+        ? new RegExp(`(?:^|[^A-Za-z0-9_$])(${[...declaredLabels]
+          .map((label) => label.replace(/[^A-Za-z0-9_$]/g, "\\$&"))
+          .join("|")})(?![A-Za-z0-9_$])`)
+        : null;
+      const relabelParts = (parts, label) => parts.map((part) =>
+        typeof part === "string"
+          ? part.replace(
+            new RegExp(`(^|[^A-Za-z0-9_$])${label}(?![A-Za-z0-9_$])`, "g"),
+            `$1${renamedLabel(label)}`)
+          : part);
+      for (const line of bodyLines) {
+        if (line.trim() === "") { lines.push(line); continue; }
+        const record = recordOf(line);
+        if (!record || record.foreign) return veto("unrecorded", line);
+        // A generator body cannot be inserted into a caller's activation.
+        // `yield` as a whole word, so a deopt reason that names a yielded
+        // thread is not mistaken for one.
+        if (/(?:^|[^A-Za-z0-9_$])yield(?![A-Za-z0-9_$])/
+          .test(partsSkeleton(record.parts))) return veto("yield", line);
+        let parts = record.parts;
+        if (typeof record.label === "string" && record.label) {
+          parts = relabelParts(parts, record.label);
+        } else if (labelPattern?.test(partsSkeleton(parts))) {
+          return veto("unrecorded-label-reference", line);
+        }
+        const positions = partsReturnPositions(parts);
+        if (positions.length === 0) {
+          lines.push(parts === record.parts ? line
+            : `${indentationOf(line)}${recordStatement(parts,
+              {...record, label: renamedLabel(record.label)}).trim()}`);
+          continue;
+        }
+        const split = splitReturnParts(parts);
+        if (!split) return veto("unsplittable-return", line);
+        exits += 1;
+        lines.push(`${indentationOf(line)}${insertableExitStatement(
+          split.before, split.value, split.after).trim()}`);
+      }
+      if (exits === 0) return veto("no-exits", "");
+      return {lines, exits};
+    };
+    // What a consumer needs to insert one positional body: the body itself
+    // with its exits carrying the two tokens, the names it expects its
+    // arguments and entry guard to be bound to, and an assembler that binds
+    // them by declaration inside the labeled block. The callee's own
+    // `local<slot>` / `ssaValue<n>` names are declared in that block too, so
+    // they shadow the caller's rather than colliding with them and nothing is
+    // renamed. Argument values are evaluated by the caller before the block is
+    // entered, because inside it every name the body declares is in its
+    // temporal dead zone.
+    const publishInsertion = (body, argumentNames) => {
+      if (!body) return null;
+      const published = {
+        serial: compileSerial,
+        source: body.lines.join("\n"),
+        exitCount: body.exits,
+        resultToken: regionInsertionResult,
+        labelToken: regionInsertionLabel,
+        argumentNames: [...argumentNames],
+        entryGuardName: "nestedEntryGuarded",
+        entryGuardValue: "2",
+      };
+      published.assemble = ({
+        source = published.source, argumentValues, resultName, exitLabel,
+        namespace, declareResult = true, bindings = [],
+      }) => {
+        if (typeof source !== "string" || typeof resultName !== "string" ||
+            typeof exitLabel !== "string" ||
+            typeof namespace !== "string") return null;
+        if (!Array.isArray(argumentValues) ||
+            argumentValues.length !== published.argumentNames.length ||
+            argumentValues.some((value) => typeof value !== "string")) {
+          return null;
+        }
+        // Late-bound compiler-owned tokens, expanded by exact identity: both
+        // names carry this compile's serial and occur nowhere else.
+        const retargeted = source
+          .split(published.resultToken).join(resultName)
+          .split(published.labelToken).join(exitLabel);
+        return [
+          declareResult ? `let ${resultName};` : null,
+          // Staged in the caller's scope. An argument may be spelled with one
+          // of the names the inserted block declares, and inside that block
+          // every one of them is in its temporal dead zone.
+          ...argumentValues.map((value, index) =>
+            `const ${namespace}a${index} = ${value};`),
+          `${exitLabel}: {`,
+          ...bindings.map(({name, value}) => `  const ${name} = ${value};`),
+          ...published.argumentNames.map((name, index) =>
+            `  const ${name} = ${namespace}a${index};`),
+          `  const ${published.entryGuardName} = ${published.entryGuardValue};`,
+          ...retargeted.split("\n").map((line) => `  ${line}`),
+          "}",
+        ].filter((line) => line !== null).join("\n");
+      };
+      return published;
     };
     const spillStatement = () =>
       recordStatement(["spillLocals();"], {kind: "spill"});
@@ -11577,6 +11793,8 @@ class JvmSsaBlockRenderer {
       let directPositionalBody = null;
       let directPositionalSource = null;
       let internalRegionPositionalSource = null;
+      let internalRegionPositionalInsertion = null;
+      let restoringDirectPositionalInsertion = null;
       // Statement-level fragments of each positional variant, published for a
       // consumer that outlines, partitions or env-lifts a body. They are only
       // published when the assembled lines survive to the published source
@@ -11697,6 +11915,24 @@ class JvmSsaBlockRenderer {
         if (!selfRecursiveCallExpressions.size) {
           regionFragments.jvmInternalRegionPositionalSource =
             regionFragmentsOf(internalRegionPositionalLines);
+          // The same body in the form a caller inserts. It is assembled from
+          // the same statement list, so the two variants differ only in how
+          // the body leaves: a standalone entry returns, an inserted copy
+          // assigns the caller's result slot and breaks out of the caller's
+          // labeled block. A respecialized body publishes none, exactly as it
+          // publishes no fragments: that specialization is a text splice over
+          // the joined module and the statements no longer describe it.
+          const insertable = insertableBodyOf(internalRegionPositionalLines);
+          if (process.env.JVM_DEBUG_INSERTION_VETO && !insertable) {
+            require("fs").appendFileSync(process.env.JVM_DEBUG_INSERTION_VETO,
+              "VETO internal-body-rejected\n");
+          }
+          if (process.env.JVM_JIT_VERIFY_STATEMENT_IR && insertable) {
+            auditStatementIrLines(insertable.lines, statementRecords,
+              emittedNames, "internal-region-insertion");
+          }
+          internalRegionPositionalInsertion =
+            publishInsertion(insertable, argumentNames);
         }
         if (directPositionalEligible) {
           directPositionalBody = createStructuredFunction(
@@ -12150,6 +12386,26 @@ class JvmSsaBlockRenderer {
         restoringDirectPositionalSource = specializeSelfRecursiveCalls(
           ["'use strict';", ...restoringPositionalLines].join("\n"),
           "ssa-direct-restoring-positional", true);
+        if (process.env.JVM_DEBUG_INSERTION_VETO &&
+            selfRecursiveCallExpressions.size) {
+          require("fs").appendFileSync(process.env.JVM_DEBUG_INSERTION_VETO,
+            "VETO self-recursive\n");
+        }
+        if (!selfRecursiveCallExpressions.size) {
+          // The restoring tier is the body an exceptional inline candidate
+          // contributes, so it publishes an insertable variant too. It carries
+          // no `'use strict';` directive: a directive is only a directive at
+          // the head of a program or a function body, and this body is
+          // inserted into one.
+          const restoringInsertable =
+            insertableBodyOf(restoringPositionalLines);
+          if (process.env.JVM_JIT_VERIFY_STATEMENT_IR && restoringInsertable) {
+            auditStatementIrLines(restoringInsertable.lines, statementRecords,
+              emittedNames, "restoring-insertion");
+          }
+          restoringDirectPositionalInsertion =
+            publishInsertion(restoringInsertable, argumentNames);
+        }
         if (!selfRecursiveCallExpressions.size) {
           const prologueFragments = regionFragmentsOf(restoringPrologue);
           const bodyFragments = regionFragmentsOf(restoringIndentedBody);
@@ -12180,6 +12436,15 @@ class JvmSsaBlockRenderer {
               (line) => line.split(from).join(to));
           }
         };
+        // The insertable variant is the same body, so it late-binds the same
+        // two sentinels. The module a region composes always captures both,
+        // so the insertion expands them unconditionally.
+        if (restoringDirectPositionalInsertion) {
+          restoringDirectPositionalInsertion.source =
+            restoringDirectPositionalInsertion.source
+              .split("helpers.returnVoid()").join("ssaReturnVoid")
+              .split("helpers.asyncInvokeSentinel()").join("ssaAsyncInvoke");
+        }
         const restoringSentinelCaptures = {};
         if (restoringDirectPositionalSource.includes(
           "helpers.returnVoid()")) {
@@ -13446,6 +13711,13 @@ class JvmSsaBlockRenderer {
         internalRegionPositionalSource;
       generated.jvmRestoringDirectPositionalBody = restoringDirectPositionalBody;
       generated.jvmRestoringDirectPositionalSource = restoringDirectPositionalSource;
+      // The insertable forms of the two bodies a hot call-graph region
+      // inserts. Each publishes the body, the names it binds, and an
+      // assembler; a consumer never rewrites the emitted text.
+      generated.jvmInternalRegionPositionalInsertion =
+        internalRegionPositionalInsertion;
+      generated.jvmRestoringDirectPositionalInsertion =
+        restoringDirectPositionalInsertion;
       const regionReceiverSlots = methodIsStatic ? 0 : 1;
       const regionArgumentCount = directMethodDescriptor.params.length +
         regionReceiverSlots;
