@@ -434,6 +434,206 @@ function partsAmbientNames(parts) {
   return found;
 }
 
+// Names a generated tier declares once in its own body prologue and then
+// calls from ordinary statements: the local spill helper and the frame
+// materialization helpers. Unlike an SSA value they are literal text in the
+// statement the emitter wrote rather than operands, so they never appear in
+// `reads` -- but a unit outlined out of the body still has to receive them.
+const BODY_HELPER_NAME_PREFIXES = ["ssaMaterialize"];
+
+function partsBodyHelperNames(parts) {
+  const skeleton = partsSkeleton(parts);
+  const found = [];
+  let position = skeleton.indexOf("spillLocals");
+  if (position >= 0 && !isPartsWordCharacter(skeleton[position - 1])) {
+    found.push("spillLocals");
+  }
+  for (const prefix of BODY_HELPER_NAME_PREFIXES) {
+    position = skeleton.indexOf(prefix);
+    while (position >= 0) {
+      if (!isPartsWordCharacter(skeleton[position - 1])) {
+        let end = position + prefix.length;
+        while (isPartsWordCharacter(skeleton[end])) end += 1;
+        const name = skeleton.slice(position, end);
+        if (name !== prefix && !found.includes(name)) found.push(name);
+      }
+      position = skeleton.indexOf(prefix, position + 1);
+    }
+  }
+  return found;
+}
+
+// A keyword the emitter wrote, as opposed to the same characters inside an
+// operand: operands are one placeholder character in the skeleton, so a
+// word-boundary test on the skeleton answers about the emitted statement.
+function skeletonKeywordPositions(skeleton, keyword) {
+  const positions = [];
+  let position = skeleton.indexOf(keyword);
+  while (position >= 0) {
+    if (!isPartsWordCharacter(skeleton[position - 1]) &&
+        !isPartsWordCharacter(skeleton[position + keyword.length])) {
+      positions.push(position);
+    }
+    position = skeleton.indexOf(keyword, position + 1);
+  }
+  return positions;
+}
+
+// The sub-list of `parts` covering the skeleton range [start, end). An
+// operand reference occupies exactly one skeleton character and is therefore
+// either wholly inside the range or wholly outside it; a literal chunk is
+// sliced. This is a slice of the compiler's own parts list, not of emitted
+// text.
+function partsSliceBySkeleton(parts, start, end) {
+  const slice = [];
+  let cursor = 0;
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index];
+    const width = typeof part === "string" ? part.length : 1;
+    const from = cursor;
+    cursor += width;
+    if (cursor <= start || from >= end) continue;
+    if (typeof part !== "string") { slice.push(part); continue; }
+    const text = part.slice(Math.max(0, start - from),
+      Math.min(width, end - from));
+    if (text !== "") slice.push(text);
+  }
+  return slice;
+}
+
+// How a statement that leaves the enclosing function through `return` is
+// split, so a consumer that relocates the statement into a helper can
+// re-establish the exit through the helper's protocol instead of rewriting
+// emitted characters. `before` and `after` are the parts around the whole
+// `return <argument>;`, `argument` is its operand list (null for `return;`).
+//
+// Only two shapes are recognized, both of which the consumer can wrap in a
+// block: the statement *is* the return, or the return is the single
+// statement of a guard the emitter wrote on one line. Anything else -- more
+// than one `;`, more than one `return`, a quote the emitted guard could hide
+// a keyword behind -- is reported as unrecognized, and the consumer then
+// leaves the statement where it is.
+function partsReturnSplit(parts) {
+  const skeleton = partsSkeleton(parts);
+  const returns = skeletonKeywordPositions(skeleton, "return");
+  if (!returns.length) return null;
+  if (returns.length > 1) return {recognized: false};
+  const start = returns[0];
+  const semicolons = [];
+  for (let index = 0; index < skeleton.length; index += 1) {
+    if (skeleton[index] === ";") semicolons.push(index);
+  }
+  if (semicolons.length !== 1 || semicolons[0] < start) {
+    return {recognized: false};
+  }
+  const end = semicolons[0] + 1;
+  const prefix = skeleton.slice(0, start);
+  const suffix = skeleton.slice(end);
+  // The prefix of a one-line guard (`if (...) { `) and its tail (` }`).
+  // Anything else around the return would change meaning when the return
+  // becomes a multi-statement block.
+  if (prefix.trim() !== "" &&
+      !(prefix.trimStart().startsWith("if (") &&
+        prefix.trimEnd().endsWith(")") ||
+        prefix.trimStart().startsWith("if (") &&
+          prefix.trimEnd().endsWith("{"))) {
+    return {recognized: false};
+  }
+  if (suffix.trim() !== "" && suffix.trim() !== "}") {
+    return {recognized: false};
+  }
+  if (prefix.trim() !== "" &&
+      (skeleton.includes("'") || skeleton.includes("\"") ||
+        skeleton.includes("`"))) {
+    return {recognized: false};
+  }
+  let argumentStart = start + "return".length;
+  while (skeleton[argumentStart] === " ") argumentStart += 1;
+  return {
+    recognized: true,
+    before: partsSliceBySkeleton(parts, 0, start),
+    argument: argumentStart >= semicolons[0]
+      ? null : partsSliceBySkeleton(parts, argumentStart, semicolons[0]),
+    after: partsSliceBySkeleton(parts, end, skeleton.length),
+  };
+}
+
+// A plain `break;` / `continue;` / `break <label>;` the emitter wrote, or
+// `{recognized: false}` when the statement mentions one of those keywords in
+// a shape a consumer must not relocate.
+function partsJumpStatement(parts) {
+  const skeleton = partsSkeleton(parts);
+  const breaks = skeletonKeywordPositions(skeleton, "break");
+  const continues = skeletonKeywordPositions(skeleton, "continue");
+  if (!breaks.length && !continues.length) return null;
+  if (breaks.length + continues.length > 1) return {recognized: false};
+  const kind = breaks.length ? "break" : "continue";
+  const trimmed = skeleton.trim();
+  if (!trimmed.startsWith(kind) || !trimmed.endsWith(";")) {
+    return {recognized: false};
+  }
+  const inner = trimmed.slice(kind.length, trimmed.length - 1).trim();
+  if (inner === "") return {recognized: true, kind, label: null};
+  for (let index = 0; index < inner.length; index += 1) {
+    if (!isPartsWordCharacter(inner[index])) return {recognized: false};
+  }
+  return {recognized: true, kind, label: inner};
+}
+
+// The label a statement introduces (`L1: while (true) {`). `case`/`default`
+// are excluded: they are not labels and a consumer must not treat them as
+// one.
+// A block a consumer must not relocate or reason about structurally: the
+// emitter opened a construct whose jump semantics (`switch`) or scoping
+// (`function`, `class`, `with`) differ from the ordinary statement nesting
+// the fragment walk tracks.
+function partsOpensNamedConstruct(parts) {
+  const skeleton = partsSkeleton(parts).trimStart();
+  for (const keyword of ["switch", "function", "class", "with", "var"]) {
+    if (skeleton.startsWith(keyword) &&
+        !isPartsWordCharacter(skeleton[keyword.length])) return keyword;
+  }
+  return null;
+}
+
+// Whether the statement carries a nested function. Moving such a statement
+// into a helper would rebind its captures to the helper's parameter copies,
+// so a consumer leaves it where it is.
+function partsCarriesNestedFunction(parts) {
+  const skeleton = partsSkeleton(parts);
+  return skeleton.includes("=>") ||
+    skeletonKeywordPositions(skeleton, "function").length > 0;
+}
+
+// Constructs whose meaning depends on the activation they were written in.
+const RELOCATION_HOSTILE_KEYWORDS = ["this", "super", "await", "arguments",
+  "eval", "var", "new.target"];
+
+function partsRelocationHostile(parts) {
+  const skeleton = partsSkeleton(parts);
+  for (const keyword of RELOCATION_HOSTILE_KEYWORDS) {
+    if (skeletonKeywordPositions(skeleton, keyword).length) return true;
+  }
+  return false;
+}
+
+function partsYields(parts) {
+  return skeletonKeywordPositions(partsSkeleton(parts), "yield").length > 0;
+}
+
+function partsLabelName(parts) {
+  const skeleton = partsSkeleton(parts).trimStart();
+  let end = 0;
+  while (end < skeleton.length && isPartsWordCharacter(skeleton[end])) {
+    end += 1;
+  }
+  if (end === 0 || skeleton[end] !== ":") return null;
+  const name = skeleton.slice(0, end);
+  if (name === "case" || name === "default") return null;
+  if (skeleton[0] >= "0" && skeleton[0] <= "9") return null;
+  return name;
+}
+
 // Whether the statement the emitter wrote is a conditional that opens a
 // block: `if (<condition>) {`.
 function partsOpenCondition(parts) {
@@ -1724,6 +1924,56 @@ class JvmSsaBlockRenderer {
     const leafBailStatement = (indentation = "") =>
       `${indentation}${recordStatement([CHECKED_LEAF_BAIL],
         {kind: "leafBail"})}`;
+    // What one emitted line of an assembled body is, for a consumer that
+    // relocates statements into helper functions. Everything here is read off
+    // the record the emitter wrote -- its parts list, its operand references
+    // and the properties derived from its own skeleton -- so a consumer never
+    // has to look at the assembled text. `parts` is the statement's own parts
+    // list: a consumer re-renders it with operand substitutions, exactly the
+    // way `rerenderStatement` does inside this renderer.
+    const regionStatementOf = (line) => {
+      const record = recordOf(line);
+      if (!record) return null;
+      const parts = record.parts;
+      const jump = partsJumpStatement(parts);
+      const exit = partsReturnSplit(parts);
+      const named = partsOpensNamedConstruct(parts);
+      const delta = record.blockDelta || 0;
+      const reads = [];
+      for (const name of [...record.reads, ...record.ambientReads,
+        ...partsBodyHelperNames(parts)]) {
+        if (!reads.includes(name)) reads.push(name);
+      }
+      return {
+        text: line,
+        indent: indentationOf(line),
+        parts,
+        kind: record.kind,
+        def: record.def || null,
+        write: record.write || null,
+        reads,
+        delta,
+        label: partsLabelName(parts),
+        jump: jump && jump.recognized
+          ? {kind: jump.kind, label: jump.label} : null,
+        exit: exit && exit.recognized ? {
+          before: exit.before, argument: exit.argument, after: exit.after,
+        } : null,
+        yields: partsYields(parts),
+        opens: delta > 0
+          ? (record.kind === "loopHeader" ? "loop"
+            : record.opensTry ? "try" : named || "block")
+          : null,
+        // A statement a consumer may move into a helper function. Every
+        // exit it carries has to be re-establishable through the helper's
+        // protocol, and nothing in it may depend on the activation or the
+        // scope it was written in.
+        relocatable: record.foreign !== true &&
+          !(jump && !jump.recognized) && !(exit && !exit.recognized) &&
+          named === null && !partsCarriesNestedFunction(parts) &&
+          !partsRelocationHostile(parts),
+      };
+    };
     // Statement-level fragments of an assembled positional body: an ordered
     // list whose lines, joined back together, are exactly the body. A loop and
     // a try/catch are each one fragment, so a consumer that outlines or
@@ -1773,6 +2023,7 @@ class JvmSsaBlockRenderer {
         }
         fragments.push({
           id: fragments.length, kind, lines, declares, reads, writes,
+          statements: lines.map((line) => regionStatementOf(line)),
         });
       };
       // Loops and try/catch are relocatable units, so each is one fragment
@@ -12158,19 +12409,28 @@ class JvmSsaBlockRenderer {
               ? [
                 ...prologueFragments,
                 {kind: "linear", lines: [restoringWrapperOpen],
-                  declares: [], reads: [], writes: []},
+                  declares: [], reads: [], writes: [],
+                  statements: [regionStatementOf(restoringWrapperOpen)]},
                 ...bodyFragments,
                 {kind: "linear", lines: [...restoringWrapperClose],
                   declares: [],
                   reads: ["frame", "helpers", "plan", "thread",
                     "restorationDepth"],
-                  writes: []},
+                  writes: [],
+                  statements: restoringWrapperClose.map(
+                    (line) => regionStatementOf(line))},
               ].map((fragment, id) => ({...fragment, id}))
               : null;
         }
         // The published body late-binds two sentinel calls to captured
         // constants. Expand them in the fragments too, so the fragments still
         // join to exactly the published source.
+        // The expansion is an exact-identity replacement of a token the
+        // compiler emitted, so it is applied to the statement records the
+        // fragments publish as well: to each statement's rendered text and to
+        // the literal chunks of its parts list. A statement whose re-rendered
+        // parts then disagree with its text keeps its text and loses its
+        // parts, and a consumer leaves it alone.
         const expandSentinelsInFragments = (from, to) => {
           const fragments =
             regionFragments.jvmRestoringDirectPositionalSource;
@@ -12178,6 +12438,19 @@ class JvmSsaBlockRenderer {
           for (const fragment of fragments) {
             fragment.lines = fragment.lines.map(
               (line) => line.split(from).join(to));
+            fragment.statements = (fragment.statements || []).map(
+              (statement) => {
+                if (!statement) return statement;
+                const text = statement.text.split(from).join(to);
+                if (text === statement.text) return statement;
+                return {
+                  ...statement,
+                  text,
+                  parts: statement.parts.map((part) =>
+                    typeof part === "string" ? part.split(from).join(to)
+                      : part),
+                };
+              });
           }
         };
         const restoringSentinelCaptures = {};
@@ -13424,23 +13697,49 @@ class JvmSsaBlockRenderer {
       // single fragments. `reads` includes the ambient names a fragment
       // mentions (`helpers`, `frame`, `thread`, `safePointBudget`, ...), which
       // an outlined unit has to receive even though no statement declares one.
-      generated.jvmStructuredRegionFragments = Object.fromEntries(
-        Object.entries(regionFragments)
-          .filter(([, fragments]) => Array.isArray(fragments))
-          .map(([variant, fragments]) => [variant, fragments.map(
-            (fragment) => ({
-              id: fragment.id,
-              kind: fragment.kind,
-              lines: [...fragment.lines],
-              declares: [...fragment.declares],
-              reads: [...fragment.reads],
-              writes: [...fragment.writes],
-            }))]));
+      // Each fragment also publishes the statement record behind every one of
+      // its lines: the parts list the emitter built, the operand names it
+      // reads and writes, the block nesting it opens or closes, and how its
+      // exits are re-established when the statement is relocated. A consumer
+      // that outlines or partitions a body therefore rewrites parts lists,
+      // never emitted characters. A statement whose parts no longer render
+      // its line -- a late expansion the fragment could not follow -- is
+      // published without them and is not relocatable.
+      const publishedRegionStatement = (statement, line) => {
+        // Every line of a published fragment has a record: `regionFragmentsOf`
+        // refuses a body that contains a line no emitter recorded.
+        if (!statement) return null;
+        // Indentation is applied by the assembler and is not part of a
+        // statement's identity, so the comparison is on the identity the
+        // record was keyed by.
+        if (renderParts(statement.parts).trim() !== line.trim()) {
+          return {...statement, text: line, parts: null, relocatable: false};
+        }
+        return statement;
+      };
+      const publishedRegionFragments = Object.entries(regionFragments)
+        .filter(([, fragments]) => Array.isArray(fragments))
+        .map(([variant, fragments]) => [variant, fragments.map(
+          (fragment) => ({
+            id: fragment.id,
+            kind: fragment.kind,
+            lines: [...fragment.lines],
+            declares: [...fragment.declares],
+            reads: [...fragment.reads],
+            writes: [...fragment.writes],
+            statements: fragment.lines.map((line, index) =>
+              publishedRegionStatement(
+                (fragment.statements || [])[index], line)),
+          }))])
+        // A variant whose statements could not all be published loses its
+        // fragments rather than publishing a partial record.
+        .filter(([, fragments]) => fragments.every(
+          (fragment) => fragment.statements.every(Boolean)));
+      generated.jvmStructuredRegionFragments =
+        Object.fromEntries(publishedRegionFragments);
       generated.jvmStructuredRegionLocalNames = Object.fromEntries(
-        Object.entries(regionFragments)
-          .filter(([, fragments]) => Array.isArray(fragments))
-          .map(([variant, fragments]) =>
-            [variant, regionLocalNamesOf(fragments)]));
+        publishedRegionFragments.map(([variant, fragments]) =>
+          [variant, regionLocalNamesOf(fragments)]));
       generated.jvmDirectPositionalSource = directPositionalSource;
       generated.jvmInternalRegionPositionalSource =
         internalRegionPositionalSource;

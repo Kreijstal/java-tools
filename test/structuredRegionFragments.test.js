@@ -86,6 +86,38 @@ public final class FragmentLoopHarness {
           `${name} is introduced by its own fragment, not read into it`);
       }
     }
+    // Every line publishes the statement record behind it, so a consumer
+    // relocates statements by rewriting parts lists instead of characters.
+    for (const fragment of list) {
+      t.equal(fragment.statements.length, fragment.lines.length,
+        'every fragment line publishes its statement record');
+      for (let index = 0; index < fragment.lines.length; index += 1) {
+        const statement = fragment.statements[index];
+        t.equal(statement.text, fragment.lines[index],
+          'a published statement carries its own emitted line');
+        if (statement.parts) {
+          t.equal(statement.parts.map((part) => typeof part === 'string'
+            ? part : (part.text === undefined ? part.ref : part.text))
+            .join('').trim(),
+          fragment.lines[index].trim(),
+          'a published parts list renders the line it belongs to');
+        }
+      }
+    }
+    // A relocatable unit is balanced; the linear runs between them need not
+    // be (the restoring tier's own wrapper opens in one of them).
+    for (const fragment of list) {
+      if (fragment.kind !== 'loop' && fragment.kind !== 'try') continue;
+      let nesting = 0;
+      for (const statement of fragment.statements) nesting += statement.delta;
+      t.equal(nesting, 0, 'the published block deltas balance a unit');
+    }
+    const loopFragment = list.find((fragment) => fragment.kind === 'loop');
+    t.equal(loopFragment.statements[0].opens, 'loop',
+      'a loop fragment opens with the loop header it was cut at');
+    t.ok(loopFragment.statements.every((statement) => statement.relocatable ||
+      statement.parts === null),
+    'a relocatable loop keeps every statement rewritable');
     const names = generated.jvmStructuredRegionLocalNames?.[variant];
     t.ok(names, 'the renderer publishes the body-level declaration names');
     for (const name of names.declared) {
