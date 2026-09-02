@@ -381,6 +381,7 @@ function auditStatementIrLines(lines, records, names, label) {
     if (trimmed === "") continue;
     const record = records.get(trimmed);
     if (!record) { note(`${label} unrecorded`, trimmed); continue; }
+    if (record.foreign) continue;
     const present = [];
     for (const match of trimmed.matchAll(/[A-Za-z_$][\w$]*/g)) {
       if (names.has(match[0])) present.push(match[0]);
@@ -923,22 +924,22 @@ class JvmSsaBlockRenderer {
       !this.jit.effectfulPreparationActive &&
       !this.jit.nonSpeculativeStaticBooleanMethods?.has(method);
     const normalizeJvmScalarExpression = (expression, type) => ({
-      Z: `((Number(${expression})) ? 1 : 0)`,
-      boolean: `((Number(${expression})) ? 1 : 0)`,
-      B: `(((Number(${expression})) << 24) >> 24)`,
-      byte: `(((Number(${expression})) << 24) >> 24)`,
-      C: `((Number(${expression})) & 0xffff)`,
-      char: `((Number(${expression})) & 0xffff)`,
-      S: `(((Number(${expression})) << 16) >> 16)`,
-      short: `(((Number(${expression})) << 16) >> 16)`,
-      I: `((Number(${expression})) | 0)`,
-      int: `((Number(${expression})) | 0)`,
-      J: `BigInt.asIntN(64, BigInt(${expression}))`,
-      long: `BigInt.asIntN(64, BigInt(${expression}))`,
-      F: `Math.fround(Number(${expression}))`,
-      float: `Math.fround(Number(${expression}))`,
-      D: `Number(${expression})`,
-      double: `Number(${expression})`,
+      Z: e`((Number(${expression})) ? 1 : 0)`,
+      boolean: e`((Number(${expression})) ? 1 : 0)`,
+      B: e`(((Number(${expression})) << 24) >> 24)`,
+      byte: e`(((Number(${expression})) << 24) >> 24)`,
+      C: e`((Number(${expression})) & 0xffff)`,
+      char: e`((Number(${expression})) & 0xffff)`,
+      S: e`(((Number(${expression})) << 16) >> 16)`,
+      short: e`(((Number(${expression})) << 16) >> 16)`,
+      I: e`((Number(${expression})) | 0)`,
+      int: e`((Number(${expression})) | 0)`,
+      J: e`BigInt.asIntN(64, BigInt(${expression}))`,
+      long: e`BigInt.asIntN(64, BigInt(${expression}))`,
+      F: e`Math.fround(Number(${expression}))`,
+      float: e`Math.fround(Number(${expression}))`,
+      D: e`Number(${expression})`,
+      double: e`Number(${expression})`,
     })[type] || expression;
     if (!this.enabled || !this.jit.canCompileSynchronously(method)) {
       return reject("disabled or asynchronous");
@@ -1390,6 +1391,10 @@ class JvmSsaBlockRenderer {
     };
     const named = (name) => { emittedNames.add(name); return name; };
     const localName = (slot) => `local${slot}`;
+    // A comma-separated operand list keeps each operand's references.
+    const argumentListExpression = (values) => exprConcat(
+      ...values.flatMap((argument, position) =>
+        position === 0 ? [e`${argument}`] : [", ", e`${argument}`]));
     // Expression form of `arrayDataExpression`: the operand is a compiler
     // value (an SSA name or a staged expression), so the same purity choice is
     // made on the compiler's own operand, and the result keeps its operand
@@ -1426,11 +1431,16 @@ class JvmSsaBlockRenderer {
         write: meta?.write || null,
         exprParts: meta?.exprParts || null,
         pure: meta?.pure === true,
+        // A statement rendered by another plan (an inline integer leaf) or a
+        // token whose text a later expansion owns. Its operands are not this
+        // compile's, so no pass may rewrite it and the audit ignores it.
+        foreign: meta?.foreign === true,
         rawArrayLoad: meta?.rawArrayLoad === true,
         division: meta?.division === true,
         pinned: meta?.pinned === true,
       };
-      record.reads = partsReferences(record.exprParts || record.parts);
+      record.reads = record.foreign
+        ? [] : partsReferences(record.exprParts || record.parts);
       if (!record.exprParts && record.def) {
         record.reads = record.reads.filter((name) => name !== record.def);
       }
@@ -1606,8 +1616,8 @@ class JvmSsaBlockRenderer {
       normalReachableItems.has(index) && opOf(item?.instruction) === "iastore");
     const arrayIndexOutOfBounds = (index, length) =>
       this.unsignedArrayBoundsEnabled
-        ? `((${index} >>> 0) >= ${length})`
-        : `(${index} < 0 || ${index} >= ${length})`;
+        ? e`((${index} >>> 0) >= ${length})`
+        : e`(${index} < 0 || ${index} >= ${length})`;
     const methodIsStatic = (method.flags || []).includes("static") ||
       (Number(method.accessFlags) & 0x0008) !== 0;
     // In the single-threaded cooperative runtime, another Java thread can
@@ -3312,8 +3322,8 @@ class JvmSsaBlockRenderer {
           indexAffine: affineLocalOffset(indexInput),
           op: arrayOp,
           store: Boolean(store),
-          marker: `__SSA_PRIMITIVE_ARRAY_ACCESS_${
-            nextPrimitiveArrayAccessMarker++}__`,
+          marker: named(`__SSA_PRIMITIVE_ARRAY_ACCESS_${
+            nextPrimitiveArrayAccessMarker++}__`),
         };
         primitiveArrayAccessCandidates.push(access);
         const fixedRange = this.bitBoundedArrayRangesEnabled
@@ -3436,8 +3446,8 @@ class JvmSsaBlockRenderer {
           entryFieldArrayLocalViews.get(localSlot);
         if (!view || !view.blocks || view.blocks.has(block.id) ||
             !Number.isInteger(itemIndex)) return null;
-        const marker = `__SSA_DEFERRED_STATIC_ARRAY_ACCESS_${
-          nextDeferredStaticArrayAccessMarker++}__`;
+        const marker = named(`__SSA_DEFERRED_STATIC_ARRAY_ACCESS_${
+          nextDeferredStaticArrayAccessMarker++}__`);
         const access = {
           block: block.id,
           itemIndex,
@@ -3846,10 +3856,10 @@ class JvmSsaBlockRenderer {
           else {
             const array = stagedValue(arrayInput, lines);
             const out = value();
-            lines.push(`if (${array} === null || ${array} === undefined) {`,
+            lines.push(st`if (${array} === null || ${array} === undefined) {`,
               ...materializeLines([...stack, array], index, true).map((line) => `  ${line}`),
-              `  helpers.arrayLength(${array}, frame);`, "}",
-              `const ${out} = ${array}.length;`);
+              st`  helpers.arrayLength(${array}, frame);`, st`}`,
+              constDecl(out, e`${array}.length`, {pure: true}));
             stack.push(out);
           }
         } else if (op === "iaload" || op === "saload" || op === "aaload" ||
@@ -3874,7 +3884,8 @@ class JvmSsaBlockRenderer {
             if (!arrayData && op !== "aaload" &&
                 this.blockArrayDataViewsEnabled) {
               arrayData = value();
-              lines.push(`const ${arrayData} = ${arrayDataExpression(array)};`);
+              lines.push(constDecl(arrayData, arrayDataExpr(array),
+                {pure: true}));
               arrayViews.set(arrayInput, arrayData);
               arrayViews.set(array, arrayData);
               dynamicBlockArrayViews.add(arrayData);
@@ -3882,7 +3893,7 @@ class JvmSsaBlockRenderer {
             }
             const primitiveSentinel = op !== "aaload" && arrayData;
             const arrayIndex = stagedValue(arrayIndexInput, lines);
-            lines.push(`let ${out};`);
+            lines.push(letDecl(out));
             if (primitiveSentinel) {
               const normalized = normalizedArrayLoadExpression(
                 out, op, array, arrayKind);
@@ -3891,48 +3902,51 @@ class JvmSsaBlockRenderer {
                   arrayData, arrayIndexInput, index, op, false);
               const loadFailure =
                 unconditionallyNonNullEntryArrayData.has(arrayData)
-                ? `((${out} = ${arrayData}[${arrayIndex}]) === undefined)`
-                : `(${arrayData} === null || ` +
-                  `(${out} = ${arrayData}[${arrayIndex}]) === undefined)`;
+                ? e`((${out} = ${arrayData}[${arrayIndex}]) === undefined)`
+                : exprConcat(e`(${arrayData} === null || `,
+                  e`(${out} = ${arrayData}[${arrayIndex}]) === undefined)`);
               const provenLoad = normalizedArrayLoadExpression(
-                `${arrayData}[${arrayIndex}]`, op, array, arrayKind);
-              const successfulLoad =
-                `${out} = ${rangeMarker} ? ${provenLoad} : ${normalized};`;
+                e`${arrayData}[${arrayIndex}]`, op, array, arrayKind);
               lines.push(
-                `if (!${rangeMarker} && ${loadFailure}) {`,
+                st`if (!${rangeMarker} && ${loadFailure}) {`,
                 ...materializeLines([...stack, array, arrayIndex], index, true).map((line) => `  ${line}`),
-                `  ${out} = helpers.arrayLoad(${arrayIndex}, ${array}, frame, ${JSON.stringify(op)});`,
+                st`  ${out} = helpers.arrayLoad(${arrayIndex}, ${array}, frame, ${JSON.stringify(op)});`,
                 ...materializeUnwindReleaseLines("  "),
-                "} else {",
-                `  ${successfulLoad}`,
-                "}",
+                st`} else {`,
+                stmt(e`  ${out} = ${rangeMarker} ? ${provenLoad} : ${
+                  normalized};`, {kind: "assign", write: out}),
+                st`}`,
               );
               checkedPrimitiveArrayAccesses.add(`${arrayData}\0${arrayIndexInput}`);
               sentinelArrayLoadCount += 1;
             } else {
               const raw = arrayData
-                ? `${arrayData} !== null ? ${arrayData}[${arrayIndex}] : ` +
-                  `(${array}.elements ? ${array}.elements[${arrayIndex}] : ${array}[${arrayIndex}])`
-                : `${array}.elements ? ${array}.elements[${arrayIndex}] : ${array}[${arrayIndex}]`;
+                ? exprConcat(
+                  e`${arrayData} !== null ? ${arrayData}[${arrayIndex}] : `,
+                  e`(${array}.elements ? ${array}.elements[${arrayIndex}] : ${array}[${arrayIndex}])`)
+                : e`${array}.elements ? ${array}.elements[${arrayIndex}] : ${array}[${arrayIndex}]`;
               const normalized = normalizedArrayLoadExpression(
                 raw, op, array, arrayKind);
               const deferred = deferredStaticView && op !== "aaload"
                 ? deferredStaticArrayAccessFor(
                   arrayInput, arrayIndexInput, index, [
-                    `${out} = ${normalizedArrayLoadExpression(
-                      `${deferredStaticView.data}[${arrayIndex}]`,
+                    stmt(e`${out} = ${normalizedArrayLoadExpression(
+                      e`${deferredStaticView.data}[${arrayIndex}]`,
                       op, array, arrayKind)};`,
+                    {kind: "assign", write: out}),
                   ]) : null;
-              if (deferred) lines.push(`/*${deferred.marker}:start*/`);
+              if (deferred) lines.push(st`/*${deferred.marker}:start*/`);
               lines.push(
-                  `if (${array} === null || ${array} === undefined || ${
-                    arrayIndexOutOfBounds(arrayIndex, `${array}.length`)}) {`,
+                  stmt(e`if (${array} === null || ${array} === undefined || ${
+                    arrayIndexOutOfBounds(arrayIndex, e`${array}.length`)}) {`),
                   ...materializeLines([...stack, array, arrayIndex], index, true).map((line) => `  ${line}`),
-                  `  ${out} = helpers.arrayLoad(${arrayIndex}, ${array}, frame, ${JSON.stringify(op)});`,
+                  st`  ${out} = helpers.arrayLoad(${arrayIndex}, ${array}, frame, ${JSON.stringify(op)});`,
                   ...materializeUnwindReleaseLines("  "),
-                  "} else {", `  ${out} = ${normalized};`, "}",
+                  st`} else {`,
+                  stmt(e`  ${out} = ${normalized};`,
+                    {kind: "assign", write: out}), st`}`,
               );
-              if (deferred) lines.push(`/*${deferred.marker}:end*/`);
+              if (deferred) lines.push(st`/*${deferred.marker}:end*/`);
             }
             if (op === "aaload" && typeof arrayKind === "string") {
               let dimensions = 0;
@@ -3991,7 +4005,8 @@ class JvmSsaBlockRenderer {
             if (!arrayData && op !== "aastore" &&
                 this.blockArrayDataViewsEnabled) {
               arrayData = value();
-              lines.push(`const ${arrayData} = ${arrayDataExpression(array)};`);
+              lines.push(constDecl(arrayData, arrayDataExpr(array),
+                {pure: true}));
               arrayViews.set(arrayInput, arrayData);
               arrayViews.set(array, arrayData);
               dynamicBlockArrayViews.add(arrayData);
@@ -4006,13 +4021,15 @@ class JvmSsaBlockRenderer {
             const normalizedStore = this.inlinePrimitiveArrayStoresEnabled
               ? normalizedArrayStoreExpression(stored, op, array, arrayKind)
               : op === "iastore"
-                ? `((${stored}) | 0)`
-                : `helpers.normalizeArrayStore(${stored}, ${
+                ? e`((${stored}) | 0)`
+                : e`helpers.normalizeArrayStore(${stored}, ${
                   JSON.stringify(op)}, ${array})`;
             const checkedKey = arrayData && `${arrayData}\0${arrayIndexInput}`;
             if (op !== "aastore" && checkedKey &&
                 checkedPrimitiveArrayAccesses.has(checkedKey)) {
-              lines.push(`${arrayData}[${arrayIndex}] = ${normalizedStore};`);
+              lines.push(stmt(
+                e`${arrayData}[${arrayIndex}] = ${normalizedStore};`,
+                {kind: "arrayStore"}));
               eliminatedArrayStoreCheckCount += 1;
             } else if (op !== "aastore" && arrayData &&
                 guardedEntryArrayData.has(arrayData)) {
@@ -4020,39 +4037,46 @@ class JvmSsaBlockRenderer {
                 arrayRangeMarkerFor(
                   arrayData, arrayIndexInput, index, op, true);
               lines.push(
-                `if (!${rangeMarker} && ` +
-                  `${arrayIndexOutOfBounds(
-                    arrayIndex, `${arrayData}.length`)}) {`,
+                stmt(exprConcat(e`if (!${rangeMarker} && `,
+                  e`${arrayIndexOutOfBounds(
+                    arrayIndex, e`${arrayData}.length`)}) {`)),
                 ...materializeLines([...stack, array, arrayIndex, stored], index, true)
                   .map((line) => `  ${line}`),
-                `  helpers.arrayStore(${stored}, ${arrayIndex}, ${array}, frame, ${JSON.stringify(op)});`,
+                st`  helpers.arrayStore(${stored}, ${arrayIndex}, ${array}, frame, ${JSON.stringify(op)});`,
                 ...materializeUnwindReleaseLines("  "),
-                "} else {",
-                `  ${arrayData}[${arrayIndex}] = ${normalizedStore};`,
-                "}",
+                st`} else {`,
+                stmt(e`  ${arrayData}[${arrayIndex}] = ${normalizedStore};`,
+                  {kind: "arrayStore"}),
+                st`}`,
               );
             } else {
               const deferred = deferredStaticView && op !== "aastore"
                 ? deferredStaticArrayAccessFor(
                   arrayInput, arrayIndexInput, index, [
-                    `${deferredStaticView.data}[${arrayIndex}] = ` +
-                      `${normalizedStore};`,
+                    stmt(exprConcat(
+                      e`${deferredStaticView.data}[${arrayIndex}] = `,
+                      e`${normalizedStore};`), {kind: "arrayStore"}),
                   ]) : null;
-              if (deferred) lines.push(`/*${deferred.marker}:start*/`);
+              if (deferred) lines.push(st`/*${deferred.marker}:start*/`);
               lines.push(
-                `if (${array} === null || ${array} === undefined || ${
-                  arrayIndexOutOfBounds(arrayIndex, `${array}.length`)}) {`,
+                stmt(e`if (${array} === null || ${array} === undefined || ${
+                  arrayIndexOutOfBounds(arrayIndex, e`${array}.length`)}) {`),
                 ...materializeLines([...stack, array, arrayIndex, stored], index, true).map((line) => `  ${line}`),
-                `  helpers.arrayStore(${stored}, ${arrayIndex}, ${array}, frame, ${JSON.stringify(op)});`,
+                st`  helpers.arrayStore(${stored}, ${arrayIndex}, ${array}, frame, ${JSON.stringify(op)});`,
                 ...materializeUnwindReleaseLines("  "),
                 ...(arrayData ? [
-                  `} else if (${arrayData} !== null) {`,
-                  `  ${arrayData}[${arrayIndex}] = ${normalizedStore};`,
+                  st`} else if (${arrayData} !== null) {`,
+                  stmt(e`  ${arrayData}[${arrayIndex}] = ${normalizedStore};`,
+                    {kind: "arrayStore"}),
                 ] : []),
-                `} else if (${array}.elements) {`, `  ${array}.elements[${arrayIndex}] = ${normalizedStore};`,
-                "} else {", `  ${array}[${arrayIndex}] = ${normalizedStore};`, "}",
+                st`} else if (${array}.elements) {`,
+                stmt(e`  ${array}.elements[${arrayIndex}] = ${
+                  normalizedStore};`, {kind: "arrayStore"}),
+                st`} else {`,
+                stmt(e`  ${array}[${arrayIndex}] = ${normalizedStore};`,
+                  {kind: "arrayStore"}), st`}`,
               );
-              if (deferred) lines.push(`/*${deferred.marker}:end*/`);
+              if (deferred) lines.push(st`/*${deferred.marker}:end*/`);
             }
           }
         } else if (op === "newarray") {
@@ -4061,10 +4085,10 @@ class JvmSsaBlockRenderer {
           else {
             const count = stagedValue(countInput, lines);
             const out = value(), caught = value();
-            lines.push(`let ${out};`,
-              `try { ${out} = helpers.newPrimitiveArray(${count}, ${JSON.stringify(instruction.arg)}); } catch (${caught}) {`,
+            lines.push(letDecl(out),
+              st`try { ${out} = helpers.newPrimitiveArray(${count}, ${JSON.stringify(instruction.arg)}); } catch (${caught}) {`,
               ...materializeLines([...stack, count], index, true).map((line) => `  ${line}`),
-              `  throw ${caught};`, "}");
+              st`  throw ${caught};`, st`}`);
             stack.push(out);
           }
         } else if (op === "anewarray") {
@@ -4073,10 +4097,10 @@ class JvmSsaBlockRenderer {
           else {
             const count = stagedValue(countInput, lines);
             const out = value(), caught = value();
-            lines.push(`let ${out};`,
-              `try { ${out} = helpers.newReferenceArray(${count}, ${JSON.stringify(instruction.arg)}); } catch (${caught}) {`,
+            lines.push(letDecl(out),
+              st`try { ${out} = helpers.newReferenceArray(${count}, ${JSON.stringify(instruction.arg)}); } catch (${caught}) {`,
               ...materializeLines([...stack, count], index, true).map((line) => `  ${line}`),
-              `  throw ${caught};`, "}");
+              st`  throw ${caught};`, st`}`);
             stack.push(out);
           }
         } else if (op === "monitorenter") {
@@ -4086,19 +4110,19 @@ class JvmSsaBlockRenderer {
             const monitor = stagedValue(monitorInput, lines);
             const caught = value();
             lines.push(
-              "try {",
-              `  if (!helpers.monitorEnter(${monitor}, thread)) {`,
+              st`try {`,
+              st`  if (!helpers.monitorEnter(${monitor}, thread)) {`,
               ...materializeLines([...stack, monitor], index)
                 .map((line) => `    ${line}`),
-              "    helpers.skipJitOnce(frame);",
-              "    return { deopt: true, transient: true, " +
-                "reason: 'contended structured SSA monitorenter' };",
-              "  }",
-              `} catch (${caught}) {`,
+              st`    helpers.skipJitOnce(frame);`,
+              stmt(exprConcat(e`    return { deopt: true, transient: true, `,
+                e`reason: 'contended structured SSA monitorenter' };`)),
+              st`  }`,
+              st`} catch (${caught}) {`,
               ...materializeLines([...stack, monitor], index)
                 .map((line) => `  ${line}`),
-              `  throw ${caught};`,
-              "}",
+              st`  throw ${caught};`,
+              st`}`,
             );
           }
         } else if (op === "monitorexit") {
@@ -4108,13 +4132,13 @@ class JvmSsaBlockRenderer {
             const monitor = stagedValue(monitorInput, lines);
             const caught = value();
             lines.push(
-              "try {",
-              `  helpers.monitorExit(${monitor}, thread);`,
-              `} catch (${caught}) {`,
+              st`try {`,
+              st`  helpers.monitorExit(${monitor}, thread);`,
+              st`} catch (${caught}) {`,
               ...materializeLines([...stack, monitor], index)
                 .map((line) => `  ${line}`),
-              `  throw ${caught};`,
-              "}",
+              st`  throw ${caught};`,
+              st`}`,
             );
           }
         } else if (op === "checkcast") {
@@ -4125,19 +4149,22 @@ class JvmSsaBlockRenderer {
             const source = value(), checked = value(), caught = value();
             const target = JSON.stringify(instruction.arg);
             lines.push(
-              `if (${castValue} !== null && ${castValue} !== undefined) {`,
-              `  const ${source} = ${runtimeClassNameExpression(castValue)};`,
-              `  if (${source} !== ${target}) {`,
-              `    let ${checked};`,
-              `    try { ${checked} = helpers.tryCheckCastSourceSync(${source}, ${target}); } catch (${caught}) {`,
-              ...materializeLines(stack, index).map((line) => `  ${line}`), `  throw ${caught};`, "}",
-              `    if (${checked} === helpers.asyncInvokeSentinel()) {`,
+              st`if (${castValue} !== null && ${castValue} !== undefined) {`,
+              stmt(e`  const ${source} = ${
+                runtimeClassNameExpression(castValue)};`,
+              {kind: "const", def: source}),
+              st`  if (${source} !== ${target}) {`,
+              st`    let ${checked};`,
+              st`    try { ${checked} = helpers.tryCheckCastSourceSync(${source}, ${target}); } catch (${caught}) {`,
+              ...materializeLines(stack, index).map((line) => `  ${line}`),
+              st`  throw ${caught};`, st`}`,
+              st`    if (${checked} === helpers.asyncInvokeSentinel()) {`,
               ...materializeLines(stack, index).map((line) => `    ${line}`),
-              "      helpers.skipJitOnce(frame);",
-              "      return { deopt: true, transient: true, reason: 'cold structured SSA checkcast' };",
-              "    }",
-              "  }",
-              "}");
+              st`      helpers.skipJitOnce(frame);`,
+              st`      return { deopt: true, transient: true, reason: 'cold structured SSA checkcast' };`,
+              st`    }`,
+              st`  }`,
+              st`}`);
           }
         } else if (op === "instanceof") {
           const input = pop();
@@ -4147,14 +4174,15 @@ class JvmSsaBlockRenderer {
             const out = value();
             const target = JSON.stringify(instruction.arg);
             lines.push(
-              `const ${out} = helpers.tryInstanceOfSync(${candidate}, ${target});`,
-              `if (${out} === helpers.asyncInvokeSentinel()) {`,
+              constDecl(out,
+                e`helpers.tryInstanceOfSync(${candidate}, ${target})`),
+              st`if (${out} === helpers.asyncInvokeSentinel()) {`,
               ...materializeLines([...stack, candidate], index)
                 .map((line) => `  ${line}`),
-              "  helpers.skipJitOnce(frame);",
-              "  return { deopt: true, transient: true, " +
-                "reason: 'cold structured SSA instanceof' };",
-              "}",
+              st`  helpers.skipJitOnce(frame);`,
+              stmt(exprConcat(e`  return { deopt: true, transient: true, `,
+                e`reason: 'cold structured SSA instanceof' };`)),
+              st`}`,
             );
             stack.push(out);
           }
@@ -4169,46 +4197,50 @@ class JvmSsaBlockRenderer {
             const directKey = fieldPlan?.directInstanceKey || null;
             const denseSlot = fieldPlan?.denseSlot;
             const directRead = Number.isInteger(denseSlot)
-              ? `(Array.isArray(${object}.fields) ? ` +
-                `${object}.fields[${denseSlot}] : ` +
-                `(${object}.fields && ` +
-                `${object}.fields[${JSON.stringify(directKey)}] !== undefined ? ` +
-                `${object}.fields[${JSON.stringify(directKey)}] : ` +
-                `helpers.getFieldAt(${site}, ${object})))`
+              ? exprConcat(
+                e`(Array.isArray(${object}.fields) ? `,
+                e`${object}.fields[${denseSlot}] : `,
+                e`(${object}.fields && `,
+                e`${object}.fields[${JSON.stringify(directKey)}] !== undefined ? `,
+                e`${object}.fields[${JSON.stringify(directKey)}] : `,
+                e`helpers.getFieldAt(${site}, ${object})))`)
               : directKey
-              ? `(${object}.fields && ` +
-                `${object}.fields[${JSON.stringify(directKey)}] !== undefined ? ` +
-                `${object}.fields[${JSON.stringify(directKey)}] : ` +
-                `helpers.getFieldAt(${site}, ${object}))`
-              : `helpers.getFieldAt(${site}, ${object})`;
+              ? exprConcat(
+                e`(${object}.fields && `,
+                e`${object}.fields[${JSON.stringify(directKey)}] !== undefined ? `,
+                e`${object}.fields[${JSON.stringify(directKey)}] : `,
+                e`helpers.getFieldAt(${site}, ${object}))`)
+              : e`helpers.getFieldAt(${site}, ${object})`;
             if (cache?.eagerLocal !== null &&
                 cache?.eagerLocal !== undefined) {
               if (!cache.eagerThis) {
                 if (cache.isArray && cache.data) {
                   eagerFieldReceiverNullChecks.set(object, cache.data);
                 }
-                lines.push(`if (${object} === null || ${object} === undefined) {`,
+                lines.push(st`if (${object} === null || ${object} === undefined) {`,
                   ...materializeLines([...stack, object], index, true).map((line) => `  ${line}`),
-                  `  helpers.getFieldAt(${site}, ${object});`, "}");
+                  st`  helpers.getFieldAt(${site}, ${object});`, st`}`);
               }
-              lines.push(`const ${out} = ${cache.value};`);
+              lines.push(constDecl(out, e`${cache.value}`, {pure: true}));
             } else {
-              lines.push(`if (${object} === null || ${object} === undefined) {`,
+              lines.push(st`if (${object} === null || ${object} === undefined) {`,
                 ...materializeLines([...stack, object], index, true).map((line) => `  ${line}`),
-                `  helpers.getFieldAt(${site}, ${object});`, "}");
+                st`  helpers.getFieldAt(${site}, ${object});`, st`}`);
             }
             if (cache && (cache.eagerLocal === null ||
                 cache.eagerLocal === undefined)) {
-              lines.push(`let ${out};`,
-                `if (${cache.valid} && ${cache.object} === ${object}) {`,
-                `  ${out} = ${cache.value};`, "} else {",
-                `  ${out} = ${directRead};`,
-                `  ${cache.object} = ${object};`,
-                `  ${cache.value} = ${out};`,
-                ...(cache.isArray ? [`  ${cache.data} = ${arrayDataExpression(out)};`] : []),
-                `  ${cache.valid} = true;`, "}");
+              lines.push(letDecl(out),
+                st`if (${cache.valid} && ${cache.object} === ${object}) {`,
+                st`  ${out} = ${cache.value};`, st`} else {`,
+                stmt(e`  ${out} = ${directRead};`,
+                  {kind: "assign", write: out}),
+                st`  ${cache.object} = ${object};`,
+                st`  ${cache.value} = ${out};`,
+                ...(cache.isArray
+                  ? [stmt(e`  ${cache.data} = ${arrayDataExpr(out)};`)] : []),
+                st`  ${cache.valid} = true;`, st`}`);
             } else if (!cache) {
-              lines.push(`const ${out} = ${directRead};`);
+              lines.push(constDecl(out, directRead));
             }
             if (cache?.isArray) {
               const descriptor = this.jit.fieldSites[site]?.descriptor;
@@ -4230,7 +4262,8 @@ class JvmSsaBlockRenderer {
               // live on the SSA operand stack. Snapshot its storage companion
               // so future cache maintenance cannot retarget this value.
               const dataSnapshot = value();
-              lines.push(`const ${dataSnapshot} = ${cache.data};`);
+              lines.push(constDecl(dataSnapshot, e`${cache.data}`,
+                {pure: true}));
               arrayViews.set(out, dataSnapshot);
             }
             stack.push(out);
@@ -4249,32 +4282,34 @@ class JvmSsaBlockRenderer {
             const object = stagedValue(objectInput, lines);
             const stored = stagedValue(storedInput, lines);
             lines.push(
-              `if (${object} === null || ${object} === undefined) {`,
+              st`if (${object} === null || ${object} === undefined) {`,
               ...materializeLines([...stack, object, stored], index, true).map((line) => `  ${line}`),
-              `  helpers.putFieldAt(${site}, ${object}, ${stored});`, "}",
+              st`  helpers.putFieldAt(${site}, ${object}, ${stored});`, st`}`,
               ...(Number.isInteger(denseSlot) ? [
-                `if (Array.isArray(${object}.fields)) {`,
-                `  ${object}.fields[${denseSlot}] = ${stored};`,
-                `} else if (${object}.fields) {`,
-                `  ${object}.fields[${JSON.stringify(directKey)}] = ${stored};`,
-                "} else {",
-                `  helpers.putFieldAt(${site}, ${object}, ${stored});`,
-                "}",
+                st`if (Array.isArray(${object}.fields)) {`,
+                st`  ${object}.fields[${denseSlot}] = ${stored};`,
+                st`} else if (${object}.fields) {`,
+                st`  ${object}.fields[${JSON.stringify(directKey)}] = ${stored};`,
+                st`} else {`,
+                st`  helpers.putFieldAt(${site}, ${object}, ${stored});`,
+                st`}`,
               ] : directKey ? [
-                `if (${object}.fields) {`,
-                `  ${object}.fields[${JSON.stringify(directKey)}] = ${stored};`,
-                "} else {",
-                `  helpers.putFieldAt(${site}, ${object}, ${stored});`,
-                "}",
-              ] : [`helpers.putFieldAt(${site}, ${object}, ${stored});`]));
+                st`if (${object}.fields) {`,
+                st`  ${object}.fields[${JSON.stringify(directKey)}] = ${stored};`,
+                st`} else {`,
+                st`  helpers.putFieldAt(${site}, ${object}, ${stored});`,
+                st`}`,
+              ] : [st`helpers.putFieldAt(${site}, ${object}, ${stored});`]));
           }
         } else if (op === "new") {
           const out = value();
-          lines.push(`const ${out} = helpers.newObjectSync(${JSON.stringify(instruction.arg)});`,
-            `if (${out} === helpers.staticDeopt()) {`,
+          lines.push(constDecl(out,
+            e`helpers.newObjectSync(${JSON.stringify(instruction.arg)})`),
+            st`if (${out} === helpers.staticDeopt()) {`,
             ...materializeLines(stack, index).map((line) => `  ${line}`),
-            "  helpers.skipJitOnce(frame);",
-            "  return { deopt: true, transient: true, reason: 'class initialization in structured SSA new' };", "}");
+            st`  helpers.skipJitOnce(frame);`,
+            st`  return { deopt: true, transient: true, reason: 'class initialization in structured SSA new' };`,
+            st`}`);
           stack.push(out);
         } else if (op === "getstatic") {
           const site = fieldSites.get(index), direct = directStaticSites.get(index), out = value();
@@ -4313,13 +4348,14 @@ class JvmSsaBlockRenderer {
             } else {
               const emissionStart = lines.length;
               const key = JSON.stringify(direct.key);
-              lines.push(`const ${out} = ${direct.kind === "map"
-                ? `${direct.variable}.get(${key})` : `${direct.variable}[${key}]`};`);
+              lines.push(constDecl(out, direct.kind === "map"
+                ? e`${direct.variable}.get(${key})`
+                : e`${direct.variable}[${key}]`, {pure: true}));
               stack.push(out);
               let data = null;
               if (direct.descriptor?.startsWith("[")) {
                 data = value();
-                lines.push(`const ${data} = ${arrayDataExpression(out)};`);
+                lines.push(constDecl(data, arrayDataExpr(out), {pure: true}));
                 arrayViews.set(out, data);
                 arrayKinds.set(out, direct.descriptor);
               }
@@ -4340,27 +4376,29 @@ class JvmSsaBlockRenderer {
               const emitted = cache &&
                   this.directEntryStaticLinkingEnabled ? [] : lines;
               const prefix = cache ? "  " : "";
-              emitted.push(`let ${out};`);
+              emitted.push(letDecl(out));
               if (cache) {
-                emitted.push(`if (${cache.valid}) {`,
-                  `  ${out} = ${cache.value};`,
-                  "} else {");
+                emitted.push(st`if (${cache.valid}) {`,
+                  st`  ${out} = ${cache.value};`,
+                  st`} else {`);
               }
-              emitted.push(`${prefix}if (${lazy.variable}) {`,
-                `${prefix}  ${out} = ${lazy.variable}.kind === "map" ? ` +
-                  `${lazy.variable}.fields.get(${lazy.variable}.key) : ` +
-                  `${lazy.variable}.fields[${lazy.variable}.key];`,
-                `${prefix}} else {`,
-                `${prefix}  ${out} = helpers.getStaticSyncAt(${site});`,
-                `${prefix}  if (${out} === helpers.staticDeopt()) {`,
+              emitted.push(st`${prefix}if (${lazy.variable}) {`,
+                stmt(exprConcat(
+                  e`${prefix}  ${out} = ${lazy.variable}.kind === "map" ? `,
+                  e`${lazy.variable}.fields.get(${lazy.variable}.key) : `,
+                  e`${lazy.variable}.fields[${lazy.variable}.key];`),
+                {kind: "assign", write: out}),
+                st`${prefix}} else {`,
+                st`${prefix}  ${out} = helpers.getStaticSyncAt(${site});`,
+                st`${prefix}  if (${out} === helpers.staticDeopt()) {`,
                 ...materializeLines(stack, index).map(
                   (line) => `${prefix}    ${line}`),
-                `${prefix}    helpers.skipJitOnce(frame);`,
-                `${prefix}    return { deopt: true, transient: true, reason: 'class initialization in structured SSA getstatic' };`,
-                `${prefix}  }`,
-                `${prefix}  ${lazy.variable} = helpers.fieldSites[${site}].staticTarget;`,
-                `${prefix}  if (${lazy.variable}) helpers.structuredSsa.lazyStaticTargetLinkCount += 1;`,
-                `${prefix}}`);
+                st`${prefix}    helpers.skipJitOnce(frame);`,
+                st`${prefix}    return { deopt: true, transient: true, reason: 'class initialization in structured SSA getstatic' };`,
+                st`${prefix}  }`,
+                st`${prefix}  ${lazy.variable} = helpers.fieldSites[${site}].staticTarget;`,
+                st`${prefix}  if (${lazy.variable}) helpers.structuredSsa.lazyStaticTargetLinkCount += 1;`,
+                st`${prefix}}`);
               if (cache) {
                 // A whole-class preparation can compile this method before
                 // the static owner initializes. Once the ordinary framed
@@ -4369,30 +4407,32 @@ class JvmSsaBlockRenderer {
                 // at its pre-link null value makes a later proven store use
                 // stale storage even though the Java reference resolved.
                 emitted.push(
-                  `  ${cache.value} = ${normalizeJvmScalarExpression(
-                    out, cache.descriptor)};`,
+                  stmt(e`  ${cache.value} = ${normalizeJvmScalarExpression(
+                    out, cache.descriptor)};`),
                   ...(cache.data
-                    ? [`  ${cache.data} = ${arrayDataExpression(out)};`]
+                    ? [stmt(e`  ${cache.data} = ${arrayDataExpr(out)};`)]
                     : []),
-                  `  ${cache.valid} = Boolean(${lazy.variable});`,
-                  "}",
+                  st`  ${cache.valid} = Boolean(${lazy.variable});`,
+                  st`}`,
                 );
               }
               if (emitted !== lines) {
-                const marker =
-                  `__JVM_DIRECT_ENTRY_STATIC_READ_${index}_${site}__`;
+                const marker = named(
+                  `__JVM_DIRECT_ENTRY_STATIC_READ_${index}_${site}__`);
                 directEntryStaticReadFallbacks.set(marker, {
-                  direct: [`const ${out} = ${cache.value};`],
+                  direct: [constDecl(out, e`${cache.value}`, {pure: true})],
                   ordinary: emitted,
                 });
-                lines.push(marker);
+                lines.push(st`${marker}`);
               }
             } else {
-              lines.push(`const ${out} = helpers.getStaticSyncAt(${site});`,
-              `if (${out} === helpers.staticDeopt()) {`,
+              lines.push(
+              constDecl(out, e`helpers.getStaticSyncAt(${site})`),
+              st`if (${out} === helpers.staticDeopt()) {`,
               ...materializeLines(stack, index).map((line) => `  ${line}`),
-              "  helpers.skipJitOnce(frame);",
-              "  return { deopt: true, transient: true, reason: 'class initialization in structured SSA getstatic' };", "}");
+              st`  helpers.skipJitOnce(frame);`,
+              st`  return { deopt: true, transient: true, reason: 'class initialization in structured SSA getstatic' };`,
+              st`}`);
             }
             stack.push(out);
             const lazyCache = lazy?.entryReadCache;
@@ -4415,15 +4455,18 @@ class JvmSsaBlockRenderer {
             changed = value();
           if (input === null || site === undefined) valid = false;
           else if (direct) lines.push(
-            `${direct.variable}.set(${JSON.stringify(direct.key)}, ${input});`,
-            `if (helpers.directStaticTargets[${direct.targetId}].versionCell` +
-              `.captureCaches) helpers.markStaticTargetChanged(` +
-              `helpers.directStaticTargets[${direct.targetId}]);`);
-          else lines.push(`const ${changed} = helpers.putStaticSyncAt(${site}, ${input});`,
-            `if (${changed} === helpers.staticDeopt()) {`,
+            st`${direct.variable}.set(${JSON.stringify(direct.key)}, ${input});`,
+            stmt(exprConcat(
+              e`if (helpers.directStaticTargets[${direct.targetId}].versionCell`,
+              e`.captureCaches) helpers.markStaticTargetChanged(`,
+              e`helpers.directStaticTargets[${direct.targetId}]);`)));
+          else lines.push(
+            constDecl(changed, e`helpers.putStaticSyncAt(${site}, ${input})`),
+            st`if (${changed} === helpers.staticDeopt()) {`,
             ...materializeLines([...stack, input], index).map((line) => `  ${line}`),
-            "  helpers.skipJitOnce(frame);",
-            "  return { deopt: true, transient: true, reason: 'class initialization in structured SSA putstatic' };", "}");
+            st`  helpers.skipJitOnce(frame);`,
+            st`  return { deopt: true, transient: true, reason: 'class initialization in structured SSA putstatic' };`,
+            st`}`);
         } else if (op === "invokestatic" || op === "invokevirtual" ||
             op === "invokespecial" || op === "invokeinterface") {
           directStaticBlockValues.clear();
@@ -4441,15 +4484,18 @@ class JvmSsaBlockRenderer {
             if (valid) {
               const out = value(), caught = value();
               lines.push(...(site.directJre.isStatic ? [
-                `if (!helpers.directJreInitializationTokens[${site.directJre.id}].initialized) {`,
+                st`if (!helpers.directJreInitializationTokens[${site.directJre.id}].initialized) {`,
                 ...materializeLines(callStack, index).map((line) => `  ${line}`),
-                "  helpers.skipJitOnce(frame);",
-                "  return { deopt: true, transient: true, reason: 'class initialization at direct structured JRE call' };",
-                "}",
-              ] : []), `let ${out};`,
-                `try { ${out} = helpers.directJreIntrinsics[${site.directJre.id}](${args.join(", ")}); } catch (${caught}) {`,
-                ...materializeLines(callStack, index).map((line) => `  ${line}`),
-                `  throw ${caught};`, "}");
+                st`  helpers.skipJitOnce(frame);`,
+                st`  return { deopt: true, transient: true, reason: 'class initialization at direct structured JRE call' };`,
+                st`}`,
+              ] : []), letDecl(out),
+              stmt(exprConcat(
+                e`try { ${out} = helpers.directJreIntrinsics[${
+                  site.directJre.id}](`,
+                argumentListExpression(args), e`); } catch (${caught}) {`)),
+              ...materializeLines(callStack, index).map((line) => `  ${line}`),
+              st`  throw ${caught};`, st`}`);
               if (!site.returnsVoid) stack.push(out);
             }
           }
@@ -4464,20 +4510,23 @@ class JvmSsaBlockRenderer {
               const out = value();
               // The plan is rendered once against fixed parameter names;
               // each site binds those names to its operands inside the block.
-              lines.push(`let ${out};`, "{",
-                ...args.map((argument, position) =>
-                  `  const ${inlineIntegerArgumentName(position)} = ${argument};`),
-                ...site.inline.statements.map((statement) => `  ${statement}`));
+              lines.push(letDecl(out), st`{`,
+                ...args.map((argument, position) => stmt(
+                  e`  const ${inlineIntegerArgumentName(position)} = ${
+                    argument};`, {foreign: true})),
+                ...site.inline.statements.map((statement) =>
+                  stmt(`  ${statement}`, {foreign: true})));
               if (site.inline.guards?.length) {
                 const guard = site.inline.guards.join(" && ");
-                lines.push(`  if (!(${guard})) {`,
+                lines.push(stmt(`  if (!(${guard})) {`, {foreign: true}),
                   ...materializeLines(callStack, index)
                     .map((line) => `    ${line}`),
-                  "    helpers.skipJitOnce(frame);",
-                  "    return { deopt: true, transient: true, reason: 'guarded inline integer leaf' };",
-                  "  }");
+                  st`    helpers.skipJitOnce(frame);`,
+                  st`    return { deopt: true, transient: true, reason: 'guarded inline integer leaf' };`,
+                  st`  }`);
               }
-              lines.push(`  ${out} = ${site.inline.result};`, "}");
+              lines.push(stmt(`  ${out} = ${site.inline.result};`,
+                {foreign: true}), st`}`);
               stack.push(out);
             }
           } else if (site.directIntrinsic?.kind === "primitiveArrayCopy" &&
@@ -4490,9 +4539,11 @@ class JvmSsaBlockRenderer {
             }
             if (valid) {
               const caught = value();
-              lines.push(`try { helpers.primitiveArrayCopyDirect(${args.join(", ")}); } catch (${caught}) {`,
+              lines.push(stmt(exprConcat(
+                e`try { helpers.primitiveArrayCopyDirect(`,
+                argumentListExpression(args), e`); } catch (${caught}) {`)),
                 ...materializeLines(callStack, index).map((line) => `  ${line}`),
-                `  throw ${caught};`, "}");
+                st`  throw ${caught};`, st`}`);
             }
           } else {
             const callStack = [...stack];

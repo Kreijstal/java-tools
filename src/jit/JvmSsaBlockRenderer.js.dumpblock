@@ -1,0 +1,17 @@
+      if (process.env.JVM_DUMP_GENERATED) {
+        try {
+          require("fs").appendFileSync(process.env.JVM_DUMP_GENERATED,
+            JSON.stringify({
+              k: `${method.className}.${method.name}${method.descriptor}`,
+              d: String(directPositionalSource || ""),
+              i: String(internalRegionPositionalSource || ""),
+              r: String(restoringDirectPositionalSource || ""),
+              c: String(checkedLeafDirectPositionalSource || ""),
+              t: String(trustedCheckedLeafDirectPositionalSource || ""),
+              p: String(preflightedCheckedLeafDirectPositionalSource || ""),
+              a: String(capturedCheckedLeafDirectPositionalSource || ""),
+              w: String(recursiveArrayWorkerSource || ""),
+              b: String(generatedSource || ""),
+            }) + "\n");
+        } catch (error) { console.error("dump", error.message); }
+      }
