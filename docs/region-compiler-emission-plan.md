@@ -2,11 +2,11 @@
 
 `src/jit/HotCallGraphRegionCompiler.js` composes a hot call-graph region out of
 the per-method JavaScript that `src/jit/JvmSsaBlockRenderer.js` publishes on
-`generated.*`. Today it recovers the structure of that JavaScript by re-parsing
+`generated.*`. It used to recover the structure of that JavaScript by re-parsing
 it with `acorn` and splicing byte ranges (`applySourceEdits`), plus a handful of
-regular expressions over generated text.
+regular expressions over generated text. One `parse()` call is left (§6).
 
-That violates the compiler-pass rule the repository works to:
+That violated the compiler-pass rule the repository works to:
 
 > The JIT emits JavaScript source text. It must not re-parse or regex-match the
 > JavaScript it has already generated. Analysis and transformation happen on the
@@ -25,15 +25,15 @@ Line numbers are as of `master` (`bc9fe15` era, region compiler at 3514 lines).
 
 | # | Site | What it recovers from text | Where the renderer has it |
 |---|------|----------------------------|---------------------------|
-| 1 | `applySourceEdits` (L70) | — (shared byte-splice engine for 2,3,4,6,8,9,10) | n/a; disappears as its callers do |
+| 1 | `applySourceEdits` (L70) | — (shared byte-splice engine for 2,3,4,6,8,9,10) | n/a; only site 3 still calls it |
 | 2 | `removeUnusedRegionBindings` (L127; `parse` L132, edits L245) | which renderer-published call bindings (`ssaCallSite<i>`, `ssaFastPositional*<i>`, `ssaLateLinkPositional<i>`) are still referenced after lowering, and their pure-initializer dependency chain | the region compiler itself decides which bindings it links; the renderer knows each binding's declaration text and kind. **Do not emit** instead of parse-and-delete. |
-| 3 | `inlineAtomicPositionalSource` (L255; `parse` L270, edits L366/L382) — **still present**, see §5 | callee parameter binding, local declarations, `return` statements, label set of an atomic positional body, in order to alpha-rename and splice it into a caller | the renderer already renders checked leaves as `ssaInlineBody<serial>: { … }` with `assemble({feeds, provenGuards, exitLabel})` (741c9b1). The same shape is needed for `jvmInternalRegionPositionalSource`: a body valid standalone *and* inserted, plus published parameter/result/label names. |
+| 3 | `inlineAtomicPositionalSource` (L255; `parse` L270, edits L366/L382) — **still present**, see §6 | callee parameter binding, local declarations, `return` statements, label set of an atomic positional body, in order to alpha-rename and splice it into a caller | the renderer already renders checked leaves as `ssaInlineBody<serial>: { … }` with `assemble({feeds, provenGuards, exitLabel})` (741c9b1). The same shape is needed for `jvmInternalRegionPositionalSource`: a body valid standalone *and* inserted, plus published parameter/result/label names. |
 | 4 | `removeUnreachableRegionFunctions` (L396; `parse` L399, edits L429) — **gone** (stage E) | the call graph among the module's own `jvmRegionNode<i>` / helper functions, to drop unreachable ones | the region compiler *builds* `declarations` itself and knows every function name it emitted and every name it linked. This is a data-level reachability walk over its own emission list. |
 | 5 | `splitModuleSourceForFactoryHoist` (L454; `parse` L457, slice L489) — **gone** (stage E) | top-level function-declaration boundaries in the assembled module | the region compiler assembled that module from a `declarations` array; keep the array, emit two texts. |
-| 6 | `outlineLargeRegionLoops` (L507; `parse` L549, edits L713/L758) | loop statements, their byte size, and their free variables, to outline them into helper functions | needs renderer-published statement/loop fragment boundaries with free-variable sets (see §4). |
-| 7 | `collectOversizedUnits` (L830) | AST consumer of #9's parse | as #9 |
-| 8 | `liftOversizedUnitLocalsToEnvironment` (L876; `parse` L883, edits L1009) | function-scoped `let/const` declarations and all their reference sites, to move them into an environment array | the renderer owns every local name it emits (`local<slot>`, `ssaValue<n>`, call bindings). It can publish the *name set* per unit and, better, render local access through a late-bound accessor token so lifting is a choice of expansion, not a rewrite. |
-| 9 | `partitionOversizedLinearBlocks` (L1014) — `yield`→`void` regex (L1045) and the `slice(node.start, +5) === "yield"` probe (L1170) are **gone** (stage D); `parse` (L1048), fragment slices (L1265/L1286/L1293), `'use strict'` prologue regex (L1403) | statement boundaries of oversized linear runs and the live names crossing them; whether a statement is a `yield`; where the directive prologue ends | statement-level fragment boundaries + free variables (§4). The `yield` regex and the directive regex are removable now (see §2, stage D). |
+| 6 | `outlineLargeRegionLoops` (L507; `parse` L549, edits L713/L758) — **gone** (stage F) | loop statements, their byte size, and their free variables, to outline them into helper functions | needs renderer-published statement/loop fragment boundaries with free-variable sets (see §4). |
+| 7 | `collectOversizedUnits` (L830) — **gone** (stage F) | AST consumer of #9's parse | as #9 |
+| 8 | `liftOversizedUnitLocalsToEnvironment` (L876; `parse` L883, edits L1009) — **gone** (stage F) | function-scoped `let/const` declarations and all their reference sites, to move them into an environment array | the renderer owns every local name it emits (`local<slot>`, `ssaValue<n>`, call bindings). It can publish the *name set* per unit and, better, render local access through a late-bound accessor token so lifting is a choice of expansion, not a rewrite. |
+| 9 | `partitionOversizedLinearBlocks` (L1014) — **gone** (stages C, D, F) | statement boundaries of oversized linear runs and the live names crossing them; whether a statement is a `yield`; where the directive prologue ends | statement-level fragment boundaries + free variables (§4). The `yield` regex and the directive regex are removable now (see §2, stage D). |
 | 10 | `rewriteCallBindings` (L1947; `parse` L1960, AST index L2030–L2110, slices L2182/L2192/L2270/L2305/L2334, edit application L2436) | per call site: the marker span, the raw-invoke `CallExpression` and its argument texts, the assignment target (`out`), the innermost `try` around the call with its `catch` parameter and its restoring `else`-block, the `let <out>;` declaration statement, the `thread.callStack.items.length` depth declaration, the binding `VariableDeclarator` initializers, and the trailing `true` literal of unlowered raw calls | **all of it.** The renderer emits every one of those strings; it only fails to publish them. |
 | 11 | `let safePointBudget = N;` regex on `outlined.source` (L2813) | the renderer's exact per-method safe-point budget declaration, so the fused module can own one counter | the renderer knows the declaration text it emitted; publish it and remove by exact identity, or publish a variant without it. |
 
@@ -158,10 +158,11 @@ rewritten. `test/hotCallGraphLinearPartition.test.js`
 ("a \"yield\" inside a string is not mistaken for a keyword") drives exactly that
 shape and diverges from the original generator under the old pass.
 
-**This stage is interim.** The parse itself remains. It disappears when the pass
-moves onto renderer-published fragments (`generated.jvmStructuredRegionFragments`,
-§4) and selects fragments instead of byte ranges; the wrapper and the offset
-rebase go with it.
+**This stage was interim** and is now finished: stage F moved the pass onto
+§4's fragments, and `GENERATOR_UNIT_PREFIX`, `rebaseAstOffsets` and the parse
+itself are gone. A unit is a generator because its *caller* says so, not
+because a wrapper made acorn accept it, and a run carries a yield because the
+statements in it say so.
 
 ### Stage E — module-level structure (sites 4, 5) — landed
 
@@ -220,33 +221,79 @@ partition pass sees rather than deleted from its output.
 
 ### Stage F — inlining, outlining, partitioning, env-lift (sites 3, 6, 8, 9)
 
-Site 3 was attempted and is **blocked on emitters outside this pass**; see §5.
+Site 3 was attempted and is **blocked on emitters outside this pass**; see §6.
+Sites 6, 8 and 9 landed: they are now selections and rewrites over the
+statement records §4 publishes, and the region compiler's last three `parse()`
+calls are gone.
 
-These are the deep ones. They are *real* compiler passes that happen to be
-implemented on text. To move them to emission the renderer must publish, for each
-positional body:
+**What each site became.**
 
-1. **Statement-level fragment boundaries.** An ordered list of fragments
-   (`{id, lines, kind}`) instead of one joined string, with loops and try/catch
-   marked as single structural units, so outlining and partitioning select
-   fragments rather than byte ranges. `checkedLeafInlineBody.assemble()` from
-   741c9b1 is the existing precedent for a body built from fragments.
-2. **Free variables per fragment.** The set of emitted names each fragment reads
-   and writes (the renderer knows them: it created every `local<slot>`,
-   `ssaValue<n>` and call binding). This is what `liftOversizedUnitLocalsToEnvironment`
-   and `partitionOversizedLinearBlocks` currently rediscover by walking the AST.
-3. **Declared-name sets and their kinds** per body, so env-lift becomes a choice
-   of how a fragment's names are spelled at emission (`local7` vs `env[7]`) —
-   ideally a late-bound accessor token expanded by identity — rather than a
-   rename over emitted text.
-4. **Return/label discipline for insertion.** For `inlineAtomicPositionalSource`,
-   the same contract 741c9b1 gave checked leaves: a body that completes through a
-   labeled block into a published result name, with published parameter names the
-   caller binds by declaration, so no alpha-renaming of emitted text is needed.
+* `outlineLargeRegionLoops(unit, options)` takes a unit -- a header, a
+  statement list and a footer the compiler owns -- and returns the rewritten
+  unit plus the helper units it created. A candidate is a loop the renderer
+  cut as its own fragment; its live-in set is the names its statements
+  recorded as reads, its live-out set the names they recorded as writes, and
+  every `return` it carries is re-established from the split the statement
+  published around its own keyword. Innermost-first selection and the
+  `jvmRegionOutlinedState<n>` protocol are unchanged.
+* `liftOversizedUnitLocalsToEnvironment(units, options)` lifts the names
+  §4's `jvmStructuredRegionLocalNames` declares once at a unit's top level.
+  A reference is rewritten by substituting the operand in the statement's own
+  parts list and rendering it again -- `rerenderStatement` performed by the
+  consumer -- so the shorthand-property expansion the AST version needed has
+  no analogue: the operand model cannot express a shorthand property, and a
+  fixture that contains one is declined.
+* `partitionOversizedLinearBlocks(units, options)` walks a unit's statement
+  groups, where a group is a statement and everything up to its matching
+  close, computed from the nesting deltas the emitters recorded. Runs are
+  maximal consecutive groups; an oversized group recurses into the statement
+  lists it owns, split at the block continuations (`} else {`) it contains.
+  The `jvmRegionSegmentState<n>` protocol, the outward-jump table and the
+  run-declaration hoist are unchanged; a jump is spliced between the parts the
+  statement published around its own `break`/`continue`.
 
-Until (1)–(4) exist, these four sites stay as they are: they are correct, they are
-covered by tests, and moving them without the structural inputs above would only
-relocate the parsing.
+**How fragments survive composition.** Option (b): the statement list travels
+alongside the source and is kept in step by construction.
+`rewriteCallBindings` returns the edits it applied, and
+`applyRegionStatementEdits` maps them onto the records -- a statement an edit
+rewrote, and every statement a multi-line edit spanned, become one opaque
+record whose names are unknown, so nothing containing it is relocated; an edit
+that empties a statement leaves an empty record. A merged record keeps the
+nesting delta of what it replaced, which holds because a lowered call span and
+its replacement are both complete constructs; if it ever stopped holding the
+deltas would not balance and `statementGroups` declines the body rather than
+mis-grouping it. Composed bodies (`composedInternalStatements`,
+`exceptionalInlineStatements`) carry their records through the composition
+fixed point the same way.
+
+**`compileModule` owns units.** A declaration entry is no longer a text blob
+but the units it is emitted from, so pruning, the factory-hoist split,
+lifting and partitioning are all list operations and the module text is
+rendered once, at the end.
+
+**What a pass now declines.** A region is extracted only when every statement
+in it is relocatable. A statement is not, when it opens a `switch`, carries a
+nested function, mentions `this`/`super`/`await`/`arguments`/`eval`/`var`,
+declares an ambient name, carries both a `return` and a jump, carries more
+than one of either, or is the opaque record a composition edit produced. The
+AST version accepted a few of these and handled them explicitly; the loss is
+measured in §3.
+
+**Sources without records.** `jvmHotCallGraphFramedSource` and the checked-leaf
+variants are not among the three positional variants §4 publishes, so a node
+emitted from one of them is emitted as finished text and no structural pass
+touches it. Two consequences, both measured:
+
+* `JVM_ENABLE_HOT_CALL_GRAPH_FRAMED_PARTITION=1` is a no-op on a real module:
+  its unit is the framed root, which has no records. It was not a no-op
+  before.
+* The renderer's own two calls (the continuation tier's loop outlining and
+  linear partitioning, `JVM_ENABLE_STRUCTURED_LOOP_OUTLINING` and
+  `JVM_ENABLE_STRUCTURED_LINEAR_PARTITION`) stay wired but are inert: the
+  canonical body's prologue still carries lines no emitter recorded -- the
+  entry scaffold, the local declarations, the spill helper and the frame
+  materialization helpers -- so `regionFragmentsOf` declines it. Recording
+  those emitters lights both back up with no further change here.
 
 ## 3. Status
 
@@ -255,10 +302,9 @@ relocate the parsing.
 * Stage B — landed. `removeUnusedRegionBindings` and `pureGeneratedExpression`
   are deleted.
 * Stage C — landed. The `'use strict'` and `safePointBudget` regexes are gone.
-* Stage D — landed as an **interim**: the `yield`→`void ` regex and the
-  `slice(node.start, +5) === "yield"` probe are gone, but the pass still parses
-  (now through the generator-declaration prefix idiom, with offsets rebased).
-  It stops parsing when §4's fragments are consumed.
+* Stage D — landed, and no longer interim: the `yield`→`void ` regex, the
+  `slice(node.start, +5) === "yield"` probe, the generator-declaration wrapper
+  and the offset rebase are all gone with stage F.
 * Stage E — landed. `removeUnreachableRegionFunctions` and
   `splitModuleSourceForFactoryHoist` are deleted; module reachability and the
   factory-hoist split are list operations over `compileModule`'s own
@@ -266,26 +312,63 @@ relocate the parsing.
 * Stage F, renderer half — landed. The renderer runs no line-level text pass
   any more: every statement it emits is recorded as a parts list (§5), the
   optimizations run over those records, and §4's fragments are published.
-* Stage F, region-compiler half — not landed. Sites 6, 8 and 9 can now be
-  replaced by selections over §4's fragments. Site 3 was attempted and is
-  blocked on the renderer; §6 records the evidence and the exact contract.
+* Stage F, region-compiler half — landed. Sites 6, 8 and 9 are selections and
+  rewrites over §4's records; `compileModule` assembles the module from units
+  it owns. Site 3 was attempted and is blocked on the renderer; §6 records the
+  evidence and the exact contract.
 
 **No regex over generated JavaScript remains in
 `HotCallGraphRegionCompiler.js`.** The two `replace(/[^A-Za-z0-9…]/g, …)` calls
 that are left sanitize compiler-owned identifiers and file names, not generated
 JavaScript.
 
-Four `parse()` calls remain, down from six:
+One `parse()` call remains, down from six:
 
 | `parse()` | Pass | Removed by |
 |-----------|------|------------|
-| L127 | `inlineAtomicPositionalSource` | §5 — the renderer must publish an insertable body; attempted and blocked |
-| L397 | `outlineLargeRegionLoops` | §4 fragments |
-| L731 | `liftOversizedUnitLocalsToEnvironment` | §4 fragments + declared-name sets |
-| L902 | `partitionOversizedLinearBlocks` | §4 fragments — stage D's generator wrapper here is explicitly interim |
+| L95 | `inlineAtomicPositionalSource` | §6 — the renderer must publish an insertable body; attempted and blocked |
 
-`applySourceEdits` survives only as the shared byte-splice engine for those
-four.
+`applySourceEdits`, `collectPatternNames` and `identifierIsPropertyName`
+survive only for that one site; `walkAst`, `GENERATOR_UNIT_PREFIX`,
+`rebaseAstOffsets`, `collectOversizedUnits` and the module-level
+`childrenOf`/`isFunction`/`isLoop`/`jumpLabelIdentifier` helpers are deleted.
+The `acorn` import stays for site 3.
+
+**Two defects the move exposed**, both in the published contract rather than
+in the passes:
+
+* A fragment's `writes` came from each statement's operand target, so it
+  missed the ambient names a statement assigns -- `frame`, `locals` and
+  `stack` through the frame materialization's destructuring target, and
+  `safePointBudget` through its own decrements. An outlined loop received
+  those as parameters and never wrote them back. The renderer publishes them
+  now, and `structuredRegionFragments.test.js` cross-checks every fragment's
+  published name sets against an acorn reading of its own text.
+* The outliner's shared `jvmRegionOutlinedState<n>` array is declared inside
+  the body, so an outer loop enclosing an earlier helper's call site has to
+  receive it; it was filtered out of the live-in set. The nested-outlining
+  case in `hotCallGraphLinearPartition.test.js` pins it.
+
+**Measured effect on emitted text.** Dumping every region module the two
+`hotCallGraph` test files compile, on `e956619` and on this branch: 27 of 28
+modules are byte-identical. The one that differs is the loop-outlining
+corpus, and it differs in four ways, all benign: the positional live-in and
+live-out orders differ (declaration and call site agree), the literal
+`undefined` is no longer passed as a parameter (the AST pass treated it as a
+free identifier), the outlined loop's first line keeps its own indentation,
+and the live-out *sets* are identical only after the ambient-write fix above.
+
+**Where the passes no longer fire.** `jvmHotCallGraphFramedSource` and the
+checked-leaf variants are not among the three positional variants §4
+publishes, so a node emitted from one carries no records and no structural
+pass touches it. `JVM_ENABLE_HOT_CALL_GRAPH_FRAMED_PARTITION=1` is therefore
+a no-op on a real module, where it was not before. Measured: over
+`hotCallGraphRegion.test.js` + `jitCompiler.test.js` with that flag and
+`JVM_ENABLE_HOT_CALL_GRAPH_LINEAR_PARTITION=1`, and again with the smallest
+budgets the options accept (16 KB units, 4 KB segments), `e956619` lifts 0
+names and cuts 0 segments in all 12 module compiles -- exactly what this
+branch does. The loss is real for a framed root larger than the unit budget
+and unobservable in the corpora.
 
 ## 4. What the renderer publishes for stage F
 
@@ -300,7 +383,19 @@ generated.jvmStructuredRegionFragments = {
       lines: string[],
       declares: string[],      // names introduced here
       reads: string[],         // names read from an enclosing scope
-      writes: string[] },      // names assigned in an enclosing scope
+      writes: string[],        // names assigned in an enclosing scope
+      statements: [            // one per line, in order
+        { text,                // == lines[i]
+          indent,              // the assembler's prefix; not part of identity
+          parts,               // the emitter's own parts list, or null
+          kind, def, write, writes, reads,
+          delta,               // the block nesting the statement opens/closes
+          label,               // the label it introduces, or null
+          jump,                // {kind, label, before, after} or null
+          exit,                // {before, argument, after} for a `return`
+          yields, continuesBlock,
+          opens,               // "loop" | "try" | "switch" | "block" | null
+          relocatable } ] },
     …
   ]
 }
@@ -330,7 +425,34 @@ contract, pinned by `test/structuredRegionFragments.test.js`:
   `safePointBudget`, `nestedEntryGuarded`, `framelessEntry`. No statement
   declares one (the tier's outermost scope does), but an outlined unit still
   has to receive them.
-* A name a fragment assigns appears in both `writes` and `reads`.
+* A name a fragment assigns appears in both `writes` and `reads`. That
+  includes the ambient names a statement assigns: the frame materialization's
+  `[frame, locals, stack] = …` target and `safePointBudget`'s own decrements
+  are writes even though no statement records them as an operand target.
+* Every line publishes the statement record behind it. `parts` is the parts
+  list the emitter built (§5), so a consumer rewrites a statement by
+  substituting operand references and rendering it again -- exactly what
+  `rerenderStatement` does inside the renderer -- rather than by editing
+  characters. Everything else on the record is read off that parts list's own
+  skeleton: the literal chunks the emitter wrote, with each operand replaced
+  by one placeholder character and with string literals and comments masked
+  out, so a `;` inside `'/ by zero'` or a keyword inside a marker comment is
+  never read as syntax.
+* `exit` and `jump` split a statement around the `return` or the
+  `break`/`continue` it carries, into the parts before it, its argument or
+  label, and the parts after it. Both are complete statements, so a consumer
+  that relocates one replaces its own range by a block and leaves the guard
+  the emitter wrote around it intact.
+* `relocatable` is false when the statement may not be moved into a helper
+  function: it opens a `switch`, carries a nested function, mentions
+  `this`/`super`/`await`/`arguments`/`eval`/`var`, declares an ambient name
+  (the helper already receives that name as a parameter), carries both a
+  `return` and a jump or more than one of either, or lost its parts to a late
+  expansion the fragment could not follow.
+* `declares` never contains an ambient name. A tier declares those in its
+  outermost scope, and a fragment that happens to contain the declaration
+  still reports the name as ambient -- which is why declaring one is not
+  relocatable.
 
 Two caveats for the consumer:
 
@@ -342,9 +464,19 @@ Two caveats for the consumer:
   variant this compile did not emit.
 
 With these, `outlineLargeRegionLoops`, `partitionOversizedLinearBlocks` and
-`liftOversizedUnitLocalsToEnvironment` become selections and joins over
-compiler-owned lists, and the last four `parse()` calls in the region compiler
-can go away.
+`liftOversizedUnitLocalsToEnvironment` became selections and joins over
+compiler-owned lists, and three of the four remaining `parse()` calls in the
+region compiler are gone.
+
+A variant that cannot publish a record for every one of its lines publishes no
+fragments at all, so a consumer never sees a partial list. The canonical
+continuation-tier body is exactly that case today: its prologue still carries
+lines no emitter recorded -- `const locals = frame.locals;`, the entry check,
+the `let local<slot>` declarations, the `spillLocals` arrow and the
+`ssaMaterialize*` helper declarations, 11-17 lines per body -- so
+`regionFragmentsOf` declines it and the renderer's own two calls into these
+passes are inert. Recording those five emitters is all that is needed to light
+them, and the framed region root, back up.
 
 ## 5. The renderer's statement IR
 
