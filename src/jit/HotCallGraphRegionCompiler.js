@@ -1,4 +1,3 @@
-const { parse } = require("acorn");
 const Frame = require("../core/frame");
 
 function opOf(instruction) {
@@ -24,198 +23,6 @@ function hasRestoringTransientDeopt(generated) {
   // exit. Range guards are independent of the marker and may materialize a
   // child after the regional host call stack has already been omitted.
   return (generated?.jvmStructuredRestoringRangeGuardDeoptCount || 0) > 0;
-}
-
-function identifierIsPropertyName(node, parent) {
-  return Boolean(
-    parent?.type === "MemberExpression" && parent.property === node &&
-      !parent.computed ||
-    (parent?.type === "Property" || parent?.type === "MethodDefinition") &&
-      parent.key === node && !parent.computed && !parent.shorthand);
-}
-
-function collectPatternNames(pattern, output) {
-  if (!pattern) return;
-  if (pattern.type === "Identifier") {
-    output.add(pattern.name);
-  } else if (pattern.type === "RestElement") {
-    collectPatternNames(pattern.argument, output);
-  } else if (pattern.type === "AssignmentPattern") {
-    collectPatternNames(pattern.left, output);
-  } else if (pattern.type === "ArrayPattern") {
-    for (const element of pattern.elements) collectPatternNames(element, output);
-  } else if (pattern.type === "ObjectPattern") {
-    for (const property of pattern.properties) {
-      collectPatternNames(property.value || property.argument, output);
-    }
-  }
-}
-
-function applySourceEdits(source, edits) {
-  // Single forward pass over the source: per-edit slice-and-concat is
-  // O(edits x source) and dominated the whole partition pipeline on
-  // megabyte-sized framed modules.
-  const ordered = [...edits].sort((left, right) =>
-    left.start - right.start || left.end - right.end);
-  const chunks = [];
-  let cursor = 0;
-  for (const edit of ordered) {
-    if (!Number.isInteger(edit.start) || !Number.isInteger(edit.end) ||
-        edit.start < 0 || edit.end < edit.start ||
-        edit.start < cursor || edit.end > source.length) return null;
-    chunks.push(source.slice(cursor, edit.start), edit.replacement);
-    cursor = edit.end;
-  }
-  chunks.push(source.slice(cursor));
-  return chunks.join("");
-}
-
-/**
- * Convert one verified call-free positional SSA body into a caller-owned
- * block. Arguments are bound once from the caller's SSA operands, every
- * callee binding and label is alpha-renamed, and Java returns feed one join
- * value. This is an interprocedural SSA operation performed before backend
- * source assembly, not a textual method-name substitution.
- */
-function inlineAtomicPositionalSource(source, argumentSources, resultName,
-  namespace, declareResult = true, diagnostic = null) {
-  const reject = (reason) => {
-    if (diagnostic) diagnostic.reason = reason;
-    return null;
-  };
-  if (typeof source !== "string" || !Array.isArray(argumentSources)) {
-    return reject("missing-source-or-arguments");
-  }
-  const parameterNames = ["helpers",
-    ...argumentSources.map((_value, index) => `argument${index}`),
-    "thread", "nestedEntryGuarded"];
-  const prefix = `function __jvmRegionInline(${parameterNames.join(",")}) {\n`;
-  let program;
-  try {
-    program = parse(`${prefix}${source}\n}`, {
-      ecmaVersion: "latest", ranges: true,
-    });
-  } catch (_) {
-    return reject("source-parse-failed");
-  }
-  const body = program.body[0]?.body;
-  if (!body) return reject("missing-function-body");
-  const declared = new Set();
-  const labelNames = new Set();
-  const returns = [];
-  const identifierNodes = [];
-  let unsupported = false;
-  const visit = (node, parent = null, functionDepth = 0) => {
-    if (!node || typeof node !== "object") return;
-    if (node.type === "WithStatement" || node.type === "YieldExpression" ||
-        node.type === "AwaitExpression" ||
-        node.type === "Property" && node.shorthand) unsupported = true;
-    if (node.type === "VariableDeclarator") {
-      collectPatternNames(node.id, declared);
-    } else if (node.type === "FunctionDeclaration" ||
-        node.type === "FunctionExpression" ||
-        node.type === "ArrowFunctionExpression") {
-      if (node.id) collectPatternNames(node.id, declared);
-      for (const parameter of node.params || []) {
-        collectPatternNames(parameter, declared);
-      }
-    } else if (node.type === "CatchClause") {
-      collectPatternNames(node.param, declared);
-    } else if (node.type === "ClassDeclaration" && node.id) {
-      declared.add(node.id.name);
-    } else if (node.type === "LabeledStatement") {
-      labelNames.add(node.label.name);
-    }
-    if (node.type === "ReturnStatement" && functionDepth === 0) {
-      returns.push(node);
-    }
-    if (node.type === "Identifier") identifierNodes.push({node, parent});
-    const childFunctionDepth = node !== body &&
-      (node.type === "FunctionDeclaration" ||
-       node.type === "FunctionExpression" ||
-       node.type === "ArrowFunctionExpression")
-      ? functionDepth + 1 : functionDepth;
-    for (const key in node) {
-      if (key === "start" || key === "end" || key === "loc" ||
-          key === "range") continue;
-      const child = node[key];
-      if (Array.isArray(child)) {
-        for (const entry of child) {
-          if (entry && typeof entry.type === "string") {
-            visit(entry, node, childFunctionDepth);
-          }
-        }
-      } else if (child && typeof child.type === "string") {
-        visit(child, node, childFunctionDepth);
-      }
-    }
-  };
-  visit(body);
-  if (unsupported) return reject("unsupported-ast-node");
-  if (returns.length === 0) return reject("missing-return");
-  const names = new Map();
-  for (const name of declared) {
-    names.set(name, `${namespace}${name}`);
-  }
-  for (const name of labelNames) {
-    names.set(name, `${namespace}${name}`);
-  }
-  for (let index = 0; index < argumentSources.length; index += 1) {
-    names.set(`argument${index}`, `${namespace}argument${index}`);
-  }
-  names.set("nestedEntryGuarded", `${namespace}nestedEntryGuarded`);
-  const returnRanges = returns.map((node) => ({
-    start: node.start, end: node.end,
-  }));
-  const identifierEdits = [];
-  for (const {node, parent} of identifierNodes) {
-    if (identifierIsPropertyName(node, parent)) continue;
-    const replacement = names.get(node.name);
-    if (!replacement) continue;
-    identifierEdits.push({
-      start: node.start - prefix.length,
-      end: node.end - prefix.length,
-      replacement,
-    });
-  }
-  const rewriteRange = (start, end) => {
-    const relativeStart = start - prefix.length;
-    const relativeEnd = end - prefix.length;
-    const fragment = source.slice(relativeStart, relativeEnd);
-    const edits = identifierEdits.filter((edit) =>
-      edit.start >= relativeStart && edit.end <= relativeEnd).map((edit) => ({
-      start: edit.start - relativeStart,
-      end: edit.end - relativeStart,
-      replacement: edit.replacement,
-    }));
-    return applySourceEdits(fragment, edits);
-  };
-  const edits = identifierEdits.filter((edit) => !returnRanges.some(
-    (range) => edit.start + prefix.length >= range.start &&
-      edit.end + prefix.length <= range.end));
-  const label = `${namespace}return`;
-  for (const node of returns) {
-    const value = node.argument
-      ? rewriteRange(node.argument.start, node.argument.end) : "ssaReturnVoid";
-    if (value === null) return reject("return-rewrite-failed");
-    edits.push({
-      start: node.start - prefix.length,
-      end: node.end - prefix.length,
-      replacement: `{ ${resultName} = ${value}; break ${label}; }`,
-    });
-  }
-  const rewritten = applySourceEdits(source, edits);
-  if (rewritten === null) return reject("overlapping-ast-edits");
-  const argumentBindings = argumentSources.map((argument, index) =>
-    `const ${namespace}argument${index} = ${argument};`);
-  return [
-    declareResult ? `let ${resultName};` : null,
-    `${label}: {`,
-    ...argumentBindings.map((line) => `  ${line}`),
-    `  const ${namespace}nestedEntryGuarded = 2;`,
-    ...rewritten.split("\n").map((line) => `  ${line}`),
-    "}",
-  ].filter(Boolean).join("\n");
 }
 
 function unionLinkedNames(...groups) {
@@ -1954,7 +1761,7 @@ class HotCallGraphRegionCompiler {
   rewriteCallBindings(source, edges, functionNames, internalNode = false,
     generatorSource = false, generated = null,
     compactClosedInternalCalls = false, inlineEdges = null,
-    inlineSources = null, fallbackInlineEdges = null) {
+    inlineInsertions = null, fallbackInlineEdges = null) {
     const replacements = new Map();
     for (const edge of edges) {
       const identifiers = edge.site.identifiers || {};
@@ -2202,18 +2009,40 @@ class HotCallGraphRegionCompiler {
       // rawInvoke -> region-node redirection.
       if (!edge.node?.atomic && !fallbackInlineEdges?.has(edge)) continue;
       const functionName = functionNames.get(edge.method);
-      const inlineDiagnostic = {};
-      const inlineSource = inlineEdges?.has(edge)
-        ? inlineAtomicPositionalSource(
-          inlineSources?.get(edge) ||
-            edge.node.generated.jvmInternalRegionPositionalSource,
-          callArguments,
+      // The callee is inserted by declaration, not by rewriting its text:
+      // the renderer published a body whose exits already assign one result
+      // token and break one label token, and the names it declares
+      // (`argument<n>`, its entry guard, its own `local<slot>` / `ssaValue<n>`)
+      // are bound inside the inserted block, where they shadow the caller's
+      // rather than colliding with them.
+      // Which body the callee contributes is a composition decision, so the
+      // insertion always comes from the map the composition built. There is no
+      // fallback to the callee's own published internal-region insertion: a
+      // node composed through the exceptional path contributes its restoring
+      // body instead, and guessing would insert the wrong one.
+      const insertion = inlineEdges?.has(edge)
+        ? inlineInsertions?.get(edge) || null : null;
+      // The names this insertion introduces in the caller -- its exit label
+      // and the staging slots for its arguments -- carry both the call site
+      // and the callee's compile serial. The call site separates two
+      // insertions of the same callee; the serial separates an insertion from
+      // the ones already embedded in the body being inserted, which a
+      // composed callee brings with it at the same call pc.
+      const namespace = insertion
+        ? `jvmRegionInline${edge.pc}_${insertion.serial}_` : null;
+      const insertBody = (declareResult) => insertion?.assemble ? (
+        insertion.assemble({
+          source: insertion.source,
+          argumentValues: callArguments,
           resultName,
-          `jvmRegionInline${edge.pc}_`, true, inlineDiagnostic)
-        : null;
+          exitLabel: `${namespace}return`,
+          namespace,
+          declareResult,
+        })) : null;
+      const inlineSource = insertBody(true);
       if (inlineEdges?.has(edge) && !inlineSource) {
-        inlineFailureReasons.push({edge, reason:
-          inlineDiagnostic.reason || "unknown-inline-rejection"});
+        inlineFailureReasons.push({edge, reason: insertion
+          ? "insertion-assembly-rejected" : "missing-published-insertion"});
       }
       let guardedFallbackInline = null;
       const needsInlineFallback = edge.proof === "runtime-monomorphic" ||
@@ -2227,11 +2056,7 @@ class HotCallGraphRegionCompiler {
             regionText.slice(0, declarationAt) +
             regionText.slice(
               declarationAt + lowering.resultDeclaration.length);
-          const guardedBody = inlineAtomicPositionalSource(
-            inlineSources?.get(edge) ||
-              edge.node.generated.jvmInternalRegionPositionalSource,
-            callArguments, resultName,
-            `jvmRegionInline${edge.pc}_`, false);
+          const guardedBody = insertBody(false);
           let guardedExecution = guardedBody;
           if (fallbackInlineEdges?.has(edge)) {
             if (!fastCall || !lowering.depthName) {
@@ -2257,7 +2082,7 @@ class HotCallGraphRegionCompiler {
             ? `${receiver} !== null && ${receiver} !== undefined && ` +
               `((${receiver}.type || ${declaredOwner}) === ${receiverType})`
             : "true";
-          const completed = `jvmRegionInline${edge.pc}_completed`;
+          const completed = `${namespace}completed`;
           guardedFallbackInline = guardedExecution && [
             `let ${resultName};`,
             `let ${completed} = false;`,
@@ -2390,6 +2215,33 @@ class HotCallGraphRegionCompiler {
     };
   }
 
+  /**
+   * The insertable form of one composed body. Composition inserts each callee
+   * at its call site, so it is performed over the callee's *insertable* base
+   * exactly as it is performed over its standalone base: the parent's own
+   * exits already carry the insertion tokens, and every callee it embeds is a
+   * self-contained labeled block whose exits break out of that block only.
+   * Nothing rewrites an emitted return, so the composed body remains
+   * insertable by construction; when any callee has no insertable form, the
+   * parent gets none either and is linked as a region function instead.
+   */
+  composeInsertion(base, prefix, node, functionNames, insertions,
+    fallbackInlineEdges = null) {
+    if (!base) return null;
+    const edgeInsertions = new Map();
+    for (const edge of node.edges) {
+      const insertion = insertions.get(edge.node);
+      if (!insertion) return null;
+      edgeInsertions.set(edge, insertion);
+    }
+    const rewritten = this.rewriteCallBindings(
+      `${prefix}${base.source}`, node.edges, functionNames, true, false,
+      node.generated, false, new Set(node.edges), edgeInsertions,
+      fallbackInlineEdges);
+    if (!rewritten.source) return null;
+    return {...base, source: rewritten.source};
+  }
+
   compileModule(plan, framedRoot = false) {
     if (framedRoot && typeof plan.root.generated
       .jvmHotCallGraphFramedSource !== "string") return null;
@@ -2406,6 +2258,12 @@ class HotCallGraphRegionCompiler {
     // text by the same edits that produced it. A body that cannot keep them
     // carries null and is simply never outlined or partitioned.
     const composedInternalStatements = new Map();
+    // The same composed bodies in the form a caller inserts. A node has one
+    // exactly when the renderer published an insertable body for it and every
+    // callee it embedded has one too, so the composed insertion is closed
+    // under composition: its own exits already carry the insertion tokens and
+    // each embedded callee is a self-contained labeled block.
+    const composedInternalInsertions = new Map();
     const composedInternalCosts = new Map();
     const composedInlineCounts = new Map();
     // Which module-level node functions a composed body still calls. Composed
@@ -2428,6 +2286,8 @@ class HotCallGraphRegionCompiler {
             node.generated.jvmInternalRegionPositionalSource,
             node.generated.jvmStructuredRegionFragments
               ?.jvmInternalRegionPositionalSource));
+          composedInternalInsertions.set(node,
+            node.generated.jvmInternalRegionPositionalInsertion || null);
           composedInternalCosts.set(node, node.codeItems);
           composedInlineCounts.set(node, 0);
           composedInternalLinkedNames.set(node, new Set());
@@ -2447,12 +2307,12 @@ class HotCallGraphRegionCompiler {
         const expandedCost = node.codeItems + node.edges.reduce(
           (sum, edge) => sum + composedInternalCosts.get(edge.node), 0);
         if (expandedCost > this.inlineCodeItemBudget) continue;
-        const edgeSources = new Map(node.edges.map((edge) =>
-          [edge, composedInternalSources.get(edge.node)]));
+        const edgeInsertions = new Map(node.edges.map((edge) =>
+          [edge, composedInternalInsertions.get(edge.node)]));
         const rewritten = this.rewriteCallBindings(
           node.generated.jvmInternalRegionPositionalSource,
           node.edges, functionNames, true, false, node.generated,
-          false, new Set(node.edges), edgeSources);
+          false, new Set(node.edges), edgeInsertions);
         if (!rewritten.source) continue;
         if (rewritten.source.length > this.inlineSourceByteBudget) continue;
         composedInternalSources.set(node, rewritten.source);
@@ -2462,6 +2322,9 @@ class HotCallGraphRegionCompiler {
             node.generated.jvmStructuredRegionFragments
               ?.jvmInternalRegionPositionalSource),
           rewritten.appliedEdits, rewritten.source));
+        composedInternalInsertions.set(node, this.composeInsertion(
+          node.generated.jvmInternalRegionPositionalInsertion, "",
+          node, functionNames, composedInternalInsertions));
         composedInternalLinkedNames.set(node, unionLinkedNames(
           rewritten.linkedFunctionNames,
           node.edges.map((edge) =>
@@ -2485,6 +2348,7 @@ class HotCallGraphRegionCompiler {
     };
     const exceptionalInlineSources = new Map();
     const exceptionalInlineStatements = new Map();
+    const exceptionalInlineInsertions = new Map();
     const exceptionalInlineCosts = new Map();
     const exceptionalInlineCounts = new Map();
     const exceptionalInlinePlanNames = new Map();
@@ -2504,6 +2368,15 @@ class HotCallGraphRegionCompiler {
         node.generated.jvmRestoringDirectPositionalSource);
       exceptionalInlineStatements.set(node, restoringInlineStatements(
         node, planName));
+      // The restoring tier receives its restoration plan as a parameter; an
+      // inserted copy binds it by declaration inside its own block, where it
+      // shadows the caller's rather than colliding with it.
+      const restoringInsertion =
+        node.generated.jvmRestoringDirectPositionalInsertion;
+      exceptionalInlineInsertions.set(node, restoringInsertion ? {
+        ...restoringInsertion,
+        source: `const plan = ${planName};\n${restoringInsertion.source}`,
+      } : null);
       exceptionalInlineLinkedNames.set(node, new Set());
       exceptionalInlineCosts.set(node, node.codeItems);
       exceptionalInlineCounts.set(node, 0);
@@ -2540,7 +2413,7 @@ class HotCallGraphRegionCompiler {
         const rewritten = this.rewriteCallBindings(
           source, node.edges, functionNames, true, false, node.generated,
           false, new Set(node.edges), new Map(node.edges.map((edge) =>
-            [edge, exceptionalInlineSources.get(edge.node)])),
+            [edge, exceptionalInlineInsertions.get(edge.node)])),
           new Set(node.edges));
         if (!rewritten.source) continue;
         if (rewritten.source.length > this.inlineSourceByteBudget) continue;
@@ -2548,6 +2421,11 @@ class HotCallGraphRegionCompiler {
         exceptionalInlineStatements.set(node, applyRegionStatementEdits(
           restoringInlineStatements(node, planName), rewritten.appliedEdits,
           rewritten.source));
+        exceptionalInlineInsertions.set(node, this.composeInsertion(
+          node.generated.jvmRestoringDirectPositionalInsertion,
+          `const plan = ${planName};\n`,
+          node, functionNames, exceptionalInlineInsertions,
+          new Set(node.edges)));
         exceptionalInlineLinkedNames.set(node, unionLinkedNames(
           rewritten.linkedFunctionNames,
           node.edges.map((edge) =>
@@ -2561,6 +2439,10 @@ class HotCallGraphRegionCompiler {
     }
     const inlineSourceForNode = (node) =>
       exceptionalInlineSources.get(node) || composedInternalSources.get(node);
+    const inlineInsertionForNode = (node) =>
+      (exceptionalInlineSources.has(node)
+        ? exceptionalInlineInsertions.get(node)
+        : composedInternalInsertions.get(node)) || null;
     const inlineLinkedNamesForNode = (node) =>
       (exceptionalInlineSources.has(node)
         ? exceptionalInlineLinkedNames.get(node)
@@ -2586,6 +2468,12 @@ class HotCallGraphRegionCompiler {
       }
       if (!inlineSourceForNode(edge.node)) {
         return "target-without-internal-region-ir";
+      }
+      // Inlining consumes the insertable form of the body. A body whose
+      // emitter grew an exit the insertion cannot route, or whose composition
+      // embedded such a body, is linked as a region function instead.
+      if (!inlineInsertionForNode(edge.node)) {
+        return "target-without-insertable-body";
       }
       const staticExact = edge.proof === "bytecode-exact" &&
         edge.site.op === "invokestatic";
@@ -2766,7 +2654,7 @@ class HotCallGraphRegionCompiler {
           Boolean(framedSource), node.generated,
           this.compactClosedInternalCalls, inlineEdges,
           new Map([...inlineEdges].map((edge) =>
-            [edge, inlineSourceForNode(edge.node)])), fallbackInlineEdges);
+            [edge, inlineInsertionForNode(edge.node)])), fallbackInlineEdges);
       if (!rewritten.source) {
         this.lastRejectionReason = rewritten.error;
         return null;
