@@ -2058,6 +2058,23 @@ class JvmSsaBlockRenderer {
         }
       }
       record.blockDelta = delta;
+      // The bracket nesting the statement leaves open. Several emitters write
+      // one condition over more than one line and record each line on its
+      // own, so a statement is not always a complete construct; when its own
+      // parentheses do not balance, the statements after it complete it and a
+      // consumer must not cut between them. Read off the statement's own
+      // skeleton with string literals and comments masked out, so a `(` in
+      // `"(I)V"` or in a marker comment is not counted.
+      const bracketSkeleton = partsSkeleton(parts);
+      const bracketMask = skeletonCodeMask(bracketSkeleton);
+      let openDelta = 0;
+      for (let index = 0; index < bracketSkeleton.length; index += 1) {
+        if (!bracketMask[index]) continue;
+        const character = bracketSkeleton[index];
+        if (character === "(" || character === "[") openDelta += 1;
+        else if (character === ")" || character === "]") openDelta -= 1;
+      }
+      record.openDelta = openDelta;
       if (!record.exprParts && record.def) {
         record.reads = record.reads.filter((name) => name !== record.def);
       }
@@ -2176,6 +2193,11 @@ class JvmSsaBlockRenderer {
         parts,
         kind: record.kind,
         def: record.def || null,
+        // Names the statement introduces besides its own operand target: the
+        // parameters of a nested function it declares. They are literal text
+        // of the statement, not operands, but a consumer still must not read
+        // one as a free name of the surrounding fragment.
+        declares: record.declares ? [...record.declares] : null,
         write: record.write || null,
         // Every name the statement assigns in an enclosing scope: its operand
         // target and the ambient names it writes.
@@ -2184,6 +2206,9 @@ class JvmSsaBlockRenderer {
             (name) => name !== record.write)],
         reads,
         delta,
+        // The bracket nesting the statement leaves open: nonzero when the
+        // emitter wrote one construct over several recorded lines.
+        openDelta: record.openDelta || 0,
         label: partsLabelName(parts),
         jump: jump && jump.recognized
           ? {kind: jump.kind, label: jump.label,
@@ -2229,9 +2254,11 @@ class JvmSsaBlockRenderer {
         const declared = new Set();
         for (const line of lines) {
           const record = recordOf(line);
-          if (record.def && !declared.has(record.def)) {
-            declared.add(record.def);
-            declares.push(record.def);
+          for (const name of [...(record.def ? [record.def] : []),
+            ...(record.declares || [])]) {
+            if (declared.has(name)) continue;
+            declared.add(name);
+            declares.push(name);
           }
         }
         const seenRead = new Set();
@@ -2300,6 +2327,23 @@ class JvmSsaBlockRenderer {
       if (depth !== 0) return null;
       describe("linear", runStart, bodyLines.length);
       return fragments;
+    };
+    // The published source of a variant opens with its `'use strict';`
+    // directive, and the fragment contract keeps that one line outside the
+    // fragments: the consumer states it itself. A body whose first fragment
+    // does not open with the directive publishes nothing rather than a list
+    // that would not rejoin to its source.
+    const fragmentsWithoutDirective = (fragments) => {
+      if (!fragments || !fragments.length) return null;
+      const [first, ...rest] = fragments;
+      if (first.kind !== "linear" || first.lines[0] !== "'use strict';") {
+        return null;
+      }
+      const remainder = first.lines.length > 1
+        ? [{...first, lines: first.lines.slice(1),
+          statements: first.statements.slice(1)}, ...rest]
+        : rest;
+      return remainder.map((fragment, id) => ({...fragment, id}));
     };
     // The function-scoped declarations of an assembled body, in order.
     const regionLocalNamesOf = (fragments) => {
@@ -2474,6 +2518,12 @@ class JvmSsaBlockRenderer {
     // audit covers it.
     const sourceDirective = () =>
       recordStatement(["'use strict';"], {kind: "directive"});
+    // An assembled body carries a blank line wherever an optional prologue
+    // fragment was not emitted. It is a statement of the body like any
+    // other -- it introduces nothing, reads nothing and nests nothing -- so
+    // it is recorded rather than skipped and the fragments still join to the
+    // published source.
+    const blankStatement = () => recordStatement([""], {kind: "blank"});
     // The universal block terminators. Their kind is what the structural
     // passes match on; the indentation is applied by the assembler and stays
     // outside the statement's identity.
@@ -11600,7 +11650,8 @@ class JvmSsaBlockRenderer {
           return declared.flatMap((variant) => [
             recordStatement([`function ssaMaterialize${variant}${depth}(pc${
               operands.length ? `, ${operands.join(", ")}` : ""}) {`],
-            {kind: "materializeHelperHeader"}),
+            {kind: "materializeHelperHeader",
+              declares: ["pc", ...operands]}),
             `  ${spillStatement()}`,
             ...operands.map((operandName, index) =>
               `  ${recordStatement(
@@ -12215,19 +12266,20 @@ class JvmSsaBlockRenderer {
       ], {kind: "spillHelperDeclaration"}),
       ...materializeHelperDeclarations(),
       ...declarations, ...tree];
-    const body = auditVariant("framed", buildBody(renderedTree));
+    // An optional prologue fragment that was not emitted joins as a blank
+    // line, so it is recorded as one rather than dropped: the fragment list
+    // is a partition of the published source, blank lines included.
+    const body = auditVariant("framed", buildBody(renderedTree).map(
+      (line) => typeof line === "string" ? line : blankStatement()));
     const canonicalGeneratedSource = body.join("\n");
     // Loop outlining and straight-line partitioning of the continuation tier
     // are selections over the statement records the emitters wrote, so they
-    // need the canonical body as a fragment list. The body's prologue still
-    // carries lines no emitter recorded -- the entry scaffold, the local
-    // declarations, the spill helper and the frame materialization helpers --
-    // so `regionFragmentsOf` declines it and both passes are inert here until
-    // those emitters record what they write. They stay wired: nothing about
-    // them is specific to the region tier.
+    // need the canonical body as a fragment list. Every prologue emitter
+    // records what it writes, so the canonical body is a fragment list like
+    // any other positional variant and both passes are live here.
     const canonicalFragments = this.loopOutliningEnabled ||
-      this.linearPartitionEnabled
-      ? regionFragmentsOf(body.filter((line) => typeof line === "string"))
+      this.linearPartitionEnabled || regionCallGraphCandidate
+      ? regionFragmentsOf(body)
       : null;
     const canonicalStatements = canonicalFragments
       ? canonicalFragments.flatMap((fragment) => fragment.statements) : null;
@@ -12301,6 +12353,16 @@ class JvmSsaBlockRenderer {
       // unchanged; the self-recursive respecialization below is a text splice
       // over the joined module, so a body that needs it publishes none.
       const regionFragments = {};
+      // The framed region root. A hot call-graph region emits this body as
+      // the root node of a framed module, so it publishes its fragments the
+      // way the positional variants do. When the renderer's own outlining or
+      // partitioning rewrote the canonical body the published source is no
+      // longer what the fragments describe, so none is published.
+      if (regionCallGraphCandidate && canonicalFragments &&
+          generatedSource === canonicalGeneratedSource) {
+        regionFragments.jvmHotCallGraphFramedSource =
+          fragmentsWithoutDirective(canonicalFragments);
+      }
       if (directPositionalEligible || internalRegionPositionalEligible) {
         const receiverSlots = methodIsStatic ? 0 : 1;
         const argumentCount = directMethodDescriptor.params.length + receiverSlots;
@@ -13718,6 +13780,19 @@ class JvmSsaBlockRenderer {
             if (!trustedCheckedLeafBody) {
               throw new Error("failed to specialize trusted checked leaf");
             }
+            // The two checked-leaf entries a region node can be emitted
+            // from publish their fragments too, so a node built from one is
+            // outlined, partitioned and lifted like any other.
+            regionFragments.jvmCheckedLeafDirectPositionalSource =
+              regionFragmentsOf([
+                restoringInitializationGuardDeclaration, directGuard,
+                ...checkedLeafBody,
+              ]);
+            regionFragments.jvmTrustedCheckedLeafDirectPositionalSource =
+              regionFragmentsOf([
+                restoringInitializationGuardDeclaration, trustedDirectGuard,
+                ...trustedCheckedLeafBody,
+              ]);
             checkedLeafDirectPositionalSource = auditVariant(
               "checked-leaf", [
                 sourceDirective(),
@@ -14290,8 +14365,31 @@ class JvmSsaBlockRenderer {
         }
         return statement;
       };
+      // The contract the consumer relies on: a variant's fragments, joined
+      // in order, are exactly its published source without the directive.
+      // It is checked here rather than assumed, so a body a late expansion
+      // rewrote loses its fragments instead of publishing a list that does
+      // not describe it.
+      const regionVariantSources = {
+        jvmDirectPositionalSource: directPositionalSource,
+        jvmInternalRegionPositionalSource: internalRegionPositionalSource,
+        jvmRestoringDirectPositionalSource: restoringDirectPositionalSource,
+        jvmHotCallGraphFramedSource: regionCallGraphCandidate
+          ? generatedSource : null,
+        jvmCheckedLeafDirectPositionalSource:
+          checkedLeafDirectPositionalSource,
+        jvmTrustedCheckedLeafDirectPositionalSource:
+          trustedCheckedLeafDirectPositionalSource,
+      };
       const publishedRegionFragments = Object.entries(regionFragments)
         .filter(([, fragments]) => Array.isArray(fragments))
+        .filter(([variant, fragments]) => {
+          const source = regionVariantSources[variant];
+          if (typeof source !== "string") return false;
+          const joined = fragments.flatMap(
+            (fragment) => fragment.lines).join("\n");
+          return joined === source || `'use strict';\n${joined}` === source;
+        })
         .map(([variant, fragments]) => [variant, fragments.map(
           (fragment) => ({
             id: fragment.id,

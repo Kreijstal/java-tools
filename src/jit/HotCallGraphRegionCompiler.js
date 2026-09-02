@@ -160,11 +160,29 @@ function substituteRegionParts(parts, replacements) {
   return out;
 }
 
+// Names every generated tier declares in its outermost scope. No statement
+// carries one as an operand -- a mention of `plan` or `frame` is literal text
+// of the statement that wrote it -- so a pass that rewrites references by
+// operand substitution can never relocate one, and must never try.
+const REGION_AMBIENT_NAMES = new Set([
+  "helpers", "frame", "locals", "stack", "thread", "plan",
+  "restorationDepth", "safePointBudget", "nestedEntryGuarded",
+  "framelessEntry", "initialBytecodeChecks",
+]);
+
 const REGION_STATEMENT_DEFAULTS = {
   parts: null, kind: "regionOwned", def: null, write: null, delta: 0,
+  // The bracket nesting the statement leaves open. Nonzero when the emitter
+  // wrote one construct over several recorded lines, which the statements
+  // after it complete.
+  openDelta: 0,
   writes: null,
   label: null, jump: null, exit: null, yields: false, opens: null,
   continuesBlock: false, relocatable: true,
+  // For a statement whose own names are unknown (`reads: null`): the names
+  // of the enclosing scope it may nevertheless mention. Null means "not even
+  // that is known".
+  mentions: null,
   // Extra names one emitted statement introduces beyond `def`: the call-site
   // `let a, b;` a hoisted run declaration becomes.
   declares: null,
@@ -208,9 +226,11 @@ function renderRegionStatement(statement, replacements = null) {
  * A statement that opens a block owns every statement up to its matching
  * close, and a block continuation (`} else {`, `} catch (error) {`) keeps the
  * construct it continues inside the same group -- its nesting delta is zero,
- * so the walk needs no special case for it. Returns null when the deltas the
- * emitters recorded do not balance, which makes every pass decline the body
- * rather than guess at its structure.
+ * so the walk needs no special case for it. A statement whose own brackets do
+ * not balance is likewise incomplete -- an emitter that wrote one condition
+ * over several recorded lines -- and owns the lines that finish it. Returns
+ * null when the deltas the emitters recorded do not balance, which makes
+ * every pass decline the body rather than guess at its structure.
  */
 function statementGroups(statements, from = 0, to = statements.length) {
   const groups = [];
@@ -218,14 +238,16 @@ function statementGroups(statements, from = 0, to = statements.length) {
   while (index < to) {
     const start = index;
     let depth = statements[index].delta;
+    let open = statements[index].openDelta || 0;
     if (depth < 0) return null;
     index += 1;
-    while (depth > 0 && index < to) {
+    while ((depth > 0 || open !== 0) && index < to) {
       depth += statements[index].delta;
+      open += statements[index].openDelta || 0;
       if (depth < 0) return null;
       index += 1;
     }
-    if (depth !== 0) return null;
+    if (depth !== 0 || open !== 0) return null;
     groups.push({start, end: index});
   }
   return groups;
@@ -350,6 +372,7 @@ function rewriteRegionExits(statements, from, to, buildExit) {
     rewritten.push(ownStatement(`${statement.indent}${text.trim()}`, {
       reads: statement.reads,
       delta: statement.delta,
+      openDelta: statement.openDelta || 0,
       relocatable: false,
     }));
   }
@@ -412,7 +435,7 @@ function regionStatementsFromFragments(source, fragments) {
   const statements = [];
   if (source.startsWith(REGION_SOURCE_DIRECTIVE)) {
     statements.push(ownStatement(REGION_SOURCE_DIRECTIVE.trimEnd(),
-      {kind: "directive"}));
+      {kind: "directive", parts: [REGION_SOURCE_DIRECTIVE.trimEnd()]}));
   }
   for (const fragment of fragments) {
     if (!Array.isArray(fragment.statements)) return null;
@@ -436,6 +459,15 @@ function variantNameOfSource(generated, source) {
   }
   if (source === generated.jvmRestoringDirectPositionalSource) {
     return "jvmRestoringDirectPositionalSource";
+  }
+  if (source === generated.jvmHotCallGraphFramedSource) {
+    return "jvmHotCallGraphFramedSource";
+  }
+  if (source === generated.jvmTrustedCheckedLeafDirectPositionalSource) {
+    return "jvmTrustedCheckedLeafDirectPositionalSource";
+  }
+  if (source === generated.jvmCheckedLeafDirectPositionalSource) {
+    return "jvmCheckedLeafDirectPositionalSource";
   }
   return null;
 }
@@ -512,12 +544,53 @@ function applyRegionStatementEdits(statements, edits, rewrittenSource) {
     if (from < 0 || to < from || to > rewrittenSource.length) return null;
     const text = rewrittenSource.slice(from, to);
     let delta = 0;
+    let openDelta = 0;
     for (let entry = block.first; entry <= block.last; entry += 1) {
       delta += statements[entry].delta;
+      openDelta += statements[entry].openDelta || 0;
+    }
+    // An edit that empties a statement leaves a blank line, which states
+    // its own facts: it introduces nothing, reads nothing and nests nothing,
+    // so it stays rewritable and does not disqualify the unit around it.
+    // A lowered call span is opaque: it is compiler-built text spliced
+    // around slices of the statements it replaced, so which of its names are
+    // reads and which are writes is unknown and nothing may be relocated
+    // across it. The *set* of enclosing names it can mention is still
+    // bounded, and stating it is what lets a pass that rewrites references
+    // by operand substitution decline exactly those names instead of the
+    // whole body:
+    //
+    //   * every slice it carries came out of the statements it replaced, so
+    //     their recorded names cover it;
+    //   * everything else the compiler wrote is either freshly minted for
+    //     this call site (`jvmRegion...`), a module-level declaration, or an
+    //     ambient name -- and a lifted name is none of those (the lift
+    //     refuses ambient names, and a `jvmRegion` name is this compiler's,
+    //     never a renderer-published unit declaration);
+    //   * an inserted callee binds every one of its own names by declaration
+    //     inside its own labeled block, so it contributes no free name
+    //     beyond the argument values, which are slices.
+    const mentions = [];
+    const mentioned = new Set();
+    let bounded = true;
+    for (let entry = block.first; entry <= block.last; entry += 1) {
+      const statement = statements[entry];
+      const names = statement.reads === null
+        ? statement.mentions
+        : [...statement.reads, ...(statement.writes || []),
+          ...(statement.def ? [statement.def] : []),
+          ...(statement.declares || [])];
+      if (!names) { bounded = false; break; }
+      for (const name of names) {
+        if (mentioned.has(name)) continue;
+        mentioned.add(name);
+        mentions.push(name);
+      }
     }
     output.push(text.trim() === ""
-      ? ownStatement(text, {delta})
-      : ownStatement(text, {delta, reads: null, relocatable: false}));
+      ? ownStatement(text, {delta, openDelta, parts: [text]})
+      : ownStatement(text, {delta, openDelta, reads: null,
+        relocatable: false, mentions: bounded ? mentions : null}));
     index = block.last + 1;
   }
   while (index < statements.length) output.push(statements[index++]);
@@ -542,6 +615,8 @@ function stripRegionSafePointBudgets(statements, declarations) {
     if (text === statement.text) return statement;
     return ownStatement(text, {
       delta: statement.delta,
+      openDelta: statement.openDelta || 0,
+      parts: [text],
       reads: text.trim() === "" ? [] : null,
       relocatable: text.trim() === "",
     });
@@ -660,6 +735,7 @@ function outlineLargeRegionLoops(unit, options = {}) {
               reads: statement.reads, write: statement.write,
               writes: statement.writes,
               def: statement.def, delta: statement.delta,
+              openDelta: statement.openDelta || 0,
               label: statement.label, jump: statement.jump,
               opens: statement.opens, yields: statement.yields,
               continuesBlock: statement.continuesBlock,
@@ -776,12 +852,25 @@ function liftOversizedUnitLocalsToEnvironment(units, options = {}) {
     // and every statement has to be rewritable, or a reference could be left
     // spelled the old way.
     const declarationCounts = new Map();
+    // A statement this pass cannot rewrite -- the opaque block a composition
+    // edit produced -- keeps whatever spelling its names have, so no name it
+    // may mention can move into an environment slot. The block states the
+    // bound; when even that is unknown the whole unit is declined.
+    const pinned = new Set();
     for (const statement of unit.statements) {
-      if (!statement.parts || statement.reads === null) return unit;
-      if (statement.def) {
-        declarationCounts.set(statement.def,
-          (declarationCounts.get(statement.def) || 0) + 1);
+      if (statement.parts && statement.reads !== null) {
+        if (statement.def) {
+          declarationCounts.set(statement.def,
+            (declarationCounts.get(statement.def) || 0) + 1);
+        }
+        continue;
       }
+      const mentions = statement.parts ? statement.reads : statement.mentions;
+      if (!mentions) return unit;
+      for (const name of mentions) pinned.add(name);
+      for (const name of [...(statement.writes || []),
+        ...(statement.def ? [statement.def] : []),
+        ...(statement.declares || [])]) pinned.add(name);
     }
     const slotIndex = new Map();
     for (const group of groups) {
@@ -791,6 +880,12 @@ function liftOversizedUnitLocalsToEnvironment(units, options = {}) {
           statement.kind !== "letUninitialized" &&
           statement.kind !== "safePointBudgetDeclaration") continue;
       if (!statement.def || statement.def === envName) continue;
+      if (REGION_AMBIENT_NAMES.has(statement.def)) continue;
+      // A name this compiler mints for the module or for a call site is
+      // never a renderer-published unit declaration, and an unrewritable
+      // block may spell one without having listed it.
+      if (statement.def.startsWith("jvmRegion")) continue;
+      if (pinned.has(statement.def)) continue;
       if (declarationCounts.get(statement.def) !== 1) continue;
       if (!slotIndex.has(statement.def)) {
         slotIndex.set(statement.def, slotIndex.size);
@@ -821,6 +916,7 @@ function liftOversizedUnitLocalsToEnvironment(units, options = {}) {
           writes: (statement.writes || []).filter(
             (name) => !slotIndex.has(name)),
           delta: statement.delta,
+          openDelta: statement.openDelta || 0,
         }));
         continue;
       }
@@ -1024,7 +1120,7 @@ function partitionOversizedLinearBlocks(units, options = {}) {
             body[position] = ownStatement(
               `${statement.indent}${jumpText.trim()}`,
               {reads: statement.reads, delta: statement.delta,
-                relocatable: false});
+                openDelta: statement.openDelta || 0, relocatable: false});
             continue;
           }
           const statement = statements[index];
@@ -1050,7 +1146,8 @@ function partitionOversizedLinearBlocks(units, options = {}) {
             assignment.startsWith("=")
               ? `${statement.def} ${assignment}` : ";"}`,
           {reads: statement.reads, write: statement.def,
-            delta: statement.delta, relocatable: false});
+            delta: statement.delta, openDelta: statement.openDelta || 0,
+            relocatable: false});
         }
 
         helperUnits.push(regionUnit({
@@ -1066,7 +1163,8 @@ function partitionOversizedLinearBlocks(units, options = {}) {
           ],
           statements: body.map((statement) => ownStatement(
             `      ${statement.text}`, {reads: statement.reads,
-              delta: statement.delta, relocatable: false})),
+              delta: statement.delta, openDelta: statement.openDelta || 0,
+              relocatable: false})),
           footerLines: [
             `      ${outputName}[0] = 0;`,
             `      ${outputName}[1] = undefined;`,
@@ -1170,14 +1268,24 @@ function partitionOversizedLinearBlocks(units, options = {}) {
       };
 
       // The nested statement lists a group owns. A block continuation ends
-      // one list and starts the next, so a run never spans an `else` arm.
+      // one list and starts the next, so a run never spans an `else` arm --
+      // but only a continuation of *this* group's own construct does. A
+      // continuation nested deeper belongs to a construct inside the body,
+      // and splitting there would hand `walkList` a statement list that does
+      // not balance, which it then declines. The depth is the nesting the
+      // statements themselves recorded.
       const recurseIntoGroup = (group) => {
         if (group.end - group.start <= 2) return;
         let start = group.start + 1;
+        let depth = 0;
         for (let index = start; index < group.end - 1; index += 1) {
-          if (!statements[index].continuesBlock) continue;
-          walkList(start, index);
-          start = index + 1;
+          const statement = statements[index];
+          if (depth === 0 && statement.continuesBlock) {
+            walkList(start, index);
+            start = index + 1;
+            continue;
+          }
+          depth += statement.delta;
         }
         walkList(start, group.end - 1);
       };
@@ -2344,7 +2452,8 @@ class HotCallGraphRegionCompiler {
         node.generated.jvmStructuredRegionFragments
           ?.jvmRestoringDirectPositionalSource);
       return body ? [ownStatement(`const plan = ${planName};`,
-        {kind: "const", def: "plan"}), ...body] : null;
+        {kind: "const", def: "plan",
+          parts: ["const ", {ref: "plan"}, ` = ${planName};`]}), ...body] : null;
     };
     const exceptionalInlineSources = new Map();
     const exceptionalInlineStatements = new Map();
@@ -2689,8 +2798,13 @@ class HotCallGraphRegionCompiler {
             node.generated.jvmStructuredRegionFragments?.[
               variantNameOfSource(node.generated, source)]),
           rewritten.appliedEdits, rewritten.source);
+      // The framed root is a generator: its statements can carry `yield`,
+      // so every pass that relocates one has to know that the unit it moves
+      // them into is a generator too.
+      const nodeIsGenerator = Boolean(framedSource);
       const outlined = this.loopOutliningEnabled && nodeStatements
-        ? outlineLargeRegionLoops(regionUnit({statements: nodeStatements}), {
+        ? outlineLargeRegionLoops(regionUnit({
+          statements: nodeStatements, generator: nodeIsGenerator}), {
           minimumSourceBytes: this.loopOutlineSourceBytes,
           maximumOutlines: this.maxOutlinedLoopsPerNode,
           namespace: index,
@@ -2744,6 +2858,7 @@ class HotCallGraphRegionCompiler {
             regionUnit({
               name: functionName,
               headerLines,
+              generator: nodeIsGenerator,
               statements: emittedStatements
                 ? [...prologueStatements, ...emittedStatements] : [],
               footerLines: emittedStatements ? ["}"]
@@ -2769,7 +2884,8 @@ class HotCallGraphRegionCompiler {
         pushNodeDeclaration(
           [`function ${functionName}(${parameters.join(",")}) {`],
           [ownStatement(`const plan = ${planName};`,
-            {kind: "const", def: "plan"})]);
+            {kind: "const", def: "plan",
+              parts: ["const ", {ref: "plan"}, ` = ${planName};`]})]);
       } else {
         pushNodeDeclaration(
           [`function ${functionName}(${parameters.join(",")}) {`]);
