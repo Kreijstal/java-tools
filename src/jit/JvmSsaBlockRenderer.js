@@ -1326,6 +1326,11 @@ class JvmSsaBlockRenderer {
     // leaf can prove that Java wrap operations are impossible and emit the
     // corresponding plain JavaScript arithmetic.
     const methodIntegerOrigins = new Map();
+    // The exact line the emitter rendered for an integer arithmetic value,
+    // together with the same operation written without its int32 mask.
+    // Interval analysis selects the lines it has proven cannot overflow by
+    // this identity, so nothing has to recognize arithmetic in rendered text.
+    const methodIntegerOriginLines = new Map();
     const methodSpecializedCheckedCaptures = {};
     let hasOutlinedClippedLeaf = false;
     const specializedCheckedCapture = (cacheId, position) => {
@@ -2961,14 +2966,22 @@ class JvmSsaBlockRenderer {
       let valid = true;
       let invalidAt = null;
       const pop = () => stack.length ? stack.pop() : null;
-      const binary = (format, originOp = null) => {
+      const binary = (format, originOp = null, plainFormat = null) => {
         const right = pop(), left = pop();
         if (left === null || right === null) { valid = false; return; }
-        const out = value(); lines.push(`const ${out} = ${format(left, right)};`); stack.push(out);
+        const out = value();
+        const line = `const ${out} = ${format(left, right)};`;
+        lines.push(line); stack.push(out);
         if (originOp) {
           const origin = {kind: originOp, left, right};
           integerOrigins.set(out, origin);
           methodIntegerOrigins.set(out, origin);
+          if (plainFormat) {
+            methodIntegerOriginLines.set(line, {
+              name: out,
+              plain: `const ${out} = ${plainFormat(left, right)};`,
+            });
+          }
         }
       };
       const boundedIntegerRange = (input, visited = new Set()) => {
@@ -3383,13 +3396,16 @@ class JvmSsaBlockRenderer {
         } else if (op === "pop") {
           if (pop() === null) valid = false;
         } else if (op === "iadd") {
-          binary((a, b) => `((${a} + ${b}) | 0)`, "iadd");
+          binary((a, b) => `((${a} + ${b}) | 0)`, "iadd",
+            (a, b) => `(${a} + ${b})`);
         }
         else if (op === "isub") {
-          binary((a, b) => `((${a} - ${b}) | 0)`, "isub");
+          binary((a, b) => `((${a} - ${b}) | 0)`, "isub",
+            (a, b) => `(${a} - ${b})`);
         }
         else if (op === "imul") {
-          binary((a, b) => `Math.imul(${a}, ${b})`, "imul");
+          binary((a, b) => `Math.imul(${a}, ${b})`, "imul",
+            (a, b) => `(${a} * ${b})`);
         }
         else if (op === "iand") binary((a, b) => `(${a} & ${b})`, "iand");
         else if (op === "ior") binary((a, b) => `(${a} | ${b})`);
@@ -3571,7 +3587,9 @@ class JvmSsaBlockRenderer {
                 ...materializeLines([...stack, dividend, divisor], index, true).map((line) => `  ${line}`),
                 '  throw { type: "java/lang/ArithmeticException", message: "/ by zero" };', "}");
             }
-            lines.push(`const ${out} = ((${dividend} ${op === "idiv" ? "/" : "%"} ${divisor}) | 0);`);
+            const line = `const ${out} = ((${dividend} ${
+              op === "idiv" ? "/" : "%"} ${divisor}) | 0);`;
+            lines.push(line);
             const origin = {
               kind: op,
               left: dividendInput,
@@ -3579,6 +3597,12 @@ class JvmSsaBlockRenderer {
             };
             integerOrigins.set(out, origin);
             methodIntegerOrigins.set(out, origin);
+            if (op === "irem") {
+              methodIntegerOriginLines.set(line, {
+                name: out,
+                plain: `const ${out} = (${dividend} % ${divisor});`,
+              });
+            }
             stack.push(out);
           }
         }
@@ -10419,7 +10443,10 @@ class JvmSsaBlockRenderer {
             lines[index + 4] !== `${indentation}}`) continue;
         const update = lines[index + 3]
           .replace(/[()\s]/g, "");
-        if (update !== `${induction}=${alias[1]}+1|0;`) continue;
+        // The increment is either the emitter's masked int32 form or the
+        // unmasked form interval analysis proved cannot overflow.
+        if (update !== `${induction}=${alias[1]}+1|0;` &&
+            update !== `${induction}=${alias[1]}+1;`) continue;
         const normalizedIndex = store[2].replace(/[()\s]/g, "");
         const localNames = [...new Set(
           [...store[2].matchAll(/\blocal\d+\b/g)]
@@ -11438,11 +11465,6 @@ class JvmSsaBlockRenderer {
             checkedLeafRenderedTree = specializeArrayRangeGuardedStores(
               checkedLeafRenderedTree, [guard]);
           }
-          let checkedLeafTree = compactCheckedLeafLines(
-            transactionalAcyclicShape || transactionalAcyclicReadShape
-              ? transactionalizeAcyclicLeafLines(checkedLeafRenderedTree)
-              : checkedLeafRenderedTree);
-          checkedLeafTree = strengthReduceAffineStoreLoops(checkedLeafTree);
           const checkedLeafSafeArithmeticGuards = [];
           // Java int multiplication/addition needs explicit wrapping for
           // arbitrary inputs. A checked leaf may use ordinary JS arithmetic
@@ -11556,40 +11578,22 @@ class JvmSsaBlockRenderer {
               return result;
             };
             const usedAssumptions = new Set();
-            const declaredArithmeticValues = new Set(checkedLeafTree
-              .map((line) => /^\s*const (ssaValue\d+) = /.exec(line)?.[1])
-              .filter(Boolean));
-            const plainSafeExpression = (expression, root = false) => {
-              if (/^-?\d+$/.test(expression)) return expression;
-              if (!root && declaredArithmeticValues.has(expression)) {
-                return expression;
-              }
-              const origin = methodIntegerOrigins.get(expression);
-              if (!origin) return expression;
-              if (origin.kind === "local") {
-                return argumentIntSlots.get(origin.slot) ||
-                  `local${origin.slot}`;
-              }
-              if (!["iadd", "isub", "imul", "irem"].includes(
-                origin.kind) || !safeRange(expression)) return expression;
-              const operator = {
-                iadd: "+", isub: "-", imul: "*", irem: "%",
-              }[origin.kind];
-              return `(${plainSafeExpression(origin.left)} ${operator} ` +
-                `${plainSafeExpression(origin.right)})`;
-            };
-            checkedLeafTree = checkedLeafTree.map((line) => {
-              const declaration =
-                /^(\s*)const (ssaValue\d+) = (.+);$/.exec(line);
-              if (!declaration) return line;
-              const origin = methodIntegerOrigins.get(declaration[2]);
-              if (!origin || !["iadd", "isub", "imul", "irem"].includes(
-                origin.kind)) return line;
-              const range = safeRange(declaration[2]);
+            // The interval proof runs on the compiler's own integer origins,
+            // and the emitter recorded the exact line it rendered for each of
+            // them together with the unmasked form of the same operation.
+            // Proven lines are selected by that identity and replaced with
+            // the emitter's alternative: no rendered statement is inspected,
+            // and a statement another pass has already rewritten simply no
+            // longer carries an emitted identity.
+            checkedLeafRenderedTree = checkedLeafRenderedTree.map((line) => {
+              const emitted = methodIntegerOriginLines.get(line.trim());
+              if (!emitted) return line;
+              const range = safeRange(emitted.name);
               if (!range) return line;
               for (const slot of range.assumptions) usedAssumptions.add(slot);
-              return `${declaration[1]}const ${declaration[2]} = ` +
-                `${plainSafeExpression(declaration[2], true)};`;
+              const indentation =
+                line.slice(0, line.length - line.trimStart().length);
+              return `${indentation}${emitted.plain}`;
             });
             if (usedAssumptions.size) {
               const failures = [...usedAssumptions]
@@ -11613,6 +11617,11 @@ class JvmSsaBlockRenderer {
               preflightedCheckedLeafArgumentLimit = assumedLimit;
             }
           }
+          let checkedLeafTree = compactCheckedLeafLines(
+            transactionalAcyclicShape || transactionalAcyclicReadShape
+              ? transactionalizeAcyclicLeafLines(checkedLeafRenderedTree)
+              : checkedLeafRenderedTree);
+          checkedLeafTree = strengthReduceAffineStoreLoops(checkedLeafTree);
           // The entry locals of every checked-leaf tier. A slot the load/store
           // compaction proved dead is never declared, and a slot this region
           // never assigns is bound to its argument by declaration. Both were
