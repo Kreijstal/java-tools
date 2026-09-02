@@ -505,9 +505,11 @@ function retargetCheckedLeafBails(lines, target) {
     `break ${target.label}; }`;
   let bails = 0;
   const retargeted = lines.map((line) => {
-    if (!line.includes(CHECKED_LEAF_BAIL)) return line;
+    // Exact-identity expansion of the compiler-owned bail statement.
+    const around = line.split(CHECKED_LEAF_BAIL);
+    if (around.length === 1) return line;
     bails += 1;
-    return line.split(CHECKED_LEAF_BAIL).join(replacement);
+    return around.join(replacement);
   });
   return { lines: retargeted, bails };
 }
@@ -1240,6 +1242,47 @@ class JvmSsaBlockRenderer {
       }
     }
     const localCount = Number(code.code.localsSize) || 0;
+    // `frame`, `locals`, `stack`, `thread`, `helpers`, `plan`,
+    // `restorationDepth`, `safePointBudget`, `nestedEntryGuarded` and
+    // `framelessEntry` are ambient: every generated tier declares them in its
+    // outermost scope and no pass ever renames, propagates or eliminates one.
+    // They are deliberately not operands. `AMBIENT_GENERATED_NAMES` records
+    // them for the published fragments, whose consumer needs the free-variable
+    // set of an outlined unit.
+    const emittedNames = new Set([checkedLeafResultVariable]);
+    for (let slot = 0; slot < localCount; slot += 1) {
+      emittedNames.add(`local${slot}`);
+    }
+    for (let index = 0; index < 64; index += 1) {
+      emittedNames.add(`argument${index}`);
+    }
+    const operandExpressions = new Map();
+    activeEmittedNames = emittedNames;
+    activeOperandExpressions = operandExpressions;
+    // Renders a composite operand once and remembers its parts, so that every
+    // later interpolation of the same operand text carries the same operand
+    // references.
+    const operand = (expression) => {
+      const text = String(expression);
+      if (expression instanceof Expr && !operandExpressions.has(text)) {
+        operandExpressions.set(text, expression.parts);
+      }
+      return text;
+    };
+    const named = (name) => { emittedNames.add(name); return name; };
+    const primitiveArrayAccessMarker = (name) => {
+      primitiveArrayAccessMarkers.add(named(name));
+      return name;
+    };
+    const entryArrayDataName = (name) => {
+      entryArrayDataNames.add(named(name));
+      return name;
+    };
+    const localNameSlots = new Map();
+    for (let slot = 0; slot < localCount; slot += 1) {
+      localNameSlots.set(`local${slot}`, slot);
+    }
+    const localName = (slot) => `local${slot}`;
     const fieldSites = new Map();
     const directStaticSites = new Map();
     const lazyStaticSites = new Map();
@@ -1273,7 +1316,8 @@ class JvmSsaBlockRenderer {
         if (op === "getstatic" || op === "putstatic") {
           const direct = this.jit.registerDirectStaticTarget(fieldSite, op === "putstatic");
           if (direct) {
-            direct.variable = `ssaStaticFields${directStaticSites.size}`;
+            direct.variable = named(
+              `ssaStaticFields${directStaticSites.size}`);
             direct.op = op;
             direct.descriptor = Array.isArray(instruction.arg?.[2])
               ? instruction.arg[2][1] : null;
@@ -1285,7 +1329,7 @@ class JvmSsaBlockRenderer {
             const plan = this.jit.fieldSites[fieldSite];
             const lazy = {
               site: fieldSite,
-              variable: `ssaLazyStaticTarget${lazyStaticSites.size}`,
+              variable: named(`ssaLazyStaticTarget${lazyStaticSites.size}`),
               className: plan.className,
             };
             lazyStaticSites.set(index, lazy);
@@ -1455,52 +1499,16 @@ class JvmSsaBlockRenderer {
     // missing entry costs an optimization, never correctness: an interpolated
     // name the registry does not know stays inside a literal chunk and the
     // statement is then treated as opaque by every pass.
-    // `frame`, `locals`, `stack`, `thread`, `helpers`, `plan`,
-    // `restorationDepth`, `safePointBudget`, `nestedEntryGuarded` and
-    // `framelessEntry` are ambient: every generated tier declares them in its
-    // outermost scope and no pass ever renames, propagates or eliminates one.
-    // They are deliberately not operands. `AMBIENT_GENERATED_NAMES` records
-    // them for the published fragments, whose consumer needs the free-variable
-    // set of an outlined unit.
-    const emittedNames = new Set([checkedLeafResultVariable]);
-    for (let slot = 0; slot < localCount; slot += 1) {
-      emittedNames.add(`local${slot}`);
-    }
-    for (let index = 0; index < 64; index += 1) {
-      emittedNames.add(`argument${index}`);
-    }
     for (const identifier of ssaValueNames) emittedNames.add(identifier);
-    const operandExpressions = new Map();
-    activeEmittedNames = emittedNames;
-    activeOperandExpressions = operandExpressions;
-    // Renders a composite operand once and remembers its parts, so that every
-    // later interpolation of the same operand text carries the same operand
-    // references.
-    const operand = (expression) => {
-      const text = String(expression);
-      if (expression instanceof Expr && !operandExpressions.has(text)) {
-        operandExpressions.set(text, expression.parts);
-      }
-      return text;
-    };
-    const named = (name) => { emittedNames.add(name); return name; };
-    const primitiveArrayAccessMarker = (name) => {
-      primitiveArrayAccessMarkers.add(named(name));
-      return name;
-    };
-    const entryArrayDataName = (name) => {
-      entryArrayDataNames.add(named(name));
-      return name;
-    };
-    const localNameSlots = new Map();
-    for (let slot = 0; slot < localCount; slot += 1) {
-      localNameSlots.set(`local${slot}`, slot);
-    }
-    const localName = (slot) => `local${slot}`;
     // Besides ordinary operand values, a checked leaf may also propagate the
     // coarse-loop and array-range predicates: it has no restoring contract
     // that has to expose them as named guard sites.
     const checkedLeafCompactableNames = new Set();
+    // Loop trip/predicate temporaries. They are pure by construction, so an
+    // entry scaffold that no longer reads one may drop its declaration.
+    const pureRangeTemporaryNames = new Set();
+    const pureRangeTemporary = (name) =>
+      pureRangeTemporaryNames.add(name) && name;
     // Raw entry-array storage views. A store through one of these is the
     // proven form an ordered array load may be propagated into.
     const entryArrayDataNames = new Set();
@@ -1579,6 +1587,14 @@ class JvmSsaBlockRenderer {
         subject, entryArrayDataNames);
       record.throwsOrTries = partsWriteThrowOrTry(parts);
       record.conditional = partsOpenCondition(parts);
+      // `safePointBudget` is ambient rather than an operand, so the entry
+      // scaffold's sweep asks the statement whether it mentions the budget.
+      record.usesSafePointBudget =
+        partsSkeleton(parts).includes("safePointBudget");
+      // `helpers.returnVoid()` is late-bound to a captured constant before a
+      // capture-free body is created, so it is not a runtime helper call.
+      record.callsRuntimeHelper = partsSkeleton(parts)
+        .split("helpers.returnVoid()").join("").includes("helpers.");
       // The lexical nesting this statement opens or closes. It is a property
       // of the statement the emitter built, measured on the literal chunks it
       // wrote itself: operand references are names and never contain braces.
@@ -2016,7 +2032,7 @@ class JvmSsaBlockRenderer {
           cache = {
             direct,
             descriptor: direct.descriptor,
-            value: `ssaEntryStaticValue${number}`,
+            value: named(`ssaEntryStaticValue${number}`),
             data: direct.descriptor?.startsWith("[")
               ? entryArrayDataName(`ssaEntryStaticArrayData${number}`) : null,
             nullableTested: nullComparedStaticArrayLocations.has(key),
@@ -2077,8 +2093,8 @@ class JvmSsaBlockRenderer {
         const cache = {
           lazy,
           descriptor: plan.descriptor,
-          value: `ssaEntryStaticValue${number}`,
-          valid: `ssaEntryStaticValid${number}`,
+          value: named(`ssaEntryStaticValue${number}`),
+          valid: named(`ssaEntryStaticValid${number}`),
           data: plan.descriptor?.startsWith("[")
             ? entryArrayDataName(`ssaEntryStaticArrayData${number}`) : null,
         };
@@ -2360,7 +2376,7 @@ class JvmSsaBlockRenderer {
             : !dominators.get(loadBlock)?.has(storeBlock);
         })) continue;
         const view = {
-          data: `ssaStaticArrayLocalData${slot}`,
+          data: named(`ssaStaticArrayLocalData${slot}`),
           descriptor: direct.descriptor,
           storeIndex,
         };
@@ -2426,7 +2442,7 @@ class JvmSsaBlockRenderer {
             : !dominators.get(loadBlock)?.has(storeBlock);
         })) continue;
         const view = {
-          data: `ssaProducedArrayLocalData${slot}`,
+          data: named(`ssaProducedArrayLocalData${slot}`),
           descriptor,
           storeIndex,
         };
@@ -5782,16 +5798,17 @@ class JvmSsaBlockRenderer {
     };
     const directFieldValueExpression = (cache, object) =>
       Number.isInteger(cache.denseSlot)
-        ? `(Array.isArray(${object}.fields) ? ` +
-          `${object}.fields[${cache.denseSlot}] : ` +
-          `${object}.fields[${JSON.stringify(cache.directKey)}])`
-        : `${object}.fields[${JSON.stringify(cache.directKey)}]`;
-    const guardedDirectFieldReadExpression = (cache, object) =>
-      `(${object}.fields && ` +
-        `(Array.isArray(${object}.fields) || ` +
-        `${object}.fields[${JSON.stringify(cache.directKey)}] !== undefined) ? ` +
-        `${directFieldValueExpression(cache, object)} : ` +
-        `helpers.getFieldAt(${cache.site}, ${object}))`;
+        ? exprConcat(
+          e`(Array.isArray(${object}.fields) ? `,
+          e`${object}.fields[${cache.denseSlot}] : `,
+          e`${object}.fields[${JSON.stringify(cache.directKey)}])`)
+        : e`${object}.fields[${JSON.stringify(cache.directKey)}]`;
+    const guardedDirectFieldReadExpression = (cache, object) => exprConcat(
+      e`(${object}.fields && `,
+      e`(Array.isArray(${object}.fields) || `,
+      e`${object}.fields[${JSON.stringify(cache.directKey)}] !== undefined) ? `,
+      e`${directFieldValueExpression(cache, object)} : `,
+      e`helpers.getFieldAt(${cache.site}, ${object}))`);
     const fieldBackedArrayGuards = [
       ...[...fieldReadCaches.values()]
         .filter((cache) => cache.isArray &&
@@ -5831,56 +5848,60 @@ class JvmSsaBlockRenderer {
       .filter((cache) =>
         cache.eagerLocal === null || cache.eagerLocal === undefined)
       .flatMap((cache) => [
-        `${cache.valid} = false;`,
-        `${cache.object} = null;`,
-        ...(cache.isArray ? [`${cache.data} = null;`] : []),
+        st`${cache.valid} = false;`,
+        st`${cache.object} = null;`,
+        ...(cache.isArray ? [st`${cache.data} = null;`] : []),
       ]);
     const refreshEagerFieldCacheLines = [...fieldReadCaches.values()]
       .filter((cache) =>
         cache.eagerLocal !== null && cache.eagerLocal !== undefined)
       .flatMap((cache) => [
-        `if (local${cache.eagerLocal} !== null && ` +
-          `local${cache.eagerLocal} !== undefined) {`,
-        `  ${cache.value} = ${cache.directKey
+        stmt(exprConcat(
+          e`if (${localName(cache.eagerLocal)} !== null && `,
+          e`${localName(cache.eagerLocal)} !== undefined) {`)),
+        stmt(e`  ${cache.value} = ${cache.directKey
           ? guardedDirectFieldReadExpression(
-            cache, `local${cache.eagerLocal}`)
-          : `helpers.getFieldAt(${cache.site}, local${cache.eagerLocal})`};`,
+            cache, localName(cache.eagerLocal))
+          : e`helpers.getFieldAt(${cache.site}, ${
+            localName(cache.eagerLocal)})`};`),
         ...(cache.isArray ? [
-          `  ${cache.data} = ${arrayDataExpression(cache.value)};`,
+          stmt(e`  ${cache.data} = ${arrayDataExpr(cache.value)};`),
         ] : []),
-        "}",
+        blockEnd(""),
       ]);
     const refreshEntryStaticCacheLines =
       [...entryStaticReadCaches.values()].flatMap((cache) => {
         if (cache.lazy) {
           const lazy = cache.lazy;
-          const read = `${lazy.variable}.cell ? ${lazy.variable}.cell.value : ` +
-            `${lazy.variable}.kind === "map" ? ` +
-            `${lazy.variable}.fields.get(${lazy.variable}.key) : ` +
-            `${lazy.variable}.fields[${lazy.variable}.key]`;
+          const read = exprConcat(
+            e`${lazy.variable}.cell ? ${lazy.variable}.cell.value : `,
+            e`${lazy.variable}.kind === "map" ? `,
+            e`${lazy.variable}.fields.get(${lazy.variable}.key) : `,
+            e`${lazy.variable}.fields[${lazy.variable}.key]`);
           return [
-            `${lazy.variable} = helpers.fieldSites[${lazy.site}].staticTarget;`,
-            `${cache.valid} = Boolean(${lazy.variable});`,
-            `${cache.value} = ${cache.valid} ? ${read} : undefined;`,
+            st`${lazy.variable} = helpers.fieldSites[${lazy.site}].staticTarget;`,
+            st`${cache.valid} = Boolean(${lazy.variable});`,
+            stmt(e`${cache.value} = ${cache.valid} ? ${read} : undefined;`),
             ...(cache.data
-              ? [`${cache.data} = ${cache.valid} ? ` +
-                `${arrayDataExpression(cache.value)} : null;`]
+              ? [stmt(exprConcat(e`${cache.data} = ${cache.valid} ? `,
+                e`${arrayDataExpr(cache.value)} : null;`))]
               : []),
           ];
         }
         const direct = cache.direct;
         const fields =
-          `helpers.directStaticTargets[${direct.targetId}].fields`;
+          e`helpers.directStaticTargets[${direct.targetId}].fields`;
         const read = direct.cell
-          ? `helpers.directStaticTargets[${direct.targetId}].cell.value` +
-            ` /* ${direct.key} */`
+          ? exprConcat(
+            e`helpers.directStaticTargets[${direct.targetId}].cell.value`,
+            e` /* ${direct.key} */`)
           : direct.kind === "map"
-            ? `${fields}.get(${JSON.stringify(direct.key)})`
-            : `${fields}[${JSON.stringify(direct.key)}]`;
+            ? e`${fields}.get(${JSON.stringify(direct.key)})`
+            : e`${fields}[${JSON.stringify(direct.key)}]`;
         return [
-          `${cache.value} = ${read};`,
+          stmt(e`${cache.value} = ${read};`),
           ...(cache.data
-            ? [`${cache.data} = ${arrayDataExpression(cache.value)};`]
+            ? [stmt(e`${cache.data} = ${arrayDataExpr(cache.value)};`)]
             : []),
         ];
       });
@@ -6177,9 +6198,10 @@ class JvmSsaBlockRenderer {
           const tripLimit = runtimeCoarseTripLimitFor(info);
           runtimeCoarseCountedLoops.set(header, {
             ...info,
-            variable: compactable(named(`ssaRuntimeCoarseLoop${header}`)),
-            tripsVariable:
-              compactable(named(`ssaRuntimeCoarseTrips${header}`)),
+            variable: pureRangeTemporary(
+              compactable(named(`ssaRuntimeCoarseLoop${header}`))),
+            tripsVariable: pureRangeTemporary(
+              compactable(named(`ssaRuntimeCoarseTrips${header}`))),
             tripsExpression: operand(exprConcat(
               e`(${localName(info.slot)} >= ${info.boundExpression} ? 0 : `,
               info.increment === 1
@@ -6190,11 +6212,13 @@ class JvmSsaBlockRenderer {
                   e`${info.increment})`),
               e`)`)),
             condition: operand(exprConcat(
-              e`${compactable(named(`ssaRuntimeCoarseTrips${header}`))} <= `,
+              e`${pureRangeTemporary(compactable(named(
+                `ssaRuntimeCoarseTrips${header}`)))} <= `,
               e`${tripLimit}`,
               info.increment === 1 ? "" : exprConcat(
                 e` && ${localName(info.slot)} <= 2147483647 - `,
-                e`${compactable(named(`ssaRuntimeCoarseTrips${header}`))} * ${
+                e`${pureRangeTemporary(compactable(named(
+                `ssaRuntimeCoarseTrips${header}`)))} * ${
                   info.increment}`))),
           });
         }
@@ -6277,12 +6301,14 @@ class JvmSsaBlockRenderer {
       if (this.coarseCountedLoopSafePointsEnabled) {
         runtimeCoarseCountedLoops.set(header, {
           header, slot, loopBlocks, writtenSlots, postDecrement: true,
-          variable: compactable(named(`ssaRuntimeCoarseLoop${header}`)),
-          tripsVariable:
-            compactable(named(`ssaRuntimeCoarseTrips${header}`)),
+          variable: pureRangeTemporary(
+            compactable(named(`ssaRuntimeCoarseLoop${header}`))),
+          tripsVariable: pureRangeTemporary(
+            compactable(named(`ssaRuntimeCoarseTrips${header}`))),
           tripsExpression: operand(e`Math.max(0, ${localName(slot)})`),
           condition: operand(exprConcat(
-            e`${compactable(named(`ssaRuntimeCoarseTrips${header}`))} <= `,
+            e`${pureRangeTemporary(compactable(named(
+              `ssaRuntimeCoarseTrips${header}`)))} <= `,
             e`${runtimeCoarseTripLimit}`)),
         });
       }
@@ -6338,9 +6364,10 @@ class JvmSsaBlockRenderer {
             runtimeCoarseCountedLoops.has(header)) continue;
         runtimeCoarseCountedLoops.set(header, {
           ...info,
-          variable: compactable(named(`ssaRuntimeCoarseLoop${header}`)),
-          tripsVariable:
-            compactable(named(`ssaRuntimeCoarseTrips${header}`)),
+          variable: pureRangeTemporary(
+            compactable(named(`ssaRuntimeCoarseLoop${header}`))),
+          tripsVariable: pureRangeTemporary(
+            compactable(named(`ssaRuntimeCoarseTrips${header}`))),
           tripsExpression: operand(exprConcat(
             e`(${localName(info.slot)} >= ${info.boundExpression} ? 0 : `,
             info.increment === 1
@@ -6351,11 +6378,13 @@ class JvmSsaBlockRenderer {
                 e`${info.increment})`),
             e`)`)),
           condition: operand(exprConcat(
-            e`${compactable(named(`ssaRuntimeCoarseTrips${header}`))} <= ${
+            e`${pureRangeTemporary(compactable(named(
+              `ssaRuntimeCoarseTrips${header}`)))} <= ${
               runtimeCoarseTripLimit}`,
             info.increment === 1 ? "" : exprConcat(
               e` && ${localName(info.slot)} <= 2147483647 - `,
-              e`${compactable(named(`ssaRuntimeCoarseTrips${header}`))} * ${
+              e`${pureRangeTemporary(compactable(named(
+                `ssaRuntimeCoarseTrips${header}`)))} * ${
                 info.increment}`))),
         });
       }
@@ -6771,7 +6800,8 @@ class JvmSsaBlockRenderer {
       if (!shared) {
         const remaining =
           e`(${info.boundExpression} - ${localName(info.slot)})`;
-        const variable = named(`ssaArrayRangeTrips${info.header}`);
+        const variable =
+          pureRangeTemporary(named(`ssaArrayRangeTrips${info.header}`));
         shared = {
           variable,
           declaration: constDecl(variable, exprConcat(
@@ -9870,63 +9900,74 @@ class JvmSsaBlockRenderer {
         continue;
       }
       const depth = depths[block.insns[0]] || 0;
-      for (let slot = 0; slot < depth; slot += 1) declarations.push(`let ssaStack${block.id}_${slot};`);
+      for (let slot = 0; slot < depth; slot += 1) {
+        declarations.push(letDecl(named(`ssaStack${block.id}_${slot}`)));
+      }
     }
     for (const [variable, island] of dispatchVariables) {
-      declarations.push(`let ${variable} = 0;`);
-      for (let slot = 0; slot < island.maxDepth; slot += 1) declarations.push(`let ${island.transfer}${slot};`);
+      declarations.push(letDecl(named(variable), e`0`));
+      for (let slot = 0; slot < island.maxDepth; slot += 1) {
+        declarations.push(letDecl(named(`${island.transfer}${slot}`)));
+      }
     }
     const staticInitializationGuardId = directStaticOwners.size
       ? this.registerClassInitializationGuard(directStaticOwners) : -1;
     const staticInitializationGuardDeclaration = staticInitializationGuardId >= 0
-      ? `const ssaClassInitializationGuard = helpers.structuredSsa.classInitializationGuards[${staticInitializationGuardId}];`
+      ? constDecl(named("ssaClassInitializationGuard"),
+        e`helpers.structuredSsa.classInitializationGuards[${
+          staticInitializationGuardId}]`)
       : null;
     const staticEntryGuard = staticInitializationGuardId >= 0
-      ? "if ((ssaClassInitializationGuard.classEpoch !== (helpers.jvm.classEpoch || 0) || " +
-        "ssaClassInitializationGuard.initializationEpoch !== " +
-        "(helpers.jvm.classInitializationEpoch || 0)) && " +
-        "!helpers.structuredSsa.verifyClassInitializationGuard(" +
-        "ssaClassInitializationGuard)) { helpers.skipJitOnce(frame); " +
-        "return { deopt: true, transient: true, reason: 'structured SSA static entry' }; }"
+      ? stmt(exprConcat(
+        e`if ((${named("ssaClassInitializationGuard")}.classEpoch !== (helpers.jvm.classEpoch || 0) || `,
+        e`${named("ssaClassInitializationGuard")}.initializationEpoch !== `,
+        e`(helpers.jvm.classInitializationEpoch || 0)) && `,
+        e`!helpers.structuredSsa.verifyClassInitializationGuard(`,
+        e`${named("ssaClassInitializationGuard")})) { helpers.skipJitOnce(frame); `,
+        e`return { deopt: true, transient: true, reason: 'structured SSA static entry' }; }`))
       : null;
     const directStaticDeclarations = [...directStaticSites.values()]
       .filter((direct) => !direct.entryReadCache)
-      .map((direct) =>
-      `const ${direct.variable} = helpers.directStaticTargets[${direct.targetId}].fields;`);
+      .map((direct) => constDecl(named(direct.variable),
+        e`helpers.directStaticTargets[${direct.targetId}].fields`));
     const lazyStaticDeclarations = [...lazyStaticSites.values()].map((lazy) =>
-      `let ${lazy.variable} = helpers.fieldSites[${lazy.site}].staticTarget;`);
+      letDecl(named(lazy.variable),
+        e`helpers.fieldSites[${lazy.site}].staticTarget`));
     const entryStaticReadDeclarations =
       [...entryStaticReadCaches.values()].flatMap((cache) => {
         if (cache.lazy) {
           const lazy = cache.lazy;
-          const read = `${lazy.variable}.cell ? ${lazy.variable}.cell.value : ` +
-            `${lazy.variable}.kind === "map" ? ` +
-            `${lazy.variable}.fields.get(${lazy.variable}.key) : ` +
-            `${lazy.variable}.fields[${lazy.variable}.key]`;
+          const read = exprConcat(
+            e`${lazy.variable}.cell ? ${lazy.variable}.cell.value : `,
+            e`${lazy.variable}.kind === "map" ? `,
+            e`${lazy.variable}.fields.get(${lazy.variable}.key) : `,
+            e`${lazy.variable}.fields[${lazy.variable}.key]`);
           return [
-            `let ${cache.valid} = Boolean(${lazy.variable});`,
-            `let ${cache.value} = ${cache.valid} ? ` +
-              `${normalizeJvmScalarExpression(read, cache.descriptor)} : undefined;`,
+            letDecl(cache.valid, e`Boolean(${lazy.variable})`),
+            letDecl(cache.value, exprConcat(e`${cache.valid} ? `,
+              e`${normalizeJvmScalarExpression(read, cache.descriptor)}`,
+              e` : undefined`)),
             ...(cache.data
-              ? [`let ${cache.data} = ${cache.valid} ? ` +
-                `${arrayDataExpression(cache.value)} : null;`]
+              ? [letDecl(cache.data, exprConcat(e`${cache.valid} ? `,
+                e`${arrayDataExpr(cache.value)} : null`))]
               : []),
           ];
         }
         const direct = cache.direct;
         const fields =
-          `helpers.directStaticTargets[${direct.targetId}].fields`;
+          e`helpers.directStaticTargets[${direct.targetId}].fields`;
         const read = direct.cell
-          ? `helpers.directStaticTargets[${direct.targetId}].cell.value` +
-            ` /* ${direct.key} */`
+          ? exprConcat(
+            e`helpers.directStaticTargets[${direct.targetId}].cell.value`,
+            e` /* ${direct.key} */`)
           : direct.kind === "map"
-            ? `${fields}.get(${JSON.stringify(direct.key)})`
-            : `${fields}[${JSON.stringify(direct.key)}]`;
+            ? e`${fields}.get(${JSON.stringify(direct.key)})`
+            : e`${fields}[${JSON.stringify(direct.key)}]`;
         return [
-          `let ${cache.value} = ` +
-            `${normalizeJvmScalarExpression(read, cache.descriptor)};`,
+          letDecl(cache.value,
+            e`${normalizeJvmScalarExpression(read, cache.descriptor)}`),
           ...(cache.data
-            ? [`let ${cache.data} = ${arrayDataExpression(cache.value)};`]
+            ? [letDecl(cache.data, arrayDataExpr(cache.value))]
             : []),
         ];
       });
@@ -9944,42 +9985,45 @@ class JvmSsaBlockRenderer {
           if (!cache.lazy) {
             const direct = cache.direct;
             const fields =
-              `helpers.directStaticTargets[${direct.targetId}].fields`;
+              e`helpers.directStaticTargets[${direct.targetId}].fields`;
             const read = direct.cell
-              ? `helpers.directStaticTargets[${direct.targetId}].cell.value` +
-            ` /* ${direct.key} */`
+              ? exprConcat(
+                e`helpers.directStaticTargets[${direct.targetId}].cell.value`,
+                e` /* ${direct.key} */`)
               : direct.kind === "map"
-                ? `${fields}.get(${JSON.stringify(direct.key)})`
-                : `${fields}[${JSON.stringify(direct.key)}]`;
+                ? e`${fields}.get(${JSON.stringify(direct.key)})`
+                : e`${fields}[${JSON.stringify(direct.key)}]`;
             return [
-              `let ${cache.value} = ` +
-                `${normalizeJvmScalarExpression(read, cache.descriptor)};`,
+              letDecl(cache.value,
+                e`${normalizeJvmScalarExpression(read, cache.descriptor)}`),
               ...(cache.data
-                ? [`let ${cache.data} = ${arrayDataExpression(cache.value)};`]
+                ? [letDecl(cache.data, arrayDataExpr(cache.value))]
                 : []),
             ];
           }
           const lazy = cache.lazy;
-          const read = `${lazy.variable}.cell ? ${lazy.variable}.cell.value : ` +
-            `${lazy.variable}.kind === "map" ? ` +
-            `${lazy.variable}.fields.get(${lazy.variable}.key) : ` +
-            `${lazy.variable}.fields[${lazy.variable}.key]`;
+          const read = exprConcat(
+            e`${lazy.variable}.cell ? ${lazy.variable}.cell.value : `,
+            e`${lazy.variable}.kind === "map" ? `,
+            e`${lazy.variable}.fields.get(${lazy.variable}.key) : `,
+            e`${lazy.variable}.fields[${lazy.variable}.key]`);
           return [
-            `let ${cache.value};`,
-            `if (${lazy.variable}) {`,
-            `  ${cache.value} = ${read};`,
-            "} else {",
-            `  ${cache.value} = helpers.getStaticSyncAt(${lazy.site});`,
-            `  if (${cache.value} === helpers.staticDeopt()) ` +
-              "{ return helpers.asyncInvokeSentinel(); }",
-            `  ${lazy.variable} = helpers.fieldSites[${lazy.site}].staticTarget;`,
-            `  if (${lazy.variable}) ` +
-              "helpers.structuredSsa.lazyStaticTargetLinkCount += 1;",
-            "}",
-            `${cache.value} = ` +
-              `${normalizeJvmScalarExpression(cache.value, cache.descriptor)};`,
+            letDecl(cache.value),
+            st`if (${lazy.variable}) {`,
+            stmt(e`  ${cache.value} = ${read};`),
+            elseArm(""),
+            st`  ${cache.value} = helpers.getStaticSyncAt(${lazy.site});`,
+            stmt(exprConcat(
+              e`  if (${cache.value} === helpers.staticDeopt()) `,
+              e`{ ${leafBailStatement()} }`)),
+            st`  ${lazy.variable} = helpers.fieldSites[${lazy.site}].staticTarget;`,
+            stmt(exprConcat(e`  if (${lazy.variable}) `,
+              e`helpers.structuredSsa.lazyStaticTargetLinkCount += 1;`)),
+            blockEnd(""),
+            stmt(e`${cache.value} = ${
+              normalizeJvmScalarExpression(cache.value, cache.descriptor)};`),
             ...(cache.data
-              ? [`let ${cache.data} = ${arrayDataExpression(cache.value)};`]
+              ? [letDecl(cache.data, arrayDataExpr(cache.value))]
               : []),
           ];
         });
@@ -10003,8 +10047,12 @@ class JvmSsaBlockRenderer {
       // links the site replaces the whole declaration by identity instead of
       // parsing the module to find the declarator's initializer.
       const declarationsByName = new Map();
-      const declare = (kind, name, initializer) => {
-        const text = `${kind} ${name} = ${initializer};`;
+      const declare = (kind, name, initializer,
+        removableWhenUnused = false) => {
+        const meta = removableWhenUnused ? {removableWhenUnused: true} : null;
+        const text = kind === "const"
+          ? constDecl(named(name), e`${initializer}`, meta)
+          : letDecl(named(name), e`${initializer}`, meta);
         declarationsByName.set(name, {kind, text});
         return text;
       };
@@ -10022,14 +10070,15 @@ class JvmSsaBlockRenderer {
         let captureRefreshLine = null;
         if (captures.length) {
           captureCacheId = site.checkedLeafCaptureCacheId;
-          captureCacheVariable = `ssaCallCaptureCache${index}`;
+          captureCacheVariable = named(`ssaCallCaptureCache${index}`);
           captureRefreshLine = alwaysRefreshCaptures
-            ? `helpers.refreshCheckedLeafCaptureCache(${captureCacheId});`
-            : `if (${captureCacheVariable}.dirty) ` +
-              `helpers.refreshCheckedLeafCaptureCache(${captureCacheId});`;
+            ? st`helpers.refreshCheckedLeafCaptureCache(${captureCacheId});`
+            : stmt(exprConcat(e`if (${captureCacheVariable}.dirty) `,
+              e`helpers.refreshCheckedLeafCaptureCache(${captureCacheId});`));
           captureLines.push(
-            `const ${captureCacheVariable} = ` +
-              `helpers.checkedLeafCaptureCaches[${captureCacheId}];`,
+            constDecl(captureCacheVariable,
+              e`helpers.checkedLeafCaptureCaches[${captureCacheId}]`,
+              {removableWhenUnused: true}),
             captureRefreshLine);
         }
         let captureValueOffset = 0;
@@ -10037,27 +10086,28 @@ class JvmSsaBlockRenderer {
           captureIndex += 1) {
           const capture = captures[captureIndex];
           const valueName =
-            `ssaCallCapture${index}_${captureArguments.length}`;
-          captureLines.push(`const ${valueName} = ${
+            named(`ssaCallCapture${index}_${captureArguments.length}`);
+          captureLines.push(constDecl(valueName,
             normalizeJvmScalarExpression(
-              `${captureCacheVariable}.value${captureValueOffset}`,
-              capture.descriptor)};`);
+              e`${captureCacheVariable}.value${captureValueOffset}`,
+              capture.descriptor), {removableWhenUnused: true}));
           captureArguments.push(valueName);
           captureValueOffset += 1;
           if (capture.data) {
             const dataName =
-              `ssaCallCapture${index}_${captureArguments.length}`;
-            captureLines.push(`const ${dataName} = ` +
-              `${captureCacheVariable}.value${captureValueOffset};`);
+              named(`ssaCallCapture${index}_${captureArguments.length}`);
+            captureLines.push(constDecl(dataName,
+              e`${captureCacheVariable}.value${captureValueOffset}`,
+              {removableWhenUnused: true}));
             captureArguments.push(dataName);
             captureValueOffset += 1;
           }
         }
-        const rawBody = `ssaFastPositionalRawBody${index}`;
+        const rawBody = named(`ssaFastPositionalRawBody${index}`);
         if (forceCanonicalCalls) {
           lines.push(
             declare("const", positionalCallSiteVariable(index),
-              `helpers.syncCallSites[${site.id}]`),
+              e`helpers.syncCallSites[${site.id}]`),
             ...captureLines,
             declare("const", positionalCallLateLinkVariable(index), "false"),
             declare("let", positionalCallTargetVariable(index), "null"),
@@ -10068,7 +10118,8 @@ class JvmSsaBlockRenderer {
         } else if (compileTimeCheckedLeaf) {
           lines.push(
             declare("const", rawBody,
-              `helpers.directCheckedLeafBodies[${site.directCheckedLeaf.id}]`),
+              e`helpers.directCheckedLeafBodies[${
+                site.directCheckedLeaf.id}]`, true),
             ...captureLines,
             declare("const", positionalCallRawInvokeVariable(index), rawBody),
             declare("const", positionalCallInvokeVariable(index), "null"),
@@ -10077,25 +10128,25 @@ class JvmSsaBlockRenderer {
         } else {
           lines.push(
             declare("const", positionalCallSiteVariable(index),
-              `helpers.syncCallSites[${site.id}]`),
+              e`helpers.syncCallSites[${site.id}]`),
             declare("const", positionalCallLateLinkVariable(index), "true"),
-            declare("let", positionalCallTargetVariable(index),
-              `!helpers.profileMethods && ` +
-              `${positionalCallSiteVariable(index)} && ` +
-              `${positionalCallSiteVariable(index)}.fastPositional && ` +
-              `(${positionalCallSiteVariable(index)}.fastPositional.debugGuarded || ` +
-              `!helpers.jvm.debugManager.isClassJitDeopted(` +
-              `${positionalCallSiteVariable(index)}.fastPositional.lookupClass)) ` +
-              `? ${positionalCallSiteVariable(index)}.fastPositional : null`),
-            declare("let", positionalCallInvokeVariable(index),
-              `${positionalCallTargetVariable(index)} && ` +
-              `${positionalCallTargetVariable(index)}.invoke`),
-            declare("let", positionalCallRawInvokeVariable(index),
-              `${positionalCallTargetVariable(index)} && ` +
-              `${positionalCallTargetVariable(index)}.rawInvoke`),
-            declare("let", positionalCallReceiverVariable(index),
-              `${positionalCallTargetVariable(index)} && ` +
-              `${positionalCallTargetVariable(index)}.receiverType`),
+            declare("let", positionalCallTargetVariable(index), exprConcat(
+              e`!helpers.profileMethods && `,
+              e`${positionalCallSiteVariable(index)} && `,
+              e`${positionalCallSiteVariable(index)}.fastPositional && `,
+              e`(${positionalCallSiteVariable(index)}.fastPositional.debugGuarded || `,
+              e`!helpers.jvm.debugManager.isClassJitDeopted(`,
+              e`${positionalCallSiteVariable(index)}.fastPositional.lookupClass)) `,
+              e`? ${positionalCallSiteVariable(index)}.fastPositional : null`)),
+            declare("let", positionalCallInvokeVariable(index), exprConcat(
+              e`${positionalCallTargetVariable(index)} && `,
+              e`${positionalCallTargetVariable(index)}.invoke`)),
+            declare("let", positionalCallRawInvokeVariable(index), exprConcat(
+              e`${positionalCallTargetVariable(index)} && `,
+              e`${positionalCallTargetVariable(index)}.rawInvoke`)),
+            declare("let", positionalCallReceiverVariable(index), exprConcat(
+              e`${positionalCallTargetVariable(index)} && `,
+              e`${positionalCallTargetVariable(index)}.receiverType`)),
           );
         }
         if (captureLines.length) {
@@ -10182,18 +10233,20 @@ class JvmSsaBlockRenderer {
         if (start < 0 || end < 0) return null;
         const indentation = indentationOf(lines[start]);
         const direct = rawWorker
-          ? `${functionName}(${call.args.join(", ")});`
-          : `${functionName}(helpers, ${call.args.join(", ")}` +
-            `${call.args.length ? ", " : ""}thread, 2);`;
+          ? stmt(exprConcat(e`${functionName}(`,
+            argumentListExpression(call.args), e`);`))
+          : stmt(exprConcat(e`${functionName}(helpers, `,
+            argumentListExpression(call.args),
+            call.args.length ? ", " : "", e`thread, 2);`));
         lines.splice(start, end - start + 1, `${indentation}${direct}`);
       }
       return lines.join("\n");
     };
     const fieldReadCacheDeclarations = [...fieldReadCaches.values()].flatMap((cache) => [
-      `let ${cache.object} = null;`,
-      `let ${cache.value};`,
-      `let ${cache.valid} = false;`,
-      ...(cache.isArray ? [`let ${cache.data} = null;`] : []),
+      letDecl(cache.object, e`null`),
+      letDecl(cache.value),
+      letDecl(cache.valid, e`false`),
+      ...(cache.isArray ? [letDecl(cache.data, e`null`)] : []),
     ]);
     const fieldReadCacheInitializations = [...fieldReadCaches.values()]
       .filter((cache) =>
@@ -10231,15 +10284,17 @@ class JvmSsaBlockRenderer {
         (cache) => cache.eagerLocal === slot);
       restoringDirectFieldLayoutSlots.add(slot);
       restoringDirectFieldCacheInitializations.push(
-        `if (local${slot} === null || local${slot} === undefined || ` +
-          `!local${slot}.fields) ` +
-          `return helpers.asyncInvokeSentinel();`,
+        stmt(exprConcat(
+          e`if (${localName(slot)} === null || ${
+            localName(slot)} === undefined || `,
+          e`!${localName(slot)}.fields) `,
+          e`${leafBailStatement()}`)),
       );
       for (const cache of caches) {
         restoringDirectFieldCacheInitializations.push(
-          `${cache.object} = local${slot};`,
-          `${cache.value} = ` +
-            `${directFieldValueExpression(cache, `local${slot}`)};`,
+          stmt(e`${cache.object} = ${localName(slot)};`),
+          stmt(exprConcat(e`${cache.value} = `,
+            e`${directFieldValueExpression(cache, localName(slot))};`)),
         );
       }
       // allocateObject may leave never-assigned Java fields absent from the
@@ -10252,23 +10307,24 @@ class JvmSsaBlockRenderer {
           (cache.descriptor.startsWith("L") ||
             cache.descriptor.startsWith("[")) ? "null" : "0";
         restoringDirectFieldCacheInitializations.push(
-          `if (${cache.value} === undefined) ${cache.value} = ${defaultValue};`,
+          stmt(e`if (${cache.value} === undefined) ${cache.value} = ${
+            defaultValue};`),
         );
       }
       for (const cache of caches) {
         if (!cache.isArray) {
           restoringDirectFieldCacheInitializations.push(
-            `${cache.value} = ${normalizeJvmScalarExpression(
-              cache.value, cache.descriptor)};`,
+            stmt(e`${cache.value} = ${normalizeJvmScalarExpression(
+              cache.value, cache.descriptor)};`),
           );
         }
         if (cache.isArray) {
           restoringDirectFieldCacheInitializations.push(
-            `${cache.data} = ${arrayDataExpression(cache.value)};`,
+            stmt(e`${cache.data} = ${arrayDataExpr(cache.value)};`),
           );
         }
         restoringDirectFieldCacheInitializations.push(
-          `${cache.valid} = true;`,
+          stmt(e`${cache.valid} = true;`),
         );
       }
     }
@@ -10279,17 +10335,19 @@ class JvmSsaBlockRenderer {
         .filter((cache) => !restoringDirectLayoutCacheSet.has(cache) &&
           cache.eagerLocal !== null && cache.eagerLocal !== undefined)
         .flatMap((cache) => [
-          `if (local${cache.eagerLocal} !== null && ` +
-            `local${cache.eagerLocal} !== undefined) {`,
-          `  ${cache.object} = local${cache.eagerLocal};`,
-          `  ${cache.value} = ${cache.directKey
+          stmt(exprConcat(
+            e`if (${localName(cache.eagerLocal)} !== null && `,
+            e`${localName(cache.eagerLocal)} !== undefined) {`)),
+          stmt(e`  ${cache.object} = ${localName(cache.eagerLocal)};`),
+          stmt(e`  ${cache.value} = ${cache.directKey
             ? guardedDirectFieldReadExpression(
-              cache, `local${cache.eagerLocal}`)
-            : `helpers.getFieldAt(${cache.site}, local${cache.eagerLocal})`};`,
+              cache, localName(cache.eagerLocal))
+            : e`helpers.getFieldAt(${cache.site}, ${
+              localName(cache.eagerLocal)})`};`),
           ...(cache.isArray
-            ? [`  ${cache.data} = ${arrayDataExpression(cache.value)};`] : []),
-          `  ${cache.valid} = true;`,
-          "}",
+            ? [stmt(e`  ${cache.data} = ${arrayDataExpr(cache.value)};`)] : []),
+          stmt(e`  ${cache.valid} = true;`),
+          blockEnd(""),
         ]),
     );
     // A transactional checked leaf must never call a field helper before it
@@ -10306,31 +10364,46 @@ class JvmSsaBlockRenderer {
       const caches = transactionalEagerFieldCaches.filter(
         (cache) => cache.eagerLocal === slot);
       transactionalFieldReadCacheInitializations.push(
-        `if (local${slot} === null || local${slot} === undefined || ` +
-          `!local${slot}.fields) ` +
-          `return helpers.asyncInvokeSentinel();`,
+        stmt(exprConcat(
+          e`if (${localName(slot)} === null || ${
+            localName(slot)} === undefined || `,
+          e`!${localName(slot)}.fields) `,
+          e`${leafBailStatement()}`)),
       );
       for (const cache of caches) {
         transactionalFieldReadCacheInitializations.push(
-          `const ${cache.value} = ` +
-            `${directFieldValueExpression(cache, `local${slot}`)};`,
+          constDecl(cache.value,
+            directFieldValueExpression(cache, localName(slot))),
         );
         if (cache.isArray) {
           transactionalFieldReadCacheInitializations.push(
-            `const ${cache.data} = ${arrayDataExpression(cache.value)};`,
+            constDecl(cache.data, arrayDataExpr(cache.value)),
           );
         }
       }
       transactionalFieldReadCacheInitializations.push(
-        `if (${caches.map((cache) => `${cache.value} === undefined`)
-          .join(" || ")}) return helpers.asyncInvokeSentinel();`,
+        stmt(exprConcat(e`if (`,
+          ...caches.flatMap((cache, position) => [
+            position === 0 ? "" : " || ",
+            e`${cache.value} === undefined`,
+          ]),
+          e`) ${leafBailStatement()}`)),
       );
     }
+    const guardedStaticBooleanConditions = (direct) => exprConcat(
+      e`((`,
+      direct.kind === "map"
+        ? e`${direct.variable}.get(${JSON.stringify(direct.key)})`
+        : e`${direct.variable}[${JSON.stringify(direct.key)}]`,
+      e` ? 1 : 0) !== ${direct.guardedBooleanValue})`);
     const guardedStaticBooleanEntryGuard = guardedStaticBooleanSites.size
-      ? `if (${[...guardedStaticBooleanSites.values()].map((direct) => `((${
-        direct.kind === "map" ? `${direct.variable}.get(${JSON.stringify(direct.key)})`
-          : `${direct.variable}[${JSON.stringify(direct.key)}]`} ? 1 : 0) !== ${
-        direct.guardedBooleanValue})`).join(" || ")}) { helpers.structuredSsa.guardedBooleanFallbackCount += 1; helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'structured SSA static boolean guard' }; }`
+      ? stmt(exprConcat(e`if (`,
+        ...[...guardedStaticBooleanSites.values()].flatMap(
+          (direct, position) => [
+            position === 0 ? "" : " || ",
+            guardedStaticBooleanConditions(direct),
+          ]),
+        e`) { helpers.structuredSsa.guardedBooleanFallbackCount += 1; helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'structured SSA static boolean guard' }; }`))
       : null;
     let renderedTree = expandContinuationFallbacks(
       render(structured.tree), useContinuations);
@@ -10386,14 +10459,24 @@ class JvmSsaBlockRenderer {
       .filter((slot) =>
         declaredLocals.includes(slot) &&
         renderedEntryArrayDataNames.has(entryArrayDataVariable(slot)));
-    const entryArrayDataDeclarationFor = (slot) =>
-      `const ${entryArrayDataVariable(slot)} = ${arrayDataExpression(`local${slot}`)};`;
+    // One JVM slot's entry declaration: `const` when the region proves the
+    // slot immutable, `let` otherwise.
+    const entryLocalDeclaration = (index, entryArgumentValue) => {
+      const initializer = e`${entryLocalInitialValues.has(index)
+        ? entryLocalInitialValues.get(index)
+        : entryArgumentValue(index) || "undefined"}`;
+      return immutableEntryLocals.has(index)
+        ? constDecl(localName(index), initializer)
+        : letDecl(localName(index), initializer);
+    };
+    const entryArrayDataDeclarationFor = (slot) => constDecl(
+      entryArrayDataVariable(slot), arrayDataExpr(localName(slot)));
     const entryArrayDataDeclarations = entryArrayDataSlots.map(
       entryArrayDataDeclarationFor);
     const persistentStaticArrayDataDeclarations =
       [...persistentStaticArrayLocalViews.values(),
         ...persistentProducedArrayLocalViews.values()].map((view) =>
-        `let ${view.data} = null;`);
+        letDecl(named(view.data), e`null`));
     const guardedArrayDataVariables = [
       ...entryArrayDataSlots.map(entryArrayDataVariable),
       ...[...entryStaticReadCaches.values()]
@@ -10401,21 +10484,27 @@ class JvmSsaBlockRenderer {
           !hasNullableStaticArrayControl)
         .map((cache) => cache.data).filter(Boolean),
     ];
+    const nullArrayDataConjunction = (variables) => exprConcat(
+      ...variables.flatMap((data, position) => [
+        position === 0 ? "" : " || ",
+        e`${data} === null`,
+      ]));
     const guardedArrayDataCondition = guardedArrayDataVariables.length
-      ? guardedArrayDataVariables.map((data) => `${data} === null`).join(" || ")
+      ? operand(nullArrayDataConjunction(guardedArrayDataVariables))
       : null;
     const framedArrayDataGuard = guardedArrayDataCondition
-      ? `if (${guardedArrayDataCondition}) { helpers.skipJitOnce(frame); ` +
-        "return { deopt: true, transient: true, reason: " +
-        `${JSON.stringify(`non-canonical primitive array storage in ${
-          compiledMethodIdentity}`)} }; }`
+      ? stmt(exprConcat(
+        e`if (${guardedArrayDataCondition}) { helpers.skipJitOnce(frame); `,
+        e`return { deopt: true, transient: true, reason: `,
+        e`${JSON.stringify(`non-canonical primitive array storage in ${
+          compiledMethodIdentity}`)} }; }`))
       : null;
-    const directGuardedArrayDataCondition = [
-      ...guardedArrayDataVariables,
-    ].map((data) => `${data} === null`).join(" || ");
+    const directGuardedArrayDataCondition = guardedArrayDataVariables.length
+      ? operand(nullArrayDataConjunction(guardedArrayDataVariables)) : "";
     const directArrayDataGuard = directGuardedArrayDataCondition
-      ? `if (${directGuardedArrayDataCondition}) { ` +
-        "return helpers.asyncInvokeSentinel(); }"
+      ? stmt(exprConcat(
+        e`if (${directGuardedArrayDataCondition}) { `,
+        e`${leafBailStatement()}`, e` }`))
       : null;
     // Small acyclic integral decision trees (character maps, classifiers,
     // clamps, flag decoders, and similar leaves) are often called once per
@@ -11252,14 +11341,15 @@ class JvmSsaBlockRenderer {
     ) => [...invariantPositionalReceiverSlots]
       .filter(([index]) => !omitSelfRecursive ||
         !callSites.get(index)?.selfRecursive)
-      .map(([index, slot]) =>
-        `const ${invariantPositionalRawVariable(index)} = ` +
-        `${positionalCallRawInvokeVariable(index)} && ` +
-        `${positionalCallRawInvokeVariable(index)}.jvmInlineInteger === true && ` +
-        `local${slot} !== null && local${slot} !== undefined && ` +
-        `(local${slot}.type || ${positionalCallSiteVariable(index)}.declaredClassName) === ` +
-        `${positionalCallReceiverVariable(index)} ? ` +
-        `${positionalCallRawInvokeVariable(index)} : null;`);
+      .map(([index, slot]) => constDecl(
+        invariantPositionalRawVariable(index), exprConcat(
+          e`${positionalCallRawInvokeVariable(index)} && `,
+          e`${positionalCallRawInvokeVariable(index)}.jvmInlineInteger === true && `,
+          e`${localName(slot)} !== null && ${localName(slot)} !== undefined && `,
+          e`(${localName(slot)}.type || ${
+            positionalCallSiteVariable(index)}.declaredClassName) === `,
+          e`${positionalCallReceiverVariable(index)} ? `,
+          e`${positionalCallRawInvokeVariable(index)} : null`)));
     const invariantPositionalCallDeclarations =
       invariantPositionalCallDeclarationsFor(false);
     const directInvariantPositionalCallDeclarations =
@@ -11281,7 +11371,8 @@ class JvmSsaBlockRenderer {
       guardedStaticBooleanEntryGuard,
       this.runCountersEnabled
         ? "helpers.structuredSsa.runCount += 1;" : null,
-      `let safePointBudget = ${entrySafePointBudget};`,
+      stmt(e`let safePointBudget = ${entrySafePointBudget};`,
+        {kind: "safePointBudgetDeclaration"}),
       ...declaredLocals.map((i) => {
         const initial = entryLocalInitialValues.has(i)
           ? entryLocalInitialValues.get(i) : `locals[${i}]`;
@@ -11423,17 +11514,15 @@ class JvmSsaBlockRenderer {
             directBooleanGuard,
             this.runCountersEnabled
               ? selfRecursiveCallExpressions.size
-                ? "if (nestedEntryGuarded !== 2) " +
-                  "helpers.structuredSsa.runCount += 1;"
-                : "helpers.structuredSsa.runCount += 1;" : null,
-            `let safePointBudget = ${regionCallGraphCandidate
+                ? stmt(exprConcat(e`if (nestedEntryGuarded !== 2) `,
+                  e`helpers.structuredSsa.runCount += 1;`))
+                : st`helpers.structuredSsa.runCount += 1;` : null,
+            stmt(e`let safePointBudget = ${regionCallGraphCandidate
               ? this.jit.hotCallGraphRegions.directSafePointBudget
               : safePointInitialBudget};`,
+            {kind: "safePointBudgetDeclaration"}),
             ...declaredLocals.map((index) =>
-              `${immutableEntryLocals.has(index) ? "const" : "let"} local${index} = ${
-                entryLocalInitialValues.has(index)
-                  ? entryLocalInitialValues.get(index)
-                  : entryArgumentValue(index) || "undefined"};`),
+              entryLocalDeclaration(index, entryArgumentValue)),
             ...directInvariantPositionalCallDeclarations,
             ...entryArrayDataDeclarations,
             ...persistentStaticArrayDataDeclarations,
@@ -11450,15 +11539,13 @@ class JvmSsaBlockRenderer {
           ...directPositionalCallDeclarations,
           directBooleanGuard,
           structured.loopHeaders.size > 0
-            ? `let safePointBudget = ${regionCallGraphCandidate
+            ? stmt(e`let safePointBudget = ${regionCallGraphCandidate
               ? this.jit.hotCallGraphRegions.directSafePointBudget
-              : safePointInitialBudget};`
+              : safePointInitialBudget};`,
+            {kind: "safePointBudgetDeclaration"})
             : null,
           ...declaredLocals.map((index) =>
-            `${immutableEntryLocals.has(index) ? "const" : "let"} local${index} = ${
-              entryLocalInitialValues.has(index)
-                ? entryLocalInitialValues.get(index)
-                : entryArgumentValue(index) || "undefined"};`),
+              entryLocalDeclaration(index, entryArgumentValue)),
           ...directInvariantPositionalCallDeclarations,
           ...entryArrayDataDeclarations,
           ...persistentStaticArrayDataDeclarations,
@@ -11804,15 +11891,13 @@ class JvmSsaBlockRenderer {
           directBooleanGuard,
           this.runCountersEnabled
             ? selfRecursiveCallExpressions.size
-              ? "if (nestedEntryGuarded !== 2) " +
-                "helpers.structuredSsa.restoringDirectRunCount += 1;"
-              : "helpers.structuredSsa.restoringDirectRunCount += 1;" : null,
-          `let safePointBudget = ${restoringDirectSafePointBudget};`,
+              ? stmt(exprConcat(e`if (nestedEntryGuarded !== 2) `,
+                e`helpers.structuredSsa.restoringDirectRunCount += 1;`))
+              : st`helpers.structuredSsa.restoringDirectRunCount += 1;` : null,
+          stmt(e`let safePointBudget = ${restoringDirectSafePointBudget};`,
+          {kind: "safePointBudgetDeclaration"}),
           ...declaredLocals.map((index) =>
-            `${immutableEntryLocals.has(index) ? "const" : "let"} local${index} = ${
-              entryLocalInitialValues.has(index)
-                ? entryLocalInitialValues.get(index)
-                : entryArgumentValue(index) || "undefined"};`),
+              entryLocalDeclaration(index, entryArgumentValue)),
           ...directInvariantPositionalCallDeclarations,
           ...entryArrayDataDeclarations,
           ...persistentStaticArrayDataDeclarations,
@@ -11828,38 +11913,53 @@ class JvmSsaBlockRenderer {
           ...declarations,
           ...restoringRenderedTree,
         ].filter(Boolean);
+        if (process.env.JVM_JIT_VERIFY_STATEMENT_IR) {
+          auditStatementIrLines(directBody, statementRecords, emittedNames,
+            "restoring-body");
+        }
         // Entry scaffolding is assembled before checked-call admission and
         // loop specialization.  Those later passes can make capture aliases,
         // call-target aliases, scheduler budgets, or JVM locals completely
         // unused. Remove only top-level declarations with compiler-owned,
         // side-effect-free initializers; nested guest expressions and all
         // potentially observable property reads remain untouched.
+        // A declaration may go when nothing reads the name and its
+        // initializer is compiler-owned and side-effect free: a literal, a
+        // copy of another name, a loop trip/predicate temporary, or one of the
+        // capture-cache reads the emitter marked removable. Whether a name is
+        // read is a question about the statements, and every one of them is
+        // recorded, so the sweep is a use count over their operands.
+        const removableDeclaration = (record) => {
+          if (record?.kind !== "const" && record?.kind !== "let") return false;
+          if (pureRangeTemporaryNames.has(record.def)) return true;
+          if (record.removableWhenUnused === true) return true;
+          if (record.exprParts?.length !== 1) return false;
+          const initializer = record.exprParts[0];
+          if (typeof initializer !== "string") return true;
+          return initializer === "undefined" || initializer === "null" ||
+            initializer === "true" || initializer === "false" ||
+            /^-?\d+$/.test(initializer);
+        };
         for (;;) {
+          if (directBody.some((line) => !recordOf(line))) break;
           const counts = new Map();
           for (const line of directBody) {
-            for (const match of line.matchAll(/\b[A-Za-z_$][\w$]*\b/g)) {
-              counts.set(match[0], (counts.get(match[0]) || 0) + 1);
+            for (const name of partsReferences(recordOf(line).parts)) {
+              counts.set(name, (counts.get(name) || 0) + 1);
             }
           }
+          const budgetMentions = directBody.reduce((total, line) =>
+            total + (recordOf(line).usesSafePointBudget ? 1 : 0), 0);
           let removed = false;
           directBody = directBody.filter((line) => {
-            const declaration = /^\s*(?:const|let) ([A-Za-z_$][\w$]*) = (.+);$/
-              .exec(line);
-            if (!declaration || counts.get(declaration[1]) !== 1) return true;
-            const initializer = declaration[2];
-            const pureRangeTemporary =
-              /^ssa(?:ArrayRangeTrips|RuntimeCoarse(?:Trips|Loop))\d+$/.test(
-                declaration[1]);
-            const pure = pureRangeTemporary ||
-              /^(?:undefined|null|true|false|-?\d+)$/.test(
-              initializer) ||
-              /^[A-Za-z_$][\w$]*$/.test(initializer) ||
-              /^helpers\.(?:directCheckedLeafBodies|checkedLeafCaptureCaches)\[\d+\]$/.test(
-                initializer) ||
-              /^ssaCallCaptureCache\d+\.value\d+$/.test(initializer) ||
-              /^\(\(ssaCallCaptureCache\d+\.value\d+\) \| 0\)$/.test(
-                initializer);
-            if (!pure) return true;
+            const record = recordOf(line);
+            if (record.kind === "safePointBudgetDeclaration") {
+              if (budgetMentions !== 1) return true;
+              removed = true;
+              return false;
+            }
+            if (!record.def || counts.get(record.def) !== 1 ||
+                !removableDeclaration(record)) return true;
             removed = true;
             return false;
           });
@@ -12322,12 +12422,16 @@ class JvmSsaBlockRenderer {
                   // Direct positional int arguments are already int32. Shift
                   // the symmetric interval into an unsigned range so one
                   // comparison proves both endpoints.
-                  return `(((${argument} + ${assumedLimit}) >>> 0) > ` +
-                    `${assumedLimit * 2})`;
+                  return exprConcat(
+                    e`(((${argument} + ${assumedLimit}) >>> 0) > `,
+                    e`${assumedLimit * 2})`);
                 });
-              checkedLeafSafeArithmeticGuards.push(
-                `if (${failures.join(" || ")}) ` +
-                  "return helpers.asyncInvokeSentinel();");
+              checkedLeafSafeArithmeticGuards.push(stmt(exprConcat(
+                e`if (`,
+                ...failures.flatMap((failure, position) => [
+                  position === 0 ? "" : " || ", failure,
+                ]),
+                e`) ${leafBailStatement()}`)));
               preflightedCheckedLeafArgumentSlots =
                 [...usedAssumptions].sort((left, right) => left - right)
                   .map((slot) => argumentNames.indexOf(
@@ -12354,16 +12458,18 @@ class JvmSsaBlockRenderer {
                 entryArguments.has(index) &&
                 !callerAssignedLocalSlots.has(index) &&
                 !renderedAssignedLocalSlots.has(index);
-              return `${immutable ? "const" : "let"} local${index} = ${
-                entryLocalInitialValues.has(index)
-                  ? entryLocalInitialValues.get(index)
-                  : entryArgumentValue(index) || "undefined"};`;
+              const initializer = e`${entryLocalInitialValues.has(index)
+                ? entryLocalInitialValues.get(index)
+                : entryArgumentValue(index) || "undefined"}`;
+              return immutable
+                ? constDecl(localName(index), initializer)
+                : letDecl(localName(index), initializer);
             });
           if (recursiveArrayPartitionLeaf) {
             let workerBody = [
               ...checkedLeafEntryLocalDeclarations(),
-              `const ${entryArrayDataVariable(
-                recursiveArrayPartitionLeaf.arraySlot)} = argument0;`,
+              constDecl(entryArrayDataVariable(
+                recursiveArrayPartitionLeaf.arraySlot), e`argument0`),
               ...persistentStaticArrayDataDeclarations,
               ...declarations,
               ...checkedLeafTree,
@@ -12374,12 +12480,24 @@ class JvmSsaBlockRenderer {
                 "ssa-recursive-array-worker", true,
               );
             if (recursiveArrayWorkerSource) {
+              // The worker must be a plain JavaScript function: no helper
+              // call, no frame reconstruction, no throwing construct. That is
+              // a question about the statements it ended up containing, and
+              // the self-recursive specialization above records the direct
+              // call it substituted, so every line has a record.
+              const workerStatements = recursiveArrayWorkerSource.split("\n")
+                .slice(1);
+              const workerIsPlain = workerStatements.every((line) => {
+                if (line.trim() === "") return true;
+                const record = recordOf(line);
+                if (!record) return false;
+                return !record.callsRuntimeHelper && record.kind !== "spill" &&
+                  record.kind !== "conditionalSpill" &&
+                  record.throwsOrTries !== true;
+              });
               recursiveArrayWorkerSource = recursiveArrayWorkerSource
                 .split("helpers.returnVoid()").join("ssaReturnVoid");
-              if (!recursiveArrayWorkerSource.includes("helpers.") &&
-                  !recursiveArrayWorkerSource.includes("spillLocals(") &&
-                  !recursiveArrayWorkerSource.includes("throw ") &&
-                  !recursiveArrayWorkerSource.includes("try {")) {
+              if (workerIsPlain) {
                 recursiveArrayWorkerBody = createStructuredFunction(
                   "ssa-recursive-array-worker",
                   argumentNames,
@@ -12445,12 +12563,12 @@ class JvmSsaBlockRenderer {
             let body = recursiveArrayWorkerBody
               ? [
                 includeRunCounter && this.runCountersEnabled
-                  ? "if (nestedEntryGuarded !== 2) " +
-                    "helpers.structuredSsa.restoringDirectRunCount += 1;"
+                  ? stmt(exprConcat(e`if (nestedEntryGuarded !== 2) `,
+                    e`helpers.structuredSsa.restoringDirectRunCount += 1;`))
                   : null,
-                `const ${entryArrayDataVariable(
-                  recursiveArrayPartitionLeaf.arraySlot)} = ` +
-                  `${arrayDataExpression(`argument0`)};`,
+                constDecl(entryArrayDataVariable(
+                  recursiveArrayPartitionLeaf.arraySlot),
+                arrayDataExpr("argument0")),
                 directArrayDataGuard,
                 ...[
                   recursiveArrayPartitionLeaf.lowerSlot,
@@ -12485,7 +12603,7 @@ class JvmSsaBlockRenderer {
                   ? checkedLeafSafeArithmeticGuards : []),
                 directBooleanGuard,
                 includeRunCounter && !inline && this.runCountersEnabled
-                  ? "helpers.structuredSsa.restoringDirectRunCount += 1;"
+                  ? st`helpers.structuredSsa.restoringDirectRunCount += 1;`
                   : null,
                 ...(atomicBoundedLoops || nestedRuntimeCountedRegion ||
                   shrinkingArrayWindowLeaf ||
@@ -12493,7 +12611,8 @@ class JvmSsaBlockRenderer {
                   transactionalAcyclicShape || lexicalCheckedLeafWrapperShape ||
                   inline
                   ? [] : [
-                  `let safePointBudget = ${restoringDirectSafePointBudget};`,
+                  stmt(e`let safePointBudget = ${restoringDirectSafePointBudget};`,
+                    {kind: "safePointBudgetDeclaration"}),
                 ]),
                 ...checkedLeafEntryLocalDeclarations(),
                 ...invariantPositionalCallDeclarations,
@@ -12679,14 +12798,15 @@ class JvmSsaBlockRenderer {
                   `let ${checkedLeafResultVariable};`,
                   ...captureDeclarations,
                   !inline && this.runCountersEnabled
-                    ? "helpers.structuredSsa.restoringDirectRunCount += 1;"
+                    ? st`helpers.structuredSsa.restoringDirectRunCount += 1;`
                     : null,
                   ...(nestedRuntimeCountedRegion || shrinkingArrayWindowLeaf ||
                     recursiveArrayPartitionLeaf ||
                     transactionalAcyclicShape ||
                     lexicalCheckedLeafWrapperShape || inline
                     ? [] : [
-                    `let safePointBudget = ${restoringDirectSafePointBudget};`,
+                    stmt(e`let safePointBudget = ${restoringDirectSafePointBudget};`,
+                      {kind: "safePointBudgetDeclaration"}),
                   ]),
                   ...checkedLeafEntryLocalDeclarations(),
                   ...checkedLeafEntryArrayDeclarationsFor(inline),
@@ -13156,11 +13276,12 @@ class JvmSsaBlockRenderer {
       // graph is one execution unit and must not re-count each member entry.
       generated.jvmStructuredRegionRunCounterStatements =
         this.runCountersEnabled ? [
-          "if (nestedEntryGuarded !== 2) helpers.structuredSsa.runCount += 1;",
-          "if (nestedEntryGuarded !== 2) " +
-            "helpers.structuredSsa.restoringDirectRunCount += 1;",
-          "helpers.structuredSsa.runCount += 1;",
-          "helpers.structuredSsa.restoringDirectRunCount += 1;",
+          stmt(exprConcat(e`if (nestedEntryGuarded !== 2) `,
+            e`helpers.structuredSsa.runCount += 1;`)),
+          stmt(exprConcat(e`if (nestedEntryGuarded !== 2) `,
+            e`helpers.structuredSsa.restoringDirectRunCount += 1;`)),
+          st`helpers.structuredSsa.runCount += 1;`,
+          st`helpers.structuredSsa.restoringDirectRunCount += 1;`,
         ] : [];
       // The exact safe-point budget declarations this renderer emitted, one
       // per positional variant. A fused module owns a single counter and
