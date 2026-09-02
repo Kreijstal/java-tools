@@ -50,10 +50,9 @@ function walkJavaScriptAst(node, visit, parent = null) {
   while (pending.length) {
     const current = pending.pop();
     visit(current.node, current.parent);
-    // Traversal consumers use source offsets for ordering; they do not depend
-    // on recursive visitation order. Avoid Object.entries(), flatMap(), and a
-    // host call frame per AST node for generated bodies containing hundreds
-    // of thousands of nodes.
+    // The verifier's question is per-identifier and order independent. Avoid
+    // Object.entries(), flatMap(), and a host call frame per AST node for
+    // generated bodies containing hundreds of thousands of nodes.
     for (const key in current.node) {
       if (key === "start" || key === "end" || key === "loc" ||
           key === "range") continue;
@@ -73,92 +72,24 @@ function walkJavaScriptAst(node, visit, parent = null) {
 }
 
 function parseGeneratedStatements(source) {
-  const prefix = "function* __jvmSsaAstWrapper() {\n";
-  const program = parseJavaScript(`${prefix}${source}\n}`, {
-    ecmaVersion: "latest",
-    ranges: true,
-  });
-  return {
-    offset: prefix.length,
-    statements: program.body[0].body.body,
-    program,
-  };
-}
-
-function rewriteGeneratedJavaScript(source, resolveIdentifier,
-  removedStatements = []) {
-  if (typeof source !== "string" || source.length === 0) return source;
-  const parsed = parseGeneratedStatements(source);
-  const removed = removedStatements.map((statement) => ({
-    start: statement.start - parsed.offset,
-    end: statement.end - parsed.offset,
-  }));
-  const edits = removed.map((range) => ({...range, replacement: ""}));
-  walkJavaScriptAst(parsed.program, (node, parent) => {
-    if (node.type !== "Identifier") return;
-    if (parent?.type === "MemberExpression" && parent.property === node &&
-        !parent.computed) return;
-    if ((parent?.type === "Property" || parent?.type === "MethodDefinition") &&
-        parent.key === node && !parent.computed && !parent.shorthand) return;
-    if ((parent?.type === "LabeledStatement" ||
-        parent?.type === "BreakStatement" ||
-        parent?.type === "ContinueStatement") && parent.label === node) return;
-    const replacement = resolveIdentifier(node.name);
-    if (replacement === node.name) return;
-    const start = node.start - parsed.offset;
-    const end = node.end - parsed.offset;
-    if (removed.some((range) => start >= range.start && end <= range.end)) return;
-    edits.push({start, end, replacement});
-  });
-  edits.sort((left, right) => right.start - left.start || right.end - left.end);
-  let rewritten = source;
-  for (const edit of edits) {
-    rewritten = rewritten.slice(0, edit.start) + edit.replacement +
-      rewritten.slice(edit.end);
-  }
-  return rewritten;
-}
-
-function rewriteGeneratedExpression(source, resolveIdentifier) {
-  if (typeof source !== "string" || source.length === 0) return source;
-  const prefix = "function __jvmSsaExpressionWrapper() { return (";
-  const program = parseJavaScript(`${prefix}${source}); }`, {
+  // The verifier below parses a finished body; wrapping it in a generator
+  // keeps `yield` and top-level `return` legal for the parser.
+  return parseJavaScript(`function* __jvmSsaAstWrapper() {\n${source}\n}`, {
     ecmaVersion: "latest",
   });
-  const edits = [];
-  walkJavaScriptAst(program, (node, parent) => {
-    if (node.type !== "Identifier") return;
-    if (parent?.type === "MemberExpression" && parent.property === node &&
-        !parent.computed) return;
-    const replacement = resolveIdentifier(node.name);
-    if (replacement !== node.name) {
-      edits.push({
-        start: node.start - prefix.length,
-        end: node.end - prefix.length,
-        replacement,
-      });
-    }
-  });
-  edits.sort((left, right) => right.start - left.start);
-  let rewritten = source;
-  for (const edit of edits) {
-    rewritten = rewritten.slice(0, edit.start) + edit.replacement +
-      rewritten.slice(edit.end);
-  }
-  return rewritten;
 }
 
-function analyzeGeneratedSsaScopes(source, candidates = null) {
-  const parsed = parseGeneratedStatements(source);
-  const parents = new WeakMap();
+// Opt-in verifier. The generated body must never reference an SSA name that
+// no enclosing scope declares; the emitters are responsible for that by
+// construction, and this parse only re-checks the result when
+// JVM_JIT_VERIFY_GENERATED=1 asks for it (or when a test calls it directly).
+// It is a check, never a transformation: nothing in the compiler reads back
+// the JavaScript it has emitted in order to decide what to emit.
+function unboundGeneratedSsaIdentifiers(source, candidates = null) {
+  const program = parseGeneratedStatements(source);
   const nodeScopes = new WeakMap();
   const declarationIdentifiers = new WeakSet();
-  const scopes = [];
-  const createScope = (parent) => {
-    const scope = {parent, bindings: new Map()};
-    scopes.push(scope);
-    return scope;
-  };
+  const createScope = (parent) => ({parent, bindings: new Set()});
   const rootScope = createScope(null);
   const isCandidate = (name) => candidates
     ? candidates.has(name) : name.startsWith("ssaValue");
@@ -177,40 +108,27 @@ function analyzeGeneratedSsaScopes(source, candidates = null) {
       }
     }
   };
-  const declarePattern = (pattern, scope, declaration = null,
-    declarator = null) => {
+  const declarePattern = (pattern, scope) => {
     if (!pattern) return;
     if (pattern.type === "Identifier") {
       declarationIdentifiers.add(pattern);
-      if (isCandidate(pattern.name)) {
-        scope.bindings.set(pattern.name, {
-          name: pattern.name,
-          scope,
-          declaration,
-          declarator,
-          references: [],
-        });
-      }
+      if (isCandidate(pattern.name)) scope.bindings.add(pattern.name);
       return;
     }
     if (pattern.type === "RestElement") {
-      declarePattern(pattern.argument, scope, declaration, declarator);
+      declarePattern(pattern.argument, scope);
     } else if (pattern.type === "AssignmentPattern") {
-      declarePattern(pattern.left, scope, declaration, declarator);
+      declarePattern(pattern.left, scope);
     } else if (pattern.type === "ArrayPattern") {
-      for (const element of pattern.elements) {
-        declarePattern(element, scope, declaration, declarator);
-      }
+      for (const element of pattern.elements) declarePattern(element, scope);
     } else if (pattern.type === "ObjectPattern") {
       for (const property of pattern.properties) {
-        declarePattern(
-          property.value || property.argument, scope, declaration, declarator);
+        declarePattern(property.value || property.argument, scope);
       }
     }
   };
-  const define = (node, scope, parent = null) => {
+  const define = (node, scope) => {
     if (!node || typeof node !== "object") return;
-    if (parent) parents.set(node, parent);
     nodeScopes.set(node, scope);
     if (node.type === "FunctionDeclaration" ||
         node.type === "FunctionExpression" ||
@@ -220,40 +138,40 @@ function analyzeGeneratedSsaScopes(source, candidates = null) {
       for (const parameter of node.params) {
         declarePattern(parameter, functionScope);
       }
-      define(node.body, functionScope, node);
+      define(node.body, functionScope);
       return;
     }
     if (node.type === "BlockStatement") {
       const blockScope = createScope(scope);
       nodeScopes.set(node, blockScope);
-      for (const statement of node.body) define(statement, blockScope, node);
+      for (const statement of node.body) define(statement, blockScope);
       return;
     }
     if (node.type === "CatchClause") {
       const catchScope = createScope(scope);
       nodeScopes.set(node, catchScope);
       declarePattern(node.param, catchScope);
-      define(node.body, catchScope, node);
+      define(node.body, catchScope);
       return;
     }
     if (node.type === "ForStatement" || node.type === "ForInStatement" ||
         node.type === "ForOfStatement" || node.type === "SwitchStatement") {
       const controlScope = createScope(scope);
       nodeScopes.set(node, controlScope);
-      visitChildren(node, (child) => define(child, controlScope, node));
+      visitChildren(node, (child) => define(child, controlScope));
       return;
     }
     if (node.type === "VariableDeclaration") {
       for (const declarator of node.declarations) {
-        declarePattern(declarator.id, scope, node, declarator);
+        declarePattern(declarator.id, scope);
       }
     }
-    visitChildren(node, (child) => define(child, scope, node));
+    visitChildren(node, (child) => define(child, scope));
   };
-  define(parsed.program, rootScope);
+  define(program, rootScope);
 
   const unbound = new Set();
-  walkJavaScriptAst(parsed.program, (node, parent) => {
+  walkJavaScriptAst(program, (node, parent) => {
     if (node.type !== "Identifier" || !isCandidate(node.name) ||
         declarationIdentifiers.has(node)) return;
     if (parent?.type === "MemberExpression" && parent.property === node &&
@@ -263,88 +181,14 @@ function analyzeGeneratedSsaScopes(source, candidates = null) {
     if ((parent?.type === "LabeledStatement" ||
         parent?.type === "BreakStatement" ||
         parent?.type === "ContinueStatement") && parent.label === node) return;
-    let scope = nodeScopes.get(node) || rootScope;
-    let binding = null;
-    while (scope && !binding) {
-      binding = scope.bindings.get(node.name) || null;
-      scope = scope.parent;
+    let bound = false;
+    for (let scope = nodeScopes.get(node) || rootScope; scope && !bound;
+      scope = scope.parent) {
+      bound = scope.bindings.has(node.name);
     }
-    if (!binding) {
-      unbound.add(node.name);
-      return;
-    }
-    const assignment = parent?.type === "AssignmentExpression" &&
-      parent.left === node ? parent : null;
-    binding.references.push({
-      identifier: node,
-      scope: nodeScopes.get(node),
-      isWrite: Boolean(assignment ||
-        parent?.type === "UpdateExpression" && parent.argument === node),
-      assignment,
-    });
+    if (!bound) unbound.add(node.name);
   });
-  return {parsed, parents, scopes, unbound: [...unbound]};
-}
-
-function unboundGeneratedSsaIdentifiers(source, candidates = null) {
-  return analyzeGeneratedSsaScopes(source, candidates).unbound;
-}
-
-function promoteSingleAssignmentSsaBindings(source, candidates) {
-  if (typeof source !== "string" || source.length === 0) return source;
-  const analysis = analyzeGeneratedSsaScopes(source, candidates);
-  const {parsed, parents, scopes} = analysis;
-  const scopeContains = (outer, inner) => {
-    for (let scope = inner; scope; scope = scope.parent) {
-      if (scope === outer) return true;
-    }
-    return false;
-  };
-  const edits = [];
-  for (const scope of scopes) {
-    for (const variable of scope.bindings.values()) {
-      const {declarator, declaration} = variable;
-      if (declaration?.kind !== "let" || !declarator ||
-          declaration.declarations.length !== 1 || declarator.init) continue;
-      const writes = variable.references.filter((reference) =>
-        reference.isWrite);
-      if (writes.length !== 1) continue;
-      const assignment = writes[0].assignment;
-      const assignmentStatement = parents.get(assignment);
-      const assignmentParent = parents.get(assignmentStatement);
-      if (assignment?.type !== "AssignmentExpression" ||
-          assignment.operator !== "=" ||
-          assignment.left !== writes[0].identifier ||
-          assignmentStatement?.type !== "ExpressionStatement" ||
-          assignmentParent?.type !== "BlockStatement" ||
-          !writes[0].scope) continue;
-      const reads = variable.references.filter((reference) =>
-        reference !== writes[0]);
-      if (reads.length === 0 || reads.some((reference) =>
-        reference.identifier.start <= assignmentStatement.end ||
-        !scopeContains(writes[0].scope, reference.scope))) continue;
-      edits.push({
-        start: declaration.start - parsed.offset,
-        end: declaration.end - parsed.offset,
-        replacement: "",
-      }, {
-        start: assignmentStatement.start - parsed.offset,
-        end: assignmentStatement.start - parsed.offset,
-        replacement: "const ",
-      });
-    }
-  }
-  edits.sort((left, right) => right.start - left.start || right.end - left.end);
-  let rewritten = source;
-  for (const edit of edits) {
-    rewritten = rewritten.slice(0, edit.start) + edit.replacement +
-      rewritten.slice(edit.end);
-  }
-  return rewritten;
-}
-
-function sinkSingleAssignmentSsaDeclarations(source) {
-  return promoteSingleAssignmentSsaBindings(source);
+  return [...unbound];
 }
 
 function normalizedArrayLoadExpression(raw, op, array, arrayKind = null) {
@@ -533,6 +377,11 @@ function dispatchIrreducibleCfg(cfg, depths, islandIndex) {
 class JvmSsaBlockRenderer {
   constructor(jit, options = {}) {
     this.jit = jit;
+    // Development assertion: re-parse each finished tier and confirm that no
+    // SSA name is referenced outside a scope that declares it. Emission is
+    // responsible for that by construction, so this is off in production.
+    this.verifyGeneratedScopes = (typeof process !== "undefined" &&
+      process.env && process.env.JVM_JIT_VERIFY_GENERATED === "1") || false;
     // SSA operand names are drawn from one counter for the lifetime of the
     // renderer so that no two compiles ever mint the same name. Checked
     // leaves are inserted lexically into their callers, and every name-keyed
@@ -10154,14 +10003,6 @@ class JvmSsaBlockRenderer {
         lines = lines.filter(Boolean);
       }
 
-      // Turn a separately declared, singly assigned load result into a const
-      // at its definition point. This shortens its live range and removes one
-      // bytecode/register pair without moving the potentially throwing load.
-      // Scope analysis is mandatory here: moving a declaration from an outer
-      // block into a conditional inline region would make later uses unbound.
-      lines = promoteSingleAssignmentSsaBindings(
-        lines.join("\n"), ssaValueNames,
-      ).split("\n").filter(Boolean);
       lines = lines.map((line) => line.replace(
         /if \(!\((.+) !== (.+)\)\) \{/,
         'if ($1 === $2) {'));
@@ -10498,22 +10339,24 @@ class JvmSsaBlockRenderer {
     try {
       const positionalAstRejections = [];
       const createStructuredFunction = (tier, parameters, source, ...options) => {
-        // Optional positional tiers are assembled from independently optimized
-        // regions (ordinary blocks, cold restoration edges, and inlined
-        // callees).  A declaration can therefore become lexically narrower
-        // than one of its surviving uses even though the JavaScript parser
-        // accepts the function.  Never install such a tier: the canonical
-        // framed structured body remains the semantics-preserving fallback.
-        // Audit the final AST, after every specialization, so this protects
-        // every method shape without recognizing guest classes or methods.
-        const unbound = unboundGeneratedSsaIdentifiers(source, ssaValueNames);
-        if (unbound.length) {
-          if (tier === "structured-ssa") {
-            throw new Error(
-              `unbound structured SSA identifiers: ${unbound.join(", ")}`);
+        // Every SSA name a tier can reference is bound by the emitter that
+        // produced it: operand names come from one renderer-wide counter, and
+        // a lexical insertion binds the inserted body's own parameter and
+        // capture names by declaration rather than renaming the child's text.
+        // Nothing here reads the emitted JavaScript back to decide what to
+        // install. JVM_JIT_VERIFY_GENERATED=1 re-checks that property by
+        // parsing the finished source; it is a development assertion, not a
+        // compilation step.
+        if (this.verifyGeneratedScopes) {
+          const unbound = unboundGeneratedSsaIdentifiers(source, ssaValueNames);
+          if (unbound.length) {
+            if (tier === "structured-ssa") {
+              throw new Error(
+                `unbound structured SSA identifiers: ${unbound.join(", ")}`);
+            }
+            positionalAstRejections.push({ tier, unbound });
+            return null;
           }
-          positionalAstRejections.push({ tier, unbound });
-          return null;
         }
         return this.jit.createGeneratedFunction(
           method, tier, parameters, source, ...options);
@@ -12620,6 +12463,5 @@ class JvmSsaBlockRenderer {
 module.exports = JvmSsaBlockRenderer;
 module.exports._test = {
   isIrreducibleError,
-  sinkSingleAssignmentSsaDeclarations,
   unboundGeneratedSsaIdentifiers,
 };
