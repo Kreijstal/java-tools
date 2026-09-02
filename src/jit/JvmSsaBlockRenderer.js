@@ -3968,7 +3968,7 @@ class JvmSsaBlockRenderer {
               ...materializeLines([...stack, dividend, divisor], index, true)
                 .map((line) => `  ${line}`),
               stmt(e`  throw { type: "java/lang/ArithmeticException", message: "/ by zero" };`,
-                {deoptEffect: true}),
+                {deoptEffect: true, arithmeticException: true}),
               blockEnd(""),
               constDecl(out, e`BigInt.asIntN(64, ${dividend} ${
                 op === "ldiv" ? "/" : "%"} ${divisor})`, {pure: true}));
@@ -4070,7 +4070,7 @@ class JvmSsaBlockRenderer {
                 {kind: "if", comparison: {input: divisor, cmp: "=== 0"}}),
                 ...materializeLines([...stack, dividend, divisor], index, true).map((line) => `  ${line}`),
                 stmt(e`  throw { type: "java/lang/ArithmeticException", message: "/ by zero" };`,
-                {deoptEffect: true}),
+                {deoptEffect: true, arithmeticException: true}),
                 blockEnd(""));
             }
             const line = constDecl(out, e`((${dividend} ${
@@ -6798,9 +6798,7 @@ class JvmSsaBlockRenderer {
     const exceptionalGuardClose = (lines, start) => {
       let depth = 0;
       for (let index = start; index < lines.length; index += 1) {
-        const trimmed = lines[index].trim();
-        if (trimmed.endsWith("{")) depth += 1;
-        if (trimmed === "}" || trimmed.startsWith("} else")) depth -= 1;
+        depth += recordOf(lines[index])?.blockDelta || 0;
         if (depth === 0) return index;
       }
       return -1;
@@ -6811,16 +6809,17 @@ class JvmSsaBlockRenderer {
       for (const block of info.loopBlocks) {
         const lines = plans[block]?.lines || [];
         for (let index = 0; index < lines.length; index += 1) {
-          const zero = /^if \((ssaValue\d+) === 0\) \{$/.exec(lines[index]);
-          const inline = /^if \(!\(.+\(\((ssaValue\d+)\) !== 0\).+\) \{$/.exec(
-            lines[index]);
-          const value = zero?.[1] || inline?.[1];
-          if (!value) continue;
+          const record = recordOf(lines[index]);
+          const value = record?.kind === "if" && !record.negated &&
+            record.comparison?.cmp === "=== 0"
+            ? record.comparison.input : null;
+          if (!value || !ownSsaValueNames.has(value)) continue;
           const close = exceptionalGuardClose(lines, index);
           if (close < 0) continue;
+          // The arm exists only to raise the guest arithmetic exception, so
+          // the divisor is non-zero on every other path.
           const exceptional = lines.slice(index + 1, close).some((line) =>
-            line.includes("ArithmeticException") ||
-            line.includes("reason: 'guarded inline integer leaf'"));
+            recordOf(line)?.arithmeticException === true);
           if (!exceptional) continue;
           const slot = localLoads.get(value);
           if (Number.isInteger(slot) && !info.writtenSlots.has(slot)) {
@@ -10181,7 +10180,7 @@ class JvmSsaBlockRenderer {
         const end = lines.findIndex((line, index) =>
           index > start && line.trim() === endMarker);
         if (start < 0 || end < 0) return null;
-        const indentation = /^\s*/.exec(lines[start])?.[0] || "";
+        const indentation = indentationOf(lines[start]);
         const direct = rawWorker
           ? `${functionName}(${call.args.join(", ")});`
           : `${functionName}(helpers, ${call.args.join(", ")}` +
@@ -10335,14 +10334,24 @@ class JvmSsaBlockRenderer {
       : null;
     let renderedTree = expandContinuationFallbacks(
       render(structured.tree), useContinuations);
+    // Which JVM slots the rendered tree reads and which it assigns. Both come
+    // from the statements themselves: a slot is read where a statement
+    // references its name and assigned where a statement writes it.
     const renderedLocalSlots = new Set();
     const renderedAssignedLocalSlots = new Set();
+    const renderedEntryArrayDataNames = new Set();
     for (const line of renderedTree) {
-      for (const match of line.matchAll(/\blocal(\d+)\b/g)) {
-        renderedLocalSlots.add(Number(match[1]));
+      const record = recordOf(line);
+      if (!record) continue;
+      for (const name of partsReferences(record.parts)) {
+        const slot = localSlotOfName(name);
+        if (slot !== null) renderedLocalSlots.add(slot);
+        if (entryArrayDataNames.has(name)) {
+          renderedEntryArrayDataNames.add(name);
+        }
       }
-      const assignment = /\blocal(\d+)\s*=/.exec(line);
-      if (assignment) renderedAssignedLocalSlots.add(Number(assignment[1]));
+      const written = localSlotOfName(record.write || "");
+      if (written !== null) renderedAssignedLocalSlots.add(written);
     }
     // Lexically inlined checked leaves deliberately reuse compact localN
     // names inside their own block scope. Reading assignments back from the
@@ -10373,11 +10382,10 @@ class JvmSsaBlockRenderer {
       ...renderedLocalSlots,
       ...spillSlots.filter((slot) => !immutableEntryLocals.has(slot)),
     ])].sort((a, b) => a - b);
-    const renderedTreeSource = renderedTree.join("\n");
     const entryArrayDataSlots = [...entryArrayLocalSlots]
       .filter((slot) =>
         declaredLocals.includes(slot) &&
-        renderedTreeSource.includes(entryArrayDataVariable(slot)));
+        renderedEntryArrayDataNames.has(entryArrayDataVariable(slot)));
     const entryArrayDataDeclarationFor = (slot) =>
       `const ${entryArrayDataVariable(slot)} = ${arrayDataExpression(`local${slot}`)};`;
     const entryArrayDataDeclarations = entryArrayDataSlots.map(
@@ -10387,8 +10395,7 @@ class JvmSsaBlockRenderer {
         ...persistentProducedArrayLocalViews.values()].map((view) =>
         `let ${view.data} = null;`);
     const guardedArrayDataVariables = [
-      ...entryArrayDataDeclarations.map((line) =>
-        /^const ([A-Za-z0-9_$]+)/.exec(line)?.[1]).filter(Boolean),
+      ...entryArrayDataSlots.map(entryArrayDataVariable),
       ...[...entryStaticReadCaches.values()]
         .filter((cache) => !cache.lazy &&
           !hasNullableStaticArrayControl)
