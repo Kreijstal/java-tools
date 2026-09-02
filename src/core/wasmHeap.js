@@ -15,6 +15,16 @@ const CTOR = {
   '[I': Int32Array, '[J': BigInt64Array, '[F': Float32Array, '[D': Float64Array,
 };
 
+// Diagnostics must not assume a Node process: the browser bundle ships a
+// `process` shim without stderr, and a missing stream turned this one-time
+// notice into a TypeError that aborted the guest run.
+function warnExhausted(limit) {
+  const message = `[wasmheap] exhausted at ${limit} bytes; falling back to plain typed arrays`;
+  const stream = typeof process !== "undefined" ? process.stderr : null;
+  if (stream && typeof stream.write === "function") stream.write(`${message}\n`);
+  else if (typeof console !== "undefined") console.warn(message);
+}
+
 class WasmHeap {
   constructor(mb) {
     const pages = Math.ceil((mb * 1024 * 1024) / 65536);
@@ -37,7 +47,7 @@ class WasmHeap {
     if (base + bytes > this.limit) {
       if (!this.exhausted) {
         this.exhausted = true;
-        process.stderr.write(`[wasmheap] exhausted at ${this.limit} bytes; falling back to plain typed arrays\n`);
+        warnExhausted(this.limit);
       }
       return -1;
     }
@@ -57,7 +67,7 @@ class WasmHeap {
     if (base + bytes > this.limit) {
       if (!this.exhausted) {
         this.exhausted = true;
-        process.stderr.write(`[wasmheap] exhausted at ${this.limit} bytes; falling back to plain typed arrays\n`);
+        warnExhausted(this.limit);
       }
       return new Ctor(count);
     }
