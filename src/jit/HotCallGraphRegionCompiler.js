@@ -901,7 +901,10 @@ function liftOversizedUnitLocalsToEnvironment(units, options = {}) {
         }
         continue;
       }
-      const mentions = statement.parts ? statement.reads : statement.mentions;
+      // A statement whose names are known but which cannot be rewritten
+      // states them itself; one whose names are unknown states its bound.
+      const mentions = statement.reads !== null
+        ? statement.reads : statement.mentions;
       if (!mentions) return unit;
       for (const name of mentions) pinned.add(name);
       for (const name of [...(statement.writes || []),
