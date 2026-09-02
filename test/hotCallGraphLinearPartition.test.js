@@ -491,3 +491,36 @@ test('standalone generator bodies partition with exact source offsets', (t) => {
   }
   t.end();
 });
+
+test('a "yield" inside a string is not mistaken for a keyword', (t) => {
+  // The generator body used to be made parseable by rewriting `yield` to
+  // `void `, which cannot tell a keyword from the same five characters inside
+  // a string literal or a comment. Parsing the body as the generator body it
+  // is removes the false positive: this run contains no yield at all, so its
+  // helper must be an ordinary function called without delegation.
+  const body = [
+    'let value = seed | 0;',
+    'const names = {yield: 3, yieldable: 4};',
+    'const label = "yield value; yield* other();";',
+    '// yield value; yield* other();',
+    ...Array.from({length: 900}, (_unused, index) =>
+      `value = (value + ${index + 1}) | 0;`),
+    'return value + label.length + names.yield;',
+  ].join('\n');
+  const partitioned = partitionOversizedLinearBlocks(body, {
+    ...OPTIONS, rootProgramGenerator: true,
+  });
+  t.ok(partitioned.count > 0, 'the standalone body is actually partitioned');
+  t.ok(!partitioned.source.includes('yield* jvmRegionSegment'),
+    'a yield-free run is not delegated to');
+  t.ok(!/function\* jvmRegionSegment/.test(partitioned.source),
+    'a yield-free run does not become a generator helper');
+  const build = (source) => new Function(
+    `return function* work(seed) { ${source} };`)();
+  for (const maximumSteps of [0, 1, Infinity]) {
+    t.deepEqual(drive(build(partitioned.source), [9], maximumSteps),
+      drive(build(body), [9], maximumSteps),
+      `standalone completion matches through ${maximumSteps} steps`);
+  }
+  t.end();
+});

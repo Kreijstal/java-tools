@@ -42,6 +42,22 @@ function walkAst(node, visit, parent = null) {
   }
 }
 
+// A generated generator body is parsed as the body of this declaration, so
+// acorn sees the `yield` tokens it really contains. Offsets are rebased onto
+// the emitted source afterwards; nothing downstream sees the wrapper.
+const GENERATOR_UNIT_PREFIX = "function* __jvmRegionUnit() {\n";
+
+function rebaseAstOffsets(node, delta) {
+  walkAst(node, (entry) => {
+    entry.start -= delta;
+    entry.end -= delta;
+    if (Array.isArray(entry.range)) {
+      entry.range[0] -= delta;
+      entry.range[1] -= delta;
+    }
+  });
+}
+
 function identifierIsPropertyName(node, parent) {
   return Boolean(
     parent?.type === "MemberExpression" && parent.property === node &&
@@ -875,16 +891,24 @@ function partitionOversizedLinearBlocks(source, options = {}) {
     let program;
     try {
       // A standalone structured source is a generator *body*, not a complete
-      // program. Acorn correctly rejects its top-level yield tokens. Replace
-      // them only in the analysis copy with same-width unary expressions so
-      // every AST offset still indexes the untouched emitted source.
+      // program, so acorn correctly rejects its top-level yield tokens. Wrap
+      // it in the generator declaration it is a body of -- the same prefix
+      // idiom the other consumers of generated bodies use -- and rebase the
+      // resulting offsets onto the untouched emitted source, so `yield` is
+      // recognised by the parser instead of by a regex that cannot tell a
+      // keyword from the same five characters inside a string or comment.
       const parseable = rootProgramGenerator
-        ? rewritten.replace(/\byield\*/g, "void  ")
-          .replace(/\byield\b/g, "void ")
-        : rewritten;
+        ? `${GENERATOR_UNIT_PREFIX}${rewritten}\n}` : rewritten;
       program = parse(parseable, {
         ecmaVersion: "latest", ranges: true, allowReturnOutsideFunction: true,
       });
+      if (rootProgramGenerator) {
+        const unit = program.body[0];
+        if (unit?.type !== "FunctionDeclaration") break;
+        rebaseAstOffsets(unit.body, GENERATOR_UNIT_PREFIX.length);
+        program = {type: "Program", start: 0, end: rewritten.length,
+          body: unit.body.body};
+      }
     } catch (_) {
       break;
     }
@@ -1001,11 +1025,6 @@ function partitionOversizedLinearBlocks(source, options = {}) {
             if (node.type === "YieldExpression") {
               if (unitIsGenerator) runHasYield = true;
               else unsupported = true;
-            }
-            if (unitIsGenerator && node.type === "UnaryExpression" &&
-                node.operator === "void" &&
-                rewritten.slice(node.start, node.start + 5) === "yield") {
-              runHasYield = true;
             }
             if (node.type === "AwaitExpression" ||
                 node.type === "ThisExpression" ||
