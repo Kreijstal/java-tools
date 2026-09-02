@@ -142,7 +142,8 @@ function renderRegionParts(parts) {
   let text = "";
   for (const part of parts) {
     text += typeof part === "string" ? part
-      : part.text !== undefined ? part.text : part.ref;
+      : part.label !== undefined ? part.label
+        : part.text !== undefined ? part.text : part.ref;
   }
   return text;
 }
@@ -152,7 +153,12 @@ function renderRegionParts(parts) {
 function substituteRegionParts(parts, replacements) {
   const out = [];
   for (const part of parts) {
-    if (typeof part === "string") { out.push(part); continue; }
+    // A label part names a statement, not a value: no operand substitution
+    // replaces one.
+    if (typeof part === "string" || part.label !== undefined) {
+      out.push(part);
+      continue;
+    }
     const replacement = replacements.get(part.ref);
     if (replacement === undefined) { out.push(part); continue; }
     for (const piece of replacement) out.push(piece);
@@ -332,7 +338,7 @@ function regionOutwardJumps(statements, from, to) {
  * statement range carries.
  *
  * Each such statement published how it splits around its own `return`: the
- * parts before it, its argument's parts, and the parts after it. The exit
+ * parts before it, its returned value's parts, and the parts after it. The exit
  * becomes a block that records the outcome and leaves the helper, spliced
  * back between those two halves -- so an exit the emitter wrote as the
  * consequent of a one-line guard stays that guard's consequent. Returns null
@@ -343,8 +349,8 @@ function rewriteRegionExits(statements, from, to, buildExit) {
   for (let index = from; index < to; index += 1) {
     const statement = statements[index];
     if (!statement.exit) { rewritten.push(statement); continue; }
-    const argument = statement.exit.argument
-      ? renderRegionParts(statement.exit.argument) : "undefined";
+    const argument = statement.exit.value
+      ? renderRegionParts(statement.exit.value) : "undefined";
     const text = `${renderRegionParts(statement.exit.before)}${
       buildExit(argument)}${renderRegionParts(statement.exit.after)}`;
     rewritten.push(ownStatement(`${statement.indent}${text.trim()}`, {
@@ -835,8 +841,8 @@ function liftOversizedUnitLocalsToEnvironment(units, options = {}) {
         // lifted argument, not the name it used to be spelled with.
         exit: statement.exit ? {
           before: substituteRegionParts(statement.exit.before, replacements),
-          argument: statement.exit.argument
-            ? substituteRegionParts(statement.exit.argument, replacements)
+          value: statement.exit.value
+            ? substituteRegionParts(statement.exit.value, replacements)
             : null,
           after: substituteRegionParts(statement.exit.after, replacements),
         } : null,

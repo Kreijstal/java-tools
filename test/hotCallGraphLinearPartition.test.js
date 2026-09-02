@@ -31,7 +31,7 @@ function compile(moduleSource) {
 // The renderer publishes each generated body as an ordered statement list:
 // per line, the parts the emitter built, the names it reads and writes, the
 // nesting it opens, the label it introduces, the jump it is and how a return
-// it carries splits around its argument. These cases are handwritten
+// it carries splits around its returned value. These cases are handwritten
 // JavaScript rather than generated bodies, so this builder stands in for that
 // publication: it derives the same records from the fixture's own syntax and
 // hands the passes exactly the shape the renderer hands them. Parsing here is
@@ -200,8 +200,9 @@ function buildRegionUnits(moduleSource) {
     if (returns.length === 1 && exitRecognized) {
       const node = returns[0];
       exit = {
+        kind: 'return',
         before: partsOf(start, node.start, own),
-        argument: node.argument
+        value: node.argument
           ? partsOf(node.argument.start, node.argument.end, own) : null,
         after: partsOf(node.end, end, own),
       };

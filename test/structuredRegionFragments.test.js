@@ -98,7 +98,9 @@ public final class FragmentLoopHarness {
           'a published statement carries its own emitted line');
         if (statement.parts) {
           t.equal(statement.parts.map((part) => typeof part === 'string'
-            ? part : (part.text === undefined ? part.ref : part.text))
+            ? part
+            : part.label !== undefined ? part.label
+              : (part.text === undefined ? part.ref : part.text))
             .join('').trim(),
           fragment.lines[index].trim(),
           'a published parts list renders the line it belongs to');

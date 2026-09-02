@@ -270,8 +270,10 @@ function renderParts(parts) {
     // A reference may render as something other than its name while a later
     // stage still owns it: an array-range access token renders as
     // `false /*token*/` until a proof replaces the whole reference by a guard.
+    // A label part renders as the label it names.
     text += typeof part === "string" ? part
-      : part.text !== undefined ? part.text : part.ref;
+      : part.label !== undefined ? part.label
+        : part.text !== undefined ? part.text : part.ref;
   }
   return text;
 }
@@ -355,9 +357,70 @@ function partsReferences(parts) {
   const names = [];
   for (let index = 0; index < parts.length; index += 1) {
     const part = parts[index];
-    if (typeof part !== "string") names.push(part.ref);
+    // A label part that names no value contributes no operand: it names a
+    // statement. A label the compile minted is also a name the generated
+    // scope carries, so it keeps its operand identity as well.
+    if (typeof part !== "string" && part.ref !== undefined) {
+      names.push(part.ref);
+    }
   }
   return names;
+}
+
+// A label a statement declares or jumps to, as a part of that statement. The
+// label is not recovered from the emitted characters by any consumer: the
+// emitter that wrote the label states it here, and a pass that has to rename
+// one substitutes these parts. A label the compile minted is an emitted name
+// as well, so it keeps its operand identity; a guest label (`L1`, named after
+// its header pc) names no value and is a label part only.
+function labelPart(name) {
+  return activeEmittedNames !== null && activeEmittedNames.has(name)
+    ? {label: name, ref: name} : {label: name};
+}
+
+// A label part list, for the emitters that build a statement out of pieces.
+function labelExpr(name) {
+  return new Expr([labelPart(name)]);
+}
+
+// Rename every label a parts list declares or jumps to. Labels are parts, so
+// this is a substitution over the compiler's own representation.
+function substituteLabelParts(parts, rename) {
+  const out = [];
+  let changed = false;
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index];
+    if (typeof part === "string" || part.label === undefined) {
+      out.push(part);
+      continue;
+    }
+    const renamed = rename(part.label);
+    if (renamed === part.label) { out.push(part); continue; }
+    changed = true;
+    out.push(part.ref === undefined
+      ? {label: renamed} : {label: renamed, ref: renamed});
+  }
+  return changed ? out : parts;
+}
+
+// Whether one of a set of compiler-owned names appears in the *literal text*
+// an emitter wrote, rather than as a part of the statement. Operands and
+// labels are parts and stand for one placeholder character in the skeleton,
+// so what is left is the emitter's own text: a name found there is one no
+// pass can rename, and the caller declines rather than leave it behind. This
+// is the scan `partsAmbientNames` performs, for a different name set.
+function partsMentionLiteralName(parts, names) {
+  if (!names || names.size === 0) return false;
+  const skeleton = partsSkeleton(parts);
+  for (const name of names) {
+    let position = skeleton.indexOf(name);
+    while (position >= 0) {
+      if (!isPartsWordCharacter(skeleton[position - 1]) &&
+          !isPartsWordCharacter(skeleton[position + name.length])) return true;
+      position = skeleton.indexOf(name, position + 1);
+    }
+  }
+  return false;
 }
 
 // Replace operand references by parts lists. This is the only way a pass may
@@ -366,7 +429,12 @@ function substituteParts(parts, replacements) {
   const out = [];
   for (let index = 0; index < parts.length; index += 1) {
     const part = parts[index];
-    if (typeof part === "string") { out.push(part); continue; }
+    // A label names a statement, not a value: no operand substitution
+    // replaces one.
+    if (typeof part === "string" || part.label !== undefined) {
+      out.push(part);
+      continue;
+    }
     const replacement = replacements.get(part.ref);
     if (replacement === undefined) { out.push(part); continue; }
     const replacementParts = replacement instanceof Expr
@@ -529,127 +597,6 @@ function skeletonKeywordPositions(skeleton, keyword, mask = null) {
   return positions;
 }
 
-// Where the statement starting at `from` ends: the first `;` the emitter
-// wrote outside every bracket it opened after that point. Returns -1 when the
-// statement's own block closes first, which means the shape is not one
-// terminated by a semicolon.
-function skeletonStatementEnd(skeleton, from, mask) {
-  let depth = 0;
-  for (let index = from; index < skeleton.length; index += 1) {
-    if (!mask[index]) continue;
-    const character = skeleton[index];
-    if (character === "(" || character === "[" || character === "{") depth += 1;
-    else if (character === ")" || character === "]" || character === "}") {
-      if (depth === 0) return -1;
-      depth -= 1;
-    } else if (character === ";" && depth === 0) return index;
-  }
-  return -1;
-}
-
-// The sub-list of `parts` covering the skeleton range [start, end). An
-// operand reference occupies exactly one skeleton character and is therefore
-// either wholly inside the range or wholly outside it; a literal chunk is
-// sliced. This is a slice of the compiler's own parts list, not of emitted
-// text.
-function partsSliceBySkeleton(parts, start, end) {
-  const slice = [];
-  let cursor = 0;
-  for (let index = 0; index < parts.length; index += 1) {
-    const part = parts[index];
-    const width = typeof part === "string" ? part.length : 1;
-    const from = cursor;
-    cursor += width;
-    if (cursor <= start || from >= end) continue;
-    if (typeof part !== "string") { slice.push(part); continue; }
-    const text = part.slice(Math.max(0, start - from),
-      Math.min(width, end - from));
-    if (text !== "") slice.push(text);
-  }
-  return slice;
-}
-
-// How a statement that leaves the enclosing function through `return` is
-// split, so a consumer that relocates the statement into a helper can
-// re-establish the exit through the helper's protocol instead of rewriting
-// emitted characters. `before` and `after` are the parts around the whole
-// `return <argument>;`, `argument` is its operand list (null for `return;`).
-//
-// Only two shapes are recognized, both of which the consumer can wrap in a
-// block: the statement *is* the return, or the return is the single
-// statement of a guard the emitter wrote on one line. Anything else -- more
-// than one `;`, more than one `return`, a quote the emitted guard could hide
-// a keyword behind -- is reported as unrecognized, and the consumer then
-// leaves the statement where it is.
-function partsReturnSplit(parts) {
-  const skeleton = partsSkeleton(parts);
-  const mask = skeletonCodeMask(skeleton);
-  const returns = skeletonKeywordPositions(skeleton, "return", mask);
-  if (!returns.length) return null;
-  if (returns.length > 1) return {recognized: false};
-  const start = returns[0];
-  const end = skeletonStatementEnd(skeleton, start + "return".length, mask);
-  if (end < 0) return {recognized: false};
-  let argumentStart = start + "return".length;
-  while (skeleton[argumentStart] === " ") argumentStart += 1;
-  return {
-    recognized: true,
-    before: partsSliceBySkeleton(parts, 0, start),
-    argument: argumentStart >= end
-      ? null : partsSliceBySkeleton(parts, argumentStart, end),
-    after: partsSliceBySkeleton(parts, end + 1, skeleton.length),
-  };
-}
-
-// The `break` / `continue` a statement carries, split the same way a return
-// is: the parts before the jump, its label, and the parts after it. A jump is
-// always a complete statement, so replacing its own range by a block is valid
-// wherever the emitter wrote it. A statement carrying more than one is
-// reported unrecognized and stays where it is.
-function partsJumpStatement(parts) {
-  const skeleton = partsSkeleton(parts);
-  const mask = skeletonCodeMask(skeleton);
-  const breaks = skeletonKeywordPositions(skeleton, "break", mask);
-  const continues = skeletonKeywordPositions(skeleton, "continue", mask);
-  if (!breaks.length && !continues.length) return null;
-  if (breaks.length + continues.length > 1) return {recognized: false};
-  const kind = breaks.length ? "break" : "continue";
-  const start = breaks.length ? breaks[0] : continues[0];
-  let cursor = start + kind.length;
-  while (skeleton[cursor] === " ") cursor += 1;
-  const labelStart = cursor;
-  while (isPartsWordCharacter(skeleton[cursor])) cursor += 1;
-  const label = cursor > labelStart
-    ? skeleton.slice(labelStart, cursor) : null;
-  while (skeleton[cursor] === " ") cursor += 1;
-  if (skeleton[cursor] !== ";" || !mask[cursor]) {
-    return {recognized: false};
-  }
-  return {
-    recognized: true,
-    kind,
-    label,
-    before: partsSliceBySkeleton(parts, 0, start),
-    after: partsSliceBySkeleton(parts, cursor + 1, skeleton.length),
-  };
-}
-
-// The label a statement introduces (`L1: while (true) {`). `case`/`default`
-// are excluded: they are not labels and a consumer must not treat them as
-// one.
-// A block a consumer must not relocate or reason about structurally: the
-// emitter opened a construct whose jump semantics (`switch`) or scoping
-// (`function`, `class`, `with`) differ from the ordinary statement nesting
-// the fragment walk tracks.
-function partsOpensNamedConstruct(parts) {
-  const skeleton = partsSkeleton(parts).trimStart();
-  for (const keyword of ["switch", "function", "class", "with", "var"]) {
-    if (skeleton.startsWith(keyword) &&
-        !isPartsWordCharacter(skeleton[keyword.length])) return keyword;
-  }
-  return null;
-}
-
 // Whether the statement carries a nested function. Moving such a statement
 // into a helper would rebind its captures to the helper's parameter copies,
 // so a consumer leaves it where it is.
@@ -760,23 +707,6 @@ function partsContinuesBlock(parts) {
   return skeleton.startsWith("}") && skeleton.endsWith("{");
 }
 
-function partsYields(parts) {
-  return skeletonKeywordPositions(partsSkeleton(parts), "yield").length > 0;
-}
-
-function partsLabelName(parts) {
-  const skeleton = partsSkeleton(parts).trimStart();
-  let end = 0;
-  while (end < skeleton.length && isPartsWordCharacter(skeleton[end])) {
-    end += 1;
-  }
-  if (end === 0 || skeleton[end] !== ":") return null;
-  const name = skeleton.slice(0, end);
-  if (name === "case" || name === "default") return null;
-  if (skeleton[0] >= "0" && skeleton[0] <= "9") return null;
-  return name;
-}
-
 // Whether the statement the emitter wrote is a conditional that opens a
 // block: `if (<condition>) {`.
 function partsOpenCondition(parts) {
@@ -788,89 +718,6 @@ function partsOpenCondition(parts) {
 function partsWriteThrowOrTry(parts) {
   const skeleton = partsSkeleton(parts);
   return skeleton.includes("throw ") || skeleton.includes("try {");
-}
-
-// Every `return` a statement leaves its activation through, located in the
-// statement's own literal chunks. An operand reference contributes exactly one
-// placeholder character to the skeleton, so it can neither supply nor split the
-// keyword, and the scan skips rendered string literals, so the deopt reason
-// `'structured SSA return with active child'` is not one. Anything else that
-// reads as a `return` is reported, including a shape no exit emitter is known
-// to produce: the caller must either route it or reject the whole variant.
-function partsReturnPositions(parts) {
-  const skeleton = partsSkeleton(parts);
-  const positions = [];
-  let quote = null;
-  for (let at = 0; at + 6 <= skeleton.length; at += 1) {
-    const character = skeleton[at];
-    if (quote) {
-      if (character === "\\") { at += 1; continue; }
-      if (character === quote) quote = null;
-      continue;
-    }
-    if (character === "'" || character === '"') { quote = character; continue; }
-    if (character !== "r" || !skeleton.startsWith("return", at)) continue;
-    if (isPartsWordCharacter(skeleton[at - 1]) ||
-        isPartsWordCharacter(skeleton[at + 6])) continue;
-    positions.push(at);
-  }
-  return positions;
-}
-
-// One skeleton range of a parts list, as a parts list. A range boundary that
-// falls inside an operand reference has no parts representation, so the caller
-// gets null rather than a split name.
-function slicePartsRange(parts, start, end) {
-  const out = [];
-  let offset = 0;
-  for (let index = 0; index < parts.length; index += 1) {
-    const part = parts[index];
-    const length = typeof part === "string" ? part.length : 1;
-    const partEnd = offset + length;
-    if (partEnd > start && offset < end) {
-      if (typeof part === "string") {
-        const chunk = part.slice(
-          Math.max(0, start - offset), Math.min(length, end - offset));
-        if (chunk !== "") out.push(chunk);
-      } else {
-        if (offset < start || partEnd > end) return null;
-        out.push(part);
-      }
-    }
-    offset = partEnd;
-  }
-  return out;
-}
-
-// Split `<before>return <value>;<after>` out of one statement's parts. Null
-// when the statement carries no return, more than one, or a return whose value
-// cannot be delimited -- the caller then keeps the statement or rejects the
-// whole insertable variant.
-function splitReturnParts(parts) {
-  const positions = partsReturnPositions(parts);
-  if (positions.length !== 1) return null;
-  const skeleton = partsSkeleton(parts);
-  const at = positions[0];
-  // The statement terminator, outside any rendered string literal.
-  let end = -1;
-  let quote = null;
-  for (let index = at + 6; index < skeleton.length; index += 1) {
-    const character = skeleton[index];
-    if (quote) {
-      if (character === "\\") { index += 1; continue; }
-      if (character === quote) quote = null;
-      continue;
-    }
-    if (character === "'" || character === '"') { quote = character; continue; }
-    if (character === ";") { end = index; break; }
-  }
-  if (end < 0) return null;
-  const valueStart = skeleton[at + 6] === ";" ? end : at + 7;
-  const before = slicePartsRange(parts, 0, at);
-  const value = slicePartsRange(parts, valueStart, end);
-  const after = slicePartsRange(parts, end + 1, skeleton.length);
-  if (!before || !value || !after) return null;
-  return {before, value, after};
 }
 
 function partsWriteDivision(parts) {
@@ -934,6 +781,105 @@ function auditStatementIrLines(lines, records, names, label) {
         `${present.join(",")}]`, trimmed);
     }
   }
+  auditStatementIrControlFlow(lines, records, label, note);
+}
+
+// The second half of the audit: the control flow every statement *declared*,
+// cross-checked against what an acorn parse of the finished body actually
+// finds there. `returnStmt` states an exit, `jumpStmt` states a break or a
+// continue, a label emitter states the label it wrote and the emitters that
+// write `yield` say so; nothing in the compiler recovers any of it from the
+// text, so this is the check that an emitter which grows a new exit, jump,
+// label or yield form is noticed instead of silently escaping the routing.
+//
+// Like the operand check it is a test oracle: opt-in, never a compilation
+// step, and nothing the compiler emits depends on it.
+function auditStatementIrControlFlow(lines, records, label, note) {
+  // A body a caller inserts breaks out of a label the *caller* declares, so
+  // the parser needs those labels wrapped around it. Which labels those are
+  // is read off the records; a record that names the wrong one shows up as a
+  // parse failure.
+  const declared = new Set();
+  const targets = new Set();
+  for (const line of lines) {
+    const record = records.get(line.trim());
+    if (!record || record.foreign) continue;
+    if (record.declaresLabel && record.label) declared.add(record.label);
+    if (record.jump && record.jump.label) targets.add(record.jump.label);
+  }
+  const wrappers = [...targets].filter((name) => !declared.has(name));
+  const body = lines.join("\n");
+  const source = wrappers.length
+    ? `${wrappers.map((name) => `${name}: {`).join("\n")}\n${body}\n${
+      wrappers.map(() => "}").join("\n")}`
+    : body;
+  const offset = wrappers.length;
+  let program = null;
+  try {
+    program = parseJavaScript(`function* __jvmSsaAuditWrapper() {\n${
+      source}\n}`, {ecmaVersion: "latest", locations: true});
+  } catch (error) {
+    note(`${label} audit parse failed`, String(error.message));
+    return;
+  }
+  // Line 1 is the wrapper, then the label wrappers, then `lines[0]`.
+  const found = lines.map(() => ({
+    exit: 0, jump: null, jumps: 0, label: null, labels: 0, yields: 0,
+  }));
+  const at = (node) => {
+    const index = node.loc.start.line - 2 - offset;
+    return index >= 0 && index < found.length ? found[index] : null;
+  };
+  walkJavaScriptAst(program, (node) => {
+    const seen = at(node);
+    if (!seen) return;
+    if (node.type === "ReturnStatement") seen.exit += 1;
+    else if (node.type === "YieldExpression") seen.yields += 1;
+    else if (node.type === "BreakStatement" ||
+        node.type === "ContinueStatement") {
+      seen.jumps += 1;
+      seen.jump = {
+        kind: node.type === "BreakStatement" ? "break" : "continue",
+        label: node.label ? node.label.name : null,
+      };
+    } else if (node.type === "LabeledStatement") {
+      seen.labels += 1;
+      seen.label = node.label.name;
+    }
+  });
+  for (let index = 0; index < lines.length; index += 1) {
+    const trimmed = lines[index].trim();
+    if (trimmed === "") continue;
+    const record = records.get(trimmed);
+    if (!record || record.foreign) continue;
+    const seen = found[index];
+    const declaredExit = record.exit ? 1 : 0;
+    if (seen.exit !== declaredExit) {
+      note(`${label} exit declared ${declaredExit} found ${seen.exit}`,
+        trimmed);
+    }
+    const declaredYields = record.yields ? 1 : 0;
+    if ((seen.yields > 0 ? 1 : 0) !== declaredYields) {
+      note(`${label} yield declared ${declaredYields} found ${seen.yields}`,
+        trimmed);
+    }
+    const declaredJumps = record.jump ? 1 : 0;
+    if (seen.jumps !== declaredJumps) {
+      note(`${label} jump declared ${declaredJumps} found ${seen.jumps}`,
+        trimmed);
+    } else if (record.jump && (record.jump.kind !== seen.jump.kind ||
+        (record.jump.label || null) !== seen.jump.label)) {
+      note(`${label} jump ${record.jump.kind} ${record.jump.label} vs ` +
+        `${seen.jump.kind} ${seen.jump.label}`, trimmed);
+    }
+    const declaresLabel = record.declaresLabel && record.label ? 1 : 0;
+    if (seen.labels !== declaresLabel) {
+      note(`${label} label declared ${declaresLabel} found ${seen.labels}`,
+        trimmed);
+    } else if (declaresLabel && record.label !== seen.label) {
+      note(`${label} label ${record.label} vs ${seen.label}`, trimmed);
+    }
+  }
 }
 
 function reportStatementIrAudit() {
@@ -945,6 +891,9 @@ function reportStatementIrAudit() {
 // the body is inserted lexically into a caller, that statement is late-bound
 // to the caller-visible result slot and exit label of the inserted scope.
 const CHECKED_LEAF_BAIL = "return helpers.asyncInvokeSentinel();";
+// The value a checked leaf bails with. The statement around it is recorded by
+// `returnStmt`, so the exit is stated rather than recovered from the text.
+const CHECKED_LEAF_BAIL_VALUE = "helpers.asyncInvokeSentinel()";
 
 function retargetCheckedLeafBails(lines, target) {
   const replacement = `{ ${target.result} = ${
@@ -2058,6 +2007,18 @@ class JvmSsaBlockRenderer {
         }
       }
       record.blockDelta = delta;
+      // The control-flow facts the statement's own emitter states. None of
+      // them is recovered from the characters or from the keywords in the
+      // parts skeleton: `returnStmt` states an exit, `jumpStmt` states a
+      // break or a continue, a label emitter states the label it wrote, and
+      // the emitters that write `yield` say so.
+      record.exit = meta?.exit || null;
+      record.jump = meta?.jump || null;
+      record.yields = meta?.yields === true;
+      record.label = meta?.label === undefined || meta.label === null
+        ? null : meta.label;
+      record.declaresLabel = meta?.declaresLabel === true;
+      record.opens = meta?.opens || null;
       if (!record.exprParts && record.def) {
         record.reads = record.reads.filter((name) => name !== record.def);
       }
@@ -2075,6 +2036,51 @@ class JvmSsaBlockRenderer {
       }
       if (!existing) statementRecords.set(key, record);
       return text;
+    };
+    // Whatever an emitter wrote around an exit or a jump: an indentation
+    // prefix, the guard the exit is the consequent of, or the brace that
+    // closes it. A string, an `Expr` or an already-built parts list.
+    const controlFlowParts = (piece) => {
+      if (piece === null || piece === undefined) return [];
+      if (piece instanceof Expr) return piece.parts;
+      if (Array.isArray(piece)) return piece;
+      return buildParts(["", ""], [piece]);
+    };
+    // The one recorder for a statement that leaves the generated function.
+    // Every emitter that writes a `return` goes through it, so the record
+    // states the exit and its split -- the parts before the keyword, the
+    // returned value, and the parts that close whatever `before` opened --
+    // instead of a consumer scanning the statement for the keyword.
+    const returnStmt = (before, value, after = "", meta = null) => {
+      const beforeParts = controlFlowParts(before);
+      const valueParts = value === null || value === undefined
+        ? null : controlFlowParts(value);
+      const afterParts = controlFlowParts(after);
+      return recordStatement([
+        ...beforeParts, "return",
+        ...(valueParts && valueParts.length ? [" ", ...valueParts] : []),
+        ";", ...afterParts,
+      ], {
+        ...(meta || {}),
+        kind: meta?.kind || "return",
+        exit: {kind: "return", before: beforeParts, value: valueParts,
+          after: afterParts},
+      });
+    };
+    // The one recorder for a `break` or a `continue`. The label, and the
+    // parts the emitter wrote around the jump, are stated the same way.
+    const jumpStmt = (kind, label, before = "", after = "", meta = null) => {
+      const beforeParts = controlFlowParts(before);
+      const afterParts = controlFlowParts(after);
+      return recordStatement([
+        ...beforeParts, kind, ...(label ? [" ", labelPart(label)] : []),
+        ";", ...afterParts,
+      ], {
+        ...(meta || {}),
+        label: label || null,
+        jump: {kind, label: label || null,
+          before: beforeParts, after: afterParts},
+      });
     };
     // Indentation is applied by the assembler and is not part of a
     // statement's identity; `recordOf` looks a rendered line up by that
@@ -2130,6 +2136,26 @@ class JvmSsaBlockRenderer {
       if (record.exprParts) {
         meta.exprParts = substituteParts(record.exprParts, replacements);
       }
+      // The exit and the jump a statement states are splits of its own parts
+      // list, so an operand substitution applies to them exactly as it
+      // applies to the statement.
+      if (record.exit) {
+        meta.exit = {
+          kind: record.exit.kind,
+          before: substituteParts(record.exit.before, replacements),
+          value: record.exit.value === null
+            ? null : substituteParts(record.exit.value, replacements),
+          after: substituteParts(record.exit.after, replacements),
+        };
+      }
+      if (record.jump) {
+        meta.jump = {
+          kind: record.jump.kind,
+          label: record.jump.label,
+          before: substituteParts(record.jump.before, replacements),
+          after: substituteParts(record.jump.after, replacements),
+        };
+      }
       return recordStatement(
         substituteParts(record.parts, replacements),
         overrides ? {...meta, ...overrides} : meta);
@@ -2148,8 +2174,8 @@ class JvmSsaBlockRenderer {
     // The checked-leaf exit statement. A checked leaf leaves its body through
     // this one compiler-owned statement.
     const leafBailStatement = (indentation = "") =>
-      `${indentation}${recordStatement([CHECKED_LEAF_BAIL],
-        {kind: "leafBail"})}`;
+      returnStmt(indentation, CHECKED_LEAF_BAIL_VALUE, "",
+        {kind: "leafBail"});
     // What one emitted line of an assembled body is, for a consumer that
     // relocates statements into helper functions. Everything here is read off
     // the record the emitter wrote -- its parts list, its operand references
@@ -2161,9 +2187,6 @@ class JvmSsaBlockRenderer {
       const record = recordOf(line);
       if (!record) return null;
       const parts = record.parts;
-      const jump = partsJumpStatement(parts);
-      const exit = partsReturnSplit(parts);
-      const named = partsOpensNamedConstruct(parts);
       const delta = record.blockDelta || 0;
       const reads = [];
       for (const name of [...record.reads, ...record.ambientReads,
@@ -2184,27 +2207,34 @@ class JvmSsaBlockRenderer {
             (name) => name !== record.write)],
         reads,
         delta,
-        label: partsLabelName(parts),
-        jump: jump && jump.recognized
-          ? {kind: jump.kind, label: jump.label,
-            before: jump.before, after: jump.after} : null,
-        exit: exit && exit.recognized ? {
-          before: exit.before, argument: exit.argument, after: exit.after,
+        // The control flow the statement's emitter stated. A label is a part
+        // of the statement that declares or jumps to it, an exit is the split
+        // `returnStmt` recorded, and a jump is the one `jumpStmt` recorded.
+        label: record.declaresLabel ? record.label : null,
+        jump: record.jump ? {
+          kind: record.jump.kind, label: record.jump.label,
+          before: record.jump.before, after: record.jump.after,
         } : null,
-        yields: partsYields(parts),
+        exit: record.exit ? {
+          before: record.exit.before, value: record.exit.value,
+          after: record.exit.after,
+        } : null,
+        yields: record.yields === true,
         continuesBlock: partsContinuesBlock(parts),
         opens: delta > 0
-          ? (record.kind === "loopHeader" ? "loop"
-            : record.opensTry ? "try" : named || "block")
+          ? (record.opens || (record.kind === "loopHeader" ? "loop"
+            : record.opensTry ? "try" : "block"))
           : null,
         // A statement a consumer may move into a helper function. Every
         // exit it carries has to be re-establishable through the helper's
         // protocol, and nothing in it may depend on the activation or the
-        // scope it was written in.
-        relocatable: record.foreign !== true &&
-          !(jump && !jump.recognized) && !(exit && !exit.recognized) &&
-          !(jump && exit) &&
-          named === null && !partsCarriesNestedFunction(parts) &&
+        // scope it was written in. An emitter that composes an exit with
+        // other effects in one statement says so (`relocatable: false`);
+        // everything else here is a property of the activation and the scope
+        // the statement was written in, not of its control flow.
+        relocatable: record.foreign !== true && record.relocatable !== false &&
+          !(record.jump && record.exit) && record.opens !== "switch" &&
+          !partsCarriesNestedFunction(parts) &&
           !partsRelocationHostile(parts) && !partsDeclaresAmbient(parts),
       };
     };
@@ -2325,11 +2355,12 @@ class JvmSsaBlockRenderer {
     const regionInsertionResult =
       named(`ssaRegionInlineResult${compileSerial}`);
     const regionInsertionLabel = named(`ssaRegionInlineBody${compileSerial}`);
-    const insertableExitStatement = (before, value, after) => recordStatement([
-      ...before, "{ ", {ref: regionInsertionResult}, " = ",
-      ...(value.length ? value : ["undefined"]),
-      "; break ", {ref: regionInsertionLabel}, "; }", ...after,
-    ], {kind: "insertableExit"});
+    const insertableExitStatement = (before, value, after) => jumpStmt(
+      "break", regionInsertionLabel,
+      [...before, "{ ", {ref: regionInsertionResult}, " = ",
+        ...(value.length ? value : ["undefined"]), "; "],
+      [" }", ...after],
+      {kind: "insertableExit", relocatable: false});
     // The insertable form of an assembled body. Statements are examined as the
     // records their emitters produced, never as characters: an exit is a
     // statement whose own parts carry a `return`, and it is replaced by a
@@ -2355,10 +2386,12 @@ class JvmSsaBlockRenderer {
       // unrelated bodies routinely declare the same one and inserting one into
       // the other would nest two identical labels. The inserted copy therefore
       // renames every label it declares and every reference to it, keyed by
-      // this compile's serial. The rename is driven by the label each
-      // statement recorded; a statement that mentions one of these labels
-      // without having recorded it rejects the whole variant, because its
-      // reference would be left pointing at the caller's label.
+      // this compile's serial. A label is a *part* of the statement that
+      // declares or jumps to it, so the rename is a substitution over the
+      // compiler's own representation; a statement that spells one of these
+      // labels in its literal text without carrying it as a part rejects the
+      // whole variant, because its reference would be left pointing at the
+      // caller's label.
       const declaredLabels = new Set();
       for (const line of bodyLines) {
         const record = recordOf(line);
@@ -2366,48 +2399,43 @@ class JvmSsaBlockRenderer {
           declaredLabels.add(record.label);
         }
       }
-      // A label is not an operand: it names a statement, not a value, so the
-      // renamed label stays a literal chunk of the statement that declares or
-      // jumps to it and is not registered as an emitted name.
+      // A label is not an operand: it names a statement, not a value, so a
+      // renamed label is a label part of the statement that declares or jumps
+      // to it and is not registered as an emitted name.
       const renamedLabel = (label) => `${label}_ssaInline${compileSerial}`;
-      const labelPattern = declaredLabels.size
-        ? new RegExp(`(?:^|[^A-Za-z0-9_$])(${[...declaredLabels]
-          .map((label) => label.replace(/[^A-Za-z0-9_$]/g, "\\$&"))
-          .join("|")})(?![A-Za-z0-9_$])`)
-        : null;
-      const relabelParts = (parts, label) => parts.map((part) =>
-        typeof part === "string"
-          ? part.replace(
-            new RegExp(`(^|[^A-Za-z0-9_$])${label}(?![A-Za-z0-9_$])`, "g"),
-            `$1${renamedLabel(label)}`)
-          : part);
+      const relabel = (parts) =>
+        substituteLabelParts(parts, (label) =>
+          declaredLabels.has(label) ? renamedLabel(label) : label);
       for (const line of bodyLines) {
         if (line.trim() === "") { lines.push(line); continue; }
         const record = recordOf(line);
         if (!record || record.foreign) return veto("unrecorded", line);
         // A generator body cannot be inserted into a caller's activation.
-        // `yield` as a whole word, so a deopt reason that names a yielded
-        // thread is not mistaken for one.
-        if (/(?:^|[^A-Za-z0-9_$])yield(?![A-Za-z0-9_$])/
-          .test(partsSkeleton(record.parts))) return veto("yield", line);
-        let parts = record.parts;
-        if (typeof record.label === "string" && record.label) {
-          parts = relabelParts(parts, record.label);
-        } else if (labelPattern?.test(partsSkeleton(parts))) {
+        // The emitters that write `yield` say so on the record.
+        if (record.yields) return veto("yield", line);
+        if (partsMentionLiteralName(record.parts, declaredLabels)) {
           return veto("unrecorded-label-reference", line);
         }
-        const positions = partsReturnPositions(parts);
-        if (positions.length === 0) {
+        const parts = relabel(record.parts);
+        if (!record.exit) {
           lines.push(parts === record.parts ? line
-            : `${indentationOf(line)}${recordStatement(parts,
-              {...record, label: renamedLabel(record.label)}).trim()}`);
+            : `${indentationOf(line)}${recordStatement(parts, {
+              ...record,
+              label: record.label ? renamedLabel(record.label) : null,
+              jump: record.jump ? {
+                ...record.jump,
+                label: record.jump.label
+                  ? renamedLabel(record.jump.label) : null,
+                before: relabel(record.jump.before),
+                after: relabel(record.jump.after),
+              } : null,
+            }).trim()}`);
           continue;
         }
-        const split = splitReturnParts(parts);
-        if (!split) return veto("unsplittable-return", line);
         exits += 1;
         lines.push(`${indentationOf(line)}${insertableExitStatement(
-          split.before, split.value, split.after).trim()}`);
+          relabel(record.exit.before), relabel(record.exit.value || []),
+          relabel(record.exit.after)).trim()}`);
       }
       if (exits === 0) return veto("no-exits", "");
       return {lines, exits};
@@ -4642,8 +4670,9 @@ class JvmSsaBlockRenderer {
                 ...materializeLines([...stack, under, top], index)
                   .map((line) => `  ${line}`),
                 st`  helpers.skipJitOnce(frame);`,
-                stmt(exprConcat(e`  return { deopt: true, transient: true, `,
-                  e`reason: 'category-2 dup2 in structured SSA' };`)),
+                returnStmt("  ", exprConcat(
+                  e`{ deopt: true, transient: true, `,
+                  e`reason: 'category-2 dup2 in structured SSA' }`)),
                 blockEnd(""));
             }
             copyValueMetadata(topInput, top);
@@ -5199,8 +5228,9 @@ class JvmSsaBlockRenderer {
               ...materializeLines([...stack, monitor], index)
                 .map((line) => `    ${line}`),
               st`    helpers.skipJitOnce(frame);`,
-              stmt(exprConcat(e`    return { deopt: true, transient: true, `,
-                e`reason: 'contended structured SSA monitorenter' };`)),
+              returnStmt("    ", exprConcat(
+                e`{ deopt: true, transient: true, `,
+                e`reason: 'contended structured SSA monitorenter' }`)),
               blockEnd("  "),
               st`} catch (${caught}) {`,
               ...materializeLines([...stack, monitor], index)
@@ -5245,7 +5275,8 @@ class JvmSsaBlockRenderer {
               st`    if (${checked} === helpers.asyncInvokeSentinel()) {`,
               ...materializeLines(stack, index).map((line) => `    ${line}`),
               st`      helpers.skipJitOnce(frame);`,
-              st`      return { deopt: true, transient: true, reason: 'cold structured SSA checkcast' };`,
+              returnStmt("      ",
+                e`{ deopt: true, transient: true, reason: 'cold structured SSA checkcast' }`),
               blockEnd("    "),
               blockEnd("  "),
               blockEnd(""));
@@ -5264,8 +5295,9 @@ class JvmSsaBlockRenderer {
               ...materializeLines([...stack, candidate], index)
                 .map((line) => `  ${line}`),
               st`  helpers.skipJitOnce(frame);`,
-              stmt(exprConcat(e`  return { deopt: true, transient: true, `,
-                e`reason: 'cold structured SSA instanceof' };`)),
+              returnStmt("  ", exprConcat(
+                e`{ deopt: true, transient: true, `,
+                e`reason: 'cold structured SSA instanceof' }`)),
               blockEnd(""),
             );
             stack.push(out);
@@ -5396,7 +5428,8 @@ class JvmSsaBlockRenderer {
             st`if (${out} === helpers.staticDeopt()) {`,
             ...materializeLines(stack, index).map((line) => `  ${line}`),
             st`  helpers.skipJitOnce(frame);`,
-            st`  return { deopt: true, transient: true, reason: 'class initialization in structured SSA new' };`,
+            returnStmt("  ",
+              e`{ deopt: true, transient: true, reason: 'class initialization in structured SSA new' }`),
             blockEnd(""));
           stack.push(out);
         } else if (op === "getstatic") {
@@ -5485,7 +5518,8 @@ class JvmSsaBlockRenderer {
                 ...materializeLines(stack, index).map(
                   (line) => `${prefix}    ${line}`),
                 st`${prefix}    helpers.skipJitOnce(frame);`,
-                st`${prefix}    return { deopt: true, transient: true, reason: 'class initialization in structured SSA getstatic' };`,
+                returnStmt(`${prefix}    `,
+                  e`{ deopt: true, transient: true, reason: 'class initialization in structured SSA getstatic' }`),
                 st`${prefix}  }`,
                 st`${prefix}  ${lazy.variable} = helpers.fieldSites[${site}].staticTarget;`,
                 st`${prefix}  if (${lazy.variable}) helpers.structuredSsa.lazyStaticTargetLinkCount += 1;`,
@@ -5522,7 +5556,8 @@ class JvmSsaBlockRenderer {
               st`if (${out} === helpers.staticDeopt()) {`,
               ...materializeLines(stack, index).map((line) => `  ${line}`),
               st`  helpers.skipJitOnce(frame);`,
-              st`  return { deopt: true, transient: true, reason: 'class initialization in structured SSA getstatic' };`,
+              returnStmt("  ",
+                e`{ deopt: true, transient: true, reason: 'class initialization in structured SSA getstatic' }`),
               blockEnd(""));
             }
             stack.push(out);
@@ -5556,7 +5591,8 @@ class JvmSsaBlockRenderer {
             st`if (${changed} === helpers.staticDeopt()) {`,
             ...materializeLines([...stack, input], index).map((line) => `  ${line}`),
             st`  helpers.skipJitOnce(frame);`,
-            st`  return { deopt: true, transient: true, reason: 'class initialization in structured SSA putstatic' };`,
+            returnStmt("  ",
+              e`{ deopt: true, transient: true, reason: 'class initialization in structured SSA putstatic' }`),
             blockEnd(""));
         } else if (op === "invokestatic" || op === "invokevirtual" ||
             op === "invokespecial" || op === "invokeinterface") {
@@ -5578,7 +5614,8 @@ class JvmSsaBlockRenderer {
                 st`if (!helpers.directJreInitializationTokens[${site.directJre.id}].initialized) {`,
                 ...materializeLines(callStack, index).map((line) => `  ${line}`),
                 st`  helpers.skipJitOnce(frame);`,
-                st`  return { deopt: true, transient: true, reason: 'class initialization at direct structured JRE call' };`,
+                returnStmt("  ",
+                  e`{ deopt: true, transient: true, reason: 'class initialization at direct structured JRE call' }`),
                 blockEnd(""),
               ] : []), letDecl(out),
               stmt(exprConcat(
@@ -5616,7 +5653,8 @@ class JvmSsaBlockRenderer {
                   ...materializeLines(callStack, index)
                     .map((line) => `    ${line}`),
                   st`    helpers.skipJitOnce(frame);`,
-                  st`    return { deopt: true, transient: true, reason: 'guarded inline integer leaf' };`,
+                  returnStmt("    ",
+                    e`{ deopt: true, transient: true, reason: 'guarded inline integer leaf' }`),
                   blockEnd("  "));
               }
               lines.push(stmt(e`  ${out} = ${site.inline.result};`),
@@ -5676,9 +5714,10 @@ class JvmSsaBlockRenderer {
             continuationFallbacks.set(activeChildCallMarker, {
               continuation: [
                 ...materializeLines(stack, index + 1).map((line) => `    ${line}`),
-                st`    yield { deopt: true, transient: true, structuredResumePc: ${
+                stmt(e`    yield { deopt: true, transient: true, structuredResumePc: ${
                   index + 1
                 }, structuredResumeOwnsFrame: true, reason: 'active child in structured SSA callee' };`,
+                {yields: true}),
                 st`    ${callStackDepth} = thread.callStack.items.length;`,
                 ...(site.returnsVoid ? [] : [
                   st`    ${out} = frame.stack.items.pop();`,
@@ -5686,9 +5725,10 @@ class JvmSsaBlockRenderer {
               ],
               ordinary: [
                 ...materializeLines(stack, index + 1).map((line) => `    ${line}`),
-                stmt(exprConcat(e`    return { deopt: true, transient: true, `,
+                returnStmt("    ", exprConcat(
+                  e`{ deopt: true, transient: true, `,
                   e`reason: 'asynchronous structured SSA callee left active child', `,
-                  e`jvmPositionalChild: frame };`)),
+                  e`jvmPositionalChild: frame }`)),
               ],
               checkedLeaf: [leafBailStatement("    ")],
             });
@@ -5699,14 +5739,16 @@ class JvmSsaBlockRenderer {
                 continuation: [
                   ...materializeLines(callStack, index).map((line) => `  ${line}`),
                   st`  helpers.skipJitOnce(frame);`,
-                  st`  yield { deopt: true, transient: true, structuredResumePc: ${
+                  stmt(e`  yield { deopt: true, transient: true, structuredResumePc: ${
                     index + 1
                   }, reason: 'asynchronous structured SSA callee' };`,
+                  {yields: true}),
                 ],
                 ordinary: [
                   ...materializeLines(callStack, index).map((line) => `  ${line}`),
                   st`  helpers.skipJitOnce(frame);`,
-                  st`  return { deopt: true, transient: true, reason: 'asynchronous structured SSA callee' };`,
+                  returnStmt("  ",
+                    e`{ deopt: true, transient: true, reason: 'asynchronous structured SSA callee' }`),
                 ],
                 checkedLeaf: [leafBailStatement()],
               });
@@ -6027,8 +6069,9 @@ class JvmSsaBlockRenderer {
                   ordinary: [
                     ...materializeLines(callStack, index),
                     st`helpers.skipJitOnce(frame);`,
-                    stmt(exprConcat(e`return { deopt: true, transient: true, `,
-                      e`reason: 'checked leaf admission' };`)),
+                    returnStmt("", exprConcat(
+                      e`{ deopt: true, transient: true, `,
+                      e`reason: 'checked leaf admission' }`)),
                   ],
                   // The lexically inserted child is proven non-throwing and
                   // performs no effect before its own entry bailout. A
@@ -6090,8 +6133,10 @@ class JvmSsaBlockRenderer {
                   e`thread, true);`));
                 const replacement = provenInlineCheckedLeafLines
                   ? [
-                    `${recordStatement([`${inlineCheckedLeafLabel}: {`],
-                    {kind: "inlineLeafLabel", label: inlineCheckedLeafLabel})}`,
+                    `${recordStatement(
+                      [labelPart(inlineCheckedLeafLabel), ": {"],
+                      {kind: "inlineLeafLabel", label: inlineCheckedLeafLabel,
+                        declaresLabel: true})}`,
                     ...provenInlineCheckedLeafLines.map(
                       (line) => `  ${line}`),
                     blockEnd(""),
@@ -6137,7 +6182,8 @@ class JvmSsaBlockRenderer {
                       this.jit.positionalCallSafePointPollBudget};`,
                     stmt(exprConcat(
                       e`    yield { deopt: true, transient: true, `,
-                      e`reason: 'structured SSA positional quantum' };`)),
+                      e`reason: 'structured SSA positional quantum' };`),
+                    {yields: true}),
                     // A frameless positional caller is restored onto the JVM
                     // stack while this generator is suspended. The depth
                     // captured before the safe point therefore no longer
@@ -6181,8 +6227,10 @@ class JvmSsaBlockRenderer {
                 // sole fallback predicate, preserving exact canonical
                 // execution when an assumption is not satisfied.
                 lines.push(
-                  `${recordStatement([`${inlineCheckedLeafLabel}: {`],
-                    {kind: "inlineLeafLabel", label: inlineCheckedLeafLabel})}`,
+                  `${recordStatement(
+                    [labelPart(inlineCheckedLeafLabel), ": {"],
+                    {kind: "inlineLeafLabel", label: inlineCheckedLeafLabel,
+                      declaresLabel: true})}`,
                   ...inlineCheckedLeafLines.map((line) => `  ${line}`),
                   blockEnd(""),
                   stmt(e`if (${inlineCheckedLeafVoid
@@ -6213,8 +6261,10 @@ class JvmSsaBlockRenderer {
                     structured.loopHeaders.size > 0
                   ? [st`${positionalQuantumMarker}`] : []),
                 ...(inlineCheckedLeafLines ? [
-                  `  ${recordStatement([`${inlineCheckedLeafLabel}: {`],
-                    {kind: "inlineLeafLabel", label: inlineCheckedLeafLabel})}`,
+                  `  ${recordStatement(
+                    [labelPart(inlineCheckedLeafLabel), ": {"],
+                    {kind: "inlineLeafLabel", label: inlineCheckedLeafLabel,
+                      declaresLabel: true})}`,
                   ...inlineCheckedLeafLines.map((line) => `    ${line}`),
                   blockEnd("  "),
                 ] : directCheckedLeafNoThrow ? [
@@ -6279,7 +6329,8 @@ class JvmSsaBlockRenderer {
               ...(resumableVoidCall ? [st`${asynchronousCallMarker}`] : [
                 ...materializeLines(callStack, index).map((line) => `  ${line}`),
                 st`  helpers.skipJitOnce(frame);`,
-                st`  return { deopt: true, transient: true, reason: 'asynchronous structured SSA callee' };`,
+                returnStmt("  ",
+                  e`{ deopt: true, transient: true, reason: 'asynchronous structured SSA callee' }`),
               ]), blockEnd(""));
             const deoptCallMarker = named(
               `__JVM_DEOPT_CALL_${index}_${site.id}__`);
@@ -6288,7 +6339,7 @@ class JvmSsaBlockRenderer {
                 ...materializeLines(stack, index + 1).map((line) => `  ${line}`),
                 st`  ${out}.structuredResumePc = ${index + 1};`,
                 st`  ${out}.structuredResumeOwnsFrame = true;`,
-                st`  yield ${out};`,
+                stmt(e`  yield ${out};`, {yields: true}),
                 st`  ${callStackDepth} = thread.callStack.items.length;`,
                 ...(site.returnsVoid ? [] : [
                   st`  ${out} = frame.stack.items.pop();`,
@@ -6297,7 +6348,7 @@ class JvmSsaBlockRenderer {
               ordinary: [
                 ...materializeLines(stack, index + 1).map((line) => `  ${line}`),
                 st`  if (frame) ${out}.jvmPositionalChild = frame;`,
-                st`  return ${out};`,
+                returnStmt("  ", e`${out}`),
               ],
               checkedLeaf: [leafBailStatement()],
             });
@@ -6314,7 +6365,7 @@ class JvmSsaBlockRenderer {
                 e`undefined, ${out}.jvmPositionalChild)) {`)),
               ...materializeLines(callStack, index).map((line) => `    ${line}`),
               st`    helpers.skipJitOnce(frame);`,
-              st`    return ${out};`,
+              returnStmt("    ", e`${out}`),
               blockEnd("  "),
               st`${deoptCallMarker}`, blockEnd(""));
             // A callee that left a frame on the stack has not run to
@@ -6330,9 +6381,10 @@ class JvmSsaBlockRenderer {
             continuationFallbacks.set(leftActiveChildMarker, {
               continuation: [
                 ...materializeLines(stack, index + 1).map((line) => `    ${line}`),
-                st`    yield { deopt: true, transient: true, structuredResumePc: ${
+                stmt(e`    yield { deopt: true, transient: true, structuredResumePc: ${
                   index + 1
                 }, structuredResumeOwnsFrame: true, reason: 'structured SSA callee left active child' };`,
+                {yields: true}),
                 st`    ${callStackDepth} = thread.callStack.items.length;`,
                 ...(site.returnsVoid ? [] : [
                   st`    ${out} = frame.stack.items.pop();`,
@@ -6340,9 +6392,10 @@ class JvmSsaBlockRenderer {
               ],
               ordinary: [
                 ...materializeLines(stack, index + 1).map((line) => `    ${line}`),
-                stmt(exprConcat(e`    return { deopt: true, transient: true, `,
+                returnStmt("    ", exprConcat(
+                  e`{ deopt: true, transient: true, `,
                   e`reason: 'structured SSA callee left active child', `,
-                  e`jvmPositionalChild: frame };`)),
+                  e`jvmPositionalChild: frame }`)),
               ],
               checkedLeaf: [leafBailStatement("    ")],
             });
@@ -6363,15 +6416,17 @@ class JvmSsaBlockRenderer {
             continuationFallbacks.set(yieldedCallMarker, {
               continuation: [
                 ...materializeLines(stack, index + 1).map((line) => `  ${line}`),
-                st`  yield { deopt: true, transient: true, structuredResumePc: ${
+                stmt(e`  yield { deopt: true, transient: true, structuredResumePc: ${
                   index + 1
                 }, reason: 'thread yielded in structured SSA callee' };`,
+                {yields: true}),
               ],
               ordinary: [
                 ...materializeLines(stack, index + 1).map((line) => `  ${line}`),
-                stmt(exprConcat(e`  return { deopt: true, transient: true, `,
+                returnStmt("  ", exprConcat(
+                  e`{ deopt: true, transient: true, `,
                   e`reason: 'thread yielded in structured SSA callee', `,
-                  e`jvmPositionalChild: frame };`)),
+                  e`jvmPositionalChild: frame }`)),
               ],
               checkedLeaf: [leafBailStatement()],
             });
@@ -7429,9 +7484,17 @@ class JvmSsaBlockRenderer {
         `counted loop=${Boolean(loop)} initial=${loop?.initial} ` +
         `increment=${loop?.increment} bound=${loop?.boundSlot}`);
       const stride = loop.increment;
+      // `<prefix>load` or `<prefix>load_<0..3>`, tested on the opcode name
+      // itself rather than through a pattern built out of it.
+      const isLoadOpcode = (op, prefix) => {
+        const base = `${prefix}load`;
+        if (op === base) return true;
+        return op.length === base.length + 2 && op.startsWith(`${base}_`) &&
+          op[base.length + 1] >= "0" && op[base.length + 1] <= "3";
+      };
       const loadSlot = (instruction, prefix = "i") => {
         const op = opOf(instruction);
-        return new RegExp(`^${prefix}load(?:_[0-3])?$`).test(op)
+        return isLoadOpcode(op, prefix)
           ? localIndex(instruction, op) : null;
       };
       const storeSlot = (instruction) => {
@@ -8401,8 +8464,9 @@ class JvmSsaBlockRenderer {
                 e`${info.boundExpression}; ${cursor} += 1) {`)),
               stmt(e`  const ${raw} = ${candidate.sourceArrayData}[${
                 cursor}];`, {kind: "const", def: raw, indexed: true}),
-              stmt(exprConcat(e`  if (${raw} === undefined) { ${valid} = false; `,
-                e`continue; }`)),
+              jumpStmt("continue", null,
+                exprConcat(e`  if (${raw} === undefined) { ${valid} = false; `),
+                " }"),
               stmt(e`  const ${element} = ${loaded};`,
                 {kind: "const", def: element}),
               stmt(exprConcat(e`  if (${element} < ${minimum}) `,
@@ -9692,8 +9756,8 @@ class JvmSsaBlockRenderer {
     const conditionLine = (condition, comparison = null, negated = false) =>
       stmt(e`if (${condition}) {`,
         {kind: "if", condition, comparison, negated});
-    const breakStatement = (label) => recordStatement(
-      [`break ${label};`], {kind: "break", label});
+    const breakStatement = (label) =>
+      jumpStmt("break", label, "", "", {kind: "break"});
     const expandContinuationFallbacks = (lines, continuationMode) =>
       lines.flatMap((line) => {
         const fallback = continuationFallbacks.get(line.trim());
@@ -10177,16 +10241,15 @@ class JvmSsaBlockRenderer {
               // A checked leaf completes through its labeled body, so the
               // same lines serve the standalone entry and a lexical
               // insertion without rewriting any return statement.
-              lines.push(stmt(exprConcat(
+              lines.push(jumpStmt("break", checkedLeafBodyLabel,
                 e`{ ${checkedLeafResultVariable} = ${
                   plan.returnKind === "void" ? "true" : plan.returnValue}; `,
-                e`break ${checkedLeafBodyLabel}; }`),
-              {kind: "leafReturn"}));
+                " }", {kind: "leafReturn", relocatable: false}));
               return lines;
             }
             lines.push(plan.returnKind === "void"
-              ? st`return helpers.returnVoid();`
-              : stmt(e`return ${plan.returnValue};`, {kind: "return"}));
+              ? returnStmt("", "helpers.returnVoid()")
+              : returnStmt("", e`${plan.returnValue}`));
             return lines;
           }
           // Positional generated calls can execute this body without making
@@ -10200,8 +10263,8 @@ class JvmSsaBlockRenderer {
             lines.push(`  ${spillStatement()}`);
           }
           lines.push(plan.returnKind === "void"
-            ? st`  return helpers.returnVoid();`
-            : stmt(e`  return ${plan.returnValue};`, {kind: "return"}));
+            ? returnStmt("  ", "helpers.returnVoid()")
+            : returnStmt("  ", e`${plan.returnValue}`));
           lines.push(blockEnd(""));
           lines.push(st`if (thread.callStack.peek() !== frame) {`);
           lines.push(...materializeLines(
@@ -10209,16 +10272,17 @@ class JvmSsaBlockRenderer {
             plan.returnIndex,
           ).map((line) => `  ${line}`));
           lines.push(st`  helpers.skipJitOnce(frame);`);
-          lines.push(st`  return { deopt: true, transient: true, reason: 'structured SSA return with active child' };`);
+          lines.push(returnStmt("  ",
+            e`{ deopt: true, transient: true, reason: 'structured SSA return with active child' }`));
           lines.push(blockEnd(""));
           lines.push(spillStatement());
           lines.push(st`stack.length = 0;`);
           lines.push(st`frame.pc = ${items.length};`);
           lines.push(st`thread.callStack.pop();`);
           lines.push(plan.returnKind === "void"
-            ? st`return { returned: true, value: helpers.returnVoid() };`
-            : stmt(e`return { returned: true, value: ${plan.returnValue} };`,
-              {kind: "return"}));
+            ? returnStmt("", "{ returned: true, value: helpers.returnVoid() }")
+            : returnStmt("",
+              e`{ returned: true, value: ${plan.returnValue} }`));
         }
         return lines;
       }
@@ -10301,7 +10365,8 @@ class JvmSsaBlockRenderer {
         if (!plan || plan.selector === undefined) {
           throw new Error(`missing structured switch plan for block ${node.block}`);
         }
-        const output = [st`switch (${plan.selector}) {`];
+        const output = [stmt(e`switch (${plan.selector}) {`,
+          {opens: "switch"})];
         for (let index = 0; index < node.cases.length; index += 1) {
           const entry = node.cases[index];
           const target = plan.cases[index]?.target;
@@ -10313,7 +10378,7 @@ class JvmSsaBlockRenderer {
             ...render(entry.body, continuationMode, directPositional,
               loopSafePointBudget, checkedLeafOnly, rangeBailout,
               loopSafePointBudgetOverrides),
-            st`break;`,
+            jumpStmt("break", null),
           ];
           output.push(st`case ${JSON.stringify(entry.key)}: {`,
             ...indent(body), blockEnd(""));
@@ -10323,7 +10388,7 @@ class JvmSsaBlockRenderer {
           ...render(node.dflt, continuationMode, directPositional,
             loopSafePointBudget, checkedLeafOnly, rangeBailout,
             loopSafePointBudgetOverrides),
-          st`break;`,
+          jumpStmt("break", null),
         ];
         output.push(st`default: {`, ...indent(defaultBody), blockEnd(""), blockEnd(""));
         return output;
@@ -10381,12 +10446,14 @@ class JvmSsaBlockRenderer {
             ...(continuationMode ? [
               ...invalidateFieldCacheLines,
               st`safePointBudget = ${currentLoopSafePointBudget};`,
-              st`yield { deopt: true, transient: true, reason: 'structured SSA continuation' };`,
+              stmt(e`yield { deopt: true, transient: true, reason: 'structured SSA continuation' };`,
+                {yields: true}),
               ...refreshEntryStaticCacheLines,
               ...refreshEagerFieldCacheLines,
             ] : [
               st`helpers.skipJitOnce(frame);`,
-              st`return { deopt: true, transient: true, reason: 'structured SSA safe point' };`,
+              returnStmt("",
+                e`{ deopt: true, transient: true, reason: 'structured SSA safe point' }`),
             ]),
           ]),
           blockEnd(""),
@@ -10441,9 +10508,10 @@ class JvmSsaBlockRenderer {
           ...(invariantDivisorGuard
             ? [invariantDivisorGuard.declaration] : []),
           ...(entryBailoutGuards.length
-            ? [recordCheckedLeafLine("rangeBailout", stmt(exprConcat(
-              e`if (!(`, guardConjunction(entryBailoutGuards),
-              e`)) ${CHECKED_LEAF_BAIL}`), {kind: "rangeBailout"}),
+            ? [recordCheckedLeafLine("rangeBailout", returnStmt(
+              exprConcat(e`if (!(`, guardConjunction(entryBailoutGuards),
+                e`)) `), CHECKED_LEAF_BAIL_VALUE, "",
+              {kind: "rangeBailout"}),
             [...entryBailoutGuards])]
             : []),
           ...(coarse && !checkedLeafOnly
@@ -10462,9 +10530,10 @@ class JvmSsaBlockRenderer {
             : []),
         ];
         const loopHeaderLine = () => stmt(
-          e`${node.label}: while (${countedLoop
-            ? countedLoop.condition : "true"}) {`,
-          {kind: "loopHeader", label: node.label,
+          exprConcat(labelExpr(node.label), e`: while (${countedLoop
+            ? countedLoop.condition : "true"}) {`),
+          {kind: "loopHeader", label: node.label, declaresLabel: true,
+            opens: "loop",
             inductionLocal: countedLoop?.inductionLocal || null,
             bound: countedLoop?.bound || null});
         const polledLoop = [
@@ -10503,8 +10572,9 @@ class JvmSsaBlockRenderer {
               spillStatement(),
               ...restoreLines,
               st`helpers.skipJitOnce(frame);`,
-              stmt(exprConcat(e`return { deopt: true, transient: true, `,
-                e`reason: 'structured SSA coarse loop guard' };`)),
+              returnStmt("", exprConcat(
+                e`{ deopt: true, transient: true, `,
+                e`reason: 'structured SSA coarse loop guard' }`)),
             ]),
             blockEnd(""),
             ...unpolledLoop,
@@ -10597,8 +10667,9 @@ class JvmSsaBlockRenderer {
                 spillStatement(),
                 ...restoreLines,
                 st`helpers.skipJitOnce(frame);`,
-                stmt(exprConcat(e`return { deopt: true, transient: true, `,
-                  e`reason: 'structured SSA range guard' };`)),
+                returnStmt("", exprConcat(
+                  e`{ deopt: true, transient: true, `,
+                  e`reason: 'structured SSA range guard' }`)),
               ]),
               blockEnd(""),
               ...specializedUnpolledLoop,
@@ -10613,8 +10684,8 @@ class JvmSsaBlockRenderer {
             // inline as an ordinary JavaScript leaf.
             return [
               ...prefix,
-              stmt(exprConcat(e`if (!(${fastLoopCondition})) `,
-                e`return helpers.asyncInvokeSentinel();`)),
+              returnStmt(e`if (!(${fastLoopCondition})) `,
+                CHECKED_LEAF_BAIL_VALUE),
               ...specializedUnpolledLoop,
             ];
           }
@@ -10642,15 +10713,14 @@ class JvmSsaBlockRenderer {
           return rendered;
         }
         return [
-          recordStatement([`${node.label}: {`],
-            {kind: "blockLabel", label: node.label}),
+          recordStatement([labelPart(node.label), ": {"],
+            {kind: "blockLabel", label: node.label, declaresLabel: true}),
           ...indent(rendered), blockEnd(""),
         ];
       }
       if (node.t === "break") return [breakStatement(node.label)];
       if (node.t === "continue") return [
-        recordStatement([`continue ${node.label};`],
-          {kind: "continue", label: node.label}),
+        jumpStmt("continue", node.label, "", "", {kind: "continue"}),
       ];
       throw new Error(`unsupported structured node ${node.t}`);
     };
@@ -10684,13 +10754,14 @@ class JvmSsaBlockRenderer {
           staticInitializationGuardId}]`)
       : null;
     const staticEntryGuard = staticInitializationGuardId >= 0
-      ? stmt(exprConcat(
+      ? returnStmt(exprConcat(
         e`if ((${named("ssaClassInitializationGuard")}.classEpoch !== (helpers.jvm.classEpoch || 0) || `,
         e`${named("ssaClassInitializationGuard")}.initializationEpoch !== `,
         e`(helpers.jvm.classInitializationEpoch || 0)) && `,
         e`!helpers.structuredSsa.verifyClassInitializationGuard(`,
-        e`${named("ssaClassInitializationGuard")})) { helpers.skipJitOnce(frame); `,
-        e`return { deopt: true, transient: true, reason: 'structured SSA static entry' }; }`))
+        e`${named("ssaClassInitializationGuard")})) { helpers.skipJitOnce(frame); `),
+      e`{ deopt: true, transient: true, reason: 'structured SSA static entry' }`,
+      " }")
       : null;
     const directStaticDeclarations = [...directStaticSites.values()]
       .filter((direct) => !direct.entryReadCache)
@@ -10779,9 +10850,9 @@ class JvmSsaBlockRenderer {
             stmt(e`  ${cache.value} = ${read};`),
             elseArm(""),
             st`  ${cache.value} = helpers.getStaticSyncAt(${lazy.site});`,
-            stmt(exprConcat(
-              e`  if (${cache.value} === helpers.staticDeopt()) `,
-              e`{ ${leafBailStatement()} }`)),
+            returnStmt(
+              e`  if (${cache.value} === helpers.staticDeopt()) { `,
+              CHECKED_LEAF_BAIL_VALUE, " }"),
             st`  ${lazy.variable} = helpers.fieldSites[${lazy.site}].staticTarget;`,
             stmt(exprConcat(e`  if (${lazy.variable}) `,
               e`helpers.structuredSsa.lazyStaticTargetLinkCount += 1;`)),
@@ -11050,11 +11121,10 @@ class JvmSsaBlockRenderer {
         (cache) => cache.eagerLocal === slot);
       restoringDirectFieldLayoutSlots.add(slot);
       restoringDirectFieldCacheInitializations.push(
-        stmt(exprConcat(
+        returnStmt(exprConcat(
           e`if (${localName(slot)} === null || ${
             localName(slot)} === undefined || `,
-          e`!${localName(slot)}.fields) `,
-          e`${leafBailStatement()}`)),
+          e`!${localName(slot)}.fields) `), CHECKED_LEAF_BAIL_VALUE),
       );
       for (const cache of caches) {
         restoringDirectFieldCacheInitializations.push(
@@ -11130,11 +11200,10 @@ class JvmSsaBlockRenderer {
       const caches = transactionalEagerFieldCaches.filter(
         (cache) => cache.eagerLocal === slot);
       transactionalFieldReadCacheInitializations.push(
-        stmt(exprConcat(
+        returnStmt(exprConcat(
           e`if (${localName(slot)} === null || ${
             localName(slot)} === undefined || `,
-          e`!${localName(slot)}.fields) `,
-          e`${leafBailStatement()}`)),
+          e`!${localName(slot)}.fields) `), CHECKED_LEAF_BAIL_VALUE),
       );
       for (const cache of caches) {
         transactionalFieldReadCacheInitializations.push(
@@ -11148,12 +11217,12 @@ class JvmSsaBlockRenderer {
         }
       }
       transactionalFieldReadCacheInitializations.push(
-        stmt(exprConcat(e`if (`,
+        returnStmt(exprConcat(e`if (`,
           ...caches.flatMap((cache, position) => [
             position === 0 ? "" : " || ",
             e`${cache.value} === undefined`,
           ]),
-          e`) ${leafBailStatement()}`)),
+          e`) `), CHECKED_LEAF_BAIL_VALUE),
       );
     }
     const guardedStaticBooleanConditions = (direct) => exprConcat(
@@ -11163,13 +11232,15 @@ class JvmSsaBlockRenderer {
         : e`${direct.variable}[${JSON.stringify(direct.key)}]`,
       e` ? 1 : 0) !== ${direct.guardedBooleanValue})`);
     const guardedStaticBooleanEntryGuard = guardedStaticBooleanSites.size
-      ? stmt(exprConcat(e`if (`,
+      ? returnStmt(exprConcat(e`if (`,
         ...[...guardedStaticBooleanSites.values()].flatMap(
           (direct, position) => [
             position === 0 ? "" : " || ",
             guardedStaticBooleanConditions(direct),
           ]),
-        e`) { helpers.structuredSsa.guardedBooleanFallbackCount += 1; helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'structured SSA static boolean guard' }; }`))
+        e`) { helpers.structuredSsa.guardedBooleanFallbackCount += 1; helpers.skipJitOnce(frame); `),
+      e`{ deopt: true, transient: true, reason: 'structured SSA static boolean guard' }`,
+      " }")
       : null;
     let renderedTree = expandContinuationFallbacks(
       render(structured.tree), useContinuations);
@@ -11259,18 +11330,17 @@ class JvmSsaBlockRenderer {
       ? operand(nullArrayDataConjunction(guardedArrayDataVariables))
       : null;
     const framedArrayDataGuard = guardedArrayDataCondition
-      ? stmt(exprConcat(
+      ? returnStmt(
         e`if (${guardedArrayDataCondition}) { helpers.skipJitOnce(frame); `,
-        e`return { deopt: true, transient: true, reason: `,
-        e`${JSON.stringify(`non-canonical primitive array storage in ${
-          compiledMethodIdentity}`)} }; }`))
+        exprConcat(e`{ deopt: true, transient: true, reason: `,
+          e`${JSON.stringify(`non-canonical primitive array storage in ${
+            compiledMethodIdentity}`)} }`), " }")
       : null;
     const directGuardedArrayDataCondition = guardedArrayDataVariables.length
       ? operand(nullArrayDataConjunction(guardedArrayDataVariables)) : "";
     const directArrayDataGuard = directGuardedArrayDataCondition
-      ? stmt(exprConcat(
-        e`if (${directGuardedArrayDataCondition}) { `,
-        e`${leafBailStatement()}`, e` }`))
+      ? returnStmt(e`if (${directGuardedArrayDataCondition}) { `,
+        CHECKED_LEAF_BAIL_VALUE, " }")
       : null;
     // Small acyclic integral decision trees (character maps, classifiers,
     // clamps, flag decoders, and similar leaves) are often called once per
@@ -11872,9 +11942,9 @@ class JvmSsaBlockRenderer {
           lines.splice(index, 6,
             `${indentation}${constDecl(name, load.rawLoad,
               {pure: true, rawArrayLoad: true})}`,
-            `${indentation}${stmt(exprConcat(
+            `${indentation}${returnStmt(
               e`if (${name} === undefined) `,
-              e`${leafBailStatement()}`))}`);
+              CHECKED_LEAF_BAIL_VALUE)}`);
         }
 
         // Checked leaves have already proved that their normal path cannot
@@ -12041,9 +12111,10 @@ class JvmSsaBlockRenderer {
         lines.splice(index, 5,
           `${indentation}${constDecl(end, e`${base} + ${bound}`)}`,
           `${indentation}${storeLocal(induction, e`${base} + ${induction}`)}`,
-          `${indentation}${stmt(e`${opening.label}: while (${
-            induction} < ${end}) {`, {kind: "loopHeader",
-            label: opening.label, inductionLocal: null, bound: null})}`,
+          `${indentation}${stmt(exprConcat(labelExpr(opening.label),
+            e`: while (${induction} < ${end}) {`), {kind: "loopHeader",
+            label: opening.label, declaresLabel: true, opens: "loop",
+            inductionLocal: null, bound: null})}`,
           `${indentation}  ${stmt(e`${store.storeTarget}[${induction}] = ${
             store.storeValue};`, {kind: "arrayStore",
             storeTarget: store.storeTarget, storeIndex: e`${induction}`,
@@ -12468,18 +12539,18 @@ class JvmSsaBlockRenderer {
             e`helpers.needsBytecodeChecks() || thread.status !== 'runnable'))`),
           e`(nestedEntryGuarded !== 2 && ${restoringInitializationCondition})`,
         ];
-        const directGuard = stmt(exprConcat(
+        const directGuard = returnStmt(exprConcat(
           e`if (`,
           ...directGuardConditions.flatMap((condition, position) =>
             position === 0 ? [condition] : [" || ", condition]),
-          e`) { ${leafBailStatement()} }`));
+          e`) { `), CHECKED_LEAF_BAIL_VALUE, " }");
         // Generated callers have already passed the scheduler/debug portion
         // of the public entry contract. Emit the remaining lifecycle check
         // directly for that ABI instead of specializing JavaScript source
         // after it has been rendered.
-        const trustedDirectGuard = stmt(exprConcat(
+        const trustedDirectGuard = returnStmt(
           e`if (${restoringInitializationCondition}) { `,
-          e`${leafBailStatement()} }`));
+          CHECKED_LEAF_BAIL_VALUE, " }");
         const directBooleanGuard = guardedStaticBooleanSites.size
           ? `if (${[...guardedStaticBooleanSites.values()].map((direct) => `((${
             direct.kind === "map"
@@ -13189,8 +13260,9 @@ class JvmSsaBlockRenderer {
             // so every later pass sees a complete statement list and the
             // same lines serve the standalone entry and a lexical insertion.
             checkedLeafRenderedTree = [
-              recordStatement([`${checkedLeafBodyLabel}: {`],
-                {kind: "blockLabel", label: checkedLeafBodyLabel}),
+              recordStatement([labelPart(checkedLeafBodyLabel), ": {"],
+                {kind: "blockLabel", label: checkedLeafBodyLabel,
+                  declaresLabel: true}),
               ...checkedLeafRenderedTree,
               blockEnd(""),
             ];
@@ -13355,12 +13427,12 @@ class JvmSsaBlockRenderer {
                     e`(((${argument} + ${assumedLimit}) >>> 0) > `,
                     e`${assumedLimit * 2})`);
                 });
-              checkedLeafSafeArithmeticGuards.push(stmt(exprConcat(
+              checkedLeafSafeArithmeticGuards.push(returnStmt(exprConcat(
                 e`if (`,
                 ...failures.flatMap((failure, position) => [
                   position === 0 ? "" : " || ", failure,
                 ]),
-                e`) ${leafBailStatement()}`)));
+                e`) `), CHECKED_LEAF_BAIL_VALUE));
               preflightedCheckedLeafArgumentSlots =
                 [...usedAssumptions].sort((left, right) => left - right)
                   .map((slot) => argumentNames.indexOf(
