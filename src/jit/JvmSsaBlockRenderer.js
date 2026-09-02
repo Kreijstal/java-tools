@@ -1437,11 +1437,17 @@ class JvmSsaBlockRenderer {
     const recordStatement = (parts, meta) => {
       const text = renderParts(parts);
       const key = text.trim();
+      // The universal block terminators are recognized by the exact text the
+      // emitter produced for them, whichever emitter that was: they carry no
+      // operand and every one of them is the same statement.
+      const structuralKind = key === "}" ? "blockEnd"
+        : key === "} else {" ? "elseArm"
+          : key === "{" ? "blockStart" : null;
       const record = {
         ...(meta || {}),
         key,
         parts,
-        kind: meta?.kind || "statement",
+        kind: meta?.kind || structuralKind || "statement",
         def: meta?.def || null,
         write: meta?.write || null,
         exprParts: meta?.exprParts || null,
@@ -1456,6 +1462,19 @@ class JvmSsaBlockRenderer {
       };
       record.reads = record.foreign
         ? [] : partsReferences(record.exprParts || record.parts);
+      // The lexical nesting this statement opens or closes. It is a property
+      // of the statement the emitter built, measured on the literal chunks it
+      // wrote itself: operand references are names and never contain braces.
+      let delta = 0;
+      for (let index = 0; index < parts.length; index += 1) {
+        const part = parts[index];
+        if (typeof part !== "string") continue;
+        for (let position = 0; position < part.length; position += 1) {
+          if (part[position] === "{") delta += 1;
+          else if (part[position] === "}") delta -= 1;
+        }
+      }
+      record.blockDelta = delta;
       if (!record.exprParts && record.def) {
         record.reads = record.reads.filter((name) => name !== record.def);
       }
@@ -1525,6 +1544,15 @@ class JvmSsaBlockRenderer {
     });
     const spillStatement = () =>
       recordStatement(["spillLocals();"], {kind: "spill"});
+    // The universal block terminators. Their kind is what the structural
+    // passes match on; the indentation is applied by the assembler and stays
+    // outside the statement's identity.
+    const blockEnd = (indentation = "") =>
+      `${indentation}${recordStatement(["}"], {kind: "blockEnd"})}`;
+    const elseArm = (indentation = "") =>
+      `${indentation}${recordStatement(["} else {"], {kind: "elseArm"})}`;
+    const blockStart = (indentation = "") =>
+      `${indentation}${recordStatement(["{"], {kind: "blockStart"})}`;
     // Generic statement: operand references are the interpolations the
     // registry recognizes; the rest of the template is opaque text.
     const st = (strings, ...values) =>
@@ -2717,7 +2745,7 @@ class JvmSsaBlockRenderer {
       stmt(e`if (${childCanResume} && thread.callStack.items.length > ${
         callStackDepth}) {`),
       ...materializeLines(postCallValues, pc + 1).map((line) => `  ${line}`),
-      st`} else {`,
+      elseArm(""),
       // A caller that lowers this call into a region reuses the exact
       // call-pc restoration arm. Bracket it with a compiler-owned token pair
       // so the arm can be taken by identity from whatever this body was
@@ -2725,7 +2753,7 @@ class JvmSsaBlockRenderer {
       ...(restoreMarkers ? [st`  /*${restoreMarkers.start}*/`] : []),
       ...materializeLines(preCallValues, pc).map((line) => `  ${line}`),
       ...(restoreMarkers ? [st`  /*${restoreMarkers.end}*/`] : []),
-      st`}`,
+      blockEnd(""),
     ];
     const stageOperandLines = (operandValues) => [
       recordStatement(["if (frame === null) spillLocals();"],
@@ -3096,7 +3124,8 @@ class JvmSsaBlockRenderer {
             (_unused, slot) => `${synthetic.transfer}${slot}`);
           plans[block.id] = {
             lines: [],
-            condition: `${synthetic.variable} === ${synthetic.state}`,
+            condition: operand(
+              e`${named(synthetic.variable)} === ${synthetic.state}`),
             taken: descriptor.taken,
             fall: descriptor.fall,
             stack: [],
@@ -3255,6 +3284,10 @@ class JvmSsaBlockRenderer {
       // and friends are not exact inverses for every JavaScript value, and
       // later passes recognize the `!(a === b)` shape of a null test.
       let negatedCondition = null;
+      // The comparison a branch encodes, as data rather than as the
+      // characters of its condition.
+      let comparison = null;
+      let negatedComparison = null;
       let conditionConstant = null;
       let returnKind = null;
       let returnValue = null;
@@ -3681,7 +3714,7 @@ class JvmSsaBlockRenderer {
                 st`  helpers.skipJitOnce(frame);`,
                 stmt(exprConcat(e`  return { deopt: true, transient: true, `,
                   e`reason: 'category-2 dup2 in structured SSA' };`)),
-                st`}`);
+                blockEnd(""));
             }
             copyValueMetadata(topInput, top);
             copyValueMetadata(underInput, under);
@@ -3788,7 +3821,7 @@ class JvmSsaBlockRenderer {
               ...materializeLines([...stack, dividend, divisor], index, true)
                 .map((line) => `  ${line}`),
               st`  throw { type: "java/lang/ArithmeticException", message: "/ by zero" };`,
-              st`}`,
+              blockEnd(""),
               constDecl(out, e`BigInt.asIntN(64, ${dividend} ${
                 op === "ldiv" ? "/" : "%"} ${divisor})`, {pure: true}));
             stack.push(out);
@@ -3885,10 +3918,11 @@ class JvmSsaBlockRenderer {
             } else if (dominatedNonZeroDivisionItems.has(index)) {
               cfgDominatedArithmeticGuardCount += 1;
             } else {
-              lines.push(st`if (${divisor} === 0) {`,
+              lines.push(stmt(e`if (${divisor} === 0) {`,
+                {kind: "if", comparison: {input: divisor, cmp: "=== 0"}}),
                 ...materializeLines([...stack, dividend, divisor], index, true).map((line) => `  ${line}`),
                 st`  throw { type: "java/lang/ArithmeticException", message: "/ by zero" };`,
-                st`}`);
+                blockEnd(""));
             }
             const line = constDecl(out, e`((${dividend} ${
               op === "idiv" ? "/" : "%"} ${divisor}) | 0)`,
@@ -3923,7 +3957,7 @@ class JvmSsaBlockRenderer {
             const previous = readLocal(slot);
             const out = value();
             lines.push(constDecl(out, e`(${previous} + ${increment}) | 0`,
-              {pure: true}));
+              {pure: true, iincSource: previous, iincIncrement: increment}));
             lines.push(storeLocal(localName(slot), e`${out}`));
             localValues[slot] = out;
           }
@@ -3936,7 +3970,7 @@ class JvmSsaBlockRenderer {
             lines.push(stmt(e`if (${array} === null || ${array} === undefined) {`,
               {kind: "nullCheck", value: array}),
               ...materializeLines([...stack, array], index, true).map((line) => `  ${line}`),
-              st`  helpers.arrayLength(${array}, frame);`, st`}`,
+              st`  helpers.arrayLength(${array}, frame);`, blockEnd(""),
               constDecl(out, e`${array}.length`, {pure: true}));
             stack.push(out);
           }
@@ -3990,10 +4024,10 @@ class JvmSsaBlockRenderer {
                 ...materializeLines([...stack, array, arrayIndex], index, true).map((line) => `  ${line}`),
                 st`  ${out} = helpers.arrayLoad(${arrayIndex}, ${array}, frame, ${JSON.stringify(op)});`,
                 ...materializeUnwindReleaseLines("  "),
-                st`} else {`,
+                elseArm(""),
                 stmt(e`  ${out} = ${rangeMarker} ? ${provenLoad} : ${
                   normalized};`, {kind: "assign", write: out}),
-                st`}`,
+                blockEnd(""),
               );
               checkedPrimitiveArrayAccesses.add(`${arrayData}\0${arrayIndexInput}`);
               sentinelArrayLoadCount += 1;
@@ -4013,18 +4047,24 @@ class JvmSsaBlockRenderer {
                       op, array, arrayKind)};`,
                     {kind: "assign", write: out}),
                   ]) : null;
-              if (deferred) lines.push(st`/*${deferred.marker}:start*/`);
+              if (deferred) {
+                lines.push(stmt(e`/*${deferred.marker}:start*/`,
+                  {kind: "deferredStaticStart", marker: deferred.marker}));
+              }
               lines.push(
                   stmt(e`if (${array} === null || ${array} === undefined || ${
                     arrayIndexOutOfBounds(arrayIndex, e`${array}.length`)}) {`),
                   ...materializeLines([...stack, array, arrayIndex], index, true).map((line) => `  ${line}`),
                   st`  ${out} = helpers.arrayLoad(${arrayIndex}, ${array}, frame, ${JSON.stringify(op)});`,
                   ...materializeUnwindReleaseLines("  "),
-                  st`} else {`,
+                  elseArm(""),
                   stmt(e`  ${out} = ${normalized};`,
-                    {kind: "assign", write: out}), st`}`,
+                    {kind: "assign", write: out}), blockEnd(""),
               );
-              if (deferred) lines.push(st`/*${deferred.marker}:end*/`);
+              if (deferred) {
+                lines.push(stmt(e`/*${deferred.marker}:end*/`,
+                  {kind: "deferredStaticEnd", marker: deferred.marker}));
+              }
             }
             if (op === "aaload" && typeof arrayKind === "string") {
               let dimensions = 0;
@@ -4122,10 +4162,10 @@ class JvmSsaBlockRenderer {
                   .map((line) => `  ${line}`),
                 st`  helpers.arrayStore(${stored}, ${arrayIndex}, ${array}, frame, ${JSON.stringify(op)});`,
                 ...materializeUnwindReleaseLines("  "),
-                st`} else {`,
+                elseArm(""),
                 stmt(e`  ${arrayData}[${arrayIndex}] = ${normalizedStore};`,
                   {kind: "arrayStore"}),
-                st`}`,
+                blockEnd(""),
               );
             } else {
               const deferred = deferredStaticView && op !== "aastore"
@@ -4135,7 +4175,10 @@ class JvmSsaBlockRenderer {
                       e`${deferredStaticView.data}[${arrayIndex}] = `,
                       e`${normalizedStore};`), {kind: "arrayStore"}),
                   ]) : null;
-              if (deferred) lines.push(st`/*${deferred.marker}:start*/`);
+              if (deferred) {
+                lines.push(stmt(e`/*${deferred.marker}:start*/`,
+                  {kind: "deferredStaticStart", marker: deferred.marker}));
+              }
               lines.push(
                 stmt(e`if (${array} === null || ${array} === undefined || ${
                   arrayIndexOutOfBounds(arrayIndex, e`${array}.length`)}) {`),
@@ -4150,11 +4193,14 @@ class JvmSsaBlockRenderer {
                 st`} else if (${array}.elements) {`,
                 stmt(e`  ${array}.elements[${arrayIndex}] = ${
                   normalizedStore};`, {kind: "arrayStore"}),
-                st`} else {`,
+                elseArm(""),
                 stmt(e`  ${array}[${arrayIndex}] = ${normalizedStore};`,
-                  {kind: "arrayStore"}), st`}`,
+                  {kind: "arrayStore"}), blockEnd(""),
               );
-              if (deferred) lines.push(st`/*${deferred.marker}:end*/`);
+              if (deferred) {
+                lines.push(stmt(e`/*${deferred.marker}:end*/`,
+                  {kind: "deferredStaticEnd", marker: deferred.marker}));
+              }
             }
           }
         } else if (op === "newarray") {
@@ -4166,7 +4212,7 @@ class JvmSsaBlockRenderer {
             lines.push(letDecl(out),
               st`try { ${out} = helpers.newPrimitiveArray(${count}, ${JSON.stringify(instruction.arg)}); } catch (${caught}) {`,
               ...materializeLines([...stack, count], index, true).map((line) => `  ${line}`),
-              st`  throw ${caught};`, st`}`);
+              st`  throw ${caught};`, blockEnd(""));
             stack.push(out);
           }
         } else if (op === "anewarray") {
@@ -4178,7 +4224,7 @@ class JvmSsaBlockRenderer {
             lines.push(letDecl(out),
               st`try { ${out} = helpers.newReferenceArray(${count}, ${JSON.stringify(instruction.arg)}); } catch (${caught}) {`,
               ...materializeLines([...stack, count], index, true).map((line) => `  ${line}`),
-              st`  throw ${caught};`, st`}`);
+              st`  throw ${caught};`, blockEnd(""));
             stack.push(out);
           }
         } else if (op === "monitorenter") {
@@ -4195,12 +4241,12 @@ class JvmSsaBlockRenderer {
               st`    helpers.skipJitOnce(frame);`,
               stmt(exprConcat(e`    return { deopt: true, transient: true, `,
                 e`reason: 'contended structured SSA monitorenter' };`)),
-              st`  }`,
+              blockEnd("  "),
               st`} catch (${caught}) {`,
               ...materializeLines([...stack, monitor], index)
                 .map((line) => `  ${line}`),
               st`  throw ${caught};`,
-              st`}`,
+              blockEnd(""),
             );
           }
         } else if (op === "monitorexit") {
@@ -4216,7 +4262,7 @@ class JvmSsaBlockRenderer {
               ...materializeLines([...stack, monitor], index)
                 .map((line) => `  ${line}`),
               st`  throw ${caught};`,
-              st`}`,
+              blockEnd(""),
             );
           }
         } else if (op === "checkcast") {
@@ -4235,14 +4281,14 @@ class JvmSsaBlockRenderer {
               st`    let ${checked};`,
               st`    try { ${checked} = helpers.tryCheckCastSourceSync(${source}, ${target}); } catch (${caught}) {`,
               ...materializeLines(stack, index).map((line) => `  ${line}`),
-              st`  throw ${caught};`, st`}`,
+              st`  throw ${caught};`, blockEnd(""),
               st`    if (${checked} === helpers.asyncInvokeSentinel()) {`,
               ...materializeLines(stack, index).map((line) => `    ${line}`),
               st`      helpers.skipJitOnce(frame);`,
               st`      return { deopt: true, transient: true, reason: 'cold structured SSA checkcast' };`,
-              st`    }`,
-              st`  }`,
-              st`}`);
+              blockEnd("    "),
+              blockEnd("  "),
+              blockEnd(""));
           }
         } else if (op === "instanceof") {
           const input = pop();
@@ -4260,7 +4306,7 @@ class JvmSsaBlockRenderer {
               st`  helpers.skipJitOnce(frame);`,
               stmt(exprConcat(e`  return { deopt: true, transient: true, `,
                 e`reason: 'cold structured SSA instanceof' };`)),
-              st`}`,
+              blockEnd(""),
             );
             stack.push(out);
           }
@@ -4298,27 +4344,27 @@ class JvmSsaBlockRenderer {
                 lines.push(stmt(e`if (${object} === null || ${object} === undefined) {`,
               {kind: "nullCheck", value: object}),
                   ...materializeLines([...stack, object], index, true).map((line) => `  ${line}`),
-                  st`  helpers.getFieldAt(${site}, ${object});`, st`}`);
+                  st`  helpers.getFieldAt(${site}, ${object});`, blockEnd(""));
               }
               lines.push(constDecl(out, e`${cache.value}`, {pure: true}));
             } else {
               lines.push(stmt(e`if (${object} === null || ${object} === undefined) {`,
               {kind: "nullCheck", value: object}),
                 ...materializeLines([...stack, object], index, true).map((line) => `  ${line}`),
-                st`  helpers.getFieldAt(${site}, ${object});`, st`}`);
+                st`  helpers.getFieldAt(${site}, ${object});`, blockEnd(""));
             }
             if (cache && (cache.eagerLocal === null ||
                 cache.eagerLocal === undefined)) {
               lines.push(letDecl(out),
                 st`if (${cache.valid} && ${cache.object} === ${object}) {`,
-                st`  ${out} = ${cache.value};`, st`} else {`,
+                st`  ${out} = ${cache.value};`, elseArm(""),
                 stmt(e`  ${out} = ${directRead};`,
                   {kind: "assign", write: out}),
                 st`  ${cache.object} = ${object};`,
                 st`  ${cache.value} = ${out};`,
                 ...(cache.isArray
                   ? [stmt(e`  ${cache.data} = ${arrayDataExpr(out)};`)] : []),
-                st`  ${cache.valid} = true;`, st`}`);
+                st`  ${cache.valid} = true;`, blockEnd(""));
             } else if (!cache) {
               lines.push(constDecl(out, directRead));
             }
@@ -4365,21 +4411,21 @@ class JvmSsaBlockRenderer {
               stmt(e`if (${object} === null || ${object} === undefined) {`,
               {kind: "nullCheck", value: object}),
               ...materializeLines([...stack, object, stored], index, true).map((line) => `  ${line}`),
-              st`  helpers.putFieldAt(${site}, ${object}, ${stored});`, st`}`,
+              st`  helpers.putFieldAt(${site}, ${object}, ${stored});`, blockEnd(""),
               ...(Number.isInteger(denseSlot) ? [
                 st`if (Array.isArray(${object}.fields)) {`,
                 st`  ${object}.fields[${denseSlot}] = ${stored};`,
                 st`} else if (${object}.fields) {`,
                 st`  ${object}.fields[${JSON.stringify(directKey)}] = ${stored};`,
-                st`} else {`,
+                elseArm(""),
                 st`  helpers.putFieldAt(${site}, ${object}, ${stored});`,
-                st`}`,
+                blockEnd(""),
               ] : directKey ? [
                 st`if (${object}.fields) {`,
                 st`  ${object}.fields[${JSON.stringify(directKey)}] = ${stored};`,
-                st`} else {`,
+                elseArm(""),
                 st`  helpers.putFieldAt(${site}, ${object}, ${stored});`,
-                st`}`,
+                blockEnd(""),
               ] : [st`helpers.putFieldAt(${site}, ${object}, ${stored});`]));
           }
         } else if (op === "new") {
@@ -4390,7 +4436,7 @@ class JvmSsaBlockRenderer {
             ...materializeLines(stack, index).map((line) => `  ${line}`),
             st`  helpers.skipJitOnce(frame);`,
             st`  return { deopt: true, transient: true, reason: 'class initialization in structured SSA new' };`,
-            st`}`);
+            blockEnd(""));
           stack.push(out);
         } else if (op === "getstatic") {
           const site = fieldSites.get(index), direct = directStaticSites.get(index), out = value();
@@ -4461,7 +4507,7 @@ class JvmSsaBlockRenderer {
               if (cache) {
                 emitted.push(st`if (${cache.valid}) {`,
                   st`  ${out} = ${cache.value};`,
-                  st`} else {`);
+                  elseArm(""));
               }
               emitted.push(st`${prefix}if (${lazy.variable}) {`,
                 stmt(exprConcat(
@@ -4494,7 +4540,7 @@ class JvmSsaBlockRenderer {
                     ? [stmt(e`  ${cache.data} = ${arrayDataExpr(out)};`)]
                     : []),
                   st`  ${cache.valid} = Boolean(${lazy.variable});`,
-                  st`}`,
+                  blockEnd(""),
                 );
               }
               if (emitted !== lines) {
@@ -4513,7 +4559,7 @@ class JvmSsaBlockRenderer {
               ...materializeLines(stack, index).map((line) => `  ${line}`),
               st`  helpers.skipJitOnce(frame);`,
               st`  return { deopt: true, transient: true, reason: 'class initialization in structured SSA getstatic' };`,
-              st`}`);
+              blockEnd(""));
             }
             stack.push(out);
             const lazyCache = lazy?.entryReadCache;
@@ -4547,7 +4593,7 @@ class JvmSsaBlockRenderer {
             ...materializeLines([...stack, input], index).map((line) => `  ${line}`),
             st`  helpers.skipJitOnce(frame);`,
             st`  return { deopt: true, transient: true, reason: 'class initialization in structured SSA putstatic' };`,
-            st`}`);
+            blockEnd(""));
         } else if (op === "invokestatic" || op === "invokevirtual" ||
             op === "invokespecial" || op === "invokeinterface") {
           directStaticBlockValues.clear();
@@ -4569,14 +4615,14 @@ class JvmSsaBlockRenderer {
                 ...materializeLines(callStack, index).map((line) => `  ${line}`),
                 st`  helpers.skipJitOnce(frame);`,
                 st`  return { deopt: true, transient: true, reason: 'class initialization at direct structured JRE call' };`,
-                st`}`,
+                blockEnd(""),
               ] : []), letDecl(out),
               stmt(exprConcat(
                 e`try { ${out} = helpers.directJreIntrinsics[${
                   site.directJre.id}](`,
                 argumentListExpression(args), e`); } catch (${caught}) {`)),
               ...materializeLines(callStack, index).map((line) => `  ${line}`),
-              st`  throw ${caught};`, st`}`);
+              st`  throw ${caught};`, blockEnd(""));
               if (!site.returnsVoid) stack.push(out);
             }
           }
@@ -4591,7 +4637,7 @@ class JvmSsaBlockRenderer {
               const out = value();
               // The plan is rendered once against fixed parameter names;
               // each site binds those names to its operands inside the block.
-              lines.push(letDecl(out), st`{`,
+              lines.push(letDecl(out), blockStart(""),
                 ...args.map((argument, position) => stmt(
                   e`  const ${inlineIntegerArgumentName(position)} = ${
                     argument};`, {foreign: true})),
@@ -4604,10 +4650,10 @@ class JvmSsaBlockRenderer {
                     .map((line) => `    ${line}`),
                   st`    helpers.skipJitOnce(frame);`,
                   st`    return { deopt: true, transient: true, reason: 'guarded inline integer leaf' };`,
-                  st`  }`);
+                  blockEnd("  "));
               }
               lines.push(stmt(`  ${out} = ${site.inline.result};`,
-                {foreign: true}), st`}`);
+                {foreign: true}), blockEnd(""));
               stack.push(out);
             }
           } else if (site.directIntrinsic?.kind === "primitiveArrayCopy" &&
@@ -4624,7 +4670,7 @@ class JvmSsaBlockRenderer {
                 e`try { helpers.primitiveArrayCopyDirect(`,
                 argumentListExpression(args), e`); } catch (${caught}) {`)),
                 ...materializeLines(callStack, index).map((line) => `  ${line}`),
-                st`  throw ${caught};`, st`}`);
+                st`  throw ${caught};`, blockEnd(""));
             }
           } else {
             const callStack = [...stack];
@@ -4705,7 +4751,7 @@ class JvmSsaBlockRenderer {
               ...materializeCallExceptionLines(
                 callStack, stack, index, callStackDepth)
                 .map((line) => `  ${line}`),
-              st`  throw ${caught};`, st`}`,
+              st`  throw ${caught};`, blockEnd(""),
             ];
             // A restoring-direct body begins without a physical caller
             // Frame. A fast positional callee can suspend before the fallback
@@ -4726,13 +4772,13 @@ class JvmSsaBlockRenderer {
               st`if (${out} === helpers.asyncInvokeSentinel() &&`,
               st`    thread.callStack.items.length > ${callStackDepth}) {`,
               ...materializeOmittedCallerForChild("  "),
-              st`}`,
+              blockEnd(""),
               st`if (${out} === helpers.asyncInvokeSentinel() &&`,
               st`    thread.callStack.items.length > ${callStackDepth} &&`,
               st`    helpers.linkStructuredCallChild(frame, thread, ${
                 callStackDepth}, ${JSON.stringify(site.returnType)}, ${site.id})) {`,
               st`${activeChildCallMarker}`,
-              st`}`,
+              blockEnd(""),
             ];
             const checkedAdmissionPlan = site.returnsVoid &&
               site.directCheckedLeaf?.noThrow === true &&
@@ -4798,9 +4844,9 @@ class JvmSsaBlockRenderer {
                   stmt(exprConcat(e`      ${positionalRawInvoke} = `,
                     e`${picTarget}.rawInvoke;`)),
                   st`      ${positionalReceiver} = ${picTarget}.receiverType;`,
-                  st`    }`,
-                  st`  }`,
-                  st`}`,
+                  blockEnd("    "),
+                  blockEnd("  "),
+                  blockEnd(""),
                 ];
               })() : [];
               // A long-lived structured activation can enter before a cold
@@ -4823,7 +4869,7 @@ class JvmSsaBlockRenderer {
                 st`  ${positionalInvoke} = ${positionalTarget}.invoke;`,
                 st`  ${positionalRawInvoke} = ${positionalTarget}.rawInvoke;`,
                 st`  ${positionalReceiver} = ${positionalTarget}.receiverType;`,
-                st`}`,
+                blockEnd(""),
               ];
               const invariantPositionalRaw =
                 !site.selfRecursive &&
@@ -4882,7 +4928,7 @@ class JvmSsaBlockRenderer {
                       inlineCheckedLeafStage("v", argument),
                       e`${positionalArgumentArrayData[argument].data}`,
                       {pure: true, pinned: true})),
-                    st`{`,
+                    blockStart(""),
                     ...inlineCheckedLeafBody.argumentNames.map(
                       (name, position) => stmt(
                         `  const ${name} = ${
@@ -4899,7 +4945,7 @@ class JvmSsaBlockRenderer {
                       stmt(`  ${line}`, {foreign: true})),
                     stmt(`  ${out} = ${inlineCheckedLeafBody.result};`,
                       {foreign: true}),
-                    st`}`,
+                    blockEnd(""),
                   ],
                 };
               };
@@ -4986,7 +5032,7 @@ class JvmSsaBlockRenderer {
                       stmt(exprConcat(e`    ${count} = (${count} - `,
                         e`(${left} - ${x}));`), {kind: "assign", write: count}),
                       st`    ${x} = ${left};`,
-                      st`  }`,
+                      blockEnd("  "),
                       stmt(exprConcat(e`  if ((${x} + ${count}) > ${right}) `,
                         e`${count} = ${right} - ${x};`)),
                       letDecl(pixel, e`(${y} * ${width}) + ${x}`),
@@ -4996,8 +5042,8 @@ class JvmSsaBlockRenderer {
                         checkedAdmissionPlan.valueArgument)};`,
                       {kind: "arrayStore"}),
                       st`    ${pixel} += 1;`,
-                      st`  }`,
-                      st`}`,
+                      blockEnd("  "),
+                      blockEnd(""),
                     );
                     return trusted;
                   })() : null;
@@ -5083,7 +5129,7 @@ class JvmSsaBlockRenderer {
                     st`${inlineCheckedLeafLabel}: {`,
                     ...provenInlineCheckedLeafLines.map(
                       (line) => `  ${line}`),
-                    st`}`,
+                    blockEnd(""),
                   ] : [provenRawCall];
                 checkedCallAdmissionCandidates.push({
                   block: block.id,
@@ -5118,7 +5164,7 @@ class JvmSsaBlockRenderer {
                     st`  if (helpers.continueStructuredQuantum(thread)) {`,
                     st`    safePointBudget = ${
                       this.jit.positionalCallSafePointPollBudget};`,
-                    st`  } else {`,
+                    elseArm("  "),
                     ...materializeLines(callStack, index)
                       .map((line) => `    ${line}`),
                     st`    helpers.structuredSsa.safePointCount += 1;`,
@@ -5134,8 +5180,8 @@ class JvmSsaBlockRenderer {
                     // before invoking the child so the caller itself cannot
                     // be mistaken for a scheduler-visible callee.
                     st`    ${callStackDepth} = thread.callStack.items.length;`,
-                    st`  }`,
-                    st`}`,
+                    blockEnd("  "),
+                    blockEnd(""),
                   ],
                   ordinary: [],
                   checkedLeaf: [],
@@ -5172,12 +5218,12 @@ class JvmSsaBlockRenderer {
                 lines.push(
                   st`${inlineCheckedLeafLabel}: {`,
                   ...inlineCheckedLeafLines.map((line) => `  ${line}`),
-                  st`}`,
+                  blockEnd(""),
                   stmt(e`if (${inlineCheckedLeafVoid
                     ? e`!${out}`
                     : e`${out} === helpers.asyncInvokeSentinel()`}) {`),
                   st`${inlineCheckedLeafFallbackMarker}`,
-                  ...(inlineCheckedLeafVoid ? [] : [st`}`]));
+                  ...(inlineCheckedLeafVoid ? [] : [blockEnd("")]));
               } else lines.push(
                 letDecl(usedDirect, e`false`),
                 ...(invariantPositionalRaw ? [
@@ -5203,7 +5249,7 @@ class JvmSsaBlockRenderer {
                 ...(inlineCheckedLeafLines ? [
                   st`  ${inlineCheckedLeafLabel}: {`,
                   ...inlineCheckedLeafLines.map((line) => `    ${line}`),
-                  st`  }`,
+                  blockEnd("  "),
                 ] : directCheckedLeafNoThrow ? [
                   stmt(e`  ${out} = ${selfRecursiveMarker}${
                     positionalRawCall};`, {kind: "assign", write: out}),
@@ -5219,16 +5265,16 @@ class JvmSsaBlockRenderer {
                     regionRestoreMarkers,
                   ).map((line) => `    ${line}`),
                   st`    throw ${caught};`,
-                  st`    /*${regionHandlerMarkers.end}*/`, st`  }`,
+                  st`    /*${regionHandlerMarkers.end}*/`, blockEnd("  "),
                 ]),
-                st`}`,
+                blockEnd(""),
                 stmt(e`if (!${usedDirect} || ${inlineCheckedLeafVoid
                   ? e`!${out}`
                   : e`${out} === helpers.asyncInvokeSentinel()`}) {`),
                 ...(inlineCheckedLeafLines
                   ? [st`${inlineCheckedLeafFallbackMarker}`]
                   : fallbackLines.map((line) => `  ${line}`)),
-                ...(inlineCheckedLeafVoid ? [] : [st`}`]));
+                ...(inlineCheckedLeafVoid ? [] : [blockEnd("")]));
               // Publish what a fused hot call-graph region needs in order to
               // link this call site, as compiler-owned tokens rather than as
               // structure to be recovered from the emitted JavaScript. The
@@ -5262,7 +5308,7 @@ class JvmSsaBlockRenderer {
                 ...materializeLines(callStack, index).map((line) => `  ${line}`),
                 st`  helpers.skipJitOnce(frame);`,
                 st`  return { deopt: true, transient: true, reason: 'asynchronous structured SSA callee' };`,
-              ]), st`}`);
+              ]), blockEnd(""));
             const deoptCallMarker = named(
               `__JVM_DEOPT_CALL_${index}_${site.id}__`);
             continuationFallbacks.set(deoptCallMarker, {
@@ -5289,7 +5335,7 @@ class JvmSsaBlockRenderer {
                 e`thread.callStack.items.length > ${callStackDepth})) {`)),
               ...materializeLines(stack, index + 1)
                 .map((line) => `    ${line}`),
-              st`  }`,
+              blockEnd("  "),
               stmt(exprConcat(
                 e`  if (!helpers.linkStructuredCallChild(frame, thread, ${
                   callStackDepth}, ${JSON.stringify(site.returnType)}, `,
@@ -5297,8 +5343,8 @@ class JvmSsaBlockRenderer {
               ...materializeLines(callStack, index).map((line) => `    ${line}`),
               st`    helpers.skipJitOnce(frame);`,
               st`    return ${out};`,
-              st`  }`,
-              st`${deoptCallMarker}`, st`}`);
+              blockEnd("  "),
+              st`${deoptCallMarker}`, blockEnd(""));
             // A callee that left a frame on the stack has not run to
             // completion, whatever it returned. The check above it is reached
             // only for the async sentinel and the one before that only for an
@@ -5333,11 +5379,11 @@ class JvmSsaBlockRenderer {
                 {kind: "leftActiveChildWithdraw", pc: index}),
               st`if (thread.callStack.items.length > ${callStackDepth}) {`,
               ...materializeOmittedCallerForChild("  "),
-              st`}`,
+              blockEnd(""),
               st`if (thread.callStack.items.length > ${callStackDepth} &&`,
               st`    helpers.linkStructuredCallChild(frame, thread, ${
                 callStackDepth}, ${JSON.stringify(site.returnType)})) {`,
-              st`${leftActiveChildMarker}`, st`}`);
+              st`${leftActiveChildMarker}`, blockEnd(""));
             if (deferMaterialization) deferredCallMaterializationCount += 1;
             if (!site.returnsVoid) stack.push(out);
             const yieldedCallMarker = named(
@@ -5358,10 +5404,10 @@ class JvmSsaBlockRenderer {
               checkedLeaf: [st`return helpers.asyncInvokeSentinel();`],
             });
             lines.push(st`if (thread.status !== 'runnable') {`,
-              st`${yieldedCallMarker}`, st`}`);
+              st`${yieldedCallMarker}`, blockEnd(""));
             lines.push(stmt(e`/*${site.regionMarkers.end}*/`,
               {kind: "regionCallEnd", pc: index}));
-            if (inlineCheckedLeafVoidFastPath) lines.push(st`}`);
+            if (inlineCheckedLeafVoidFastPath) lines.push(blockEnd(""));
             if (checkedAdmissionEnd) lines.push(checkedAdmissionEnd);
             if (site.selfRecursive) {
               lines.push(st`/*__SSA_SELF_RECURSIVE_REGION_END_${index}__*/`);
@@ -5409,8 +5455,12 @@ class JvmSsaBlockRenderer {
               if_acmpeq: "===", if_acmpne: "!==" }[op];
             if (left === null || right === null || !cmp) valid = false;
             else {
-              condition = `${left} ${cmp} ${right}`;
-              if (cmp === "!==") negatedCondition = `${left} === ${right}`;
+              condition = operand(e`${left} ${cmp} ${right}`);
+              comparison = {left, right, cmp};
+              if (cmp === "!==") {
+                negatedCondition = operand(e`${left} === ${right}`);
+                negatedComparison = {left, right, cmp: "==="};
+              }
               const literal = (expression) => /^-?\d+$/.test(expression)
                 ? Number(expression) : expression === "null" ? null : undefined;
               const a = literal(left), b = literal(right);
@@ -5426,9 +5476,15 @@ class JvmSsaBlockRenderer {
               ifgt: "> 0", ifle: "<= 0", ifnull: "=== null", ifnonnull: "!== null" }[op];
             if (input === null || !cmp) valid = false;
             else {
-              condition = `${input} ${cmp}`;
-              if (op === "ifne") negatedCondition = `${input} === 0`;
-              else if (op === "ifnonnull") negatedCondition = `${input} === null`;
+              condition = operand(e`${input} ${cmp}`);
+              comparison = {input, cmp};
+              if (op === "ifne") {
+                negatedCondition = operand(e`${input} === 0`);
+                negatedComparison = {input, cmp: "=== 0"};
+              } else if (op === "ifnonnull") {
+                negatedCondition = operand(e`${input} === null`);
+                negatedComparison = {input, cmp: "=== null"};
+              }
               if (/^-?\d+$/.test(input)) {
                 const number = Number(input);
                 conditionConstant = op === "ifeq" ? number === 0 : op === "ifne" ? number !== 0
@@ -5443,6 +5499,7 @@ class JvmSsaBlockRenderer {
           if (!valid || !edgeLines(target, stack) || !edgeLines(fall, stack)) valid = false;
           else plans[block.id] = {
             lines, condition, negatedCondition, conditionConstant,
+            comparison, negatedComparison,
             taken: target, fall, stack: [...stack],
           };
         } else if (op === "athrow") {
@@ -6514,13 +6571,16 @@ class JvmSsaBlockRenderer {
     const sharedCountedTrips = (info, preamble) => {
       let shared = countedRangeTripValues.get(info.header);
       if (!shared) {
-        const remaining = `(${info.boundExpression} - local${info.slot})`;
+        const remaining =
+          e`(${info.boundExpression} - ${localName(info.slot)})`;
+        const variable = named(`ssaArrayRangeTrips${info.header}`);
         shared = {
-          variable: `ssaArrayRangeTrips${info.header}`,
-          declaration: `const ssaArrayRangeTrips${info.header} = ` +
-            `(local${info.slot} >= ${info.boundExpression} ? 0 : ` +
-            (info.increment === 1 ? remaining :
-              `Math.ceil(${remaining} / ${info.increment})`) + `);`,
+          variable,
+          declaration: constDecl(variable, exprConcat(
+            e`(${localName(info.slot)} >= ${info.boundExpression} ? 0 : `,
+            info.increment === 1 ? remaining
+              : e`Math.ceil(${remaining} / ${info.increment})`, e`)`),
+          {pure: true}),
           emitted: false,
         };
         countedRangeTripValues.set(info.header, shared);
@@ -7308,52 +7368,58 @@ class JvmSsaBlockRenderer {
         if (!shared) {
           const prefix =
             `ssaIndirectArrayRange${indirectArrayRangePreambles.size}`;
-          const cursor = `${prefix}Index`;
-          const raw = `${prefix}Raw`;
+          const cursor = named(`${prefix}Index`);
+          const raw = named(`${prefix}Raw`);
+          const valid = named(`${prefix}Valid`);
+          const minimum = named(`${prefix}Minimum`);
+          const maximum = named(`${prefix}Maximum`);
+          const element = named(`${prefix}Value`);
           const loaded = candidate.sourceOp === "saload"
-            ? `((${raw} << 16) >> 16)`
+            ? e`((${raw} << 16) >> 16)`
             : candidate.sourceOp === "baload"
               ? candidate.sourceDescriptor === "[Z"
-                ? `(${raw} ? 1 : 0)`
-                : `((${raw} << 24) >> 24)`
+                ? e`(${raw} ? 1 : 0)`
+                : e`((${raw} << 24) >> 24)`
               : candidate.sourceOp === "caload"
-                ? `(${raw} & 0xffff)` : `(${raw} | 0)`;
+                ? e`(${raw} & 0xffff)` : e`(${raw} | 0)`;
           shared = {
-            valid: `${prefix}Valid`,
-            minimum: `${prefix}Minimum`,
-            maximum: `${prefix}Maximum`,
+            valid, minimum, maximum,
             declarations: [
-              `let ${prefix}Valid = ` +
-                `${candidate.sourceArrayData} !== null && ` +
-                `${info.boundExpression} >= 0 && ` +
-                `${info.boundExpression} <= ${runtimeCoarseTripLimit} && ` +
-                `${candidate.sourceArrayData}.length >= ` +
-                `${info.boundExpression};`,
-              `let ${prefix}Minimum = 2147483647;`,
-              `let ${prefix}Maximum = -2147483648;`,
-              `for (let ${cursor} = 0; ${prefix}Valid && ${cursor} < ` +
-                `${info.boundExpression}; ${cursor} += 1) {`,
-              `  const ${raw} = ${candidate.sourceArrayData}[${cursor}];`,
-              `  if (${raw} === undefined) { ${prefix}Valid = false; ` +
-                `continue; }`,
-              `  const ${prefix}Value = ${loaded};`,
-              `  if (${prefix}Value < ${prefix}Minimum) ` +
-                `${prefix}Minimum = ${prefix}Value;`,
-              `  if (${prefix}Value > ${prefix}Maximum) ` +
-                `${prefix}Maximum = ${prefix}Value;`,
-              `}`,
+              letDecl(valid, exprConcat(
+                e`${candidate.sourceArrayData} !== null && `,
+                e`${info.boundExpression} >= 0 && `,
+                e`${info.boundExpression} <= ${runtimeCoarseTripLimit} && `,
+                e`${candidate.sourceArrayData}.length >= `,
+                e`${info.boundExpression}`)),
+              letDecl(minimum, e`2147483647`),
+              letDecl(maximum, e`-2147483648`),
+              stmt(exprConcat(
+                e`for (let ${cursor} = 0; ${valid} && ${cursor} < `,
+                e`${info.boundExpression}; ${cursor} += 1) {`)),
+              stmt(e`  const ${raw} = ${candidate.sourceArrayData}[${
+                cursor}];`, {kind: "const", def: raw}),
+              stmt(exprConcat(e`  if (${raw} === undefined) { ${valid} = false; `,
+                e`continue; }`)),
+              stmt(e`  const ${element} = ${loaded};`,
+                {kind: "const", def: element}),
+              stmt(exprConcat(e`  if (${element} < ${minimum}) `,
+                e`${minimum} = ${element};`)),
+              stmt(exprConcat(e`  if (${element} > ${maximum}) `,
+                e`${maximum} = ${element};`)),
+              blockEnd(""),
             ],
           };
           indirectArrayRangePreambles.set(sharedKey, shared);
           preamble.push(...shared.declarations);
         }
-        condition = `(${info.boundExpression} <= 0 || (` +
-          `${shared.valid} && ${shared.minimum} >= 0 && ` +
-          `${shared.maximum} < ${candidate.arrayData}.length))`;
+        condition = operand(exprConcat(
+          e`(${info.boundExpression} <= 0 || (`,
+          e`${shared.valid} && ${shared.minimum} >= 0 && `,
+          e`${shared.maximum} < ${candidate.arrayData}.length))`));
       } else if (candidate.kind === "bounded-index") {
-        condition =
-          `(${candidate.minimum} >= 0 && ${candidate.maximum} < ` +
-          `${candidate.arrayData}.length)`;
+        condition = operand(exprConcat(
+          e`(${candidate.minimum} >= 0 && ${candidate.maximum} < `,
+          e`${candidate.arrayData}.length)`));
         const outer = outermostCountedLoop || outermostPostDecrementLoop;
         if (outer) {
           declarationHeader = outer.header;
@@ -7363,6 +7429,7 @@ class JvmSsaBlockRenderer {
         const directCountedInduction = indexSlot === info.slot;
         const step = directCountedInduction
           ? String(info.increment) : affineLocalStep(info, indexSlot);
+        const stepExpression = step === null ? null : e`${step}`;
         const carried = step === null
           ? carriedCountedLocalRelation(info, candidate) : null;
         const packed = step === null && !carried
@@ -7434,142 +7501,157 @@ class JvmSsaBlockRenderer {
           // start it must not be hoisted across an enclosing loop.
           const literalInitial = Number.isInteger(info.initial);
           const inductionStart = literalInitial
-            ? String(info.initial) : `local${info.slot}`;
+            ? e`${info.initial}` : e`${localName(info.slot)}`;
           const remaining =
-            `(${info.boundExpression} - ${inductionStart})`;
-          const trips = `(${remaining} <= 0 ? 0 : ` +
-            `Math.ceil(${remaining} / ${info.increment}))`;
-          const first = `(${inductionStart} + ${minimumAffineOffset})`;
-          const last = `(${inductionStart} + (${trips} - 1) * ` +
-            `${info.increment} + ${maximumAffineOffset})`;
-          const next = `(${inductionStart} + ${trips} * ${info.increment})`;
-          const runtimeTerminationGuard = literalInitial ? "" :
-            `${next} >= ${inductionStart} && ` +
-            `${next} <= 2147483647 && `;
-          condition = `(${trips} === 0 || (${trips} <= ` +
-            `${runtimeCoarseTripLimit} && ${first} >= 0 && ` +
-            `${last} >= ${first} && ${last} <= 2147483647 && ` +
-            runtimeTerminationGuard +
-            `${last} < ${candidate.arrayData}.length))`;
+            e`(${info.boundExpression} - ${inductionStart})`;
+          const trips = exprConcat(e`(${remaining} <= 0 ? 0 : `,
+            e`Math.ceil(${remaining} / ${info.increment}))`);
+          const first = e`(${inductionStart} + ${minimumAffineOffset})`;
+          const last = exprConcat(e`(${inductionStart} + (${trips} - 1) * `,
+            e`${info.increment} + ${maximumAffineOffset})`);
+          const next = e`(${inductionStart} + ${trips} * ${info.increment})`;
+          const runtimeTerminationGuard = literalInitial ? "" : exprConcat(
+            e`${next} >= ${inductionStart} && `,
+            e`${next} <= 2147483647 && `);
+          condition = operand(exprConcat(
+            e`(${trips} === 0 || (${trips} <= `,
+            e`${runtimeCoarseTripLimit} && ${first} >= 0 && `,
+            e`${last} >= ${first} && ${last} <= 2147483647 && `,
+            runtimeTerminationGuard,
+            e`${last} < ${candidate.arrayData}.length))`));
           if (literalInitial && outermostCountedLoop && info.initial === 0) {
             declarationHeader = outermostCountedLoop.header;
           }
         } else if (packed) {
           const trips = sharedCountedTrips(info, preamble);
-          const first = `(local${packed.slot} + ${minimumAffineOffset})`;
-          const end = `(local${packed.slot} + ${trips} * ` +
-            `${packed.incrementsPerTrip} + ${maximumAffineOffset} + ` +
-            `${packed.postIncrement ? 0 : 1})`;
-          condition = `(${trips} === 0 || (${trips} <= ` +
-            `${runtimeCoarseTripLimit} && ${first} >= 0 && ${end} >= ` +
-            `${first} && ${end} <= ${candidate.arrayData}.length && ` +
-            `${end} <= 2147483647))`;
+          const first = e`(${localName(packed.slot)} + ${
+            minimumAffineOffset})`;
+          const end = exprConcat(
+            e`(${localName(packed.slot)} + ${trips} * `,
+            e`${packed.incrementsPerTrip} + ${maximumAffineOffset} + `,
+            e`${packed.postIncrement ? 0 : 1})`);
+          condition = operand(exprConcat(
+            e`(${trips} === 0 || (${trips} <= `,
+            e`${runtimeCoarseTripLimit} && ${first} >= 0 && ${end} >= `,
+            e`${first} && ${end} <= ${candidate.arrayData}.length && `,
+            e`${end} <= 2147483647))`));
         } else if (carried) {
           const trips = sharedCountedTrips(info, preamble);
-          const first = minimumAffineOffset;
-          const last = `(${info.boundExpression} - ${info.increment} + ` +
-            `${maximumAffineOffset})`;
-          condition = `(${trips} === 0 || (${trips} <= ` +
-            `${runtimeCoarseTripLimit} && ${first} >= 0 && ${last} >= ` +
-            `${first} && ${last} < ${candidate.arrayData}.length && ` +
-            `${last} <= 2147483647))`;
+          const first = e`${minimumAffineOffset}`;
+          const last = exprConcat(
+            e`(${info.boundExpression} - ${info.increment} + `,
+            e`${maximumAffineOffset})`);
+          condition = operand(exprConcat(
+            e`(${trips} === 0 || (${trips} <= `,
+            e`${runtimeCoarseTripLimit} && ${first} >= 0 && ${last} >= `,
+            e`${first} && ${last} < ${candidate.arrayData}.length && `,
+            e`${last} <= 2147483647))`));
         } else if (info.postDecrement && step !== null) {
-          const trips = `Math.max(0, local${info.slot})`;
-          const last = `(local${indexSlot} + (${trips} - 1) * ${step})`;
-          condition =
-            `(${trips} === 0 || (${trips} <= ` +
-            `${runtimeCoarseTripLimit} && ${step} >= 0 && ` +
-            `local${indexSlot} >= 0 && ${last} < ` +
-            `${candidate.arrayData}.length && ${last} <= 2147483647))`;
+          const trips = e`Math.max(0, ${localName(info.slot)})`;
+          const last = e`(${localName(indexSlot)} + (${trips} - 1) * ${
+            stepExpression})`;
+          condition = operand(exprConcat(
+            e`(${trips} === 0 || (${trips} <= `,
+            e`${runtimeCoarseTripLimit} && ${stepExpression} >= 0 && `,
+            e`${localName(indexSlot)} >= 0 && ${last} < `,
+            e`${candidate.arrayData}.length && ${last} <= 2147483647))`));
         } else if (nestedCyclic) {
           cyclicArrayRangeCandidates.add(candidate);
           const prefix = `ssaNestedCyclicRange${candidateIndex}`;
-          const product = `${prefix}Product`;
-          const base = `${prefix}Base`;
-          const end = `${prefix}End`;
+          const product = named(`${prefix}Product`);
+          const base = named(`${prefix}Base`);
+          const end = named(`${prefix}End`);
           preamble.push(
-            `const ${product} = local${nestedCyclic.heightSlot} * ` +
-              `local${cyclic.modulusSlot};`,
-            `const ${base} = ` +
-              `(local${cyclic.indexSlot} - local${cyclic.phaseSlot}) - ` +
-              `local${nestedCyclic.rowSlot} * local${cyclic.modulusSlot};`,
-            `const ${end} = ${base} + ${product};`,
+            constDecl(product, e`${localName(nestedCyclic.heightSlot)} * ${
+              localName(cyclic.modulusSlot)}`, {pure: true}),
+            constDecl(base, exprConcat(
+              e`(${localName(cyclic.indexSlot)} - ${
+                localName(cyclic.phaseSlot)}) - `,
+              e`${localName(nestedCyclic.rowSlot)} * ${
+                localName(cyclic.modulusSlot)}`), {pure: true}),
+            constDecl(end, e`${base} + ${product}`, {pure: true}),
           );
-          condition =
-            `(local${cyclic.modulusSlot} > 0 && ` +
-            `local${nestedCyclic.heightSlot} > 0 && ` +
-            `${product} <= 2147483647 && ` +
-            `local${cyclic.phaseSlot} >= 0 && ` +
-            `local${cyclic.phaseSlot} < local${cyclic.modulusSlot} && ` +
-            `local${nestedCyclic.rowSlot} >= 0 && ` +
-            `local${nestedCyclic.rowSlot} < ` +
-            `local${nestedCyclic.heightSlot} && ` +
-            `${base} >= 0 && ${end} <= ${candidate.arrayData}.length && ` +
-            `${end} <= 2147483647)`;
+          condition = operand(exprConcat(
+            e`(${localName(cyclic.modulusSlot)} > 0 && `,
+            e`${localName(nestedCyclic.heightSlot)} > 0 && `,
+            e`${product} <= 2147483647 && `,
+            e`${localName(cyclic.phaseSlot)} >= 0 && `,
+            e`${localName(cyclic.phaseSlot)} < ${
+              localName(cyclic.modulusSlot)} && `,
+            e`${localName(nestedCyclic.rowSlot)} >= 0 && `,
+            e`${localName(nestedCyclic.rowSlot)} < `,
+            e`${localName(nestedCyclic.heightSlot)} && `,
+            e`${base} >= 0 && ${end} <= ${candidate.arrayData}.length && `,
+            e`${end} <= 2147483647)`));
           declarationHeader = nestedCyclic.outer.header;
         } else if (cyclic) {
           cyclicArrayRangeCandidates.add(candidate);
-          const base =
-            `(local${cyclic.indexSlot} - local${cyclic.phaseSlot})`;
-          const end = `(${base} + local${cyclic.modulusSlot})`;
-          condition =
-            `(local${cyclic.modulusSlot} > 0 && ` +
-            `local${cyclic.phaseSlot} >= 0 && ` +
-            `local${cyclic.phaseSlot} < local${cyclic.modulusSlot} && ` +
-            `${base} >= 0 && ${end} <= ${candidate.arrayData}.length && ` +
-            `${end} <= 2147483647)`;
+          const base = e`(${localName(cyclic.indexSlot)} - ${
+            localName(cyclic.phaseSlot)})`;
+          const end = e`(${base} + ${localName(cyclic.modulusSlot)})`;
+          condition = operand(exprConcat(
+            e`(${localName(cyclic.modulusSlot)} > 0 && `,
+            e`${localName(cyclic.phaseSlot)} >= 0 && `,
+            e`${localName(cyclic.phaseSlot)} < ${
+              localName(cyclic.modulusSlot)} && `,
+            e`${base} >= 0 && ${end} <= ${candidate.arrayData}.length && `,
+            e`${end} <= 2147483647)`));
         } else if (Number.isInteger(countedOuterSkipSlot)) {
           const prefix = `ssaNestedAffineRange${candidateIndex}`;
-          const outerTripsExpression =
-            `(local${outermostCountedLoop.slot} >= ` +
-            `${outermostCountedLoop.boundExpression} ? 0 : ` +
-            `(${outermostCountedLoop.boundExpression} - ` +
-            `local${outermostCountedLoop.slot}))`;
+          const outerTripsExpression = exprConcat(
+            e`(${localName(outermostCountedLoop.slot)} >= `,
+            e`${outermostCountedLoop.boundExpression} ? 0 : `,
+            e`(${outermostCountedLoop.boundExpression} - `,
+            e`${localName(outermostCountedLoop.slot)}))`);
           const innerTripsExpression =
-            `Math.max(0, ${info.boundExpression})`;
-          const outerTrips = `${prefix}OuterTrips`;
-          const innerTrips = `${prefix}InnerTrips`;
-          const rowStride = `${prefix}RowStride`;
-          const last = `${prefix}Last`;
+            e`Math.max(0, ${info.boundExpression})`;
+          const outerTrips = named(`${prefix}OuterTrips`);
+          const innerTrips = named(`${prefix}InnerTrips`);
+          const rowStride = named(`${prefix}RowStride`);
+          const last = named(`${prefix}Last`);
           preamble.push(
-            `const ${outerTrips} = ${outerTripsExpression};`,
-            `const ${innerTrips} = ${innerTripsExpression};`,
-            `const ${rowStride} = ` +
-              `${innerTrips} * ${step} + local${countedOuterSkipSlot};`,
-            `const ${last} = local${indexSlot} + (${outerTrips} - 1) * ` +
-              `${rowStride} + (${innerTrips} - 1) * ${step};`,
+            constDecl(outerTrips, outerTripsExpression, {pure: true}),
+            constDecl(innerTrips, innerTripsExpression, {pure: true}),
+            constDecl(rowStride, e`${innerTrips} * ${stepExpression} + ${
+              localName(countedOuterSkipSlot)}`, {pure: true}),
+            constDecl(last, exprConcat(
+              e`${localName(indexSlot)} + (${outerTrips} - 1) * `,
+              e`${rowStride} + (${innerTrips} - 1) * ${stepExpression}`),
+            {pure: true}),
           );
-          condition =
-            `(${outerTrips} === 0 || ${innerTrips} === 0 || (` +
-            `${outerTrips} <= ${runtimeCoarseTripLimit} && ` +
-            `${innerTrips} <= ${runtimeCoarseTripLimit} && ${step} >= 0 && ` +
-            `local${countedOuterSkipSlot} >= 0 && ` +
-            `local${indexSlot} >= 0 && ${last} < ` +
-            `${candidate.arrayData}.length && ${last} <= 2147483647))`;
+          condition = operand(exprConcat(
+            e`(${outerTrips} === 0 || ${innerTrips} === 0 || (`,
+            e`${outerTrips} <= ${runtimeCoarseTripLimit} && `,
+            e`${innerTrips} <= ${runtimeCoarseTripLimit} && ${
+              stepExpression} >= 0 && `,
+            e`${localName(countedOuterSkipSlot)} >= 0 && `,
+            e`${localName(indexSlot)} >= 0 && ${last} < `,
+            e`${candidate.arrayData}.length && ${last} <= 2147483647))`));
           declarationHeader = outermostCountedLoop.header;
         } else if (postDecrementOuter && writesInPostDecrementOuter === 1) {
           const outerTrips =
-            `Math.max(0, local${postDecrementOuter.slot})`;
-          const totalTrips = `(${outerTrips} * ${info.bound})`;
-          const last =
-            `(local${indexSlot} + (${totalTrips} - 1) * ${step})`;
-          condition =
-            `(${totalTrips} === 0 || (${outerTrips} <= ` +
-            `${runtimeCoarseTripLimit} && ${step} >= 0 && ` +
-            `local${indexSlot} >= 0 && ${last} < ` +
-            `${candidate.arrayData}.length && ${last} <= 2147483647))`;
+            e`Math.max(0, ${localName(postDecrementOuter.slot)})`;
+          const totalTrips = e`(${outerTrips} * ${info.bound})`;
+          const last = e`(${localName(indexSlot)} + (${totalTrips} - 1) * ${
+            stepExpression})`;
+          condition = operand(exprConcat(
+            e`(${totalTrips} === 0 || (${outerTrips} <= `,
+            e`${runtimeCoarseTripLimit} && ${stepExpression} >= 0 && `,
+            e`${localName(indexSlot)} >= 0 && ${last} < `,
+            e`${candidate.arrayData}.length && ${last} <= 2147483647))`));
           declarationHeader = postDecrementOuter.header;
         } else {
           const trips = sharedCountedTrips(info, preamble);
-          const first = `(local${indexSlot} + ${minimumAffineOffset})`;
-          const last =
-            `(local${indexSlot} + ${maximumAffineOffset} + ` +
-            `(${trips} - 1) * ${step})`;
-          condition =
-            `(${trips} === 0 || (${trips} <= ${runtimeCoarseTripLimit} && ` +
-            `${step} >= 0 && ` +
-            `${first} >= 0 && ${last} < ${candidate.arrayData}.length && ` +
-            `${last} <= 2147483647))`;
+          const first = e`(${localName(indexSlot)} + ${
+            minimumAffineOffset})`;
+          const last = exprConcat(
+            e`(${localName(indexSlot)} + ${maximumAffineOffset} + `,
+            e`(${trips} - 1) * ${stepExpression})`);
+          condition = operand(exprConcat(
+            e`(${trips} === 0 || (${trips} <= ${runtimeCoarseTripLimit} && `,
+            e`${stepExpression} >= 0 && `,
+            e`${first} >= 0 && ${last} < ${candidate.arrayData}.length && `,
+            e`${last} <= 2147483647))`));
         }
       } else if (candidate.kind === "scaled-local") {
         const relation = scaledCountedLocalRelation(info, candidate);
@@ -7581,20 +7663,23 @@ class JvmSsaBlockRenderer {
           outermostCountedLoop && info.initial === 0 &&
           boundInvariantInOuterLoops);
         const trips = hoistScaledGuard
-          ? `Math.max(0, ${info.boundExpression})`
-          : `(local${info.slot} >= ${info.boundExpression} ? 0 : ` +
-            `(${info.boundExpression} - local${info.slot}))`;
+          ? e`Math.max(0, ${info.boundExpression})`
+          : exprConcat(
+            e`(${localName(info.slot)} >= ${info.boundExpression} ? 0 : `,
+            e`(${info.boundExpression} - ${localName(info.slot)}))`);
         const firstCounter = relation.kind === "carried"
-          ? "0" : hoistScaledGuard ? "0" : `local${info.slot}`;
-        const first = `(${firstCounter} * ${candidate.scale} + ` +
-          `${candidate.offset})`;
-        const last = `((${info.boundExpression} - 1) * ` +
-          `${candidate.scale} + ${candidate.offset})`;
-        condition =
-          `(${trips} === 0 || (${trips} <= ${runtimeCoarseTripLimit} && ` +
-          `${first} >= 0 && ${last} >= ${first} && ` +
-          `${last} <= 2147483647 && ` +
-          `${last} < ${candidate.arrayData}.length))`;
+          ? e`0` : hoistScaledGuard ? e`0` : e`${localName(info.slot)}`;
+        const first = exprConcat(
+          e`(${firstCounter} * ${candidate.scale} + `,
+          e`${candidate.offset})`);
+        const last = exprConcat(
+          e`((${info.boundExpression} - 1) * `,
+          e`${candidate.scale} + ${candidate.offset})`);
+        condition = operand(exprConcat(
+          e`(${trips} === 0 || (${trips} <= ${runtimeCoarseTripLimit} && `,
+          e`${first} >= 0 && ${last} >= ${first} && `,
+          e`${last} <= 2147483647 && `,
+          e`${last} < ${candidate.arrayData}.length))`));
         if (hoistScaledGuard) declarationHeader = outermostCountedLoop.header;
       } else {
         const recurrence =
@@ -7612,62 +7697,79 @@ class JvmSsaBlockRenderer {
           if (!shared) {
             const prefix =
               `ssaArrayRangeRecurrence${quotientProductRangePreambles.size}`;
-            const trips =
-              `(local${info.slot} >= ${info.boundExpression} ? 0 : ` +
-              `(${info.boundExpression} - local${info.slot}))`;
+            const trips = exprConcat(
+              e`(${localName(info.slot)} >= ${info.boundExpression} ? 0 : `,
+              e`(${info.boundExpression} - ${localName(info.slot)}))`);
+            const tripsName = named(`${prefix}Trips`);
+            const lastName = named(`${prefix}Last`);
+            const firstQuotient = named(`${prefix}FirstQuotientRaw`);
+            const lastQuotient = named(`${prefix}LastQuotientRaw`);
+            const firstProduct = named(`${prefix}FirstProduct`);
+            const lastProduct = named(`${prefix}LastProduct`);
+            const validName = named(`${prefix}Valid`);
             shared = {
               prefix,
               declarations: [
-                `const ${prefix}Trips = ${trips};`,
-                `const ${prefix}Last = local${recurrence.recurrenceSlot} + ` +
-                  `(${prefix}Trips - 1) * local${recurrence.stepSlot};`,
-                `const ${prefix}FirstQuotientRaw = ` +
-                  `local${recurrence.recurrenceSlot} / ` +
-                  `local${recurrence.divisorSlot};`,
-                `const ${prefix}LastQuotientRaw = ${prefix}Last / ` +
-                  `local${recurrence.divisorSlot};`,
-                `const ${prefix}FirstProduct = ` +
-                  `Math.trunc(${prefix}FirstQuotientRaw) * ` +
-                  `local${recurrence.multiplierSlot};`,
-                `const ${prefix}LastProduct = ` +
-                  `Math.trunc(${prefix}LastQuotientRaw) * ` +
-                  `local${recurrence.multiplierSlot};`,
-                `const ${prefix}Valid = ${prefix}Trips <= ` +
-                  `${runtimeCoarseTripLimit} && ` +
-                  `local${recurrence.divisorSlot} !== 0 && ` +
-                  `${prefix}Last >= -2147483648 && ` +
-                  `${prefix}Last <= 2147483647 && ` +
-                  `${prefix}FirstProduct >= -2147483648 && ` +
-                  `${prefix}FirstProduct <= 2147483647 && ` +
-                  `${prefix}LastProduct >= -2147483648 && ` +
-                  `${prefix}LastProduct <= 2147483647;`,
+                constDecl(tripsName, trips, {pure: true}),
+                constDecl(lastName, exprConcat(
+                  e`${localName(recurrence.recurrenceSlot)} + `,
+                  e`(${tripsName} - 1) * ${
+                    localName(recurrence.stepSlot)}`), {pure: true}),
+                constDecl(firstQuotient, exprConcat(
+                  e`${localName(recurrence.recurrenceSlot)} / `,
+                  e`${localName(recurrence.divisorSlot)}`), {pure: true}),
+                constDecl(lastQuotient, e`${lastName} / ${
+                  localName(recurrence.divisorSlot)}`, {pure: true}),
+                constDecl(firstProduct, exprConcat(
+                  e`Math.trunc(${firstQuotient}) * `,
+                  e`${localName(recurrence.multiplierSlot)}`), {pure: true}),
+                constDecl(lastProduct, exprConcat(
+                  e`Math.trunc(${lastQuotient}) * `,
+                  e`${localName(recurrence.multiplierSlot)}`), {pure: true}),
+                constDecl(validName, exprConcat(
+                  e`${tripsName} <= `,
+                  e`${runtimeCoarseTripLimit} && `,
+                  e`${localName(recurrence.divisorSlot)} !== 0 && `,
+                  e`${lastName} >= -2147483648 && `,
+                  e`${lastName} <= 2147483647 && `,
+                  e`${firstProduct} >= -2147483648 && `,
+                  e`${firstProduct} <= 2147483647 && `,
+                  e`${lastProduct} >= -2147483648 && `,
+                  e`${lastProduct} <= 2147483647`), {pure: true}),
               ],
             };
             quotientProductRangePreambles.set(recurrenceKey, shared);
             preamble.push(...shared.declarations);
           }
           const prefix = `ssaArrayRangeInterval${candidateIndex}`;
+          const firstIndex = named(`${prefix}FirstIndex`);
+          const lastIndex = named(`${prefix}LastIndex`);
           preamble.push(
-            `const ${prefix}FirstIndex = ${shared.prefix}FirstProduct + ` +
-              `local${recurrence.offsetSlot};`,
-            `const ${prefix}LastIndex = ${shared.prefix}LastProduct + ` +
-              `local${recurrence.offsetSlot};`,
+            constDecl(firstIndex, exprConcat(
+              e`${named(`${shared.prefix}FirstProduct`)} + `,
+              e`${localName(recurrence.offsetSlot)}`), {pure: true}),
+            constDecl(lastIndex, exprConcat(
+              e`${named(`${shared.prefix}LastProduct`)} + `,
+              e`${localName(recurrence.offsetSlot)}`), {pure: true}),
           );
-          condition =
-            `(${shared.prefix}Trips === 0 || (` +
-            `${shared.prefix}Valid && ` +
-            `${prefix}FirstIndex >= 0 && ${prefix}LastIndex >= 0 && ` +
-            `${prefix}FirstIndex < ${candidate.arrayData}.length && ` +
-            `${prefix}LastIndex < ${candidate.arrayData}.length && ` +
-            `${prefix}FirstIndex <= 2147483647 && ` +
-            `${prefix}LastIndex <= 2147483647))`;
+          condition = operand(exprConcat(
+            e`(${named(`${shared.prefix}Trips`)} === 0 || (`,
+            e`${named(`${shared.prefix}Valid`)} && `,
+            e`${firstIndex} >= 0 && ${lastIndex} >= 0 && `,
+            e`${firstIndex} < ${candidate.arrayData}.length && `,
+            e`${lastIndex} < ${candidate.arrayData}.length && `,
+            e`${firstIndex} <= 2147483647 && `,
+            e`${lastIndex} <= 2147483647))`));
         } else {
           const baseSlot = candidate.slots.find((slot) => slot !== info.slot);
-          const trips = `(${info.boundExpression} - local${info.slot})`;
-          const start = `((local${baseSlot} + local${info.slot}) | 0)`;
-          condition =
-            `(local${info.slot} >= ${info.boundExpression} || ` +
-            `((${start} >>> 0) <= ${candidate.arrayData}.length - ${trips}))`;
+          const trips = e`(${info.boundExpression} - ${
+            localName(info.slot)})`;
+          const start = e`((${localName(baseSlot)} + ${
+            localName(info.slot)}) | 0)`;
+          condition = operand(exprConcat(
+            e`(${localName(info.slot)} >= ${info.boundExpression} || `,
+            e`((${start} >>> 0) <= ${candidate.arrayData}.length - ${
+              trips}))`));
         }
       }
       if (eagerEntryFieldArrayData.has(candidate.arrayData) ||
@@ -7681,7 +7783,8 @@ class JvmSsaBlockRenderer {
         fieldBackedArrayRangeCandidateCount += 1;
       }
       if (!unconditionallyNonNullEntryArrayData.has(candidate.arrayData)) {
-        condition = `(${candidate.arrayData} !== null && ${condition})`;
+        condition = operand(
+          e`(${candidate.arrayData} !== null && ${condition})`);
       }
       if (info.increment > 1 && candidate.kind === "affine-local") {
         // The positive-stride affine guard above includes both an exact
@@ -7703,8 +7806,8 @@ class JvmSsaBlockRenderer {
         arrayRangeGuardNonZeroLocals.set(existingGuard, [...proven]);
         for (const plan of plans) {
           if (!plan?.lines) continue;
-          plan.lines = plan.lines.map((line) =>
-            line.replace(candidate.marker, existingGuard));
+          plan.lines = substituteInLines(plan.lines,
+            new Map([[candidate.marker, [{ref: existingGuard}]]]));
         }
         coalescedArrayRangeGuardCount += 1;
         continue;
@@ -7716,7 +7819,7 @@ class JvmSsaBlockRenderer {
       declarations.push(...preamble.map((line) =>
         recordCheckedLeafLine("guardDeclaration", line, [variable])),
       recordCheckedLeafLine("guardDeclaration",
-        `const ${variable} = ${condition};`, [variable]));
+        constDecl(variable, e`${condition}`, {pure: true}), [variable]));
       arrayRangeGuardDeclarations.set(declarationHeader, declarations);
       if (declarationHeader !== info.header) {
         hoistedArrayRangeGuardCount += 1;
@@ -7765,8 +7868,8 @@ class JvmSsaBlockRenderer {
         variable, candidate.provenNonZeroSlots || []);
       for (const plan of plans) {
         if (!plan?.lines) continue;
-        plan.lines = plan.lines.map((line) =>
-          line.replace(candidate.marker, variable));
+        plan.lines = substituteInLines(plan.lines,
+          new Map([[candidate.marker, [{ref: variable}]]]));
       }
     }
     if (typeof process !== "undefined" &&
@@ -8579,8 +8682,8 @@ class JvmSsaBlockRenderer {
     const guardConjunction = (guards) => exprConcat(
       ...guards.flatMap((guard, position) =>
         position === 0 ? [e`${guard}`] : [" && ", e`${guard}`]));
-    const conditionLine = (condition) =>
-      stmt(e`if (${condition}) {`, {kind: "if", condition});
+    const conditionLine = (condition, comparison = null) =>
+      stmt(e`if (${condition}) {`, {kind: "if", condition, comparison});
     const breakStatement = (label) => recordStatement(
       [`break ${label};`], {kind: "break", label});
     const expandContinuationFallbacks = (lines, continuationMode) =>
@@ -8831,28 +8934,43 @@ class JvmSsaBlockRenderer {
       const info = countedLoopInfos.get(header);
       if (!info || !Number.isInteger(info.slot) || !info.boundExpression ||
           lines.length < 5) return null;
-      const first = /^const (ssaValue\d+) = local(\d+);$/.exec(lines[0]);
-      if (!first || Number(first[2]) !== info.slot) return null;
-      const second = /^const (ssaValue\d+) = (.+);$/.exec(lines[1]);
-      let conditionLine;
+      const first = recordOf(lines[0]);
+      if (first?.kind !== "const" || first.localSnapshot !== info.slot) {
+        return null;
+      }
+      const second = recordOf(lines[1]);
+      const secondIsBound = second?.kind === "const" &&
+        renderParts(second.exprParts) === String(info.boundExpression);
+      const headerComparison = (line, left, right) => {
+        const record = recordOf(line);
+        const comparison = record?.kind === "if" ? record.comparison : null;
+        if (!comparison) return null;
+        if (comparison.left !== undefined) {
+          return comparison.left === left && comparison.right === right
+            ? comparison.cmp : null;
+        }
+        // A bytecode `ifge`/`iflt` compares against zero directly, so its
+        // comparison carries one operand and the zero is part of the operator.
+        if (comparison.input !== left || right !== "0") return null;
+        return comparison.cmp === ">= 0" ? ">="
+          : comparison.cmp === "< 0" ? "<" : null;
+      };
+      const loopCondition = operand(
+        e`${localName(info.slot)} < ${info.boundExpression}`);
       let conditionIndex;
       let bodyOnThen = false;
-      if (second && second[2] === info.boundExpression &&
-          lines[2] === `if (${first[1]} >= ${second[1]}) {`) {
-        conditionLine = `local${info.slot} < ${info.boundExpression}`;
+      const twoValueCmp = secondIsBound
+        ? headerComparison(lines[2], first.def, second.def) : null;
+      const boundCmp = headerComparison(
+        lines[1], first.def, String(info.boundExpression));
+      if (twoValueCmp === ">=") {
         conditionIndex = 2;
-      } else if (second && second[2] === info.boundExpression &&
-          lines[2] === `if (${first[1]} < ${second[1]}) {`) {
-        conditionLine = `local${info.slot} < ${info.boundExpression}`;
+      } else if (twoValueCmp === "<") {
         conditionIndex = 2;
         bodyOnThen = true;
-      } else if (lines[1] ===
-          `if (${first[1]} >= ${info.boundExpression}) {`) {
-        conditionLine = `local${info.slot} < ${info.boundExpression}`;
+      } else if (boundCmp === ">=") {
         conditionIndex = 1;
-      } else if (lines[1] ===
-          `if (${first[1]} < ${info.boundExpression}) {`) {
-        conditionLine = `local${info.slot} < ${info.boundExpression}`;
+      } else if (boundCmp === "<") {
         conditionIndex = 1;
         bodyOnThen = true;
       } else {
@@ -8861,24 +8979,28 @@ class JvmSsaBlockRenderer {
       let alternate = -1;
       let depth = 0;
       for (let index = conditionIndex; index < lines.length; index += 1) {
-        const trimmed = lines[index].trim();
-        if (index > conditionIndex && depth === 1 && trimmed === "} else {") {
+        const record = recordOf(lines[index]);
+        const closesToElse = record?.kind === "elseArm";
+        if (index > conditionIndex && depth === 1 && closesToElse) {
           alternate = index;
           break;
         }
-        if (trimmed.endsWith("{")) depth += 1;
-        if (trimmed === "}" || trimmed.startsWith("} else")) depth -= 1;
+        depth += record?.blockDelta || 0;
       }
-      if (alternate < 0 || lines[lines.length - 1] !== "}") return null;
+      if (alternate < 0 ||
+          recordOf(lines[lines.length - 1])?.kind !== "blockEnd") return null;
       const unindentOne = (line) => line.startsWith("  ")
         ? line.slice(2) : line;
       const thenLines = lines.slice(conditionIndex + 1, alternate).map(unindentOne);
       const elseLines = lines.slice(alternate + 1, -1).map(unindentOne);
       const exit = bodyOnThen ? elseLines : thenLines;
       const body = bodyOnThen ? thenLines : elseLines;
-      if (body[body.length - 1]?.trim() === `continue ${label};`) body.pop();
+      const lastRecord = recordOf(body[body.length - 1] || "");
+      if (lastRecord?.kind === "continue" && lastRecord.label === label) {
+        body.pop();
+      }
       return {
-        condition: conditionLine,
+        condition: loopCondition,
         body,
         exit,
       };
@@ -8890,26 +9012,32 @@ class JvmSsaBlockRenderer {
     // infinite-loop/if/continue scaffold without assuming a trip bound.
     const canonicalPostDecrementLoop = (label, lines) => {
       if (lines.length < 8) return null;
-      const oldValue = /^const (ssaValue\d+) = local(\d+);$/.exec(lines[0]);
-      if (!oldValue) return null;
-      const nextValue = new RegExp(
-        `^const (ssaValue\\d+) = \\(${oldValue[1]} \\+ -1\\) \\| 0;$`,
-      ).exec(lines[1]);
-      if (!nextValue || lines[2] !==
-          `local${oldValue[2]} = ${nextValue[1]};` ||
-          lines[3] !== `if (${oldValue[1]} <= 0) {`) return null;
+      const oldValue = recordOf(lines[0]);
+      if (oldValue?.kind !== "const" ||
+          !Number.isInteger(oldValue.localSnapshot)) return null;
+      const nextValue = recordOf(lines[1]);
+      if (nextValue?.kind !== "const" ||
+          nextValue.iincSource !== oldValue.def ||
+          nextValue.iincIncrement !== -1) return null;
+      const store = recordOf(lines[2]);
+      if (store?.kind !== "store" ||
+          store.write !== localName(oldValue.localSnapshot) ||
+          renderParts(store.exprParts) !== nextValue.def) return null;
+      const test = recordOf(lines[3]);
+      if (test?.kind !== "if" || test.comparison?.input !== oldValue.def ||
+          test.comparison?.cmp !== "<= 0") return null;
       let alternate = -1;
       let depth = 0;
       for (let index = 3; index < lines.length; index += 1) {
-        const trimmed = lines[index].trim();
-        if (index > 3 && depth === 1 && trimmed === "} else {") {
+        const record = recordOf(lines[index]);
+        if (index > 3 && depth === 1 && record?.kind === "elseArm") {
           alternate = index;
           break;
         }
-        if (trimmed.endsWith("{")) depth += 1;
-        if (trimmed === "}" || trimmed.startsWith("} else")) depth -= 1;
+        depth += record?.blockDelta || 0;
       }
-      if (alternate < 0 || lines[lines.length - 1] !== "}") return null;
+      if (alternate < 0 ||
+          recordOf(lines[lines.length - 1])?.kind !== "blockEnd") return null;
       const unindentOne = (line) => line.startsWith("  ")
         ? line.slice(2) : line;
       const exit = lines.slice(4, alternate).map(unindentOne);
@@ -8917,9 +9045,13 @@ class JvmSsaBlockRenderer {
         ...lines.slice(0, 3),
         ...lines.slice(alternate + 1, -1).map(unindentOne),
       ];
-      if (body[body.length - 1]?.trim() === `continue ${label};`) body.pop();
+      const lastRecord = recordOf(body[body.length - 1] || "");
+      if (lastRecord?.kind === "continue" && lastRecord.label === label) {
+        body.pop();
+      }
       return {
-        condition: `local${oldValue[2]} > 0`,
+        condition: operand(
+          e`${localName(oldValue.localSnapshot)} > 0`),
         body,
         exit,
       };
@@ -9110,7 +9242,7 @@ class JvmSsaBlockRenderer {
           lines.push(plan.returnKind === "void"
             ? st`  return helpers.returnVoid();`
             : stmt(e`  return ${plan.returnValue};`, {kind: "return"}));
-          lines.push(st`}`);
+          lines.push(blockEnd(""));
           lines.push(st`if (thread.callStack.peek() !== frame) {`);
           lines.push(...materializeLines(
             plan.returnKind === "void" ? [] : [plan.returnValue],
@@ -9118,7 +9250,7 @@ class JvmSsaBlockRenderer {
           ).map((line) => `  ${line}`));
           lines.push(st`  helpers.skipJitOnce(frame);`);
           lines.push(st`  return { deopt: true, transient: true, reason: 'structured SSA return with active child' };`);
-          lines.push(st`}`);
+          lines.push(blockEnd(""));
           lines.push(spillStatement());
           lines.push(st`stack.length = 0;`);
           lines.push(st`frame.pc = ${items.length};`);
@@ -9145,23 +9277,25 @@ class JvmSsaBlockRenderer {
             loopSafePointBudgetOverrides),
         ];
         if (plan.conditionConstant === true) {
-          return [st`{`, ...indent(thenLines), st`}`];
+          return [blockStart(""), ...indent(thenLines), blockEnd("")];
         }
         if (plan.conditionConstant === false) {
-          return [st`{`, ...indent(elseLines), st`}`];
+          return [blockStart(""), ...indent(elseLines), blockEnd("")];
         }
         if (thenLines.length === elseLines.length &&
             thenLines.every((line, index) => line === elseLines[index])) {
-          return [st`{`, ...indent(thenLines), st`}`];
+          return [blockStart(""), ...indent(thenLines), blockEnd("")];
         }
         if (elseLines.length === 0) {
-          return [conditionLine(plan.condition), ...indent(thenLines), st`}`];
+          return [conditionLine(plan.condition, plan.comparison),
+            ...indent(thenLines), blockEnd("")];
         }
         // Emit the compiler's own negation of the branch condition when it
         // has one, instead of leaving `!(a !== b)` for a later text pass.
         const negated = plan.negatedCondition || e`!(${plan.condition})`;
         if (thenLines.length === 0) {
-          return [conditionLine(negated), ...indent(elseLines), st`}`];
+          return [conditionLine(negated, plan.negatedComparison),
+            ...indent(elseLines), blockEnd("")];
         }
         // The break a branch arm ends in is a compiler-owned statement; ask
         // its record for the label instead of matching the rendered line.
@@ -9175,9 +9309,9 @@ class JvmSsaBlockRenderer {
           ? breakTarget(elseLines[elseLines.length - 1]) : null;
         if (thenBreak && thenBreak === elseBreak) {
           return [
-            conditionLine(negated),
+            conditionLine(negated, plan.negatedComparison),
             ...indent(elseLines.slice(0, -1)),
-            st`}`,
+            blockEnd(""),
             breakStatement(thenBreak),
           ];
         }
@@ -9187,14 +9321,15 @@ class JvmSsaBlockRenderer {
           ? breakTarget(thenLines[thenLines.length - 1]) : null;
         if (fallBreak && fallBreak === takenBreak) {
           return [
-            conditionLine(plan.condition),
+            conditionLine(plan.condition, plan.comparison),
             ...indent(thenLines.slice(0, -1)),
-            st`}`,
+            blockEnd(""),
             breakStatement(fallBreak),
           ];
         }
-        return [conditionLine(plan.condition), ...indent(thenLines),
-          st`} else {`, ...indent(elseLines), st`}`];
+        return [conditionLine(plan.condition, plan.comparison),
+          ...indent(thenLines),
+          elseArm(""), ...indent(elseLines), blockEnd("")];
       }
       if (node.t === "switch") {
         const plan = plans[node.block];
@@ -9216,7 +9351,7 @@ class JvmSsaBlockRenderer {
             st`break;`,
           ];
           output.push(st`case ${JSON.stringify(entry.key)}: {`,
-            ...indent(body), st`}`);
+            ...indent(body), blockEnd(""));
         }
         const defaultBody = [
           ...edgeLines(plan.defaultTarget, plan.stack),
@@ -9225,7 +9360,7 @@ class JvmSsaBlockRenderer {
             loopSafePointBudgetOverrides),
           st`break;`,
         ];
-        output.push(st`default: {`, ...indent(defaultBody), st`}`, st`}`);
+        output.push(st`default: {`, ...indent(defaultBody), blockEnd(""), blockEnd(""));
         return output;
       }
       if (node.t === "loop") {
@@ -9251,7 +9386,7 @@ class JvmSsaBlockRenderer {
                 st`stack.length = ${depth};`,
                 st`helpers.materialize(frame, locals, stack, ${pc});`,
               ]),
-              st`}`,
+              blockEnd(""),
             ];
           })
           : (() => {
@@ -9287,7 +9422,7 @@ class JvmSsaBlockRenderer {
               st`return { deopt: true, transient: true, reason: 'structured SSA safe point' };`,
             ]),
           ]),
-          st`}`,
+          blockEnd(""),
         ];
         const checkedLeafCoarse = checkedLeafOnly &&
           checkedLeafCoarseLoopHeaders.has(header);
@@ -9364,14 +9499,14 @@ class JvmSsaBlockRenderer {
             stmt(exprConcat(e`  if (`, runtimeCoarse
               ? e`!${runtimeCoarse.variable} && ` : "",
             e`--safePointBudget <= 0) {`)),
-            ...indent(indent(materialize)), st`  }`,
+            ...indent(indent(materialize)), blockEnd("  "),
           ]),
-          ...indent(emittedLoopBody), st`}`,
+          ...indent(emittedLoopBody), blockEnd(""),
           ...(countedLoop ? countedLoop.exit : []),
         ];
         const unpolledLoop = [
           loopHeaderLine(),
-          ...indent(emittedLoopBody), st`}`,
+          ...indent(emittedLoopBody), blockEnd(""),
           ...(countedLoop ? countedLoop.exit : []),
         ];
         // A restoring entry can transfer an unexpectedly large loop back to
@@ -9397,7 +9532,7 @@ class JvmSsaBlockRenderer {
               stmt(exprConcat(e`return { deopt: true, transient: true, `,
                 e`reason: 'structured SSA coarse loop guard' };`)),
             ]),
-            st`}`,
+            blockEnd(""),
             ...unpolledLoop,
           ];
         }
@@ -9415,7 +9550,7 @@ class JvmSsaBlockRenderer {
             ...indent(specializeArrayRangeGuardedStores(
               emittedLoopBody,
               specializationGuards)),
-            st`}`,
+            blockEnd(""),
             ...(countedLoop ? countedLoop.exit : []),
           ];
         }
@@ -9435,7 +9570,7 @@ class JvmSsaBlockRenderer {
             ...indent(specializeArrayRangeGuardedStores(
               emittedLoopBody,
               specializationGuards)),
-            st`}`,
+            blockEnd(""),
             ...(countedLoop ? countedLoop.exit : []),
           ];
         }
@@ -9464,7 +9599,7 @@ class JvmSsaBlockRenderer {
             specializationGuards);
           const specializedUnpolledLoop = [
             loopHeaderLine(),
-            ...indent(fastLoopBody), st`}`,
+            ...indent(fastLoopBody), blockEnd(""),
             ...(countedLoop ? countedLoop.exit : []),
           ];
           // A failed array-range specialization used to reconstruct the frame
@@ -9491,7 +9626,7 @@ class JvmSsaBlockRenderer {
                 stmt(exprConcat(e`return { deopt: true, transient: true, `,
                   e`reason: 'structured SSA range guard' };`)),
               ]),
-              st`}`,
+              blockEnd(""),
               ...specializedUnpolledLoop,
             ];
           }
@@ -9513,9 +9648,9 @@ class JvmSsaBlockRenderer {
             ...prefix,
             st`if (${fastLoopCondition}) {`,
             ...indent(specializedUnpolledLoop),
-            st`} else {`,
+            elseArm(""),
             ...indent(polledLoop),
-            st`}`,
+            blockEnd(""),
           ];
         }
         return [...prefix, ...polledLoop];
@@ -9535,7 +9670,7 @@ class JvmSsaBlockRenderer {
         return [
           recordStatement([`${node.label}: {`],
             {kind: "blockLabel", label: node.label}),
-          ...indent(rendered), st`}`,
+          ...indent(rendered), blockEnd(""),
         ];
       }
       if (node.t === "break") return [breakStatement(node.label)];
@@ -11235,7 +11370,7 @@ class JvmSsaBlockRenderer {
         const restoringSpillLines = [
           st`if (frame === null) {`,
           ...initializeFrame.map((line) => `  ${line}`),
-          st`}`,
+          blockEnd(""),
           ...spillSlots.map((index) => stmt(e`locals[${index}] = ${
             immutableEntryLocals.has(index)
               ? entryLocalInitialValues.get(index) : localName(index)};`,
@@ -11317,14 +11452,14 @@ class JvmSsaBlockRenderer {
                 return [
                   `${prefix}${st`if (frame === null) {`}`,
                   ...restoreCaptureFreeFrame(`${prefix}  `),
-                  `${prefix}${st`}`}`,
+                  `${prefix}${blockEnd("")}`,
                 ];
               }
               return [
                 `${prefix}${st`if (frame === null) {`}`,
                 ...restoringSpillLines.map(
                   (spill) => `${prefix}  ${spill}`),
-                `${prefix}${st`}`}`,
+                `${prefix}${blockEnd("")}`,
               ];
             }
             if (record?.kind !== "spill") return [line];
@@ -11422,7 +11557,7 @@ class JvmSsaBlockRenderer {
             e`.releaseUnwindFrame(plan, thread, frame);`))}`,
           `${indent}  ${st`locals = null;`}`,
           `${indent}  ${st`stack = null;`}`,
-          `${indent}${st`}`}`,
+          `${indent}${blockEnd("")}`,
         ];
         restoringRenderedTree = restoringRenderedTree.flatMap((line) => {
           const kind = recordOf(line)?.kind;
@@ -11805,7 +11940,7 @@ class JvmSsaBlockRenderer {
               recordStatement([`${checkedLeafBodyLabel}: {`],
                 {kind: "blockLabel", label: checkedLeafBodyLabel}),
               ...checkedLeafRenderedTree,
-              st`}`,
+              blockEnd(""),
             ];
           }
           if (shrinkingArrayWindowLeaf) {
