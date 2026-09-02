@@ -447,11 +447,13 @@ function partsWriteThrowOrTry(parts) {
   return skeleton.includes("throw ") || skeleton.includes("try {");
 }
 
-// The `return` a statement leaves its activation through, located in the
+// Every `return` a statement leaves its activation through, located in the
 // statement's own literal chunks. An operand reference contributes exactly one
 // placeholder character to the skeleton, so it can neither supply nor split the
-// keyword, and a `return` that only occurs inside a rendered string (a deopt
-// reason naming one) is not at a statement position and is not reported.
+// keyword, and the scan skips rendered string literals, so the deopt reason
+// `'structured SSA return with active child'` is not one. Anything else that
+// reads as a `return` is reported, including a shape no exit emitter is known
+// to produce: the caller must either route it or reject the whole variant.
 function partsReturnPositions(parts) {
   const skeleton = partsSkeleton(parts);
   const positions = [];
@@ -2029,7 +2031,7 @@ class JvmSsaBlockRenderer {
       };
       published.assemble = ({
         source = published.source, argumentValues, resultName, exitLabel,
-        namespace, declareResult = true, bindings = [],
+        namespace, declareResult = true,
       }) => {
         if (typeof source !== "string" || typeof resultName !== "string" ||
             typeof exitLabel !== "string" ||
@@ -2052,7 +2054,6 @@ class JvmSsaBlockRenderer {
           ...argumentValues.map((value, index) =>
             `const ${namespace}a${index} = ${value};`),
           `${exitLabel}: {`,
-          ...bindings.map(({name, value}) => `  const ${name} = ${value};`),
           ...published.argumentNames.map((name, index) =>
             `  const ${name} = ${namespace}a${index};`),
           `  const ${published.entryGuardName} = ${published.entryGuardValue};`,

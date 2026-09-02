@@ -412,7 +412,7 @@ generated.jvmRestoringDirectPositionalInsertion = {
   entryGuardName,         // `nestedEntryGuarded`
   entryGuardValue,        // `2`
   assemble({source, argumentValues, resultName, exitLabel, namespace,
-            declareResult, bindings}) -> string | null,
+            declareResult}) -> string | null,
 }
 ```
 
@@ -423,7 +423,9 @@ let <resultName>;                          // when declareResult
 const <namespace>a0 = <argumentValues[0]>; // staged in the caller's scope
 …
 <exitLabel>: {
-  const plan = <bindings…>;                // the restoring tier's plan
+  const plan = jvmRegionInlinePlan<i>;     // the restoring tier's plan, which
+                                           // the region compiler prefixes onto
+                                           // the insertable source
   const argument0 = <namespace>a0;
   …
   const nestedEntryGuarded = 2;
@@ -500,6 +502,10 @@ Every one of these is an identity or metadata check over statement records, not
 a scan of generated text. An emitter that grows a new exit form loses inlining
 rather than escaping the caller's activation.
 
+`JVM_DEBUG_INSERTION_VETO=<file>` appends one line per rejection, naming the
+reason and the statement, so a body that stops being insertable can be traced
+back to the emitter that changed.
+
 ### Composition
 
 `inlineAtomicPositionalSource` was not applied to the renderer's published
@@ -560,8 +566,9 @@ zero `inlineFailures`.
 
 ### Generated-text differences
 
-Diffing all 31 emitted region modules over the two JIT test files, master vs
-this change, the only differences inside inlined bodies are:
+Diffing the 31 emitted region modules over the two JIT test files, master vs
+this change: 9 are byte-identical (no edge in them was inlined) and 22 differ.
+Every difference is inside an inlined body, and they are:
 
 1. the alpha-renaming is gone — the callee's names are its own, shadowing the
    caller's inside the inserted block;

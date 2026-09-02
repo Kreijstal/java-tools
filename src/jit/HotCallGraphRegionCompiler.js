@@ -1918,10 +1918,13 @@ class HotCallGraphRegionCompiler {
       // (`argument<n>`, its entry guard, its own `local<slot>` / `ssaValue<n>`)
       // are bound inside the inserted block, where they shadow the caller's
       // rather than colliding with them.
+      // Which body the callee contributes is a composition decision, so the
+      // insertion always comes from the map the composition built. There is no
+      // fallback to the callee's own published internal-region insertion: a
+      // node composed through the exceptional path contributes its restoring
+      // body instead, and guessing would insert the wrong one.
       const insertion = inlineEdges?.has(edge)
-        ? inlineInsertions?.get(edge) ||
-          edge.node.generated.jvmInternalRegionPositionalInsertion || null
-        : null;
+        ? inlineInsertions?.get(edge) || null : null;
       // The names this insertion introduces in the caller -- its exit label
       // and the staging slots for its arguments -- carry both the call site
       // and the callee's compile serial. The call site separates two
