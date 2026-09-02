@@ -15,6 +15,8 @@ const { parse: parseJavaScript } = require("acorn");
 const {
   outlineLargeRegionLoops,
   partitionOversizedLinearBlocks,
+  regionUnit,
+  renderRegionUnit,
 } = require("./HotCallGraphRegionCompiler");
 const STRUCTURED_CONTINUATION = Symbol("jvm.structuredSsaContinuation");
 const STRUCTURED_LONG_OPCODES = new Set([
@@ -463,20 +465,86 @@ function partsBodyHelperNames(parts) {
   return found;
 }
 
+// Which characters of a skeleton are code rather than the contents of a
+// string literal or a comment the emitter wrote. Operands are already blanked
+// to one placeholder character, so what is left is the emitter's own literal
+// text: a `;` inside `'/ by zero'` or a keyword inside `/*__JVM_...__*/` must
+// not be read as syntax.
+function skeletonCodeMask(skeleton) {
+  const mask = new Array(skeleton.length).fill(true);
+  let index = 0;
+  while (index < skeleton.length) {
+    const character = skeleton[index];
+    if (character === "'" || character === "\"" || character === "`") {
+      mask[index] = false;
+      index += 1;
+      while (index < skeleton.length) {
+        mask[index] = false;
+        if (skeleton[index] === "\\") { index += 2; continue; }
+        if (skeleton[index] === character) { index += 1; break; }
+        index += 1;
+      }
+      continue;
+    }
+    if (character === "/" && skeleton[index + 1] === "/") {
+      while (index < skeleton.length) mask[index++] = false;
+      continue;
+    }
+    if (character === "/" && skeleton[index + 1] === "*") {
+      mask[index] = false;
+      mask[index + 1] = false;
+      index += 2;
+      while (index < skeleton.length) {
+        mask[index] = false;
+        if (skeleton[index] === "*" && skeleton[index + 1] === "/") {
+          mask[index + 1] = false;
+          index += 2;
+          break;
+        }
+        index += 1;
+      }
+      continue;
+    }
+    index += 1;
+  }
+  return mask;
+}
+
 // A keyword the emitter wrote, as opposed to the same characters inside an
-// operand: operands are one placeholder character in the skeleton, so a
-// word-boundary test on the skeleton answers about the emitted statement.
-function skeletonKeywordPositions(skeleton, keyword) {
+// operand, a string or a comment: operands are one placeholder character in
+// the skeleton, so a word-boundary test on the code positions answers about
+// the emitted statement.
+function skeletonKeywordPositions(skeleton, keyword, mask = null) {
+  const codeMask = mask || skeletonCodeMask(skeleton);
   const positions = [];
   let position = skeleton.indexOf(keyword);
   while (position >= 0) {
-    if (!isPartsWordCharacter(skeleton[position - 1]) &&
+    if (codeMask[position] &&
+        !isPartsWordCharacter(skeleton[position - 1]) &&
         !isPartsWordCharacter(skeleton[position + keyword.length])) {
       positions.push(position);
     }
     position = skeleton.indexOf(keyword, position + 1);
   }
   return positions;
+}
+
+// Where the statement starting at `from` ends: the first `;` the emitter
+// wrote outside every bracket it opened after that point. Returns -1 when the
+// statement's own block closes first, which means the shape is not one
+// terminated by a semicolon.
+function skeletonStatementEnd(skeleton, from, mask) {
+  let depth = 0;
+  for (let index = from; index < skeleton.length; index += 1) {
+    if (!mask[index]) continue;
+    const character = skeleton[index];
+    if (character === "(" || character === "[" || character === "{") depth += 1;
+    else if (character === ")" || character === "]" || character === "}") {
+      if (depth === 0) return -1;
+      depth -= 1;
+    } else if (character === ";" && depth === 0) return index;
+  }
+  return -1;
 }
 
 // The sub-list of `parts` covering the skeleton range [start, end). An
@@ -515,69 +583,55 @@ function partsSliceBySkeleton(parts, start, end) {
 // leaves the statement where it is.
 function partsReturnSplit(parts) {
   const skeleton = partsSkeleton(parts);
-  const returns = skeletonKeywordPositions(skeleton, "return");
+  const mask = skeletonCodeMask(skeleton);
+  const returns = skeletonKeywordPositions(skeleton, "return", mask);
   if (!returns.length) return null;
   if (returns.length > 1) return {recognized: false};
   const start = returns[0];
-  const semicolons = [];
-  for (let index = 0; index < skeleton.length; index += 1) {
-    if (skeleton[index] === ";") semicolons.push(index);
-  }
-  if (semicolons.length !== 1 || semicolons[0] < start) {
-    return {recognized: false};
-  }
-  const end = semicolons[0] + 1;
-  const prefix = skeleton.slice(0, start);
-  const suffix = skeleton.slice(end);
-  // The prefix of a one-line guard (`if (...) { `) and its tail (` }`).
-  // Anything else around the return would change meaning when the return
-  // becomes a multi-statement block.
-  if (prefix.trim() !== "" &&
-      !(prefix.trimStart().startsWith("if (") &&
-        prefix.trimEnd().endsWith(")") ||
-        prefix.trimStart().startsWith("if (") &&
-          prefix.trimEnd().endsWith("{"))) {
-    return {recognized: false};
-  }
-  if (suffix.trim() !== "" && suffix.trim() !== "}") {
-    return {recognized: false};
-  }
-  if (prefix.trim() !== "" &&
-      (skeleton.includes("'") || skeleton.includes("\"") ||
-        skeleton.includes("`"))) {
-    return {recognized: false};
-  }
+  const end = skeletonStatementEnd(skeleton, start + "return".length, mask);
+  if (end < 0) return {recognized: false};
   let argumentStart = start + "return".length;
   while (skeleton[argumentStart] === " ") argumentStart += 1;
   return {
     recognized: true,
     before: partsSliceBySkeleton(parts, 0, start),
-    argument: argumentStart >= semicolons[0]
-      ? null : partsSliceBySkeleton(parts, argumentStart, semicolons[0]),
-    after: partsSliceBySkeleton(parts, end, skeleton.length),
+    argument: argumentStart >= end
+      ? null : partsSliceBySkeleton(parts, argumentStart, end),
+    after: partsSliceBySkeleton(parts, end + 1, skeleton.length),
   };
 }
 
-// A plain `break;` / `continue;` / `break <label>;` the emitter wrote, or
-// `{recognized: false}` when the statement mentions one of those keywords in
-// a shape a consumer must not relocate.
+// The `break` / `continue` a statement carries, split the same way a return
+// is: the parts before the jump, its label, and the parts after it. A jump is
+// always a complete statement, so replacing its own range by a block is valid
+// wherever the emitter wrote it. A statement carrying more than one is
+// reported unrecognized and stays where it is.
 function partsJumpStatement(parts) {
   const skeleton = partsSkeleton(parts);
-  const breaks = skeletonKeywordPositions(skeleton, "break");
-  const continues = skeletonKeywordPositions(skeleton, "continue");
+  const mask = skeletonCodeMask(skeleton);
+  const breaks = skeletonKeywordPositions(skeleton, "break", mask);
+  const continues = skeletonKeywordPositions(skeleton, "continue", mask);
   if (!breaks.length && !continues.length) return null;
   if (breaks.length + continues.length > 1) return {recognized: false};
   const kind = breaks.length ? "break" : "continue";
-  const trimmed = skeleton.trim();
-  if (!trimmed.startsWith(kind) || !trimmed.endsWith(";")) {
+  const start = breaks.length ? breaks[0] : continues[0];
+  let cursor = start + kind.length;
+  while (skeleton[cursor] === " ") cursor += 1;
+  const labelStart = cursor;
+  while (isPartsWordCharacter(skeleton[cursor])) cursor += 1;
+  const label = cursor > labelStart
+    ? skeleton.slice(labelStart, cursor) : null;
+  while (skeleton[cursor] === " ") cursor += 1;
+  if (skeleton[cursor] !== ";" || !mask[cursor]) {
     return {recognized: false};
   }
-  const inner = trimmed.slice(kind.length, trimmed.length - 1).trim();
-  if (inner === "") return {recognized: true, kind, label: null};
-  for (let index = 0; index < inner.length; index += 1) {
-    if (!isPartsWordCharacter(inner[index])) return {recognized: false};
-  }
-  return {recognized: true, kind, label: inner};
+  return {
+    recognized: true,
+    kind,
+    label,
+    before: partsSliceBySkeleton(parts, 0, start),
+    after: partsSliceBySkeleton(parts, cursor + 1, skeleton.length),
+  };
 }
 
 // The label a statement introduces (`L1: while (true) {`). `case`/`default`
@@ -615,6 +669,15 @@ function partsRelocationHostile(parts) {
     if (skeletonKeywordPositions(skeleton, keyword).length) return true;
   }
   return false;
+}
+
+// Whether the statement continues the block it closes (`} else {`,
+// `} catch (error) {`, `} finally {`). Its nesting delta is zero, but a
+// consumer must not treat it as an ordinary statement: it belongs to the
+// construct around it and can never be relocated on its own.
+function partsContinuesBlock(parts) {
+  const skeleton = partsSkeleton(parts).trim();
+  return skeleton.startsWith("}") && skeleton.endsWith("{");
 }
 
 function partsYields(parts) {
@@ -1955,11 +2018,13 @@ class JvmSsaBlockRenderer {
         delta,
         label: partsLabelName(parts),
         jump: jump && jump.recognized
-          ? {kind: jump.kind, label: jump.label} : null,
+          ? {kind: jump.kind, label: jump.label,
+            before: jump.before, after: jump.after} : null,
         exit: exit && exit.recognized ? {
           before: exit.before, argument: exit.argument, after: exit.after,
         } : null,
         yields: partsYields(parts),
+        continuesBlock: partsContinuesBlock(parts),
         opens: delta > 0
           ? (record.kind === "loopHeader" ? "loop"
             : record.opensTry ? "try" : named || "block")
@@ -1970,6 +2035,7 @@ class JvmSsaBlockRenderer {
         // scope it was written in.
         relocatable: record.foreign !== true &&
           !(jump && !jump.recognized) && !(exit && !exit.recognized) &&
+          !(jump && exit) &&
           named === null && !partsCarriesNestedFunction(parts) &&
           !partsRelocationHostile(parts),
       };
@@ -11771,32 +11837,51 @@ class JvmSsaBlockRenderer {
       ...declarations, ...tree];
     const body = buildBody(renderedTree);
     const canonicalGeneratedSource = body.join("\n");
-    const outlinedGenerated = this.loopOutliningEnabled && useContinuations
-      ? outlineLargeRegionLoops(canonicalGeneratedSource, {
-        minimumSourceBytes: this.loopOutlineSourceBytes,
-        maximumOutlines: 32,
-        namespace: 97,
-        generator: true,
-      })
-      : {source: canonicalGeneratedSource, helperSources: [], count: 0,
-        outlinedSourceBytes: 0};
-    const outlinedGeneratedSource = outlinedGenerated.count > 0
-      ? `${outlinedGenerated.source}\n${outlinedGenerated.helperSources.join("\n")}`
+    // Loop outlining and straight-line partitioning of the continuation tier
+    // are selections over the statement records the emitters wrote, so they
+    // need the canonical body as a fragment list. The body's prologue still
+    // carries lines no emitter recorded -- the entry scaffold, the local
+    // declarations, the spill helper and the frame materialization helpers --
+    // so `regionFragmentsOf` declines it and both passes are inert here until
+    // those emitters record what they write. They stay wired: nothing about
+    // them is specific to the region tier.
+    const canonicalFragments = this.loopOutliningEnabled ||
+      this.linearPartitionEnabled
+      ? regionFragmentsOf(body.filter((line) => typeof line === "string"))
+      : null;
+    const canonicalStatements = canonicalFragments
+      ? canonicalFragments.flatMap((fragment) => fragment.statements) : null;
+    const outlinedGenerated = this.loopOutliningEnabled && useContinuations &&
+      canonicalStatements
+      ? outlineLargeRegionLoops(
+        regionUnit({statements: canonicalStatements, generator: true}), {
+          minimumSourceBytes: this.loopOutlineSourceBytes,
+          maximumOutlines: 32,
+          namespace: 97,
+        })
+      : {unit: null, helpers: [], count: 0, outlinedSourceBytes: 0};
+    const outlinedGeneratedUnits = outlinedGenerated.count > 0
+      ? [outlinedGenerated.unit, ...outlinedGenerated.helpers]
+      : (canonicalStatements
+        ? [regionUnit({statements: canonicalStatements, generator: true})]
+        : null);
+    const outlinedGeneratedSource = outlinedGeneratedUnits
+      ? outlinedGeneratedUnits.map(renderRegionUnit).join("\n")
       : canonicalGeneratedSource;
     const partitionedGenerated = this.linearPartitionEnabled &&
-      useContinuations &&
+      useContinuations && outlinedGeneratedUnits &&
       outlinedGeneratedSource.length > this.linearPartitionUnitBytes
-      ? partitionOversizedLinearBlocks(outlinedGeneratedSource, {
+      ? partitionOversizedLinearBlocks(outlinedGeneratedUnits, {
         maximumUnitBytes: this.linearPartitionUnitBytes,
         targetSegmentBytes: this.linearPartitionSegmentBytes,
         minimumSegmentBytes: this.linearPartitionMinimumSegmentBytes,
-        rootProgramGenerator: true,
         namespace: "structured",
-        directive: "'use strict';\n",
       })
-      : {source: outlinedGeneratedSource, count: 0,
-        partitionedSourceBytes: 0};
-    const generatedSource = partitionedGenerated.source;
+      : {units: outlinedGeneratedUnits, count: 0, partitionedSourceBytes: 0};
+    const generatedSource = partitionedGenerated.count > 0 ||
+      outlinedGenerated.count > 0
+      ? partitionedGenerated.units.map(renderRegionUnit).join("\n")
+      : canonicalGeneratedSource;
     try {
       const positionalAstRejections = [];
       const createStructuredFunction = (tier, parameters, source, ...options) => {

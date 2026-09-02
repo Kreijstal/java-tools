@@ -26,38 +26,6 @@ function hasRestoringTransientDeopt(generated) {
   return (generated?.jvmStructuredRestoringRangeGuardDeoptCount || 0) > 0;
 }
 
-function walkAst(node, visit, parent = null) {
-  if (!node || typeof node !== "object") return;
-  visit(node, parent);
-  for (const [key, child] of Object.entries(node)) {
-    if (key === "start" || key === "end" || key === "loc" ||
-        key === "range") continue;
-    if (Array.isArray(child)) {
-      for (const entry of child) {
-        if (entry?.type) walkAst(entry, visit, node);
-      }
-    } else if (child?.type) {
-      walkAst(child, visit, node);
-    }
-  }
-}
-
-// A generated generator body is parsed as the body of this declaration, so
-// acorn sees the `yield` tokens it really contains. Offsets are rebased onto
-// the emitted source afterwards; nothing downstream sees the wrapper.
-const GENERATOR_UNIT_PREFIX = "function* __jvmRegionUnit() {\n";
-
-function rebaseAstOffsets(node, delta) {
-  walkAst(node, (entry) => {
-    entry.start -= delta;
-    entry.end -= delta;
-    if (Array.isArray(entry.range)) {
-      entry.range[0] -= delta;
-      entry.range[1] -= delta;
-    }
-  });
-}
-
 function identifierIsPropertyName(node, parent) {
   return Boolean(
     parent?.type === "MemberExpression" && parent.property === node &&
@@ -343,16 +311,446 @@ function splitRegionModuleForFactoryHoist(plan) {
 }
 
 /**
+ * Structured region bodies.
+ *
+ * The renderer publishes each positional body as an ordered list of
+ * fragments, and each fragment as the statement records its emitter built:
+ * the parts list, the operand names the statement reads and writes, the block
+ * nesting it opens or closes, the label it introduces, the jump it is, and
+ * how a `return` it carries splits around its argument. The three structural
+ * passes below -- loop outlining, environment lifting and straight-line
+ * partitioning -- are selections and rewrites over those records.
+ *
+ * Nothing here reads emitted JavaScript. A statement is relocated by moving
+ * its record; a statement is rewritten by substituting operand references in
+ * its parts list and rendering it again, which is the same operation the
+ * renderer's own passes perform through `rerenderStatement`; and a statement
+ * this compiler emits itself states its own facts, because it wrote the text.
+ */
+
+// Render a published parts list. A reference may render as something other
+// than its name while a later stage still owns it, exactly as in the
+// renderer.
+function renderRegionParts(parts) {
+  let text = "";
+  for (const part of parts) {
+    text += typeof part === "string" ? part
+      : part.text !== undefined ? part.text : part.ref;
+  }
+  return text;
+}
+
+// Replace operand references by parts lists. This is the only way one of
+// these passes rewrites a statement.
+function substituteRegionParts(parts, replacements) {
+  const out = [];
+  for (const part of parts) {
+    if (typeof part === "string") { out.push(part); continue; }
+    const replacement = replacements.get(part.ref);
+    if (replacement === undefined) { out.push(part); continue; }
+    for (const piece of replacement) out.push(piece);
+  }
+  return out;
+}
+
+const REGION_STATEMENT_DEFAULTS = {
+  parts: null, kind: "regionOwned", def: null, write: null, delta: 0,
+  label: null, jump: null, exit: null, yields: false, opens: null,
+  continuesBlock: false, relocatable: true,
+  // Extra names one emitted statement introduces beyond `def`: the call-site
+  // `let a, b;` a hoisted run declaration becomes.
+  declares: null,
+};
+
+/**
+ * A statement this compiler emits itself.
+ *
+ * The caller states what the statement reads, writes and opens because it
+ * built the text from its own templates; none of it is recovered from the
+ * characters. `reads: null` marks a statement whose names are unknown -- the
+ * opaque result of a composition edit -- and disqualifies every region that
+ * contains it.
+ */
+function ownStatement(text, facts = {}) {
+  const trimmedStart = text.length - text.trimStart().length;
+  return {
+    ...REGION_STATEMENT_DEFAULTS,
+    ...facts,
+    text,
+    indent: text.slice(0, trimmedStart),
+    reads: facts.reads === null ? null : facts.reads || [],
+  };
+}
+
+// Statement text with an operand substitution applied. Indentation is applied
+// by the assembler and is not part of a statement's identity, so it is
+// re-attached to the re-rendered statement.
+function renderRegionStatement(statement, replacements = null) {
+  if (!statement.parts || !replacements || replacements.size === 0) {
+    return statement.text;
+  }
+  return `${statement.indent}${renderRegionParts(
+    substituteRegionParts(statement.parts, replacements)).trim()}`;
+}
+
+/**
+ * The top-level statements of a statement list.
+ *
+ * A statement that opens a block owns every statement up to its matching
+ * close, and a block continuation (`} else {`, `} catch (error) {`) keeps the
+ * construct it continues inside the same group -- its nesting delta is zero,
+ * so the walk needs no special case for it. Returns null when the deltas the
+ * emitters recorded do not balance, which makes every pass decline the body
+ * rather than guess at its structure.
+ */
+function statementGroups(statements, from = 0, to = statements.length) {
+  const groups = [];
+  let index = from;
+  while (index < to) {
+    const start = index;
+    let depth = statements[index].delta;
+    if (depth < 0) return null;
+    index += 1;
+    while (depth > 0 && index < to) {
+      depth += statements[index].delta;
+      if (depth < 0) return null;
+      index += 1;
+    }
+    if (depth !== 0) return null;
+    groups.push({start, end: index});
+  }
+  return groups;
+}
+
+function statementBytes(statements, from, to) {
+  let bytes = 0;
+  for (let index = from; index < to; index += 1) {
+    bytes += statements[index].text.length + 1;
+  }
+  return bytes > 0 ? bytes - 1 : 0;
+}
+
+/**
+ * The names a statement range introduces, reads from an enclosing scope and
+ * assigns there, in first-appearance order.
+ *
+ * Returns null when the range contains a statement whose names are unknown or
+ * that may not be relocated: a region whose free-variable set cannot be
+ * stated exactly is never extracted.
+ */
+function regionNames(statements, from, to) {
+  const declared = new Set();
+  for (let index = from; index < to; index += 1) {
+    const statement = statements[index];
+    if (!statement.relocatable || statement.reads === null) return null;
+    if (statement.def) declared.add(statement.def);
+    for (const name of statement.declares || []) declared.add(name);
+  }
+  const free = [];
+  const seen = new Set();
+  const written = new Set();
+  for (let index = from; index < to; index += 1) {
+    const statement = statements[index];
+    for (const name of statement.reads) {
+      if (declared.has(name) || seen.has(name)) continue;
+      seen.add(name);
+      free.push(name);
+    }
+    const write = statement.write;
+    if (!write || declared.has(write)) continue;
+    written.add(write);
+    if (!seen.has(write)) {
+      seen.add(write);
+      free.push(write);
+    }
+  }
+  return {declared, free, written};
+}
+
+// The labels a statement range introduces.
+function regionLabels(statements, from, to) {
+  const labels = new Set();
+  for (let index = from; index < to; index += 1) {
+    if (statements[index].label) labels.add(statements[index].label);
+  }
+  return labels;
+}
+
+/**
+ * Every jump in a statement range that leaves it.
+ *
+ * A labeled jump targets an enclosing label, so it stays inside the range
+ * exactly when the range introduces that label. An unlabeled jump binds to
+ * the innermost loop or switch, so it stays inside when the statement sits
+ * below one the range contains. `null` is returned when the range carries a
+ * jump the emitter did not write in a relocatable shape.
+ */
+function regionOutwardJumps(statements, from, to) {
+  const labels = regionLabels(statements, from, to);
+  const jumps = [];
+  let loopDepth = 0;
+  let breakableDepth = 0;
+  const openings = [];
+  for (let index = from; index < to; index += 1) {
+    const statement = statements[index];
+    if (statement.jump) {
+      const outward = statement.jump.label
+        ? !labels.has(statement.jump.label)
+        : (statement.jump.kind === "break"
+          ? breakableDepth === 0 : loopDepth === 0);
+      if (outward) jumps.push({index, ...statement.jump});
+    }
+    for (let step = 0; step < statement.delta; step += 1) {
+      openings.push(step === 0 ? statement.opens : "block");
+      if (statement.opens === "loop" && step === 0) {
+        loopDepth += 1;
+        breakableDepth += 1;
+      } else if (statement.opens === "switch" && step === 0) {
+        breakableDepth += 1;
+      }
+    }
+    for (let step = 0; step < -statement.delta; step += 1) {
+      const opened = openings.pop();
+      if (opened === "loop") { loopDepth -= 1; breakableDepth -= 1; }
+      else if (opened === "switch") breakableDepth -= 1;
+    }
+  }
+  return jumps;
+}
+
+/**
+ * Re-establish, through a helper's protocol, every `return` a relocated
+ * statement range carries.
+ *
+ * Each such statement published how it splits around its own `return`: the
+ * parts before it, its argument's parts, and the parts after it. The exit
+ * becomes a block that records the outcome and leaves the helper, spliced
+ * back between those two halves -- so an exit the emitter wrote as the
+ * consequent of a one-line guard stays that guard's consequent. Returns null
+ * when the range carries an exit in a shape the emitter did not publish.
+ */
+function rewriteRegionExits(statements, from, to, buildExit) {
+  const rewritten = [];
+  for (let index = from; index < to; index += 1) {
+    const statement = statements[index];
+    if (!statement.exit) { rewritten.push(statement); continue; }
+    const argument = statement.exit.argument
+      ? renderRegionParts(statement.exit.argument) : "undefined";
+    const text = `${renderRegionParts(statement.exit.before)}${
+      buildExit(argument)}${renderRegionParts(statement.exit.after)}`;
+    rewritten.push(ownStatement(`${statement.indent}${text.trim()}`, {
+      reads: statement.reads,
+      delta: statement.delta,
+      relocatable: false,
+    }));
+  }
+  return rewritten;
+}
+
+function regionRangeCarriesYield(statements, from, to) {
+  for (let index = from; index < to; index += 1) {
+    if (statements[index].yields) return true;
+  }
+  return false;
+}
+
+/**
+ * A compilation unit the structural passes rewrite: a function the region
+ * compiler emits, its body held as the statement records the renderer
+ * published for it.
+ */
+function regionUnit(fields) {
+  return {
+    name: fields.name || null,
+    headerLines: fields.headerLines || [],
+    footerLines: fields.footerLines || [],
+    statements: fields.statements || [],
+    generator: fields.generator === true,
+    partitionable: fields.partitionable !== false,
+  };
+}
+
+// A module region the compiler emits as finished text: it holds no statement
+// records and no pass touches it.
+function rawRegionUnit(text) {
+  return regionUnit({headerLines: [text], partitionable: false});
+}
+
+function renderRegionUnit(unit) {
+  return [
+    ...unit.headerLines,
+    ...unit.statements.map((statement) => statement.text),
+    ...unit.footerLines,
+  ].join("\n");
+}
+
+function regionUnitBytes(unit) {
+  return renderRegionUnit(unit).length;
+}
+
+/**
+ * The statement records of one published positional body.
+ *
+ * The renderer publishes the body as fragments and each fragment as the
+ * records behind its lines, so the flat statement list is a concatenation.
+ * The `'use strict';` directive is the one line the region compiler keeps
+ * outside the fragments, and the joined result is checked against the source
+ * the compiler is about to emit: a body whose records do not reproduce it
+ * exactly publishes nothing usable and every pass declines it.
+ */
+function regionStatementsFromFragments(source, fragments) {
+  if (typeof source !== "string" || !Array.isArray(fragments)) return null;
+  const statements = [];
+  if (source.startsWith(REGION_SOURCE_DIRECTIVE)) {
+    statements.push(ownStatement(REGION_SOURCE_DIRECTIVE.trimEnd(),
+      {kind: "directive"}));
+  }
+  for (const fragment of fragments) {
+    if (!Array.isArray(fragment.statements)) return null;
+    for (const statement of fragment.statements) statements.push(statement);
+  }
+  return statements.map((statement) => statement.text).join("\n") === source
+    ? statements : null;
+}
+
+const REGION_SOURCE_DIRECTIVE = "'use strict';\n";
+
+// Which published positional variant a node body came from, so its fragments
+// can be looked up. The comparison is on identity with the string the
+// renderer published, never on the body's content.
+function variantNameOfSource(generated, source) {
+  if (source === generated.jvmDirectPositionalSource) {
+    return "jvmDirectPositionalSource";
+  }
+  if (source === generated.jvmInternalRegionPositionalSource) {
+    return "jvmInternalRegionPositionalSource";
+  }
+  if (source === generated.jvmRestoringDirectPositionalSource) {
+    return "jvmRestoringDirectPositionalSource";
+  }
+  return null;
+}
+
+/**
+ * Keep a body's statement records in step with the edits that lowered its
+ * call sites.
+ *
+ * `rewriteCallBindings` links a node by splicing text it built itself into
+ * spans the renderer delimited with compiler-owned markers. The same edits
+ * are applied here to the statement list: a statement an edit rewrote, and
+ * every statement a multi-line edit spanned, become one opaque record whose
+ * names are unknown, so no later pass relocates it or anything containing
+ * it. An edit that deletes a statement outright -- an eliminated call binding
+ * or a dropped run counter -- leaves an empty record instead, which is exactly
+ * as relocatable as the blank line it emits.
+ *
+ * A merged record keeps the nesting delta of the statements it replaced: a
+ * lowered call span and its replacement are both complete constructs. If that
+ * ever stopped holding, the deltas would no longer balance and
+ * `statementGroups` would decline the body rather than mis-group it.
+ */
+function applyRegionStatementEdits(statements, edits) {
+  if (!statements) return null;
+  if (!edits.length) return statements;
+  const starts = [];
+  let cursor = 0;
+  for (const statement of statements) {
+    starts.push(cursor);
+    cursor += statement.text.length + 1;
+  }
+  const endOf = (index) => starts[index] + statements[index].text.length;
+  const locate = (offset) => {
+    let low = 0;
+    let high = statements.length - 1;
+    while (low <= high) {
+      const middle = (low + high) >> 1;
+      if (offset < starts[middle]) high = middle - 1;
+      else if (offset > endOf(middle)) low = middle + 1;
+      else return middle;
+    }
+    return -1;
+  };
+  const blocks = [];
+  for (const edit of [...edits].sort((left, right) =>
+    left.start - right.start)) {
+    const first = locate(edit.start);
+    const last = locate(edit.end);
+    if (first < 0 || last < 0 || last < first) return null;
+    const previous = blocks[blocks.length - 1];
+    if (previous && previous.last >= first) {
+      previous.last = Math.max(previous.last, last);
+      previous.edits.push(edit);
+    } else {
+      blocks.push({first, last, edits: [edit]});
+    }
+  }
+  const output = [];
+  let index = 0;
+  for (const block of blocks) {
+    while (index < block.first) output.push(statements[index++]);
+    const base = starts[block.first];
+    const text = applySourceEdits(
+      statements.slice(block.first, block.last + 1)
+        .map((statement) => statement.text).join("\n"),
+      block.edits.map((edit) => ({
+        start: edit.start - base,
+        end: edit.end - base,
+        replacement: edit.replacement,
+      })));
+    if (text === null) return null;
+    let delta = 0;
+    for (let entry = block.first; entry <= block.last; entry += 1) {
+      delta += statements[entry].delta;
+    }
+    output.push(text.trim() === ""
+      ? ownStatement(text)
+      : ownStatement(text, {delta, reads: null, relocatable: false}));
+    index = block.last + 1;
+  }
+  while (index < statements.length) output.push(statements[index++]);
+  return output;
+}
+
+/**
+ * Remove the renderer's exact per-method safe-point budget declarations.
+ *
+ * A fused graph is one scheduler execution unit, so every node closes over
+ * the module-owned counter instead of resetting the quantum at each internal
+ * edge. The declaration is removed by the exact text the renderer published
+ * for it, from the statement that carries it.
+ */
+function stripRegionSafePointBudgets(statements, declarations) {
+  if (!declarations || !declarations.length) return statements;
+  return statements.map((statement) => {
+    let text = statement.text;
+    for (const declaration of declarations) {
+      text = text.split(declaration).join("");
+    }
+    if (text === statement.text) return statement;
+    return ownStatement(text, {
+      delta: statement.delta,
+      reads: text.trim() === "" ? [] : null,
+      relocatable: text.trim() === "",
+    });
+  });
+}
+
+/**
  * Split oversized structured loops into ordinary nested JavaScript functions.
  *
  * The renderer has already proved the Java CFG and SSA joins before this pass
- * runs.  A nested function therefore keeps scalar locals as lexical bindings,
+ * runs. A nested function therefore keeps scalar locals as lexical bindings,
  * while V8/SpiderMonkey receive a separate optimization unit for the loop.
- * Java returns are explicitly forwarded to the containing region.  We reject
- * source constructs whose meaning would change across a function boundary;
- * this is intentionally a structural AST pass, never a guest-name heuristic.
+ * Java returns are explicitly forwarded to the containing region.
+ *
+ * A loop is a fragment the renderer published, and the names crossing its
+ * boundary are the ones its statements recorded, so the pass selects loops
+ * and joins statements; it never recovers a loop from emitted text. A loop
+ * whose statements are not all relocatable -- an exit the emitter wrote in an
+ * unrecognized shape, an opaque range a composition edit produced, a nested
+ * function whose captures extraction would rebind -- is left alone.
  */
-function outlineLargeRegionLoops(source, options = {}) {
+function outlineLargeRegionLoops(unit, options = {}) {
   const minimumSourceBytes = Math.max(512,
     Number(options.minimumSourceBytes) || 32768);
   const maximumOutlines = Math.max(0,
@@ -360,261 +758,291 @@ function outlineLargeRegionLoops(source, options = {}) {
   const numericNamespace = Number(options.namespace);
   const namespace = Number.isSafeInteger(numericNamespace) &&
     numericNamespace >= 0 ? String(numericNamespace) : "0";
-  let rewritten = source;
+  const empty = {
+    unit, helpers: [], count: 0, outlinedSourceBytes: 0,
+    largestOutlinedSourceBytes: 0,
+  };
+  if (!unit || !Array.isArray(unit.statements)) return empty;
+  let statements = unit.statements;
+  const sharedStateName = `jvmRegionOutlinedState${namespace}`;
+  const generator = unit.generator === true;
+  const helpers = [];
+  const helperNames = new Set();
   let outlineCount = 0;
   let outlinedSourceBytes = 0;
   let largestOutlinedSourceBytes = 0;
-  const helperSources = [];
-  const helperNames = new Set();
-  const sharedStateName = `jvmRegionOutlinedState${namespace}`;
-  const generator = options.generator === true;
 
-  const childrenOf = (node) => {
-    const children = [];
-    for (const [key, child] of Object.entries(node || {})) {
-      if (key === "start" || key === "end" || key === "loc" ||
-          key === "range") continue;
-      if (Array.isArray(child)) {
-        for (const entry of child) if (entry?.type) children.push(entry);
-      } else if (child?.type) {
-        children.push(child);
+  // Every loop in the body, innermost last, with the range it occupies.
+  const collectLoops = (from, to, into) => {
+    const groups = statementGroups(statements, from, to);
+    if (!groups) return false;
+    for (const group of groups) {
+      const head = statements[group.start];
+      if (head.opens === "loop") into.push(group);
+      if (group.end - group.start > 2) {
+        if (!collectLoops(group.start + 1, group.end - 1, into)) return false;
       }
     }
-    return children;
+    return true;
   };
-  const isFunction = (node) => node && (
-    node.type === "FunctionDeclaration" ||
-    node.type === "FunctionExpression" ||
-    node.type === "ArrowFunctionExpression");
-  const isLoop = (node) => node && (
-    node.type === "WhileStatement" || node.type === "DoWhileStatement" ||
-    node.type === "ForStatement" || node.type === "ForInStatement" ||
-    node.type === "ForOfStatement");
 
   while (outlineCount < maximumOutlines) {
-    let program;
-    try {
-      program = parse(rewritten, {
-        ecmaVersion: "latest", ranges: true, allowReturnOutsideFunction: true,
-      });
-    } catch (_) {
-      break;
-    }
-    const candidates = [];
-    const visit = (node, parent = null, currentFunction = null,
-      loopDepth = 0) => {
-      if (!node?.type) return;
-      const nextFunction = isFunction(node) ? node : currentFunction;
-      const currentIsLoop = isLoop(node);
-      if (currentIsLoop) {
-        const outlinedOwner = currentFunction?.type === "FunctionDeclaration" &&
-          currentFunction.id?.name?.startsWith("jvmRegionOutlinedLoop");
-        // The first loop is the payload of a helper created by this pass.
-        // Its nested loops may still be split, but wrapping the payload again
-        // would only add an infinite chain of equivalent helper functions.
-        if (!(outlinedOwner && loopDepth === 0)) {
-          const region = parent?.type === "LabeledStatement" &&
-            parent.body === node ? parent : node;
-          let nestedFunctionBytes = 0;
-          const measure = (entry, functionDepth = 0) => {
-            for (const child of childrenOf(entry)) {
-              if (isFunction(child)) {
-                if (functionDepth === 0 && child.type === "FunctionDeclaration" &&
-                    child.id?.name?.startsWith("jvmRegionOutlinedLoop")) {
-                  nestedFunctionBytes += child.end - child.start;
-                }
-                continue;
-              }
-              measure(child, functionDepth);
-            }
-          };
-          measure(region);
-          const executableBytes = region.end - region.start -
-            nestedFunctionBytes;
-          if (executableBytes >= minimumSourceBytes) {
-            candidates.push({node, region, executableBytes});
-          }
-        }
-      }
-      for (const child of childrenOf(node)) {
-        visit(child, node, nextFunction,
-          loopDepth + (currentIsLoop ? 1 : 0));
-      }
-    };
-    visit(program);
+    const loops = [];
+    if (!collectLoops(0, statements.length, loops)) break;
+    const candidates = loops.filter((loop) =>
+      statementBytes(statements, loop.start, loop.end) >= minimumSourceBytes);
     if (!candidates.length) break;
-
-    // Rewrite only candidates that contain no other candidate in this pass.
-    // The next parse sees the new helper as a distinct lexical function and
-    // may then split its parent.  This keeps all source edits non-overlapping.
+    // Rewrite only candidates that contain no other candidate: the next round
+    // sees the new helper call in place of the inner loop and may then split
+    // its parent, which keeps every edit non-overlapping.
     const innermost = candidates.filter((candidate) => !candidates.some(
       (other) => other !== candidate &&
-        other.region.start > candidate.region.start &&
-        other.region.end < candidate.region.end));
+        other.start >= candidate.start && other.end <= candidate.end &&
+        (other.start !== candidate.start || other.end !== candidate.end)));
     const edits = [];
     for (const candidate of innermost.slice(
       0, maximumOutlines - outlineCount)) {
-      const labels = new Set();
-      const returns = [];
-      const declared = new Set();
-      const referenced = [];
-      const written = new Set();
-      let unsupported = false;
-      let hasYield = false;
-      const audit = (node, parent = null, functionDepth = 0) => {
-        if (!node?.type) return;
-        if (node.type === "LabeledStatement") labels.add(node.label.name);
-        if (node.type === "VariableDeclarator") {
-          collectPatternNames(node.id, declared);
-        } else if (isFunction(node)) {
-          if (node.id) collectPatternNames(node.id, declared);
-          for (const parameter of node.params || []) {
-            collectPatternNames(parameter, declared);
-          }
-        } else if (node.type === "CatchClause") {
-          collectPatternNames(node.param, declared);
-        }
-        if (functionDepth === 0 && node.type === "ReturnStatement") {
-          returns.push(node);
-        }
-        if (node.type === "AssignmentExpression") {
-          collectPatternNames(node.left, written);
-        } else if (node.type === "UpdateExpression" &&
-            node.argument?.type === "Identifier") {
-          written.add(node.argument.name);
-        }
-        if (node.type === "Identifier" &&
-            !identifierIsPropertyName(node, parent)) {
-          referenced.push(node);
-        }
-        if (functionDepth === 0) {
-          if (node.type === "YieldExpression") {
-            if (generator) hasYield = true;
-            else unsupported = true;
-          } else if (
-              node.type === "AwaitExpression" ||
-              node.type === "ThisExpression" ||
-              node.type === "Super" ||
-              node.type === "MetaProperty" ||
-              node.type === "VariableDeclaration" && node.kind === "var" ||
-              node.type === "Identifier" && node.name === "arguments" ||
-              node.type === "CallExpression" &&
-                node.callee?.type === "Identifier" &&
-                node.callee.name === "eval") unsupported = true;
-        }
-        for (const child of childrenOf(node)) {
-          audit(child, node, functionDepth +
-            (isFunction(child) && child !== node ? 1 : 0));
-        }
-      };
-      audit(candidate.region);
-      const auditJumps = (node, functionDepth = 0) => {
-        if (!node?.type) return;
-        if (functionDepth === 0 &&
-            (node.type === "BreakStatement" ||
-              node.type === "ContinueStatement") &&
-            node.label && !labels.has(node.label.name)) unsupported = true;
-        for (const child of childrenOf(node)) {
-          auditJumps(child, functionDepth + (isFunction(child) ? 1 : 0));
-        }
-      };
-      auditJumps(candidate.region);
-      if (unsupported) continue;
+      const names = regionNames(statements, candidate.start, candidate.end);
+      if (!names) continue;
+      const outward = regionOutwardJumps(
+        statements, candidate.start, candidate.end);
+      if (outward.length) continue;
+      const hasYield = regionRangeCarriesYield(
+        statements, candidate.start, candidate.end);
+      if (hasYield && !generator) continue;
 
-      const id = outlineCount++;
+      const id = outlineCount;
       const helperName = `jvmRegionOutlinedLoop${namespace}_${id}`;
       const caughtName = `jvmRegionOutlinedError${namespace}_${id}`;
       const outputName = `jvmRegionOutlinedOutput${namespace}_${id}`;
-      // Generated SSA names are unique within the containing function. The
-      // complete declaration set (including nested outlined helpers) lets us
-      // compute a positional live-in ABI without making every scalar escape
-      // through a closure context. Global/captured constants are legal
-      // positional operands too and are resolved once at the call site.
-      const freeNames = [];
-      const seenFreeNames = new Set();
-      for (const identifier of referenced) {
-        const name = identifier.name;
-        if (declared.has(name) || labels.has(name) ||
-            helperNames.has(name) ||
-            seenFreeNames.has(name)) continue;
-        seenFreeNames.add(name);
-        freeNames.push(name);
-      }
-      const liveOutNames = freeNames.filter((name) => written.has(name));
-      const fragmentStart = candidate.region.start;
-      let fragment = rewritten.slice(fragmentStart, candidate.region.end);
-      // Braces keep the multi-statement replacement a single statement: the
-      // original return may be an unbraced if-consequent.
-      const returnEdits = returns.map((entry) => ({
-        start: entry.start - fragmentStart,
-        end: entry.end - fragmentStart,
-        replacement: [
+      // Generated SSA names are unique within the containing function, so a
+      // positional live-in ABI is exact: every free name becomes a parameter
+      // and every free name the range assigns is written back.
+      const freeNames = names.free.filter((name) =>
+        !helperNames.has(name) && name !== sharedStateName);
+      const liveOutNames = freeNames.filter((name) => names.written.has(name));
+      const body = rewriteRegionExits(statements, candidate.start,
+        candidate.end, (argument) => [
           `{ ${outputName}[0] = 1;`,
-          `${outputName}[1] = ${entry.argument
-            ? rewritten.slice(entry.argument.start, entry.argument.end)
-            : "undefined"};`,
+          `${outputName}[1] = ${argument};`,
           ...liveOutNames.map((name, index) =>
             `${outputName}[${index + 2}] = ${name};`),
           "return; }",
-        ].join(" "),
-      }));
-      fragment = applySourceEdits(fragment, returnEdits);
-      if (fragment === null) {
-        outlineCount -= 1;
-        continue;
-      }
-      const assignLiveOuts = liveOutNames.map((name, index) =>
-        `  ${name} = ${sharedStateName}[${index + 2}];`);
+        ].join(" "));
+      outlineCount += 1;
       helperNames.add(helperName);
-      helperSources.push([
-        `function${hasYield ? "*" : ""} ${helperName}(${[
-          ...freeNames, outputName].join(",")}) {`,
-        "  try {",
-        ...fragment.split("\n").map((line) => `    ${line}`),
-        `    ${outputName}[0] = 0;`,
-        `    ${outputName}[1] = undefined;`,
-        ...liveOutNames.map((name, index) =>
-          `    ${outputName}[${index + 2}] = ${name};`),
-        `  } catch (${caughtName}) {`,
-        `    ${outputName}[0] = 2;`,
-        `    ${outputName}[1] = ${caughtName};`,
-        ...liveOutNames.map((name, index) =>
-          `    ${outputName}[${index + 2}] = ${name};`),
-        "  }",
-        "}",
-      ].join("\n"));
-      edits.push({
-        start: candidate.region.start,
-        end: candidate.region.end,
-        replacement: [
-          "{",
-          `  ${hasYield ? "yield* " : ""}${helperName}(${[
-            ...freeNames, sharedStateName].join(",")});`,
-          ...assignLiveOuts,
-          `  if (${sharedStateName}[0] === 1) ` +
-            `return ${sharedStateName}[1];`,
-          `  if (${sharedStateName}[0] === 2) ` +
-            `throw ${sharedStateName}[1];`,
+      helpers.push(regionUnit({
+        name: helperName,
+        generator: hasYield,
+        headerLines: [
+          `function${hasYield ? "*" : ""} ${helperName}(${[
+            ...freeNames, outputName].join(",")}) {`,
+          "  try {",
+        ],
+        statements: [
+          ...body.map((statement) => ownStatement(
+            `    ${statement.text}`, {
+              reads: statement.reads, write: statement.write,
+              def: statement.def, delta: statement.delta,
+              label: statement.label, jump: statement.jump,
+              opens: statement.opens, yields: statement.yields,
+              continuesBlock: statement.continuesBlock,
+              parts: statement.parts, kind: statement.kind,
+              declares: statement.declares,
+              relocatable: statement.relocatable,
+            })),
+          ownStatement(`    ${outputName}[0] = 0;`),
+          ownStatement(`    ${outputName}[1] = undefined;`),
+          ...liveOutNames.map((name, index) => ownStatement(
+            `    ${outputName}[${index + 2}] = ${name};`)),
+        ],
+        footerLines: [
+          `  } catch (${caughtName}) {`,
+          `    ${outputName}[0] = 2;`,
+          `    ${outputName}[1] = ${caughtName};`,
+          ...liveOutNames.map((name, index) =>
+            `    ${outputName}[${index + 2}] = ${name};`),
+          "  }",
           "}",
-        ].join("\n"),
+        ],
+      }));
+      const callReads = [...freeNames, sharedStateName, helperName];
+      edits.push({
+        start: candidate.start,
+        end: candidate.end,
+        replacement: [
+          ownStatement("{", {delta: 1, opens: "block", reads: callReads}),
+          ownStatement(`  ${hasYield ? "yield* " : ""}${helperName}(${[
+            ...freeNames, sharedStateName].join(",")});`,
+          {reads: callReads, yields: hasYield}),
+          ...liveOutNames.map((name, index) => ownStatement(
+            `  ${name} = ${sharedStateName}[${index + 2}];`,
+            {reads: [sharedStateName], write: name})),
+          ownStatement(
+            `  if (${sharedStateName}[0] === 1) return ${sharedStateName}[1];`,
+            {
+              reads: [sharedStateName],
+              exit: {
+                before: [`if (${sharedStateName}[0] === 1) `],
+                argument: [`${sharedStateName}[1]`],
+                after: [],
+              },
+            }),
+          ownStatement(
+            `  if (${sharedStateName}[0] === 2) throw ${sharedStateName}[1];`,
+            {reads: [sharedStateName]}),
+          ownStatement("}", {delta: -1}),
+        ],
       });
-      outlinedSourceBytes += candidate.executableBytes;
+      const bytes = statementBytes(statements, candidate.start, candidate.end);
+      outlinedSourceBytes += bytes;
       largestOutlinedSourceBytes = Math.max(
-        largestOutlinedSourceBytes, candidate.executableBytes);
+        largestOutlinedSourceBytes, bytes);
     }
     if (!edits.length) break;
-    const next = applySourceEdits(rewritten, edits);
-    if (next === null) break;
-    rewritten = next;
+    const next = statements.slice();
+    for (const edit of [...edits].sort((left, right) =>
+      right.start - left.start)) {
+      next.splice(edit.start, edit.end - edit.start, ...edit.replacement);
+    }
+    statements = next;
   }
+  if (outlineCount === 0) return empty;
   return {
-    source: outlineCount > 0
-      ? `const ${sharedStateName} = [];\n${rewritten}` : rewritten,
-    helperSources,
+    unit: regionUnit({
+      ...unit,
+      statements: [
+        ownStatement(`const ${sharedStateName} = [];`,
+          {kind: "const", def: sharedStateName}),
+        ...statements,
+      ],
+    }),
+    helpers,
     count: outlineCount,
     outlinedSourceBytes,
     largestOutlinedSourceBytes,
   };
+}
+
+/**
+ * Rewrite the stable function-scoped locals of oversized units into one
+ * per-invocation environment array.
+ *
+ * A framed region body declares hundreds of call-site caches and scalar
+ * locals at its top level that are referenced throughout; partitioning such a
+ * body under a positional ABI re-plumbs that whole name set through every
+ * segment boundary and grows the source faster than it shrinks the units.
+ * After this pass a segment's free-name set collapses to the environment
+ * array plus the unit parameters.
+ *
+ * The names come from the renderer's published declaration list, and a
+ * reference is rewritten by substituting the operand in the statement's own
+ * parts list and rendering it again -- the same operation the renderer
+ * performs on its own statements. Only names declared exactly once in the
+ * unit's top statement list are lifted, so per-iteration block scoping is
+ * never disturbed. Lifting a `const` into a mutable slot is safe because
+ * generated code never reassigns and never relies on TDZ.
+ */
+function liftOversizedUnitLocalsToEnvironment(units, options = {}) {
+  const maximumUnitBytes = Math.max(16384,
+    Number(options.maximumUnitBytes) || 49152);
+  const namespace = String(options.namespace ?? "0")
+    .replace(/[^A-Za-z0-9_]/g, "") || "0";
+  let liftedNames = 0;
+  let liftedUnits = 0;
+  const rewrittenUnits = units.map((unit, unitIndex) => {
+    if (!unit.partitionable || !unit.statements.length) return unit;
+    if (regionUnitBytes(unit) <= maximumUnitBytes) return unit;
+    const envName = `jvmRegionEnv${namespace}_${unitIndex}`;
+    const groups = statementGroups(unit.statements);
+    if (!groups) return unit;
+    // One declaration site per name across the whole unit, or it stays local;
+    // and every statement has to be rewritable, or a reference could be left
+    // spelled the old way.
+    const declarationCounts = new Map();
+    for (const statement of unit.statements) {
+      if (!statement.parts || statement.reads === null) return unit;
+      if (statement.def) {
+        declarationCounts.set(statement.def,
+          (declarationCounts.get(statement.def) || 0) + 1);
+      }
+    }
+    const slotIndex = new Map();
+    for (const group of groups) {
+      if (group.end !== group.start + 1) continue;
+      const statement = unit.statements[group.start];
+      if (statement.kind !== "const" && statement.kind !== "let" &&
+          statement.kind !== "letUninitialized" &&
+          statement.kind !== "safePointBudgetDeclaration") continue;
+      if (!statement.def || statement.def === envName) continue;
+      if (declarationCounts.get(statement.def) !== 1) continue;
+      if (!slotIndex.has(statement.def)) {
+        slotIndex.set(statement.def, slotIndex.size);
+      }
+    }
+    if (!slotIndex.size) return unit;
+    const replacements = new Map();
+    for (const [name, slot] of slotIndex) {
+      replacements.set(name, [`${envName}[${slot}]`]);
+    }
+    const rewritten = [];
+    for (const statement of unit.statements) {
+      if (slotIndex.has(statement.def)) {
+        // The declaration becomes an in-place slot assignment: the
+        // initializer keeps its own operands, which the same substitution
+        // rewrites.
+        const initializer = statement.parts.slice(
+          statement.parts.findIndex((part) =>
+            typeof part !== "string" && part.ref === statement.def) + 1);
+        const assignment = renderRegionParts(
+          substituteRegionParts(initializer, replacements)).trim();
+        rewritten.push(ownStatement(`${statement.indent}${
+          assignment.startsWith("=")
+            ? `${envName}[${slotIndex.get(statement.def)}] ${assignment}`
+            : ";"}`, {
+          reads: [...statement.reads.filter((name) => !slotIndex.has(name)),
+            envName],
+          write: null,
+          delta: statement.delta,
+        }));
+        continue;
+      }
+      const text = renderRegionStatement(statement, replacements);
+      if (text === statement.text) { rewritten.push(statement); continue; }
+      rewritten.push({
+        ...statement,
+        text,
+        parts: substituteRegionParts(statement.parts, replacements),
+        // A statement's published exit split is derived from its parts, so it
+        // is substituted with them: a later partition of this unit splices the
+        // lifted argument, not the name it used to be spelled with.
+        exit: statement.exit ? {
+          before: substituteRegionParts(statement.exit.before, replacements),
+          argument: statement.exit.argument
+            ? substituteRegionParts(statement.exit.argument, replacements)
+            : null,
+          after: substituteRegionParts(statement.exit.after, replacements),
+        } : null,
+        def: statement.def,
+        write: slotIndex.has(statement.write) ? null : statement.write,
+        reads: [...statement.reads.filter((name) => !slotIndex.has(name)),
+          envName],
+      });
+    }
+    liftedNames += slotIndex.size;
+    liftedUnits += 1;
+    return regionUnit({
+      ...unit,
+      statements: [
+        ownStatement(`const ${envName} = new Array(${
+          slotIndex.size}).fill(undefined);`,
+        {kind: "const", def: envName}),
+        ...rewritten,
+      ],
+    });
+  });
+  if (!liftedNames) return {units, liftedNames: 0, liftedUnits: 0};
+  return {units: rewrittenUnits, liftedNames, liftedUnits};
 }
 
 /**
@@ -623,14 +1051,13 @@ function outlineLargeRegionLoops(source, options = {}) {
  * outlineLargeRegionLoops splits at loop granularity; region bodies dominated
  * by flat statement bulk (thousands of small statements plus embedded
  * conditionals) still exceed the engines' per-function optimization budgets.
- * This pass walks every module function whose executable self-size exceeds
+ * This pass walks every unit whose executable self-size exceeds
  * maximumUnitBytes and extracts maximal consecutive statement runs into
  * module-level helpers with the loop outliner's positional live-in/live-out
- * ABI.  A run executes exactly once per arrival at its block position, so the
- * call overhead is amortized over ~targetSegmentBytes of straight-line work —
- * unlike fine-grained loop outlining, which pays the ABI inside hot
- * iterations.  Single statements larger than a segment recurse into their
- * nested statement lists, innermost lists partitioning first.
+ * ABI. A run executes exactly once per arrival at its block position, so the
+ * call overhead is amortized over ~targetSegmentBytes of straight-line work.
+ * A statement larger than a segment recurses into its own nested statement
+ * lists, innermost lists partitioning first.
  *
  * Protocol extensions over the loop outliner:
  *  - outcome 3 carries an outward-jump table index: break/continue statements
@@ -643,223 +1070,12 @@ function outlineLargeRegionLoops(source, options = {}) {
  *    rewritten to plain assignments inside the helper (with a helper-preamble
  *    `let` so early protocol exits never read a TDZ binding), and written
  *    back as live-outs.
- *  - a run is rejected when a nested function inside it references any name
- *    the run does not declare: extraction would rebind that capture to the
- *    helper's parameter copy.
+ *  - a run carrying a statement that may not be relocated is rejected: an
+ *    exit in a shape the emitter did not publish, a nested function whose
+ *    captures extraction would rebind, or an opaque range a composition edit
+ *    produced.
  */
-const childrenOf = (node) => {
-  const children = [];
-  for (const [key, child] of Object.entries(node || {})) {
-    if (key === "start" || key === "end" || key === "loc" ||
-        key === "range") continue;
-    if (Array.isArray(child)) {
-      for (const entry of child) if (entry?.type) children.push(entry);
-    } else if (child?.type) {
-      children.push(child);
-    }
-  }
-  return children;
-};
-const isFunction = (node) => node && (
-  node.type === "FunctionDeclaration" ||
-  node.type === "FunctionExpression" ||
-  node.type === "ArrowFunctionExpression");
-const isLoop = (node) => node && (
-  node.type === "WhileStatement" || node.type === "DoWhileStatement" ||
-  node.type === "ForStatement" || node.type === "ForInStatement" ||
-  node.type === "ForOfStatement");
-const jumpLabelIdentifier = (node, parent) => Boolean(parent &&
-  (parent.type === "LabeledStatement" || parent.type === "BreakStatement" ||
-    parent.type === "ContinueStatement") && parent.label === node);
-
-// Collects every function whose own body (nested functions excluded) exceeds
-// the unit budget, skipping partitioner-emitted segment helpers, then keeps
-// only the innermost so queued source edits never overlap.
-function collectOversizedUnits(program, maximumUnitBytes) {
-  const units = [];
-  const collect = (node) => {
-    if (isFunction(node) && node.body?.type === "BlockStatement" &&
-        !(node.type === "FunctionDeclaration" &&
-          node.id?.name?.startsWith("jvmRegionSegment"))) {
-      let nestedFunctionBytes = 0;
-      const measure = (entry) => {
-        for (const child of childrenOf(entry)) {
-          if (isFunction(child)) {
-            nestedFunctionBytes += child.end - child.start;
-            continue;
-          }
-          measure(child);
-        }
-      };
-      measure(node.body);
-      if (node.end - node.start - nestedFunctionBytes > maximumUnitBytes) {
-        units.push(node);
-      }
-    }
-    for (const child of childrenOf(node)) collect(child);
-  };
-  collect(program);
-  return units.filter((unit) => !units.some((other) =>
-    other !== unit && other.start > unit.start && other.end < unit.end));
-}
-
-/**
- * Rewrites the stable function-scoped locals of oversized functions into one
- * per-invocation environment array. A framed region body declares hundreds of
- * call-site caches and scalar locals at its top level that are referenced
- * throughout; partitioning such a body under a positional ABI re-plumbs that
- * whole name set through every segment boundary and grows the source faster
- * than it shrinks the units. After this pass a segment's free-name set
- * collapses to the environment array plus the unit parameters, so a call
- * site stays a few dozen bytes regardless of how many locals cross the cut.
- *
- * Only names with exactly one declaration site in the unit are lifted (the
- * generated SSA namespace is shadow-free; anything else stays a local), and
- * only from `let`/`const` declarations in the unit body's top statement list,
- * so per-iteration block scoping is never disturbed. Lifting a `const` into
- * a mutable slot is safe because generated code never reassigns and never
- * relies on TDZ. Nested functions keep working: they capture the environment
- * array itself.
- */
-function liftOversizedUnitLocalsToEnvironment(source, options = {}) {
-  const maximumUnitBytes = Math.max(16384,
-    Number(options.maximumUnitBytes) || 49152);
-  const namespace = String(options.namespace ?? "0")
-    .replace(/[^A-Za-z0-9_]/g, "") || "0";
-  let program;
-  try {
-    program = parse(source, {
-      ecmaVersion: "latest", ranges: true, allowReturnOutsideFunction: true,
-    });
-  } catch (_) {
-    return {source, liftedNames: 0, units: 0};
-  }
-  const edits = [];
-  let liftedNames = 0;
-  let liftedUnits = 0;
-  const units = collectOversizedUnits(program, maximumUnitBytes);
-  for (let unitIndex = 0; unitIndex < units.length; unitIndex += 1) {
-    const unit = units[unitIndex];
-    const envName = `jvmRegionEnv${namespace}_${unitIndex}`;
-    // One declaration site per name across the whole unit, or it stays local.
-    const declarationCounts = new Map();
-    const bump = (name) => declarationCounts.set(
-      name, (declarationCounts.get(name) || 0) + 1);
-    const bumpPattern = (pattern) => {
-      const names = new Set();
-      collectPatternNames(pattern, names);
-      for (const name of names) bump(name);
-    };
-    let unsupportedUnit = false;
-    for (const parameter of unit.params || []) bumpPattern(parameter);
-    walkAst(unit.body, (node) => {
-      if (node.type === "VariableDeclarator") bumpPattern(node.id);
-      else if (isFunction(node)) {
-        if (node.id) bump(node.id.name);
-        for (const parameter of node.params || []) bumpPattern(parameter);
-      } else if (node.type === "CatchClause" && node.param) {
-        bumpPattern(node.param);
-      } else if (node.type === "WithStatement" ||
-          node.type === "CallExpression" &&
-            node.callee?.type === "Identifier" &&
-            node.callee.name === "eval" ||
-          node.type === "Identifier" && node.name === envName) {
-        unsupportedUnit = true;
-      }
-    });
-    if (unsupportedUnit) continue;
-    const forbidden = new Set(
-      ["arguments", "eval", "undefined", "NaN", "Infinity", envName]);
-    const slotIndex = new Map();
-    const liftedDeclarations = [];
-    for (const statement of unit.body.body) {
-      if (statement.type !== "VariableDeclaration" ||
-          statement.kind === "var") continue;
-      if (!statement.declarations.every((declarator) =>
-        declarator.id.type === "Identifier" &&
-        declarationCounts.get(declarator.id.name) === 1 &&
-        !forbidden.has(declarator.id.name))) continue;
-      liftedDeclarations.push(statement);
-      for (const declarator of statement.declarations) {
-        if (!slotIndex.has(declarator.id.name)) {
-          slotIndex.set(declarator.id.name, slotIndex.size);
-        }
-      }
-    }
-    if (!slotIndex.size) continue;
-    // Declaration statements become in-place slot assignments. Only the
-    // declaration prefix and the inter-declarator separators are replaced,
-    // so initializer expressions keep their own positions and their inner
-    // references are rewritten by the ordinary reference edits below.
-    for (const declaration of liftedDeclarations) {
-      const withInitializer = declaration.declarations
-        .filter((declarator) => declarator.init);
-      if (!withInitializer.length) {
-        edits.push({start: declaration.start, end: declaration.end,
-          replacement: ";"});
-        continue;
-      }
-      edits.push({
-        start: declaration.start,
-        end: withInitializer[0].init.start,
-        replacement: `${envName}[${
-          slotIndex.get(withInitializer[0].id.name)}] = `,
-      });
-      for (let k = 1; k < withInitializer.length; k += 1) {
-        edits.push({
-          start: withInitializer[k - 1].init.end,
-          end: withInitializer[k].init.start,
-          replacement: `; ${envName}[${
-            slotIndex.get(withInitializer[k].id.name)}] = `,
-        });
-      }
-      edits.push({
-        start: withInitializer[withInitializer.length - 1].init.end,
-        end: declaration.end,
-        replacement: ";",
-      });
-    }
-    const liftedDeclarationSet = new Set(liftedDeclarations);
-    const shorthandEditStarts = new Set();
-    walkAst(unit.body, (node, parent) => {
-      if (node.type !== "Identifier" || !slotIndex.has(node.name)) return;
-      if (identifierIsPropertyName(node, parent) ||
-          jumpLabelIdentifier(node, parent)) return;
-      if (parent?.type === "VariableDeclarator" && parent.id === node) return;
-      if (isFunction(parent) && parent.body !== node) return;
-      if (parent?.type === "CatchClause" && parent.param === node) return;
-      if (parent?.type === "Property" && parent.shorthand) {
-        // {x} would become {env[i]}; expand the shorthand instead. Acorn
-        // aliases key and value to one node, so dedupe by position.
-        if (shorthandEditStarts.has(parent.start)) return;
-        shorthandEditStarts.add(parent.start);
-        edits.push({start: parent.start, end: parent.end,
-          replacement: `${node.name}: ${envName}[${
-            slotIndex.get(node.name)}]`});
-        return;
-      }
-      edits.push({start: node.start, end: node.end,
-        replacement: `${envName}[${slotIndex.get(node.name)}]`});
-    });
-    const firstStatement = unit.body.body[0];
-    const insertAt = firstStatement &&
-      firstStatement.type === "ExpressionStatement" &&
-      firstStatement.expression.type === "Literal" &&
-      typeof firstStatement.expression.value === "string"
-      ? firstStatement.end : unit.body.start + 1;
-    edits.push({start: insertAt, end: insertAt,
-      replacement: `\nconst ${envName} = new Array(${
-        slotIndex.size}).fill(undefined);`});
-    liftedNames += slotIndex.size;
-    liftedUnits += 1;
-  }
-  if (!liftedNames) return {source, liftedNames: 0, units: 0};
-  const rewritten = applySourceEdits(source, edits);
-  if (rewritten === null) return {source, liftedNames: 0, units: 0};
-  return {source: rewritten, liftedNames, units: liftedUnits};
-}
-
-function partitionOversizedLinearBlocks(source, options = {}) {
+function partitionOversizedLinearBlocks(units, options = {}) {
   const maximumUnitBytes = Math.max(16384,
     Number(options.maximumUnitBytes) || 49152);
   const targetSegmentBytes = Math.max(4096, Math.min(maximumUnitBytes,
@@ -872,219 +1088,62 @@ function partitionOversizedLinearBlocks(source, options = {}) {
   const namespace = String(options.namespace ?? "0")
     .replace(/[^A-Za-z0-9_]/g, "") || "0";
   const sharedStateName = `jvmRegionSegmentState${namespace}`;
-  const rootProgramGenerator = options.rootProgramGenerator === true;
-  // A caller that prefixed a directive prologue names it here. The pass then
-  // partitions the body alone and re-attaches the prologue, instead of
-  // looking for a directive in the text it is about to rewrite.
-  const directive = typeof options.directive === "string" &&
-    source.startsWith(options.directive) ? options.directive : "";
-  let rewritten = directive ? source.slice(directive.length) : source;
   let segmentCount = 0;
   let partitionedSourceBytes = 0;
-  let appendedHelperCount = 0;
-  const helperSources = [];
   let attemptedRuns = 0;
   let oversizedStatements = 0;
+  const helperUnits = [];
+  const working = units.slice();
 
   for (let round = 0; round < maximumRounds &&
     segmentCount < maximumSegments; round += 1) {
-    let program;
-    try {
-      // A standalone structured source is a generator *body*, not a complete
-      // program, so acorn correctly rejects its top-level yield tokens. Wrap
-      // it in the generator declaration it is a body of -- the same prefix
-      // idiom the other consumers of generated bodies use -- and rebase the
-      // resulting offsets onto the untouched emitted source, so `yield` is
-      // recognised by the parser instead of by a regex that cannot tell a
-      // keyword from the same five characters inside a string or comment.
-      const parseable = rootProgramGenerator
-        ? `${GENERATOR_UNIT_PREFIX}${rewritten}\n}` : rewritten;
-      program = parse(parseable, {
-        ecmaVersion: "latest", ranges: true, allowReturnOutsideFunction: true,
-      });
-      if (rootProgramGenerator) {
-        const unit = program.body[0];
-        if (unit?.type !== "FunctionDeclaration") break;
-        rebaseAstOffsets(unit.body, GENERATOR_UNIT_PREFIX.length);
-        program = {type: "Program", start: 0, end: rewritten.length,
-          body: unit.body.body};
-      }
-    } catch (_) {
-      break;
-    }
-    // Segment helpers are terminal (skipped inside the collector):
-    // re-partitioning one only re-plumbs its full live-name set through
-    // another ABI layer and grows the source. Innermost-only per round,
-    // mirroring the loop outliner: queued source edits stay non-overlapping
-    // and shrunken parents re-qualify on the next round's reparse.
-    const innermost = rootProgramGenerator
-      ? [] : collectOversizedUnits(program, maximumUnitBytes);
-    if (rootProgramGenerator && rewritten.length > maximumUnitBytes) {
-      innermost.push({
-        type: "FunctionExpression",
-        generator: true,
-        params: [],
-        start: 0,
-        end: rewritten.length,
-        body: {
-          type: "BlockStatement",
-          start: 0,
-          end: rewritten.length,
-          body: program.body,
-        },
-      });
-    }
-    if (!innermost.length) break;
+    let roundChanged = false;
+    for (let unitIndex = 0; unitIndex < working.length; unitIndex += 1) {
+      const unit = working[unitIndex];
+      if (!unit.partitionable || !unit.statements.length) continue;
+      if (regionUnitBytes(unit) <= maximumUnitBytes) continue;
+      const statements = unit.statements;
+      const edits = [];
 
-    const edits = [];
-    for (const unit of innermost) {
-      const unitIsGenerator = unit.generator === true;
-      // Per-unit reference index: generated SSA names are unique within a
-      // function, so name-keyed positions decide whether a run-level
-      // declaration escapes the run.  A duplicate-name false positive only
-      // hoists an extra binding, which preserves semantics.
-      const referencePositionsByName = new Map();
-      walkAst(unit.body, (node, parent) => {
-        if (node.type !== "Identifier" ||
-            identifierIsPropertyName(node, parent) ||
-            jumpLabelIdentifier(node, parent)) return;
-        let positions = referencePositionsByName.get(node.name);
-        if (!positions) {
-          positions = [];
-          referencePositionsByName.set(node.name, positions);
-        }
-        positions.push(node.start);
-      });
-
-      const tryExtractRun = (runStatements) => {
+      const tryExtractRun = (from, to, topLevelStarts) => {
         if (segmentCount >= maximumSegments) return;
         attemptedRuns += 1;
-        const runStartPosition = runStatements[0].start;
-        const runEndPosition = runStatements[runStatements.length - 1].end;
         if (process.env.JVM_DEBUG_PARTITION === "1") {
           console.error("[partition] round=" + round + " seg=" + segmentCount +
-            " stmts=" + runStatements.length +
-            " span=" + (runEndPosition - runStartPosition));
+            " stmts=" + (to - from) +
+            " span=" + statementBytes(statements, from, to));
         }
-        const labels = new Set();
-        const declared = new Set();
-        const written = new Set();
-        const returns = [];
-        const outwardJumps = [];
-        const referenced = [];
-        let unsupported = false;
-        let runHasYield = false;
-        const audit = (node, parent, functionDepth, loopDepth,
-          breakableDepth) => {
-          if (!node?.type) return;
-          if (node.type === "LabeledStatement") labels.add(node.label.name);
-          if (node.type === "VariableDeclarator") {
-            collectPatternNames(node.id, declared);
-          } else if (isFunction(node)) {
-            if (node.id) collectPatternNames(node.id, declared);
-            for (const parameter of node.params || []) {
-              collectPatternNames(parameter, declared);
-            }
-          } else if (node.type === "CatchClause" && node.param) {
-            collectPatternNames(node.param, declared);
-          }
-          if (functionDepth === 0 && node.type === "ReturnStatement") {
-            returns.push(node);
-          }
-          if (functionDepth === 0 &&
-              (node.type === "BreakStatement" ||
-                node.type === "ContinueStatement")) {
-            const isBreak = node.type === "BreakStatement";
-            // A labeled jump may only target an enclosing label, which the
-            // pre-order walk has already recorded when it lies in the run.
-            const outward = node.label
-              ? !labels.has(node.label.name)
-              : (isBreak ? breakableDepth === 0 : loopDepth === 0);
-            if (outward) {
-              outwardJumps.push({node, kind: isBreak ? "break" : "continue",
-                label: node.label ? node.label.name : null});
-            }
-          }
-          if (node.type === "AssignmentExpression") {
-            collectPatternNames(node.left, written);
-          } else if (node.type === "UpdateExpression" &&
-              node.argument?.type === "Identifier") {
-            written.add(node.argument.name);
-          }
-          if (node.type === "Identifier" &&
-              !identifierIsPropertyName(node, parent) &&
-              !jumpLabelIdentifier(node, parent)) {
-            referenced.push({name: node.name, functionDepth});
-          }
-          if (functionDepth === 0) {
-            // In a generator unit a depth-0 yield may move into a generator
-            // helper reached through yield*: delegation forwards the yielded
-            // value, the argument-less next() resume, and abandonment via
-            // iterator.return() unchanged, so the driver cannot observe the
-            // split.
-            if (node.type === "YieldExpression") {
-              if (unitIsGenerator) runHasYield = true;
-              else unsupported = true;
-            }
-            if (node.type === "AwaitExpression" ||
-                node.type === "ThisExpression" ||
-                node.type === "Super" ||
-                node.type === "MetaProperty" ||
-                node.type === "VariableDeclaration" && node.kind === "var" ||
-                node.type === "Identifier" && node.name === "arguments" ||
-                node.type === "CallExpression" &&
-                  node.callee?.type === "Identifier" &&
-                  node.callee.name === "eval") unsupported = true;
-          }
-          for (const child of childrenOf(node)) {
-            audit(child, node,
-              functionDepth + (isFunction(child) ? 1 : 0),
-              isFunction(child) ? 0 : loopDepth + (isLoop(node) ? 1 : 0),
-              isFunction(child) ? 0 : breakableDepth +
-                (isLoop(node) || node.type === "SwitchStatement" ? 1 : 0));
-          }
-        };
-        for (const statement of runStatements) {
-          // Block-level function declarations hoist to the whole enclosing
-          // block, including statements before the run.
-          if (statement.type === "FunctionDeclaration") return;
-          audit(statement, null, 0, 0, 0);
-        }
-        if (unsupported) return;
-        for (const entry of referenced) {
-          if (entry.functionDepth > 0 && !declared.has(entry.name)) return;
-        }
+        const names = regionNames(statements, from, to);
+        if (!names) return;
+        const outward = regionOutwardJumps(statements, from, to);
+        const runHasYield = regionRangeCarriesYield(statements, from, to);
+        if (runHasYield && !unit.generator) return;
 
-        const hoistDeclarations = [];
+        // A run-level declaration whose binding is read after the run has to
+        // survive the extraction: it is declared at the call site and written
+        // back, and the helper assigns it instead of declaring it.
         const hoistNames = [];
-        for (const statement of runStatements) {
-          if (statement.type !== "VariableDeclaration") continue;
-          const names = new Set();
-          for (const declarator of statement.declarations) {
-            collectPatternNames(declarator.id, names);
+        for (const index of topLevelStarts) {
+          const statement = statements[index];
+          if (!statement.def) continue;
+          if (statement.kind !== "const" && statement.kind !== "let" &&
+              statement.kind !== "letUninitialized" &&
+              statement.kind !== "safePointBudgetDeclaration") continue;
+          let escapes = false;
+          for (let other = 0; other < statements.length && !escapes; other++) {
+            if (other >= from && other < to) continue;
+            const outside = statements[other];
+            if (outside.reads === null) { escapes = true; break; }
+            escapes = outside.reads.includes(statement.def) ||
+              outside.write === statement.def;
           }
-          const escapes = [...names].some((name) =>
-            (referencePositionsByName.get(name) || []).some((position) =>
-              position < runStartPosition || position >= runEndPosition));
-          if (!escapes) continue;
-          for (const declarator of statement.declarations) {
-            if (declarator.id.type !== "Identifier") return;
-          }
-          hoistDeclarations.push(statement);
-          hoistNames.push(...names);
+          if (escapes) hoistNames.push(statement.def);
         }
 
-        const freeNames = [];
-        const seenFreeNames = new Set(["undefined", "NaN", "Infinity"]);
-        for (const entry of referenced) {
-          if (declared.has(entry.name) || seenFreeNames.has(entry.name)) {
-            continue;
-          }
-          seenFreeNames.add(entry.name);
-          freeNames.push(entry.name);
-        }
+        const freeNames = names.free.filter((name) =>
+          name !== sharedStateName);
         const liveOutNames = [
-          ...freeNames.filter((name) => written.has(name)),
+          ...freeNames.filter((name) => names.written.has(name)),
           ...hoistNames,
         ];
 
@@ -1101,130 +1160,164 @@ function partitionOversizedLinearBlocks(source, options = {}) {
           jumpTable.push({kind, label});
           return jumpTable.length - 1;
         };
-        const liveOutWrites = () => liveOutNames.map((name, index) =>
-          `${outputName}[${index + 2}] = ${name};`);
-        const fragmentStart = runStartPosition;
-        const fragmentEdits = [];
         // Protocol exits jump to the shared epilogue rather than inlining the
         // live-out write-back: a run with many exits and many live-outs would
         // otherwise re-grow past the optimization budget the pass exists to
         // meet.
-        // Braces keep the multi-statement replacement a single statement:
-        // the original exit may be an unbraced if-consequent.
-        for (const entry of returns) {
-          fragmentEdits.push({
-            start: entry.start - fragmentStart,
-            end: entry.end - fragmentStart,
-            replacement: [
-              `{ ${outputName}[0] = 1;`,
-              `${outputName}[1] = ${entry.argument
-                ? rewritten.slice(entry.argument.start, entry.argument.end)
-                : "undefined"};`,
-              `break ${bodyLabel}; }`,
-            ].join(" "),
-          });
+        const outwardIndexes = new Map(
+          outward.map((jump) => [jump.index, jump]));
+        const hoistNameSet = new Set(hoistNames);
+        const body = [];
+        for (const statement of rewriteRegionExits(statements, from, to,
+          (argument) => [
+            `{ ${outputName}[0] = 1;`,
+            `${outputName}[1] = ${argument};`,
+            `break ${bodyLabel}; }`,
+          ].join(" "))) {
+          body.push(statement);
         }
-        for (const jump of outwardJumps) {
-          fragmentEdits.push({
-            start: jump.node.start - fragmentStart,
-            end: jump.node.end - fragmentStart,
-            replacement: [
-              `{ ${outputName}[0] = 3;`,
-              `${outputName}[1] = ${jumpIndex(jump.kind, jump.label)};`,
-              `break ${bodyLabel}; }`,
-            ].join(" "),
-          });
+        for (let index = from; index < to; index += 1) {
+          const position = index - from;
+          const jump = outwardIndexes.get(index);
+          if (jump) {
+            // The jump is re-established at the call site, which occupies the
+            // run's original block position and therefore sees the identical
+            // label environment. Inside the helper it becomes a table index,
+            // spliced into the statement between the parts the emitter
+            // published around its own jump.
+            const statement = statements[index];
+            if (!statement.jump || !statement.jump.before) return;
+            const jumpText = `${renderRegionParts(statement.jump.before)}{ ${
+              outputName}[0] = 3; ${outputName}[1] = ${
+              jumpIndex(jump.kind, jump.label)}; break ${bodyLabel}; }${
+              renderRegionParts(statement.jump.after)}`;
+            body[position] = ownStatement(
+              `${statement.indent}${jumpText.trim()}`,
+              {reads: statement.reads, delta: statement.delta,
+                relocatable: false});
+            continue;
+          }
+          const statement = statements[index];
+          if (!statement.def || !hoistNameSet.has(statement.def)) continue;
+          // The declaration becomes an assignment; the binding itself is
+          // declared at the call site and in the helper preamble.
+          const initializer = statement.parts
+            ? statement.parts.slice(statement.parts.findIndex((part) =>
+              typeof part !== "string" && part.ref === statement.def) + 1)
+            : null;
+          if (!initializer) return;
+          const assignment = renderRegionParts(initializer).trim();
+          body[position] = ownStatement(`${statement.indent}${
+            assignment.startsWith("=")
+              ? `${statement.def} ${assignment}` : ";"}`,
+          {reads: statement.reads, write: statement.def,
+            delta: statement.delta, relocatable: false});
         }
-        for (const declaration of hoistDeclarations) {
-          const assignments = declaration.declarations
-            .filter((declarator) => declarator.init)
-            .map((declarator) => `${declarator.id.name} = ${
-              rewritten.slice(declarator.init.start, declarator.init.end)};`);
-          fragmentEdits.push({
-            start: declaration.start - fragmentStart,
-            end: declaration.end - fragmentStart,
-            replacement: assignments.join(" ") || ";",
-          });
-        }
-        const fragment = applySourceEdits(
-          rewritten.slice(fragmentStart, runEndPosition), fragmentEdits);
-        if (fragment === null) return;
 
-        helperSources.push([
-          `function${runHasYield ? "*" : ""} ${helperName}(${
-            [...freeNames, outputName].join(",")}) {`,
-          hoistNames.length ? `  let ${hoistNames.join(", ")};` : null,
-          "  try {",
-          `    ${bodyLabel}: {`,
-          ...fragment.split("\n").map((line) => `      ${line}`),
-          `      ${outputName}[0] = 0;`,
-          `      ${outputName}[1] = undefined;`,
-          "    }",
-          `  } catch (${caughtName}) {`,
-          `    ${outputName}[0] = 2;`,
-          `    ${outputName}[1] = ${caughtName};`,
-          "  }",
-          ...liveOutWrites().map((line) => `  ${line}`),
-          "}",
-        ].filter((line) => line !== null).join("\n"));
-        const callLines = [
-          hoistNames.length ? `let ${hoistNames.join(", ")};` : null,
-          // A yield-bearing helper suspends inside the delegation, so the
-          // shared state array is only written by whichever helper exits, and
-          // its protocol reads below run in the same synchronous burst.
+        helperUnits.push(regionUnit({
+          name: helperName,
+          partitionable: false,
+          generator: runHasYield,
+          headerLines: [
+            `function${runHasYield ? "*" : ""} ${helperName}(${
+              [...freeNames, outputName].join(",")}) {`,
+            ...(hoistNames.length ? [`  let ${hoistNames.join(", ")};`] : []),
+            "  try {",
+            `    ${bodyLabel}: {`,
+          ],
+          statements: body.map((statement) => ownStatement(
+            `      ${statement.text}`, {reads: statement.reads,
+              delta: statement.delta, relocatable: false})),
+          footerLines: [
+            `      ${outputName}[0] = 0;`,
+            `      ${outputName}[1] = undefined;`,
+            "    }",
+            `  } catch (${caughtName}) {`,
+            `    ${outputName}[0] = 2;`,
+            `    ${outputName}[1] = ${caughtName};`,
+            "  }",
+            ...liveOutNames.map((name, index) =>
+              `  ${outputName}[${index + 2}] = ${name};`),
+            "}",
+          ],
+        }));
+
+        const callReads = [...freeNames, sharedStateName, helperName];
+        const callStatements = [];
+        if (hoistNames.length) {
+          callStatements.push(ownStatement(
+            `let ${hoistNames.join(", ")};`,
+            {kind: "letUninitialized", declares: hoistNames}));
+        }
+        // A yield-bearing helper suspends inside the delegation, so the
+        // shared state array is only written by whichever helper exits, and
+        // its protocol reads below run in the same synchronous burst.
+        callStatements.push(ownStatement(
           `${runHasYield ? "yield* " : ""}${helperName}(${
             [...freeNames, sharedStateName].join(",")});`,
-          ...liveOutNames.map((name, index) =>
-            `${name} = ${sharedStateName}[${index + 2}];`),
-          `if (${sharedStateName}[0] === 1) return ${sharedStateName}[1];`,
-          `if (${sharedStateName}[0] === 2) throw ${sharedStateName}[1];`,
-        ].filter((line) => line !== null);
-        if (jumpTable.length) {
-          callLines.push(`if (${sharedStateName}[0] === 3) {`);
-          jumpTable.forEach((entry, index) => {
-            callLines.push(`  if (${sharedStateName}[1] === ${index}) ` +
-              `${entry.kind}${entry.label ? ` ${entry.label}` : ""};`);
-          });
-          callLines.push("}");
+          {reads: callReads, yields: runHasYield}));
+        for (let index = 0; index < liveOutNames.length; index += 1) {
+          callStatements.push(ownStatement(
+            `${liveOutNames[index]} = ${sharedStateName}[${index + 2}];`,
+            {reads: [sharedStateName], write: liveOutNames[index]}));
         }
-        edits.push({
-          start: runStartPosition,
-          end: runEndPosition,
-          replacement: callLines.join("\n"),
-        });
+        callStatements.push(ownStatement(
+          `if (${sharedStateName}[0] === 1) return ${sharedStateName}[1];`,
+          {
+            reads: [sharedStateName],
+            exit: {
+              before: [`if (${sharedStateName}[0] === 1) `],
+              argument: [`${sharedStateName}[1]`],
+              after: [],
+            },
+          }));
+        callStatements.push(ownStatement(
+          `if (${sharedStateName}[0] === 2) throw ${sharedStateName}[1];`,
+          {reads: [sharedStateName]}));
+        if (jumpTable.length) {
+          callStatements.push(ownStatement(
+            `if (${sharedStateName}[0] === 3) {`,
+            {reads: [sharedStateName], delta: 1, opens: "block"}));
+          jumpTable.forEach((entry, index) => {
+            callStatements.push(ownStatement(
+              `  if (${sharedStateName}[1] === ${index}) ${entry.kind}${
+                entry.label ? ` ${entry.label}` : ""};`,
+              {reads: [sharedStateName], relocatable: false}));
+          });
+          callStatements.push(ownStatement("}", {delta: -1}));
+        }
+        edits.push({start: from, end: to, replacement: callStatements});
         segmentCount += 1;
-        partitionedSourceBytes += runEndPosition - runStartPosition;
+        partitionedSourceBytes += statementBytes(statements, from, to);
       };
 
-      const recurseIntoStatement = (statement) => {
-        const gather = (node) => {
-          if (!node?.type || isFunction(node)) return;
-          if (node.type === "BlockStatement") {
-            walkList(node.body);
-            return;
-          }
-          for (const child of childrenOf(node)) gather(child);
-        };
-        for (const child of childrenOf(statement)) gather(child);
-      };
-
-      const walkList = (statements) => {
+      const walkList = (from, to) => {
+        const groups = statementGroups(statements, from, to);
+        if (!groups) return;
         let runStart = 0;
         let runBytes = 0;
         const flush = (endIndex) => {
           if (endIndex > runStart && runBytes >= minimumSegmentBytes) {
-            tryExtractRun(statements.slice(runStart, endIndex));
+            tryExtractRun(groups[runStart].start, groups[endIndex - 1].end,
+              groups.slice(runStart, endIndex).map((entry) => entry.start));
           }
           runBytes = 0;
         };
-        for (let index = 0; index < statements.length; index += 1) {
-          const statement = statements[index];
-          const bytes = statement.end - statement.start;
+        for (let index = 0; index < groups.length; index += 1) {
+          const group = groups[index];
+          const head = statements[group.start];
+          const bytes = statementBytes(statements, group.start, group.end);
+          if (head.continuesBlock || !head.relocatable ||
+              head.reads === null) {
+            flush(index);
+            runStart = index + 1;
+            continue;
+          }
           if (bytes > targetSegmentBytes) {
             oversizedStatements += 1;
             flush(index);
             runStart = index + 1;
-            recurseIntoStatement(statement);
+            recurseIntoGroup(group);
             continue;
           }
           if (runBytes + bytes > targetSegmentBytes &&
@@ -1234,28 +1327,45 @@ function partitionOversizedLinearBlocks(source, options = {}) {
           }
           runBytes += bytes;
         }
-        flush(statements.length);
+        flush(groups.length);
       };
-      walkList(unit.body.body);
+
+      // The nested statement lists a group owns. A block continuation ends
+      // one list and starts the next, so a run never spans an `else` arm.
+      const recurseIntoGroup = (group) => {
+        if (group.end - group.start <= 2) return;
+        let start = group.start + 1;
+        for (let index = start; index < group.end - 1; index += 1) {
+          if (!statements[index].continuesBlock) continue;
+          walkList(start, index);
+          start = index + 1;
+        }
+        walkList(start, group.end - 1);
+      };
+
+      walkList(0, statements.length);
+      if (!edits.length) continue;
+      const next = statements.slice();
+      for (const edit of [...edits].sort((left, right) =>
+        right.start - left.start)) {
+        next.splice(edit.start, edit.end - edit.start, ...edit.replacement);
+      }
+      working[unitIndex] = regionUnit({...unit, statements: next});
+      roundChanged = true;
     }
-    if (!edits.length) break;
-    const next = applySourceEdits(rewritten, edits);
-    if (next === null) break;
-    rewritten = next;
-    // Helpers are terminal (never re-collected as units), so they stay out
-    // of the working source until the end: re-parsing a megabyte of emitted
-    // helpers every round dominated the pass cost on framed-sized modules.
-  }
-  if (helperSources.length > appendedHelperCount) {
-    rewritten += `\n${helperSources.slice(appendedHelperCount).join("\n")}`;
-    appendedHelperCount = helperSources.length;
+    if (!roundChanged) break;
   }
 
-  if (segmentCount > 0) {
-    rewritten = `const ${sharedStateName} = [];\n${rewritten}`;
+  if (segmentCount === 0) {
+    return {units, count: 0, partitionedSourceBytes: 0, attemptedRuns,
+      oversizedStatements};
   }
   return {
-    source: `${directive}${rewritten}`,
+    units: [
+      rawRegionUnit(`const ${sharedStateName} = [];`),
+      ...working,
+      ...helperUnits,
+    ],
     count: segmentCount,
     partitionedSourceBytes,
     attemptedRuns,
@@ -2195,6 +2305,7 @@ class HotCallGraphRegionCompiler {
     edits.sort((left, right) => left.start - right.start ||
       right.end - left.end);
     const rewrittenParts = [];
+    const appliedEdits = [];
     let sourceCursor = 0;
     for (const edit of edits) {
       if (edit.start < sourceCursor) {
@@ -2203,11 +2314,16 @@ class HotCallGraphRegionCompiler {
       }
       rewrittenParts.push(source.slice(sourceCursor, edit.start),
         edit.replacement);
+      appliedEdits.push(edit);
       sourceCursor = edit.end;
     }
     rewrittenParts.push(source.slice(sourceCursor));
     return {
       source: rewrittenParts.join(""),
+      // The same edits, so a caller that holds the body's statement records
+      // can keep them in step with the text instead of recovering them from
+      // it again.
+      appliedEdits,
       linkedFunctionNames,
       lexicallyInlinedEdges,
       exceptionalInlinedEdges,
@@ -2254,6 +2370,10 @@ class HotCallGraphRegionCompiler {
     // than merely substituting terminal leaves into otherwise independent
     // generated functions.
     const composedInternalSources = new Map();
+    // The statement records behind each composed body, kept in step with the
+    // text by the same edits that produced it. A body that cannot keep them
+    // carries null and is simply never outlined or partitioned.
+    const composedInternalStatements = new Map();
     const composedInternalCosts = new Map();
     const composedInlineCounts = new Map();
     // Which module-level node functions a composed body still calls. Composed
@@ -2272,6 +2392,10 @@ class HotCallGraphRegionCompiler {
         if (node.edges.length === 0) {
           composedInternalSources.set(node,
             node.generated.jvmInternalRegionPositionalSource);
+          composedInternalStatements.set(node, regionStatementsFromFragments(
+            node.generated.jvmInternalRegionPositionalSource,
+            node.generated.jvmStructuredRegionFragments
+              ?.jvmInternalRegionPositionalSource));
           composedInternalCosts.set(node, node.codeItems);
           composedInlineCounts.set(node, 0);
           composedInternalLinkedNames.set(node, new Set());
@@ -2300,6 +2424,12 @@ class HotCallGraphRegionCompiler {
         if (!rewritten.source) continue;
         if (rewritten.source.length > this.inlineSourceByteBudget) continue;
         composedInternalSources.set(node, rewritten.source);
+        composedInternalStatements.set(node, applyRegionStatementEdits(
+          regionStatementsFromFragments(
+            node.generated.jvmInternalRegionPositionalSource,
+            node.generated.jvmStructuredRegionFragments
+              ?.jvmInternalRegionPositionalSource),
+          rewritten.appliedEdits));
         composedInternalLinkedNames.set(node, unionLinkedNames(
           rewritten.linkedFunctionNames,
           node.edges.map((edge) =>
@@ -2311,7 +2441,18 @@ class HotCallGraphRegionCompiler {
         compositionChanged = true;
       }
     }
+    // `const plan = <planName>;` is a statement the region compiler emits in
+    // front of a restoring body it inlines, so it states its own facts.
+    const restoringInlineStatements = (node, planName) => {
+      const body = regionStatementsFromFragments(
+        node.generated.jvmRestoringDirectPositionalSource,
+        node.generated.jvmStructuredRegionFragments
+          ?.jvmRestoringDirectPositionalSource);
+      return body ? [ownStatement(`const plan = ${planName};`,
+        {kind: "const", def: "plan"}), ...body] : null;
+    };
     const exceptionalInlineSources = new Map();
+    const exceptionalInlineStatements = new Map();
     const exceptionalInlineCosts = new Map();
     const exceptionalInlineCounts = new Map();
     const exceptionalInlinePlanNames = new Map();
@@ -2329,6 +2470,8 @@ class HotCallGraphRegionCompiler {
       exceptionalInlineSources.set(node,
         `const plan = ${planName};\n` +
         node.generated.jvmRestoringDirectPositionalSource);
+      exceptionalInlineStatements.set(node, restoringInlineStatements(
+        node, planName));
       exceptionalInlineLinkedNames.set(node, new Set());
       exceptionalInlineCosts.set(node, node.codeItems);
       exceptionalInlineCounts.set(node, 0);
@@ -2370,6 +2513,8 @@ class HotCallGraphRegionCompiler {
         if (!rewritten.source) continue;
         if (rewritten.source.length > this.inlineSourceByteBudget) continue;
         exceptionalInlineSources.set(node, rewritten.source);
+        exceptionalInlineStatements.set(node, applyRegionStatementEdits(
+          restoringInlineStatements(node, planName), rewritten.appliedEdits));
         exceptionalInlineLinkedNames.set(node, unionLinkedNames(
           rewritten.linkedFunctionNames,
           node.edges.map((edge) =>
@@ -2534,13 +2679,13 @@ class HotCallGraphRegionCompiler {
           name: recursiveName,
           kind: "function",
           references: [],
-          text: [
+          units: [rawRegionUnit([
             `function ${recursiveName}(${parameters.join(",")}) {`,
             `return ${bodyName}(helpers,${planName},${
               argumentsList.join(",")}${argumentsList.length ? "," : ""}` +
               "thread,nestedEntryGuarded);",
             "}",
-          ].join("\n"),
+          ].join("\n"))],
         });
         continue;
       }
@@ -2577,7 +2722,7 @@ class HotCallGraphRegionCompiler {
         (source === composedInternalSources.get(node) ||
           source === exceptionalInlineSources.get(node));
       const rewritten = sourceAlreadyComposed
-        ? {source, lexicallyInlinedEdges:
+        ? {source, appliedEdits: [], lexicallyInlinedEdges:
           exceptionalInlineCounts.get(node) ||
             composedInlineCounts.get(node) || 0,
         exceptionalInlinedEdges: source === exceptionalInlineSources.get(node)
@@ -2607,23 +2752,50 @@ class HotCallGraphRegionCompiler {
         : unionLinkedNames(rewritten.linkedFunctionNames,
           node.edges.filter((edge) => inlineEdges.has(edge))
             .map((edge) => inlineLinkedNamesForNode(edge.node)));
-      const outlined = this.loopOutliningEnabled && !framedSource
-        ? outlineLargeRegionLoops(rewritten.source, {
+      // The statement records behind this node's emitted body. A composed
+      // body carries the records the composition kept; a body lowered here
+      // takes the records the renderer published for the variant it came
+      // from and applies this lowering's own edits to them. When neither is
+      // available -- a framed root, a checked-leaf source, a body whose
+      // records could not be kept -- the node is emitted as finished text
+      // and no structural pass touches it.
+      const nodeStatements = sourceAlreadyComposed
+        ? (source === exceptionalInlineSources.get(node)
+          ? exceptionalInlineStatements.get(node)
+          : composedInternalStatements.get(node)) || null
+        : applyRegionStatementEdits(
+          regionStatementsFromFragments(source,
+            node.generated.jvmStructuredRegionFragments?.[
+              variantNameOfSource(node.generated, source)]),
+          rewritten.appliedEdits);
+      const outlined = this.loopOutliningEnabled && nodeStatements
+        ? outlineLargeRegionLoops(regionUnit({statements: nodeStatements}), {
           minimumSourceBytes: this.loopOutlineSourceBytes,
           maximumOutlines: this.maxOutlinedLoopsPerNode,
           namespace: index,
         })
-        : {source: rewritten.source, count: 0, outlinedSourceBytes: 0,
-          largestOutlinedSourceBytes: 0, helperSources: []};
+        : {unit: null, count: 0, outlinedSourceBytes: 0,
+          largestOutlinedSourceBytes: 0, helpers: []};
       // A fused graph is one scheduler execution unit. Per-method generated
       // sources normally own their counter, but retaining those declarations
       // here resets the quantum at every internal edge and lets a deep graph
       // run for N independent budgets. Remove only the renderer's exact
       // declaration; every node then closes over the module-owned counter.
-      let emittedSource = outlined.source;
-      for (const declaration of
-        node.generated.jvmStructuredSafePointBudgetDeclarations || []) {
-        emittedSource = emittedSource.split(declaration).join("");
+      const budgetDeclarations =
+        node.generated.jvmStructuredSafePointBudgetDeclarations || [];
+      const bodyStatements = outlined.unit
+        ? outlined.unit.statements : nodeStatements;
+      const emittedStatements = bodyStatements
+        ? stripRegionSafePointBudgets(bodyStatements, budgetDeclarations)
+        : null;
+      let emittedSource = rewritten.source;
+      if (emittedStatements) {
+        emittedSource = emittedStatements
+          .map((statement) => statement.text).join("\n");
+      } else {
+        for (const declaration of budgetDeclarations) {
+          emittedSource = emittedSource.split(declaration).join("");
+        }
       }
       outlinedLoops += outlined.count;
       outlinedLoopSourceBytes += outlined.outlinedSourceBytes;
@@ -2638,20 +2810,33 @@ class HotCallGraphRegionCompiler {
       elidedFieldCacheInvalidations +=
         rewritten.elidedFieldCacheInvalidations || 0;
       const functionName = functionNames.get(node.method);
-      const pushNodeDeclaration = (lines) => {
+      // The node and the helpers loop outlining moved out of it are one
+      // declaration entry: they share a reachability group and a reference
+      // set, and the assembler emits the helpers in front of the node.
+      const pushNodeDeclaration = (headerLines, prologueStatements = []) => {
         declarations.push({
           name: functionName,
           kind: "function",
           references: [...nodeReferences],
-          text: [...outlined.helperSources, ...lines].join("\n"),
+          units: [
+            ...outlined.helpers,
+            regionUnit({
+              name: functionName,
+              headerLines,
+              statements: emittedStatements
+                ? [...prologueStatements, ...emittedStatements] : [],
+              footerLines: emittedStatements ? ["}"]
+                : [...prologueStatements.map(
+                  (statement) => statement.text), emittedSource, "}"],
+              partitionable: Boolean(emittedStatements),
+            }),
+          ],
         });
       };
       if (framedSource) {
         pushNodeDeclaration([
           `function* ${functionName}(` +
             "frame,thread,helpers,initialBytecodeChecks,framelessEntry) {",
-          emittedSource,
-          "}",
         ]);
         continue;
       }
@@ -2660,18 +2845,13 @@ class HotCallGraphRegionCompiler {
       if (source === restoringSource) {
         const planName = `jvmRegionPlan${index}`;
         captures[planName] = this.restorationPlan(node);
-        pushNodeDeclaration([
-          `function ${functionName}(${parameters.join(",")}) {`,
-          `const plan = ${planName};`,
-          emittedSource,
-          "}",
-        ]);
+        pushNodeDeclaration(
+          [`function ${functionName}(${parameters.join(",")}) {`],
+          [ownStatement(`const plan = ${planName};`,
+            {kind: "const", def: "plan"})]);
       } else {
-        pushNodeDeclaration([
-          `function ${functionName}(${parameters.join(",")}) {`,
-          emittedSource,
-          "}",
-        ]);
+        pushNodeDeclaration(
+          [`function ${functionName}(${parameters.join(",")}) {`]);
       }
     }
     const rootArguments = plan.root.generated
@@ -2715,28 +2895,32 @@ class HotCallGraphRegionCompiler {
     // is lifted, partitioned or measured.
     const reachableDeclarations =
       pruneUnreachableRegionDeclarations(declarations, [rootName]);
-    const declarationSource = reachableDeclarations
-      .map((declaration) => declaration.text).join("\n");
+    const declarationUnits = reachableDeclarations
+      .flatMap((declaration) => declaration.units);
     // A framed root shares one function-scoped local namespace across the
     // whole body; lift it into an environment array first so partitioning
     // does not re-plumb hundreds of names through every segment boundary.
     const partitionStarted = this.jit.monotonicNow();
     const lifted = framedRoot && this.framedPartitionEnabled
-      ? liftOversizedUnitLocalsToEnvironment(declarationSource, {
+      ? liftOversizedUnitLocalsToEnvironment(declarationUnits, {
         maximumUnitBytes: this.linearPartitionUnitBytes,
         namespace: "0",
       })
-      : {source: declarationSource, liftedNames: 0, units: 0};
+      : {units: declarationUnits, liftedNames: 0, liftedUnits: 0};
     this.liftedEnvironmentNameCount += lifted.liftedNames;
-    const partitioned = (framedRoot
+    const partitionedUnits = (framedRoot
       ? this.framedPartitionEnabled : this.linearPartitionEnabled)
-      ? partitionOversizedLinearBlocks(lifted.source, {
+      ? partitionOversizedLinearBlocks(lifted.units, {
         maximumUnitBytes: this.linearPartitionUnitBytes,
         targetSegmentBytes: this.linearPartitionSegmentBytes,
         maximumSegments: this.linearPartitionMaxSegments,
         namespace: "0",
       })
-      : {source: lifted.source, count: 0, partitionedSourceBytes: 0};
+      : {units: lifted.units, count: 0, partitionedSourceBytes: 0};
+    const partitioned = {
+      ...partitionedUnits,
+      source: partitionedUnits.units.map(renderRegionUnit).join("\n"),
+    };
     this.partitionPassMillis += this.jit.monotonicNow() - partitionStarted;
     this.partitionedSegmentCount += partitioned.count;
     this.partitionedSegmentSourceBytes += partitioned.partitionedSourceBytes;
@@ -2754,8 +2938,7 @@ class HotCallGraphRegionCompiler {
         hoistedSource: partitioned.source,
         entrySources: [entryPrologueSource, entryTailSource],
         entryDeclaredNames: ["safePointBudget"],
-        hoistedCount: reachableDeclarations.length +
-          (partitioned.count > 0 ? 1 : 0),
+        hoistedCount: partitionedUnits.units.length,
       }) : null;
     if (factorySplit) {
       this.factoryHoistedModuleCount += 1;
@@ -3350,5 +3533,11 @@ module.exports.liftOversizedUnitLocalsToEnvironment =
   liftOversizedUnitLocalsToEnvironment;
 module.exports.splitRegionModuleForFactoryHoist =
   splitRegionModuleForFactoryHoist;
+module.exports.regionUnit = regionUnit;
+module.exports.rawRegionUnit = rawRegionUnit;
+module.exports.renderRegionUnit = renderRegionUnit;
+module.exports.ownStatement = ownStatement;
+module.exports.regionStatementsFromFragments = regionStatementsFromFragments;
+module.exports.applyRegionStatementEdits = applyRegionStatementEdits;
 module.exports.pruneUnreachableRegionDeclarations =
   pruneUnreachableRegionDeclarations;

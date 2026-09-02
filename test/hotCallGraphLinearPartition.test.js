@@ -2,7 +2,7 @@ const test = require('tape');
 const {parse} = require('acorn');
 const {
   partitionOversizedLinearBlocks, liftOversizedUnitLocalsToEnvironment,
-  outlineLargeRegionLoops,
+  outlineLargeRegionLoops, regionUnit, rawRegionUnit, renderRegionUnit,
 } =
   require('../src/jit/HotCallGraphRegionCompiler');
 
@@ -10,6 +10,10 @@ const {
 // builds a synthetic module, partitions it with forced-small thresholds, and
 // executes both versions against identical inputs, comparing results and a
 // side-effect log. The pass must be a pure refactor at the observable level.
+//
+// The passes consume the statement records the renderer publishes for a body,
+// so each case hands them a fixture-built record list for its handwritten
+// source (see `buildRegionUnits`) and compiles the units they return.
 
 const OPTIONS = {
   namespace: '0',
@@ -24,8 +28,280 @@ function compile(moduleSource) {
   return new Function(moduleSource)();
 }
 
+// The renderer publishes each generated body as an ordered statement list:
+// per line, the parts the emitter built, the names it reads and writes, the
+// nesting it opens, the label it introduces, the jump it is and how a return
+// it carries splits around its argument. These cases are handwritten
+// JavaScript rather than generated bodies, so this builder stands in for that
+// publication: it derives the same records from the fixture's own syntax and
+// hands the passes exactly the shape the renderer hands them. Parsing here is
+// the fixture producing compiler input, not a pass recovering it.
+function childrenOf(node) {
+  const children = [];
+  for (const [key, child] of Object.entries(node || {})) {
+    if (key === 'start' || key === 'end' || key === 'loc' ||
+        key === 'range') continue;
+    if (Array.isArray(child)) {
+      for (const entry of child) if (entry?.type) children.push(entry);
+    } else if (child?.type) {
+      children.push(child);
+    }
+  }
+  return children;
+}
+
+const isFunctionNode = (node) => node && (
+  node.type === 'FunctionDeclaration' ||
+  node.type === 'FunctionExpression' ||
+  node.type === 'ArrowFunctionExpression');
+
+function buildRegionUnits(moduleSource) {
+  const program = parse(moduleSource, {
+    ecmaVersion: 'latest', ranges: true, allowReturnOutsideFunction: true,
+  });
+  const lines = moduleSource.split('\n');
+  const lineStarts = [];
+  let cursor = 0;
+  for (const line of lines) {
+    lineStarts.push(cursor);
+    cursor += line.length + 1;
+  }
+  const lineOf = (offset) => {
+    let low = 0;
+    let high = lines.length - 1;
+    while (low < high) {
+      const middle = (low + high + 1) >> 1;
+      if (lineStarts[middle] <= offset) low = middle;
+      else high = middle - 1;
+    }
+    return low;
+  };
+  // Braces inside a string or a comment are not nesting. The renderer never
+  // has to ask, because it counts the braces of its own literal chunks; the
+  // fixture blanks the literals it parsed instead.
+  const masked = moduleSource.split('');
+  const references = [];
+  const perLine = lines.map(() => ({
+    declarators: [], assignments: [], updates: [], returns: [], jumps: [],
+    labels: [], yields: 0, functions: 0, hostile: 0, opens: null,
+    unrepresentable: 0,
+  }));
+  const visit = (node, parent) => {
+    if (node.type === 'Literal' && typeof node.value === 'string' ||
+        node.type === 'TemplateElement') {
+      for (let at = node.start; at < node.end; at += 1) masked[at] = ' ';
+    }
+    const line = perLine[lineOf(node.start)];
+    if (node.type === 'YieldExpression') line.yields += 1;
+    if (isFunctionNode(node)) line.functions += 1;
+    if (node.type === 'ThisExpression' || node.type === 'Super' ||
+        node.type === 'AwaitExpression' ||
+        node.type === 'VariableDeclaration' && node.kind === 'var') {
+      line.hostile += 1;
+    }
+    if (node.type === 'VariableDeclaration') line.declarators.push(node);
+    if (node.type === 'AssignmentExpression') line.assignments.push(node);
+    if (node.type === 'UpdateExpression') line.updates.push(node);
+    if (node.type === 'ReturnStatement') line.returns.push(node);
+    if (node.type === 'BreakStatement' || node.type === 'ContinueStatement') {
+      line.jumps.push(node);
+    }
+    if (node.type === 'LabeledStatement') line.labels.push(node.label.name);
+    if (node.type === 'ForStatement' || node.type === 'ForInStatement' ||
+        node.type === 'ForOfStatement' || node.type === 'WhileStatement' ||
+        node.type === 'DoWhileStatement') line.opens = line.opens || 'loop';
+    if (node.type === 'TryStatement') line.opens = line.opens || 'try';
+    if (node.type === 'SwitchStatement') line.opens = 'switch';
+    if (isFunctionNode(node)) line.opens = 'function';
+    if (node.type === 'Property' && node.shorthand) {
+      perLine[lineOf(node.start)].unrepresentable += 1;
+    }
+    if (node.type === 'Identifier' && isReference(node, parent)) {
+      references.push(node);
+    }
+    for (const child of childrenOf(node)) visit(child, node);
+  };
+  const isReference = (node, parent) => {
+    if (!parent) return true;
+    if (parent.type === 'MemberExpression' && parent.property === node &&
+        !parent.computed) return false;
+    if ((parent.type === 'Property' || parent.type === 'MethodDefinition') &&
+        parent.key === node && !parent.computed) return false;
+    if ((parent.type === 'LabeledStatement' ||
+        parent.type === 'BreakStatement' ||
+        parent.type === 'ContinueStatement') && parent.label === node) {
+      return false;
+    }
+    if (isFunctionNode(parent) &&
+        (parent.id === node || parent.params.includes(node))) return false;
+    if (parent.type === 'CatchClause' && parent.param === node) return false;
+    return true;
+  };
+  visit(program, null);
+  const maskedSource = masked.join('');
+  references.sort((left, right) => left.start - right.start);
+
+  const partsOf = (from, to, own) => {
+    const parts = [];
+    let at = from;
+    for (const reference of own) {
+      if (reference.start < from || reference.end > to) continue;
+      if (reference.start > at) parts.push(moduleSource.slice(at, reference.start));
+      parts.push({ref: reference.name});
+      at = reference.end;
+    }
+    if (at < to) parts.push(moduleSource.slice(at, to));
+    return parts;
+  };
+
+  const statementFor = (index) => {
+    const start = lineStarts[index];
+    const end = start + lines[index].length;
+    const own = references.filter((reference) =>
+      reference.start >= start && reference.end <= end);
+    const facts = perLine[index];
+    const maskedLine = maskedSource.slice(start, end);
+    let delta = 0;
+    for (const character of maskedLine) {
+      if (character === '{') delta += 1;
+      else if (character === '}') delta -= 1;
+    }
+    const wholeLine = (node) => node.start >= start && node.end <= end;
+    const declaration = facts.declarators.find(wholeLine);
+    let def = null;
+    let declares = null;
+    let kind = 'statement';
+    if (declaration && declaration.declarations.every((entry) =>
+      entry.id.type === 'Identifier')) {
+      kind = declaration.kind === 'const' ? 'const'
+        : declaration.declarations.some((entry) => entry.init)
+          ? 'let' : 'letUninitialized';
+      if (declaration.declarations.length === 1) {
+        def = declaration.declarations[0].id.name;
+      } else {
+        declares = declaration.declarations.map((entry) => entry.id.name);
+      }
+    }
+    let write = null;
+    const assignment = facts.assignments.find((node) => wholeLine(node) &&
+      node.left.type === 'Identifier');
+    if (assignment) write = assignment.left.name;
+    const update = facts.updates.find((node) => wholeLine(node) &&
+      node.argument.type === 'Identifier');
+    if (!write && update) write = update.argument.name;
+    const reads = [];
+    for (const reference of own) {
+      if (reference.name === def) continue;
+      if (!reads.includes(reference.name)) reads.push(reference.name);
+    }
+    const returns = facts.returns.filter(wholeLine);
+    let exit = null;
+    let exitRecognized = facts.returns.length === returns.length;
+    if (returns.length === 1 && exitRecognized) {
+      const node = returns[0];
+      exit = {
+        before: partsOf(start, node.start, own),
+        argument: node.argument
+          ? partsOf(node.argument.start, node.argument.end, own) : null,
+        after: partsOf(node.end, end, own),
+      };
+    } else if (returns.length) {
+      exitRecognized = false;
+    }
+    const jumps = facts.jumps.filter(wholeLine);
+    let jump = null;
+    if (jumps.length === 1 && facts.jumps.length === 1) {
+      const node = jumps[0];
+      jump = {
+        kind: node.type === 'BreakStatement' ? 'break' : 'continue',
+        label: node.label ? node.label.name : null,
+        before: partsOf(start, node.start, own),
+        after: partsOf(node.end, end, own),
+      };
+    }
+    const trimmed = maskedLine.trim();
+    return {
+      text: lines[index],
+      indent: lines[index].slice(0,
+        lines[index].length - lines[index].trimStart().length),
+      parts: facts.unrepresentable ? null : partsOf(start, end, own),
+      kind,
+      def,
+      declares,
+      write,
+      reads,
+      delta,
+      label: facts.labels.length ? facts.labels[0] : null,
+      jump,
+      exit,
+      yields: facts.yields > 0,
+      continuesBlock: trimmed.startsWith('}') && trimmed.endsWith('{'),
+      opens: delta > 0 ? (facts.opens || 'block') : null,
+      relocatable: facts.unrepresentable === 0 &&
+        facts.functions === 0 && facts.hostile === 0 &&
+        exitRecognized && (jump !== null || facts.jumps.length === 0) &&
+        !(jump && exit) && facts.opens !== 'switch',
+    };
+  };
+
+  const units = [];
+  let pending = [];
+  const flushPending = () => {
+    if (!pending.length) return;
+    units.push(rawRegionUnit(pending.join('\n')));
+    pending = [];
+  };
+  let line = 0;
+  for (const node of program.body) {
+    const first = lineOf(node.start);
+    const last = lineOf(node.end - 1);
+    while (line < first) pending.push(lines[line++]);
+    if (node.type === 'FunctionDeclaration') {
+      const bodyFirst = lineOf(node.body.start);
+      flushPending();
+      const statements = [];
+      for (let index = bodyFirst + 1; index < last; index += 1) {
+        statements.push(statementFor(index));
+      }
+      units.push(regionUnit({
+        name: node.id.name,
+        generator: node.generator === true,
+        headerLines: lines.slice(first, bodyFirst + 1),
+        statements,
+        footerLines: [lines[last]],
+      }));
+    } else {
+      for (let index = first; index <= last; index += 1) {
+        pending.push(lines[index]);
+      }
+    }
+    line = last + 1;
+  }
+  while (line < lines.length) pending.push(lines[line++]);
+  flushPending();
+  return units;
+}
+
+// A standalone generator body: the whole source is one unit's statement list,
+// the way the renderer hands a continuation-tier body over.
+function buildGeneratorBodyUnit(bodySource) {
+  const units = buildRegionUnits(
+    `function* __fixture() {\n${bodySource}\n}`);
+  return regionUnit({...units[0], headerLines: [], footerLines: []});
+}
+
+function renderUnits(units) {
+  return units.map(renderRegionUnit).join('\n');
+}
+
+function partition(moduleSource, options = OPTIONS) {
+  const partitioned = partitionOversizedLinearBlocks(
+    buildRegionUnits(moduleSource), options);
+  return {...partitioned, source: renderUnits(partitioned.units)};
+}
+
 function partitionAndCompile(t, moduleSource) {
-  const partitioned = partitionOversizedLinearBlocks(moduleSource, OPTIONS);
+  const partitioned = partition(moduleSource);
   t.ok(partitioned.count > 0, 'the case is large enough to partition');
   return {fn: compile(partitioned.source), partitioned};
 }
@@ -244,7 +520,7 @@ test('generator units delegate yield-bearing runs through yield*', (t) => {
       `      total = (total + i * ${k + 1} + j) | 0;`,
       `      ${pad(`g${k}`)}`,
       `      if (total % 101 === ${k}) { log.push("y${k}"); ` +
-        `yield {at: ${k}, total}; }`,
+        `yield {at: ${k}, total: total}; }`,
       `      if (total % 97 === ${k}) { log.push("cont${k}"); continue; }`,
       `      if (total % 89 === ${k}) { log.push("co${k}"); continue OUTER; }`,
       `      if (total % 83 === ${k}) { log.push("bo${k}"); break OUTER; }`,
@@ -258,7 +534,7 @@ test('generator units delegate yield-bearing runs through yield*', (t) => {
     '}',
   ].join('\n')}\nreturn work;`;
   const original = compile(moduleSource);
-  const partitioned = partitionOversizedLinearBlocks(moduleSource, OPTIONS);
+  const partitioned = partition(moduleSource);
   t.ok(partitioned.count > 0, 'the generator case partitions');
   t.ok(/function\* jvmRegionSegment/.test(partitioned.source),
     'yield-bearing runs become generator helpers');
@@ -304,7 +580,7 @@ test('iterator.return abandonment runs finallys across yield* boundaries',
       '}',
     ].join('\n')}\nreturn work;`;
     const original = compile(moduleSource);
-    const partitioned = partitionOversizedLinearBlocks(moduleSource, OPTIONS);
+    const partitioned = partition(moduleSource);
     t.ok(partitioned.count > 0, 'the abandonment case partitions');
     const fn = compile(partitioned.source);
     for (let n = 0; n < 20; n += 1) {
@@ -343,17 +619,21 @@ test('environment lift is a pure refactor and shrinks call-site plumbing',
       '}',
     ].join('\n')}\nreturn work;`;
     const original = compile(moduleSource);
-    const lifted = liftOversizedUnitLocalsToEnvironment(moduleSource, {
-      namespace: '0', maximumUnitBytes: OPTIONS.maximumUnitBytes,
-    });
+    const lifted = liftOversizedUnitLocalsToEnvironment(
+      buildRegionUnits(moduleSource), {
+        namespace: '0', maximumUnitBytes: OPTIONS.maximumUnitBytes,
+      });
+    lifted.source = renderUnits(lifted.units);
     t.ok(lifted.liftedNames > 60, 'the top-level cache namespace lifts');
-    t.ok(/jvmRegionEnv0_0/.test(lifted.source),
+    t.ok(/jvmRegionEnv0_1/.test(lifted.source),
       'an environment array is introduced');
     t.ok(/const shadowed = a \+ 1;/.test(lifted.source),
       'a shadowed name keeps its original declaration');
     const liftedFn = compile(lifted.source);
-    const partitioned = partitionOversizedLinearBlocks(
-      lifted.source, OPTIONS);
+    const partitionedUnits = partitionOversizedLinearBlocks(
+      lifted.units, OPTIONS);
+    const partitioned = {...partitionedUnits,
+      source: renderUnits(partitionedUnits.units)};
     t.ok(partitioned.count > 0, 'the lifted module partitions');
     const partitionedFn = compile(partitioned.source);
     for (const [a, b] of [[3, 5], [-7, 2], [100, -1]]) {
@@ -393,17 +673,22 @@ test('framed-style generator: lift then partition end to end', (t) => {
         `log.push("deopt${i}"); ` +
         `yield {deopt: true, structuredResumePc: pc}; }`,
       `  if (value % 401 === ${i}) { log.push("exit${i}"); ` +
-        `return {returned: true, value}; }`,
+        `return {returned: true, value: value}; }`,
     ].join('\n')),
-    '  return {returned: true, value, sites: site0.hits + site59.hits};',
+    '  return {returned: true, value: value, ' +
+      'sites: site0.hits + site59.hits};',
     '}',
   ].join('\n')}\nreturn work;`;
   const original = compile(moduleSource);
-  const lifted = liftOversizedUnitLocalsToEnvironment(moduleSource, {
-    namespace: '0', maximumUnitBytes: OPTIONS.maximumUnitBytes,
-  });
+  const lifted = liftOversizedUnitLocalsToEnvironment(
+    buildRegionUnits(moduleSource), {
+      namespace: '0', maximumUnitBytes: OPTIONS.maximumUnitBytes,
+    });
   t.ok(lifted.liftedNames > 50, 'the framed-style preamble lifts');
-  const partitioned = partitionOversizedLinearBlocks(lifted.source, OPTIONS);
+  const partitionedUnits = partitionOversizedLinearBlocks(
+    lifted.units, OPTIONS);
+  const partitioned = {...partitionedUnits,
+    source: renderUnits(partitionedUnits.units)};
   t.ok(partitioned.count > 0, 'the framed-style case partitions');
   t.ok(/yield\* jvmRegionSegment/.test(partitioned.source),
     'the framed-style case delegates through yield*');
@@ -430,26 +715,28 @@ test('framed-style generator: lift then partition end to end', (t) => {
 test('loop outlining preserves generator yields and abandonment', (t) => {
   const repeated = Array.from({length: 180}, (_unused, index) =>
     `value = (value + ${index + 1}) | 0;`).join('\n');
-  const moduleSource = `return function* work(limit, log) {
-    let value = 0;
-    try {
-      for (let index = 0; index < limit; index += 1) {
-        ${repeated}
-        log.push(value);
-        yield value;
-      }
-      return value;
-    } finally {
-      log.push('finally');
+  const moduleSource = `function* work(limit, log) {
+  let value = 0;
+  try {
+    for (let index = 0; index < limit; index += 1) {
+${repeated}
+      log.push(value);
+      yield value;
     }
-  };`;
-  const outlined = outlineLargeRegionLoops(moduleSource, {
-    minimumSourceBytes: 4096, maximumOutlines: 4,
-    namespace: 31, generator: true,
+    return value;
+  } finally {
+    log.push('finally');
+  }
+}
+return work;`;
+  const units = buildRegionUnits(moduleSource);
+  const work = units.find((unit) => unit.name === 'work');
+  const outlined = outlineLargeRegionLoops(work, {
+    minimumSourceBytes: 4096, maximumOutlines: 4, namespace: 31,
   });
   t.ok(outlined.count > 0, 'the yield-bearing loop is outlined');
-  const transformed = compile(`${outlined.source}\n${
-    outlined.helperSources.join('\n')}`);
+  const transformed = compile(renderUnits(units.flatMap((unit) =>
+    unit === work ? [outlined.unit, ...outlined.helpers] : [unit])));
   const original = compile(moduleSource);
   for (const maximumSteps of [0, 1, 3, Infinity]) {
     const expectedLog = [];
@@ -474,9 +761,9 @@ test('standalone generator bodies partition with exact source offsets', (t) => {
       `value = (value ^ ${index + 17}) | 0;`),
     'return value;',
   ].join('\n');
-  const partitioned = partitionOversizedLinearBlocks(body, {
-    ...OPTIONS, rootProgramGenerator: true,
-  });
+  const partitioned = partitionOversizedLinearBlocks(
+    [buildGeneratorBodyUnit(body)], OPTIONS);
+  partitioned.source = renderUnits(partitioned.units);
   t.ok(partitioned.attemptedRuns > 0,
     'analysis accepts yields from a standalone generator body');
   t.ok(partitioned.count > 0, 'the standalone body is actually partitioned');
@@ -507,9 +794,9 @@ test('a "yield" inside a string is not mistaken for a keyword', (t) => {
       `value = (value + ${index + 1}) | 0;`),
     'return value + label.length + names.yield;',
   ].join('\n');
-  const partitioned = partitionOversizedLinearBlocks(body, {
-    ...OPTIONS, rootProgramGenerator: true,
-  });
+  const partitioned = partitionOversizedLinearBlocks(
+    [buildGeneratorBodyUnit(body)], OPTIONS);
+  partitioned.source = renderUnits(partitioned.units);
   t.ok(partitioned.count > 0, 'the standalone body is actually partitioned');
   t.ok(!partitioned.source.includes('yield* jvmRegionSegment'),
     'a yield-free run is not delegated to');
