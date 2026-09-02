@@ -2316,13 +2316,19 @@ class JvmSsaBlockRenderer {
     // complete pre-call stack for normal handler dispatch.
     const materializeCallExceptionLines = (
       preCallValues, postCallValues, pc, callStackDepth,
-      childCanResume = "true",
+      childCanResume = "true", restoreMarkers = null,
     ) => [
       `if (${childCanResume} && thread.callStack.items.length > ${
         callStackDepth}) {`,
       ...materializeLines(postCallValues, pc + 1).map((line) => `  ${line}`),
       "} else {",
+      // A caller that lowers this call into a region reuses the exact
+      // call-pc restoration arm. Bracket it with a compiler-owned token pair
+      // so the arm can be taken by identity from whatever this body was
+      // finally emitted as, rather than located by parsing the result.
+      ...(restoreMarkers ? [`  /*${restoreMarkers.start}*/`] : []),
       ...materializeLines(preCallValues, pc).map((line) => `  ${line}`),
+      ...(restoreMarkers ? [`  /*${restoreMarkers.end}*/`] : []),
       "}",
     ];
     const stageOperandLines = (operandValues) => [
@@ -4547,14 +4553,36 @@ class JvmSsaBlockRenderer {
                   checkedLeaf: ["return helpers.asyncInvokeSentinel();"],
                 });
               }
-              const positionalRawCall = `${positionalRawInvoke} ? ` +
-                `${positionalRawInvoke}(helpers${args.length ? ", " : ""}` +
-                `${args.join(", ")}${positionalRawCaptures.length
-                  ? `${args.length ? ", " : ""}${positionalRawCaptures.join(", ")}`
-                  : ""}${args.length || positionalRawCaptures.length
-                  ? ", " : ", "}thread, true) : ` +
+              // Rendered against the nested-entry argument so a region that
+              // links this site can select the already-guarded form by
+              // identity instead of locating the call in emitted text, and
+              // with one compiler-owned token in front of each operand. Later
+              // line passes rewrite operand expressions freely (SSA aliasing,
+              // one-use inlining); the tokens are what survives, so a caller
+              // takes each operand from between them instead of re-deriving
+              // the argument list from the emitted call.
+              const regionOperandTokens = [...args, ...positionalRawCaptures]
+                .map((_operand, position) =>
+                  `/*__JVM_CALL_ARG_${index}_${position}__*/`);
+              const regionMarkedOperands = [...args, ...positionalRawCaptures]
+                .map((operand, position) =>
+                  `${regionOperandTokens[position]}${operand}`);
+              const positionalRawCallFor = (nestedEntryGuarded) =>
+                `${positionalRawInvoke} ? ` +
+                `${positionalRawInvoke}(helpers, ${regionMarkedOperands.length
+                  ? `${regionMarkedOperands.join(", ")}, ` : ""
+                }thread, ${nestedEntryGuarded}) : ` +
                 `${positionalInvoke}(${args.join(", ")}${
                   args.length ? ", " : ""}thread, true)`;
+              const positionalRawCall = positionalRawCallFor("true");
+              const regionRestoreMarkers = {
+                start: `__JVM_CALL_RESTORE_START_${index}__`,
+                end: `__JVM_CALL_RESTORE_END_${index}__`,
+              };
+              const regionHandlerMarkers = {
+                start: `__JVM_CALL_HANDLER_START_${index}__`,
+                end: `__JVM_CALL_HANDLER_END_${index}__`,
+              };
               const invariantPositionalRawCall = invariantPositionalRaw
                 ? `${invariantPositionalRaw}(helpers${
                   args.length ? ", " : ""}${args.join(", ")})`
@@ -4692,13 +4720,16 @@ class JvmSsaBlockRenderer {
                 ] : [
                   `  try { ${out} = ${selfRecursiveMarker}${
                     positionalRawCall}; } catch (${caught}) {`,
+                  `    /*${regionHandlerMarkers.start}*/`,
                   ...materializeCallExceptionLines(
                     callStack, stack, index,
                     callStackDepth,
                     site.selfRecursive ? "false" :
                       `!${positionalInvoke}.jvmRestoresExceptionFrames`,
+                    regionRestoreMarkers,
                   ).map((line) => `    ${line}`),
-                  `    throw ${caught};`, "  }",
+                  `    throw ${caught};`,
+                  `    /*${regionHandlerMarkers.end}*/`, "  }",
                 ]),
                 "}",
                 `if (!${usedDirect} || ${inlineCheckedLeafVoid
@@ -4708,6 +4739,30 @@ class JvmSsaBlockRenderer {
                   ? [inlineCheckedLeafFallbackMarker]
                   : fallbackLines.map((line) => `  ${line}`)),
                 ...(inlineCheckedLeafVoid ? [] : ["}"]));
+              // Publish what a fused hot call-graph region needs in order to
+              // link this call site, as compiler-owned tokens rather than as
+              // structure to be recovered from the emitted JavaScript. The
+              // names below are stable through every later line pass; the
+              // operand list and the two exception arms are delimited by
+              // token pairs this call emitted, so they are taken by identity
+              // from whichever specialized body finally carries them.
+              if (!(inlineCheckedLeafLines && receiverGuard === "true")) {
+                site.regionLowering = {
+                  resultName: out,
+                  resultDeclaration: `let ${out};`,
+                  depthName: callStackDepth,
+                  rawCallPrefix: `${positionalRawInvoke}(helpers, `,
+                  rawCallSuffix: "thread, true)",
+                  nestedRawCallSuffix: "thread, 2)",
+                  operandTokens: [...regionOperandTokens],
+                  fastCall: inlineCheckedLeafLines || directCheckedLeafNoThrow
+                    ? null : {
+                      caught,
+                      restoreMarkers: {...regionRestoreMarkers},
+                      handlerMarkers: {...regionHandlerMarkers},
+                    },
+                };
+              }
             } else {
               lines.push(...fallbackLines);
             }
@@ -9098,6 +9153,16 @@ class JvmSsaBlockRenderer {
     ) => {
       const lines = [];
       const captureSections = [];
+      // Each call binding is emitted through `declare` so its exact
+      // declaration text and declaration kind can be published. A region that
+      // links the site replaces the whole declaration by identity instead of
+      // parsing the module to find the declarator's initializer.
+      const declarationsByName = new Map();
+      const declare = (kind, name, initializer) => {
+        const text = `${kind} ${name} = ${initializer};`;
+        declarationsByName.set(name, {kind, text});
+        return text;
+      };
       for (const [index, site] of [...callSites].filter(([, candidate]) =>
         candidate.id !== null && candidate.id !== undefined &&
         !(omitSelfRecursive && candidate.selfRecursive))) {
@@ -9146,46 +9211,46 @@ class JvmSsaBlockRenderer {
         const rawBody = `ssaFastPositionalRawBody${index}`;
         if (forceCanonicalCalls) {
           lines.push(
-            `const ${positionalCallSiteVariable(index)} = ` +
-              `helpers.syncCallSites[${site.id}];`,
+            declare("const", positionalCallSiteVariable(index),
+              `helpers.syncCallSites[${site.id}]`),
             ...captureLines,
-            `const ${positionalCallLateLinkVariable(index)} = false;`,
-            `let ${positionalCallTargetVariable(index)} = null;`,
-            `let ${positionalCallInvokeVariable(index)} = null;`,
-            `let ${positionalCallRawInvokeVariable(index)} = null;`,
-            `let ${positionalCallReceiverVariable(index)} = null;`,
+            declare("const", positionalCallLateLinkVariable(index), "false"),
+            declare("let", positionalCallTargetVariable(index), "null"),
+            declare("let", positionalCallInvokeVariable(index), "null"),
+            declare("let", positionalCallRawInvokeVariable(index), "null"),
+            declare("let", positionalCallReceiverVariable(index), "null"),
           );
         } else if (compileTimeCheckedLeaf) {
           lines.push(
-            `const ${rawBody} = ` +
-              `helpers.directCheckedLeafBodies[${site.directCheckedLeaf.id}];`,
+            declare("const", rawBody,
+              `helpers.directCheckedLeafBodies[${site.directCheckedLeaf.id}]`),
             ...captureLines,
-            `const ${positionalCallRawInvokeVariable(index)} = ${rawBody};`,
-            `const ${positionalCallInvokeVariable(index)} = null;`,
-            `const ${positionalCallReceiverVariable(index)} = null;`,
+            declare("const", positionalCallRawInvokeVariable(index), rawBody),
+            declare("const", positionalCallInvokeVariable(index), "null"),
+            declare("const", positionalCallReceiverVariable(index), "null"),
           );
         } else {
           lines.push(
-            `const ${positionalCallSiteVariable(index)} = ` +
-              `helpers.syncCallSites[${site.id}];`,
-            `const ${positionalCallLateLinkVariable(index)} = true;`,
-            `let ${positionalCallTargetVariable(index)} = ` +
+            declare("const", positionalCallSiteVariable(index),
+              `helpers.syncCallSites[${site.id}]`),
+            declare("const", positionalCallLateLinkVariable(index), "true"),
+            declare("let", positionalCallTargetVariable(index),
               `!helpers.profileMethods && ` +
               `${positionalCallSiteVariable(index)} && ` +
               `${positionalCallSiteVariable(index)}.fastPositional && ` +
               `(${positionalCallSiteVariable(index)}.fastPositional.debugGuarded || ` +
               `!helpers.jvm.debugManager.isClassJitDeopted(` +
               `${positionalCallSiteVariable(index)}.fastPositional.lookupClass)) ` +
-              `? ${positionalCallSiteVariable(index)}.fastPositional : null;`,
-            `let ${positionalCallInvokeVariable(index)} = ` +
+              `? ${positionalCallSiteVariable(index)}.fastPositional : null`),
+            declare("let", positionalCallInvokeVariable(index),
               `${positionalCallTargetVariable(index)} && ` +
-              `${positionalCallTargetVariable(index)}.invoke;`,
-            `let ${positionalCallRawInvokeVariable(index)} = ` +
+              `${positionalCallTargetVariable(index)}.invoke`),
+            declare("let", positionalCallRawInvokeVariable(index),
               `${positionalCallTargetVariable(index)} && ` +
-              `${positionalCallTargetVariable(index)}.rawInvoke;`,
-            `let ${positionalCallReceiverVariable(index)} = ` +
+              `${positionalCallTargetVariable(index)}.rawInvoke`),
+            declare("let", positionalCallReceiverVariable(index),
               `${positionalCallTargetVariable(index)} && ` +
-              `${positionalCallTargetVariable(index)}.receiverType;`,
+              `${positionalCallTargetVariable(index)}.receiverType`),
           );
         }
         if (captureLines.length) {
@@ -9196,7 +9261,7 @@ class JvmSsaBlockRenderer {
           });
         }
       }
-      return {lines, captureSections};
+      return {lines, captureSections, declarationsByName};
     };
     // A continuation that owns both recursive calls and independent scheduler
     // handoffs cannot safely mix lexical continuation state with nested
@@ -10367,6 +10432,7 @@ class JvmSsaBlockRenderer {
         minimumSegmentBytes: this.linearPartitionMinimumSegmentBytes,
         rootProgramGenerator: true,
         namespace: "structured",
+        directive: "'use strict';\n",
       })
       : {source: outlinedGeneratedSource, count: 0,
         partitionedSourceBytes: 0};
@@ -12178,7 +12244,53 @@ class JvmSsaBlockRenderer {
               ? [...site.directJre.fieldWriteKeys] : null,
           identifiers: {...site.identifiers},
           regionMarkers: {...site.regionMarkers},
+          regionLowering: site.regionLowering || null,
         }));
+      // A region that links a call site replaces the site's bindings by
+      // identity. Publish the exact declaration text and declaration kind of
+      // every binding this renderer emitted, in both the framed and the
+      // positional variants, together with the dependency order among them.
+      const regionCallBindingDeclarations = {};
+      for (const declarationSet of [
+        directPositionalCallDeclarationSet, positionalCallDeclarationSet,
+      ]) {
+        for (const [name, entry] of declarationSet.declarationsByName) {
+          const entries = regionCallBindingDeclarations[name] || [];
+          if (!entries.some((candidate) => candidate.text === entry.text)) {
+            entries.push(entry);
+          }
+          regionCallBindingDeclarations[name] = entries;
+        }
+      }
+      generated.jvmStructuredRegionCallBindingDeclarations =
+        regionCallBindingDeclarations;
+      // These sites read their call bindings from a declaration outside the
+      // call's own marker span (the loop-invariant raw target). A region that
+      // lowers such a site must keep the bindings it linked.
+      generated.jvmStructuredRegionInvariantPositionalCallIndices =
+        [...invariantPositionalReceiverSlots.keys()];
+      // The exact run-accounting statements a fused internal node drops: the
+      // graph is one execution unit and must not re-count each member entry.
+      generated.jvmStructuredRegionRunCounterStatements =
+        this.runCountersEnabled ? [
+          "if (nestedEntryGuarded !== 2) helpers.structuredSsa.runCount += 1;",
+          "if (nestedEntryGuarded !== 2) " +
+            "helpers.structuredSsa.restoringDirectRunCount += 1;",
+          "helpers.structuredSsa.runCount += 1;",
+          "helpers.structuredSsa.restoringDirectRunCount += 1;",
+        ] : [];
+      // The exact safe-point budget declarations this renderer emitted, one
+      // per positional variant. A fused module owns a single counter and
+      // removes these by identity rather than matching emitted text.
+      generated.jvmStructuredSafePointBudgetDeclarations = [...new Set([
+        safePointInitialBudget,
+        regionCallGraphCandidate
+          ? this.jit.hotCallGraphRegions.directSafePointBudget
+          : safePointInitialBudget,
+        Math.min(1_000_000, regionCallGraphCandidate
+          ? this.jit.hotCallGraphRegions.directSafePointBudget
+          : safePointInitialBudget * this.restoringDirectBudgetMultiplier),
+      ])].map((budget) => `let safePointBudget = ${budget};`);
       generated.jvmCheckedLeafDirectPositionalBody =
         checkedLeafDirectPositionalBody;
       generated.jvmCheckedLeafDirectPositionalSource =

@@ -507,19 +507,11 @@ public class GenericCallGraphLoop {
 
   t.ok(plan?.body && plan.backendEligible,
     'an acyclic exact graph emits one executable JavaScript module');
-  const bindingBuilds = jvm.jit.hotCallGraphRegions
-    .callBindingIndexBuildCount;
-  const bindingReuses = jvm.jit.hotCallGraphRegions
-    .callBindingIndexReuseCount;
   const rebuiltBody = jvm.jit.hotCallGraphRegions.compileModule(plan, false);
   t.ok(rebuiltBody,
     'the same verified plan can be emitted again during graph expansion');
-  t.equal(jvm.jit.hotCallGraphRegions.callBindingIndexBuildCount,
-    bindingBuilds,
-  'region expansion does not parse unchanged generated sources again');
-  t.ok(jvm.jit.hotCallGraphRegions.callBindingIndexReuseCount >=
-      bindingReuses + plan.nodes.length,
-  'region expansion reuses one AST-derived binding index per graph node');
+  t.equal(jvm.jit.hotCallGraphRegions.callBindingParseCount, 0,
+    'region composition never parses a generated source');
   t.equal(plan.nodes.length, 5,
     'the module contains every transitive exact node');
   t.equal(plan.loweredEdgeCount, 2,
@@ -739,8 +731,6 @@ public class GenericCallGraphLoop {
     priorRangeGuardDeopts;
   loopingChildGenerated.jvmRestoringDirectPositionalSource =
     priorRestoringSource;
-  jvm.jit.hotCallGraphRegions.callBindingIndexes.delete(
-    loopingChildGenerated);
 
   const nestedRootMethod = await jvm.findMethodInHierarchy(
     className, 'nestedLoopRoot', '([III)I');
