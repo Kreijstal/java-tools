@@ -1474,9 +1474,9 @@ class HotCallGraphRegionCompiler {
     // Regression measurement showed that even a positional live-in/live-out
     // ABI does not recover the cost of already-expanded cold JVM paths. The
     // production refactor must split verified CFG/SSA before source emission.
-    this.loopOutliningEnabled =
-      options.hotCallGraphLoopOutlining === true ||
-      environment.JVM_ENABLE_HOT_CALL_GRAPH_LOOP_OUTLINING === "1";
+    this.loopOutliningEnabled = options.hotCallGraphLoopOutlining !== false &&
+      (options.hotCallGraphLoopOutlining === true ||
+        environment.JVM_ENABLE_HOT_CALL_GRAPH_LOOP_OUTLINING === "1");
     this.loopOutlineSourceBytes = Math.max(4096, Math.min(262144,
       Number(options.hotCallGraphLoopOutlineSourceBytes ??
         environment.JVM_HOT_CALL_GRAPH_LOOP_OUTLINE_SOURCE_BYTES) || 32768));
@@ -1486,8 +1486,9 @@ class HotCallGraphRegionCompiler {
     // Straight-line partitioning of whatever oversized flat bodies remain
     // after loop outlining. Opt-in while under differential measurement.
     this.linearPartitionEnabled =
-      options.hotCallGraphLinearPartition === true ||
-      environment.JVM_ENABLE_HOT_CALL_GRAPH_LINEAR_PARTITION === "1";
+      options.hotCallGraphLinearPartition !== false &&
+      (options.hotCallGraphLinearPartition === true ||
+        environment.JVM_ENABLE_HOT_CALL_GRAPH_LINEAR_PARTITION === "1");
     this.linearPartitionUnitBytes = Math.max(16384, Math.min(262144,
       Number(options.hotCallGraphLinearPartitionUnitBytes ??
         environment.JVM_HOT_CALL_GRAPH_LINEAR_PARTITION_UNIT_BYTES) ||
@@ -1504,16 +1505,17 @@ class HotCallGraphRegionCompiler {
     // every run unsplittable. Separately gated so the framed and positional
     // partitioners can be measured independently.
     this.framedPartitionEnabled =
-      options.hotCallGraphFramedPartition === true ||
-      environment.JVM_ENABLE_HOT_CALL_GRAPH_FRAMED_PARTITION === "1";
+      options.hotCallGraphFramedPartition !== false &&
+      (options.hotCallGraphFramedPartition === true ||
+        environment.JVM_ENABLE_HOT_CALL_GRAPH_FRAMED_PARTITION === "1");
     // Module-level function declarations and protocol state arrays are
     // invocation-independent by construction (every helper is
     // parameter-complete). Evaluating them once in the factory scope stops
     // every module entry from re-instantiating each helper closure and
     // re-allocating the segment state array.
-    this.factoryHoistEnabled =
-      options.hotCallGraphFactoryHoist === true ||
-      environment.JVM_ENABLE_HOT_CALL_GRAPH_FACTORY_HOIST === "1";
+    this.factoryHoistEnabled = options.hotCallGraphFactoryHoist !== false &&
+      (options.hotCallGraphFactoryHoist === true ||
+        environment.JVM_ENABLE_HOT_CALL_GRAPH_FACTORY_HOIST === "1");
     this.factoryHoistedModuleCount = 0;
     this.factoryHoistedDeclarationCount = 0;
     this.partitionedSegmentCount = 0;

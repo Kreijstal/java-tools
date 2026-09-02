@@ -37,8 +37,9 @@ test('hot call-graph roots have a conservative structural size bound', (t) => {
     'an explicit structural experiment can widen the root bound');
   t.equal(widened.jit.hotCallGraphRegions.directSafePointBudget, 256,
     'a fused graph can use a browser-sized scheduler quantum');
-  t.notOk(ordinary.jit.hotCallGraphRegions.loopOutliningEnabled,
-    'post-render loop outlining remains disabled after its live rejection');
+  t.equal(ordinary.jit.hotCallGraphRegions.loopOutliningEnabled,
+    process.env.JVM_ENABLE_HOT_CALL_GRAPH_LOOP_OUTLINING === '1',
+    'post-render loop outlining stays off unless it is explicitly enabled');
   t.end();
 });
 
@@ -1324,6 +1325,12 @@ public final class GuardedInternalGraphRoot {
     structuredRunCounters: false,
     hotCallGraphRegions: true,
     profileMethods: false,
+    // The cold-island count below is a statement about the node body as it
+    // is emitted, so this case states that it measures the unpartitioned
+    // shape rather than inheriting a forced experiment from the environment.
+    hotCallGraphLinearPartition: false,
+    hotCallGraphFramedPartition: false,
+    hotCallGraphLoopOutlining: false,
   }});
   for (const owner of [className, operationName, alternateName]) {
     await jvm.loadClassByName(owner);
@@ -1453,7 +1460,11 @@ ${grind}
     hotCallGraphLinearPartitionUnitBytes: 16384,
     hotCallGraphLinearPartitionSegmentBytes: 4096,
   };
-  const baseline = await compileGraph({});
+  const baseline = await compileGraph({
+    hotCallGraphFramedPartition: false,
+    hotCallGraphLinearPartitionUnitBytes: 49152,
+    hotCallGraphLinearPartitionSegmentBytes: 32768,
+  });
   const cut = await compileGraph(forced);
 
   t.ok(baseline.plan?.body && baseline.plan.framedBody,
