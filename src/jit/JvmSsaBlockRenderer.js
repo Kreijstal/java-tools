@@ -2959,6 +2959,11 @@ class JvmSsaBlockRenderer {
         }
       };
       let condition = null;
+      // The algebraic negation of `condition`, when the emitter can write it
+      // without a leading `!`. Only the equality pair is inverted: `<`/`>=`
+      // and friends are not exact inverses for every JavaScript value, and
+      // later passes recognize the `!(a === b)` shape of a null test.
+      let negatedCondition = null;
       let conditionConstant = null;
       let returnKind = null;
       let returnValue = null;
@@ -4969,6 +4974,7 @@ class JvmSsaBlockRenderer {
             if (left === null || right === null || !cmp) valid = false;
             else {
               condition = `${left} ${cmp} ${right}`;
+              if (cmp === "!==") negatedCondition = `${left} === ${right}`;
               const literal = (expression) => /^-?\d+$/.test(expression)
                 ? Number(expression) : expression === "null" ? null : undefined;
               const a = literal(left), b = literal(right);
@@ -4985,6 +4991,8 @@ class JvmSsaBlockRenderer {
             if (input === null || !cmp) valid = false;
             else {
               condition = `${input} ${cmp}`;
+              if (op === "ifne") negatedCondition = `${input} === 0`;
+              else if (op === "ifnonnull") negatedCondition = `${input} === null`;
               if (/^-?\d+$/.test(input)) {
                 const number = Number(input);
                 conditionConstant = op === "ifeq" ? number === 0 : op === "ifne" ? number !== 0
@@ -4998,7 +5006,8 @@ class JvmSsaBlockRenderer {
           }
           if (!valid || !edgeLines(target, stack) || !edgeLines(fall, stack)) valid = false;
           else plans[block.id] = {
-            lines, condition, conditionConstant, taken: target, fall, stack: [...stack],
+            lines, condition, negatedCondition, conditionConstant,
+            taken: target, fall, stack: [...stack],
           };
         } else if (op === "athrow") {
           const thrown = pop();
@@ -8807,8 +8816,11 @@ class JvmSsaBlockRenderer {
         if (elseLines.length === 0) {
           return [`if (${plan.condition}) {`, ...indent(thenLines), "}"];
         }
+        // Emit the compiler's own negation of the branch condition when it
+        // has one, instead of leaving `!(a !== b)` for a later text pass.
+        const negated = plan.negatedCondition || `!(${plan.condition})`;
         if (thenLines.length === 0) {
-          return [`if (!(${plan.condition})) {`, ...indent(elseLines), "}"];
+          return [`if (${negated}) {`, ...indent(elseLines), "}"];
         }
         const breakTarget = (line) =>
           /^break (L\d+);$/.exec(line)?.[1] || null;
@@ -8818,7 +8830,7 @@ class JvmSsaBlockRenderer {
           ? breakTarget(elseLines[elseLines.length - 1]) : null;
         if (thenBreak && thenBreak === elseBreak) {
           return [
-            `if (!(${plan.condition})) {`,
+            `if (${negated}) {`,
             ...indent(elseLines.slice(0, -1)),
             "}",
             `break ${thenBreak};`,
@@ -10263,9 +10275,6 @@ class JvmSsaBlockRenderer {
       lines = promoteSingleAssignmentSsaBindings(
         lines.join("\n"), ssaValueNames,
       ).split("\n").filter(Boolean);
-      lines = lines.map((line) => line.replace(
-        /if \(!\((.+) !== (.+)\)\) \{/,
-        'if ($1 === $2) {'));
 
       // Branch folding above can leave a labeled block whose sole remaining
       // exit is an unconditional trailing break. SSA names are globally
