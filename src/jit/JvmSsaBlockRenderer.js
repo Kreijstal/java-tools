@@ -1434,6 +1434,7 @@ class JvmSsaBlockRenderer {
       const text = renderParts(parts);
       const key = text.trim();
       const record = {
+        ...(meta || {}),
         key,
         parts,
         kind: meta?.kind || "statement",
@@ -5869,19 +5870,22 @@ class JvmSsaBlockRenderer {
             ...info,
             variable: named(`ssaRuntimeCoarseLoop${header}`),
             tripsVariable: named(`ssaRuntimeCoarseTrips${header}`),
-            tripsExpression:
-              `(local${info.slot} >= ${info.boundExpression} ? 0 : ` +
-              (info.increment === 1
-                ? `(${info.boundExpression} - local${info.slot})`
-                : `Math.ceil((${info.boundExpression} - local${info.slot}) / ` +
-                  `${info.increment})`) +
-              `)`,
-            condition:
-              `ssaRuntimeCoarseTrips${header} <= ` +
-              `${tripLimit}` +
-              (info.increment === 1 ? "" :
-                ` && local${info.slot} <= 2147483647 - ` +
-                `ssaRuntimeCoarseTrips${header} * ${info.increment}`),
+            tripsExpression: operand(exprConcat(
+              e`(${localName(info.slot)} >= ${info.boundExpression} ? 0 : `,
+              info.increment === 1
+                ? e`(${info.boundExpression} - ${localName(info.slot)})`
+                : exprConcat(
+                  e`Math.ceil((${info.boundExpression} - ${
+                    localName(info.slot)}) / `,
+                  e`${info.increment})`),
+              e`)`)),
+            condition: operand(exprConcat(
+              e`${named(`ssaRuntimeCoarseTrips${header}`)} <= `,
+              e`${tripLimit}`,
+              info.increment === 1 ? "" : exprConcat(
+                e` && ${localName(info.slot)} <= 2147483647 - `,
+                e`${named(`ssaRuntimeCoarseTrips${header}`)} * ${
+                  info.increment}`))),
           });
         }
         findNestedCountedLoops(node.body, loopDepth + 1);
@@ -5965,9 +5969,10 @@ class JvmSsaBlockRenderer {
           header, slot, loopBlocks, writtenSlots, postDecrement: true,
           variable: named(`ssaRuntimeCoarseLoop${header}`),
           tripsVariable: named(`ssaRuntimeCoarseTrips${header}`),
-          tripsExpression: `Math.max(0, local${slot})`,
-          condition: `ssaRuntimeCoarseTrips${header} <= ` +
-            `${runtimeCoarseTripLimit}`,
+          tripsExpression: operand(e`Math.max(0, ${localName(slot)})`),
+          condition: operand(exprConcat(
+            e`${named(`ssaRuntimeCoarseTrips${header}`)} <= `,
+            e`${runtimeCoarseTripLimit}`)),
         });
       }
     }
@@ -6095,8 +6100,8 @@ class JvmSsaBlockRenderer {
           view = {
             direct,
             descriptor: direct.descriptor,
-            value: `ssaLoopStaticArrayValue${number}`,
-            data: `ssaLoopStaticArrayData${number}`,
+            value: named(`ssaLoopStaticArrayValue${number}`),
+            data: named(`ssaLoopStaticArrayData${number}`),
           };
           views.set(location, view);
         }
@@ -8504,6 +8509,15 @@ class JvmSsaBlockRenderer {
       items.length >= hotCallGraph.minRootCodeItems &&
       items.length <= hotCallGraph.maxRootCodeItems;
     const indent = (lines) => lines.map((line) => `  ${line}`);
+    // `a && b && c` over compiler-owned guard names, keeping each as an
+    // operand reference.
+    const guardConjunction = (guards) => exprConcat(
+      ...guards.flatMap((guard, position) =>
+        position === 0 ? [e`${guard}`] : [" && ", e`${guard}`]));
+    const conditionLine = (condition) =>
+      stmt(e`if (${condition}) {`, {kind: "if", condition});
+    const breakStatement = (label) => recordStatement(
+      [`break ${label};`], {kind: "break", label});
     const expandContinuationFallbacks = (lines, continuationMode) =>
       lines.flatMap((line) => {
         const fallback = continuationFallbacks.get(line.trim());
@@ -9006,14 +9020,16 @@ class JvmSsaBlockRenderer {
               // A checked leaf completes through its labeled body, so the
               // same lines serve the standalone entry and a lexical
               // insertion without rewriting any return statement.
-              lines.push(`{ ${checkedLeafResultVariable} = ${
-                plan.returnKind === "void" ? "true" : plan.returnValue}; ` +
-                `break ${checkedLeafBodyLabel}; }`);
+              lines.push(stmt(exprConcat(
+                e`{ ${checkedLeafResultVariable} = ${
+                  plan.returnKind === "void" ? "true" : plan.returnValue}; `,
+                e`break ${checkedLeafBodyLabel}; }`),
+              {kind: "leafReturn"}));
               return lines;
             }
             lines.push(plan.returnKind === "void"
-              ? "return helpers.returnVoid();"
-              : `return ${plan.returnValue};`);
+              ? st`return helpers.returnVoid();`
+              : stmt(e`return ${plan.returnValue};`, {kind: "return"}));
             return lines;
           }
           // Positional generated calls can execute this body without making
@@ -9022,29 +9038,30 @@ class JvmSsaBlockRenderer {
           // the wrapper reconstructs/inserts the omitted Frame only when this
           // body deoptimizes or throws.  Ordinary scheduler entries retain the
           // canonical Frame spill/pop/result protocol below.
-          lines.push("if (framelessEntry) {");
+          lines.push(st`if (framelessEntry) {`);
           if (method.jvmStructuredRegionSpillOnReturn) {
-            lines.push("  spillLocals();");
+            lines.push(st`  spillLocals();`);
           }
           lines.push(plan.returnKind === "void"
-            ? "  return helpers.returnVoid();"
-            : `  return ${plan.returnValue};`);
-          lines.push("}");
-          lines.push("if (thread.callStack.peek() !== frame) {");
+            ? st`  return helpers.returnVoid();`
+            : stmt(e`  return ${plan.returnValue};`, {kind: "return"}));
+          lines.push(st`}`);
+          lines.push(st`if (thread.callStack.peek() !== frame) {`);
           lines.push(...materializeLines(
             plan.returnKind === "void" ? [] : [plan.returnValue],
             plan.returnIndex,
           ).map((line) => `  ${line}`));
-          lines.push("  helpers.skipJitOnce(frame);");
-          lines.push("  return { deopt: true, transient: true, reason: 'structured SSA return with active child' };");
-          lines.push("}");
-          lines.push("spillLocals();");
-          lines.push("stack.length = 0;");
-          lines.push(`frame.pc = ${items.length};`);
-          lines.push("thread.callStack.pop();");
+          lines.push(st`  helpers.skipJitOnce(frame);`);
+          lines.push(st`  return { deopt: true, transient: true, reason: 'structured SSA return with active child' };`);
+          lines.push(st`}`);
+          lines.push(st`spillLocals();`);
+          lines.push(st`stack.length = 0;`);
+          lines.push(st`frame.pc = ${items.length};`);
+          lines.push(st`thread.callStack.pop();`);
           lines.push(plan.returnKind === "void"
-            ? "return { returned: true, value: helpers.returnVoid() };"
-            : `return { returned: true, value: ${plan.returnValue} };`);
+            ? st`return { returned: true, value: helpers.returnVoid() };`
+            : stmt(e`return { returned: true, value: ${plan.returnValue} };`,
+              {kind: "return"}));
         }
         return lines;
       }
@@ -9063,36 +9080,40 @@ class JvmSsaBlockRenderer {
             loopSafePointBudgetOverrides),
         ];
         if (plan.conditionConstant === true) {
-          return ["{", ...indent(thenLines), "}"];
+          return [st`{`, ...indent(thenLines), st`}`];
         }
         if (plan.conditionConstant === false) {
-          return ["{", ...indent(elseLines), "}"];
+          return [st`{`, ...indent(elseLines), st`}`];
         }
         if (thenLines.length === elseLines.length &&
             thenLines.every((line, index) => line === elseLines[index])) {
-          return ["{", ...indent(thenLines), "}"];
+          return [st`{`, ...indent(thenLines), st`}`];
         }
         if (elseLines.length === 0) {
-          return [`if (${plan.condition}) {`, ...indent(thenLines), "}"];
+          return [conditionLine(plan.condition), ...indent(thenLines), st`}`];
         }
         // Emit the compiler's own negation of the branch condition when it
         // has one, instead of leaving `!(a !== b)` for a later text pass.
-        const negated = plan.negatedCondition || `!(${plan.condition})`;
+        const negated = plan.negatedCondition || e`!(${plan.condition})`;
         if (thenLines.length === 0) {
-          return [`if (${negated}) {`, ...indent(elseLines), "}"];
+          return [conditionLine(negated), ...indent(elseLines), st`}`];
         }
-        const breakTarget = (line) =>
-          /^break (L\d+);$/.exec(line)?.[1] || null;
+        // The break a branch arm ends in is a compiler-owned statement; ask
+        // its record for the label instead of matching the rendered line.
+        const breakTarget = (line) => {
+          const record = statementRecords.get(line.trim());
+          return record?.kind === "break" ? record.label : null;
+        };
         const thenBreak = thenLines.length === 1
           ? breakTarget(thenLines[0]) : null;
         const elseBreak = elseLines.length > 0
           ? breakTarget(elseLines[elseLines.length - 1]) : null;
         if (thenBreak && thenBreak === elseBreak) {
           return [
-            `if (${negated}) {`,
+            conditionLine(negated),
             ...indent(elseLines.slice(0, -1)),
-            "}",
-            `break ${thenBreak};`,
+            st`}`,
+            breakStatement(thenBreak),
           ];
         }
         const fallBreak = elseLines.length === 1
@@ -9101,21 +9122,21 @@ class JvmSsaBlockRenderer {
           ? breakTarget(thenLines[thenLines.length - 1]) : null;
         if (fallBreak && fallBreak === takenBreak) {
           return [
-            `if (${plan.condition}) {`,
+            conditionLine(plan.condition),
             ...indent(thenLines.slice(0, -1)),
-            "}",
-            `break ${fallBreak};`,
+            st`}`,
+            breakStatement(fallBreak),
           ];
         }
-        return [`if (${plan.condition}) {`, ...indent(thenLines),
-          "} else {", ...indent(elseLines), "}"];
+        return [conditionLine(plan.condition), ...indent(thenLines),
+          st`} else {`, ...indent(elseLines), st`}`];
       }
       if (node.t === "switch") {
         const plan = plans[node.block];
         if (!plan || plan.selector === undefined) {
           throw new Error(`missing structured switch plan for block ${node.block}`);
         }
-        const output = [`switch (${plan.selector}) {`];
+        const output = [st`switch (${plan.selector}) {`];
         for (let index = 0; index < node.cases.length; index += 1) {
           const entry = node.cases[index];
           const target = plan.cases[index]?.target;
@@ -9127,19 +9148,19 @@ class JvmSsaBlockRenderer {
             ...render(entry.body, continuationMode, directPositional,
               loopSafePointBudget, checkedLeafOnly, rangeBailout,
               loopSafePointBudgetOverrides),
-            "break;",
+            st`break;`,
           ];
-          output.push(`case ${JSON.stringify(entry.key)}: {`,
-            ...indent(body), "}");
+          output.push(st`case ${JSON.stringify(entry.key)}: {`,
+            ...indent(body), st`}`);
         }
         const defaultBody = [
           ...edgeLines(plan.defaultTarget, plan.stack),
           ...render(node.dflt, continuationMode, directPositional,
             loopSafePointBudget, checkedLeafOnly, rangeBailout,
             loopSafePointBudgetOverrides),
-          "break;",
+          st`break;`,
         ];
-        output.push("default: {", ...indent(defaultBody), "}", "}");
+        output.push(st`default: {`, ...indent(defaultBody), st`}`, st`}`);
         return output;
       }
       if (node.t === "loop") {
@@ -9156,22 +9177,26 @@ class JvmSsaBlockRenderer {
           ? headerBlock.synthetic.entryPcs.flatMap((pc, state) => {
             const depth = headerBlock.synthetic.entryDepths[state];
             return [
-              `if (${headerBlock.synthetic.variable} === ${state}) {`,
+              st`if (${headerBlock.synthetic.variable} === ${state}) {`,
               ...indent([
-                ...Array.from({ length: depth }, (_u, slot) =>
-                  `stack[${slot}] = ${headerBlock.synthetic.transfer}${slot};`),
-                `stack.length = ${depth};`,
-                `helpers.materialize(frame, locals, stack, ${pc});`,
+                ...Array.from({ length: depth }, (_u, slot) => stmt(
+                  e`stack[${slot}] = ${named(
+                    `${headerBlock.synthetic.transfer}${slot}`)};`,
+                  {kind: "spillStack"})),
+                st`stack.length = ${depth};`,
+                st`helpers.materialize(frame, locals, stack, ${pc});`,
               ]),
-              "}",
+              st`}`,
             ];
           })
           : (() => {
             const headerDepth = depths[headerBlock.insns[0]] || 0;
             return [
-              ...Array.from({ length: headerDepth }, (_u, i) => `stack[${i}] = ssaStack${header}_${i};`),
-              `stack.length = ${headerDepth};`,
-              `helpers.materialize(frame, locals, stack, ${headerBlock.insns[0]});`,
+              ...Array.from({ length: headerDepth }, (_u, i) => stmt(
+                e`stack[${i}] = ${named(`ssaStack${header}_${i}`)};`,
+                {kind: "spillStack"})),
+              st`stack.length = ${headerDepth};`,
+              st`helpers.materialize(frame, locals, stack, ${headerBlock.insns[0]});`,
             ];
           })();
         const materialize = [
@@ -9181,23 +9206,23 @@ class JvmSsaBlockRenderer {
           // deopt would discard the shared region path and resume the child
           // through generic JVM dispatch.  Keep precise throwing-operation
           // restoration in the node, but charge/yield at the root boundary.
-          `if (${directPositional ? "nestedEntryGuarded === 2 || " : ""}helpers.continueStructuredQuantum(thread)) { safePointBudget = ${currentLoopSafePointBudget}; } else {`,
+          st`if (${directPositional ? "nestedEntryGuarded === 2 || " : ""}helpers.continueStructuredQuantum(thread)) { safePointBudget = ${currentLoopSafePointBudget}; } else {`,
           ...indent([
-            "spillLocals();",
+            st`spillLocals();`,
             ...restoreLines,
-            "helpers.structuredSsa.safePointCount += 1;",
+            st`helpers.structuredSsa.safePointCount += 1;`,
             ...(continuationMode ? [
               ...invalidateFieldCacheLines,
-              `safePointBudget = ${currentLoopSafePointBudget};`,
-              "yield { deopt: true, transient: true, reason: 'structured SSA continuation' };",
+              st`safePointBudget = ${currentLoopSafePointBudget};`,
+              st`yield { deopt: true, transient: true, reason: 'structured SSA continuation' };`,
               ...refreshEntryStaticCacheLines,
               ...refreshEagerFieldCacheLines,
             ] : [
-              "helpers.skipJitOnce(frame);",
-              "return { deopt: true, transient: true, reason: 'structured SSA safe point' };",
+              st`helpers.skipJitOnce(frame);`,
+              st`return { deopt: true, transient: true, reason: 'structured SSA safe point' };`,
             ]),
           ]),
-          "}",
+          st`}`,
         ];
         const checkedLeafCoarse = checkedLeafOnly &&
           checkedLeafCoarseLoopHeaders.has(header);
@@ -9225,59 +9250,63 @@ class JvmSsaBlockRenderer {
           ? rangeBailoutGuardsByHeader.get(header) || [] : [];
         const prefix = [
           ...(!coarse && currentLoopSafePointBudget !== loopSafePointBudget
-            ? [recordCheckedLeafLine("safePoint",
-              `safePointBudget = Math.min(safePointBudget, ` +
-              `${currentLoopSafePointBudget});`)]
+            ? [recordCheckedLeafLine("safePoint", stmt(exprConcat(
+              e`safePointBudget = Math.min(safePointBudget, `,
+              e`${currentLoopSafePointBudget});`)))]
             : []),
           ...[...(loopInvariantStaticArrayViewsByHeader.get(header)
             ?.values() || [])].flatMap((view) => {
             const key = JSON.stringify(view.direct.key);
             const read = view.direct.kind === "map"
-              ? `${view.direct.variable}.get(${key})`
-              : `${view.direct.variable}[${key}]`;
+              ? e`${view.direct.variable}.get(${key})`
+              : e`${view.direct.variable}[${key}]`;
             return [
-              `const ${view.value} = ${read};`,
-              `const ${view.data} = ${arrayDataExpression(view.value)};`,
+              constDecl(view.value, read, {pure: true}),
+              constDecl(view.data, arrayDataExpr(view.value), {pure: true}),
             ];
           }),
           ...(arrayRangeGuardDeclarations.get(header) || []),
           ...(invariantDivisorGuard
             ? [invariantDivisorGuard.declaration] : []),
           ...(entryBailoutGuards.length
-            ? [recordCheckedLeafLine("rangeBailout",
-              `if (!(${entryBailoutGuards.join(" && ")})) ` +
-              CHECKED_LEAF_BAIL, [...entryBailoutGuards])]
+            ? [recordCheckedLeafLine("rangeBailout", stmt(exprConcat(
+              e`if (!(`, guardConjunction(entryBailoutGuards),
+              e`)) ${CHECKED_LEAF_BAIL}`), {kind: "rangeBailout"}),
+            [...entryBailoutGuards])]
             : []),
           ...(coarse && !checkedLeafOnly
-            ? [`safePointBudget -= ${coarseCountedLoops.get(header)};`]
+            ? [st`safePointBudget -= ${coarseCountedLoops.get(header)};`]
             : []),
           ...(runtimeCoarse
             ? [
-              `const ${runtimeCoarse.tripsVariable} = ` +
-                `${runtimeCoarse.tripsExpression};`,
-              `const ${runtimeCoarse.variable} = ${runtimeCoarse.condition};`,
-              recordCheckedLeafLine("safePoint",
-                `if (${runtimeCoarse.variable}) safePointBudget -= ` +
-                `${runtimeCoarse.tripsVariable};`),
+              constDecl(runtimeCoarse.tripsVariable,
+                e`${runtimeCoarse.tripsExpression}`, {pure: true}),
+              constDecl(runtimeCoarse.variable, e`${runtimeCoarse.condition}`,
+                {pure: true}),
+              recordCheckedLeafLine("safePoint", stmt(exprConcat(
+                e`if (${runtimeCoarse.variable}) safePointBudget -= `,
+                e`${runtimeCoarse.tripsVariable};`))),
             ]
             : []),
         ];
+        const loopHeaderLine = () => stmt(
+          e`${node.label}: while (${countedLoop
+            ? countedLoop.condition : "true"}) {`,
+          {kind: "loopHeader", label: node.label});
         const polledLoop = [
-          `${node.label}: while (${countedLoop
-              ? countedLoop.condition : "true"}) {`,
+          loopHeaderLine(),
           ...(coarse ? [] : [
-            `  if (${runtimeCoarse
-              ? `!${runtimeCoarse.variable} && ` : ""}` +
-              "--safePointBudget <= 0) {",
-            ...indent(indent(materialize)), "  }",
+            stmt(exprConcat(e`  if (`, runtimeCoarse
+              ? e`!${runtimeCoarse.variable} && ` : "",
+            e`--safePointBudget <= 0) {`)),
+            ...indent(indent(materialize)), st`  }`,
           ]),
-          ...indent(emittedLoopBody), "}",
+          ...indent(emittedLoopBody), st`}`,
           ...(countedLoop ? countedLoop.exit : []),
         ];
         const unpolledLoop = [
-          `${node.label}: while (${countedLoop
-            ? countedLoop.condition : "true"}) {`,
-          ...indent(emittedLoopBody), "}",
+          loopHeaderLine(),
+          ...indent(emittedLoopBody), st`}`,
           ...(countedLoop ? countedLoop.exit : []),
         ];
         // A restoring entry can transfer an unexpectedly large loop back to
@@ -9295,15 +9324,15 @@ class JvmSsaBlockRenderer {
           restoringCoarseLoopDeoptCount += 1;
           return [
             ...prefix,
-            `if (nestedEntryGuarded !== 2 && !${runtimeCoarse.variable}) {`,
+            st`if (nestedEntryGuarded !== 2 && !${runtimeCoarse.variable}) {`,
             ...indent([
-              "spillLocals();",
+              st`spillLocals();`,
               ...restoreLines,
-              "helpers.skipJitOnce(frame);",
-              "return { deopt: true, transient: true, " +
-                "reason: 'structured SSA coarse loop guard' };",
+              st`helpers.skipJitOnce(frame);`,
+              stmt(exprConcat(e`return { deopt: true, transient: true, `,
+                e`reason: 'structured SSA coarse loop guard' };`)),
             ]),
-            "}",
+            st`}`,
             ...unpolledLoop,
           ];
         }
@@ -9317,12 +9346,11 @@ class JvmSsaBlockRenderer {
         if (entryDominatedFastLoop) {
           return [
             ...prefix,
-            `${node.label}: while (${countedLoop
-              ? countedLoop.condition : "true"}) {`,
+            loopHeaderLine(),
             ...indent(specializeArrayRangeGuardedStores(
               emittedLoopBody,
               specializationGuards)),
-            "}",
+            st`}`,
             ...(countedLoop ? countedLoop.exit : []),
           ];
         }
@@ -9338,12 +9366,11 @@ class JvmSsaBlockRenderer {
         if (rangeBailoutFastLoop) {
           return [
             ...prefix,
-            `${node.label}: while (${countedLoop
-              ? countedLoop.condition : "true"}) {`,
+            loopHeaderLine(),
             ...indent(specializeArrayRangeGuardedStores(
               emittedLoopBody,
               specializationGuards)),
-            "}",
+            st`}`,
             ...(countedLoop ? countedLoop.exit : []),
           ];
         }
@@ -9363,17 +9390,16 @@ class JvmSsaBlockRenderer {
           // Inside that dominated arm optimizing JavaScript engines can fold
           // every `!rangeGuard && boundsCheck` store branch away. The other
           // arm retains the exact per-store exception materialization.
-          const fastLoopCondition = [
+          const fastLoopCondition = guardConjunction([
             ...(runtimeCoarse && !coarse ? [runtimeCoarse.variable] : []),
             ...specializationGuards,
-          ].join(" && ");
+          ]);
           const fastLoopBody = specializeArrayRangeGuardedStores(
             emittedLoopBody,
             specializationGuards);
           const specializedUnpolledLoop = [
-            `${node.label}: while (${countedLoop
-              ? countedLoop.condition : "true"}) {`,
-            ...indent(fastLoopBody), "}",
+            loopHeaderLine(),
+            ...indent(fastLoopBody), st`}`,
             ...(countedLoop ? countedLoop.exit : []),
           ];
           // A failed array-range specialization used to reconstruct the frame
@@ -9392,15 +9418,15 @@ class JvmSsaBlockRenderer {
             restoringRangeGuardDeoptCount += 1;
             return [
               ...prefix,
-              `if (!(${fastLoopCondition})) {`,
+              st`if (!(${fastLoopCondition})) {`,
               ...indent([
-                "spillLocals();",
+                st`spillLocals();`,
                 ...restoreLines,
-                "helpers.skipJitOnce(frame);",
-                "return { deopt: true, transient: true, " +
-                  "reason: 'structured SSA range guard' };",
+                st`helpers.skipJitOnce(frame);`,
+                stmt(exprConcat(e`return { deopt: true, transient: true, `,
+                  e`reason: 'structured SSA range guard' };`)),
               ]),
-              "}",
+              st`}`,
               ...specializedUnpolledLoop,
             ];
           }
@@ -9413,18 +9439,18 @@ class JvmSsaBlockRenderer {
             // inline as an ordinary JavaScript leaf.
             return [
               ...prefix,
-              `if (!(${fastLoopCondition})) ` +
-                "return helpers.asyncInvokeSentinel();",
+              stmt(exprConcat(e`if (!(${fastLoopCondition})) `,
+                e`return helpers.asyncInvokeSentinel();`)),
               ...specializedUnpolledLoop,
             ];
           }
           return [
             ...prefix,
-            `if (${fastLoopCondition}) {`,
+            st`if (${fastLoopCondition}) {`,
             ...indent(specializedUnpolledLoop),
-            "} else {",
+            st`} else {`,
             ...indent(polledLoop),
-            "}",
+            st`}`,
           ];
         }
         return [...prefix, ...polledLoop];
@@ -9434,15 +9460,24 @@ class JvmSsaBlockRenderer {
         const rendered = render(body, continuationMode, directPositional,
           loopSafePointBudget, checkedLeafOnly, rangeBailout,
           loopSafePointBudgetOverrides);
-        if (!rendered.some((line) =>
-          line.trim() === `break ${node.label};`)) {
+        if (!rendered.some((line) => {
+          const record = statementRecords.get(line.trim());
+          return record?.kind === "break" && record.label === node.label;
+        })) {
           eliminatedStructuredBlockCount += 1;
           return rendered;
         }
-        return [`${node.label}: {`, ...indent(rendered), "}"];
+        return [
+          recordStatement([`${node.label}: {`],
+            {kind: "blockLabel", label: node.label}),
+          ...indent(rendered), st`}`,
+        ];
       }
-      if (node.t === "break") return [`break ${node.label};`];
-      if (node.t === "continue") return [`continue ${node.label};`];
+      if (node.t === "break") return [breakStatement(node.label)];
+      if (node.t === "continue") return [
+        recordStatement([`continue ${node.label};`],
+          {kind: "continue", label: node.label}),
+      ];
       throw new Error(`unsupported structured node ${node.t}`);
     };
     const declarations = [];
