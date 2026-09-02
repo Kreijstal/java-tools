@@ -1203,7 +1203,12 @@ function partitionOversizedLinearBlocks(units, options = {}) {
   let partitionedSourceBytes = 0;
   let attemptedRuns = 0;
   let oversizedStatements = 0;
-  const helperUnits = [];
+  // The helpers extracted out of each unit, emitted directly after it. A
+  // segment helper belongs to the unit it came out of exactly as an outlined
+  // loop's helper belongs to its node, and a consumer that reads one node
+  // function out of the module text finds the whole of what that node
+  // executes in one place.
+  const helperUnitsByUnit = new Map();
   const working = units.slice();
 
   for (let round = 0; round < maximumRounds &&
@@ -1340,7 +1345,10 @@ function partitionOversizedLinearBlocks(units, options = {}) {
             delta: statement.delta, relocatable: false});
         }
 
-        helperUnits.push(regionUnit({
+        if (!helperUnitsByUnit.has(unitIndex)) {
+          helperUnitsByUnit.set(unitIndex, []);
+        }
+        helperUnitsByUnit.get(unitIndex).push(regionUnit({
           name: helperName,
           partitionable: false,
           generator: runHasYield,
@@ -1457,14 +1465,25 @@ function partitionOversizedLinearBlocks(units, options = {}) {
       };
 
       // The nested statement lists a group owns. A block continuation ends
-      // one list and starts the next, so a run never spans an `else` arm.
+      // one list and starts the next, so a run never spans an `else` arm --
+      // but only a continuation of *this* group does. The scan therefore
+      // follows the nesting the emitters recorded and splits at depth zero;
+      // splitting at every continuation it passed, at whatever depth, handed
+      // `walkList` ranges whose deltas do not balance, and `statementGroups`
+      // then declined each of them, which is why nothing was ever attempted
+      // inside a body containing a nested `else`.
       const recurseIntoGroup = (group) => {
         if (group.end - group.start <= 2) return;
         let start = group.start + 1;
+        let depth = 0;
         for (let index = start; index < group.end - 1; index += 1) {
-          if (!statements[index].continuesBlock) continue;
-          walkList(start, index);
-          start = index + 1;
+          const statement = statements[index];
+          if (depth === 0 && statement.continuesBlock) {
+            walkList(start, index);
+            start = index + 1;
+          }
+          depth += statement.delta;
+          if (depth < 0) return;
         }
         walkList(start, group.end - 1);
       };
@@ -1489,8 +1508,8 @@ function partitionOversizedLinearBlocks(units, options = {}) {
   return {
     units: [
       rawRegionUnit(`const ${sharedStateName} = [];`),
-      ...working,
-      ...helperUnits,
+      ...working.flatMap((unit, index) =>
+        [unit, ...(helperUnitsByUnit.get(index) || [])]),
     ],
     count: segmentCount,
     partitionedSourceBytes,
