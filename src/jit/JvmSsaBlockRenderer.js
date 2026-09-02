@@ -376,30 +376,92 @@ function substituteParts(parts, replacements) {
   return out;
 }
 
+// The syntactic properties the checked-leaf passes ask a statement about.
+// Each is read off the parts list through its *skeleton*: the literal chunks
+// the emitter wrote, with every operand reference replaced by one placeholder
+// character. An operand is a name, so it can neither contribute an operator,
+// a bracket or a keyword nor split one; the skeleton therefore answers these
+// questions on the statement the compiler built, not on a rendered body.
+const PARTS_OPERAND_PLACEHOLDER = "\u0000";
+
+function partsSkeleton(parts) {
+  let text = "";
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index];
+    text += typeof part === "string" ? part : PARTS_OPERAND_PLACEHOLDER;
+  }
+  return text;
+}
+
+function isPartsWordCharacter(character) {
+  return character !== undefined && character !== "" &&
+    (character >= "a" && character <= "z" ||
+      character >= "A" && character <= "Z" ||
+      character >= "0" && character <= "9" ||
+      character === "_" || character === "$");
+}
+
+function partsWriteImpureCall(parts) {
+  const skeleton = partsSkeleton(parts);
+  if (skeleton.includes("helpers.")) return true;
+  let position = skeleton.indexOf("new");
+  while (position >= 0) {
+    if (!isPartsWordCharacter(skeleton[position - 1]) &&
+        !isPartsWordCharacter(skeleton[position + 3])) return true;
+    position = skeleton.indexOf("new", position + 1);
+  }
+  return false;
+}
+
+// Whether the statement the emitter wrote is a conditional that opens a
+// block: `if (<condition>) {`.
+function partsOpenCondition(parts) {
+  const skeleton = partsSkeleton(parts);
+  return skeleton.trimStart().startsWith("if (") && skeleton.endsWith(") {");
+}
+
+// Whether the emitter opened a `try` or wrote a `throw` in this statement.
+function partsWriteThrowOrTry(parts) {
+  const skeleton = partsSkeleton(parts);
+  return skeleton.includes("throw ") || skeleton.includes("try {");
+}
+
+function partsWriteDivision(parts) {
+  const skeleton = partsSkeleton(parts);
+  return skeleton.includes(" / ") || skeleton.includes(" % ");
+}
+
+function partsWriteIndex(parts) {
+  const skeleton = partsSkeleton(parts);
+  let open = -1;
+  for (let index = 0; index < skeleton.length; index += 1) {
+    const character = skeleton[index];
+    if (character === "[") { open = index; continue; }
+    if (character !== "]" || open < 0) continue;
+    if (index > open + 1) return true;
+    open = -1;
+  }
+  return false;
+}
+
+function partsLoadEntryArrayElement(parts, entryArrayDataNames) {
+  for (let index = 0; index + 1 < parts.length; index += 1) {
+    const part = parts[index];
+    if (typeof part === "string" || !entryArrayDataNames.has(part.ref)) {
+      continue;
+    }
+    const next = parts[index + 1];
+    if (typeof next === "string" && next.startsWith("[")) return true;
+  }
+  return false;
+}
+
 // Opt-in audit of the statement IR (JVM_JIT_VERIFY_STATEMENT_IR=1). Like the
 // generated-scope verifier it only re-checks a finished body: it scans the
 // rendered text for names the compile minted and reports any line the emitters
 // did not record, or whose record disagrees with the operands actually
 // present. Nothing in the compiler decides what to emit from this scan; the
 // passes read the records, never the characters.
-const passFireCounts = new Map();
-function countPassFire(name) {
-  passFireCounts.set(name, (passFireCounts.get(name) || 0) + 1);
-}
-function reportPassFires() {
-  return [...passFireCounts.entries()].sort((a, b) => b[1] - a[1]);
-}
-if (typeof process !== "undefined" && process.env &&
-    process.env.JVM_PASS_FIRE_LOG) {
-  process.on("exit", () => {
-    try {
-      require("fs").appendFileSync(process.env.JVM_PASS_FIRE_LOG,
-        [...passFireCounts.entries()]
-          .map(([name, count]) => `${name} ${count}`).join("\n") + "\n");
-    } catch (error) { /* diagnostic only */ }
-  });
-}
-
 const statementIrAuditIssues = new Map();
 function auditStatementIrLines(lines, records, names, label) {
   const note = (issue, line) => {
@@ -1422,7 +1484,31 @@ class JvmSsaBlockRenderer {
       return text;
     };
     const named = (name) => { emittedNames.add(name); return name; };
+    const primitiveArrayAccessMarker = (name) => {
+      primitiveArrayAccessMarkers.add(named(name));
+      return name;
+    };
+    const entryArrayDataName = (name) => {
+      entryArrayDataNames.add(named(name));
+      return name;
+    };
+    const localNameSlots = new Map();
+    for (let slot = 0; slot < localCount; slot += 1) {
+      localNameSlots.set(`local${slot}`, slot);
+    }
     const localName = (slot) => `local${slot}`;
+    // Besides ordinary operand values, a checked leaf may also propagate the
+    // coarse-loop and array-range predicates: it has no restoring contract
+    // that has to expose them as named guard sites.
+    const checkedLeafCompactableNames = new Set();
+    // Raw entry-array storage views. A store through one of these is the
+    // proven form an ordered array load may be propagated into.
+    const entryArrayDataNames = new Set();
+    // Array-range access tokens that are still unresolved in a body make it
+    // unsafe as a trusted checked leaf.
+    const primitiveArrayAccessMarkers = new Set();
+    const compactable = (name) =>
+      checkedLeafCompactableNames.add(name) && name;
     // A comma-separated operand list keeps each operand's references.
     const argumentListExpression = (values) => exprConcat(
       ...values.flatMap((argument, position) =>
@@ -1438,13 +1524,17 @@ class JvmSsaBlockRenderer {
       // The operand is evaluated more than once, so only an operand
       // reference -- a name this compile minted -- may be expanded inline.
       if (parts.length !== 1 || typeof parts[0] === "string") {
-        return e`helpers.arrayData(${value})`;
+        const helperCall = e`helpers.arrayData(${value})`;
+        helperCall.pure = false;
+        return helperCall;
       }
-      return exprConcat(
+      const inline = exprConcat(
         e`(${value} === null || ${value} === undefined ? null : `,
         e`${value}.elements ? ${value}.elements : `,
         e`(Array.isArray(${value}) || ArrayBuffer.isView(${value}) ? `,
         e`${value} : null))`);
+      inline.pure = true;
+      return inline;
     };
     // Statement records for every line this compile emits, keyed by the
     // trimmed rendered text. Indentation is applied by the assembler and is
@@ -1469,17 +1559,26 @@ class JvmSsaBlockRenderer {
         def: meta?.def || null,
         write: meta?.write || null,
         exprParts: meta?.exprParts || null,
-        pure: meta?.pure === true,
         // A statement rendered by another plan (an inline integer leaf) or a
         // token whose text a later expansion owns. Its operands are not this
         // compile's, so no pass may rewrite it and the audit ignores it.
         foreign: meta?.foreign === true,
-        rawArrayLoad: meta?.rawArrayLoad === true,
-        division: meta?.division === true,
         pinned: meta?.pinned === true,
       };
       record.reads = record.foreign
         ? [] : partsReferences(record.exprParts || record.parts);
+      // Properties of the operators and brackets the emitter itself wrote.
+      // They are read off the statement's own parts -- operand references are
+      // names and contribute no operator, bracket or keyword -- and they are
+      // what the propagation and dead-declaration passes ask about.
+      const subject = record.exprParts || parts;
+      record.pure = !partsWriteImpureCall(subject);
+      record.division = partsWriteDivision(subject);
+      record.indexed = partsWriteIndex(subject);
+      record.rawArrayLoad = partsLoadEntryArrayElement(
+        subject, entryArrayDataNames);
+      record.throwsOrTries = partsWriteThrowOrTry(parts);
+      record.conditional = partsOpenCondition(parts);
       // The lexical nesting this statement opens or closes. It is a property
       // of the statement the emitter built, measured on the literal chunks it
       // wrote itself: operand references are names and never contain braces.
@@ -1517,6 +1616,18 @@ class JvmSsaBlockRenderer {
     const indentationOf = (line) =>
       line.slice(0, line.length - line.trimStart().length);
     const recordOf = (line) => statementRecords.get(line.trim());
+    // The JVM slot a name denotes, or null when the name is not a local.
+    const localSlotOfName = (name) => {
+      const slot = localNameSlots.get(name);
+      return slot === undefined ? null : slot;
+    };
+    // `local<slot> = <ssa value>;`, the shape both the local-update folds and
+    // the checked-leaf local sinking look for.
+    const isLocalCopy = (record, value) => record?.kind === "store" &&
+      localSlotOfName(record.write) !== null &&
+      record.exprParts?.length === 1 &&
+      typeof record.exprParts[0] !== "string" &&
+      record.exprParts[0].ref === value;
     // Re-emit a recorded statement with some of its operand references
     // replaced. This is the only way a pass may rewrite a statement: the
     // operands are substituted in the parts list and the statement is
@@ -1544,7 +1655,7 @@ class JvmSsaBlockRenderer {
       }
       return value;
     };
-    const rerenderStatement = (record, replacements) => {
+    const rerenderStatement = (record, replacements, overrides = null) => {
       const meta = {};
       for (const key of Object.keys(record)) {
         if (key === "key" || key === "parts" || key === "reads") continue;
@@ -1554,7 +1665,8 @@ class JvmSsaBlockRenderer {
         meta.exprParts = substituteParts(record.exprParts, replacements);
       }
       return recordStatement(
-        substituteParts(record.parts, replacements), meta);
+        substituteParts(record.parts, replacements),
+        overrides ? {...meta, ...overrides} : meta);
     };
     // Replace operand references throughout a rendered line list.
     const substituteInLines = (lines, replacements) => lines.map((line) => {
@@ -1567,6 +1679,11 @@ class JvmSsaBlockRenderer {
       return `${indentationOf(line)}${
         rerenderStatement(record, replacements).trim()}`;
     });
+    // The checked-leaf exit statement. A checked leaf leaves its body through
+    // this one compiler-owned statement.
+    const leafBailStatement = (indentation = "") =>
+      `${indentation}${recordStatement([CHECKED_LEAF_BAIL],
+        {kind: "leafBail"})}`;
     const spillStatement = () =>
       recordStatement(["spillLocals();"], {kind: "spill"});
     // The universal block terminators. Their kind is what the structural
@@ -1901,7 +2018,7 @@ class JvmSsaBlockRenderer {
             descriptor: direct.descriptor,
             value: `ssaEntryStaticValue${number}`,
             data: direct.descriptor?.startsWith("[")
-              ? named(`ssaEntryStaticArrayData${number}`) : null,
+              ? entryArrayDataName(`ssaEntryStaticArrayData${number}`) : null,
             nullableTested: nullComparedStaticArrayLocations.has(key),
           };
           entryStaticReadCaches.set(key, cache);
@@ -1963,7 +2080,7 @@ class JvmSsaBlockRenderer {
           value: `ssaEntryStaticValue${number}`,
           valid: `ssaEntryStaticValid${number}`,
           data: plan.descriptor?.startsWith("[")
-            ? named(`ssaEntryStaticArrayData${number}`) : null,
+            ? entryArrayDataName(`ssaEntryStaticArrayData${number}`) : null,
         };
         entryStaticReadCaches.set(location, cache);
         lazy.entryReadCache = cache;
@@ -2050,7 +2167,11 @@ class JvmSsaBlockRenderer {
     } catch (_) {
       // Descriptor validation elsewhere will reject malformed methods.
     }
-    const entryArrayDataVariable = (slot) => named(`ssaEntryArrayData${slot}`);
+    const entryArrayDataVariable = (slot) => {
+      const name = named(`ssaEntryArrayData${slot}`);
+      entryArrayDataNames.add(name);
+      return name;
+    };
     const guardedEntryArrayData = new Set([
       ...[...entryArrayLocalSlots].map(entryArrayDataVariable),
       ...[...entryStaticReadCaches.values()]
@@ -2724,7 +2845,8 @@ class JvmSsaBlockRenderer {
           ...operandValues.map((expression, index) =>
             stmt(e`stack[${index}] = ${expression};`, {kind: "spillStack"})),
           st`stack.length = ${operandValues.length};`,
-          st`helpers.materialize(frame, locals, stack, ${pc});`,
+          stmt(e`helpers.materialize(frame, locals, stack, ${pc});`,
+            {kind: "materializeSpill"}),
         ];
       }
       // The expansion regex splits marker operands on commas, so compaction
@@ -3457,8 +3579,9 @@ class JvmSsaBlockRenderer {
           indexAffine: affineLocalOffset(indexInput),
           op: arrayOp,
           store: Boolean(store),
-          marker: named(`__SSA_PRIMITIVE_ARRAY_ACCESS_${
-            nextPrimitiveArrayAccessMarker++}__`),
+          marker: primitiveArrayAccessMarker(
+            `__SSA_PRIMITIVE_ARRAY_ACCESS_${
+              nextPrimitiveArrayAccessMarker++}__`),
         };
         primitiveArrayAccessCandidates.push(access);
         const fixedRange = this.bitBoundedArrayRangesEnabled
@@ -3660,8 +3783,7 @@ class JvmSsaBlockRenderer {
             // Java string constants are interned once per site at runtime.
             const out = value();
             lines.push(constDecl(out,
-              e`helpers.constantValue(${JSON.stringify(resolved)})`,
-              {pure: true}));
+              e`helpers.constantValue(${JSON.stringify(resolved)})`));
             stack.push(out);
           } else valid = false;
         } else if (op === "ldc2_w") {
@@ -3845,7 +3967,8 @@ class JvmSsaBlockRenderer {
               st`if (${divisor} === 0n) {`,
               ...materializeLines([...stack, dividend, divisor], index, true)
                 .map((line) => `  ${line}`),
-              st`  throw { type: "java/lang/ArithmeticException", message: "/ by zero" };`,
+              stmt(e`  throw { type: "java/lang/ArithmeticException", message: "/ by zero" };`,
+                {deoptEffect: true}),
               blockEnd(""),
               constDecl(out, e`BigInt.asIntN(64, ${dividend} ${
                 op === "ldiv" ? "/" : "%"} ${divisor})`, {pure: true}));
@@ -3946,7 +4069,8 @@ class JvmSsaBlockRenderer {
               lines.push(stmt(e`if (${divisor} === 0) {`,
                 {kind: "if", comparison: {input: divisor, cmp: "=== 0"}}),
                 ...materializeLines([...stack, dividend, divisor], index, true).map((line) => `  ${line}`),
-                st`  throw { type: "java/lang/ArithmeticException", message: "/ by zero" };`,
+                stmt(e`  throw { type: "java/lang/ArithmeticException", message: "/ by zero" };`,
+                {deoptEffect: true}),
                 blockEnd(""));
             }
             const line = constDecl(out, e`((${dividend} ${
@@ -3995,7 +4119,7 @@ class JvmSsaBlockRenderer {
             lines.push(stmt(e`if (${array} === null || ${array} === undefined) {`,
               {kind: "nullCheck", value: array}),
               ...materializeLines([...stack, array], index, true).map((line) => `  ${line}`),
-              st`  helpers.arrayLength(${array}, frame);`, blockEnd(""),
+              stmt(e`  helpers.arrayLength(${array}, frame);`, {deoptEffect: true}), blockEnd(""),
               constDecl(out, e`${array}.length`, {pure: true}));
             stack.push(out);
           }
@@ -4021,8 +4145,9 @@ class JvmSsaBlockRenderer {
             if (!arrayData && op !== "aaload" &&
                 this.blockArrayDataViewsEnabled) {
               arrayData = value();
-              lines.push(constDecl(arrayData, arrayDataExpr(array),
-                {pure: true}));
+              const arrayDataView = arrayDataExpr(array);
+              lines.push(constDecl(arrayData, arrayDataView,
+                {pure: arrayDataView.pure === true}));
               arrayViews.set(arrayInput, arrayData);
               arrayViews.set(array, arrayData);
               dynamicBlockArrayViews.add(arrayData);
@@ -4046,9 +4171,17 @@ class JvmSsaBlockRenderer {
                 e`${arrayData}[${arrayIndex}]`, op, array, arrayKind);
               lines.push(
                 stmt(e`if (!${rangeMarker} && ${loadFailure}) {`,
-                  {kind: "rangeGuardedAccess", guard: rangeMarker}),
+                  {kind: "rangeGuardedAccess", guard: rangeMarker,
+                    // The transactional fold needs the raw load itself; it is
+                    // only available when the storage is proven non-null, the
+                    // shape whose failure test is exactly the sentinel probe.
+                    rawLoad: unconditionallyNonNullEntryArrayData.has(arrayData)
+                      ? e`${arrayData}[${arrayIndex}]` : null,
+                    loadTarget: out}),
                 ...materializeLines([...stack, array, arrayIndex], index, true).map((line) => `  ${line}`),
-                st`  ${out} = helpers.arrayLoad(${arrayIndex}, ${array}, frame, ${JSON.stringify(op)});`,
+                stmt(e`  ${out} = helpers.arrayLoad(${arrayIndex}, ${array}, frame, ${JSON.stringify(op)});`,
+                  {kind: "assign", write: out, deoptEffect: true,
+                    guestArrayHelper: true}),
                 ...materializeUnwindReleaseLines("  "),
                 elseArm(""),
                 stmt(e`  ${out} = ${rangeMarker} ? ${provenLoad} : ${
@@ -4083,7 +4216,9 @@ class JvmSsaBlockRenderer {
                   stmt(e`if (${array} === null || ${array} === undefined || ${
                     arrayIndexOutOfBounds(arrayIndex, e`${array}.length`)}) {`),
                   ...materializeLines([...stack, array, arrayIndex], index, true).map((line) => `  ${line}`),
-                  st`  ${out} = helpers.arrayLoad(${arrayIndex}, ${array}, frame, ${JSON.stringify(op)});`,
+                  stmt(e`  ${out} = helpers.arrayLoad(${arrayIndex}, ${array}, frame, ${JSON.stringify(op)});`,
+                  {kind: "assign", write: out, deoptEffect: true,
+                    guestArrayHelper: true}),
                   ...materializeUnwindReleaseLines("  "),
                   elseArm(""),
                   stmt(e`  ${out} = ${normalized};`,
@@ -4151,8 +4286,9 @@ class JvmSsaBlockRenderer {
             if (!arrayData && op !== "aastore" &&
                 this.blockArrayDataViewsEnabled) {
               arrayData = value();
-              lines.push(constDecl(arrayData, arrayDataExpr(array),
-                {pure: true}));
+              const arrayDataView = arrayDataExpr(array);
+              lines.push(constDecl(arrayData, arrayDataView,
+                {pure: arrayDataView.pure === true}));
               arrayViews.set(arrayInput, arrayData);
               arrayViews.set(array, arrayData);
               dynamicBlockArrayViews.add(arrayData);
@@ -4175,7 +4311,9 @@ class JvmSsaBlockRenderer {
                 checkedPrimitiveArrayAccesses.has(checkedKey)) {
               lines.push(stmt(
                 e`${arrayData}[${arrayIndex}] = ${normalizedStore};`,
-                {kind: "arrayStore"}));
+                {kind: "arrayStore", storeTarget: arrayData,
+                  storeIndex: e`${arrayIndex}`,
+                  storeValue: e`${normalizedStore}`}));
               eliminatedArrayStoreCheckCount += 1;
             } else if (op !== "aastore" && arrayData &&
                 guardedEntryArrayData.has(arrayData)) {
@@ -4189,11 +4327,14 @@ class JvmSsaBlockRenderer {
                 {kind: "rangeGuardedAccess", guard: rangeMarker}),
                 ...materializeLines([...stack, array, arrayIndex, stored], index, true)
                   .map((line) => `  ${line}`),
-                st`  helpers.arrayStore(${stored}, ${arrayIndex}, ${array}, frame, ${JSON.stringify(op)});`,
+                stmt(e`  helpers.arrayStore(${stored}, ${arrayIndex}, ${array}, frame, ${JSON.stringify(op)});`,
+                  {deoptEffect: true, guestArrayHelper: true}),
                 ...materializeUnwindReleaseLines("  "),
                 elseArm(""),
                 stmt(e`  ${arrayData}[${arrayIndex}] = ${normalizedStore};`,
-                  {kind: "arrayStore"}),
+                  {kind: "arrayStore", storeTarget: arrayData,
+                    storeIndex: e`${arrayIndex}`,
+                    storeValue: e`${normalizedStore}`}),
                 blockEnd(""),
               );
             } else {
@@ -4202,7 +4343,9 @@ class JvmSsaBlockRenderer {
                   arrayInput, arrayIndexInput, index, [
                     stmt(exprConcat(
                       e`${deferredStaticView.data}[${arrayIndex}] = `,
-                      e`${normalizedStore};`), {kind: "arrayStore"}),
+                      e`${normalizedStore};`),
+                    {kind: "arrayStore",
+                      storeTarget: deferredStaticView.data}),
                   ]) : null;
               if (deferred) {
                 lines.push(stmt(e`/*${deferred.marker}:start*/`,
@@ -4212,14 +4355,19 @@ class JvmSsaBlockRenderer {
                 stmt(e`if (${array} === null || ${array} === undefined || ${
                   arrayIndexOutOfBounds(arrayIndex, e`${array}.length`)}) {`),
                 ...materializeLines([...stack, array, arrayIndex, stored], index, true).map((line) => `  ${line}`),
-                st`  helpers.arrayStore(${stored}, ${arrayIndex}, ${array}, frame, ${JSON.stringify(op)});`,
+                stmt(e`  helpers.arrayStore(${stored}, ${arrayIndex}, ${array}, frame, ${JSON.stringify(op)});`,
+                  {deoptEffect: true, guestArrayHelper: true}),
                 ...materializeUnwindReleaseLines("  "),
                 ...(arrayData ? [
-                  st`} else if (${arrayData} !== null) {`,
+                  stmt(e`} else if (${arrayData} !== null) {`,
+                    {kind: "elseIfArm"}),
                   stmt(e`  ${arrayData}[${arrayIndex}] = ${normalizedStore};`,
-                    {kind: "arrayStore"}),
+                    {kind: "arrayStore", storeTarget: arrayData,
+                    storeIndex: e`${arrayIndex}`,
+                    storeValue: e`${normalizedStore}`}),
                 ] : []),
-                st`} else if (${array}.elements) {`,
+                stmt(e`} else if (${array}.elements) {`,
+                  {kind: "elseIfArm"}),
                 stmt(e`  ${array}.elements[${arrayIndex}] = ${
                   normalizedStore};`, {kind: "arrayStore"}),
                 elseArm(""),
@@ -4373,14 +4521,14 @@ class JvmSsaBlockRenderer {
                 lines.push(stmt(e`if (${object} === null || ${object} === undefined) {`,
               {kind: "nullCheck", value: object}),
                   ...materializeLines([...stack, object], index, true).map((line) => `  ${line}`),
-                  st`  helpers.getFieldAt(${site}, ${object});`, blockEnd(""));
+                  stmt(e`  helpers.getFieldAt(${site}, ${object});`, {deoptEffect: true}), blockEnd(""));
               }
               lines.push(constDecl(out, e`${cache.value}`, {pure: true}));
             } else {
               lines.push(stmt(e`if (${object} === null || ${object} === undefined) {`,
               {kind: "nullCheck", value: object}),
                 ...materializeLines([...stack, object], index, true).map((line) => `  ${line}`),
-                st`  helpers.getFieldAt(${site}, ${object});`, blockEnd(""));
+                stmt(e`  helpers.getFieldAt(${site}, ${object});`, {deoptEffect: true}), blockEnd(""));
             }
             if (cache && (cache.eagerLocal === null ||
                 cache.eagerLocal === undefined)) {
@@ -4444,7 +4592,8 @@ class JvmSsaBlockRenderer {
               ...(Number.isInteger(denseSlot) ? [
                 st`if (Array.isArray(${object}.fields)) {`,
                 st`  ${object}.fields[${denseSlot}] = ${stored};`,
-                st`} else if (${object}.fields) {`,
+                stmt(e`} else if (${object}.fields) {`,
+                  {kind: "elseIfArm"}),
                 st`  ${object}.fields[${JSON.stringify(directKey)}] = ${stored};`,
                 elseArm(""),
                 st`  helpers.putFieldAt(${site}, ${object}, ${stored});`,
@@ -4506,12 +4655,15 @@ class JvmSsaBlockRenderer {
               const key = JSON.stringify(direct.key);
               lines.push(constDecl(out, direct.kind === "map"
                 ? e`${direct.variable}.get(${key})`
-                : e`${direct.variable}[${key}]`, {pure: true}));
+                : e`${direct.variable}[${key}]`,
+              {pure: true, indexed: direct.kind !== "map"}));
               stack.push(out);
               let data = null;
               if (direct.descriptor?.startsWith("[")) {
                 data = value();
-                lines.push(constDecl(data, arrayDataExpr(out), {pure: true}));
+                const producedView = arrayDataExpr(out);
+                lines.push(constDecl(data, producedView,
+                  {pure: producedView.pure === true}));
                 arrayViews.set(out, data);
                 arrayKinds.set(out, direct.descriptor);
               }
@@ -4667,9 +4819,12 @@ class JvmSsaBlockRenderer {
               // The plan is rendered once against fixed parameter names;
               // each site binds those names to its operands inside the block.
               lines.push(letDecl(out), blockStart(""),
+                // The inline plan's own statements are foreign, but the
+                // bindings that feed them are this compile's statements: the
+                // operand each one reads is an ordinary operand reference.
                 ...args.map((argument, position) => stmt(
                   e`  const ${inlineIntegerArgumentName(position)} = ${
-                    argument};`, {foreign: true})),
+                    argument};`)),
                 ...site.inline.statements.map((statement) =>
                   stmt(`  ${statement}`, {foreign: true})));
               if (site.inline.guards?.length) {
@@ -4681,8 +4836,8 @@ class JvmSsaBlockRenderer {
                   st`    return { deopt: true, transient: true, reason: 'guarded inline integer leaf' };`,
                   blockEnd("  "));
               }
-              lines.push(stmt(`  ${out} = ${site.inline.result};`,
-                {foreign: true}), blockEnd(""));
+              lines.push(stmt(e`  ${out} = ${site.inline.result};`),
+                blockEnd(""));
               stack.push(out);
             }
           } else if (site.directIntrinsic?.kind === "primitiveArrayCopy" &&
@@ -4752,7 +4907,7 @@ class JvmSsaBlockRenderer {
                   e`reason: 'asynchronous structured SSA callee left active child', `,
                   e`jvmPositionalChild: frame };`)),
               ],
-              checkedLeaf: [st`    return helpers.asyncInvokeSentinel();`],
+              checkedLeaf: [leafBailStatement("    ")],
             });
             const asynchronousCallMarker = named(
               `__JVM_ASYNC_VOID_CALL_${index}_${site.id}__`);
@@ -4770,7 +4925,7 @@ class JvmSsaBlockRenderer {
                   st`  helpers.skipJitOnce(frame);`,
                   st`  return { deopt: true, transient: true, reason: 'asynchronous structured SSA callee' };`,
                 ],
-                checkedLeaf: [st`return helpers.asyncInvokeSentinel();`],
+                checkedLeaf: [leafBailStatement()],
               });
             }
             const fallbackLines = [
@@ -4949,31 +5104,28 @@ class JvmSsaBlockRenderer {
                   lines: [
                     ...args.map((argument, position) => constDecl(
                       inlineCheckedLeafStage("a", position), e`${argument}`,
-                      {pure: true, pinned: true})),
+                      {pure: true})),
                     ...positionalRawCaptures.map((capture, position) =>
                       constDecl(inlineCheckedLeafStage("c", position),
-                        e`${capture}`, {pure: true, pinned: true})),
+                        e`${capture}`, {pure: true})),
                     ...[...feeds.keys()].map((argument) => constDecl(
                       inlineCheckedLeafStage("v", argument),
                       e`${positionalArgumentArrayData[argument].data}`,
-                      {pure: true, pinned: true})),
+                      {pure: true})),
                     blockStart(""),
                     ...inlineCheckedLeafBody.argumentNames.map(
                       (name, position) => stmt(
-                        `  const ${name} = ${
-                          inlineCheckedLeafStage("a", position)};`,
-                        {foreign: true})),
+                        e`  const ${name} = ${
+                          inlineCheckedLeafStage("a", position)};`)),
                     ...inlineCheckedLeafBody.captureArguments.map(
                       (name, position) => stmt(
-                        `  const ${name} = ${
-                          inlineCheckedLeafStage("c", position)};`,
-                        {foreign: true})),
+                        e`  const ${name} = ${
+                          inlineCheckedLeafStage("c", position)};`)),
                     stmt("  const nestedEntryGuarded = true;",
                       {foreign: true}),
                     ...assembled.lines.map((line) =>
                       stmt(`  ${line}`, {foreign: true})),
-                    stmt(`  ${out} = ${inlineCheckedLeafBody.result};`,
-                      {foreign: true}),
+                    stmt(e`  ${out} = ${inlineCheckedLeafBody.result};`),
                     blockEnd(""),
                   ],
                 };
@@ -5099,7 +5251,7 @@ class JvmSsaBlockRenderer {
                   // performs no effect before its own entry bailout. A
                   // wrapper checked leaf can therefore reject directly and
                   // let its canonical caller execute the original bytecode.
-                  checkedLeaf: [st`return helpers.asyncInvokeSentinel();`],
+                  checkedLeaf: [leafBailStatement()],
                 });
               }
               // Rendered against the nested-entry argument so a region that
@@ -5155,7 +5307,8 @@ class JvmSsaBlockRenderer {
                   e`thread, true);`));
                 const replacement = provenInlineCheckedLeafLines
                   ? [
-                    st`${inlineCheckedLeafLabel}: {`,
+                    `${recordStatement([`${inlineCheckedLeafLabel}: {`],
+                    {kind: "inlineLeafLabel", label: inlineCheckedLeafLabel})}`,
                     ...provenInlineCheckedLeafLines.map(
                       (line) => `  ${line}`),
                     blockEnd(""),
@@ -5245,7 +5398,8 @@ class JvmSsaBlockRenderer {
                 // sole fallback predicate, preserving exact canonical
                 // execution when an assumption is not satisfied.
                 lines.push(
-                  st`${inlineCheckedLeafLabel}: {`,
+                  `${recordStatement([`${inlineCheckedLeafLabel}: {`],
+                    {kind: "inlineLeafLabel", label: inlineCheckedLeafLabel})}`,
                   ...inlineCheckedLeafLines.map((line) => `  ${line}`),
                   blockEnd(""),
                   stmt(e`if (${inlineCheckedLeafVoid
@@ -5276,15 +5430,21 @@ class JvmSsaBlockRenderer {
                     structured.loopHeaders.size > 0
                   ? [st`${positionalQuantumMarker}`] : []),
                 ...(inlineCheckedLeafLines ? [
-                  st`  ${inlineCheckedLeafLabel}: {`,
+                  `  ${recordStatement([`${inlineCheckedLeafLabel}: {`],
+                    {kind: "inlineLeafLabel", label: inlineCheckedLeafLabel})}`,
                   ...inlineCheckedLeafLines.map((line) => `    ${line}`),
                   blockEnd("  "),
                 ] : directCheckedLeafNoThrow ? [
                   stmt(e`  ${out} = ${selfRecursiveMarker}${
-                    positionalRawCall};`, {kind: "assign", write: out}),
+                    positionalRawCall};`,
+                  // A self-recursive call is respecialized into a direct call
+                  // to the generated body after these passes run, against the
+                  // operand names recorded here, so those operands are pinned.
+                  {kind: "assign", write: out, pinned: site.selfRecursive}),
                 ] : [
                   stmt(e`  try { ${out} = ${selfRecursiveMarker}${
-                    positionalRawCall}; } catch (${caught}) {`),
+                    positionalRawCall}; } catch (${caught}) {`,
+                  {pinned: site.selfRecursive}),
                   st`    /*${regionHandlerMarkers.start}*/`,
                   ...materializeCallExceptionLines(
                     callStack, stack, index,
@@ -5356,7 +5516,7 @@ class JvmSsaBlockRenderer {
                 st`  if (frame) ${out}.jvmPositionalChild = frame;`,
                 st`  return ${out};`,
               ],
-              checkedLeaf: [st`return helpers.asyncInvokeSentinel();`],
+              checkedLeaf: [leafBailStatement()],
             });
             lines.push(st`if (${out} && ${out}.deopt) {`,
               stmt(exprConcat(
@@ -5401,7 +5561,7 @@ class JvmSsaBlockRenderer {
                   e`reason: 'structured SSA callee left active child', `,
                   e`jvmPositionalChild: frame };`)),
               ],
-              checkedLeaf: [st`    return helpers.asyncInvokeSentinel();`],
+              checkedLeaf: [leafBailStatement("    ")],
             });
             lines.push(
               stmt(e`/*__JVM_LEFT_ACTIVE_CHILD_WITHDRAW_${index}_${site.id}__*/`,
@@ -5430,7 +5590,7 @@ class JvmSsaBlockRenderer {
                   e`reason: 'thread yielded in structured SSA callee', `,
                   e`jvmPositionalChild: frame };`)),
               ],
-              checkedLeaf: [st`return helpers.asyncInvokeSentinel();`],
+              checkedLeaf: [leafBailStatement()],
             });
             lines.push(st`if (thread.status !== 'runnable') {`,
               st`${yieldedCallMarker}`, blockEnd(""));
@@ -6017,8 +6177,9 @@ class JvmSsaBlockRenderer {
           const tripLimit = runtimeCoarseTripLimitFor(info);
           runtimeCoarseCountedLoops.set(header, {
             ...info,
-            variable: named(`ssaRuntimeCoarseLoop${header}`),
-            tripsVariable: named(`ssaRuntimeCoarseTrips${header}`),
+            variable: compactable(named(`ssaRuntimeCoarseLoop${header}`)),
+            tripsVariable:
+              compactable(named(`ssaRuntimeCoarseTrips${header}`)),
             tripsExpression: operand(exprConcat(
               e`(${localName(info.slot)} >= ${info.boundExpression} ? 0 : `,
               info.increment === 1
@@ -6029,11 +6190,11 @@ class JvmSsaBlockRenderer {
                   e`${info.increment})`),
               e`)`)),
             condition: operand(exprConcat(
-              e`${named(`ssaRuntimeCoarseTrips${header}`)} <= `,
+              e`${compactable(named(`ssaRuntimeCoarseTrips${header}`))} <= `,
               e`${tripLimit}`,
               info.increment === 1 ? "" : exprConcat(
                 e` && ${localName(info.slot)} <= 2147483647 - `,
-                e`${named(`ssaRuntimeCoarseTrips${header}`)} * ${
+                e`${compactable(named(`ssaRuntimeCoarseTrips${header}`))} * ${
                   info.increment}`))),
           });
         }
@@ -6116,11 +6277,12 @@ class JvmSsaBlockRenderer {
       if (this.coarseCountedLoopSafePointsEnabled) {
         runtimeCoarseCountedLoops.set(header, {
           header, slot, loopBlocks, writtenSlots, postDecrement: true,
-          variable: named(`ssaRuntimeCoarseLoop${header}`),
-          tripsVariable: named(`ssaRuntimeCoarseTrips${header}`),
+          variable: compactable(named(`ssaRuntimeCoarseLoop${header}`)),
+          tripsVariable:
+            compactable(named(`ssaRuntimeCoarseTrips${header}`)),
           tripsExpression: operand(e`Math.max(0, ${localName(slot)})`),
           condition: operand(exprConcat(
-            e`${named(`ssaRuntimeCoarseTrips${header}`)} <= `,
+            e`${compactable(named(`ssaRuntimeCoarseTrips${header}`))} <= `,
             e`${runtimeCoarseTripLimit}`)),
         });
       }
@@ -6176,8 +6338,9 @@ class JvmSsaBlockRenderer {
             runtimeCoarseCountedLoops.has(header)) continue;
         runtimeCoarseCountedLoops.set(header, {
           ...info,
-          variable: named(`ssaRuntimeCoarseLoop${header}`),
-          tripsVariable: named(`ssaRuntimeCoarseTrips${header}`),
+          variable: compactable(named(`ssaRuntimeCoarseLoop${header}`)),
+          tripsVariable:
+            compactable(named(`ssaRuntimeCoarseTrips${header}`)),
           tripsExpression: operand(exprConcat(
             e`(${localName(info.slot)} >= ${info.boundExpression} ? 0 : `,
             info.increment === 1
@@ -6188,11 +6351,11 @@ class JvmSsaBlockRenderer {
                 e`${info.increment})`),
             e`)`)),
           condition: operand(exprConcat(
-            e`${named(`ssaRuntimeCoarseTrips${header}`)} <= ${
+            e`${compactable(named(`ssaRuntimeCoarseTrips${header}`))} <= ${
               runtimeCoarseTripLimit}`,
             info.increment === 1 ? "" : exprConcat(
               e` && ${localName(info.slot)} <= 2147483647 - `,
-              e`${named(`ssaRuntimeCoarseTrips${header}`)} * ${
+              e`${compactable(named(`ssaRuntimeCoarseTrips${header}`))} * ${
                 info.increment}`))),
         });
       }
@@ -6265,10 +6428,10 @@ class JvmSsaBlockRenderer {
         const emission = directStaticEmissionsByItem.get(itemIndex);
         if (!emission) continue;
         emission.lines[emission.start] =
-          `const ${emission.value} = ${view.value};`;
+          constDecl(emission.value, e`${view.value}`);
         if (emission.data) {
           emission.lines[emission.start + 1] =
-            `const ${emission.data} = ${view.data};`;
+            constDecl(emission.data, e`${view.data}`);
         }
       }
     }
@@ -7381,7 +7544,8 @@ class JvmSsaBlockRenderer {
       if (affineOffset !== 0 &&
           (outermostCountedLoop || outermostPostDecrementLoop ||
            info.postDecrement)) continue;
-      const variable = named(`ssaArrayRangeGuard${candidateIndex}`);
+      const variable =
+        compactable(named(`ssaArrayRangeGuard${candidateIndex}`));
       let condition;
       let preamble = [];
       let declarationHeader = info.header;
@@ -7440,7 +7604,7 @@ class JvmSsaBlockRenderer {
                 e`for (let ${cursor} = 0; ${valid} && ${cursor} < `,
                 e`${info.boundExpression}; ${cursor} += 1) {`)),
               stmt(e`  const ${raw} = ${candidate.sourceArrayData}[${
-                cursor}];`, {kind: "const", def: raw}),
+                cursor}];`, {kind: "const", def: raw, indexed: true}),
               stmt(exprConcat(e`  if (${raw} === undefined) { ${valid} = false; `,
                 e`continue; }`)),
               stmt(e`  const ${element} = ${loaded};`,
@@ -8358,20 +8522,22 @@ class JvmSsaBlockRenderer {
                 }
               };
             admittedReplacement = [
-              `${helper}(${[
-                plan.xArgument, plan.yArgument,
-                plan.countArgument, plan.valueArgument,
-              ].map((position) => candidate.args[position]).join(", ")}); ` +
-                "/*__SSA_SAFE_ARITHMETIC_CALL__*/",
+              stmt(exprConcat(
+                e`${helper}(`,
+                argumentListExpression([
+                  plan.xArgument, plan.yArgument,
+                  plan.countArgument, plan.valueArgument,
+                ].map((position) => candidate.args[position])),
+                e`); /*__SSA_SAFE_ARITHMETIC_CALL__*/`), {pinned: true}),
             ];
           }
-          const marker = `__JVM_DIRECT_CHECKED_ADMISSION_${
-            directCheckedAdmissionFallbacks.size}__`;
+          const marker = named(`__JVM_DIRECT_CHECKED_ADMISSION_${
+            directCheckedAdmissionFallbacks.size}__`);
           directCheckedAdmissionFallbacks.set(marker, {
             direct: admittedReplacement,
             ordinary: candidateLines.slice(start + 1, end),
           });
-          candidateLines.splice(start, end - start + 1, marker);
+          candidateLines.splice(start, end - start + 1, st`${marker}`);
           provenCheckedCallAdmissionCount += 1;
           clippedAffineRegionAdmission = {
             top,
@@ -8438,13 +8604,13 @@ class JvmSsaBlockRenderer {
           bailouts.push(guard);
           rangeBailoutGuardsByHeader.set(
             capacityFact.declarationHeader, bailouts);
-          const marker = `__JVM_DIRECT_CHECKED_ADMISSION_${
-            directCheckedAdmissionFallbacks.size}__`;
+          const marker = named(`__JVM_DIRECT_CHECKED_ADMISSION_${
+            directCheckedAdmissionFallbacks.size}__`);
           directCheckedAdmissionFallbacks.set(marker, {
             direct: candidate.replacement,
             ordinary: candidateLines.slice(start + 1, end),
           });
-          candidateLines.splice(start, end - start + 1, marker);
+          candidateLines.splice(start, end - start + 1, st`${marker}`);
           provenCheckedCallAdmissionCount += 1;
         } else if (!needsTighterTripGuard) {
           candidateLines.splice(
@@ -8984,6 +9150,8 @@ class JvmSsaBlockRenderer {
       }
       return {
         condition: loopCondition,
+        inductionLocal: localName(info.slot),
+        bound: String(info.boundExpression),
         body,
         exit,
       };
@@ -9045,21 +9213,24 @@ class JvmSsaBlockRenderer {
     const specializeDeferredStaticArrayAccessLines = (lines, trusted) => {
       const output = [];
       for (let index = 0; index < lines.length; index += 1) {
-        const start = /^\/\*(__SSA_DEFERRED_STATIC_ARRAY_ACCESS_\d+__):start\*\/$/
-          .exec(lines[index]);
-        if (!start) {
+        const start = recordOf(lines[index]);
+        if (start?.kind !== "deferredStaticStart") {
           output.push(lines[index]);
           continue;
         }
-        const access = deferredStaticArrayAccessByMarker.get(start[1]);
-        const end = `/*${start[1]}:end*/`;
+        const access = deferredStaticArrayAccessByMarker.get(start.marker);
         let close = index + 1;
-        while (close < lines.length && lines[close] !== end) close += 1;
+        while (close < lines.length) {
+          const record = recordOf(lines[close]);
+          if (record?.kind === "deferredStaticEnd" &&
+              record.marker === start.marker) break;
+          close += 1;
+        }
         if (!access || close >= lines.length) {
           output.push(lines[index]);
           continue;
         }
-        if (trusted && provenDeferredStaticArrayAccesses.has(start[1])) {
+        if (trusted && provenDeferredStaticArrayAccesses.has(start.marker)) {
           output.push(...access.directLines);
         } else {
           output.push(...lines.slice(index + 1, close));
@@ -9105,16 +9276,25 @@ class JvmSsaBlockRenderer {
       return node;
     };
     const specializeNonZeroBranch = (plan, lines) => {
-      const match = /^(ssaValue\d+) !== 0$/.exec(plan.condition || "");
-      if (!match) return lines;
-      const equivalent = new Set([match[1]]);
+      const comparison = plan.comparison;
+      if (!comparison || comparison.cmp !== "!== 0" ||
+          !ownSsaValueNames.has(comparison.input)) return lines;
+      const equivalent = new Set([comparison.input]);
+      // A copy of a value known non-zero is known non-zero. The record says
+      // what a statement defines or writes and what its right-hand side is,
+      // so the equivalence walk needs no line matching.
       const learnAlias = (line) => {
-        const declaration = /^\s*const (ssaValue\d+) = ([A-Za-z_$][\w$]*);$/.exec(line);
-        const assignment = /^\s*(local\d+) = ([A-Za-z_$][\w$]*);$/.exec(line);
-        const alias = declaration || assignment;
-        if (!alias || !equivalent.has(alias[2])) return false;
+        const record = recordOf(line);
+        if (!record || record.kind !== "const" && record.kind !== "store") {
+          return false;
+        }
+        const target = record.def || record.write;
+        const source = record.exprParts?.length === 1 &&
+          typeof record.exprParts[0] !== "string"
+          ? record.exprParts[0].ref : null;
+        if (!target || !source || !equivalent.has(source)) return false;
         const size = equivalent.size;
-        equivalent.add(alias[1]);
+        equivalent.add(target);
         return equivalent.size !== size;
       };
       // The conditional plan commonly stores the tested stack value into a
@@ -9129,18 +9309,20 @@ class JvmSsaBlockRenderer {
       for (let index = 0; index < lines.length; index += 1) {
         const line = lines[index];
         learnAlias(line);
-        const zeroCheck = /^([\s]*)if \(([A-Za-z_$][\w$]*) === 0\) \{$/.exec(line);
-        if (!zeroCheck || !equivalent.has(zeroCheck[2])) {
+        const record = recordOf(line);
+        const zeroCheck = record?.kind === "if" &&
+          record.comparison?.cmp === "=== 0" && !record.negated
+          ? record.comparison.input : null;
+        if (!zeroCheck || !equivalent.has(zeroCheck)) {
           output.push(line);
           continue;
         }
         let depth = 1;
         let close = index + 1;
         for (; close < lines.length && depth > 0; close += 1) {
-          const trimmed = lines[close].trim();
-          if (trimmed.endsWith("{")) depth += 1;
-          if (trimmed === "}") depth -= 1;
-          if (trimmed.startsWith("} else")) break;
+          const closeRecord = recordOf(lines[close]);
+          if (closeRecord?.kind === "elseArm") break;
+          depth += closeRecord?.blockDelta || 0;
         }
         if (depth !== 0) {
           output.push(line);
@@ -9372,7 +9554,8 @@ class JvmSsaBlockRenderer {
                     `${headerBlock.synthetic.transfer}${slot}`)};`,
                   {kind: "spillStack"})),
                 st`stack.length = ${depth};`,
-                st`helpers.materialize(frame, locals, stack, ${pc});`,
+                stmt(e`helpers.materialize(frame, locals, stack, ${pc});`,
+            {kind: "materializeSpill"}),
               ]),
               blockEnd(""),
             ];
@@ -9384,7 +9567,8 @@ class JvmSsaBlockRenderer {
                 e`stack[${i}] = ${named(`ssaStack${header}_${i}`)};`,
                 {kind: "spillStack"})),
               st`stack.length = ${headerDepth};`,
-              st`helpers.materialize(frame, locals, stack, ${headerBlock.insns[0]});`,
+              stmt(e`helpers.materialize(frame, locals, stack, ${
+                headerBlock.insns[0]});`, {kind: "materializeSpill"}),
             ];
           })();
         const materialize = [
@@ -9449,8 +9633,13 @@ class JvmSsaBlockRenderer {
               ? e`${view.direct.variable}.get(${key})`
               : e`${view.direct.variable}[${key}]`;
             return [
-              constDecl(view.value, read, {pure: true}),
-              constDecl(view.data, arrayDataExpr(view.value), {pure: true}),
+              constDecl(view.value, read,
+                {pure: true, indexed: view.direct.kind !== "map"}),
+              (() => {
+                const loopView = arrayDataExpr(view.value);
+                return constDecl(view.data, loopView,
+                  {pure: loopView.pure === true});
+              })(),
             ];
           }),
           ...(arrayRangeGuardDeclarations.get(header) || []),
@@ -9480,7 +9669,9 @@ class JvmSsaBlockRenderer {
         const loopHeaderLine = () => stmt(
           e`${node.label}: while (${countedLoop
             ? countedLoop.condition : "true"}) {`,
-          {kind: "loopHeader", label: node.label});
+          {kind: "loopHeader", label: node.label,
+            inductionLocal: countedLoop?.inductionLocal || null,
+            bound: countedLoop?.bound || null});
         const polledLoop = [
           loopHeaderLine(),
           ...(coarse ? [] : [
@@ -10550,8 +10741,8 @@ class JvmSsaBlockRenderer {
             `${prefix}${stmt(e`stack[${index}] = ${operandExpression};`,
               {kind: "spillStack"})}`),
           `${prefix}${st`stack.length = ${record.operands.length};`}`,
-          `${prefix}${st`helpers.materialize(frame, locals, stack, ${
-            record.pc});`}`,
+          `${prefix}${stmt(e`helpers.materialize(frame, locals, stack, ${
+            record.pc});`, {kind: "materializeSpill"})}`,
         ];
       });
     const eliminatedCheckedLeafLocalSlots = new Set();
@@ -10562,47 +10753,44 @@ class JvmSsaBlockRenderer {
         auditStatementIrLines(sourceLines, statementRecords, emittedNames,
           checkedLeafSemantics ? "leaf" : "restoring");
       }
+      // Every pass below reasons about which names a statement defines and
+      // reads. A line the emitters did not record has an unknown read set, so
+      // the whole body is left alone rather than optimized on a guess.
+      if (sourceLines.some(
+        (line) => line.trim() !== "" && !recordOf(line))) {
+        return [...sourceLines];
+      }
       let lines = [...sourceLines];
-      const inlineCheckedLeafLineIndexes = () => {
-        const indexes = new Set();
-        let depth = 0;
-        for (let index = 0; index < lines.length; index += 1) {
-          const line = lines[index];
-          if (depth === 0 &&
-              /^\s*ssaInlineCheckedLeaf\d+: \{$/.test(line)) {
-            depth = 1;
-            indexes.add(index);
-            continue;
-          }
-          if (depth === 0) continue;
-          indexes.add(index);
-          depth += (line.match(/\{/g) || []).length -
-            (line.match(/\}/g) || []).length;
-        }
-        return indexes;
-      };
-      const initialInlineIndexes = inlineCheckedLeafLineIndexes();
+      const recordAt = (index) => recordOf(lines[index]);
+      const refsAt = (index) => partsReferences(recordAt(index)?.parts || []);
+      // A self-recursive call and a specialized safe-arithmetic call pin the
+      // operands they read.
+      //
+      // A lexically inserted checked leaf needs no such pinning. Its own
+      // statements reference only names it declares inside its block, and the
+      // caller-side bindings that feed it are ordinary statements of this
+      // compile, so substituting an immutable local alias or an unassigned SSA
+      // value into one is exactly as sound there as anywhere else. (The text
+      // version tried to exclude those lines with
+      // `/^\s*ssaInlineCheckedLeaf\d+: \{$/`, which never matched the
+      // `ssaInlineCheckedLeaf<serial>_<pc>` labels the emitter produces, so
+      // that exclusion never affected a generated body.)
       const selfRecursiveProtectedValues = new Set(lines
-        .filter((line, index) =>
-          line.includes("__SSA_SELF_RECURSIVE_CALL_") ||
-          line.includes("__SSA_SAFE_ARITHMETIC_CALL__") ||
-          initialInlineIndexes.has(index))
-        .flatMap((line) => [...line.matchAll(/\bssaValue\d+\b/g)]
-          .map((match) => match[0])));
+        .flatMap((_line, index) =>
+          recordAt(index)?.pinned === true ? refsAt(index) : [])
+        .filter((name) => ownSsaValueNames.has(name)));
       // Restoring bodies expose the coarse-loop and range predicates as
       // explicit guard sites used by deoptimization and diagnostics. Keep
       // those names stable there; checked leaves have no restoring contract
       // and may freely propagate the predicates as ordinary SSA values.
-      const compactTemporaryPattern = checkedLeafSemantics
-        ? "(?:ssaValue\\d+|ssaRuntimeCoarse(?:Trips|Loop)\\d+|" +
-          "ssaArrayRangeGuard\\d+)"
-        : "ssaValue\\d+";
+      const isCompactable = (name) => ownSsaValueNames.has(name) ||
+        checkedLeafSemantics && checkedLeafCompactableNames.has(name);
       const occurrenceCounts = () => {
         const counts = new Map();
-        for (const line of lines) {
-          for (const match of line.matchAll(new RegExp(
-            `\\b${compactTemporaryPattern}\\b`, "g"))) {
-            counts.set(match[0], (counts.get(match[0]) || 0) + 1);
+        for (let index = 0; index < lines.length; index += 1) {
+          for (const name of refsAt(index)) {
+            if (!isCompactable(name)) continue;
+            counts.set(name, (counts.get(name) || 0) + 1);
           }
         }
         return counts;
@@ -10612,25 +10800,19 @@ class JvmSsaBlockRenderer {
       // snapshots, they do not need a distinct SSA register.
       const aliases = new Map();
       const removedAliases = new Set();
-      const aliasInlineIndexes = inlineCheckedLeafLineIndexes();
+      const assignedLocals = checkedLeafSemantics
+        ? renderedAssignedLocalSlots : callerAssignedLocalSlots;
       for (let index = 0; index < lines.length; index += 1) {
-        if (aliasInlineIndexes.has(index)) continue;
-        const match = /^\s*const (ssaValue\d+) = local(\d+);$/.exec(lines[index]);
-        const assignedLocals = checkedLeafSemantics
-          ? renderedAssignedLocalSlots : callerAssignedLocalSlots;
-        if (!match || assignedLocals.has(Number(match[2]))) {
-          continue;
-        }
-        if (selfRecursiveProtectedValues.has(match[1])) continue;
-        aliases.set(match[1], `local${match[2]}`);
+        const record = recordAt(index);
+        if (record?.kind !== "const" ||
+            !Number.isInteger(record.localSnapshot) ||
+            assignedLocals.has(record.localSnapshot)) continue;
+        if (selfRecursiveProtectedValues.has(record.def)) continue;
+        aliases.set(record.def, [{ref: localName(record.localSnapshot)}]);
         removedAliases.add(index);
       }
       if (aliases.size) {
-        const replacementInlineIndexes = inlineCheckedLeafLineIndexes();
-        lines = lines
-          .map((line, index) => replacementInlineIndexes.has(index)
-            ? line : line.replace(/\bssaValue\d+\b/g,
-              (name) => aliases.get(name) || name))
+        lines = substituteInLines(lines, aliases)
           .filter((_line, index) => !removedAliases.has(index));
       }
 
@@ -10640,42 +10822,38 @@ class JvmSsaBlockRenderer {
       // proven raw store in a checked leaf.
       for (;;) {
         const counts = occurrenceCounts();
-        const inlineIndexes = inlineCheckedLeafLineIndexes();
         let changed = false;
         for (let declarationIndex = 0;
           declarationIndex < lines.length; declarationIndex += 1) {
-          if (inlineIndexes.has(declarationIndex)) continue;
-          const declaration =
-            new RegExp(`^(\\s*)const (${compactTemporaryPattern}) = (.+);$`)
-              .exec(lines[declarationIndex]);
-          if (!declaration || counts.get(declaration[2]) !== 2) continue;
-          if (selfRecursiveProtectedValues.has(declaration[2])) continue;
+          const declaration = recordAt(declarationIndex);
+          if (declaration?.kind !== "const" ||
+              !isCompactable(declaration.def) ||
+              counts.get(declaration.def) !== 2) continue;
+          if (selfRecursiveProtectedValues.has(declaration.def)) continue;
           let useIndex = -1;
-          const usePattern = new RegExp(`\\b${declaration[2]}\\b`);
           for (let index = declarationIndex + 1; index < lines.length; index += 1) {
-            if (!usePattern.test(lines[index])) continue;
+            if (!refsAt(index).includes(declaration.def)) continue;
             useIndex = index;
             break;
           }
-          if (useIndex < 0 || inlineIndexes.has(useIndex)) continue;
-          const rawArrayLoad = /ssaEntry(?:Array|StaticArray)Data\d+\[/.test(
-            declaration[3]);
-          const immediateRawStore = rawArrayLoad &&
+          if (useIndex < 0) continue;
+          const use = recordAt(useIndex);
+          const immediateRawStore = declaration.rawArrayLoad &&
             useIndex === declarationIndex + 1 &&
-            /ssaEntry(?:Array|StaticArray)Data\d+\[.+\] =/.test(lines[useIndex]);
-          if (rawArrayLoad && !immediateRawStore ||
-              !checkedLeafSemantics && /\s[\/%]\s/.test(declaration[3]) ||
-              /\bhelpers\.|\bnew\b/.test(declaration[3])) continue;
-          const referencedLocals = [...declaration[3].matchAll(/\blocal(\d+)\b/g)]
-            .map((match) => Number(match[1]));
-          const localChanged = referencedLocals.some((slot) => {
-            const assignment = new RegExp(`\\blocal${slot}\\s*=(?!=)`);
-            return lines.slice(declarationIndex + 1, useIndex)
-              .some((line) => assignment.test(line));
-          });
+            use?.kind === "arrayStore" &&
+            entryArrayDataNames.has(use.storeTarget);
+          if (declaration.rawArrayLoad && !immediateRawStore ||
+              !checkedLeafSemantics && declaration.division ||
+              !declaration.pure) continue;
+          const referencedLocals = partsReferences(declaration.exprParts)
+            .filter((name) => localSlotOfName(name) !== null);
+          const localChanged = referencedLocals.some((name) =>
+            lines.slice(declarationIndex + 1, useIndex).some((line) =>
+              recordOf(line)?.write === name));
           if (localChanged) continue;
-          lines[useIndex] = lines[useIndex].replace(
-            usePattern, `(${declaration[3]})`);
+          lines[useIndex] = `${indentationOf(lines[useIndex])}${
+            rerenderStatement(use, new Map([[declaration.def,
+              ["(", ...declaration.exprParts, ")"]]])).trim()}`;
           lines[declarationIndex] = '';
           changed = true;
         }
@@ -10688,19 +10866,21 @@ class JvmSsaBlockRenderer {
       // access, but avoid a second one-use SSA register for the new value.
       for (;;) {
         const counts = occurrenceCounts();
-        const inlineIndexes = inlineCheckedLeafLineIndexes();
         let changed = false;
         for (let index = 0; index + 1 < lines.length; index += 1) {
-          if (inlineIndexes.has(index) || inlineIndexes.has(index + 1)) continue;
-          const declaration = /^(\s*)const (ssaValue\d+) = (.+);$/.exec(lines[index]);
-          if (!declaration || counts.get(declaration[2]) !== 2) continue;
-          const assignment = new RegExp(
-            `^${declaration[1]}(local\\d+) = ${declaration[2]};$`)
-            .exec(lines[index + 1]);
-          if (!assignment) continue;
+          const declaration = recordAt(index);
+          if (declaration?.kind !== "const" ||
+              !ownSsaValueNames.has(declaration.def) ||
+              counts.get(declaration.def) !== 2) continue;
+          const assignment = recordAt(index + 1);
+          if (!isLocalCopy(assignment, declaration.def) ||
+              indentationOf(lines[index]) !==
+                indentationOf(lines[index + 1])) continue;
           lines[index] = '';
-          lines[index + 1] =
-            `${declaration[1]}${assignment[1]} = ${declaration[3]};`;
+          lines[index + 1] = `${indentationOf(lines[index + 1])}${
+            storeLocal(assignment.write, new Expr(declaration.exprParts),
+              {pure: declaration.pure, division: declaration.division,
+                rawArrayLoad: declaration.rawArrayLoad})}`;
           changed = true;
         }
         if (!changed) break;
@@ -10712,22 +10892,24 @@ class JvmSsaBlockRenderer {
       // Render it as a direct local update and compare the updated local.
       for (;;) {
         const counts = occurrenceCounts();
-        const inlineIndexes = inlineCheckedLeafLineIndexes();
         let changed = false;
         for (let index = 0; index + 2 < lines.length; index += 1) {
-          if (inlineIndexes.has(index) || inlineIndexes.has(index + 1) ||
-              inlineIndexes.has(index + 2)) continue;
-          const next = /^(\s*)const (ssaValue\d+) = (.+);$/.exec(lines[index]);
-          if (!next || counts.get(next[2]) !== 3) continue;
-          const assignment = new RegExp(
-            `^${next[1]}(local\\d+) = ${next[2]};$`).exec(lines[index + 1]);
-          if (!assignment || !new RegExp(`\\b${next[2]}\\b`)
-            .test(lines[index + 2])) continue;
+          const next = recordAt(index);
+          if (next?.kind !== "const" || !ownSsaValueNames.has(next.def) ||
+              counts.get(next.def) !== 3) continue;
+          const assignment = recordAt(index + 1);
+          if (!isLocalCopy(assignment, next.def) ||
+              indentationOf(lines[index]) !==
+                indentationOf(lines[index + 1])) continue;
+          if (!refsAt(index + 2).includes(next.def)) continue;
           lines[index] = '';
-          lines[index + 1] =
-            `${next[1]}${assignment[1]} = ${next[3]};`;
-          lines[index + 2] = lines[index + 2].replace(
-            new RegExp(`\\b${next[2]}\\b`, 'g'), assignment[1]);
+          lines[index + 1] = `${indentationOf(lines[index + 1])}${
+            storeLocal(assignment.write, new Expr(next.exprParts),
+              {pure: next.pure, division: next.division,
+                rawArrayLoad: next.rawArrayLoad})}`;
+          lines[index + 2] = `${indentationOf(lines[index + 2])}${
+            rerenderStatement(recordAt(index + 2),
+              new Map([[next.def, [{ref: assignment.write}]]])).trim()}`;
           changed = true;
         }
         if (!changed) break;
@@ -10739,21 +10921,23 @@ class JvmSsaBlockRenderer {
       // identical and exposes a conventional induction variable to the host.
       for (;;) {
         const counts = occurrenceCounts();
-        const inlineIndexes = inlineCheckedLeafLineIndexes();
         let changed = false;
         for (let index = 0; index + 1 < lines.length; index += 1) {
-          if (inlineIndexes.has(index) || inlineIndexes.has(index + 1)) continue;
-          const snapshot =
-            /^(\s*)const (ssaValue\d+) = (local\d+);$/.exec(lines[index]);
-          if (!snapshot || counts.get(snapshot[2]) !== 2) continue;
-          const update = new RegExp(
-            `^${snapshot[1]}${snapshot[3]} = (.+\\b${snapshot[2]}\\b.+);$`)
-            .exec(lines[index + 1]);
-          if (!update) continue;
+          const snapshot = recordAt(index);
+          if (snapshot?.kind !== "const" ||
+              !ownSsaValueNames.has(snapshot.def) ||
+              !Number.isInteger(snapshot.localSnapshot) ||
+              counts.get(snapshot.def) !== 2) continue;
+          const target = localName(snapshot.localSnapshot);
+          const update = recordAt(index + 1);
+          if (update?.kind !== "store" || update.write !== target ||
+              !partsReferences(update.exprParts).includes(snapshot.def) ||
+              indentationOf(lines[index]) !==
+                indentationOf(lines[index + 1])) continue;
           lines[index] = '';
-          lines[index + 1] = `${snapshot[1]}${snapshot[3]} = ` +
-            `${update[1].replace(new RegExp(`\\b${snapshot[2]}\\b`, 'g'),
-              snapshot[3])};`;
+          lines[index + 1] = `${indentationOf(lines[index + 1])}${
+            rerenderStatement(update,
+              new Map([[snapshot.def, [{ref: target}]]])).trim()}`;
           changed = true;
         }
         if (!changed) break;
@@ -10767,25 +10951,26 @@ class JvmSsaBlockRenderer {
       for (;;) {
         let changed = false;
         for (let start = 0; start < lines.length; start += 1) {
-          const opening = /^(\s*)(L\d+): \{$/.exec(lines[start]);
-          if (!opening) continue;
+          const opening = recordAt(start);
+          if (opening?.kind !== "blockLabel") continue;
+          const indentation = indentationOf(lines[start]);
           let depth = 1;
           let end = start + 1;
           for (; end < lines.length; end += 1) {
-            const opens = (lines[end].match(/\{/g) || []).length;
-            const closes = (lines[end].match(/\}/g) || []).length;
-            depth += opens - closes;
+            depth += recordAt(end)?.blockDelta || 0;
             if (depth === 0) break;
           }
           if (end >= lines.length) continue;
-          const trailing = `${opening[1]}  break ${opening[2]};`;
-          if (lines[end - 1] !== trailing) continue;
+          const trailing = recordAt(end - 1);
+          if (trailing?.kind !== "break" ||
+              trailing.label !== opening.label ||
+              indentationOf(lines[end - 1]) !== `${indentation}  `) continue;
           lines.splice(end - 1, 2);
           lines.splice(start, 1);
           for (let index = start; index < end - 2; index += 1) {
-            if (lines[index].startsWith(`${opening[1]}  `)) {
-              lines[index] = opening[1] +
-                lines[index].slice(opening[1].length + 2);
+            if (lines[index].startsWith(`${indentation}  `)) {
+              lines[index] = indentation +
+                lines[index].slice(indentation.length + 2);
             }
           }
           changed = true;
@@ -10800,22 +10985,34 @@ class JvmSsaBlockRenderer {
       // array view and index expression, not to a particular sampler.
       if (checkedLeafSemantics) {
         for (let index = 0; index + 5 < lines.length; index += 1) {
-          const declaration = /^(\s*)let (ssaValue\d+);$/.exec(lines[index]);
-          if (!declaration) continue;
-          const name = declaration[2];
-          const load = new RegExp(
-            `^${declaration[1]}if \\(!false && \\(\\(${name} = (.+)\\) === undefined\\)\\) \\{$`,
-          ).exec(lines[index + 1]);
-          if (!load || lines[index + 2] !==
-              `${declaration[1]}  return helpers.asyncInvokeSentinel();` ||
-              lines[index + 3] !== `${declaration[1]}} else {` ||
-              !new RegExp(`^${declaration[1]}  ${name} = false \\? .+ : \\(\\(${name}\\) \\| 0\\);$`)
-                .test(lines[index + 4]) ||
-              lines[index + 5] !== `${declaration[1]}}`) continue;
+          const declaration = recordAt(index);
+          if (declaration?.kind !== "letUninitialized") continue;
+          const name = declaration.def;
+          const indentation = indentationOf(lines[index]);
+          const load = recordAt(index + 1);
+          if (load?.kind !== "rangeGuardedAccess" || load.guard !== "false" ||
+              !load.rawLoad || load.loadTarget !== name ||
+              indentationOf(lines[index + 1]) !== indentation) continue;
+          const bail = recordAt(index + 2);
+          const alternate = recordAt(index + 3);
+          const success = recordAt(index + 4);
+          const close = recordAt(index + 5);
+          if (bail?.kind !== "leafBail" ||
+              lines[index + 2] !== `${indentation}  ${bail.key}` ||
+              alternate?.kind !== "elseArm" ||
+              indentationOf(lines[index + 3]) !== indentation ||
+              success?.kind !== "guardedLoad" || success.guard !== "false" ||
+              success.target !== name ||
+              renderParts(success.ordinary.parts) !== `((${name}) | 0)` ||
+              indentationOf(lines[index + 4]) !== `${indentation}  ` ||
+              close?.kind !== "blockEnd" ||
+              indentationOf(lines[index + 5]) !== indentation) continue;
           lines.splice(index, 6,
-            `${declaration[1]}const ${name} = ${load[1]};`,
-            `${declaration[1]}if (${name} === undefined) ` +
-              "return helpers.asyncInvokeSentinel();");
+            `${indentation}${constDecl(name, load.rawLoad,
+              {pure: true, rawArrayLoad: true})}`,
+            `${indentation}${stmt(exprConcat(
+              e`if (${name} === undefined) `,
+              e`${leafBailStatement()}`))}`);
         }
 
         // Checked leaves have already proved that their normal path cannot
@@ -10830,24 +11027,41 @@ class JvmSsaBlockRenderer {
         const localAssignments = new Map();
         const localReads = new Map();
         for (let index = 0; index < lines.length; index += 1) {
-          const declaration = /^\s*let (local\d+) = undefined;$/.exec(
-            lines[index]);
-          if (declaration) localDeclarations.set(declaration[1], index);
-          const assignment = /^(\s*)(local\d+) = (ssaValue\d+);$/.exec(
-            lines[index]);
-          if (assignment) {
-            const values = localAssignments.get(assignment[2]) || [];
+          const record = recordAt(index);
+          if (record?.kind === "letUndefinedLocal") {
+            localDeclarations.set(record.def, index);
+          }
+          if (record?.kind === "store" &&
+              localSlotOfName(record.write) !== null &&
+              record.exprParts?.length === 1 &&
+              typeof record.exprParts[0] !== "string" &&
+              ownSsaValueNames.has(record.exprParts[0].ref)) {
+            const values = localAssignments.get(record.write) || [];
             values.push({
               index,
-              indentation: assignment[1].length,
-              value: assignment[3],
+              indentation: indentationOf(lines[index]).length,
+              value: record.exprParts[0].ref,
             });
-            localAssignments.set(assignment[2], values);
+            localAssignments.set(record.write, values);
           }
-          for (const match of lines[index].matchAll(/\blocal\d+\b/g)) {
-            const name = match[0];
-            if (declaration?.[1] === name || assignment?.[2] === name &&
-                match.index === assignment[1].length) continue;
+          // Every occurrence of a local is a read, except the name a
+          // `let local<slot> = undefined;` introduces and the target of a
+          // plain `local<slot> = <ssa value>;` copy. A self-update such as
+          // `local3 = (local3 + 1) | 0;` reads the slot on both sides.
+          const occurrences = partsReferences(record?.parts || []);
+          if (record?.kind === "letUndefinedLocal") {
+            const at = occurrences.indexOf(record.def);
+            if (at >= 0) occurrences.splice(at, 1);
+          } else if (record?.kind === "store" &&
+              localSlotOfName(record.write) !== null &&
+              record.exprParts?.length === 1 &&
+              typeof record.exprParts[0] !== "string" &&
+              ownSsaValueNames.has(record.exprParts[0].ref)) {
+            const at = occurrences.indexOf(record.write);
+            if (at >= 0) occurrences.splice(at, 1);
+          }
+          for (const name of occurrences) {
+            if (localSlotOfName(name) === null) continue;
             const reads = localReads.get(name) || [];
             reads.push(index);
             localReads.set(name, reads);
@@ -10864,8 +11078,7 @@ class JvmSsaBlockRenderer {
             for (const assignment of assignments) {
               removeLocalLines.add(assignment.index);
             }
-            eliminatedCheckedLeafLocalSlots.add(
-              Number(name.slice("local".length)));
+            eliminatedCheckedLeafLocalSlots.add(localSlotOfName(name));
             continue;
           }
           if (assignments.length !== 1 || !reads.length) continue;
@@ -10873,28 +11086,27 @@ class JvmSsaBlockRenderer {
           let scopeEnd = lines.length;
           for (let index = assignment.index + 1;
             index < lines.length; index += 1) {
-            const trimmed = lines[index].trim();
-            const indentation = lines[index].length -
-              lines[index].trimStart().length;
-            if (trimmed.startsWith("}") &&
-                indentation < assignment.indentation) {
+            const record = recordAt(index);
+            const closes = record?.kind === "blockEnd" ||
+              record?.kind === "elseArm" || record?.kind === "elseIfArm";
+            const indentation = indentationOf(lines[index]).length;
+            if (closes && indentation < assignment.indentation) {
               scopeEnd = index;
               break;
             }
           }
           if (reads.some((index) =>
             index <= assignment.index || index >= scopeEnd)) continue;
-          const readPattern = new RegExp(`\\b${name}\\b`, "g");
+          const replacement = new Map([[name, [{ref: assignment.value}]]]);
           for (const index of reads) {
-            lines[index] = lines[index].replace(
-              readPattern, assignment.value);
+            lines[index] = `${indentationOf(lines[index])}${
+              rerenderStatement(recordAt(index), replacement).trim()}`;
           }
           if (Number.isInteger(declarationIndex)) {
             removeLocalLines.add(declarationIndex);
           }
           removeLocalLines.add(assignment.index);
-          eliminatedCheckedLeafLocalSlots.add(
-            Number(name.slice("local".length)));
+          eliminatedCheckedLeafLocalSlots.add(localSlotOfName(name));
         }
         if (removeLocalLines.size) {
           lines = lines.filter((_line, index) =>
@@ -10905,13 +11117,15 @@ class JvmSsaBlockRenderer {
       // checked-leaf rewrites above.
       for (;;) {
         const counts = occurrenceCounts();
-        const inlineIndexes = inlineCheckedLeafLineIndexes();
         const previousLength = lines.length;
-        lines = lines.filter((line, index) => {
-          if (inlineIndexes.has(index)) return true;
-          const declaration = /^\s*const (ssaValue\d+) = (.+);$/.exec(line);
-          return !declaration || counts.get(declaration[1]) !== 1 ||
-            /\bhelpers\.|\bnew\b|\[[^\]]+\]/.test(declaration[2]);
+        lines = lines.filter((line) => {
+          const record = recordOf(line);
+          if (record?.kind !== "const" ||
+              !ownSsaValueNames.has(record.def)) {
+            return true;
+          }
+          return counts.get(record.def) !== 1 || !record.pure ||
+            record.indexed === true;
         });
         if (lines.length === previousLength) break;
       }
@@ -10920,47 +11134,61 @@ class JvmSsaBlockRenderer {
     const strengthReduceAffineStoreLoops = (sourceLines) => {
       const lines = [...sourceLines];
       for (let index = 0; index + 4 < lines.length; index += 1) {
-        const opening = /^(\s*)(L\d+): while \((local\d+) < (local\d+)\) \{$/
-          .exec(lines[index]);
-        if (!opening) continue;
-        const indentation = opening[1];
-        const induction = opening[3];
-        const bound = opening[4];
-        const alias = new RegExp(
-          `^${indentation}  const (ssaValue\\d+) = ${induction};$`)
-          .exec(lines[index + 1]);
-        const store = new RegExp(
-          `^${indentation}  ([A-Za-z_$][\\w$]*)\\[(.+)\\] = (.+);$`)
-          .exec(lines[index + 2]);
-        if (!alias || !store ||
-            lines[index + 4] !== `${indentation}}`) continue;
-        const update = lines[index + 3]
-          .replace(/[()\s]/g, "");
+        const opening = recordOf(lines[index]);
+        if (opening?.kind !== "loopHeader" || !opening.inductionLocal ||
+            localSlotOfName(opening.bound) === null) continue;
+        const indentation = indentationOf(lines[index]);
+        const induction = opening.inductionLocal;
+        const bound = opening.bound;
+        const alias = recordOf(lines[index + 1]);
+        const store = recordOf(lines[index + 2]);
+        const update = recordOf(lines[index + 3]);
+        const close = recordOf(lines[index + 4]);
+        if (alias?.kind !== "const" ||
+            localSlotOfName(induction) !== alias.localSnapshot ||
+            indentationOf(lines[index + 1]) !== `${indentation}  ` ||
+            store?.kind !== "arrayStore" || !store.storeTarget ||
+            indentationOf(lines[index + 2]) !== `${indentation}  ` ||
+            close?.kind !== "blockEnd" ||
+            indentationOf(lines[index + 4]) !== indentation) continue;
         // The increment is either the emitter's masked int32 form or the
         // unmasked form interval analysis proved cannot overflow.
-        if (update !== `${induction}=${alias[1]}+1|0;` &&
-            update !== `${induction}=${alias[1]}+1;`) continue;
-        const normalizedIndex = store[2].replace(/[()\s]/g, "");
+        const updateText = update?.kind === "store" &&
+          update.write === induction &&
+          indentationOf(lines[index + 3]) === `${indentation}  `
+          ? renderParts(update.exprParts) : null;
+        if (updateText !== `(${alias.def} + 1) | 0` &&
+            updateText !== `(${alias.def} + 1)`) continue;
+        // The index must be `base + i` over exactly one loop-invariant local.
+        const indexText = renderParts(store.storeIndex.parts);
         const localNames = [...new Set(
-          [...store[2].matchAll(/\blocal\d+\b/g)]
-            .map((match) => match[0]))];
+          partsReferences(store.storeIndex.parts)
+            .filter((name) => localSlotOfName(name) !== null))];
         if (localNames.length !== 1) continue;
         const base = localNames[0];
         if (base === induction || base === bound ||
-            !([`${base}+${alias[1]}|0`,
-              `${alias[1]}+${base}|0`].includes(normalizedIndex)) ||
-            new RegExp(`\\b(?:${alias[1]}|${induction}|${base})\\b`)
-              .test(store[3])) continue;
-        const suffix = opening[2].slice(1);
-        const end = `ssaAffineStoreEnd${suffix}`;
+            ![`((${base} + ${alias.def}) | 0)`,
+              `((${alias.def} + ${base}) | 0)`,
+              `(${base} + ${alias.def}) | 0`,
+              `(${alias.def} + ${base}) | 0`].includes(indexText) ||
+            partsReferences(store.storeValue.parts).some((name) =>
+              name === alias.def || name === induction ||
+              name === base)) continue;
+        const suffix = opening.label.slice(1);
+        const end = named(`ssaAffineStoreEnd${suffix}`);
         lines.splice(index, 5,
-          `${indentation}const ${end} = ${base} + ${bound};`,
-          `${indentation}${induction} = ${base} + ${induction};`,
-          `${indentation}${opening[2]}: while (${induction} < ${end}) {`,
-          `${indentation}  ${store[1]}[${induction}] = ${store[3]};`,
-          `${indentation}  ${induction} += 1;`,
-          `${indentation}}`,
-          `${indentation}${induction} -= ${base};`);
+          `${indentation}${constDecl(end, e`${base} + ${bound}`)}`,
+          `${indentation}${storeLocal(induction, e`${base} + ${induction}`)}`,
+          `${indentation}${stmt(e`${opening.label}: while (${
+            induction} < ${end}) {`, {kind: "loopHeader",
+            label: opening.label, inductionLocal: null, bound: null})}`,
+          `${indentation}  ${stmt(e`${store.storeTarget}[${induction}] = ${
+            store.storeValue};`, {kind: "arrayStore",
+            storeTarget: store.storeTarget, storeIndex: e`${induction}`,
+            storeValue: store.storeValue})}`,
+          `${indentation}  ${stmt(e`${induction} += 1;`)}`,
+          blockEnd(indentation),
+          `${indentation}${stmt(e`${induction} -= ${base};`)}`);
         index += 6;
       }
       return lines;
@@ -10968,41 +11196,41 @@ class JvmSsaBlockRenderer {
     const transactionalizeAcyclicLeafLines = (sourceLines) => {
       const lines = [...sourceLines];
       const output = [];
-      const braceDelta = (line) =>
-        (line.match(/\{/g) || []).length - (line.match(/\}/g) || []).length;
       for (let index = 0; index < lines.length; index += 1) {
-        const opening = /^(\s*)if \(.+\) \{$/.exec(lines[index]);
-        if (!opening) {
+        const opening = recordOf(lines[index]);
+        if (opening?.conditional !== true) {
           output.push(lines[index]);
           continue;
         }
         let depth = 1;
         let boundary = -1;
         for (let cursor = index + 1; cursor < lines.length; cursor += 1) {
-          const trimmed = lines[cursor].trim();
-          if (depth === 1 &&
-              (trimmed === "}" || trimmed.startsWith("} else"))) {
+          const record = recordOf(lines[cursor]);
+          if (depth === 1 && (record?.kind === "blockEnd" ||
+              record?.kind === "elseArm" || record?.kind === "elseIfArm")) {
             boundary = cursor;
             break;
           }
-          depth += braceDelta(lines[cursor]);
+          depth += record?.blockDelta || 0;
         }
         if (boundary < 0) {
           output.push(lines[index]);
           continue;
         }
-        const failureBody = lines.slice(index + 1, boundary).join("\n");
-        const firstFailureLine = lines[index + 1]?.trim() || "";
-        if (!(firstFailureLine === "if (frame === null) {" ||
-              firstFailureLine === "spillLocals();" ||
-              /^ssaMaterialize(?:Unwind)?\d+\(/.test(firstFailureLine)) ||
-            !/helpers\.(?:arrayLoad|arrayStore|arrayLength|getFieldAt)\(|java\/lang\/ArithmeticException/.test(
-              failureBody)) {
+        // The arm is a cold reconstruct-and-throw arm: it opens with the
+        // frame reconstruction the emitter writes there, and it performs an
+        // operation whose only purpose is to raise the guest exception.
+        const first = recordOf(lines[index + 1] || "");
+        const opensReconstruction = first?.kind === "conditionalSpill" ||
+          first?.kind === "spill" || first?.kind === "materialize";
+        const raises = lines.slice(index + 1, boundary).some((line) =>
+          recordOf(line)?.deoptEffect === true);
+        if (!opensReconstruction || !raises) {
           output.push(lines[index]);
           continue;
         }
         output.push(lines[index],
-          `${opening[1]}  return helpers.asyncInvokeSentinel();`);
+          leafBailStatement(`${indentationOf(lines[index])}  `));
         index = boundary - 1;
       }
       return output;
@@ -12296,26 +12524,30 @@ class JvmSsaBlockRenderer {
             tier: "ssa-checked-leaf-positional",
           });
           const checkedLeafRecursiveSpecialized = checkedLeafBody !== null;
+          // A trusted checked leaf must contain no frame reconstruction, no
+          // helper that can raise a guest exception, no unresolved array-range
+          // token and no throwing construct. Transactionalization removes some
+          // of those statements, so the question is about the statements that
+          // actually survived into this body -- their records answer it.
+          const unsafeCheckedLeafStatement = (line) => {
+            const record = recordOf(line);
+            if (!record) return false;
+            if (record.kind === "spill" ||
+                record.kind === "conditionalSpill" ||
+                record.kind === "materializeSpill" ||
+                record.guestArrayHelper === true ||
+                record.throwsOrTries === true) return true;
+            return partsReferences(record.parts)
+              .some((name) => primitiveArrayAccessMarkers.has(name));
+          };
           const unsafeCheckedLeafLine = !checkedLeafRecursiveSpecialized ||
-            checkedLeafBody?.some((line) =>
-            line.includes("spillLocals(") ||
-            line.includes("helpers.materialize(") ||
-            line.includes("helpers.arrayLoad(") ||
-            line.includes("helpers.arrayStore(") ||
-            line.includes("__SSA_PRIMITIVE_ARRAY_ACCESS_") ||
-            line.includes("throw ") || line.includes("try {"));
+            checkedLeafBody?.some(unsafeCheckedLeafStatement);
           if (recursiveArrayPartitionLeaf && unsafeCheckedLeafLine &&
               typeof process !== "undefined" &&
               process.env?.JVM_TRACE_STRUCTURED_RECURSIVE_ARRAY === "1") {
             console.error("[structured-recursive-array] unsafe", {
               checkedLeafRecursiveSpecialized,
-              lines: checkedLeafBody.filter((line) =>
-                line.includes("spillLocals(") ||
-                line.includes("helpers.materialize(") ||
-                line.includes("helpers.arrayLoad(") ||
-                line.includes("helpers.arrayStore(") ||
-                line.includes("__SSA_PRIMITIVE_ARRAY_ACCESS_") ||
-                line.includes("throw ") || line.includes("try {")),
+              lines: checkedLeafBody.filter(unsafeCheckedLeafStatement),
             });
           }
           if (!unsafeCheckedLeafLine) {
@@ -13199,5 +13431,4 @@ module.exports._test = {
   isIrreducibleError,
   unboundGeneratedSsaIdentifiers,
   reportStatementIrAudit,
-  reportPassFires,
 };
