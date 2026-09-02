@@ -413,6 +413,27 @@ function partsWriteImpureCall(parts) {
   return false;
 }
 
+// The ambient names a statement mentions. They are declared by the tier's
+// outermost scope rather than by any statement, so they are not operands; an
+// outlined unit still has to receive them.
+function partsAmbientNames(parts) {
+  const skeleton = partsSkeleton(parts);
+  const found = [];
+  for (let index = 0; index < AMBIENT_GENERATED_NAMES.length; index += 1) {
+    const name = AMBIENT_GENERATED_NAMES[index];
+    let position = skeleton.indexOf(name);
+    while (position >= 0) {
+      if (!isPartsWordCharacter(skeleton[position - 1]) &&
+          !isPartsWordCharacter(skeleton[position + name.length])) {
+        found.push(name);
+        break;
+      }
+      position = skeleton.indexOf(name, position + 1);
+    }
+  }
+  return found;
+}
+
 // Whether the statement the emitter wrote is a conditional that opens a
 // block: `if (<condition>) {`.
 function partsOpenCondition(parts) {
@@ -1587,6 +1608,8 @@ class JvmSsaBlockRenderer {
         subject, entryArrayDataNames);
       record.throwsOrTries = partsWriteThrowOrTry(parts);
       record.conditional = partsOpenCondition(parts);
+      record.opensTry = partsSkeleton(parts).trimStart().startsWith("try {") ||
+        partsSkeleton(parts).trimStart().startsWith("try ");
       // `safePointBudget` is ambient rather than an operand, so the entry
       // scaffold's sweep asks the statement whether it mentions the budget.
       record.usesSafePointBudget =
@@ -1595,6 +1618,7 @@ class JvmSsaBlockRenderer {
       // capture-free body is created, so it is not a runtime helper call.
       record.callsRuntimeHelper = partsSkeleton(parts)
         .split("helpers.returnVoid()").join("").includes("helpers.");
+      record.ambientReads = partsAmbientNames(parts);
       // The lexical nesting this statement opens or closes. It is a property
       // of the statement the emitter built, measured on the literal chunks it
       // wrote itself: operand references are names and never contain braces.
@@ -1700,6 +1724,109 @@ class JvmSsaBlockRenderer {
     const leafBailStatement = (indentation = "") =>
       `${indentation}${recordStatement([CHECKED_LEAF_BAIL],
         {kind: "leafBail"})}`;
+    // Statement-level fragments of an assembled positional body: an ordered
+    // list whose lines, joined back together, are exactly the body. A loop and
+    // a try/catch are each one fragment, so a consumer that outlines or
+    // partitions a body selects fragments instead of byte ranges, and each
+    // fragment states the names it introduces, reads and writes.
+    const regionFragmentsOf = (bodyLines) => {
+      const fragments = [];
+      if (bodyLines.some((line) => !recordOf(line))) return null;
+      const deltaAt = (index) => recordOf(bodyLines[index]).blockDelta || 0;
+      const isDeclaration = (record) => record.kind === "const" ||
+        record.kind === "let" || record.kind === "letUninitialized" ||
+        record.kind === "safePointBudgetDeclaration";
+      const describe = (kind, from, to) => {
+        if (to <= from) return;
+        const lines = bodyLines.slice(from, to);
+        const declares = [];
+        const reads = [];
+        const writes = [];
+        const declared = new Set();
+        for (const line of lines) {
+          const record = recordOf(line);
+          if (record.def && !declared.has(record.def)) {
+            declared.add(record.def);
+            declares.push(record.def);
+          }
+        }
+        const seenRead = new Set();
+        const seenWrite = new Set();
+        for (const line of lines) {
+          const record = recordOf(line);
+          for (const name of [...record.reads, ...record.ambientReads]) {
+            if (declared.has(name) || seenRead.has(name)) continue;
+            seenRead.add(name);
+            reads.push(name);
+          }
+          const written = record.write;
+          if (!written || declared.has(written)) continue;
+          if (!seenWrite.has(written)) {
+            seenWrite.add(written);
+            writes.push(written);
+          }
+          // A unit that assigns an enclosing name still has to bind it.
+          if (!seenRead.has(written)) {
+            seenRead.add(written);
+            reads.push(written);
+          }
+        }
+        fragments.push({
+          id: fragments.length, kind, lines, declares, reads, writes,
+        });
+      };
+      // Loops and try/catch are relocatable units, so each is one fragment
+      // wherever it sits. Every other construct stays with the statements
+      // around it: the fragments are a partition of the body in order, so
+      // joining them reproduces it exactly.
+      let index = 0;
+      let runStart = 0;
+      let depth = 0;
+      while (index < bodyLines.length) {
+        const record = recordOf(bodyLines[index]);
+        const delta = deltaAt(index);
+        if (delta > 0 && (record.kind === "loopHeader" || record.opensTry)) {
+          describe("linear", runStart, index);
+          let nested = delta;
+          let end = index + 1;
+          for (; end < bodyLines.length && nested > 0; end += 1) {
+            nested += deltaAt(end);
+          }
+          if (nested !== 0) return null;
+          describe(record.kind === "loopHeader" ? "loop" : "try", index, end);
+          index = end;
+          runStart = index;
+          depth = depth;
+          continue;
+        }
+        if (depth === 0 && delta === 0 && isDeclaration(record)) {
+          describe("linear", runStart, index);
+          describe("declaration", index, index + 1);
+          index += 1;
+          runStart = index;
+          continue;
+        }
+        depth += delta;
+        if (depth < 0) return null;
+        index += 1;
+      }
+      if (depth !== 0) return null;
+      describe("linear", runStart, bodyLines.length);
+      return fragments;
+    };
+    // The function-scoped declarations of an assembled body, in order.
+    const regionLocalNamesOf = (fragments) => {
+      const declared = [];
+      const kinds = {};
+      for (const fragment of fragments || []) {
+        if (fragment.kind !== "declaration") continue;
+        const record = recordOf(fragment.lines[0]);
+        if (!record.def || kinds[record.def]) continue;
+        declared.push(record.def);
+        kinds[record.def] = record.kind === "const" ? "const" : "let";
+      }
+      return {declared, kinds};
+    };
     const spillStatement = () =>
       recordStatement(["spillLocals();"], {kind: "spill"});
     // The universal block terminators. Their kind is what the structural
@@ -11450,6 +11577,12 @@ class JvmSsaBlockRenderer {
       let directPositionalBody = null;
       let directPositionalSource = null;
       let internalRegionPositionalSource = null;
+      // Statement-level fragments of each positional variant, published for a
+      // consumer that outlines, partitions or env-lifts a body. They are only
+      // published when the assembled lines survive to the published source
+      // unchanged; the self-recursive respecialization below is a text splice
+      // over the joined module, so a body that needs it publishes none.
+      const regionFragments = {};
       if (directPositionalEligible || internalRegionPositionalEligible) {
         const receiverSlots = methodIsStatic ? 0 : 1;
         const argumentCount = directMethodDescriptor.params.length + receiverSlots;
@@ -11503,8 +11636,7 @@ class JvmSsaBlockRenderer {
         const directRenderedTree = expandContinuationFallbacks(
           render(structured.tree, false, true), false);
         if (directPositionalEligible) {
-          directPositionalSource = specializeSelfRecursiveCalls([
-            "'use strict';",
+          const directPositionalLines = [
             directInitializationGuardDeclaration,
             directGuard,
             ...directStaticDeclarations,
@@ -11529,10 +11661,16 @@ class JvmSsaBlockRenderer {
             directArrayDataGuard,
             ...declarations,
             ...directRenderedTree,
-          ].filter(Boolean).join("\n"), "ssa-direct-positional", false);
+          ].filter(Boolean);
+          directPositionalSource = specializeSelfRecursiveCalls(
+            ["'use strict';", ...directPositionalLines].join("\n"),
+            "ssa-direct-positional", false);
+          if (!selfRecursiveCallExpressions.size) {
+            regionFragments.jvmDirectPositionalSource =
+              regionFragmentsOf(directPositionalLines);
+          }
         }
-        internalRegionPositionalSource = specializeSelfRecursiveCalls([
-          "'use strict';",
+        const internalRegionPositionalLines = [
           ...directStaticDeclarations,
           ...lazyStaticDeclarations,
           ...directEntryStaticReadDeclarations,
@@ -11552,8 +11690,14 @@ class JvmSsaBlockRenderer {
           directArrayDataGuard,
           ...declarations,
           ...directRenderedTree,
-        ].filter(Boolean).join("\n"),
-        "ssa-internal-region-positional", false);
+        ].filter(Boolean);
+        internalRegionPositionalSource = specializeSelfRecursiveCalls(
+          ["'use strict';", ...internalRegionPositionalLines].join("\n"),
+          "ssa-internal-region-positional", false);
+        if (!selfRecursiveCallExpressions.size) {
+          regionFragments.jvmInternalRegionPositionalSource =
+            regionFragmentsOf(internalRegionPositionalLines);
+        }
         if (directPositionalEligible) {
           directPositionalBody = createStructuredFunction(
             "ssa-direct-positional",
@@ -11627,31 +11771,37 @@ class JvmSsaBlockRenderer {
         const owners = [...new Set([directMethodOwner, ...directStaticOwners])];
         const restoringInitializationGuardId =
           this.registerClassInitializationGuard(owners);
-        const restoringInitializationGuardDeclaration =
-          `const ssaRestoringClassInitializationGuard = ` +
-          `helpers.structuredSsa.classInitializationGuards[${restoringInitializationGuardId}];`;
-        const restoringInitializationCondition =
-          "((ssaRestoringClassInitializationGuard.classEpoch !== " +
-          "(helpers.jvm.classEpoch || 0) || " +
-          "ssaRestoringClassInitializationGuard.initializationEpoch !== " +
-          "(helpers.jvm.classInitializationEpoch || 0)) && " +
-          "!helpers.structuredSsa.verifyClassInitializationGuard(" +
-          "ssaRestoringClassInitializationGuard))";
+        const restoringGuardVariable =
+          named("ssaRestoringClassInitializationGuard");
+        const restoringInitializationGuardDeclaration = constDecl(
+          restoringGuardVariable,
+          e`helpers.structuredSsa.classInitializationGuards[${
+            restoringInitializationGuardId}]`);
+        const restoringInitializationCondition = operand(exprConcat(
+          e`((${restoringGuardVariable}.classEpoch !== `,
+          e`(helpers.jvm.classEpoch || 0) || `,
+          e`${restoringGuardVariable}.initializationEpoch !== `,
+          e`(helpers.jvm.classInitializationEpoch || 0)) && `,
+          e`!helpers.structuredSsa.verifyClassInitializationGuard(`,
+          e`${restoringGuardVariable}))`));
         const directGuardConditions = [
-          "(!nestedEntryGuarded && (helpers.profileMethods || " +
-            "helpers.needsBytecodeChecks() || thread.status !== 'runnable'))",
-          `(nestedEntryGuarded !== 2 && ${restoringInitializationCondition})`,
+          exprConcat(
+            e`(!nestedEntryGuarded && (helpers.profileMethods || `,
+            e`helpers.needsBytecodeChecks() || thread.status !== 'runnable'))`),
+          e`(nestedEntryGuarded !== 2 && ${restoringInitializationCondition})`,
         ];
-        const directGuard =
-          `if (${directGuardConditions.join(" || ")}) { ` +
-          "return helpers.asyncInvokeSentinel(); }";
+        const directGuard = stmt(exprConcat(
+          e`if (`,
+          ...directGuardConditions.flatMap((condition, position) =>
+            position === 0 ? [condition] : [" || ", condition]),
+          e`) { ${leafBailStatement()} }`));
         // Generated callers have already passed the scheduler/debug portion
         // of the public entry contract. Emit the remaining lifecycle check
         // directly for that ABI instead of specializing JavaScript source
         // after it has been rendered.
-        const trustedDirectGuard =
-          `if (${restoringInitializationCondition}) { ` +
-          "return helpers.asyncInvokeSentinel(); }";
+        const trustedDirectGuard = stmt(exprConcat(
+          e`if (${restoringInitializationCondition}) { `,
+          e`${leafBailStatement()} }`));
         const directBooleanGuard = guardedStaticBooleanSites.size
           ? `if (${[...guardedStaticBooleanSites.values()].map((direct) => `((${
             direct.kind === "map"
@@ -11965,29 +12115,76 @@ class JvmSsaBlockRenderer {
           });
           if (!removed) break;
         }
-        restoringDirectPositionalSource = specializeSelfRecursiveCalls([
-          "'use strict';",
+        const restoringPrologue = [
           restoringInitializationGuardDeclaration,
           directGuard,
-          "const restorationDepth = thread.callStack.items.length;",
-          "let frame = null;",
-          "let locals = null;",
-          "let stack = null;",
-          "try {",
-          ...directBody.map((line) => `  ${line}`),
-          "} catch (error) {",
-          "  if (frame !== null) {",
-          "    helpers.structuredSsa.restoredDirectExceptionFrameCount += 1;",
-          "    plan.restoreFrame(thread, frame, restorationDepth);",
-          "  }",
-          "  throw error;",
-          "}",
-        ].join("\n"), "ssa-direct-restoring-positional", true);
+          constDecl(named("restorationDepth"),
+            e`thread.callStack.items.length`),
+          letDecl(named("frame"), e`null`),
+          letDecl(named("locals"), e`null`),
+          letDecl(named("stack"), e`null`),
+        ].filter(Boolean);
+        // The restoring tier wraps its whole body in one compiler-owned
+        // try/catch. That wrapper is scaffolding, not a guest exception
+        // region, so it does not make the body a single fragment: the opening
+        // and the handler are their own fragments and the body between them
+        // keeps its statement-level structure.
+        const restoringWrapperOpen = st`try {`;
+        const restoringIndentedBody = directBody.map((line) => `  ${line}`);
+        const restoringWrapperClose = [
+          st`} catch (error) {`,
+          st`  if (frame !== null) {`,
+          st`    helpers.structuredSsa.restoredDirectExceptionFrameCount += 1;`,
+          st`    plan.restoreFrame(thread, frame, restorationDepth);`,
+          blockEnd("  "),
+          st`  throw error;`,
+          blockEnd(""),
+        ];
+        const restoringPositionalLines = [
+          ...restoringPrologue,
+          restoringWrapperOpen,
+          ...restoringIndentedBody,
+          ...restoringWrapperClose,
+        ];
+        restoringDirectPositionalSource = specializeSelfRecursiveCalls(
+          ["'use strict';", ...restoringPositionalLines].join("\n"),
+          "ssa-direct-restoring-positional", true);
+        if (!selfRecursiveCallExpressions.size) {
+          const prologueFragments = regionFragmentsOf(restoringPrologue);
+          const bodyFragments = regionFragmentsOf(restoringIndentedBody);
+          regionFragments.jvmRestoringDirectPositionalSource =
+            prologueFragments && bodyFragments
+              ? [
+                ...prologueFragments,
+                {kind: "linear", lines: [restoringWrapperOpen],
+                  declares: [], reads: [], writes: []},
+                ...bodyFragments,
+                {kind: "linear", lines: [...restoringWrapperClose],
+                  declares: [],
+                  reads: ["frame", "helpers", "plan", "thread",
+                    "restorationDepth"],
+                  writes: []},
+              ].map((fragment, id) => ({...fragment, id}))
+              : null;
+        }
+        // The published body late-binds two sentinel calls to captured
+        // constants. Expand them in the fragments too, so the fragments still
+        // join to exactly the published source.
+        const expandSentinelsInFragments = (from, to) => {
+          const fragments =
+            regionFragments.jvmRestoringDirectPositionalSource;
+          if (!fragments) return;
+          for (const fragment of fragments) {
+            fragment.lines = fragment.lines.map(
+              (line) => line.split(from).join(to));
+          }
+        };
         const restoringSentinelCaptures = {};
         if (restoringDirectPositionalSource.includes(
           "helpers.returnVoid()")) {
           restoringDirectPositionalSource = restoringDirectPositionalSource
             .split("helpers.returnVoid()").join("ssaReturnVoid");
+          expandSentinelsInFragments("helpers.returnVoid()", "ssaReturnVoid");
           restoringSentinelCaptures.ssaReturnVoid =
             this.jit.returnVoid();
         }
@@ -11995,6 +12192,8 @@ class JvmSsaBlockRenderer {
           "helpers.asyncInvokeSentinel()")) {
           restoringDirectPositionalSource = restoringDirectPositionalSource
             .split("helpers.asyncInvokeSentinel()").join("ssaAsyncInvoke");
+          expandSentinelsInFragments(
+            "helpers.asyncInvokeSentinel()", "ssaAsyncInvoke");
           restoringSentinelCaptures.ssaAsyncInvoke =
             this.jit.asyncInvokeSentinel();
         }

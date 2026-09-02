@@ -15,3 +15,27 @@
             }) + "\n");
         } catch (error) { console.error("dump", error.message); }
       }
+      // Statement-level fragments of each published positional body, for the
+      // region compiler's outlining, partitioning and environment lifting.
+      // The fragments' lines, joined in order, are exactly the published
+      // source without its `'use strict';` directive. Loops and try/catch are
+      // single fragments. `reads` includes the ambient names a fragment
+      // mentions (`helpers`, `frame`, `thread`, `safePointBudget`, ...), which
+      // an outlined unit has to receive even though no statement declares one.
+      generated.jvmStructuredRegionFragments = Object.fromEntries(
+        Object.entries(regionFragments)
+          .filter(([, fragments]) => Array.isArray(fragments))
+          .map(([variant, fragments]) => [variant, fragments.map(
+            (fragment) => ({
+              id: fragment.id,
+              kind: fragment.kind,
+              lines: [...fragment.lines],
+              declares: [...fragment.declares],
+              reads: [...fragment.reads],
+              writes: [...fragment.writes],
+            }))]));
+      generated.jvmStructuredRegionLocalNames = Object.fromEntries(
+        Object.entries(regionFragments)
+          .filter(([, fragments]) => Array.isArray(fragments))
+          .map(([variant, fragments]) =>
+            [variant, regionLocalNamesOf(fragments)]));
