@@ -9466,9 +9466,10 @@ class JvmSsaBlockRenderer {
       }
       if (regionRangeGuards.size) {
         for (const [header, declarations] of arrayRangeGuardDeclarations) {
+          // The guard's own declaration is the record whose definition is
+          // that guard; its preamble records define other names and stay.
           arrayRangeGuardDeclarations.set(header, declarations.filter(
-            (line) => ![...regionRangeGuards].some((variable) =>
-              line.startsWith(`const ${variable} = `))));
+            (line) => !regionRangeGuards.has(recordOf(line)?.def)));
         }
         for (const [header, variables] of arrayRangeGuardVariables) {
           arrayRangeGuardVariables.set(header, [...new Set(variables.map(
@@ -9484,17 +9485,15 @@ class JvmSsaBlockRenderer {
               !(variable === fact.guardVariable &&
                 header !== fact.declarationHeader))) ]);
         }
+        // Every superseded guard is an emitted name, so each mention is an
+        // operand reference in its statement's parts list and is retargeted
+        // by substitution, not by matching the rendered text.
+        const guardReplacements = new Map([...regionRangeGuards].map(
+          (variable) => [variable, [{ref: fact.guardVariable}]]));
         for (const candidatePlan of plans) {
           if (!candidatePlan?.lines) continue;
-          candidatePlan.lines = candidatePlan.lines.map((line) => {
-            let rewritten = line;
-            for (const variable of regionRangeGuards) {
-              rewritten = rewritten.replace(
-                new RegExp(`\\b${variable}\\b`, "g"),
-                fact.guardVariable);
-            }
-            return rewritten;
-          });
+          candidatePlan.lines = substituteInLines(
+            candidatePlan.lines, guardReplacements);
         }
       }
       for (const header of structured.loopHeaders) {
