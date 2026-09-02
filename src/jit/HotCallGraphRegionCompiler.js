@@ -86,165 +86,6 @@ function applySourceEdits(source, edits) {
   return chunks.join("");
 }
 
-function pureGeneratedExpression(node) {
-  if (!node) return true;
-  switch (node.type) {
-    case "Literal":
-    case "Identifier":
-    case "ThisExpression":
-      return true;
-    case "UnaryExpression":
-      return node.operator !== "delete" &&
-        pureGeneratedExpression(node.argument);
-    case "BinaryExpression":
-    case "LogicalExpression":
-      return pureGeneratedExpression(node.left) &&
-        pureGeneratedExpression(node.right);
-    case "ConditionalExpression":
-      return pureGeneratedExpression(node.test) &&
-        pureGeneratedExpression(node.consequent) &&
-        pureGeneratedExpression(node.alternate);
-    case "MemberExpression":
-      return pureGeneratedExpression(node.object) &&
-        (!node.computed || pureGeneratedExpression(node.property));
-    case "ArrayExpression":
-      return node.elements.every((element) =>
-        !element || pureGeneratedExpression(element));
-    case "ObjectExpression":
-      return node.properties.every((property) =>
-        property.type === "Property" && property.kind === "init" &&
-        !property.method && pureGeneratedExpression(property.value));
-    default:
-      return false;
-  }
-}
-
-/**
- * Remove compiler-published call bindings after their entire call operation
- * has been replaced in the region IR. The exact binding names come from the
- * renderer metadata; no generated-source spelling or guest identity is used.
- */
-function removeUnusedRegionBindings(source, candidateNames) {
-  if (!candidateNames?.size) return source;
-  const prefix = "function __jvmRegionDce() {\n";
-  let program;
-  try {
-    program = parse(`${prefix}${source}\n}`, {
-      ecmaVersion: "latest", ranges: true,
-    });
-  } catch (_) {
-    return source;
-  }
-  const declarations = new Map();
-  const dependencies = new Map();
-  const externalReferences = new Set();
-  const ancestors = [];
-  const visit = (node, parent = null) => {
-    if (!node || typeof node !== "object") return;
-    ancestors.push(node);
-    if (node.type === "VariableDeclarator" &&
-        node.id?.type === "Identifier" &&
-        candidateNames.has(node.id.name)) {
-      const entries = declarations.get(node.id.name) || [];
-      entries.push(node);
-      declarations.set(node.id.name, entries);
-    }
-    if (node.type === "Identifier" && !identifierIsPropertyName(node, parent)) {
-      const declaration = parent?.type === "VariableDeclarator" &&
-        parent.id === node ? parent : null;
-      if (!declaration && candidateNames.has(node.name)) {
-        let owner = null;
-        for (let index = ancestors.length - 2; index >= 0; index -= 1) {
-          const candidate = ancestors[index];
-          if (candidate.type === "VariableDeclarator" &&
-              candidate.init && node.start >= candidate.init.start &&
-              node.end <= candidate.init.end &&
-              candidate.id?.type === "Identifier" &&
-              candidateNames.has(candidate.id.name)) {
-            owner = candidate.id.name;
-            break;
-          }
-        }
-        if (owner) {
-          const values = dependencies.get(owner) || new Set();
-          values.add(node.name);
-          dependencies.set(owner, values);
-        } else {
-          externalReferences.add(node.name);
-        }
-      }
-    }
-    for (const key in node) {
-      if (key === "start" || key === "end" || key === "loc" ||
-          key === "range") continue;
-      const child = node[key];
-      if (Array.isArray(child)) {
-        for (const entry of child) {
-          if (entry && typeof entry.type === "string") visit(entry, node);
-        }
-      } else if (child && typeof child.type === "string") {
-        visit(child, node);
-      }
-    }
-    ancestors.pop();
-  };
-  visit(program);
-  const live = new Set(externalReferences);
-  for (const [name, entries] of declarations) {
-    if (entries.length !== 1 || !pureGeneratedExpression(entries[0].init)) {
-      live.add(name);
-    }
-  }
-  const pending = [...live];
-  while (pending.length) {
-    const name = pending.pop();
-    for (const dependency of dependencies.get(name) || []) {
-      if (live.has(dependency)) continue;
-      live.add(dependency);
-      pending.push(dependency);
-    }
-  }
-  const edits = [];
-  for (const [name, entries] of declarations) {
-    if (live.has(name) || entries.length !== 1) continue;
-    const declaration = entries[0];
-    // Renderer call bindings are deliberately one declarator per statement.
-    // Refuse to alter a combined declaration rather than regenerating syntax.
-    let statement = null;
-    const findParent = (node, parent = null) => {
-      if (!node || statement) return;
-      if (node === declaration) {
-        if (parent?.type === "VariableDeclaration" &&
-            parent.declarations.length === 1) statement = parent;
-        return;
-      }
-      for (const key in node) {
-        if (key === "start" || key === "end" || key === "loc" ||
-            key === "range") continue;
-        const child = node[key];
-        if (Array.isArray(child)) {
-          for (const entry of child) {
-            if (entry && typeof entry.type === "string") {
-              findParent(entry, node);
-            }
-          }
-        } else if (child && typeof child.type === "string") {
-          findParent(child, node);
-        }
-      }
-    };
-    findParent(program);
-    if (statement) {
-      edits.push({
-        start: statement.start - prefix.length,
-        end: statement.end - prefix.length,
-        replacement: "",
-      });
-    }
-  }
-  return applySourceEdits(source, edits) || source;
-}
-
 /**
  * Convert one verified call-free positional SSA body into a caller-owned
  * block. Arguments are bound once from the caller's SSA operands, every
@@ -1989,6 +1830,10 @@ class HotCallGraphRegionCompiler {
     }
     const bindingDeclarations =
       generated?.jvmStructuredRegionCallBindingDeclarations || {};
+    // A site whose raw target is also read by a loop-invariant declaration
+    // outside its own span keeps every binding it declared.
+    const invariantPositionalCallIndices = new Set(
+      generated?.jvmStructuredRegionInvariantPositionalCallIndices || []);
     const edits = [];
     const replaced = new Set();
     const loweredRanges = [];
@@ -2059,6 +1904,10 @@ class HotCallGraphRegionCompiler {
         endToken, markerStart + startToken.length);
       if (markerEnd < 0) continue;
       const range = {start: markerStart, end: markerEnd + endToken.length};
+      // Bindings may only be dropped when this call was emitted once: a
+      // duplicated span still reads them.
+      const dropsBindings = !invariantPositionalCallIndices.has(edge.pc) &&
+        source.indexOf(startToken, markerStart + startToken.length) < 0;
       const regionText = source.slice(range.start, range.end);
       // A source this node publishes may have been specialized after the call
       // was emitted (self-recursive direct calls, partitioning). Its tokens
@@ -2165,9 +2014,11 @@ class HotCallGraphRegionCompiler {
           replaced.add(rawName);
           compactInternalEdges += 1;
           if (guardedRuntimeTarget) guardedInternalEdges += 1;
-          for (const identifier of Object.values(
-            edge.site.identifiers || {})) {
-            if (identifier) eliminatedBindingNames.add(identifier);
+          if (dropsBindings) {
+            for (const identifier of Object.values(
+              edge.site.identifiers || {})) {
+              if (identifier) eliminatedBindingNames.add(identifier);
+            }
           }
           continue;
         }
@@ -2276,7 +2127,7 @@ class HotCallGraphRegionCompiler {
       loweredRanges.push(range);
       edits.push({...range, replacement});
       replaced.add(rawName);
-      if (!needsInlineFallback) {
+      if (!needsInlineFallback && dropsBindings) {
         for (const identifier of Object.values(edge.site.identifiers || {})) {
           if (identifier) eliminatedBindingNames.add(identifier);
         }
@@ -2295,12 +2146,23 @@ class HotCallGraphRegionCompiler {
           replacement: lowering.nestedRawCallSuffix});
       }
     }
+    // A binding whose entire call operation was lowered is not emitted at
+    // all. The renderer publishes each binding's exact declaration and
+    // declaration kind, so this is a decision taken while composing the
+    // module -- not dead-code elimination over a re-parsed result.
     for (const [name, replacement] of replacements) {
+      const eliminated = eliminatedBindingNames.has(name);
       for (const declaration of bindingDeclarations[name] || []) {
-        if (editEveryOccurrence(declaration.text,
-          `${declaration.kind} ${name} = ${replacement};`) > 0) {
+        if (editEveryOccurrence(declaration.text, eliminated
+          ? "" : `${declaration.kind} ${name} = ${replacement};`) > 0) {
           replaced.add(name);
         }
+      }
+    }
+    for (const name of eliminatedBindingNames) {
+      if (replacements.has(name)) continue;
+      for (const declaration of bindingDeclarations[name] || []) {
+        editEveryOccurrence(declaration.text, "");
       }
     }
     for (const edge of edges) {
@@ -2322,10 +2184,8 @@ class HotCallGraphRegionCompiler {
       sourceCursor = edit.end;
     }
     rewrittenParts.push(source.slice(sourceCursor));
-    const rewritten = removeUnusedRegionBindings(
-      rewrittenParts.join(""), eliminatedBindingNames);
     return {
-      source: rewritten,
+      source: rewrittenParts.join(""),
       lexicallyInlinedEdges,
       exceptionalInlinedEdges,
       compactInternalEdges,

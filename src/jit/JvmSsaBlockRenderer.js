@@ -12519,6 +12519,11 @@ class JvmSsaBlockRenderer {
       }
       generated.jvmStructuredRegionCallBindingDeclarations =
         regionCallBindingDeclarations;
+      // These sites read their call bindings from a declaration outside the
+      // call's own marker span (the loop-invariant raw target). A region that
+      // lowers such a site must keep the bindings it linked.
+      generated.jvmStructuredRegionInvariantPositionalCallIndices =
+        [...invariantPositionalReceiverSlots.keys()];
       // The exact run-accounting statements a fused internal node drops: the
       // graph is one execution unit and must not re-count each member entry.
       generated.jvmStructuredRegionRunCounterStatements =
