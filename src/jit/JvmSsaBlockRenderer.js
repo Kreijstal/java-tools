@@ -50,10 +50,9 @@ function walkJavaScriptAst(node, visit, parent = null) {
   while (pending.length) {
     const current = pending.pop();
     visit(current.node, current.parent);
-    // Traversal consumers use source offsets for ordering; they do not depend
-    // on recursive visitation order. Avoid Object.entries(), flatMap(), and a
-    // host call frame per AST node for generated bodies containing hundreds
-    // of thousands of nodes.
+    // The verifier's question is per-identifier and order independent. Avoid
+    // Object.entries(), flatMap(), and a host call frame per AST node for
+    // generated bodies containing hundreds of thousands of nodes.
     for (const key in current.node) {
       if (key === "start" || key === "end" || key === "loc" ||
           key === "range") continue;
@@ -73,92 +72,24 @@ function walkJavaScriptAst(node, visit, parent = null) {
 }
 
 function parseGeneratedStatements(source) {
-  const prefix = "function* __jvmSsaAstWrapper() {\n";
-  const program = parseJavaScript(`${prefix}${source}\n}`, {
-    ecmaVersion: "latest",
-    ranges: true,
-  });
-  return {
-    offset: prefix.length,
-    statements: program.body[0].body.body,
-    program,
-  };
-}
-
-function rewriteGeneratedJavaScript(source, resolveIdentifier,
-  removedStatements = []) {
-  if (typeof source !== "string" || source.length === 0) return source;
-  const parsed = parseGeneratedStatements(source);
-  const removed = removedStatements.map((statement) => ({
-    start: statement.start - parsed.offset,
-    end: statement.end - parsed.offset,
-  }));
-  const edits = removed.map((range) => ({...range, replacement: ""}));
-  walkJavaScriptAst(parsed.program, (node, parent) => {
-    if (node.type !== "Identifier") return;
-    if (parent?.type === "MemberExpression" && parent.property === node &&
-        !parent.computed) return;
-    if ((parent?.type === "Property" || parent?.type === "MethodDefinition") &&
-        parent.key === node && !parent.computed && !parent.shorthand) return;
-    if ((parent?.type === "LabeledStatement" ||
-        parent?.type === "BreakStatement" ||
-        parent?.type === "ContinueStatement") && parent.label === node) return;
-    const replacement = resolveIdentifier(node.name);
-    if (replacement === node.name) return;
-    const start = node.start - parsed.offset;
-    const end = node.end - parsed.offset;
-    if (removed.some((range) => start >= range.start && end <= range.end)) return;
-    edits.push({start, end, replacement});
-  });
-  edits.sort((left, right) => right.start - left.start || right.end - left.end);
-  let rewritten = source;
-  for (const edit of edits) {
-    rewritten = rewritten.slice(0, edit.start) + edit.replacement +
-      rewritten.slice(edit.end);
-  }
-  return rewritten;
-}
-
-function rewriteGeneratedExpression(source, resolveIdentifier) {
-  if (typeof source !== "string" || source.length === 0) return source;
-  const prefix = "function __jvmSsaExpressionWrapper() { return (";
-  const program = parseJavaScript(`${prefix}${source}); }`, {
+  // The verifier below parses a finished body; wrapping it in a generator
+  // keeps `yield` and top-level `return` legal for the parser.
+  return parseJavaScript(`function* __jvmSsaAstWrapper() {\n${source}\n}`, {
     ecmaVersion: "latest",
   });
-  const edits = [];
-  walkJavaScriptAst(program, (node, parent) => {
-    if (node.type !== "Identifier") return;
-    if (parent?.type === "MemberExpression" && parent.property === node &&
-        !parent.computed) return;
-    const replacement = resolveIdentifier(node.name);
-    if (replacement !== node.name) {
-      edits.push({
-        start: node.start - prefix.length,
-        end: node.end - prefix.length,
-        replacement,
-      });
-    }
-  });
-  edits.sort((left, right) => right.start - left.start);
-  let rewritten = source;
-  for (const edit of edits) {
-    rewritten = rewritten.slice(0, edit.start) + edit.replacement +
-      rewritten.slice(edit.end);
-  }
-  return rewritten;
 }
 
-function analyzeGeneratedSsaScopes(source, candidates = null) {
-  const parsed = parseGeneratedStatements(source);
-  const parents = new WeakMap();
+// Opt-in verifier. The generated body must never reference an SSA name that
+// no enclosing scope declares; the emitters are responsible for that by
+// construction, and this parse only re-checks the result when
+// JVM_JIT_VERIFY_GENERATED=1 asks for it (or when a test calls it directly).
+// It is a check, never a transformation: nothing in the compiler reads back
+// the JavaScript it has emitted in order to decide what to emit.
+function unboundGeneratedSsaIdentifiers(source, candidates = null) {
+  const program = parseGeneratedStatements(source);
   const nodeScopes = new WeakMap();
   const declarationIdentifiers = new WeakSet();
-  const scopes = [];
-  const createScope = (parent) => {
-    const scope = {parent, bindings: new Map()};
-    scopes.push(scope);
-    return scope;
-  };
+  const createScope = (parent) => ({parent, bindings: new Set()});
   const rootScope = createScope(null);
   const isCandidate = (name) => candidates
     ? candidates.has(name) : name.startsWith("ssaValue");
@@ -177,40 +108,27 @@ function analyzeGeneratedSsaScopes(source, candidates = null) {
       }
     }
   };
-  const declarePattern = (pattern, scope, declaration = null,
-    declarator = null) => {
+  const declarePattern = (pattern, scope) => {
     if (!pattern) return;
     if (pattern.type === "Identifier") {
       declarationIdentifiers.add(pattern);
-      if (isCandidate(pattern.name)) {
-        scope.bindings.set(pattern.name, {
-          name: pattern.name,
-          scope,
-          declaration,
-          declarator,
-          references: [],
-        });
-      }
+      if (isCandidate(pattern.name)) scope.bindings.add(pattern.name);
       return;
     }
     if (pattern.type === "RestElement") {
-      declarePattern(pattern.argument, scope, declaration, declarator);
+      declarePattern(pattern.argument, scope);
     } else if (pattern.type === "AssignmentPattern") {
-      declarePattern(pattern.left, scope, declaration, declarator);
+      declarePattern(pattern.left, scope);
     } else if (pattern.type === "ArrayPattern") {
-      for (const element of pattern.elements) {
-        declarePattern(element, scope, declaration, declarator);
-      }
+      for (const element of pattern.elements) declarePattern(element, scope);
     } else if (pattern.type === "ObjectPattern") {
       for (const property of pattern.properties) {
-        declarePattern(
-          property.value || property.argument, scope, declaration, declarator);
+        declarePattern(property.value || property.argument, scope);
       }
     }
   };
-  const define = (node, scope, parent = null) => {
+  const define = (node, scope) => {
     if (!node || typeof node !== "object") return;
-    if (parent) parents.set(node, parent);
     nodeScopes.set(node, scope);
     if (node.type === "FunctionDeclaration" ||
         node.type === "FunctionExpression" ||
@@ -220,40 +138,40 @@ function analyzeGeneratedSsaScopes(source, candidates = null) {
       for (const parameter of node.params) {
         declarePattern(parameter, functionScope);
       }
-      define(node.body, functionScope, node);
+      define(node.body, functionScope);
       return;
     }
     if (node.type === "BlockStatement") {
       const blockScope = createScope(scope);
       nodeScopes.set(node, blockScope);
-      for (const statement of node.body) define(statement, blockScope, node);
+      for (const statement of node.body) define(statement, blockScope);
       return;
     }
     if (node.type === "CatchClause") {
       const catchScope = createScope(scope);
       nodeScopes.set(node, catchScope);
       declarePattern(node.param, catchScope);
-      define(node.body, catchScope, node);
+      define(node.body, catchScope);
       return;
     }
     if (node.type === "ForStatement" || node.type === "ForInStatement" ||
         node.type === "ForOfStatement" || node.type === "SwitchStatement") {
       const controlScope = createScope(scope);
       nodeScopes.set(node, controlScope);
-      visitChildren(node, (child) => define(child, controlScope, node));
+      visitChildren(node, (child) => define(child, controlScope));
       return;
     }
     if (node.type === "VariableDeclaration") {
       for (const declarator of node.declarations) {
-        declarePattern(declarator.id, scope, node, declarator);
+        declarePattern(declarator.id, scope);
       }
     }
-    visitChildren(node, (child) => define(child, scope, node));
+    visitChildren(node, (child) => define(child, scope));
   };
-  define(parsed.program, rootScope);
+  define(program, rootScope);
 
   const unbound = new Set();
-  walkJavaScriptAst(parsed.program, (node, parent) => {
+  walkJavaScriptAst(program, (node, parent) => {
     if (node.type !== "Identifier" || !isCandidate(node.name) ||
         declarationIdentifiers.has(node)) return;
     if (parent?.type === "MemberExpression" && parent.property === node &&
@@ -263,88 +181,14 @@ function analyzeGeneratedSsaScopes(source, candidates = null) {
     if ((parent?.type === "LabeledStatement" ||
         parent?.type === "BreakStatement" ||
         parent?.type === "ContinueStatement") && parent.label === node) return;
-    let scope = nodeScopes.get(node) || rootScope;
-    let binding = null;
-    while (scope && !binding) {
-      binding = scope.bindings.get(node.name) || null;
-      scope = scope.parent;
+    let bound = false;
+    for (let scope = nodeScopes.get(node) || rootScope; scope && !bound;
+      scope = scope.parent) {
+      bound = scope.bindings.has(node.name);
     }
-    if (!binding) {
-      unbound.add(node.name);
-      return;
-    }
-    const assignment = parent?.type === "AssignmentExpression" &&
-      parent.left === node ? parent : null;
-    binding.references.push({
-      identifier: node,
-      scope: nodeScopes.get(node),
-      isWrite: Boolean(assignment ||
-        parent?.type === "UpdateExpression" && parent.argument === node),
-      assignment,
-    });
+    if (!bound) unbound.add(node.name);
   });
-  return {parsed, parents, scopes, unbound: [...unbound]};
-}
-
-function unboundGeneratedSsaIdentifiers(source, candidates = null) {
-  return analyzeGeneratedSsaScopes(source, candidates).unbound;
-}
-
-function promoteSingleAssignmentSsaBindings(source, candidates) {
-  if (typeof source !== "string" || source.length === 0) return source;
-  const analysis = analyzeGeneratedSsaScopes(source, candidates);
-  const {parsed, parents, scopes} = analysis;
-  const scopeContains = (outer, inner) => {
-    for (let scope = inner; scope; scope = scope.parent) {
-      if (scope === outer) return true;
-    }
-    return false;
-  };
-  const edits = [];
-  for (const scope of scopes) {
-    for (const variable of scope.bindings.values()) {
-      const {declarator, declaration} = variable;
-      if (declaration?.kind !== "let" || !declarator ||
-          declaration.declarations.length !== 1 || declarator.init) continue;
-      const writes = variable.references.filter((reference) =>
-        reference.isWrite);
-      if (writes.length !== 1) continue;
-      const assignment = writes[0].assignment;
-      const assignmentStatement = parents.get(assignment);
-      const assignmentParent = parents.get(assignmentStatement);
-      if (assignment?.type !== "AssignmentExpression" ||
-          assignment.operator !== "=" ||
-          assignment.left !== writes[0].identifier ||
-          assignmentStatement?.type !== "ExpressionStatement" ||
-          assignmentParent?.type !== "BlockStatement" ||
-          !writes[0].scope) continue;
-      const reads = variable.references.filter((reference) =>
-        reference !== writes[0]);
-      if (reads.length === 0 || reads.some((reference) =>
-        reference.identifier.start <= assignmentStatement.end ||
-        !scopeContains(writes[0].scope, reference.scope))) continue;
-      edits.push({
-        start: declaration.start - parsed.offset,
-        end: declaration.end - parsed.offset,
-        replacement: "",
-      }, {
-        start: assignmentStatement.start - parsed.offset,
-        end: assignmentStatement.start - parsed.offset,
-        replacement: "const ",
-      });
-    }
-  }
-  edits.sort((left, right) => right.start - left.start || right.end - left.end);
-  let rewritten = source;
-  for (const edit of edits) {
-    rewritten = rewritten.slice(0, edit.start) + edit.replacement +
-      rewritten.slice(edit.end);
-  }
-  return rewritten;
-}
-
-function sinkSingleAssignmentSsaDeclarations(source) {
-  return promoteSingleAssignmentSsaBindings(source);
+  return [...unbound];
 }
 
 function normalizedArrayLoadExpression(raw, op, array, arrayKind = null) {
@@ -533,6 +377,18 @@ function dispatchIrreducibleCfg(cfg, depths, islandIndex) {
 class JvmSsaBlockRenderer {
   constructor(jit, options = {}) {
     this.jit = jit;
+    // Development assertion: re-parse each finished tier and confirm that no
+    // SSA name is referenced outside a scope that declares it. Emission is
+    // responsible for that by construction, so this is off in production.
+    this.verifyGeneratedScopes = (typeof process !== "undefined" &&
+      process.env && process.env.JVM_JIT_VERIFY_GENERATED === "1") || false;
+    // SSA operand names are drawn from one counter for the lifetime of the
+    // renderer so that no two compiles ever mint the same name. Checked
+    // leaves are inserted lexically into their callers, and every name-keyed
+    // record in a compile (integer provenance, the generated-scope audit)
+    // would otherwise conflate a child's value with an identically named
+    // value of the caller.
+    this.nextSsaValue = 0;
     const environment = typeof process !== "undefined" && process.env
       ? process.env : {};
     const explicitlyEnabled = options.structuredSsa === true ||
@@ -1303,8 +1159,13 @@ class JvmSsaBlockRenderer {
         return reject("pruned boolean CFG branch lacks an entry guard");
       }
     }
-    let nextValue = 0;
     const ssaValueNames = new Set();
+    // Operand SSA names allocated by this compile, without the compiler-owned
+    // call/PIC identifiers below. A lexically inserted child body carries the
+    // SSA names of its own compile, so membership here is what distinguishes
+    // "a value this compile produced" from "a name that merely looks like
+    // one". The renderer-wide counter keeps the two disjoint by construction.
+    const ownSsaValueNames = new Set();
     // The final scope audit covers compiler-owned call/PIC identifiers as
     // well as ordinary operand SSA values.  A specialization can remove a
     // prologue declaration while leaving a cold or polymorphic edge behind;
@@ -1316,9 +1177,34 @@ class JvmSsaBlockRenderer {
       }
     }
     const value = () => {
-      const name = `ssaValue${nextValue++}`;
+      // SSA operand names are unique across every compile this renderer
+      // performs, not merely within one method. A checked leaf is inserted
+      // lexically into its caller's body, so two compiles that both started
+      // numbering at zero would put identically named, unrelated values in
+      // one function; every name-keyed record here (integer provenance,
+      // staged-copy reuse, the generated-scope audit) would then conflate
+      // them.
+      const name = `ssaValue${this.nextSsaValue++}`;
       ssaValueNames.add(name);
+      ownSsaValueNames.add(name);
       return name;
+    };
+    // Bytecode stack staging would otherwise bind an operand that is already
+    // an immutable SSA value to a second name: `const ssaValueA = ssaValueB;`.
+    // Such a declaration carries no information, so reuse the existing name at
+    // the point of emission instead of emitting the copy and coalescing it
+    // out of the rendered text afterwards. Only names this compile allocated
+    // qualify; block entry slots (`ssaStackN_M`) and locals are reassigned,
+    // and an inserted child's names belong to another compile.
+    let coalescedSsaCopyCount = 0;
+    const stagedValue = (input, lines) => {
+      if (ownSsaValueNames.has(input)) {
+        coalescedSsaCopyCount += 1;
+        return input;
+      }
+      const out = value();
+      lines.push(`const ${out} = ${input};`);
+      return out;
     };
     const plans = [];
     // SSA names are unique across the method. Preserve their integer
@@ -3326,8 +3212,7 @@ class JvmSsaBlockRenderer {
           const input = pop();
           if (input === null) valid = false;
           else {
-            const out = value();
-            lines.push(`const ${out} = ${input};`);
+            const out = stagedValue(input, lines);
             stack.push(out, out);
             copyValueMetadata(input, out);
           }
@@ -3339,9 +3224,8 @@ class JvmSsaBlockRenderer {
           if (topInput === null || underInput === null || !categoryOnePair) {
             valid = false;
           } else {
-            const top = value(), under = value();
-            lines.push(`const ${top} = ${topInput};`,
-              `const ${under} = ${underInput};`);
+            const top = stagedValue(topInput, lines);
+            const under = stagedValue(underInput, lines);
             copyValueMetadata(topInput, top);
             copyValueMetadata(underInput, under);
             stack.push(top, under, top);
@@ -3359,16 +3243,14 @@ class JvmSsaBlockRenderer {
                 (!categoryOneTriple || bottomInput === null))) {
             valid = false;
           } else {
-            const top = value(), under = value();
-            lines.push(`const ${top} = ${topInput};`,
-              `const ${under} = ${underInput};`);
+            const top = stagedValue(topInput, lines);
+            const under = stagedValue(underInput, lines);
             copyValueMetadata(topInput, top);
             copyValueMetadata(underInput, under);
             if (underCategoryTwo) {
               stack.push(top, under, top);
             } else {
-              const bottom = value();
-              lines.push(`const ${bottom} = ${bottomInput};`);
+              const bottom = stagedValue(bottomInput, lines);
               copyValueMetadata(bottomInput, bottom);
               stack.push(top, bottom, under, top);
             }
@@ -3380,12 +3262,11 @@ class JvmSsaBlockRenderer {
           const topInput = pop(), underInput = pop();
           if (topInput === null || underInput === null) valid = false;
           else {
-            const top = value(), under = value();
             const widths = verifiedStackWidthsBefore?.get(index) || [];
             const categoryOnePair = widths.length >= 2 &&
               widths.at(-1) === 1 && widths.at(-2) === 1;
-            lines.push(`const ${top} = ${topInput};`,
-              `const ${under} = ${underInput};`);
+            const top = stagedValue(topInput, lines);
+            const under = stagedValue(underInput, lines);
             if (!categoryOnePair) {
               lines.push(`if (typeof ${top} === "bigint") {`,
                 ...materializeLines([...stack, under, top], index)
@@ -3568,9 +3449,10 @@ class JvmSsaBlockRenderer {
                 `(Math.imul((${left}) & 65535, (${right}) & 65535) >>> 16)) | 0;`);
               stack.push(out);
             } else {
-              const out = value();
-              lines.push(`const ${out} = ${expressions[op]};`);
-              stack.push(out);
+              // `i2d` and `f2d` are representationally the identity here, so
+              // their expression is the operand itself; staging reuses the
+              // existing SSA value instead of binding a second name to it.
+              stack.push(stagedValue(expressions[op], lines));
             }
           }
         }
@@ -3578,8 +3460,9 @@ class JvmSsaBlockRenderer {
           const divisorInput = pop(), dividendInput = pop();
           if (divisorInput === null || dividendInput === null) valid = false;
           else {
-            const dividend = value(), divisor = value(), out = value();
-            lines.push(`const ${dividend} = ${dividendInput};`, `const ${divisor} = ${divisorInput};`);
+            const dividend = stagedValue(dividendInput, lines);
+            const divisor = stagedValue(divisorInput, lines);
+            const out = value();
             const literalDivisor = /^-?\d+$/.test(divisorInput)
               ? Number(divisorInput) : 0;
             if (literalDivisor !== 0) {
@@ -3629,8 +3512,8 @@ class JvmSsaBlockRenderer {
           const arrayInput = pop();
           if (arrayInput === null) valid = false;
           else {
-            const array = value(), out = value();
-            lines.push(`const ${array} = ${arrayInput};`);
+            const array = stagedValue(arrayInput, lines);
+            const out = value();
             lines.push(`if (${array} === null || ${array} === undefined) {`,
               ...materializeLines([...stack, array], index, true).map((line) => `  ${line}`),
               `  helpers.arrayLength(${array}, frame);`, "}",
@@ -3643,7 +3526,8 @@ class JvmSsaBlockRenderer {
           const arrayIndexInput = pop(), arrayInput = pop();
           if (arrayIndexInput === null || arrayInput === null) valid = false;
           else {
-            const array = value(), arrayIndex = value(), out = value();
+            const array = stagedValue(arrayInput, lines);
+            const out = value();
             let arrayData = arrayViews.get(arrayInput);
             const deferredStaticView = !arrayData
               ? persistentProducedArrayLocalViews.get(
@@ -3655,7 +3539,6 @@ class JvmSsaBlockRenderer {
             const arrayKind = this.staticPrimitiveArrayKindsEnabled
               ? arrayKinds.get(arrayInput) ||
                 deferredStaticView?.descriptor || null : null;
-            lines.push(`const ${array} = ${arrayInput};`);
             if (!arrayData && op !== "aaload" &&
                 this.blockArrayDataViewsEnabled) {
               arrayData = value();
@@ -3666,7 +3549,8 @@ class JvmSsaBlockRenderer {
               blockArrayDataViewCount += 1;
             }
             const primitiveSentinel = op !== "aaload" && arrayData;
-            lines.push(`const ${arrayIndex} = ${arrayIndexInput};`, `let ${out};`);
+            const arrayIndex = stagedValue(arrayIndexInput, lines);
+            lines.push(`let ${out};`);
             if (primitiveSentinel) {
               const normalized = normalizedArrayLoadExpression(
                 out, op, array, arrayKind);
@@ -3760,7 +3644,7 @@ class JvmSsaBlockRenderer {
           const storedInput = pop(), arrayIndexInput = pop(), arrayInput = pop();
           if (storedInput === null || arrayIndexInput === null || arrayInput === null) valid = false;
           else {
-            const array = value(), arrayIndex = value(), stored = value();
+            const array = stagedValue(arrayInput, lines);
             let arrayData = arrayViews.get(arrayInput);
             const deferredStaticView = !arrayData
               ? persistentProducedArrayLocalViews.get(
@@ -3772,7 +3656,6 @@ class JvmSsaBlockRenderer {
             const arrayKind = this.staticPrimitiveArrayKindsEnabled
               ? arrayKinds.get(arrayInput) ||
                 deferredStaticView?.descriptor || null : null;
-            lines.push(`const ${array} = ${arrayInput};`);
             if (!arrayData && op !== "aastore" &&
                 this.blockArrayDataViewsEnabled) {
               arrayData = value();
@@ -3782,8 +3665,8 @@ class JvmSsaBlockRenderer {
               dynamicBlockArrayViews.add(arrayData);
               blockArrayDataViewCount += 1;
             }
-            lines.push(`const ${arrayIndex} = ${arrayIndexInput};`,
-              `const ${stored} = ${storedInput};`);
+            const arrayIndex = stagedValue(arrayIndexInput, lines);
+            const stored = stagedValue(storedInput, lines);
             // The opcode fixes primitive narrowing. Keep it in the generated
             // block instead of crossing a generic helper boundary per element.
             // `bastore` retains its runtime [B/[Z distinction; all other
@@ -3844,8 +3727,9 @@ class JvmSsaBlockRenderer {
           const countInput = pop();
           if (countInput === null) valid = false;
           else {
-            const count = value(), out = value(), caught = value();
-            lines.push(`const ${count} = ${countInput};`, `let ${out};`,
+            const count = stagedValue(countInput, lines);
+            const out = value(), caught = value();
+            lines.push(`let ${out};`,
               `try { ${out} = helpers.newPrimitiveArray(${count}, ${JSON.stringify(instruction.arg)}); } catch (${caught}) {`,
               ...materializeLines([...stack, count], index, true).map((line) => `  ${line}`),
               `  throw ${caught};`, "}");
@@ -3855,8 +3739,9 @@ class JvmSsaBlockRenderer {
           const countInput = pop();
           if (countInput === null) valid = false;
           else {
-            const count = value(), out = value(), caught = value();
-            lines.push(`const ${count} = ${countInput};`, `let ${out};`,
+            const count = stagedValue(countInput, lines);
+            const out = value(), caught = value();
+            lines.push(`let ${out};`,
               `try { ${out} = helpers.newReferenceArray(${count}, ${JSON.stringify(instruction.arg)}); } catch (${caught}) {`,
               ...materializeLines([...stack, count], index, true).map((line) => `  ${line}`),
               `  throw ${caught};`, "}");
@@ -3866,9 +3751,9 @@ class JvmSsaBlockRenderer {
           const monitorInput = pop();
           if (monitorInput === null) valid = false;
           else {
-            const monitor = value(), caught = value();
+            const monitor = stagedValue(monitorInput, lines);
+            const caught = value();
             lines.push(
-              `const ${monitor} = ${monitorInput};`,
               "try {",
               `  if (!helpers.monitorEnter(${monitor}, thread)) {`,
               ...materializeLines([...stack, monitor], index)
@@ -3888,9 +3773,9 @@ class JvmSsaBlockRenderer {
           const monitorInput = pop();
           if (monitorInput === null) valid = false;
           else {
-            const monitor = value(), caught = value();
+            const monitor = stagedValue(monitorInput, lines);
+            const caught = value();
             lines.push(
-              `const ${monitor} = ${monitorInput};`,
               "try {",
               `  helpers.monitorExit(${monitor}, thread);`,
               `} catch (${caught}) {`,
@@ -3904,9 +3789,10 @@ class JvmSsaBlockRenderer {
           const input = stack[stack.length - 1];
           if (input === undefined) valid = false;
           else {
-            const castValue = value(), source = value(), checked = value(), caught = value();
+            const castValue = stagedValue(input, lines);
+            const source = value(), checked = value(), caught = value();
             const target = JSON.stringify(instruction.arg);
-            lines.push(`const ${castValue} = ${input};`,
+            lines.push(
               `if (${castValue} !== null && ${castValue} !== undefined) {`,
               `  const ${source} = ${runtimeClassNameExpression(castValue)};`,
               `  if (${source} !== ${target}) {`,
@@ -3925,10 +3811,10 @@ class JvmSsaBlockRenderer {
           const input = pop();
           if (input === null) valid = false;
           else {
-            const candidate = value(), out = value();
+            const candidate = stagedValue(input, lines);
+            const out = value();
             const target = JSON.stringify(instruction.arg);
             lines.push(
-              `const ${candidate} = ${input};`,
               `const ${out} = helpers.tryInstanceOfSync(${candidate}, ${target});`,
               `if (${out} === helpers.asyncInvokeSentinel()) {`,
               ...materializeLines([...stack, candidate], index)
@@ -3944,7 +3830,8 @@ class JvmSsaBlockRenderer {
           const objectInput = pop(), site = fieldSites.get(index);
           if (objectInput === null || site === undefined) valid = false;
           else {
-            const object = value(), out = value();
+            const object = stagedValue(objectInput, lines);
+            const out = value();
             const cache = fieldReadCacheSites.get(index);
             const fieldPlan = this.jit.fieldSites[site];
             const directKey = fieldPlan?.directInstanceKey || null;
@@ -3962,7 +3849,6 @@ class JvmSsaBlockRenderer {
                 `${object}.fields[${JSON.stringify(directKey)}] : ` +
                 `helpers.getFieldAt(${site}, ${object}))`
               : `helpers.getFieldAt(${site}, ${object})`;
-            lines.push(`const ${object} = ${objectInput};`);
             if (cache?.eagerLocal !== null &&
                 cache?.eagerLocal !== undefined) {
               if (!cache.eagerThis) {
@@ -4021,15 +3907,16 @@ class JvmSsaBlockRenderer {
           const storedInput = pop(), objectInput = pop(), site = fieldSites.get(index);
           if (storedInput === null || objectInput === null || site === undefined) valid = false;
           else {
-            const object = value(), stored = value();
             const fieldPlan = this.jit.fieldSites[site];
             const directKey = fieldPlan?.directInstanceKey || null;
             const denseSlot = fieldPlan?.denseSlot;
             const writeKeys = fieldPlan
               ? new Set([`${fieldPlan.fieldName}:${fieldPlan.descriptor}`])
               : null;
-            lines.push(...invalidateFieldReadCaches(writeKeys),
-              `const ${object} = ${objectInput};`, `const ${stored} = ${storedInput};`,
+            lines.push(...invalidateFieldReadCaches(writeKeys));
+            const object = stagedValue(objectInput, lines);
+            const stored = stagedValue(storedInput, lines);
+            lines.push(
               `if (${object} === null || ${object} === undefined) {`,
               ...materializeLines([...stack, object, stored], index, true).map((line) => `  ${line}`),
               `  helpers.putFieldAt(${site}, ${object}, ${stored});`, "}",
@@ -5046,121 +4933,6 @@ class JvmSsaBlockRenderer {
         plans[block.id] = {
           lines, returnKind, returnValue, returnIndex, stack: [...stack],
         };
-      }
-    }
-
-    // Bytecode stack staging creates immutable SSA-copy chains. Discover the
-    // declarations through the JavaScript AST, then apply one method-wide
-    // alias graph to normal blocks and every deferred edge. Cold async/deopt
-    // continuations consume the same SSA namespace, so a per-block text
-    // rewrite can otherwise delete a declaration while leaving those uses
-    // behind. Identifier nodes—not generated text, comments, or property
-    // names—are the only rewrite targets.
-    let coalescedSsaCopyCount = 0;
-    const aliases = new Map();
-    const removedDeclarationsByPlan = new Map();
-    const resolveAlias = (name) => {
-      const visited = new Set();
-      let current = name;
-      while (aliases.has(current) && !visited.has(current)) {
-        visited.add(current);
-        current = aliases.get(current);
-      }
-      return current;
-    };
-    for (const plan of plans) {
-      if (!plan?.lines?.length) continue;
-      const parsedPlan = parseGeneratedStatements(plan.lines.join("\n"));
-      const removedDeclarations = [];
-      for (const statement of parsedPlan.statements) {
-        if (statement.type !== "VariableDeclaration" ||
-            statement.kind !== "const" || statement.declarations.length !== 1) {
-          continue;
-        }
-        const declaration = statement.declarations[0];
-        if (declaration.id?.type !== "Identifier" ||
-            declaration.init?.type !== "Identifier" ||
-            !ssaValueNames.has(declaration.id.name) ||
-            !ssaValueNames.has(declaration.init.name)) continue;
-        aliases.set(declaration.id.name, resolveAlias(declaration.init.name));
-        removedDeclarations.push(statement);
-        coalescedSsaCopyCount += 1;
-      }
-      if (removedDeclarations.length) {
-        removedDeclarationsByPlan.set(plan, removedDeclarations);
-      }
-    }
-    if (aliases.size) {
-      const rewriteStatements = (lines, removed = []) =>
-        rewriteGeneratedJavaScript(
-          lines.join("\n"), resolveAlias, removed,
-        ).split("\n").filter(Boolean);
-      const rewriteExpression = (expression) =>
-        rewriteGeneratedExpression(expression, resolveAlias);
-      for (const plan of plans) {
-        if (!plan?.lines?.length) continue;
-        plan.lines = rewriteStatements(
-          plan.lines, removedDeclarationsByPlan.get(plan) || []);
-        plan.condition = rewriteExpression(plan.condition);
-        plan.returnValue = rewriteExpression(plan.returnValue);
-        if (plan.stack) plan.stack = plan.stack.map(rewriteExpression);
-        if (plan.takenStack) {
-          plan.takenStack = plan.takenStack.map(rewriteExpression);
-        }
-        if (plan.fallStack) {
-          plan.fallStack = plan.fallStack.map(rewriteExpression);
-        }
-      }
-      // Call, static-read, and checked-leaf fallbacks are emitted out of line
-      // and expanded only after the ordinary block has been rendered.  They
-      // nevertheless consume the same method-global SSA values as the plans
-      // owning their markers, so rewrite every alternate edge once with the
-      // complete method alias graph.
-      for (const fallback of continuationFallbacks.values()) {
-        fallback.continuation = rewriteStatements(fallback.continuation);
-        fallback.ordinary = rewriteStatements(fallback.ordinary);
-        if (fallback.checkedLeaf) {
-          fallback.checkedLeaf = rewriteStatements(fallback.checkedLeaf);
-        }
-      }
-      for (const fallback of directEntryStaticReadFallbacks.values()) {
-        fallback.direct = rewriteStatements(fallback.direct);
-        fallback.ordinary = rewriteStatements(fallback.ordinary);
-      }
-      for (const fallback of directCheckedAdmissionFallbacks.values()) {
-        fallback.direct = rewriteStatements(fallback.direct);
-        fallback.ordinary = rewriteStatements(fallback.ordinary);
-      }
-      for (const access of deferredStaticArrayAccesses) {
-        access.directLines = rewriteStatements(access.directLines);
-      }
-      for (const [object, data] of [...eagerFieldReceiverNullChecks]) {
-        const resolvedObject = resolveAlias(object);
-        if (resolvedObject === object) continue;
-        eagerFieldReceiverNullChecks.delete(object);
-        eagerFieldReceiverNullChecks.set(resolvedObject, data);
-      }
-      for (const [reference, slot] of [...entryReferenceLoads]) {
-        const resolvedReference = resolveAlias(reference);
-        if (resolvedReference === reference) continue;
-        entryReferenceLoads.delete(reference);
-        entryReferenceLoads.set(resolvedReference, slot);
-      }
-      for (const [load, slot] of [...localLoads]) {
-        const resolvedLoad = resolveAlias(load);
-        if (resolvedLoad === load) continue;
-        localLoads.delete(load);
-        localLoads.set(resolvedLoad, slot);
-      }
-      // Precise deoptimization snapshots are collected while rendering, before
-      // the method-wide SSA alias graph is known. Keep those saved local
-      // expressions in the same namespace as the rewritten blocks; otherwise
-      // a removed copy declaration can survive only in a cold restoration
-      // path and make an otherwise valid positional body fail its AST audit.
-      for (const [pc, values] of materializationLocalValuesByPc) {
-        materializationLocalValuesByPc.set(pc, values.map((expression) =>
-          typeof expression === "string"
-            ? rewriteExpression(expression) : expression));
       }
     }
 
@@ -10267,15 +10039,6 @@ class JvmSsaBlockRenderer {
         lines = lines.filter(Boolean);
       }
 
-      // Turn a separately declared, singly assigned load result into a const
-      // at its definition point. This shortens its live range and removes one
-      // bytecode/register pair without moving the potentially throwing load.
-      // Scope analysis is mandatory here: moving a declaration from an outer
-      // block into a conditional inline region would make later uses unbound.
-      lines = promoteSingleAssignmentSsaBindings(
-        lines.join("\n"), ssaValueNames,
-      ).split("\n").filter(Boolean);
-
       // Branch folding above can leave a labeled block whose sole remaining
       // exit is an unconditional trailing break. SSA names are globally
       // unique, so the lexical wrapper is unnecessary once that break is
@@ -10611,22 +10374,24 @@ class JvmSsaBlockRenderer {
     try {
       const positionalAstRejections = [];
       const createStructuredFunction = (tier, parameters, source, ...options) => {
-        // Optional positional tiers are assembled from independently optimized
-        // regions (ordinary blocks, cold restoration edges, and inlined
-        // callees).  A declaration can therefore become lexically narrower
-        // than one of its surviving uses even though the JavaScript parser
-        // accepts the function.  Never install such a tier: the canonical
-        // framed structured body remains the semantics-preserving fallback.
-        // Audit the final AST, after every specialization, so this protects
-        // every method shape without recognizing guest classes or methods.
-        const unbound = unboundGeneratedSsaIdentifiers(source, ssaValueNames);
-        if (unbound.length) {
-          if (tier === "structured-ssa") {
-            throw new Error(
-              `unbound structured SSA identifiers: ${unbound.join(", ")}`);
+        // Every SSA name a tier can reference is bound by the emitter that
+        // produced it: operand names come from one renderer-wide counter, and
+        // a lexical insertion binds the inserted body's own parameter and
+        // capture names by declaration rather than renaming the child's text.
+        // Nothing here reads the emitted JavaScript back to decide what to
+        // install. JVM_JIT_VERIFY_GENERATED=1 re-checks that property by
+        // parsing the finished source; it is a development assertion, not a
+        // compilation step.
+        if (this.verifyGeneratedScopes) {
+          const unbound = unboundGeneratedSsaIdentifiers(source, ssaValueNames);
+          if (unbound.length) {
+            if (tier === "structured-ssa") {
+              throw new Error(
+                `unbound structured SSA identifiers: ${unbound.join(", ")}`);
+            }
+            positionalAstRejections.push({ tier, unbound });
+            return null;
           }
-          positionalAstRejections.push({ tier, unbound });
-          return null;
         }
         return this.jit.createGeneratedFunction(
           method, tier, parameters, source, ...options);
@@ -12500,6 +12265,9 @@ class JvmSsaBlockRenderer {
         blockCoalescedArrayRangeAccessCount;
       generated.jvmStructuredHoistedArrayRangeGuardCount =
         hoistedArrayRangeGuardCount;
+      // Staging operations that reused an existing SSA value instead of
+      // binding a second name to it. The copies are never emitted, so this
+      // counts declarations avoided rather than declarations removed.
       generated.jvmStructuredCoalescedSsaCopyCount =
         coalescedSsaCopyCount;
       generated.jvmStructuredDominatedArithmeticGuardCount =
@@ -12673,6 +12441,5 @@ class JvmSsaBlockRenderer {
 module.exports = JvmSsaBlockRenderer;
 module.exports._test = {
   isIrreducibleError,
-  sinkSingleAssignmentSsaDeclarations,
   unboundGeneratedSsaIdentifiers,
 };

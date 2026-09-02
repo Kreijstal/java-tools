@@ -8799,7 +8799,7 @@ public final class StructuredAliasFallbackHarness {
   t.ok(generated?.jvmStructuredSsa,
     'the constructor and deferred call compile through structured SSA');
   t.ok(generated.jvmStructuredCoalescedSsaCopyCount >= 1,
-    'bytecode stack copies are coalesced without guest identity rules');
+    'bytecode stack copies reuse an existing SSA value at emission');
   t.deepEqual(structuredRendererTest.unboundGeneratedSsaIdentifiers(
     generated.jvmStructuredSource), [],
   'ordinary, asynchronous, deopt, and yield edges bind every SSA value');
@@ -8822,34 +8822,6 @@ public final class StructuredAliasFallbackHarness {
   t.deepEqual(outOfScope, ['ssaValue1'],
     'the AST scope graph rejects nested declarations used from outer scope');
 
-  const escapedInlineResult = [
-    'let ssaValue13;',
-    '{',
-    '  let inlineValue0;',
-    '  inlineValue0 = 7;',
-    '  ssaValue13 = inlineValue0;',
-    '}',
-    'helpers.consume(ssaValue13);',
-  ].join('\n');
-  t.equal(structuredRendererTest.sinkSingleAssignmentSsaDeclarations(
-    escapedInlineResult), escapedInlineResult,
-  'const sinking keeps an inlined result visible to its outer consumer');
-  const localResult = [
-    'let ssaValue14;',
-    '{',
-    '  ssaValue14 = 9;',
-    '  helpers.consume(ssaValue14);',
-    '}',
-  ].join('\n');
-  const sunkLocalResult = structuredRendererTest
-    .sinkSingleAssignmentSsaDeclarations(localResult);
-  t.notOk(sunkLocalResult.includes('let ssaValue14;'),
-    'the AST transform removes a declaration whose uses stay in the block');
-  t.ok(sunkLocalResult.includes('const ssaValue14 = 9;'),
-    'the definition becomes a block-local const');
-  t.deepEqual(structuredRendererTest.unboundGeneratedSsaIdentifiers(
-    sunkLocalResult), [], 'the sunk declaration remains lexically valid');
-
   const guardedEscapedResult = [
     'let ssaValue54;',
     'if (helpers.guard()) {',
@@ -8860,9 +8832,6 @@ public final class StructuredAliasFallbackHarness {
     '}',
     'if (ssaValue54 !== undefined) helpers.consume(ssaValue54);',
   ].join('\n');
-  t.equal(structuredRendererTest.sinkSingleAssignmentSsaDeclarations(
-    guardedEscapedResult), guardedEscapedResult,
-  'conditional inline results remain declared outside their defining branch');
   t.deepEqual(structuredRendererTest.unboundGeneratedSsaIdentifiers(
     guardedEscapedResult), [],
   'the Safari-style missing-variable shape remains lexically bound');
@@ -8901,7 +8870,7 @@ public final class StructuredInlineScopeHarness {
     'the verified loop publishes its direct restoring ABI');
   t.deepEqual(structuredRendererTest.unboundGeneratedSsaIdentifiers(
     generated.jvmRestoringDirectPositionalSource), [],
-  'scope-aware promotion leaves every direct-body value lexically bound');
+  'every direct-body value is lexically bound as emitted');
 
   const values = [0x1234, 0x80ff, 0x7f, -1];
   values.type = '[I';
