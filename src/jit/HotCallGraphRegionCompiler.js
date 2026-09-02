@@ -709,7 +709,7 @@ function applyRegionStatementEdits(statements, edits, rewrittenSource) {
       delta += statements[entry].delta;
     }
     output.push(text.trim() === ""
-      ? ownStatement(text)
+      ? ownStatement(text, {delta})
       : ownStatement(text, {delta, reads: null, relocatable: false}));
     index = block.last + 1;
   }
@@ -1043,13 +1043,18 @@ function liftOversizedUnitLocalsToEnvironment(units, options = {}) {
     }
     liftedNames += slotIndex.size;
     liftedUnits += 1;
+    // A directive prologue has to stay first, or the body silently stops
+    // being strict.
+    const prologue = rewritten.length && rewritten[0].kind === "directive"
+      ? 1 : 0;
     return regionUnit({
       ...unit,
       statements: [
+        ...rewritten.slice(0, prologue),
         ownStatement(`const ${envName} = new Array(${
           slotIndex.size}).fill(undefined);`,
         {kind: "const", def: envName}),
-        ...rewritten,
+        ...rewritten.slice(prologue),
       ],
     });
   });
@@ -1137,19 +1142,25 @@ function partitionOversizedLinearBlocks(units, options = {}) {
         const hoistNames = [];
         for (const index of topLevelStarts) {
           const statement = statements[index];
-          if (!statement.def) continue;
           if (statement.kind !== "const" && statement.kind !== "let" &&
               statement.kind !== "letUninitialized" &&
               statement.kind !== "safePointBudgetDeclaration") continue;
+          // A declaration introduces `def`, or the list of names an
+          // uninitialized multi-name declaration the compiler emitted itself
+          // carries.
+          const introduced = statement.def
+            ? [statement.def] : statement.declares || [];
+          if (!introduced.length) continue;
           let escapes = false;
           for (let other = 0; other < statements.length && !escapes; other++) {
             if (other >= from && other < to) continue;
             const outside = statements[other];
             if (outside.reads === null) { escapes = true; break; }
-            escapes = outside.reads.includes(statement.def) ||
-              (outside.writes || []).includes(statement.def);
+            escapes = introduced.some((name) =>
+              outside.reads.includes(name) ||
+              (outside.writes || []).includes(name));
           }
-          if (escapes) hoistNames.push(statement.def);
+          if (escapes) hoistNames.push(...introduced);
         }
 
         const freeNames = names.free.filter((name) =>
@@ -1210,9 +1221,18 @@ function partitionOversizedLinearBlocks(units, options = {}) {
             continue;
           }
           const statement = statements[index];
-          if (!statement.def || !hoistNameSet.has(statement.def)) continue;
+          const introduced = statement.def
+            ? [statement.def] : statement.declares || [];
+          if (!introduced.some((name) => hoistNameSet.has(name))) continue;
           // The declaration becomes an assignment; the binding itself is
-          // declared at the call site and in the helper preamble.
+          // declared at the call site and in the helper preamble. A
+          // declaration that introduces no value at all just goes away.
+          if (!statement.def) {
+            if (statement.kind !== "letUninitialized") return;
+            body[position] = ownStatement(`${statement.indent};`,
+              {reads: [], relocatable: false});
+            continue;
+          }
           const initializer = statement.parts
             ? statement.parts.slice(statement.parts.findIndex((part) =>
               typeof part !== "string" && part.ref === statement.def) + 1)
