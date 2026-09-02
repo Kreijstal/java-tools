@@ -283,18 +283,18 @@ measured in §3.
 **Sources without records.** `jvmHotCallGraphFramedSource` and the checked-leaf
 variants are not among the three positional variants §4 publishes, so a node
 emitted from one of them is emitted as finished text and no structural pass
-touches it. Two consequences, both measured:
+touches it. Two consequences, both measured in §3:
 
 * `JVM_ENABLE_HOT_CALL_GRAPH_FRAMED_PARTITION=1` is a no-op on a real module:
-  its unit is the framed root, which has no records. It was not a no-op
-  before.
+  its unit is the framed root, which has no records.
 * The renderer's own two calls (the continuation tier's loop outlining and
   linear partitioning, `JVM_ENABLE_STRUCTURED_LOOP_OUTLINING` and
   `JVM_ENABLE_STRUCTURED_LINEAR_PARTITION`) stay wired but are inert: the
   canonical body's prologue still carries lines no emitter recorded -- the
   entry scaffold, the local declarations, the spill helper and the frame
-  materialization helpers -- so `regionFragmentsOf` declines it. Recording
-  those emitters lights both back up with no further change here.
+  materialization helpers, 11-17 lines per body -- so `regionFragmentsOf`
+  declines it. Recording those emitters lights both back up with no further
+  change here.
 
 ## 3. Status
 
@@ -348,25 +348,41 @@ in the passes:
   case in `hotCallGraphLinearPartition.test.js` pins it.
 
 **Measured effect on emitted text.** Dumping every region module the two
-`hotCallGraph` test files compile, on `e956619` and on this branch: 27 of 28
+`hotCallGraph` test files compile, on `20214f1` and on this branch: 27 of 28
 modules are byte-identical. The one that differs is the loop-outlining
-corpus, and it differs in four ways, all benign: the positional live-in and
-live-out orders differ (declaration and call site agree), the literal
-`undefined` is no longer passed as a parameter (the AST pass treated it as a
-free identifier), the outlined loop's first line keeps its own indentation,
-and the live-out *sets* are identical only after the ambient-write fix above.
+corpus, and it differs in three ways, all benign: the positional live-in and
+live-out orders differ (the helper's declaration and its call site agree), the
+literal `undefined` is no longer passed as a parameter (the AST pass treated
+it as a free identifier and passed the global to shadow itself), and the
+outlined loop's first line keeps its own indentation. The live-out *sets* are
+identical -- but only after the ambient-write fix above; before it they were
+short by `frame`, `locals`, `stack` and `safePointBudget`.
 
-**Where the passes no longer fire.** `jvmHotCallGraphFramedSource` and the
-checked-leaf variants are not among the three positional variants §4
-publishes, so a node emitted from one carries no records and no structural
-pass touches it. `JVM_ENABLE_HOT_CALL_GRAPH_FRAMED_PARTITION=1` is therefore
-a no-op on a real module, where it was not before. Measured: over
-`hotCallGraphRegion.test.js` + `jitCompiler.test.js` with that flag and
-`JVM_ENABLE_HOT_CALL_GRAPH_LINEAR_PARTITION=1`, and again with the smallest
-budgets the options accept (16 KB units, 4 KB segments), `e956619` lifts 0
-names and cuts 0 segments in all 12 module compiles -- exactly what this
-branch does. The loss is real for a framed root larger than the unit budget
-and unobservable in the corpora.
+**Where the passes decline, and what that is worth.** A region body a
+composition edit touched carries opaque records there, and neither outlining
+nor partitioning will cut across one; a framed root and a checked-leaf source
+publish no records at all, so no structural pass touches them. Measured over
+`hotCallGraphRegion.test.js` + `jitCompiler.test.js`:
+
+* At the default budgets nothing fires on either side -- 0 lifted names and 0
+  segments in all 12 module compiles, on `20214f1` and here alike -- and the
+  three region flags give `20214f1` 513 passing assertions and this branch 527
+  (the difference is this branch's new cases).
+* Forced to the smallest budgets the options accept (16 KB units, 4 KB
+  segments), `20214f1` *does* fire: it lifts 24 and 13 names in two framed
+  roots and cuts 2, 6 and 4 segments -- and **miscompiles**, failing 7 of the
+  164 assertions in `hotCallGraphRegion.test.js` (the outlined-loop return, the
+  cold restoration frame order, the guarded-edge islands). This branch declines
+  every one of those cuts and passes 164/164 under the identical configuration.
+  On `e956619`, before site 3 started inserting callee bodies, none of them
+  fired at all, so the defect is newly reachable rather than newly introduced.
+
+So the capability this branch gives up is one that, where it is currently
+reachable at all, emits wrong code. Recovering it soundly means giving the
+composition a record for what it inserted rather than an opaque one -- an
+inserted body already publishes its own fragments, so splicing those in place
+of the call's record is the next step -- and recording the canonical body's
+prologue emitters for the framed root.
 
 ## 4. What the renderer publishes for stage F
 
