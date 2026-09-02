@@ -198,7 +198,12 @@ relocate the parsing.
 * Stage B — landed. `removeUnusedRegionBindings` and `pureGeneratedExpression`
   are deleted.
 * Stage C — landed. The `'use strict'` and `safePointBudget` regexes are gone.
-* Stages D, E, F — not landed; see §2 for exactly what each needs.
+* Stage F, renderer half — landed. The renderer runs no line-level text pass
+  any more: every statement it emits is recorded as a parts list (§5), the
+  optimizations run over those records, and §4's fragments are published. The
+  region compiler's own four `parse()` calls are unchanged and can now be
+  replaced by selections over those fragments.
+* Stages D, E and the region-compiler half of F — not landed; see §2.
 
 What is left in `HotCallGraphRegionCompiler.js` after A–C: six `parse()` calls
 (`inlineAtomicPositionalSource`, `removeUnreachableRegionFunctions`,
@@ -209,10 +214,11 @@ splices those six passes use. The two `replace(/[^A-Za-z0-9…]/g, …)` calls t
 remain sanitize compiler-owned identifiers and file names, not generated
 JavaScript.
 
-## 4. What the renderer must publish next
+## 4. What the renderer publishes for stage F
 
-Concretely, for stage F, near the existing `generated.jvmHotCallGraph*`
-assignments:
+`generated.jvmStructuredRegionFragments` and
+`generated.jvmStructuredRegionLocalNames` are published next to the existing
+`generated.jvmHotCallGraph*` assignments:
 
 ```
 generated.jvmStructuredRegionFragments = {
@@ -225,10 +231,86 @@ generated.jvmStructuredRegionFragments = {
     …
   ]
 }
-generated.jvmStructuredRegionLocalNames = { declared: string[], kinds: {name: "let"|"const"} }
+generated.jvmStructuredRegionLocalNames = {
+  <variantName>: { declared: string[], kinds: {name: "let"|"const"} }
+}
 ```
 
-With those, `outlineLargeRegionLoops`, `partitionOversizedLinearBlocks` and
+`<variantName>` is one of `jvmDirectPositionalSource`,
+`jvmInternalRegionPositionalSource` and `jvmRestoringDirectPositionalSource` —
+the three sources `HotCallGraphRegionCompiler.compileModule` composes. The
+contract, pinned by `test/structuredRegionFragments.test.js`:
+
+* The fragments' lines, joined in order with `"\n"`, are exactly the published
+  source of that variant without its `'use strict';` directive. Late-bound
+  sentinel expansions (`helpers.returnVoid()` → `ssaReturnVoid`) are applied to
+  the fragments as well.
+* A guest loop and a guest `try`/`catch` are each one fragment, at whatever
+  depth they occur. Every other construct stays with the statements around it,
+  so the list is a partition of the body in order.
+* The restoring tier's own `try { … } catch (error)` wrapper is compiler
+  scaffolding rather than a guest exception region, so it does not collapse the
+  whole body into one fragment: the opening and the handler are their own
+  fragments and the statements between keep their structure.
+* `reads` includes the *ambient* names a fragment mentions — `helpers`,
+  `frame`, `locals`, `stack`, `thread`, `plan`, `restorationDepth`,
+  `safePointBudget`, `nestedEntryGuarded`, `framelessEntry`. No statement
+  declares one (the tier's outermost scope does), but an outlined unit still
+  has to receive them.
+* A name a fragment assigns appears in both `writes` and `reads`.
+
+Two caveats for the consumer:
+
+* `jvmStructuredRegionLocalNames` is keyed by variant instead of being one
+  record, because the variants declare different names.
+* A method whose self-recursive calls are respecialized publishes no fragments
+  for the affected variant: that respecialization is still a text splice over
+  the joined module. A missing entry must be handled, as must an entry for a
+  variant this compile did not emit.
+
+With these, `outlineLargeRegionLoops`, `partitionOversizedLinearBlocks` and
 `liftOversizedUnitLocalsToEnvironment` become selections and joins over
-compiler-owned lists, and the last four `parse()` calls in the region compiler go
-away.
+compiler-owned lists, and the last four `parse()` calls in the region compiler
+can go away.
+
+## 5. The renderer's statement IR
+
+`src/jit/JvmSsaBlockRenderer.js` used to emit strings and then run its own
+optimizations over them with about fifty regular expressions. Every statement
+it emits is now built from a *parts list*: opaque literal chunks interleaved
+with `{ref: name}` operand references.
+
+* `e` is the expression tagged template, `exprConcat` joins pieces, and
+  `st` / `constDecl` / `letDecl` / `storeLocal` / `stmt` record a statement.
+  Records are keyed by the trimmed rendered text — the identity idiom
+  `methodIntegerOriginLines` and `checkedLeafOmittableLines` already used —
+  because indentation is applied by the assembler, not by the statement.
+* `emittedNames` is every name a compile mints, so an interpolation becomes an
+  operand reference exactly when it is one; `operandExpressions` remembers the
+  parts of every composite operand the block simulator keeps as a string
+  (it compares and keys those by identity).
+* A record carries what it defines, what it writes, what it reads, and a small
+  set of properties read off its own *parts skeleton* — the literal chunks with
+  each operand reference replaced by one placeholder character, so an operand
+  can neither contribute nor split an operator, a bracket or a keyword: does it
+  call a helper or `new`, does it divide, does it index, does it open a
+  condition or a `try`, does it throw, does it mention the safe-point budget,
+  and what lexical nesting does it open or close.
+* A pass rewrites a statement only through `rerenderStatement`, which
+  substitutes operand references and records the result again. Marker
+  expansion (an array-range access token becoming its guard variable) is that
+  same substitution.
+* `JVM_JIT_VERIFY_STATEMENT_IR=1` re-checks a finished body the way the
+  generated-scope verifier does: it reports any line no emitter recorded and
+  any record whose operands disagree with the names actually present. It
+  reports 0 issues over both JIT corpora. `scripts/statement-ir-audit.js` runs
+  it over a test file.
+
+What still touches emitted characters in the renderer: the opt-in verifier
+above; the exact-identity token expansions the rule permits
+(`helpers.returnVoid()` → `ssaReturnVoid`, `helpers.asyncInvokeSentinel()` →
+`ssaAsyncInvoke`, the checked-leaf bail retarget, and the self-recursive
+respecialization, whose search text and replacement the compiler both built);
+and one admission test on a *compiler operand* rather than on a rendered line —
+`materializeLines` only compacts a materialization whose operand expressions
+contain no comma.
