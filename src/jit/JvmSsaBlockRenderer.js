@@ -11613,39 +11613,33 @@ class JvmSsaBlockRenderer {
               preflightedCheckedLeafArgumentLimit = assumedLimit;
             }
           }
-          const compactCheckedLeafEntryLocals = (bodyLines) => {
-            const aliases = new Map([...entryArguments]
-              .filter(([slot]) => !renderedAssignedLocalSlots.has(slot))
-              .map(([slot]) => [`local${slot}`, entryArgumentValue(slot)]));
-            const withoutEliminatedLocals = bodyLines.filter((line) => {
-              const declaration =
-                /^\s*(?:const|let) local(\d+) = .+;$/.exec(line);
-              return !declaration ||
-                !eliminatedCheckedLeafLocalSlots.has(Number(declaration[1]));
+          // The entry locals of every checked-leaf tier. A slot the load/store
+          // compaction proved dead is never declared, and a slot this region
+          // never assigns is bound to its argument by declaration. Both were
+          // previously done by rewriting the rendered text, which cannot tell
+          // this method's `localN` from the compact `localN` namespace that a
+          // lexically inserted child body brings into its own block scope.
+          const checkedLeafEntryLocalDeclarations = () => declaredLocals
+            .filter((index) => !eliminatedCheckedLeafLocalSlots.has(index))
+            .map((index) => {
+              const immutable = immutableEntryLocals.has(index) ||
+                entryArguments.has(index) &&
+                !callerAssignedLocalSlots.has(index) &&
+                !renderedAssignedLocalSlots.has(index);
+              return `${immutable ? "const" : "let"} local${index} = ${
+                entryLocalInitialValues.has(index)
+                  ? entryLocalInitialValues.get(index)
+                  : entryArgumentValue(index) || "undefined"};`;
             });
-            if (!aliases.size) return withoutEliminatedLocals;
-            return withoutEliminatedLocals
-              .filter((line) => {
-                const declaration =
-                  /^\s*(?:const|let) (local\d+) = .+;$/.exec(line);
-                return !declaration || !aliases.has(declaration[1]);
-              })
-              .map((line) => line.replace(/\blocal\d+\b/g,
-                (name) => aliases.get(name) || name));
-          };
           if (recursiveArrayPartitionLeaf) {
-            let workerBody = compactCheckedLeafEntryLocals([
-              ...declaredLocals.map((index) =>
-                `${immutableEntryLocals.has(index) ? "const" : "let"} local${index} = ${
-                  entryLocalInitialValues.has(index)
-                    ? entryLocalInitialValues.get(index)
-                    : entryArgumentValue(index) || "undefined"};`),
+            let workerBody = [
+              ...checkedLeafEntryLocalDeclarations(),
               `const ${entryArrayDataVariable(
                 recursiveArrayPartitionLeaf.arraySlot)} = argument0;`,
               ...persistentStaticArrayDataDeclarations,
               ...declarations,
               ...checkedLeafTree,
-            ].filter(Boolean));
+            ].filter(Boolean);
             recursiveArrayWorkerSource =
               specializeCheckedLeafSelfRecursiveCalls(
                 ["'use strict';", ...workerBody].join("\n"),
@@ -11742,7 +11736,7 @@ class JvmSsaBlockRenderer {
                   ...argumentNames.slice(1),
                 ].join(", ")});`,
               ].filter(Boolean)
-              : compactCheckedLeafEntryLocals([
+              : [
                 // The result slot precedes every guard: a lexical insertion
                 // routes its prologue exits to this slot as well.
                 `let ${checkedLeafResultVariable};`,
@@ -11773,11 +11767,7 @@ class JvmSsaBlockRenderer {
                   ? [] : [
                   `let safePointBudget = ${restoringDirectSafePointBudget};`,
                 ]),
-                ...declaredLocals.map((index) =>
-                  `${immutableEntryLocals.has(index) ? "const" : "let"} local${index} = ${
-                    entryLocalInitialValues.has(index)
-                      ? entryLocalInitialValues.get(index)
-                      : entryArgumentValue(index) || "undefined"};`),
+                ...checkedLeafEntryLocalDeclarations(),
                 ...invariantPositionalCallDeclarations,
                 ...checkedLeafEntryArrayDeclarationsFor(inline),
                 ...persistentStaticArrayDataDeclarations,
@@ -11788,7 +11778,7 @@ class JvmSsaBlockRenderer {
                 ...checkedLeafTripDeclarations,
                 ...declarations,
                 ...checkedLeafFramedTreeFor(inline),
-              ].filter(Boolean));
+              ].filter(Boolean);
             // Admission and constant/static specialization can render the
             // original capture aliases dead. Remove only compiler-owned pure
             // top-level declarations; guest property reads and expressions
@@ -11978,7 +11968,7 @@ class JvmSsaBlockRenderer {
                 captures.push(capture);
               }
               capturedCheckedLeafBodyFor = (inline = null) =>
-                compactCheckedLeafEntryLocals([
+                [
                   `let ${checkedLeafResultVariable};`,
                   ...captureDeclarations,
                   !inline && this.runCountersEnabled
@@ -11991,11 +11981,7 @@ class JvmSsaBlockRenderer {
                     ? [] : [
                     `let safePointBudget = ${restoringDirectSafePointBudget};`,
                   ]),
-                  ...declaredLocals.map((index) =>
-                    `${immutableEntryLocals.has(index) ? "const" : "let"} local${index} = ${
-                      entryLocalInitialValues.has(index)
-                        ? entryLocalInitialValues.get(index)
-                        : entryArgumentValue(index) || "undefined"};`),
+                  ...checkedLeafEntryLocalDeclarations(),
                   ...checkedLeafEntryArrayDeclarationsFor(inline),
                   ...persistentStaticArrayDataDeclarations,
                   ...(transactionalAcyclicShape
@@ -12004,7 +11990,7 @@ class JvmSsaBlockRenderer {
                   ...checkedLeafTripDeclarations,
                   ...declarations,
                   ...checkedLeafFramedTreeFor(inline),
-                ].filter(Boolean));
+                ].filter(Boolean);
               const capturedBody = capturedCheckedLeafBodyFor();
               capturedCheckedLeafDirectPositionalSource = [
                 "'use strict';",
