@@ -1,5 +1,13 @@
 'use strict';
 
+const {
+  op,
+  arg,
+  pushValue,
+  intLoadLocal,
+  intStoreLocal,
+} = require('../utils/instructionUtils');
+
 function runNarrowCharArrayStores(astRoot) {
   let rewrites = 0;
   for (const cls of astRoot.classes || []) {
@@ -64,38 +72,6 @@ function isCharProducer(item) {
   if ((itemOp === 'getstatic' || itemOp === 'getfield') && fieldDescriptor(itemArg) === 'C') return true;
   if ((itemOp === 'invokevirtual' || itemOp === 'invokeinterface' || itemOp === 'invokestatic') && methodReturnsChar(itemArg)) return true;
   return false;
-}
-
-function intLoadLocal(item) {
-  const itemOp = op(item);
-  if (itemOp === 'iload') return String(arg(item));
-  if (/^iload_[0-3]$/.test(itemOp || '')) return itemOp.slice(-1);
-  return null;
-}
-
-function intStoreLocal(item) {
-  const itemOp = op(item);
-  if (itemOp === 'istore') return String(arg(item));
-  if (/^istore_[0-3]$/.test(itemOp || '')) return itemOp.slice(-1);
-  return null;
-}
-
-function pushValue(item) {
-  const itemOp = op(item);
-  if (itemOp === 'iconst_m1') return -1;
-  if (/^iconst_[0-5]$/.test(itemOp || '')) return Number(itemOp.slice(-1));
-  if (itemOp === 'bipush' || itemOp === 'sipush') return Number(arg(item));
-  return null;
-}
-
-function op(item) {
-  const insn = item && item.instruction;
-  return typeof insn === 'string' ? insn : insn && insn.op;
-}
-
-function arg(item) {
-  const insn = item && item.instruction;
-  return insn && typeof insn === 'object' ? insn.arg : null;
 }
 
 function methodReturnsChar(itemArg) {

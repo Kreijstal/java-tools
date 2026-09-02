@@ -1,5 +1,15 @@
 'use strict';
 
+const {
+  op,
+  arg,
+  pushValue,
+  intLoadLocal,
+  objectLoadLocal,
+  objectStoreLocal,
+  parseParameterDescriptors,
+} = require('../utils/instructionUtils');
+
 function runNarrowByteArrayStores(astRoot) {
   let rewrites = 0;
   for (const cls of astRoot.classes || []) {
@@ -89,35 +99,6 @@ function isNarrowableIntValue(item) {
   return pushValue(item) != null || intLoadLocal(item) != null;
 }
 
-function objectLoadLocal(item) {
-  const itemOp = op(item);
-  if (itemOp === 'aload') return String(arg(item));
-  if (/^aload_[0-3]$/.test(itemOp || '')) return itemOp.slice(-1);
-  return null;
-}
-
-function objectStoreLocal(item) {
-  const itemOp = op(item);
-  if (itemOp === 'astore') return String(arg(item));
-  if (/^astore_[0-3]$/.test(itemOp || '')) return itemOp.slice(-1);
-  return null;
-}
-
-function intLoadLocal(item) {
-  const itemOp = op(item);
-  if (itemOp === 'iload') return String(arg(item));
-  if (/^iload_[0-3]$/.test(itemOp || '')) return itemOp.slice(-1);
-  return null;
-}
-
-function pushValue(item) {
-  const itemOp = op(item);
-  if (itemOp === 'iconst_m1') return -1;
-  if (/^iconst_[0-5]$/.test(itemOp || '')) return Number(itemOp.slice(-1));
-  if (itemOp === 'bipush' || itemOp === 'sipush') return Number(arg(item));
-  return null;
-}
-
 function byteArrayParameterLocals(method) {
   return parameterLocals(method, '[B');
 }
@@ -136,36 +117,6 @@ function parameterLocals(method, descriptor) {
     local += (desc === 'J' || desc === 'D') ? 2 : 1;
   }
   return out;
-}
-
-function parseParameterDescriptors(descriptor) {
-  const close = descriptor.indexOf(')');
-  if (!descriptor.startsWith('(') || close < 0) return [];
-  const params = [];
-  for (let i = 1; i < close;) {
-    const start = i;
-    while (descriptor[i] === '[') i += 1;
-    if (descriptor[i] === 'L') {
-      const semi = descriptor.indexOf(';', i);
-      if (semi < 0 || semi > close) return params;
-      params.push(descriptor.slice(start, semi + 1));
-      i = semi + 1;
-    } else {
-      params.push(descriptor.slice(start, i + 1));
-      i += 1;
-    }
-  }
-  return params;
-}
-
-function op(item) {
-  const insn = item && item.instruction;
-  return typeof insn === 'string' ? insn : insn && insn.op;
-}
-
-function arg(item) {
-  const insn = item && item.instruction;
-  return insn && typeof insn === 'object' ? insn.arg : null;
 }
 
 function methodReturnsByteArray(itemArg) {
