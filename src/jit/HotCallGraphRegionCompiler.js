@@ -648,8 +648,11 @@ function variantNameOfSource(generated, source) {
  * lowered call span and its replacement are both complete constructs. If that
  * ever stopped holding, the deltas would no longer balance and
  * `statementGroups` would decline the body rather than mis-group it.
+ *
+ * The rewritten text is the caller's own result, so the record's new text is
+ * the slice of it the block now occupies rather than a second splice.
  */
-function applyRegionStatementEdits(statements, edits) {
+function applyRegionStatementEdits(statements, edits, rewrittenSource) {
   if (!statements) return null;
   if (!edits.length) return statements;
   const starts = [];
@@ -670,34 +673,35 @@ function applyRegionStatementEdits(statements, edits) {
     }
     return -1;
   };
+  // The blocks of statements the edits touch, with the offset each one moves
+  // to in the rewritten text. Nothing is spliced a second time: the caller
+  // already applied these edits, so a block's new text is the slice of that
+  // result the block now occupies.
   const blocks = [];
+  let shift = 0;
   for (const edit of [...edits].sort((left, right) =>
     left.start - right.start)) {
     const first = locate(edit.start);
     const last = locate(edit.end);
     if (first < 0 || last < 0 || last < first) return null;
+    const growth = edit.replacement.length - (edit.end - edit.start);
     const previous = blocks[blocks.length - 1];
     if (previous && previous.last >= first) {
       previous.last = Math.max(previous.last, last);
-      previous.edits.push(edit);
+      previous.growth += growth;
     } else {
-      blocks.push({first, last, edits: [edit]});
+      blocks.push({first, last, shift, growth});
     }
+    shift += growth;
   }
   const output = [];
   let index = 0;
   for (const block of blocks) {
     while (index < block.first) output.push(statements[index++]);
-    const base = starts[block.first];
-    const text = applySourceEdits(
-      statements.slice(block.first, block.last + 1)
-        .map((statement) => statement.text).join("\n"),
-      block.edits.map((edit) => ({
-        start: edit.start - base,
-        end: edit.end - base,
-        replacement: edit.replacement,
-      })));
-    if (text === null) return null;
+    const from = starts[block.first] + block.shift;
+    const to = endOf(block.last) + block.shift + block.growth;
+    if (from < 0 || to < from || to > rewrittenSource.length) return null;
+    const text = rewrittenSource.slice(from, to);
     let delta = 0;
     for (let entry = block.first; entry <= block.last; entry += 1) {
       delta += statements[entry].delta;
@@ -2429,7 +2433,7 @@ class HotCallGraphRegionCompiler {
             node.generated.jvmInternalRegionPositionalSource,
             node.generated.jvmStructuredRegionFragments
               ?.jvmInternalRegionPositionalSource),
-          rewritten.appliedEdits));
+          rewritten.appliedEdits, rewritten.source));
         composedInternalLinkedNames.set(node, unionLinkedNames(
           rewritten.linkedFunctionNames,
           node.edges.map((edge) =>
@@ -2514,7 +2518,8 @@ class HotCallGraphRegionCompiler {
         if (rewritten.source.length > this.inlineSourceByteBudget) continue;
         exceptionalInlineSources.set(node, rewritten.source);
         exceptionalInlineStatements.set(node, applyRegionStatementEdits(
-          restoringInlineStatements(node, planName), rewritten.appliedEdits));
+          restoringInlineStatements(node, planName), rewritten.appliedEdits,
+          rewritten.source));
         exceptionalInlineLinkedNames.set(node, unionLinkedNames(
           rewritten.linkedFunctionNames,
           node.edges.map((edge) =>
@@ -2767,7 +2772,7 @@ class HotCallGraphRegionCompiler {
           regionStatementsFromFragments(source,
             node.generated.jvmStructuredRegionFragments?.[
               variantNameOfSource(node.generated, source)]),
-          rewritten.appliedEdits);
+          rewritten.appliedEdits, rewritten.source);
       const outlined = this.loopOutliningEnabled && nodeStatements
         ? outlineLargeRegionLoops(regionUnit({statements: nodeStatements}), {
           minimumSourceBytes: this.loopOutlineSourceBytes,
