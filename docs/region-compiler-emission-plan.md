@@ -519,8 +519,8 @@ operand identity it has as a generated name). The file contains no
   each operand reference replaced by one placeholder character, so an operand
   can neither contribute nor split an operator, a bracket or a keyword: does it
   call a helper or `new`, does it divide, does it index, does it open a
-  condition or a `try`, does it throw, does it mention the safe-point budget,
-  and what lexical nesting does it open or close.
+  condition, does it throw, does it mention the safe-point budget, and what
+  lexical nesting does it open or close.
 * **Control flow is stated by the emitter, never read off the skeleton.** A
   statement that leaves the generated function is recorded by `returnStmt`,
   which states `exit: {kind: "return", before, value, after}` — the parts the
@@ -529,12 +529,13 @@ operand identity it has as a generated name). The file contains no
   by `jumpStmt`, which states `jump: {kind, label, before, after}` the same
   way. A label declaration states `label` and `declaresLabel`; a statement
   that opens a construct whose jump semantics differ from ordinary nesting
-  states `opens` (`"switch"`); the emitters that write `yield` state
+  states `opens` (`"switch"`, `"try"`); the emitters that write `yield` state
   `yields: true`; and an emitter that composes an exit with other effects in
   one statement states `relocatable: false`. `regionStatementOf` publishes
   those fields as they stand. There is no `partsReturnPositions`,
   `splitReturnParts`, `partsReturnSplit`, `partsJumpStatement`,
-  `partsOpensNamedConstruct`, `partsLabelName` or `partsYields`: a keyword
+  `partsOpensNamedConstruct`, `partsLabelName`, `partsYields` or an
+  `opensTry` startsWith test: a keyword
   scan can only ever be as complete as the emitters it happens to know
   about, and an emitter that grows a new exit form now has to say so.
   What is still read off the skeleton is not control flow but *relocation

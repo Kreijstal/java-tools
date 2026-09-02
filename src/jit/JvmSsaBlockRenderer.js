@@ -1983,8 +1983,6 @@ class JvmSsaBlockRenderer {
         subject, entryArrayDataNames);
       record.throwsOrTries = partsWriteThrowOrTry(parts);
       record.conditional = partsOpenCondition(parts);
-      record.opensTry = partsSkeleton(parts).trimStart().startsWith("try {") ||
-        partsSkeleton(parts).trimStart().startsWith("try ");
       // `safePointBudget` is ambient rather than an operand, so the entry
       // scaffold's sweep asks the statement whether it mentions the budget.
       record.usesSafePointBudget =
@@ -2222,8 +2220,7 @@ class JvmSsaBlockRenderer {
         yields: record.yields === true,
         continuesBlock: partsContinuesBlock(parts),
         opens: delta > 0
-          ? (record.opens || (record.kind === "loopHeader" ? "loop"
-            : record.opensTry ? "try" : "block"))
+          ? (record.opens || (record.kind === "loopHeader" ? "loop" : "block"))
           : null,
         // A statement a consumer may move into a helper function. Every
         // exit it carries has to be re-establishable through the helper's
@@ -2302,7 +2299,8 @@ class JvmSsaBlockRenderer {
       while (index < bodyLines.length) {
         const record = recordOf(bodyLines[index]);
         const delta = deltaAt(index);
-        if (delta > 0 && (record.kind === "loopHeader" || record.opensTry)) {
+        if (delta > 0 &&
+            (record.kind === "loopHeader" || record.opens === "try")) {
           describe("linear", runStart, index);
           let nested = delta;
           let end = index + 1;
@@ -5199,7 +5197,8 @@ class JvmSsaBlockRenderer {
             const count = stagedValue(countInput, lines);
             const out = value(), caught = value();
             lines.push(letDecl(out),
-              st`try { ${out} = helpers.newPrimitiveArray(${count}, ${JSON.stringify(instruction.arg)}); } catch (${caught}) {`,
+              stmt(e`try { ${out} = helpers.newPrimitiveArray(${count}, ${JSON.stringify(instruction.arg)}); } catch (${caught}) {`,
+                {opens: "try"}),
               ...materializeLines([...stack, count], index, true).map((line) => `  ${line}`),
               st`  throw ${caught};`, blockEnd(""));
             stack.push(out);
@@ -5211,7 +5210,8 @@ class JvmSsaBlockRenderer {
             const count = stagedValue(countInput, lines);
             const out = value(), caught = value();
             lines.push(letDecl(out),
-              st`try { ${out} = helpers.newReferenceArray(${count}, ${JSON.stringify(instruction.arg)}); } catch (${caught}) {`,
+              stmt(e`try { ${out} = helpers.newReferenceArray(${count}, ${JSON.stringify(instruction.arg)}); } catch (${caught}) {`,
+                {opens: "try"}),
               ...materializeLines([...stack, count], index, true).map((line) => `  ${line}`),
               st`  throw ${caught};`, blockEnd(""));
             stack.push(out);
@@ -5223,7 +5223,7 @@ class JvmSsaBlockRenderer {
             const monitor = stagedValue(monitorInput, lines);
             const caught = value();
             lines.push(
-              st`try {`,
+              stmt(e`try {`, {opens: "try"}),
               st`  if (!helpers.monitorEnter(${monitor}, thread)) {`,
               ...materializeLines([...stack, monitor], index)
                 .map((line) => `    ${line}`),
@@ -5246,7 +5246,7 @@ class JvmSsaBlockRenderer {
             const monitor = stagedValue(monitorInput, lines);
             const caught = value();
             lines.push(
-              st`try {`,
+              stmt(e`try {`, {opens: "try"}),
               st`  helpers.monitorExit(${monitor}, thread);`,
               st`} catch (${caught}) {`,
               ...materializeLines([...stack, monitor], index)
@@ -5269,7 +5269,8 @@ class JvmSsaBlockRenderer {
               {kind: "const", def: source}),
               st`  if (${source} !== ${target}) {`,
               st`    let ${checked};`,
-              st`    try { ${checked} = helpers.tryCheckCastSourceSync(${source}, ${target}); } catch (${caught}) {`,
+              stmt(e`    try { ${checked} = helpers.tryCheckCastSourceSync(${source}, ${target}); } catch (${caught}) {`,
+                {opens: "try"}),
               ...materializeLines(stack, index).map((line) => `  ${line}`),
               st`  throw ${caught};`, blockEnd(""),
               st`    if (${checked} === helpers.asyncInvokeSentinel()) {`,
@@ -5621,7 +5622,8 @@ class JvmSsaBlockRenderer {
               stmt(exprConcat(
                 e`try { ${out} = helpers.directJreIntrinsics[${
                   site.directJre.id}](`,
-                argumentListExpression(args), e`); } catch (${caught}) {`)),
+                argumentListExpression(args), e`); } catch (${caught}) {`),
+              {opens: "try"}),
               ...materializeLines(callStack, index).map((line) => `  ${line}`),
               st`  throw ${caught};`, blockEnd(""));
               if (!site.returnsVoid) stack.push(out);
@@ -5673,7 +5675,8 @@ class JvmSsaBlockRenderer {
               const caught = value();
               lines.push(stmt(exprConcat(
                 e`try { helpers.primitiveArrayCopyDirect(`,
-                argumentListExpression(args), e`); } catch (${caught}) {`)),
+                argumentListExpression(args), e`); } catch (${caught}) {`),
+              {opens: "try"}),
                 ...materializeLines(callStack, index).map((line) => `  ${line}`),
                 st`  throw ${caught};`, blockEnd(""));
             }
@@ -5756,7 +5759,8 @@ class JvmSsaBlockRenderer {
             const fallbackLines = [
               ...(deferMaterialization
                 ? stageOperandLines(callStack) : materializeLines(callStack, index + 1)),
-              st`try { ${out} = helpers.tryInvokeSyncAt(${site.id}, frame, thread); } catch (${caught}) {`,
+              stmt(e`try { ${out} = helpers.tryInvokeSyncAt(${site.id}, frame, thread); } catch (${caught}) {`,
+                {opens: "try"}),
               ...materializeCallExceptionLines(
                 callStack, stack, index, callStackDepth)
                 .map((line) => `  ${line}`),
@@ -6277,7 +6281,7 @@ class JvmSsaBlockRenderer {
                 ] : [
                   stmt(e`  try { ${out} = ${selfRecursiveMarker}${
                     positionalRawCall}; } catch (${caught}) {`,
-                  {pinned: site.selfRecursive}),
+                  {opens: "try", pinned: site.selfRecursive}),
                   st`    /*${regionHandlerMarkers.start}*/`,
                   ...materializeCallExceptionLines(
                     callStack, stack, index,
@@ -12879,7 +12883,7 @@ class JvmSsaBlockRenderer {
         // region, so it does not make the body a single fragment: the opening
         // and the handler are their own fragments and the body between them
         // keeps its statement-level structure.
-        const restoringWrapperOpen = st`try {`;
+        const restoringWrapperOpen = stmt(e`try {`, {opens: "try"});
         const restoringIndentedBody = directBody.map((line) => `  ${line}`);
         const restoringWrapperClose = [
           st`} catch (error) {`,
