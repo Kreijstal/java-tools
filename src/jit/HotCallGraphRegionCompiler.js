@@ -3791,5 +3791,6 @@ module.exports.renderRegionUnit = renderRegionUnit;
 module.exports.ownStatement = ownStatement;
 module.exports.regionStatementsFromFragments = regionStatementsFromFragments;
 module.exports.applyRegionStatementEdits = applyRegionStatementEdits;
+module.exports.assembleInsertion = assembleInsertion;
 module.exports.pruneUnreachableRegionDeclarations =
   pruneUnreachableRegionDeclarations;
