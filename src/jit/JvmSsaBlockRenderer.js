@@ -10633,6 +10633,7 @@ class JvmSsaBlockRenderer {
         minimumSegmentBytes: this.linearPartitionMinimumSegmentBytes,
         rootProgramGenerator: true,
         namespace: "structured",
+        directive: "'use strict';\n",
       })
       : {source: outlinedGeneratedSource, count: 0,
         partitionedSourceBytes: 0};

@@ -52,29 +52,56 @@ The renderer gains, per call site with a real `syncCallSite` id, a
 
 ```
 regionLowering: {
-  resultName, resultDeclaration,          // `out`, `let out;`
-  depthName, depthDeclaration,            // callStackDepth and its `let … = thread.callStack.items.length;`
-  callArguments: [...args, ...captures],  // exactly rawCall.arguments.slice(1, -2)
-  rawCallExpression,                      // the emitted `raw ? raw(helpers, …, thread, true) : invoke(…)`
-  nestedRawCallExpression,                // same with the raw arm's nestedEntryGuarded = 2
-  fastCall: { caught, restoringSource, handlerSource } | null,
+  resultName, resultDeclaration,   // `out`, `let out;`
+  depthName,                       // the call's `thread.callStack.items.length` snapshot
+  rawCallPrefix,                   // `<rawInvoke>(helpers, `
+  rawCallSuffix, nestedRawCallSuffix,   // `thread, true)` / `thread, 2)`
+  operandTokens: ["/*__JVM_CALL_ARG_<pc>_0__*/", …],
+  fastCall: { caught, restoreMarkers, handlerMarkers } | null,
 }
 ```
 
-and `generated.jvmStructuredRegionCallBindingDeclarations`, mapping each binding
+plus `generated.jvmStructuredRegionCallBindingDeclarations`, mapping each binding
 name to the exact declaration text(s) and kind (`let`/`const`) the renderer
-emitted for it in each positional variant, plus
+emitted for it in each positional variant, and
 `generated.jvmStructuredRegionRunCounterStatements`, the exact
 `helpers.structuredSsa.*RunCount += 1;` statements an internal node drops.
 
 `rewriteCallBindings` then does no parsing. It locates the compiler-owned
 `/*__JVM_REGION_CALL_START_<pc>__*/` … `/*__JVM_REGION_CALL_END_<pc>__*/` span by
-exact identity, and takes every other fact from `regionLowering`. Selecting the
-*linked* form of a call is a choice between two published strings, not a search
-for a call expression.
+exact identity and takes every other fact from tokens the call itself emitted.
+Selecting the *linked* form of a call is a choice between published forms, not a
+search for a call expression.
 
-Conservatism: when a published fragment is not present verbatim in the variant
-being composed (a source that a later renderer pass specialized or partitioned),
+**Why the record is tokens and not finished strings.** The first attempt
+published the operand list, the restoring arm and the catch body as the strings
+the call was emitted from. That is wrong, and the tests said so: the renderer
+runs *line-level* passes over its own output after emission — the SSA alias
+coalescer at ~5030-5200 and, for the restoring and checked-leaf tiers, the
+regex peephole `compactCheckedLeafLines` (~10070-10460, which substitutes
+immutable local aliases, inlines one-use pure snapshots and folds local
+self-updates). A `ssaValue7` captured at emission may be `local0` — or an
+inlined expression — in the body finally published. Only names that are never
+rewritten (the result, the depth snapshot, the catch parameter, the call
+bindings) can be published as text. Everything the peephole may rewrite is
+instead *delimited* in the emitted call, so the region reads the operand and the
+two exception arms out of whichever specialized body carries them:
+
+* one `/*__JVM_CALL_ARG_<pc>_<n>__*/` token in front of each operand inside the
+  raw invocation;
+* `/*__JVM_CALL_HANDLER_START_<pc>__*/` … `_END_` around the fast-call catch body;
+* `/*__JVM_CALL_RESTORE_START_<pc>__*/` … `_END_` around its call-pc restoring arm
+  (an optional argument of `materializeCallExceptionLines`).
+
+This is the same idiom as the region call markers themselves, and the same one
+`specializeSelfRecursiveCalls` already uses: exact identity on a token the
+compiler emitted. Those line-level renderer passes are themselves a much larger
+instance of the problem this document is about; a later pass that moved them
+onto the structured representation would let these delimiters be dropped again
+in favour of a plain published operand list.
+
+Conservatism: when a call's tokens are not present in the variant being composed
+(a body a later pass specialized away, such as a self-recursive direct call),
 the edge is simply not lowered — exactly the `if (!rawCall) continue` outcome the
 AST version already had. Correctness never depends on the lookup succeeding; the
 final `replaced.has(rawInvoke)` check still rejects a module that could not be
@@ -84,22 +111,34 @@ linked, and the ordinary tier remains the fallback.
 
 `removeUnusedRegionBindings` parsed the *result* to discover that a binding had
 become dead. After stage A the compiler already knows precisely which bindings it
-eliminated (`eliminatedBindingNames`) and which declaration text belongs to each.
-It therefore deletes the declaration by exact identity of the published text —
-"do not emit this binding" — and the DCE parse disappears. The transitive
-`pureGeneratedExpression` closure is replaced by the renderer's own knowledge of
-the binding dependency chain (`ssaCallSite<i>` → `ssaFastPositional<i>` →
-`ssaFastPositionalInvoke<i>` / `…RawInvoke<i>` / `…Receiver<i>`), published with
-the declarations.
+eliminated (`eliminatedBindingNames`) and which declaration text belongs to each,
+so the binding is simply not emitted: the published declaration is replaced by
+nothing rather than by a rewritten initializer. The DCE parse and its
+`pureGeneratedExpression` purity predicate are gone.
+
+The reference walk it replaced existed to catch the one out-of-span reader of a
+call binding, the loop-invariant raw target declared in the prologue. The
+renderer now publishes those sites as
+`generated.jvmStructuredRegionInvariantPositionalCallIndices`, and they keep
+their bindings; so does a call span the renderer emitted more than once, since
+an unlowered copy still reads them. Both conditions fail safe: the binding
+survives as a dead declaration — a missed size win, never an unbound name.
 
 ### Stage C — no directive regex, no `safePointBudget` regex (sites 9, 11)
 
-* The `'use strict';` prologue is *prepended by the region compiler itself*. It
-  now partitions the body without the directive and re-joins afterwards, so the
-  partition pass never has to find a directive in text.
+* The `'use strict';` prologue is *prepended by the region compiler itself*, so
+  it now assembles the module body without it, runs the source passes, and
+  attaches the directive at the end. `partitionOversizedLinearBlocks` takes an
+  `options.directive` naming the prologue its caller prefixed (the renderer's
+  own call passes `"'use strict';\n"`), slices it off before partitioning and
+  re-attaches it after, instead of locating a directive with
+  `/^(['"]use strict['"];\n?)/`.
 * The renderer publishes `generated.jvmStructuredSafePointBudgetDeclarations`,
-  the exact declaration strings it emitted. The fused module removes them by
-  exact identity instead of matching `/let safePointBudget = \d+;/`.
+  the exact declaration strings it emitted for each positional variant (three
+  distinct budgets: the entry budget, the direct/internal budget, and the
+  restoring budget). The fused module removes them by exact identity instead of
+  matching `/let safePointBudget = \d+;/`, so every node closes over the one
+  module-owned counter.
 
 ### Stage D — `yield` regex (site 9), deferred
 
@@ -154,10 +193,21 @@ relocate the parsing.
 
 ## 3. Status
 
-* Stage A — landed.
-* Stage B — landed.
-* Stage C — landed.
+* Stage A — landed. `rewriteCallBindings` no longer calls `parse`, walks an AST,
+  or caches an AST index; `callBindingParseCount` is asserted to stay at zero.
+* Stage B — landed. `removeUnusedRegionBindings` and `pureGeneratedExpression`
+  are deleted.
+* Stage C — landed. The `'use strict'` and `safePointBudget` regexes are gone.
 * Stages D, E, F — not landed; see §2 for exactly what each needs.
+
+What is left in `HotCallGraphRegionCompiler.js` after A–C: six `parse()` calls
+(`inlineAtomicPositionalSource`, `removeUnreachableRegionFunctions`,
+`splitModuleSourceForFactoryHoist`, `outlineLargeRegionLoops`,
+`liftOversizedUnitLocalsToEnvironment`, `partitionOversizedLinearBlocks`), the
+`yield`→`void ` regex feeding the last of them, and the `applySourceEdits`
+splices those six passes use. The two `replace(/[^A-Za-z0-9…]/g, …)` calls that
+remain sanitize compiler-owned identifiers and file names, not generated
+JavaScript.
 
 ## 4. What the renderer must publish next
 

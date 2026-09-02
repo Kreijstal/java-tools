@@ -866,7 +866,12 @@ function partitionOversizedLinearBlocks(source, options = {}) {
     .replace(/[^A-Za-z0-9_]/g, "") || "0";
   const sharedStateName = `jvmRegionSegmentState${namespace}`;
   const rootProgramGenerator = options.rootProgramGenerator === true;
-  let rewritten = source;
+  // A caller that prefixed a directive prologue names it here. The pass then
+  // partitions the body alone and re-attaches the prologue, instead of
+  // looking for a directive in the text it is about to rewrite.
+  const directive = typeof options.directive === "string" &&
+    source.startsWith(options.directive) ? options.directive : "";
+  let rewritten = directive ? source.slice(directive.length) : source;
   let segmentCount = 0;
   let partitionedSourceBytes = 0;
   let appendedHelperCount = 0;
@@ -1237,15 +1242,10 @@ function partitionOversizedLinearBlocks(source, options = {}) {
   }
 
   if (segmentCount > 0) {
-    // Keep a leading directive prologue in directive position.
-    const directive = /^(['"]use strict['"];\n?)/.exec(rewritten);
-    const prologue = `const ${sharedStateName} = [];\n`;
-    rewritten = directive
-      ? directive[1] + prologue + rewritten.slice(directive[1].length)
-      : prologue + rewritten;
+    rewritten = `const ${sharedStateName} = [];\n${rewritten}`;
   }
   return {
-    source: rewritten,
+    source: `${directive}${rewritten}`,
     count: segmentCount,
     partitionedSourceBytes,
     attemptedRuns,
@@ -2554,9 +2554,11 @@ class HotCallGraphRegionCompiler {
       // here resets the quantum at every internal edge and lets a deep graph
       // run for N independent budgets. Remove only the renderer's exact
       // declaration; every node then closes over the module-owned counter.
-      const emittedSource = outlined.source.replace(
-        /(^|\n)([ \t]*)let safePointBudget = \d+;(?=\n|$)/g,
-        "$1$2");
+      let emittedSource = outlined.source;
+      for (const declaration of
+        node.generated.jvmStructuredSafePointBudgetDeclarations || []) {
+        emittedSource = emittedSource.split(declaration).join("");
+      }
       outlinedLoops += outlined.count;
       outlinedLoopSourceBytes += outlined.outlinedSourceBytes;
       largestOutlinedLoopSourceBytes = Math.max(
@@ -2614,8 +2616,9 @@ class HotCallGraphRegionCompiler {
         "typeof argument0 !== 'string' && typeof argument0 !== 'function')) " +
         "return ssaAsyncInvoke;"
       : null;
+    // The directive prologue is this compiler's own, so it is attached after
+    // the source passes rather than located in their output.
     const unprunedModuleSource = [
-      "'use strict';",
       `let safePointBudget = ${this.directSafePointBudget};`,
       ...declarations,
       framedRoot
@@ -2659,8 +2662,8 @@ class HotCallGraphRegionCompiler {
           this.moduleCompileCount}-${plan.root.method.name}.js`,
         partitioned.source);
     }
-    const moduleSource = removeUnreachableRegionFunctions(
-      partitioned.source, rootName);
+    const moduleSource = `'use strict';\n${removeUnreachableRegionFunctions(
+      partitioned.source, rootName)}`;
     const factorySplit = this.factoryHoistEnabled
       ? splitModuleSourceForFactoryHoist(moduleSource) : null;
     if (factorySplit) {
