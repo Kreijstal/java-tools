@@ -162,9 +162,12 @@ function buildRegionUnits(moduleSource) {
     const facts = perLine[index];
     const maskedLine = maskedSource.slice(start, end);
     let delta = 0;
+    let openDelta = 0;
     for (const character of maskedLine) {
       if (character === '{') delta += 1;
       else if (character === '}') delta -= 1;
+      else if (character === '(' || character === '[') openDelta += 1;
+      else if (character === ')' || character === ']') openDelta -= 1;
     }
     const wholeLine = (node) => node.start >= start && node.end <= end;
     const declaration = facts.declarators.find(wholeLine);
@@ -232,6 +235,7 @@ function buildRegionUnits(moduleSource) {
       writes: write ? [write] : [],
       reads,
       delta,
+      openDelta,
       label: facts.labels.length ? facts.labels[0] : null,
       jump,
       exit,
@@ -858,6 +862,117 @@ test('a "yield" inside a string is not mistaken for a keyword', (t) => {
     t.deepEqual(drive(build(partitioned.source), [9], maximumSteps),
       drive(build(body), [9], maximumSteps),
       `standalone completion matches through ${maximumSteps} steps`);
+  }
+  t.end();
+});
+
+// Several renderer emitters write one construct over more than one recorded
+// line (`if (a &&` / `    b) {`), so a statement is not always complete on its
+// own. A run must never be cut between such a head and the lines that finish
+// it: the first framed root the partitioner ever cut produced an unparseable
+// module exactly there. The statements say so themselves through the bracket
+// nesting they leave open.
+test('a run is never cut inside a construct written over several lines',
+  (t) => {
+    const moduleSource = `'use strict';\n${[
+      'function work(a, log) {',
+      '  let total = 0;',
+      ...Array.from({length: 90}, (_unused, i) => [
+        `  let v${i} = (a + ${i}) | 0;`,
+        `  ${pad(`s${i}`)}`,
+        `  if (v${i} > 0 &&`,
+        `      v${i} < 1000000) {`,
+        `    total = (total + v${i}) | 0;`,
+        '  }',
+      ].join('\n')),
+      '  return total;',
+      '}',
+    ].join('\n')}\nreturn work;`;
+    const partitioned = partition(moduleSource);
+    t.ok(partitioned.count > 0, 'the case is large enough to partition');
+    // The multi-line condition is one construct: every `if (` a segment
+    // carries is closed inside the same function it was cut into.
+    t.doesNotThrow(() => parse(partitioned.source, {
+      ecmaVersion: 'latest', allowReturnOutsideFunction: true,
+    }), 'the partitioned module is still a program');
+    const original = compile(moduleSource);
+    const cut = compile(partitioned.source);
+    for (const input of [-5, 0, 1, 17, 4242]) {
+      const originalLog = [];
+      const cutLog = [];
+      t.equal(cut(input, cutLog), original(input, originalLog),
+        `the partitioned body agrees at ${input}`);
+      t.deepEqual(cutLog, originalLog,
+        `the partitioned body logs the same effects at ${input}`);
+    }
+    t.end();
+  });
+
+// A body's `spillLocals` / `ssaMaterialize<n>` helpers close over that body's
+// own `local<slot>` bindings. A helper this pass extracts receives them by
+// value, so a range that both calls one of those helpers and assigns a JVM
+// slot would spill the enclosing body's stale copy at the moment the
+// interpreter takes the state over. Such a range is not extracted.
+test('a run that spills while assigning a JVM local is not extracted', (t) => {
+  const body = [
+    ...Array.from({length: 120}, (_unused, i) => [
+      `  ${pad(`s${i}`)}`,
+      `  local3 = (local3 + ${i}) | 0;`,
+      '  spillLocals();',
+    ].join('\n')),
+  ].join('\n');
+  const unit = buildGeneratorBodyUnit(body);
+  const declined = partitionOversizedLinearBlocks([unit], OPTIONS);
+  t.equal(declined.count, 0,
+    'no segment is cut out of a range that spills a local it assigns');
+  // The same range without the spill helper is extracted, so the decline is
+  // the spill relationship and not the shape of the run.
+  const spillFree = buildGeneratorBodyUnit(body.split(
+    '  spillLocals();\n').join(''));
+  const cut = partitionOversizedLinearBlocks([spillFree], OPTIONS);
+  t.ok(cut.count > 0, 'the same run without the spill helper is extracted');
+  t.end();
+});
+
+// A later round can offer a run that already contains an earlier segment's
+// call site. Both would then use the one shared `jvmRegionSegmentState<n>`
+// array with unrelated index spaces, which is the cut that miscompiled the
+// first framed root this pass ever fired on.
+test('a segment is never cut around another segment\'s call site', (t) => {
+  const moduleSource = `'use strict';\n${[
+    'function work(a, log) {',
+    '  let total = 0;',
+    ...Array.from({length: 400}, (_unused, i) => [
+      `  let v${i} = (a + ${i}) | 0;`,
+      `  ${pad(`s${i}`)}`,
+      `  total = (total + v${i}) | 0;`,
+    ].join('\n')),
+    '  return total;',
+    '}',
+  ].join('\n')}\nreturn work;`;
+  const partitioned = partition(moduleSource);
+  t.ok(partitioned.count > 0, 'the case is large enough to partition');
+  for (const unit of partitioned.units) {
+    if (!unit.name || !unit.name.startsWith('jvmRegionSegment')) continue;
+    const text = renderRegionUnit(unit);
+    const calls = text.split('jvmRegionSegment').length - 1;
+    const own = text.split(unit.name).length - 1;
+    const state = text.split('jvmRegionSegmentState').length - 1;
+    const output = text.split('jvmRegionSegmentOutput').length - 1;
+    const label = text.split('jvmRegionSegmentBody').length - 1;
+    const error = text.split('jvmRegionSegmentError').length - 1;
+    t.equal(calls - own - state - output - label - error, 0,
+      `${unit.name} calls no other segment helper`);
+  }
+  const original = compile(moduleSource);
+  const cut = compile(partitioned.source);
+  for (const input of [0, 3, 91]) {
+    const originalLog = [];
+    const cutLog = [];
+    t.equal(cut(input, cutLog), original(input, originalLog),
+      `the partitioned body agrees at ${input}`);
+    t.deepEqual(cutLog, originalLog,
+      `the partitioned body logs the same effects at ${input}`);
   }
   t.end();
 });

@@ -1049,6 +1049,9 @@ function partitionOversizedLinearBlocks(units, options = {}) {
   let attemptedRuns = 0;
   let oversizedStatements = 0;
   const helperUnits = [];
+  // The helper names this pass has emitted so far, so a later round can tell
+  // a run that already contains one of its own call sites.
+  const emittedHelperNames = new Set();
   const working = units.slice();
 
   for (let round = 0; round < maximumRounds &&
@@ -1075,6 +1078,18 @@ function partitionOversizedLinearBlocks(units, options = {}) {
         const runHasYield = regionRangeCarriesYield(statements, from, to);
         if (runHasYield && !unit.generator) return;
         if (regionRangeSpillsStaleLocals(statements, from, to)) return;
+        // A later round can offer a run that already contains an earlier
+        // segment's call site. Both segments would then use the one shared
+        // `jvmRegionSegmentState<n>` array -- the inner one for its own
+        // live-outs, the outer one for its live-ins and live-outs -- and the
+        // index spaces are unrelated. The nesting is declined rather than
+        // renumbered: the cut it would make is exactly the one that
+        // miscompiled a framed root the first time this pass fired on one.
+        for (let index = from; index < to; index += 1) {
+          for (const name of statements[index].reads || []) {
+            if (emittedHelperNames.has(name)) return;
+          }
+        }
 
         // A run-level declaration whose binding is read after the run has to
         // survive the extraction: it is declared at the call site and written
@@ -1187,6 +1202,7 @@ function partitionOversizedLinearBlocks(units, options = {}) {
             relocatable: false});
         }
 
+        emittedHelperNames.add(helperName);
         helperUnits.push(regionUnit({
           name: helperName,
           partitionable: false,
