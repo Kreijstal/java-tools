@@ -12307,8 +12307,11 @@ class JvmSsaBlockRenderer {
         {kind: "entryScaffold"}),
       recordStatement(["const stack = frame.stack.items;"],
         {kind: "entryScaffold"}),
-      recordStatement(["if ((!framelessEntry && frame.pc !== 0) || (initialBytecodeChecks === undefined ? helpers.needsBytecodeChecks() : initialBytecodeChecks)) { helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'structured SSA entry' }; }"],
-        {kind: "entryGuard"}),
+      // The framed entry check composes a deopt exit with `skipJitOnce`, so
+      // it states the exit and is not relocatable.
+      returnStmt("if ((!framelessEntry && frame.pc !== 0) || (initialBytecodeChecks === undefined ? helpers.needsBytecodeChecks() : initialBytecodeChecks)) { helpers.skipJitOnce(frame); ",
+        "{ deopt: true, transient: true, reason: 'structured SSA entry' }",
+        " }", {kind: "entryGuard", relocatable: false}),
       staticInitializationGuardDeclaration,
       staticEntryGuard,
       ...directStaticDeclarations,
@@ -12487,20 +12490,21 @@ class JvmSsaBlockRenderer {
           e`(helpers.jvm.classInitializationEpoch || 0)) && `,
           e`!helpers.structuredSsa.verifyClassInitializationGuard(`,
           e`${directGuardVariable}))`));
-        const directGuard = stmt(exprConcat(
+        const directGuard = returnStmt(exprConcat(
           e`if ((!nestedEntryGuarded && helpers.needsBytecodeChecks()) || `,
           e`(nestedEntryGuarded !== 2 && ${directInitializationCondition})`,
-          e`) { return helpers.asyncInvokeSentinel(); }`),
+          e`) { `), CHECKED_LEAF_BAIL_VALUE, " }",
         {kind: "entryGuard"});
         const directBooleanGuard = guardedStaticBooleanSites.size
-          ? stmt(exprConcat(e`if (`,
+          ? returnStmt(exprConcat(e`if (`,
             ...[...guardedStaticBooleanSites.values()].flatMap(
               (direct, position) => [
                 position === 0 ? "" : " || ",
                 guardedStaticBooleanConditions(direct),
               ]),
-            e`) { helpers.structuredSsa.guardedBooleanFallbackCount += 1; return helpers.asyncInvokeSentinel(); }`),
-          {kind: "entryGuard"})
+            e`) { helpers.structuredSsa.guardedBooleanFallbackCount += 1; `),
+          CHECKED_LEAF_BAIL_VALUE, " }",
+          {kind: "entryGuard", relocatable: false})
           : null;
         const directRenderedTree = expandContinuationFallbacks(
           render(structured.tree, false, true), false);
@@ -12693,14 +12697,15 @@ class JvmSsaBlockRenderer {
           e`if (${restoringInitializationCondition}) { `,
           CHECKED_LEAF_BAIL_VALUE, " }");
         const directBooleanGuard = guardedStaticBooleanSites.size
-          ? stmt(exprConcat(e`if (`,
+          ? returnStmt(exprConcat(e`if (`,
             ...[...guardedStaticBooleanSites.values()].flatMap(
               (direct, position) => [
                 position === 0 ? "" : " || ",
                 guardedStaticBooleanConditions(direct),
               ]),
-            e`) { helpers.structuredSsa.guardedBooleanFallbackCount += 1; return helpers.asyncInvokeSentinel(); }`),
-          {kind: "entryGuard"})
+            e`) { helpers.structuredSsa.guardedBooleanFallbackCount += 1; `),
+          CHECKED_LEAF_BAIL_VALUE, " }",
+          {kind: "entryGuard", relocatable: false})
           : null;
         const initializeFrame = [
           st`frame = plan.target.freeFrame || new plan.Frame(plan.method);`,
@@ -13727,8 +13732,9 @@ class JvmSsaBlockRenderer {
             return [
               ...treeLines,
               directMethodDescriptor.returnType === "void"
-                ? st`return helpers.returnVoid();`
-                : stmt(e`return ${checkedLeafResultVariable};`,
+                ? returnStmt("", "helpers.returnVoid()", "",
+                  {kind: "checkedLeafReturn"})
+                : returnStmt("", e`${checkedLeafResultVariable}`, "",
                   {kind: "checkedLeafReturn"}),
             ];
           };
