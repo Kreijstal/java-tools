@@ -256,16 +256,19 @@ region compiler no longer calls `parse` at all.
 **How fragments survive composition.** Option (b): the statement list travels
 alongside the source and is kept in step by construction.
 `rewriteCallBindings` returns the edits it applied, and
-`applyRegionStatementEdits` maps them onto the records -- a statement an edit
-rewrote, and every statement a multi-line edit spanned, become one opaque
-record whose names are unknown, so nothing containing it is relocated; an edit
-that empties a statement leaves an empty record. A merged record keeps the
-nesting delta of what it replaced, which holds because a lowered call span and
-its replacement are both complete constructs; if it ever stopped holding the
-deltas would not balance and `statementGroups` declines the body rather than
-mis-grouping it. Composed bodies (`composedInternalStatements`,
-`exceptionalInlineStatements`) carry their records through the composition
-fixed point the same way.
+`applyRegionStatementEdits` maps them onto the records. An edit that composed
+a callee's body into the caller carries the records behind the text it
+produced and those are *spliced* in place of the statements the call span
+occupied (§7); every other edit -- a binding declaration replaced or dropped,
+a run counter removed, a call lowered to text the region compiler wrote --
+still merges the statements it touched into one opaque record whose names are
+unknown, so nothing containing it is relocated, and an edit that empties a
+statement leaves an empty record. A merged record keeps the nesting delta of
+what it replaced, which holds because a lowered call span and its replacement
+are both complete constructs; if it ever stopped holding the deltas would not
+balance and `statementGroups` declines the body rather than mis-grouping it.
+Composed bodies (`composedInternalStatements`, `exceptionalInlineStatements`)
+carry their records through the composition fixed point the same way.
 
 **`compileModule` owns units.** A declaration entry is no longer a text blob
 but the units it is emitted from, so pruning, the factory-hoist split,
@@ -319,6 +322,9 @@ touches it. Two consequences, both measured in §3:
 * Stage F, the rest of the region-compiler half — landed. Sites 6, 8 and 9 are
   selections and rewrites over §4's records; `compileModule` assembles the
   module from units it owns.
+* Site 3’s composition — landed. A composed callee’s own records are spliced
+  into its caller’s statement list instead of collapsing into one opaque
+  record; §7 records the contract and the two soundness rules it required.
 
 **No regex over generated JavaScript remains in
 `HotCallGraphRegionCompiler.js`.** The two `replace(/[^A-Za-z0-9…]/g, …)` calls
@@ -383,6 +389,12 @@ composition a record for what it inserted rather than an opaque one -- an
 inserted body already publishes its own fragments, so splicing those in place
 of the call's record is the next step -- and recording the canonical body's
 prologue emitters for the framed root.
+
+**The splice landed; §7 records it.** With it, the same forced-minimum
+configuration attempts 21 runs and cuts 21 segments over the two JIT corpora
+where it attempted none before, and `hotCallGraphRegion.test.js` passes
+164/164 under it. Two defects had to be fixed for that to be sound and
+reachable at all, both recorded in §7.
 
 ## 4. What the renderer publishes for stage F
 
@@ -803,3 +815,149 @@ Every difference is inside an inlined body, and they are:
    difference that is not purely syntactic.
 
 Nothing outside the inlined bodies changed.
+
+## 7. Composed bodies are spliced, not collapsed (site 3, continued)
+
+§6 landed the insertion contract; what it left behind was one opaque record
+per inserted body. A caller that composed a callee gained a single record
+covering the whole insertion, so `attemptedRuns` was 0 on the 25 KB composed
+module -- and that module is the one the oversized-unit problem is about,
+because it is the composition that makes a unit oversized.
+
+### What the renderer publishes
+
+`generated.jvmInternalRegionPositionalInsertion` and
+`generated.jvmRestoringDirectPositionalInsertion` gain one field:
+
+```
+statements,   // the records behind `source`, one per line, in order --
+              // the same shape §4's fragments carry per statement
+```
+
+`publishInsertion` maps the insertable body's own lines through
+`regionStatementOf`, exactly as `regionFragmentsOf` does, and publishes null
+when any line has no record. That is the same fail-safe the fragments use, and
+a consumer that receives null falls back to the opaque record.
+
+`statements[i].text` is `source`'s line `i`, so the two halves are the same
+body by construction rather than by agreement.
+
+### What the region compiler assembles
+
+`assembleInsertion(insertion, options)` returns `{source, statements}`.
+
+* `source` **is** `insertion.assemble(options)`. The text is not rebuilt from
+  the records, so a module composed through this function is byte-identical to
+  one composed before it existed -- verified by dumping the 31 region modules
+  of the two JIT corpora with `JVM_TRACE_REGION_SOURCE_DIR` before and after:
+  31/31 identical.
+* `statements` is the record list behind that text, and it is returned only
+  when its joined text reproduces `source` exactly. The identity check is the
+  contract: the record list and the source stay the same body.
+
+The scaffold is emitted as records the region compiler states the facts of,
+because it wrote the text:
+
+| statement | record |
+|---|---|
+| `let <result>;` | `kind: "letUninitialized"`, `def: <result>` |
+| `const <ns>a<i> = <operand>;` | `kind: "const"`, `def: <ns>a<i>`, `reads: null`, `relocatable: false` |
+| `<exitLabel>: {` | `delta: 1`, `opens: "block"`, `label: <exitLabel>` |
+| `const argument<i> = <ns>a<i>;` | `kind: "const"`, `def: argument<i>`, `reads: [<ns>a<i>]` |
+| `const nestedEntryGuarded = 2;` | `kind: "const"`, `def: nestedEntryGuarded` |
+| the callee's body | its own published records, retargeted |
+| `}` | `kind: "blockEnd"`, `delta: -1` |
+
+The argument staging declaration is the one opaque part, and deliberately so:
+an operand comes out of the caller's *emitted* call, where the renderer's own
+line passes may have rewritten it, so the region compiler never learned which
+names it mentions. A run that would contain one is declined; everything the
+insertion introduces around it stays a record.
+
+`retargetInsertionStatement` retargets one published record onto the names
+this call site chose. The text takes the same exact-identity token expansion
+`assemble` performs over the joined body -- both tokens spell the callee's
+compile serial and occur nowhere else. Everything else is a substitution over
+the record: operand references, the label a jump names, and the parts an exit
+or a jump splits into. One thing changes shape: a label part loses its operand
+identity. The renderer keeps it, because a compile-minted label is also a name
+its generated scope carries -- and that is exactly what would make a partition
+helper take `jvmRegionInline7_3_return` as a parameter the call site cannot
+supply. A label names a statement, not a value.
+
+### How the splice is applied
+
+`applyRegionStatementEdits` splices an edit's records in place of the
+statements its span occupied, when all of
+
+* the edit carries records (a plain lexical insertion does; a guarded
+  exceptional fallback does not, because its `if (!completed)` arm is the
+  original checked call span rebuilt as text),
+* no second edit landed in the same span of statements,
+* the edit replaced *whole* statements -- it starts where the first one's text
+  starts, behind the indentation the assembler owns, and ends where the last
+  one ends,
+* the nesting deltas of what it replaced and of what it splices agree,
+* and the spliced records' joined text is the text the edit actually produced.
+
+Otherwise the block collapses to one opaque record, exactly as before.
+
+Nested insertions come out flat: `composeInsertion` maps the composition's own
+edits onto the base insertion's records the same way, so a callee inlined into
+a callee inlined into a caller arrives as one flat list.
+
+### Two soundness rules the splice required
+
+**Free names resolve by block scope.** `regionNames` collected every name a
+statement range declared into one flat set. That holds while a body's names
+are unique, and stops holding the moment a composition splices a callee in:
+the callee's `local<slot>` / `ssaValue<n>` declarations sit inside a nested
+block where they *shadow* the caller's names of the same spelling -- that is
+the whole point of binding by declaration rather than renaming. A flat set
+reports such a name as bound for the whole range, so a relocated statement
+receives the wrong binding; and for a name only the callee declares, it
+reports the name as bound where the call site has nothing to pass.
+`regionScopes` states the block scope each statement sits in, from the deltas
+the emitters recorded plus the arm boundaries `continuesBlock` marks, and a
+name is bound at a use exactly when some enclosing scope declares it.
+
+**A group recurses at its own depth.** `recurseIntoGroup` split a group's
+interior at *every* statement marked as a block continuation, at whatever
+depth it sat, so a nested `} else {` cut the list in the middle of its own
+construct and `walkList` received ranges whose deltas do not balance;
+`statementGroups` then declined each of them. That is why nothing was ever
+attempted inside a body containing a nested `else` -- the flat-record era
+never noticed, because the composed body was one opaque record anyway. The
+scan now follows the recorded deltas and splits only at depth zero.
+
+A third change is presentational rather than sound: a segment helper is now
+emitted directly after the unit it came out of, the way an outlined loop's
+helper belongs to its node, instead of after every unit in the module.
+
+### Measured effect
+
+Over `hotCallGraphRegion.test.js` + `jitCompiler.test.js`:
+
+| | base | with the splice |
+|---|---|---|
+| region modules byte-identical | -- | 31/31 |
+| `lexicallyInlinedEdges` / `exceptionalInlinedEdges` / `inlineFailures` | 44 / 17 / 0 | 44 / 17 / 0 |
+| forced-minimum `attemptedRuns` | 0 | 21 |
+| forced-minimum segments cut | 0 | 21 |
+| forced-minimum `hotCallGraphRegion.test.js` | 164/164 | 164/164 |
+
+At the default budgets nothing fires on either side, and the emitted text is
+unchanged. `test/hotCallGraphLinearPartition.test.js` gains two cases that
+compose a callee into a caller through the published contract, assert the
+splice leaves only the argument staging opaque, assert a segment helper
+carries statements from inside the inserted body and that the exit jump to the
+caller's label is re-established at the call site, and execute the partitioned
+and unpartitioned modules against identical inputs.
+
+### What is still opaque, and what is still not partitioned
+
+* A guarded exceptional-inline replacement, because it embeds the original
+  checked call span as text this lowering rebuilt.
+* The argument staging declarations, per above.
+* A framed root and a checked-leaf source still publish no records at all
+  (§4's last paragraph), so no structural pass touches them.
