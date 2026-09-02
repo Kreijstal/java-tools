@@ -287,7 +287,7 @@ let activeEmittedNames = null;
 const AMBIENT_GENERATED_NAMES = [
   "helpers", "frame", "locals", "stack", "thread", "plan",
   "restorationDepth", "safePointBudget", "nestedEntryGuarded",
-  "framelessEntry",
+  "framelessEntry", "initialBytecodeChecks",
 ];
 
 // Composite operands the simulator stages on the bytecode operand stack stay
@@ -2469,6 +2469,11 @@ class JvmSsaBlockRenderer {
     };
     const spillStatement = () =>
       recordStatement(["spillLocals();"], {kind: "spill"});
+    // The strict-mode directive every assembled source opens with. It is a
+    // statement of the body like any other, so it carries a record and the
+    // audit covers it.
+    const sourceDirective = () =>
+      recordStatement(["'use strict';"], {kind: "directive"});
     // The universal block terminators. Their kind is what the structural
     // passes match on; the indentation is applied by the assembler and stays
     // outside the statement's identity.
@@ -4042,7 +4047,8 @@ class JvmSsaBlockRenderer {
         const descriptor = cfg.term[block.id];
         if (synthetic.kind === "set") {
           plans[block.id] = {
-            lines: [`${synthetic.variable} = ${synthetic.state};`],
+            lines: [storeLocal(named(synthetic.variable),
+              e`${synthetic.state}`, {kind: "assign"})],
             stack: [],
           };
         } else {
@@ -4703,8 +4709,11 @@ class JvmSsaBlockRenderer {
             stack.push(out);
           } else {
             const out = value();
-            lines.push(constDecl(out, e`BigInt.asIntN(64, ` +
-              e`BigInt(${left}) ${operator} BigInt(${right}))`, {pure: true}));
+            // `+` on two tagged templates stringifies both and loses their
+            // operand references; the pieces are concatenated as parts.
+            lines.push(constDecl(out, exprConcat(e`BigInt.asIntN(64, `,
+              e`BigInt(${left}) ${operator} BigInt(${right}))`),
+            {pure: true}));
             stack.push(out);
           }
         }
@@ -11018,18 +11027,25 @@ class JvmSsaBlockRenderer {
       .filter((cache) =>
         cache.eagerLocal !== null && cache.eagerLocal !== undefined)
       .flatMap((cache) => [
-        `if (local${cache.eagerLocal} !== null && ` +
-          `local${cache.eagerLocal} !== undefined) {`,
-        `  ${cache.object} = local${cache.eagerLocal};`,
-        `  ${cache.value} = ${cache.directKey
+        stmt(exprConcat(
+          e`if (${localName(cache.eagerLocal)} !== null && `,
+          e`${localName(cache.eagerLocal)} !== undefined) {`),
+        {kind: "fieldCacheInitialization"}),
+        `  ${storeLocal(cache.object, e`${localName(cache.eagerLocal)}`,
+    {kind: "fieldCacheInitialization"})}`,
+        `  ${storeLocal(cache.value, e`${cache.directKey
           ? guardedDirectFieldReadExpression(
-            cache, `local${cache.eagerLocal}`)
-          : `helpers.getFieldAt(${cache.site}, local${cache.eagerLocal})`};`,
+            cache, localName(cache.eagerLocal))
+          : e`helpers.getFieldAt(${cache.site}, ${
+            localName(cache.eagerLocal)})`}`,
+    {kind: "fieldCacheInitialization"})}`,
         ...(cache.isArray ? [
-          `  ${cache.data} = ${arrayDataExpression(cache.value)};`,
+          `  ${storeLocal(cache.data, e`${arrayDataExpression(cache.value)}`,
+            {kind: "fieldCacheInitialization"})}`,
         ] : []),
-        `  ${cache.valid} = true;`,
-        "}",
+        `  ${storeLocal(cache.valid, e`true`,
+          {kind: "fieldCacheInitialization"})}`,
+        blockEnd(),
       ]);
     // A restoring positional entry can reject an exotic instance layout
     // before its first guest effect and let the canonical call path preserve
@@ -11577,19 +11593,27 @@ class JvmSsaBlockRenderer {
           const declared = [];
           if (materializeDepths.has(depth)) declared.push("");
           if (materializeUnwindDepths.has(depth)) declared.push("Unwind");
+          // The helper's own name, its parameters and the `pc`/`operand<n>`
+          // it forwards are literal text of the statements that declare it,
+          // not operands of this compile, so each line is recorded as the
+          // chunk its emitter wrote.
           return declared.flatMap((variant) => [
-            `function ssaMaterialize${variant}${depth}(pc${
-              operands.length ? `, ${operands.join(", ")}` : ""}) {`,
-            "  spillLocals();",
-            ...operands.map((operand, index) =>
-              `  stack[${index}] = ${operand};`),
-            `  stack.length = ${depth};`,
-            "  helpers.materialize(frame, locals, stack, pc);",
-            "}",
+            recordStatement([`function ssaMaterialize${variant}${depth}(pc${
+              operands.length ? `, ${operands.join(", ")}` : ""}) {`],
+            {kind: "materializeHelperHeader"}),
+            `  ${spillStatement()}`,
+            ...operands.map((operandName, index) =>
+              `  ${recordStatement(
+                [`stack[${index}] = ${operandName};`], null)}`),
+            `  ${recordStatement([`stack.length = ${depth};`], null)}`,
+            `  ${recordStatement(
+              ["helpers.materialize(frame, locals, stack, pc);"], null)}`,
+            blockEnd(),
           ]);
         }),
       ...(materializeUnwindDepths.size
-        ? ["function ssaMaterializeUnwindRelease() {}"] : []),
+        ? [recordStatement(["function ssaMaterializeUnwindRelease() {}"],
+          {kind: "materializeHelperHeader"})] : []),
     ];
     const inlineMaterializeCalls = (lines) =>
       lines.flatMap((line) => {
@@ -11607,6 +11631,17 @@ class JvmSsaBlockRenderer {
             record.pc});`, {kind: "materializeSpill"})}`,
         ];
       });
+    // Every variant this compile publishes, as the line list it was assembled
+    // from. `JVM_JIT_VERIFY_STATEMENT_IR=1` audits all of them at publication
+    // rather than only the bodies a line-level pass happens to run over, so a
+    // prologue emitter that stops recording what it writes is reported.
+    const publishedVariantLines = [];
+    const auditVariant = (label, lines) => {
+      if (!lines) return lines;
+      publishedVariantLines.push(
+        [label, lines.filter((line) => typeof line === "string")]);
+      return lines;
+    };
     const eliminatedCheckedLeafLocalSlots = new Set();
     const compactCheckedLeafLines = (
       sourceLines, checkedLeafSemantics = true,
@@ -12123,11 +12158,20 @@ class JvmSsaBlockRenderer {
     for (const index of invariantPositionalReceiverSlots.keys()) {
       ssaValueNames.add(invariantPositionalRawVariable(index));
     }
+    // The continuation tier's entry scaffold. `locals`, `stack` and the
+    // entry check are ambient rather than operands -- every tier declares
+    // them in its outermost scope -- but each line is still a recorded
+    // statement, so a structural pass sees the whole body and not only the
+    // part below the prologue.
     const buildBody = (
       tree, entrySafePointBudget = safePointInitialBudget,
-    ) => ["'use strict';",
-      "const locals = frame.locals;", "const stack = frame.stack.items;",
-      "if ((!framelessEntry && frame.pc !== 0) || (initialBytecodeChecks === undefined ? helpers.needsBytecodeChecks() : initialBytecodeChecks)) { helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'structured SSA entry' }; }",
+    ) => [sourceDirective(),
+      recordStatement(["const locals = frame.locals;"],
+        {kind: "entryScaffold"}),
+      recordStatement(["const stack = frame.stack.items;"],
+        {kind: "entryScaffold"}),
+      recordStatement(["if ((!framelessEntry && frame.pc !== 0) || (initialBytecodeChecks === undefined ? helpers.needsBytecodeChecks() : initialBytecodeChecks)) { helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'structured SSA entry' }; }"],
+        {kind: "entryGuard"}),
       staticInitializationGuardDeclaration,
       staticEntryGuard,
       ...directStaticDeclarations,
@@ -12136,7 +12180,7 @@ class JvmSsaBlockRenderer {
       ...positionalCallDeclarations,
       guardedStaticBooleanEntryGuard,
       this.runCountersEnabled
-        ? "helpers.structuredSsa.runCount += 1;" : null,
+        ? st`helpers.structuredSsa.runCount += 1;` : null,
       stmt(e`let safePointBudget = ${entrySafePointBudget};`,
         {kind: "safePointBudgetDeclaration"}),
       ...declaredLocals.map((i) => {
@@ -12145,7 +12189,9 @@ class JvmSsaBlockRenderer {
         const value = !entryLocalInitialValues.has(i) && entryScalarKinds.has(i)
           ? normalizeJvmScalarExpression(initial, entryScalarKinds.get(i))
           : initial;
-        return `${immutableEntryLocals.has(i) ? "const" : "let"} local${i} = ${value};`;
+        return immutableEntryLocals.has(i)
+          ? constDecl(localName(i), e`${value}`)
+          : letDecl(localName(i), e`${value}`);
       }),
       ...invariantPositionalCallDeclarations,
       ...entryArrayDataDeclarations,
@@ -12153,11 +12199,23 @@ class JvmSsaBlockRenderer {
       ...fieldReadCacheDeclarations,
       ...fieldReadCacheInitializations,
       framedArrayDataGuard,
-      `const spillLocals = () => {${spillSlots.map((i) => ` locals[${i}] = ${
-        immutableEntryLocals.has(i) ? entryLocalInitialValues.get(i) : `local${i}`};`).join("")} };`,
+      // The spill helper is one statement carrying a nested function: it is
+      // recorded like any other, and a consumer never relocates it because
+      // its parts carry an arrow.
+      recordStatement([
+        "const spillLocals = () => {",
+        ...spillSlots.flatMap((i) => [
+          ` locals[${i}] = `,
+          ...(immutableEntryLocals.has(i)
+            ? buildParts(["", ""], [entryLocalInitialValues.get(i)])
+            : [{ref: localName(i)}]),
+          ";",
+        ]),
+        " };",
+      ], {kind: "spillHelperDeclaration"}),
       ...materializeHelperDeclarations(),
       ...declarations, ...tree];
-    const body = buildBody(renderedTree);
+    const body = auditVariant("framed", buildBody(renderedTree));
     const canonicalGeneratedSource = body.join("\n");
     // Loop outlining and straight-line partitioning of the continuation tier
     // are selections over the statement records the emitters wrote, so they
@@ -12266,32 +12324,36 @@ class JvmSsaBlockRenderer {
         const owners = [...new Set([directMethodOwner, ...directStaticOwners])];
         const directInitializationGuardId =
           this.registerClassInitializationGuard(owners);
-        const directInitializationGuardDeclaration =
-          `const ssaDirectClassInitializationGuard = ` +
-          `helpers.structuredSsa.classInitializationGuards[${directInitializationGuardId}];`;
-        const directInitializationCondition =
-          "((ssaDirectClassInitializationGuard.classEpoch !== " +
-          "(helpers.jvm.classEpoch || 0) || " +
-          "ssaDirectClassInitializationGuard.initializationEpoch !== " +
-          "(helpers.jvm.classInitializationEpoch || 0)) && " +
-          "!helpers.structuredSsa.verifyClassInitializationGuard(" +
-          "ssaDirectClassInitializationGuard))";
-        const directGuardConditions = [
-          "(!nestedEntryGuarded && helpers.needsBytecodeChecks())",
-          `(nestedEntryGuarded !== 2 && ${directInitializationCondition})`,
-        ];
-        const directGuard = directGuardConditions.length
-          ? `if (${directGuardConditions.join(" || ")}) ` +
-            "{ return helpers.asyncInvokeSentinel(); }"
-          : null;
+        // The guard variable is a name this compile mints, so every mention
+        // of it is an operand reference and a consumer that relocates a
+        // statement reading it knows to bind it.
+        const directGuardVariable =
+          named("ssaDirectClassInitializationGuard");
+        const directInitializationGuardDeclaration = constDecl(
+          directGuardVariable,
+          e`helpers.structuredSsa.classInitializationGuards[${
+            directInitializationGuardId}]`);
+        const directInitializationCondition = operand(exprConcat(
+          e`((${directGuardVariable}.classEpoch !== `,
+          e`(helpers.jvm.classEpoch || 0) || `,
+          e`${directGuardVariable}.initializationEpoch !== `,
+          e`(helpers.jvm.classInitializationEpoch || 0)) && `,
+          e`!helpers.structuredSsa.verifyClassInitializationGuard(`,
+          e`${directGuardVariable}))`));
+        const directGuard = stmt(exprConcat(
+          e`if ((!nestedEntryGuarded && helpers.needsBytecodeChecks()) || `,
+          e`(nestedEntryGuarded !== 2 && ${directInitializationCondition})`,
+          e`) { return helpers.asyncInvokeSentinel(); }`),
+        {kind: "entryGuard"});
         const directBooleanGuard = guardedStaticBooleanSites.size
-          ? `if (${[...guardedStaticBooleanSites.values()].map((direct) => `((${
-            direct.kind === "map"
-              ? `${direct.variable}.get(${JSON.stringify(direct.key)})`
-              : `${direct.variable}[${JSON.stringify(direct.key)}]`} ? 1 : 0) !== ${
-            direct.guardedBooleanValue})`).join(" || ")}) { ` +
-            "helpers.structuredSsa.guardedBooleanFallbackCount += 1; " +
-            "return helpers.asyncInvokeSentinel(); }"
+          ? stmt(exprConcat(e`if (`,
+            ...[...guardedStaticBooleanSites.values()].flatMap(
+              (direct, position) => [
+                position === 0 ? "" : " || ",
+                guardedStaticBooleanConditions(direct),
+              ]),
+            e`) { helpers.structuredSsa.guardedBooleanFallbackCount += 1; return helpers.asyncInvokeSentinel(); }`),
+          {kind: "entryGuard"})
           : null;
         const directRenderedTree = expandContinuationFallbacks(
           render(structured.tree, false, true), false);
@@ -12322,8 +12384,9 @@ class JvmSsaBlockRenderer {
             ...declarations,
             ...directRenderedTree,
           ].filter(Boolean);
+          auditVariant("direct-positional", directPositionalLines);
           directPositionalSource = specializeSelfRecursiveCalls(
-            ["'use strict';", ...directPositionalLines].join("\n"),
+            [sourceDirective(), ...directPositionalLines].join("\n"),
             "ssa-direct-positional", false);
           if (!selfRecursiveCallExpressions.size) {
             regionFragments.jvmDirectPositionalSource =
@@ -12351,8 +12414,10 @@ class JvmSsaBlockRenderer {
           ...declarations,
           ...directRenderedTree,
         ].filter(Boolean);
+        auditVariant("internal-region-positional",
+          internalRegionPositionalLines);
         internalRegionPositionalSource = specializeSelfRecursiveCalls(
-          ["'use strict';", ...internalRegionPositionalLines].join("\n"),
+          [sourceDirective(), ...internalRegionPositionalLines].join("\n"),
           "ssa-internal-region-positional", false);
         if (!selfRecursiveCallExpressions.size) {
           regionFragments.jvmInternalRegionPositionalSource =
@@ -12481,13 +12546,14 @@ class JvmSsaBlockRenderer {
           e`if (${restoringInitializationCondition}) { `,
           e`${leafBailStatement()} }`));
         const directBooleanGuard = guardedStaticBooleanSites.size
-          ? `if (${[...guardedStaticBooleanSites.values()].map((direct) => `((${
-            direct.kind === "map"
-              ? `${direct.variable}.get(${JSON.stringify(direct.key)})`
-              : `${direct.variable}[${JSON.stringify(direct.key)}]`} ? 1 : 0) !== ${
-            direct.guardedBooleanValue})`).join(" || ")}) { ` +
-            "helpers.structuredSsa.guardedBooleanFallbackCount += 1; " +
-            "return helpers.asyncInvokeSentinel(); }"
+          ? stmt(exprConcat(e`if (`,
+            ...[...guardedStaticBooleanSites.values()].flatMap(
+              (direct, position) => [
+                position === 0 ? "" : " || ",
+                guardedStaticBooleanConditions(direct),
+              ]),
+            e`) { helpers.structuredSsa.guardedBooleanFallbackCount += 1; return helpers.asyncInvokeSentinel(); }`),
+          {kind: "entryGuard"})
           : null;
         const initializeFrame = [
           st`frame = plan.target.freeFrame || new plan.Frame(plan.method);`,
@@ -12825,8 +12891,9 @@ class JvmSsaBlockRenderer {
           ...restoringIndentedBody,
           ...restoringWrapperClose,
         ];
+        auditVariant("restoring-positional", restoringPositionalLines);
         restoringDirectPositionalSource = specializeSelfRecursiveCalls(
-          ["'use strict';", ...restoringPositionalLines].join("\n"),
+          [sourceDirective(), ...restoringPositionalLines].join("\n"),
           "ssa-direct-restoring-positional", true);
         if (process.env.JVM_DEBUG_INSERTION_VETO &&
             selfRecursiveCallExpressions.size) {
@@ -12965,16 +13032,22 @@ class JvmSsaBlockRenderer {
           for (const info of countedRegionLoops) {
             checkedLeafCoarseLoopHeaders.add(info.header);
             checkedLeafTripDeclarations.push(
-              `const ssaCheckedLeafTrips${info.header} = ` +
-                `Math.max(0, ${info.boundExpression});`);
+              constDecl(named(`ssaCheckedLeafTrips${info.header}`),
+                e`Math.max(0, ${info.boundExpression})`));
           }
           const tripVariables = countedRegionLoops.map((info) =>
             `ssaCheckedLeafTrips${info.header}`);
           checkedLeafTripDeclarations.push(
-            `if (!(${tripVariables.map((variable) =>
-              `${variable} <= ${runtimeCoarseTripLimit}`).join(" && ")} && ` +
-              `${tripVariables.join(" * ")} <= 1000000)) ` +
-              "return helpers.asyncInvokeSentinel();",
+            stmt(exprConcat(e`if (!(`,
+              ...tripVariables.flatMap((variable, position) => [
+                position === 0 ? "" : " && ",
+                e`${variable} <= ${runtimeCoarseTripLimit}`,
+              ]),
+              e` && `,
+              ...tripVariables.flatMap((variable, position) =>
+                [position === 0 ? "" : " * ", e`${variable}`]),
+              e` <= 1000000)) return helpers.asyncInvokeSentinel();`),
+            {kind: "entryGuard"}),
           );
         }
         if (shrinkingArrayWindowLeaf) {
@@ -12991,64 +13064,88 @@ class JvmSsaBlockRenderer {
             const delta = `${prefix}Delta`;
             const maximumTrips = Math.min(
               runtimeCoarseTripLimit, Math.floor(Math.sqrt(1_000_000)));
+            const windowGuard = named(shape.variable);
+            const windowThreshold = named(threshold);
+            const windowDelta = named(delta);
             checkedLeafTripDeclarations.push(
-              `const ${threshold} = local${shape.lowerSlot} + ` +
-                `${shape.window};`,
-              `let ${shape.variable} = ` +
-                `local${shape.lowerSlot} <= ${2147483647 - shape.window};`,
-              `if (${shape.variable} && ` +
-                `local${shape.upperSlot} >= ${threshold}) {`,
-              `  const ${delta} = local${shape.upperSlot} - ` +
-                `local${shape.lowerSlot};`,
-              `  ${shape.variable} = ` +
-                `(` +
-                `local${shape.lowerSlot} >= 0 && ` +
-                `local${shape.upperSlot} <= ${shape.arrayData}.length && ` +
-                `${delta} % ${shape.stride} === 0 && ` +
-                `${delta} / ${shape.stride} - 1 <= ${maximumTrips});`,
-              `}`,
-              `if (!${shape.variable}) ` +
-                "return helpers.asyncInvokeSentinel();",
+              constDecl(windowThreshold, exprConcat(
+                e`${localName(shape.lowerSlot)} + `, e`${shape.window}`)),
+              letDecl(windowGuard, exprConcat(
+                e`${localName(shape.lowerSlot)} <= `,
+                e`${2147483647 - shape.window}`)),
+              stmt(exprConcat(e`if (${windowGuard} && `,
+                e`${localName(shape.upperSlot)} >= ${windowThreshold}) {`),
+              {kind: "entryGuard"}),
+              `  ${constDecl(windowDelta, exprConcat(
+                e`${localName(shape.upperSlot)} - `,
+                e`${localName(shape.lowerSlot)}`))}`,
+              `  ${storeLocal(windowGuard, exprConcat(
+                e`(`,
+                e`${localName(shape.lowerSlot)} >= 0 && `,
+                e`${localName(shape.upperSlot)} <= ${shape.arrayData}.length && `,
+                e`${windowDelta} % ${shape.stride} === 0 && `,
+                e`${windowDelta} / ${shape.stride} - 1 <= ${maximumTrips})`))}`,
+              blockEnd(),
+              stmt(e`if (!${windowGuard}) return helpers.asyncInvokeSentinel();`,
+                {kind: "entryGuard"}),
             );
-          } else checkedLeafTripDeclarations.push(
-            `const ${threshold} = local${shape.lowerSlot} + ` +
-              `${shape.window};`,
-            `const ${outerTrips} = local${shape.upperSlot} < ${threshold} ` +
-              `? 0 : Math.floor((local${shape.upperSlot} - ${threshold}) / ` +
-              `${shape.stride}) + 1;`,
-            `const ${innerTrips} = ${outerTrips} === 0 ? 0 : ` +
-              `(local${shape.upperSlot} - local${shape.lowerSlot}) / ` +
-              `${shape.stride} - 1;`,
-            `const ${shape.variable} = ` +
-              `(local${shape.lowerSlot} <= ${2147483647 - shape.window} && ` +
-              `(${outerTrips} === 0 || (` +
-              `local${shape.lowerSlot} >= 0 && ` +
-              `local${shape.upperSlot} <= ${shape.arrayData}.length && ` +
-              `(local${shape.upperSlot} - local${shape.lowerSlot}) % ` +
-              `${shape.stride} === 0 && ${outerTrips} <= ` +
-              `${runtimeCoarseTripLimit} && ${innerTrips} >= 0 && ` +
-              `${innerTrips} <= ${runtimeCoarseTripLimit} && ` +
-              `${outerTrips} * ${innerTrips} <= 1000000)));`,
-            `if (!${shape.variable}) ` +
-              "return helpers.asyncInvokeSentinel();",
-          );
+          } else {
+            const windowGuard = named(shape.variable);
+            const windowThreshold = named(threshold);
+            const windowOuterTrips = named(outerTrips);
+            const windowInnerTrips = named(innerTrips);
+            checkedLeafTripDeclarations.push(
+              constDecl(windowThreshold, exprConcat(
+                e`${localName(shape.lowerSlot)} + `, e`${shape.window}`)),
+              constDecl(windowOuterTrips, exprConcat(
+                e`${localName(shape.upperSlot)} < ${windowThreshold} `,
+                e`? 0 : Math.floor((${localName(shape.upperSlot)} - ${
+                  windowThreshold}) / `,
+                e`${shape.stride}) + 1`)),
+              constDecl(windowInnerTrips, exprConcat(
+                e`${windowOuterTrips} === 0 ? 0 : `,
+                e`(${localName(shape.upperSlot)} - ${
+                  localName(shape.lowerSlot)}) / `,
+                e`${shape.stride} - 1`)),
+              constDecl(windowGuard, exprConcat(
+                e`(${localName(shape.lowerSlot)} <= ${
+                  2147483647 - shape.window} && `,
+                e`(${windowOuterTrips} === 0 || (`,
+                e`${localName(shape.lowerSlot)} >= 0 && `,
+                e`${localName(shape.upperSlot)} <= ${shape.arrayData}.length && `,
+                e`(${localName(shape.upperSlot)} - ${
+                  localName(shape.lowerSlot)}) % `,
+                e`${shape.stride} === 0 && ${windowOuterTrips} <= `,
+                e`${runtimeCoarseTripLimit} && ${windowInnerTrips} >= 0 && `,
+                e`${windowInnerTrips} <= ${runtimeCoarseTripLimit} && `,
+                e`${windowOuterTrips} * ${windowInnerTrips} <= 1000000)))`)),
+              stmt(e`if (!${windowGuard}) return helpers.asyncInvokeSentinel();`,
+                {kind: "entryGuard"}),
+            );
+          }
         }
         if (recursiveArrayPartitionLeaf) {
           const shape = recursiveArrayPartitionLeaf;
           const delta = `ssaRecursiveArrayWindow${shape.header}Delta`;
           checkedLeafCoarseLoopHeaders.add(shape.header);
           arrayRangeGuardDataVariables.set(shape.variable, shape.arrayData);
+          const partitionGuard = named(shape.variable);
+          const partitionDelta = named(delta);
           checkedLeafTripDeclarations.push(
-            `const ${delta} = local${shape.upperSlot} - ` +
-              `local${shape.lowerSlot};`,
-            `const ${shape.variable} = (` +
-              `local${shape.lowerSlot} >= 0 && ` +
-              `local${shape.upperSlot} >= local${shape.lowerSlot} && ` +
-              `local${shape.upperSlot} <= ${shape.arrayData}.length && ` +
-              `${delta} % ${shape.stride} === 0 && ` +
-              `${delta} / ${shape.stride} <= ${runtimeCoarseTripLimit});`,
-            `if (!${shape.variable}) ` +
-              "return helpers.asyncInvokeSentinel();",
+            constDecl(partitionDelta, exprConcat(
+              e`${localName(shape.upperSlot)} - `,
+              e`${localName(shape.lowerSlot)}`)),
+            constDecl(partitionGuard, exprConcat(
+              e`(`,
+              e`${localName(shape.lowerSlot)} >= 0 && `,
+              e`${localName(shape.upperSlot)} >= ${
+                localName(shape.lowerSlot)} && `,
+              e`${localName(shape.upperSlot)} <= ${shape.arrayData}.length && `,
+              e`${partitionDelta} % ${shape.stride} === 0 && `,
+              e`${partitionDelta} / ${shape.stride} <= ${
+                runtimeCoarseTripLimit})`)),
+            stmt(e`if (!${partitionGuard}) return helpers.asyncInvokeSentinel();`,
+              {kind: "entryGuard"}),
           );
         }
         const deepestCountedLoop = countedRegionLoops.at(-1) || null;
@@ -13405,7 +13502,7 @@ class JvmSsaBlockRenderer {
             ].filter(Boolean);
             recursiveArrayWorkerSource =
               specializeCheckedLeafSelfRecursiveCalls(
-                ["'use strict';", ...workerBody].join("\n"),
+                [sourceDirective(), ...workerBody].join("\n"),
                 "ssa-recursive-array-worker", true,
               );
             if (recursiveArrayWorkerSource) {
@@ -13448,7 +13545,8 @@ class JvmSsaBlockRenderer {
             ? entryArrayDataSlots.map((slot) => {
               const feed = inline.feeds.get(entryArrayArgumentIndex(slot));
               return feed
-                ? `const ${entryArrayDataVariable(slot)} = ${feed.expression};`
+                ? constDecl(entryArrayDataVariable(slot),
+                  e`${feed.expression}`)
                 : entryArrayDataDeclarationFor(slot);
             })
             : entryArrayDataDeclarations;
@@ -13461,8 +13559,10 @@ class JvmSsaBlockRenderer {
             const guarded = guardedArrayDataVariables
               .filter((data) => !fed.has(data));
             return guarded.length
-              ? `if (${guarded.map((data) => `${data} === null`)
-                .join(" || ")}) { ${CHECKED_LEAF_BAIL} }`
+              ? stmt(exprConcat(e`if (`,
+                ...guarded.flatMap((data, position) =>
+                  [position === 0 ? "" : " || ", e`${data} === null`]),
+                e`) { ${CHECKED_LEAF_BAIL} }`), {kind: "entryGuard"})
               : null;
           };
           const checkedLeafFramedTreeFor = (inline) => {
@@ -13479,8 +13579,9 @@ class JvmSsaBlockRenderer {
             return [
               ...treeLines,
               directMethodDescriptor.returnType === "void"
-                ? "return helpers.returnVoid();"
-                : `return ${checkedLeafResultVariable};`,
+                ? st`return helpers.returnVoid();`
+                : stmt(e`return ${checkedLeafResultVariable};`,
+                  {kind: "checkedLeafReturn"}),
             ];
           };
           const checkedLeafBodyFor = ({
@@ -13503,18 +13604,21 @@ class JvmSsaBlockRenderer {
                   recursiveArrayPartitionLeaf.lowerSlot,
                   recursiveArrayPartitionLeaf.upperSlot,
                 ].map((slot) =>
-                  `const local${slot} = ${entryArgumentValue(slot)};`),
+                  constDecl(localName(slot), e`${entryArgumentValue(slot)}`)),
                 ...checkedLeafTripDeclarations,
-                `return ssaRecursiveArrayWorker(${[
-                  entryArrayDataVariable(
-                    recursiveArrayPartitionLeaf.arraySlot),
-                  ...argumentNames.slice(1),
-                ].join(", ")});`,
+                stmt(exprConcat(e`return ssaRecursiveArrayWorker(`,
+                  ...[
+                    entryArrayDataVariable(
+                      recursiveArrayPartitionLeaf.arraySlot),
+                    ...argumentNames.slice(1),
+                  ].flatMap((name, position) =>
+                    [position === 0 ? "" : ", ", e`${name}`]),
+                  e`);`), {kind: "checkedLeafReturn"}),
               ].filter(Boolean)
               : [
                 // The result slot precedes every guard: a lexical insertion
                 // routes its prologue exits to this slot as well.
-                `let ${checkedLeafResultVariable};`,
+                letDecl(checkedLeafResultVariable),
                 ...directStaticDeclarations,
                 ...lazyStaticDeclarations,
                 ...directEntryStaticReadDeclarations,
@@ -13614,12 +13718,13 @@ class JvmSsaBlockRenderer {
             if (!trustedCheckedLeafBody) {
               throw new Error("failed to specialize trusted checked leaf");
             }
-            checkedLeafDirectPositionalSource = [
-              "'use strict';",
-              restoringInitializationGuardDeclaration,
-              directGuard,
-              ...checkedLeafBody,
-            ].join("\n");
+            checkedLeafDirectPositionalSource = auditVariant(
+              "checked-leaf", [
+                sourceDirective(),
+                restoringInitializationGuardDeclaration,
+                directGuard,
+                ...checkedLeafBody,
+              ]).join("\n");
             checkedLeafDirectPositionalBody =
               createStructuredFunction(
                 "ssa-checked-leaf-positional",
@@ -13641,12 +13746,13 @@ class JvmSsaBlockRenderer {
             // declines to inline it. The child class-initialization epoch and
             // every array/range predicate remain in this entry; only the
             // already-dominated outer-entry condition is specialized.
-            trustedCheckedLeafDirectPositionalSource = [
-              "'use strict';",
-              restoringInitializationGuardDeclaration,
-              trustedDirectGuard,
-              ...trustedCheckedLeafBody,
-            ].join("\n");
+            trustedCheckedLeafDirectPositionalSource = auditVariant(
+              "trusted-checked-leaf", [
+                sourceDirective(),
+                restoringInitializationGuardDeclaration,
+                trustedDirectGuard,
+                ...trustedCheckedLeafBody,
+              ]).join("\n");
             trustedCheckedLeafDirectPositionalBody =
               createStructuredFunction(
                 "ssa-trusted-checked-leaf-positional",
@@ -13670,10 +13776,11 @@ class JvmSsaBlockRenderer {
               if (!preflightedCheckedLeafBody) {
                 throw new Error("failed to specialize preflighted checked leaf");
               }
-              preflightedCheckedLeafDirectPositionalSource = [
-                "'use strict';",
-                ...preflightedCheckedLeafBody,
-              ].join("\n");
+              preflightedCheckedLeafDirectPositionalSource = auditVariant(
+                "preflighted-checked-leaf", [
+                  sourceDirective(),
+                  ...preflightedCheckedLeafBody,
+                ]).join("\n");
               preflightedCheckedLeafDirectPositionalBody =
                 createStructuredFunction(
                   "ssa-preflighted-checked-leaf-positional",
@@ -13704,7 +13811,7 @@ class JvmSsaBlockRenderer {
                   `ssaCapturedStatic${captureArguments.length}`;
                 captureArguments.push(valueArgument);
                 captureDeclarations.push(
-                  `const ${cache.value} = ${valueArgument};`);
+                  constDecl(cache.value, e`${valueArgument}`));
                 const capture = {
                   targetId: cache.direct.targetId,
                   kind: cache.direct.kind,
@@ -13718,13 +13825,13 @@ class JvmSsaBlockRenderer {
                     `ssaCapturedStatic${captureArguments.length}`;
                   captureArguments.push(dataArgument);
                   captureDeclarations.push(
-                    `const ${cache.data} = ${dataArgument};`);
+                    constDecl(cache.data, e`${dataArgument}`));
                 }
                 captures.push(capture);
               }
               capturedCheckedLeafBodyFor = (inline = null) =>
                 [
-                  `let ${checkedLeafResultVariable};`,
+                  letDecl(checkedLeafResultVariable),
                   ...captureDeclarations,
                   !inline && this.runCountersEnabled
                     ? st`helpers.structuredSsa.restoringDirectRunCount += 1;`
@@ -13748,12 +13855,13 @@ class JvmSsaBlockRenderer {
                   ...checkedLeafFramedTreeFor(inline),
                 ].filter(Boolean);
               const capturedBody = capturedCheckedLeafBodyFor();
-              capturedCheckedLeafDirectPositionalSource = [
-                "'use strict';",
-                restoringInitializationGuardDeclaration,
-                directGuard,
-                ...capturedBody,
-              ].join("\n");
+              capturedCheckedLeafDirectPositionalSource = auditVariant(
+                "captured-checked-leaf", [
+                  sourceDirective(),
+                  restoringInitializationGuardDeclaration,
+                  directGuard,
+                  ...capturedBody,
+                ]).join("\n");
               capturedCheckedLeafDirectPositionalBody =
                 createStructuredFunction(
                   "ssa-captured-checked-leaf-positional",
@@ -14161,6 +14269,15 @@ class JvmSsaBlockRenderer {
       // never emitted characters. A statement whose parts no longer render
       // its line -- a late expansion the fragment could not follow -- is
       // published without them and is not relocatable.
+      // The statement-IR audit covers the *whole* published source of every
+      // variant, not merely the bodies a line-level pass runs over: an
+      // emitter that stops recording a prologue line is reported here even
+      // when no pass would have looked at it.
+      if (process.env.JVM_JIT_VERIFY_STATEMENT_IR) {
+        for (const [label, lines] of publishedVariantLines) {
+          auditStatementIrLines(lines, statementRecords, emittedNames, label);
+        }
+      }
       const publishedRegionStatement = (statement, line) => {
         // Every line of a published fragment has a record: `regionFragmentsOf`
         // refuses a body that contains a line no emitter recorded.
