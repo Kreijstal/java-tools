@@ -455,11 +455,18 @@ function partsWriteThrowOrTry(parts) {
 function partsReturnPositions(parts) {
   const skeleton = partsSkeleton(parts);
   const positions = [];
-  for (let at = skeleton.indexOf("return"); at >= 0;
-    at = skeleton.indexOf("return", at + 1)) {
-    const next = skeleton[at + 6];
-    if (next !== " " && next !== ";") continue;
-    if (!/(?:^|[{};)])\s*$/.test(skeleton.slice(0, at))) continue;
+  let quote = null;
+  for (let at = 0; at + 6 <= skeleton.length; at += 1) {
+    const character = skeleton[at];
+    if (quote) {
+      if (character === "\\") { at += 1; continue; }
+      if (character === quote) quote = null;
+      continue;
+    }
+    if (character === "'" || character === '"') { quote = character; continue; }
+    if (character !== "r" || !skeleton.startsWith("return", at)) continue;
+    if (isPartsWordCharacter(skeleton[at - 1]) ||
+        isPartsWordCharacter(skeleton[at + 6])) continue;
     positions.push(at);
   }
   return positions;
@@ -499,7 +506,19 @@ function splitReturnParts(parts) {
   if (positions.length !== 1) return null;
   const skeleton = partsSkeleton(parts);
   const at = positions[0];
-  const end = skeleton.indexOf(";", at);
+  // The statement terminator, outside any rendered string literal.
+  let end = -1;
+  let quote = null;
+  for (let index = at + 6; index < skeleton.length; index += 1) {
+    const character = skeleton[index];
+    if (quote) {
+      if (character === "\\") { index += 1; continue; }
+      if (character === quote) quote = null;
+      continue;
+    }
+    if (character === "'" || character === '"') { quote = character; continue; }
+    if (character === ";") { end = index; break; }
+  }
   if (end < 0) return null;
   const valueStart = skeleton[at + 6] === ";" ? end : at + 7;
   const before = slicePartsRange(parts, 0, at);
