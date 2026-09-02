@@ -10,6 +10,7 @@
 
 // Import the generated JRE index for real class implementations
 const jreClasses = require('../jre/index');
+const { StaticFieldStore } = require('./StaticFieldStore');
 
 // Synthesised JRE methods are public unless the model says otherwise. The
 // assumption is right almost everywhere, but not for the two protected members
@@ -99,7 +100,7 @@ class JreBootstrap {
           ],
         },
         constantPool: [],
-        staticFields: new Map(),
+        staticFields: new StaticFieldStore(),
         isJreStub: true,
       methods: jreClassDef.methods || {},
       staticMethods: jreClassDef.staticMethods || {},
@@ -163,7 +164,7 @@ class JreBootstrap {
                   ],
                 },
                 constantPool: [],
-                staticFields: new Map(),
+                staticFields: new StaticFieldStore(),
                 isJreStub: true,
               };
 
@@ -724,7 +725,7 @@ class JreBootstrap {
         ],
       },
       constantPool: [],
-      staticFields: new Map(),
+      staticFields: new StaticFieldStore(),
       isJreStub: true,
       methods: jreClassDef.methods || {},
       staticMethods: jreClassDef.staticMethods || {},

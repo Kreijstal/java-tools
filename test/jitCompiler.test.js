@@ -1860,7 +1860,8 @@ public final class BlockArrayDataViewHarness {
   t.equal(generated.jvmStructuredBlockArrayDataViewCount, 1,
     'four loads from one local array share one raw-storage snapshot');
   t.equal((generated.jvmStructuredSource.match(/\.elements \?/g) || []).length,
-    0, 'the normal path contains no repeated array-representation branches');
+    1, 'the normal path selects the array representation once at the shared ' +
+    'snapshot and never per load');
 
   const run = (source, index) => {
     const frame = new Frame(method);
@@ -4926,7 +4927,7 @@ public final class RenamedShrinkingWindowHarness {
     'an arbitrarily named wrapper receives the lexical checked child');
   t.equal(wrapperGenerated?.jvmStructuredLexicalCheckedLeafCallCount, 1,
     'the wrapper is selected by verified call and CFG structure');
-  t.equal((wrapperSource.match(/helpers\.arrayData\(/g) || []).length, 1,
+  t.equal((wrapperSource.match(/ArrayBuffer\.isView\(/g) || []).length, 1,
     'the lexical child consumes the caller raw-array operand without re-extracting it');
   t.notOk(wrapperSource.includes(
     'const ssaEntryArrayData0 = ssaEntryArrayData0'),
@@ -8343,7 +8344,7 @@ public final class StructuredProducedArrayLocalHarness {
   t.equal(allocated.jvmStructuredPersistentProducedArrayLocalViewCount, 1,
     'a newarray result receives one dominated raw companion');
   t.ok(allocatedSource.includes('ssaProducedArrayLocalData') &&
-      !allocatedSource.includes('.elements ?'),
+      (allocatedSource.match(/\.elements \?/g) || []).length <= 1,
     'the numeric loop no longer performs per-element representation selection');
 
   const run = (limit) => {
@@ -9339,8 +9340,9 @@ public class ScalarFeatureHarness {
     'normal synchronous calls defer parent Frame materialization');
   t.notOk(structured.generated.jvmStructuredSource.includes('getStaticSyncAt'),
     'initialized static target is read directly without the generic helper');
-  t.ok(structured.generated.jvmStructuredSource.includes('.get("staticBias:I")'),
-    'direct static access retains a live read from the canonical field map');
+  t.ok(structured.generated.jvmStructuredSource.includes(
+    '.cell.value /* staticBias:I */'),
+  'direct static access reads the live value cell of the canonical field map');
   t.ok(structured.generated.jvmStructuredSource.includes(
     'structuredSsa.classInitializationGuards'),
   'structured entry uses an epoch-keyed class-initialization proof');

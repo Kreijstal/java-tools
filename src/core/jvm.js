@@ -1,4 +1,5 @@
 const Stack = require("./stack");
+const { StaticFieldStore } = require("./StaticFieldStore");
 const CallStack = require("./callStack");
 const { releaseFrameMonitor } = CallStack;
 const FRAME_STATIC_KIND = Symbol("frame.staticKind");
@@ -449,7 +450,7 @@ class JVM {
       // Handle static field overrides
       if (classOverrides.staticFields) {
         if (!this.jre[className].staticFields) {
-          this.jre[className].staticFields = new Map();
+          this.jre[className].staticFields = new StaticFieldStore();
         }
         for (const [fieldName, fieldValue] of Object.entries(
           classOverrides.staticFields,
@@ -2203,7 +2204,7 @@ class JVM {
     try {
       const classData = await loadClassByPath(classFilePath, options);
       if (classData) {
-        classData.staticFields = new Map();
+        classData.staticFields = new StaticFieldStore();
         this.classes[classData.ast.classes[0].className] = classData;
       }
       return classData;
@@ -2212,7 +2213,7 @@ class JVM {
       try {
         const classData = loadConvertedClass(classFilePath, options);
         if (classData) {
-          classData.staticFields = new Map();
+          classData.staticFields = new StaticFieldStore();
           this.classes[classData.ast.classes[0].className] = classData;
         }
         return classData;
@@ -2244,7 +2245,7 @@ class JVM {
     const classData = {
       ast: convertedAst,
       constantPool: rawAst.constantPool,
-      staticFields: new Map(),
+      staticFields: new StaticFieldStore(),
     };
 
     this.classes[classData.ast.classes[0].className] = classData;
@@ -2566,7 +2567,7 @@ class JVM {
       // Initialize static fields with default values first
       if (!classData.staticFields || !classData.staticFieldsInitialized) {
         if (!classData.staticFields) {
-          classData.staticFields = new Map();
+          classData.staticFields = new StaticFieldStore();
         }
         classData.staticFieldsInitialized = true;
 

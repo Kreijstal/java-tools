@@ -7,6 +7,7 @@ const {
 } = require("../decompiler/structurer");
 const { splitIrreducibleTerms } = require("../decompiler/exceptionStructurer");
 const { parseDescriptor } = require("../parsing/typeParser");
+const { arrayDataExpression, matchEntryArrayDataLine } = require("./arrayDataExpression");
 const { buildSsa } = require("../analysis/opgraph/ssa");
 const { kindWidth } = require("../analysis/opgraph/ssaTypes");
 const { parse: parseJavaScript } = require("acorn");
@@ -3281,7 +3282,7 @@ class JvmSsaBlockRenderer {
               persistentStaticArrayStoreViews.get(index);
             if (persistentArrayView) {
               lines.push(`${persistentArrayView.data} = ${
-                arrayViews.get(input) || `helpers.arrayData(${input})`};`);
+                arrayViews.get(input) || `${arrayDataExpression(input)}`};`);
             }
             localValues[slot] = this.localValueNumberingEnabled ? input : null;
           }
@@ -3642,7 +3643,7 @@ class JvmSsaBlockRenderer {
             if (!arrayData && op !== "aaload" &&
                 this.blockArrayDataViewsEnabled) {
               arrayData = value();
-              lines.push(`const ${arrayData} = helpers.arrayData(${array});`);
+              lines.push(`const ${arrayData} = ${arrayDataExpression(array)};`);
               arrayViews.set(arrayInput, arrayData);
               arrayViews.set(array, arrayData);
               dynamicBlockArrayViews.add(arrayData);
@@ -3759,7 +3760,7 @@ class JvmSsaBlockRenderer {
             if (!arrayData && op !== "aastore" &&
                 this.blockArrayDataViewsEnabled) {
               arrayData = value();
-              lines.push(`const ${arrayData} = helpers.arrayData(${array});`);
+              lines.push(`const ${arrayData} = ${arrayDataExpression(array)};`);
               arrayViews.set(arrayInput, arrayData);
               arrayViews.set(array, arrayData);
               dynamicBlockArrayViews.add(arrayData);
@@ -3970,7 +3971,7 @@ class JvmSsaBlockRenderer {
                 `  ${out} = ${directRead};`,
                 `  ${cache.object} = ${object};`,
                 `  ${cache.value} = ${out};`,
-                ...(cache.isArray ? [`  ${cache.data} = helpers.arrayData(${out});`] : []),
+                ...(cache.isArray ? [`  ${cache.data} = ${arrayDataExpression(out)};`] : []),
                 `  ${cache.valid} = true;`, "}");
             } else if (!cache) {
               lines.push(`const ${out} = ${directRead};`);
@@ -4083,7 +4084,7 @@ class JvmSsaBlockRenderer {
               let data = null;
               if (direct.descriptor?.startsWith("[")) {
                 data = value();
-                lines.push(`const ${data} = helpers.arrayData(${out});`);
+                lines.push(`const ${data} = ${arrayDataExpression(out)};`);
                 arrayViews.set(out, data);
                 arrayKinds.set(out, direct.descriptor);
               }
@@ -4136,7 +4137,7 @@ class JvmSsaBlockRenderer {
                   `  ${cache.value} = ${normalizeJvmScalarExpression(
                     out, cache.descriptor)};`,
                   ...(cache.data
-                    ? [`  ${cache.data} = helpers.arrayData(${out});`]
+                    ? [`  ${cache.data} = ${arrayDataExpression(out)};`]
                     : []),
                   `  ${cache.valid} = Boolean(${lazy.variable});`,
                   "}",
@@ -4500,17 +4501,16 @@ class JvmSsaBlockRenderer {
                   const fedNonNullEntryArrays = new Set();
                   childLines = childLines.map((line) => {
                     let rewritten = line;
-                    const entryArray = /^([\s]*)const (ssaEntryArrayData\d+) = helpers\.arrayData\(argument(\d+)\);$/.exec(
-                      rewritten);
+                    const entryArray = matchEntryArrayDataLine(rewritten);
                     if (entryArray) {
-                      const argument = Number(entryArray[3]);
-                      const view = positionalArgumentArrayData[argument];
+                      const view =
+                        positionalArgumentArrayData[entryArray.argument];
                       if (view) {
-                        rewritten = entryArray[2] === view.data
+                        rewritten = entryArray.variable === view.data
                           ? ""
-                          : `${entryArray[1]}const ${entryArray[2]} = ${view.data};`;
+                          : `${entryArray.indent}const ${entryArray.variable} = ${view.data};`;
                         if (view.nonNull) {
-                          fedNonNullEntryArrays.add(entryArray[2]);
+                          fedNonNullEntryArrays.add(entryArray.variable);
                         }
                       }
                     }
@@ -5319,7 +5319,7 @@ class JvmSsaBlockRenderer {
             cache, `local${cache.eagerLocal}`)
           : `helpers.getFieldAt(${cache.site}, local${cache.eagerLocal})`};`,
         ...(cache.isArray ? [
-          `  ${cache.data} = helpers.arrayData(${cache.value});`,
+          `  ${cache.data} = ${arrayDataExpression(cache.value)};`,
         ] : []),
         "}",
       ]);
@@ -5327,7 +5327,8 @@ class JvmSsaBlockRenderer {
       [...entryStaticReadCaches.values()].flatMap((cache) => {
         if (cache.lazy) {
           const lazy = cache.lazy;
-          const read = `${lazy.variable}.kind === "map" ? ` +
+          const read = `${lazy.variable}.cell ? ${lazy.variable}.cell.value : ` +
+            `${lazy.variable}.kind === "map" ? ` +
             `${lazy.variable}.fields.get(${lazy.variable}.key) : ` +
             `${lazy.variable}.fields[${lazy.variable}.key]`;
           return [
@@ -5336,20 +5337,23 @@ class JvmSsaBlockRenderer {
             `${cache.value} = ${cache.valid} ? ${read} : undefined;`,
             ...(cache.data
               ? [`${cache.data} = ${cache.valid} ? ` +
-                `helpers.arrayData(${cache.value}) : null;`]
+                `${arrayDataExpression(cache.value)} : null;`]
               : []),
           ];
         }
         const direct = cache.direct;
         const fields =
           `helpers.directStaticTargets[${direct.targetId}].fields`;
-        const read = direct.kind === "map"
-          ? `${fields}.get(${JSON.stringify(direct.key)})`
-          : `${fields}[${JSON.stringify(direct.key)}]`;
+        const read = direct.cell
+          ? `helpers.directStaticTargets[${direct.targetId}].cell.value` +
+            ` /* ${direct.key} */`
+          : direct.kind === "map"
+            ? `${fields}.get(${JSON.stringify(direct.key)})`
+            : `${fields}[${JSON.stringify(direct.key)}]`;
         return [
           `${cache.value} = ${read};`,
           ...(cache.data
-            ? [`${cache.data} = helpers.arrayData(${cache.value});`]
+            ? [`${cache.data} = ${arrayDataExpression(cache.value)};`]
             : []),
         ];
       });
@@ -8998,7 +9002,7 @@ class JvmSsaBlockRenderer {
               : `${view.direct.variable}[${key}]`;
             return [
               `const ${view.value} = ${read};`,
-              `const ${view.data} = helpers.arrayData(${view.value});`,
+              `const ${view.data} = ${arrayDataExpression(view.value)};`,
             ];
           }),
           ...(arrayRangeGuardDeclarations.get(header) || []),
@@ -9245,7 +9249,8 @@ class JvmSsaBlockRenderer {
       [...entryStaticReadCaches.values()].flatMap((cache) => {
         if (cache.lazy) {
           const lazy = cache.lazy;
-          const read = `${lazy.variable}.kind === "map" ? ` +
+          const read = `${lazy.variable}.cell ? ${lazy.variable}.cell.value : ` +
+            `${lazy.variable}.kind === "map" ? ` +
             `${lazy.variable}.fields.get(${lazy.variable}.key) : ` +
             `${lazy.variable}.fields[${lazy.variable}.key]`;
           return [
@@ -9254,21 +9259,24 @@ class JvmSsaBlockRenderer {
               `${normalizeJvmScalarExpression(read, cache.descriptor)} : undefined;`,
             ...(cache.data
               ? [`let ${cache.data} = ${cache.valid} ? ` +
-                `helpers.arrayData(${cache.value}) : null;`]
+                `${arrayDataExpression(cache.value)} : null;`]
               : []),
           ];
         }
         const direct = cache.direct;
         const fields =
           `helpers.directStaticTargets[${direct.targetId}].fields`;
-        const read = direct.kind === "map"
-          ? `${fields}.get(${JSON.stringify(direct.key)})`
-          : `${fields}[${JSON.stringify(direct.key)}]`;
+        const read = direct.cell
+          ? `helpers.directStaticTargets[${direct.targetId}].cell.value` +
+            ` /* ${direct.key} */`
+          : direct.kind === "map"
+            ? `${fields}.get(${JSON.stringify(direct.key)})`
+            : `${fields}[${JSON.stringify(direct.key)}]`;
         return [
           `let ${cache.value} = ` +
             `${normalizeJvmScalarExpression(read, cache.descriptor)};`,
           ...(cache.data
-            ? [`let ${cache.data} = helpers.arrayData(${cache.value});`]
+            ? [`let ${cache.data} = ${arrayDataExpression(cache.value)};`]
             : []),
         ];
       });
@@ -9287,19 +9295,23 @@ class JvmSsaBlockRenderer {
             const direct = cache.direct;
             const fields =
               `helpers.directStaticTargets[${direct.targetId}].fields`;
-            const read = direct.kind === "map"
-              ? `${fields}.get(${JSON.stringify(direct.key)})`
-              : `${fields}[${JSON.stringify(direct.key)}]`;
+            const read = direct.cell
+              ? `helpers.directStaticTargets[${direct.targetId}].cell.value` +
+            ` /* ${direct.key} */`
+              : direct.kind === "map"
+                ? `${fields}.get(${JSON.stringify(direct.key)})`
+                : `${fields}[${JSON.stringify(direct.key)}]`;
             return [
               `let ${cache.value} = ` +
                 `${normalizeJvmScalarExpression(read, cache.descriptor)};`,
               ...(cache.data
-                ? [`let ${cache.data} = helpers.arrayData(${cache.value});`]
+                ? [`let ${cache.data} = ${arrayDataExpression(cache.value)};`]
                 : []),
             ];
           }
           const lazy = cache.lazy;
-          const read = `${lazy.variable}.kind === "map" ? ` +
+          const read = `${lazy.variable}.cell ? ${lazy.variable}.cell.value : ` +
+            `${lazy.variable}.kind === "map" ? ` +
             `${lazy.variable}.fields.get(${lazy.variable}.key) : ` +
             `${lazy.variable}.fields[${lazy.variable}.key]`;
           return [
@@ -9317,7 +9329,7 @@ class JvmSsaBlockRenderer {
             `${cache.value} = ` +
               `${normalizeJvmScalarExpression(cache.value, cache.descriptor)};`,
             ...(cache.data
-              ? [`let ${cache.data} = helpers.arrayData(${cache.value});`]
+              ? [`let ${cache.data} = ${arrayDataExpression(cache.value)};`]
               : []),
           ];
         });
@@ -9535,7 +9547,7 @@ class JvmSsaBlockRenderer {
             cache, `local${cache.eagerLocal}`)
           : `helpers.getFieldAt(${cache.site}, local${cache.eagerLocal})`};`,
         ...(cache.isArray ? [
-          `  ${cache.data} = helpers.arrayData(${cache.value});`,
+          `  ${cache.data} = ${arrayDataExpression(cache.value)};`,
         ] : []),
         `  ${cache.valid} = true;`,
         "}",
@@ -9592,7 +9604,7 @@ class JvmSsaBlockRenderer {
         }
         if (cache.isArray) {
           restoringDirectFieldCacheInitializations.push(
-            `${cache.data} = helpers.arrayData(${cache.value});`,
+            `${cache.data} = ${arrayDataExpression(cache.value)};`,
           );
         }
         restoringDirectFieldCacheInitializations.push(
@@ -9615,7 +9627,7 @@ class JvmSsaBlockRenderer {
               cache, `local${cache.eagerLocal}`)
             : `helpers.getFieldAt(${cache.site}, local${cache.eagerLocal})`};`,
           ...(cache.isArray
-            ? [`  ${cache.data} = helpers.arrayData(${cache.value});`] : []),
+            ? [`  ${cache.data} = ${arrayDataExpression(cache.value)};`] : []),
           `  ${cache.valid} = true;`,
           "}",
         ]),
@@ -9645,7 +9657,7 @@ class JvmSsaBlockRenderer {
         );
         if (cache.isArray) {
           transactionalFieldReadCacheInitializations.push(
-            `const ${cache.data} = helpers.arrayData(${cache.value});`,
+            `const ${cache.data} = ${arrayDataExpression(cache.value)};`,
           );
         }
       }
@@ -9706,7 +9718,7 @@ class JvmSsaBlockRenderer {
         declaredLocals.includes(slot) &&
         renderedTreeSource.includes(entryArrayDataVariable(slot)))
       .map((slot) =>
-        `const ${entryArrayDataVariable(slot)} = helpers.arrayData(local${slot});`);
+        `const ${entryArrayDataVariable(slot)} = ${arrayDataExpression(`local${slot}`)};`);
     const persistentStaticArrayDataDeclarations =
       [...persistentStaticArrayLocalViews.values(),
         ...persistentProducedArrayLocalViews.values()].map((view) =>
@@ -11712,7 +11724,7 @@ class JvmSsaBlockRenderer {
                   : null,
                 `const ${entryArrayDataVariable(
                   recursiveArrayPartitionLeaf.arraySlot)} = ` +
-                  `helpers.arrayData(argument0);`,
+                  `${arrayDataExpression(`argument0`)};`,
                 directArrayDataGuard,
                 ...[
                   recursiveArrayPartitionLeaf.lowerSlot,

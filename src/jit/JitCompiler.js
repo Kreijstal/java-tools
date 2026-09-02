@@ -1,3 +1,4 @@
+const { arrayDataExpression } = require("./arrayDataExpression");
 const Frame = require("../core/frame");
 const { ASYNC_METHOD_SENTINEL } = require("../core/constants");
 const { parseDescriptor } = require("../parsing/typeParser");
@@ -3708,11 +3709,11 @@ class JitCompiler {
       ...[...usedLocals].sort((a, b) => a - b)
         .map((index) => `let local${index} = locals[${index}];`),
       ...(ssaOptimizations ? [...referenceLocals].sort((a, b) => a - b)
-        .map((index) => `let local${index}ArrayData = helpers.arrayData(local${index});`) : []),
+        .map((index) => `let local${index}ArrayData = ${arrayDataExpression(`local${index}`)};`) : []),
       ...Array.from({ length: maxStackDepth }, (_unused, index) =>
         `let scalarJoin${index} = stack[${index}];`),
       ...(ssaOptimizations ? Array.from({ length: maxStackDepth }, (_unused, index) =>
-        `let scalarJoin${index}ArrayData = helpers.arrayData(stack[${index}]);`) : []),
+        `let scalarJoin${index}ArrayData = ${arrayDataExpression(`stack[${index}]`)};`) : []),
       "if ((initialBytecodeChecks === undefined ? helpers.needsBytecodeChecks() : initialBytecodeChecks)) return { deopt: true, transient: true, reason: 'scalar loop debug entry' };",
       "helpers.scalarLoopRunCount += 1;",
       ...(ssaOptimizations ? ["helpers.scalarSsaRunCount += 1;"] : []),
@@ -3804,7 +3805,7 @@ class JitCompiler {
             const variable = localIndex(instruction, op);
             body.push(`local${variable} = ${value};`);
             if (ssaOptimizations && op[0] === "a") {
-              body.push(`local${variable}ArrayData = ${arrayViews.get(value) || `helpers.arrayData(${value})`};`);
+              body.push(`local${variable}ArrayData = ${arrayViews.get(value) || `${arrayDataExpression(value)}`};`);
               localVersions.set(variable, (localVersions.get(variable) || 0) + 1);
             }
           }
@@ -3925,7 +3926,7 @@ class JitCompiler {
             const arrayData = ssaOptimizations ? temp() : null;
             const arrayIndex = temp();
             const value = temp();
-            body.push(`const ${array} = ${arrayExpression};${ssaOptimizations ? ` const ${arrayData} = ${arrayViews.get(arrayExpression) || `helpers.arrayData(${array})`};` : ""} const ${arrayIndex} = ${arrayIndexExpression}; let ${value};`);
+            body.push(`const ${array} = ${arrayExpression};${ssaOptimizations ? ` const ${arrayData} = ${arrayViews.get(arrayExpression) || `${arrayDataExpression(array)}`};` : ""} const ${arrayIndex} = ${arrayIndexExpression}; let ${value};`);
             body.push(`if (${array} === null || ${array} === undefined || ${arrayIndex} < 0 || ${arrayIndex} >= ${array}.length) {`);
             body.push(...materialize([...expressions, array, arrayIndex], index));
             body.push(`${value} = helpers.arrayLoad(${arrayIndex}, ${array}, frame, ${JSON.stringify(op)});`, "} else {");
@@ -3948,7 +3949,7 @@ class JitCompiler {
             const arrayData = ssaOptimizations ? temp() : null;
             const arrayIndex = temp();
             const value = temp();
-            body.push(`const ${array} = ${arrayExpression};${ssaOptimizations ? ` const ${arrayData} = ${arrayViews.get(arrayExpression) || `helpers.arrayData(${array})`};` : ""} const ${arrayIndex} = ${arrayIndexExpression}; const ${value} = ${valueExpression};`);
+            body.push(`const ${array} = ${arrayExpression};${ssaOptimizations ? ` const ${arrayData} = ${arrayViews.get(arrayExpression) || `${arrayDataExpression(array)}`};` : ""} const ${arrayIndex} = ${arrayIndexExpression}; const ${value} = ${valueExpression};`);
             body.push(`if (${array} === null || ${array} === undefined || ${arrayIndex} < 0 || ${arrayIndex} >= ${array}.length) {`);
             body.push(...materialize([...expressions, array, arrayIndex, value], index));
             if (ssaOptimizations) {
@@ -3989,7 +3990,7 @@ class JitCompiler {
             }
             if (ssaOptimizations && this.fieldSites[siteId]?.descriptor?.startsWith("[")) {
               const data = temp();
-              body.push(`const ${data} = helpers.arrayData(${value});`);
+              body.push(`const ${data} = ${arrayDataExpression(value)};`);
               arrayViews.set(value, data);
             }
           }
@@ -4003,7 +4004,7 @@ class JitCompiler {
           expressions.push(value);
           if (ssaOptimizations && this.fieldSites[siteId]?.descriptor?.startsWith("[")) {
             const data = temp();
-            body.push(`const ${data} = helpers.arrayData(${value});`);
+            body.push(`const ${data} = ${arrayDataExpression(value)};`);
             arrayViews.set(value, data);
           }
         } else if (op === "putstatic") {
@@ -4077,7 +4078,7 @@ class JitCompiler {
                   `scalarJoin${slot} = stack[${slot}];`));
                 if (ssaOptimizations) {
                   body.push(...Array.from({ length: resultDepth }, (_unused, slot) =>
-                    `scalarJoin${slot}ArrayData = helpers.arrayData(stack[${slot}]);`));
+                    `scalarJoin${slot}ArrayData = ${arrayDataExpression(`stack[${slot}]`)};`));
                 }
                 body.push(`pc = ${index + 1}; continue;`);
                 terminated = true;
@@ -4794,9 +4795,10 @@ class JitCompiler {
           const direct = this.registerDirectStaticTarget(fieldSiteId);
           if (direct) {
             const target = `helpers.directStaticTargets[${direct.targetId}]`;
-            const read = direct.kind === "map"
-              ? `${target}.fields.get(${JSON.stringify(direct.key)})`
-              : `${target}.fields[${JSON.stringify(direct.key)}]`;
+            const read = direct.cell ? `${target}.cell.value /* ${direct.key} */`
+              : direct.kind === "map"
+                ? `${target}.fields.get(${JSON.stringify(direct.key)})`
+                : `${target}.fields[${JSON.stringify(direct.key)}]`;
             return `{ const target = ${target}; if (!target.initializationToken.initialized) { ` +
               `helpers.materializeCached(frame, locals, stack, sp, ${index}); ` +
               `helpers.skipJitOnce(frame); return { deopt: true, transient: true, ` +
@@ -5872,19 +5874,24 @@ class JitCompiler {
     while (currentClassName) {
       const classData = this.jvm.classes[currentClassName];
       if (classData && classData.staticFields) {
-        if (classData.staticFields.has(key)) {
-          return { kind: "map", fields: classData.staticFields, key };
+        const fields = classData.staticFields;
+        // A StaticFieldStore publishes a value cell per key: generated code
+        // then reads `target.cell.value` instead of a string-keyed Map.get.
+        const mapTarget = (targetKey) => ({
+          kind: "map", fields, key: targetKey,
+          cell: typeof fields.cell === "function" ? fields.cell(targetKey) : null,
+        });
+        if (fields.has(key)) {
+          return mapTarget(key);
         }
-        if (!forWrite && classData.staticFields.has(site.fieldName)) {
-          return { kind: "map", fields: classData.staticFields,
-            key: site.fieldName };
+        if (!forWrite && fields.has(site.fieldName)) {
+          return mapTarget(site.fieldName);
         }
         if (!forWrite) {
-          for (const candidate of classData.staticFields.keys()) {
+          for (const candidate of fields.keys()) {
             if (typeof candidate === "string" &&
                 candidate.split(":")[0].replace(/'/g, "") === site.fieldName) {
-              return { kind: "map", fields: classData.staticFields,
-                key: candidate };
+              return mapTarget(candidate);
             }
           }
         }
@@ -5931,7 +5938,8 @@ class JitCompiler {
       target.fields, target.key);
     const targetId = this.directStaticTargets.length;
     this.directStaticTargets.push(target);
-    return { targetId, kind: target.kind, key: target.key, className: site.className };
+    return { targetId, kind: target.kind, key: target.key,
+      cell: Boolean(target.cell), className: site.className };
   }
 
   getStaticFieldVersionCell(fields, key) {
