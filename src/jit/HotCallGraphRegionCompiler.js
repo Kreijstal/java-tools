@@ -124,7 +124,8 @@ function splitRegionModuleForFactoryHoist(plan) {
  * fragments, and each fragment as the statement records its emitter built:
  * the parts list, the operand names the statement reads and writes, the block
  * nesting it opens or closes, the label it introduces, the jump it is, and
- * how a `return` it carries splits around its argument. The three structural
+ * how a `return` it carries splits around its returned value. The emitter
+ * states all of that; none of it is recovered from the emitted text. The three structural
  * passes below -- loop outlining, environment lifting and straight-line
  * partitioning -- are selections and rewrites over those records.
  *
@@ -338,8 +339,8 @@ function regionOutwardJumps(statements, from, to) {
  * statement range carries.
  *
  * Each such statement published how it splits around its own `return`: the
- * parts before it, its returned value's parts, and the parts after it. The exit
- * becomes a block that records the outcome and leaves the helper, spliced
+ * parts before it, its returned value's parts, and the parts after it. The
+ * exit becomes a block that records the outcome and leaves the helper, spliced
  * back between those two halves -- so an exit the emitter wrote as the
  * consequent of a one-line guard stays that guard's consequent. Returns null
  * when the range carries an exit in a shape the emitter did not publish.
