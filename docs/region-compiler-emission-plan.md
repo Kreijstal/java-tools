@@ -27,7 +27,7 @@ Line numbers are as of `master` (`bc9fe15` era, region compiler at 3514 lines).
 |---|------|----------------------------|---------------------------|
 | 1 | `applySourceEdits` (L70) | — (shared byte-splice engine for 2,3,4,6,8,9,10) | n/a; disappears as its callers do |
 | 2 | `removeUnusedRegionBindings` (L127; `parse` L132, edits L245) | which renderer-published call bindings (`ssaCallSite<i>`, `ssaFastPositional*<i>`, `ssaLateLinkPositional<i>`) are still referenced after lowering, and their pure-initializer dependency chain | the region compiler itself decides which bindings it links; the renderer knows each binding's declaration text and kind. **Do not emit** instead of parse-and-delete. |
-| 3 | `inlineAtomicPositionalSource` (L255; `parse` L270, edits L366/L382) — **still present**, see §5 | callee parameter binding, local declarations, `return` statements, label set of an atomic positional body, in order to alpha-rename and splice it into a caller | the renderer already renders checked leaves as `ssaInlineBody<serial>: { … }` with `assemble({feeds, provenGuards, exitLabel})` (741c9b1). The same shape is needed for `jvmInternalRegionPositionalSource`: a body valid standalone *and* inserted, plus published parameter/result/label names. |
+| 3 | `inlineAtomicPositionalSource` — **gone** (§6) | callee parameter binding, local declarations, `return` statements, label set of an atomic positional body, in order to alpha-rename and splice it into a caller | the renderer publishes `jvmInternalRegionPositionalInsertion` and `jvmRestoringDirectPositionalInsertion`: the same body with its exits routed to a result token and an exit label, plus an `assemble` that binds the parameters by declaration. |
 | 4 | `removeUnreachableRegionFunctions` (L396; `parse` L399, edits L429) — **gone** (stage E) | the call graph among the module's own `jvmRegionNode<i>` / helper functions, to drop unreachable ones | the region compiler *builds* `declarations` itself and knows every function name it emitted and every name it linked. This is a data-level reachability walk over its own emission list. |
 | 5 | `splitModuleSourceForFactoryHoist` (L454; `parse` L457, slice L489) — **gone** (stage E) | top-level function-declaration boundaries in the assembled module | the region compiler assembled that module from a `declarations` array; keep the array, emit two texts. |
 | 6 | `outlineLargeRegionLoops` (L507; `parse` L549, edits L713/L758) | loop statements, their byte size, and their free variables, to outline them into helper functions | needs renderer-published statement/loop fragment boundaries with free-variable sets (see §4). |
@@ -220,7 +220,7 @@ partition pass sees rather than deleted from its output.
 
 ### Stage F — inlining, outlining, partitioning, env-lift (sites 3, 6, 8, 9)
 
-Site 3 was attempted and is **blocked on emitters outside this pass**; see §5.
+Site 3 has landed; see §6. Sites 6, 8 and 9 still parse.
 
 These are the deep ones. They are *real* compiler passes that happen to be
 implemented on text. To move them to emission the renderer must publish, for each
@@ -239,14 +239,14 @@ positional body:
    of how a fragment's names are spelled at emission (`local7` vs `env[7]`) —
    ideally a late-bound accessor token expanded by identity — rather than a
    rename over emitted text.
-4. **Return/label discipline for insertion.** For `inlineAtomicPositionalSource`,
-   the same contract 741c9b1 gave checked leaves: a body that completes through a
-   labeled block into a published result name, with published parameter names the
-   caller binds by declaration, so no alpha-renaming of emitted text is needed.
+4. **Return/label discipline for insertion** — landed, see §6. The same contract
+   741c9b1 gave checked leaves: a body that completes through a labeled block
+   into a published result name, with published parameter names the caller binds
+   by declaration, so no alpha-renaming of emitted text is needed.
 
-Until (1)–(4) exist, these four sites stay as they are: they are correct, they are
-covered by tests, and moving them without the structural inputs above would only
-relocate the parsing.
+Until (1)–(3) exist, sites 6, 8 and 9 stay as they are: they are correct, they
+are covered by tests, and moving them without the structural inputs above would
+only relocate the parsing.
 
 ## 3. Status
 
@@ -266,26 +266,28 @@ relocate the parsing.
 * Stage F, renderer half — landed. The renderer runs no line-level text pass
   any more: every statement it emits is recorded as a parts list (§5), the
   optimizations run over those records, and §4's fragments are published.
-* Stage F, region-compiler half — not landed. Sites 6, 8 and 9 can now be
-  replaced by selections over §4's fragments. Site 3 was attempted and is
-  blocked on the renderer; §6 records the evidence and the exact contract.
+* Stage F, site 3 — landed. `inlineAtomicPositionalSource` is deleted. The
+  renderer publishes an insertable form of both bodies a region inserts and the
+  region compiler assembles it; §6 records the contract that shipped.
+* Stage F, rest of the region-compiler half — not landed. Sites 6, 8 and 9 can
+  now be replaced by selections over §4's fragments.
 
 **No regex over generated JavaScript remains in
 `HotCallGraphRegionCompiler.js`.** The two `replace(/[^A-Za-z0-9…]/g, …)` calls
 that are left sanitize compiler-owned identifiers and file names, not generated
 JavaScript.
 
-Four `parse()` calls remain, down from six:
+Three `parse()` calls remain, down from six:
 
 | `parse()` | Pass | Removed by |
 |-----------|------|------------|
-| L127 | `inlineAtomicPositionalSource` | §5 — the renderer must publish an insertable body; attempted and blocked |
-| L397 | `outlineLargeRegionLoops` | §4 fragments |
-| L731 | `liftOversizedUnitLocalsToEnvironment` | §4 fragments + declared-name sets |
-| L902 | `partitionOversizedLinearBlocks` | §4 fragments — stage D's generator wrapper here is explicitly interim |
+| `outlineLargeRegionLoops` | loop outlining | §4 fragments |
+| `liftOversizedUnitLocalsToEnvironment` | environment lift | §4 fragments + declared-name sets |
+| `partitionOversizedLinearBlocks` | linear partitioning | §4 fragments — stage D's generator wrapper here is explicitly interim |
 
-`applySourceEdits` survives only as the shared byte-splice engine for those
-four.
+`applySourceEdits`, `walkAst`, `identifierIsPropertyName` and
+`collectPatternNames` survive only as the shared byte-splice engine and AST
+helpers for those three.
 
 ## 4. What the renderer publishes for stage F
 
@@ -388,87 +390,199 @@ and one admission test on a *compiler operand* rather than on a rendered line �
 `materializeLines` only compacts a materialization whose operand expressions
 contain no comma.
 
-## 6. Site 3 (`inlineAtomicPositionalSource`): attempted, blocked
+## 6. Site 3 (`inlineAtomicPositionalSource`): landed
 
-The intended replacement is 741c9b1's insertion contract applied to
-`generated.jvmInternalRegionPositionalSource` — the body the region compiler
-inlines at `HotCallGraphRegionCompiler.js` L2045/L2071. The renderer would
-publish an *insertable* variant of it: the body wrapped in
-`ssaRegionInlineBody<serial>: { … }`, every exit rendered as
-`{ ssaRegionInlineResult<serial> = v; break ssaRegionInlineBody<serial>; }`, and
-the parameter names published so the caller binds them by declaration inside a
-block scope (which is also what retires the alpha-renaming: the child's
-`local<slot>` / `ssaValue<n>` names shadow the caller's inside that block, and
-`compileSerial` already makes the label and result slot unique at any nesting
-depth). The region compiler would then assemble, never parse.
+`inlineAtomicPositionalSource` parsed the JavaScript the renderer had just
+emitted, alpha-renamed every binding and label it found, and turned each
+`return` into an assignment plus a `break` so the body could be spliced into a
+caller. It is deleted. The renderer publishes the body a caller inserts, the
+way 741c9b1 published the checked-leaf one, and the region compiler assembles.
 
-**Why it does not land yet.** The contract requires that *every* exit of that
-body be lowered at emission. It is not one exit family. Measured over
-`test/hotCallGraphRegion.test.js` + `test/jitCompiler.test.js` by dumping the 85
-sources actually handed to `inlineAtomicPositionalSource`:
+### What the renderer publishes
 
-* 57/85 bodies exit only through Java returns — `render`'s `directPositional`
-  branch, `JvmSsaBlockRenderer.js:8571`;
-* **28/85 also carry deopt exits**, in seven distinct shapes:
-  `'asynchronous structured SSA callee'`,
+```
+generated.jvmInternalRegionPositionalInsertion =
+generated.jvmRestoringDirectPositionalInsertion = {
+  serial,                 // this compile's serial
+  source,                 // the body, exits carrying the two tokens
+  exitCount,
+  resultToken,            // `ssaRegionInlineResult<serial>`
+  labelToken,             // `ssaRegionInlineBody<serial>`
+  argumentNames,          // `argument0` … `argumentN`
+  entryGuardName,         // `nestedEntryGuarded`
+  entryGuardValue,        // `2`
+  assemble({source, argumentValues, resultName, exitLabel, namespace,
+            declareResult, bindings}) -> string | null,
+}
+```
+
+`assemble` emits, for one call site:
+
+```
+let <resultName>;                          // when declareResult
+const <namespace>a0 = <argumentValues[0]>; // staged in the caller's scope
+…
+<exitLabel>: {
+  const plan = <bindings…>;                // the restoring tier's plan
+  const argument0 = <namespace>a0;
+  …
+  const nestedEntryGuarded = 2;
+  <source, with both tokens expanded by exact identity>
+}
+```
+
+The caller binds the callee's names *by declaration inside a block*, so the
+callee's `local<slot>` / `ssaValue<n>` / `plan` / `frame` / `locals` / `stack` /
+`restorationDepth` shadow the caller's rather than colliding with them, and
+nothing is renamed. The argument values are staged in the caller's scope first
+because inside that block every name the body declares is in its temporal dead
+zone, and a call operand is routinely spelled `local3` or `argument0`.
+
+### How an exit becomes insertable
+
+Not by a fourth `insertable` arm per emitter, which is what §6 first proposed:
+that would have had to enumerate the exits, and the census below shows they are
+spread across `render`, the getstatic emitters and five `continuationFallbacks`
+entries, with more shapes reachable in bodies the corpora do not exercise. The
+transform is instead uniform, and it runs on the statement IR (§5), not on text:
+
+* `partsReturnPositions(parts)` walks a statement's own *parts skeleton* — the
+  literal chunks the emitter wrote, with each operand reference standing for one
+  placeholder character — with rendered string literals excluded, and reports
+  every whole-word `return` outside one. An operand can neither supply nor split
+  the keyword, and the deopt reason `'structured SSA return with active child'`
+  is inside a string and is not reported.
+* `splitReturnParts(parts)` splits the statement into `before` / `value` /
+  `after` around exactly one such return, locating the terminating `;` the same
+  string-aware way. It handles both a whole-line `return { deopt: … };` and an
+  exit embedded in a one-line guard, `if (c) { return ssaAsyncInvoke; }`.
+* `insertableExitStatement` re-records the statement through `recordStatement`
+  as `{ <resultToken> = <value>; break <labelToken>; }`, so the insertable body
+  is statement IR like every other body. `JVM_JIT_VERIFY_STATEMENT_IR=1` audits
+  it explicitly (`internal-region-insertion` / `restoring-insertion` labels) and
+  reports 0 issues over both JIT corpora.
+
+The caller therefore observes exactly the value it observes today, including the
+`{deopt: …}` object. The `checkedLeaf` arm was **not** reused: it delivers
+`helpers.asyncInvokeSentinel()` where the caller receives a deopt object, and
+the guarded-fallback shape in `rewriteCallBindings` distinguishes the two.
+
+### Labels
+
+A guest loop or block label is named after its header pc (`L1`, `L3`), so two
+unrelated bodies routinely declare the same one and nesting them is a syntax
+error — the first thing the change hit. The inserted copy renames every label it
+declares and every reference to it to `<label>_ssaInline<serial>`. The rename is
+driven by the label each statement *recorded* (`loopHeader`, `blockLabel`,
+`break`, `continue` all carry `label` meta); a statement that mentions one of the
+body's labels without having recorded one rejects the whole variant, because its
+jump would otherwise be left pointing at the caller's label. A renamed label
+stays a literal chunk and is not registered as an emitted name: it names a
+statement, not a value.
+
+### The fail-safe
+
+`insertableBodyOf` returns null — no insertion is published, and the edge is
+linked as a region function instead of inlined — when
+
+* a line was never recorded by an emitter (a hand-assembled nested function such
+  as the restoring tier's `function spillLocals() { … }`, whose returns belong
+  to it and not to this activation),
+* a statement carries `yield` as a whole word,
+* a statement mentions one of the body's labels without having recorded it,
+* an exit cannot be represented as one assignment-and-break (two returns in one
+  statement, or a return whose value cannot be delimited),
+* the body has no exits at all,
+* or the compile respecialized its self-recursive calls, which is a text splice
+  over the joined module — the same condition that suppresses §4's fragments.
+
+Every one of these is an identity or metadata check over statement records, not
+a scan of generated text. An emitter that grows a new exit form loses inlining
+rather than escaping the caller's activation.
+
+### Composition
+
+`inlineAtomicPositionalSource` was not applied to the renderer's published
+source. Measured over `test/hotCallGraphRegion.test.js` +
+`test/jitCompiler.test.js`, every one of its inputs came from
+`inlineSources`, and they are two different bodies:
+
+* 31/81 are `composedInternalSources` — `jvmInternalRegionPositionalSource`
+  after `rewriteCallBindings` has already inserted the node's own callees;
+* 50/81 are `exceptionalInlineSources` — `const plan = jvmRegionInlinePlan<i>;`
+  followed by **`jvmRestoringDirectPositionalSource`**, a different tier
+  entirely, again possibly composed.
+
+So both bodies publish an insertion, and composition runs over the callee's
+*insertable* base exactly as it runs over its standalone base
+(`composeInsertion`, one extra `rewriteCallBindings` per composed node). A
+composed body then stays insertable by construction: its own exits already carry
+the tokens, and every callee it embeds is a self-contained labeled block whose
+exits break out of that block only. Nothing rewrites an emitted `return`. A node
+whose callee has no insertable form gets none either, and
+`inlineAdmissionReason` reports `target-without-insertable-body`.
+
+Admission budgets still measure the standalone composed source, so which edges
+are inlined is unchanged.
+
+### Uniqueness
+
+The exit label and the argument staging slots a call site introduces are named
+`jvmRegionInline<pc>_<calleeSerial>_`. The pc separates two insertions of the
+same callee in one body; the callee's compile serial separates an insertion from
+the ones a *composed* callee already carries at the same pc — which is exactly
+the collision the first attempt produced (`Label 'jvmRegionInline2_return' has
+already been declared`). The result and label tokens themselves carry the
+callee's serial, so no two insertions can share one at any nesting depth; a body
+can never nest inside itself, because composition is a fixed point over an
+acyclic graph.
+
+### The census that shaped this
+
+Measured by dumping the sources actually handed to `inlineAtomicPositionalSource`
+over the two JIT test files (81 insertions on this tree; §6's earlier count of 85
+was taken before intervening renderer changes):
+
+* Java returns — `render`'s `directPositional` branch;
+* `return ssaAsyncInvoke;` embedded in one-line guards (the restoring entry
+  guard and the entry array-data guard, both built from `CHECKED_LEAF_BAIL`);
+* seven deopt shapes: `'asynchronous structured SSA callee'`,
   `'asynchronous structured SSA callee left active child'`,
   `'structured SSA callee left active child'`,
   `'thread yielded in structured SSA callee'`,
   `'class initialization in structured SSA getstatic'`,
-  `'structured SSA coarse loop guard'`,
-  `'structured SSA safe point'`;
-* 0/85 carry the checked-leaf bail (`return helpers.asyncInvokeSentinel();`), so
-  `retargetCheckedLeafBails` alone is not enough.
+  `'structured SSA coarse loop guard'`, `'structured SSA safe point'`.
 
-The AST inliner converts all of them uniformly, which is exactly why it parses.
-Their emitters are:
+After the change all 52 inline sites over those two files still receive an
+insertion, and the region modules report the same
+`lexicallyInlinedEdges` (44) and `exceptionalInlinedEdges` (17) as before, with
+zero `inlineFailures`.
 
-| Exit | Emitter |
-|------|---------|
-| Java return | `JvmSsaBlockRenderer.js:8571` (`render`, `directPositional`) |
-| safe point | `:8765` (`render`) |
-| coarse loop guard | `:8872` (`render`) |
-| getstatic class init | `:4033`, `:4069` |
-| async callee / left-active-child / yielded callee | `:4219`, `:4233`, `:4238`, `:4774`, `:4825`, `:4834`, `:4857`, `:4862` |
+### Generated-text differences
 
-The last two rows sit in the block-simulator emitters (~1300–5000) that
-`refactor/checked-leaf-ir` rewrote concurrently, so they were left alone. The
-line numbers in this section are those of 77d1e23; after §5 landed the same
-exits are the `continuationFallbacks` entries and `render` exits described
-here, but at different lines.
+Diffing all 31 emitted region modules over the two JIT test files, master vs
+this change, the only differences inside inlined bodies are:
 
-**What the renderer still owes, concretely.** The mechanism is already in place
-and needs one more arm, not a redesign. Those call-lowering exits are not
-emitted inline: they are entries in the `continuationFallbacks` map, which
-already publishes three variants per exit — `continuation` (a `yield`),
-`ordinary` (the deopt `return`) and `checkedLeaf` (`return
-helpers.asyncInvokeSentinel();`). `render`'s `expandLines` (`:8548`) selects
-one. Site 3 needs a fourth, `insertable`, holding the same statement with the
-`return` replaced by the late-bound exit token, plus:
+1. the alpha-renaming is gone — the callee's names are its own, shadowing the
+   caller's inside the inserted block;
+2. one argument is now two declarations (`const <ns>a0 = <operand>;` in the
+   caller's scope, `const argument0 = <ns>a0;` inside the block) instead of one,
+   which is what makes the operand safe to evaluate;
+3. the callee's `'use strict';` directive is no longer carried into the middle
+   of the caller's block, where it was a no-op expression statement (48
+   occurrences);
+4. a returned value keeps the parentheses the emitter wrote
+   (`{ x = (((a + 1) | 0)); … }` rather than `{ x = (a + 1) | 0; … }`); the AST
+   version dropped one layer because acorn does not model them;
+5. in one module, an inserted body's `let safePointBudget = …;` is now removed
+   by the module's exact-identity safe-point strip, because the declaration is
+   no longer renamed and therefore matches. That body's polling now charges the
+   enclosing region counter instead of a private one — which is the "fused graph
+   owns one shared quantum" property stage C introduced, extended to inserted
+   bodies. It is strictly more conservative (a shared counter reaches its safe
+   point sooner, never later) and the module always declares one, so no name is
+   left unbound. This is a behavioural consequence of removing the rename, not a
+   deliberate design choice; it is recorded here because it is the one
+   difference that is not purely syntactic.
 
-1. an `insertable` arm at `:4033`/`:4069` and at the five
-   `continuationFallbacks.set(...)` sites listed above (one array entry each);
-2. an exit target threaded through `render` for `:8571`, `:8765` and `:8872`
-   (a scoped `insertableExitTarget`, selected the same way `checkedLeafOnly`
-   already is);
-3. `internalRegionPositionalInsertableSource` assembled beside
-   `internalRegionPositionalSource` at `:10554` from the same fragment list,
-   wrapped in the labeled block, and published as
-   `generated.jvmInternalRegionPositionalInsertion =
-   {source, result, label, argumentNames, entryGuardName}`;
-4. the same fail-safe `assemble` already uses — reject the insertable variant if
-   any `return ` survives — so an emitter that grows a new exit form loses
-   inlining rather than silently leaving the caller's activation.
-
-Two shortcuts were considered and rejected:
-
-* *Reuse the existing `checkedLeaf` arm* (it already ends the exit in a bail
-  that `retargetCheckedLeafBails` can retarget). Rejected: it delivers
-  `helpers.asyncInvokeSentinel()` where the caller today receives the
-  `{deopt: …}` object, and the guarded-fallback shape at
-  `HotCallGraphRegionCompiler.js:2100` distinguishes the two. That is a
-  semantic change, not a refactor.
-* *Retarget returns by a line-level rewrite of the assembled body* (match lines
-  whose trimmed text starts with `return `). Rejected: that is a new instance of
-  precisely the problem this document exists to remove, and it would have to be
-  correct about function nesting, which is the fact only a parse supplies.
+Nothing outside the inlined bodies changed.
