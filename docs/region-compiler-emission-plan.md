@@ -280,21 +280,98 @@ than one of either, or is the opaque record a composition edit produced. The
 AST version accepted a few of these and handled them explicitly; the loss is
 measured in §3.
 
-**Sources without records.** `jvmHotCallGraphFramedSource` and the checked-leaf
-variants are not among the three positional variants §4 publishes, so a node
-emitted from one of them is emitted as finished text and no structural pass
-touches it. Two consequences, both measured in §3:
+### Stage G -- the prologue emitters record, and the framed passes fire
 
-* `JVM_ENABLE_HOT_CALL_GRAPH_FRAMED_PARTITION=1` is a no-op on a real module:
-  its unit is the framed root, which has no records.
-* The renderer's own two calls (the continuation tier's loop outlining and
-  linear partitioning, `JVM_ENABLE_STRUCTURED_LOOP_OUTLINING` and
-  `JVM_ENABLE_STRUCTURED_LINEAR_PARTITION`) stay wired but are inert: the
-  canonical body's prologue still carries lines no emitter recorded -- the
-  entry scaffold, the local declarations, the spill helper and the frame
-  materialization helpers, 11-17 lines per body -- so `regionFragmentsOf`
-  declines it. Recording those emitters lights both back up with no further
-  change here.
+Stage F left two kinds of body without records, because their prologues were
+assembled as raw strings rather than through the recorders: the continuation
+tier's canonical body (the framed region root) and the checked-leaf entries.
+`regionFragmentsOf` refuses a body containing a line no emitter recorded, so
+those variants published nothing and every structural pass opted out of them.
+
+Every one of those emitters is routed through the recorders now:
+`buildBody`'s directive, `const locals = frame.locals;`,
+`const stack = frame.stack.items;` and the entry check; the run counter, the
+entry `local<slot>` declarations and the `spillLocals` arrow;
+`materializeHelperDeclarations`, line by line; `fieldReadCacheInitializations`;
+the direct tier's class-initialization guard (whose guard variable is a minted
+name now, so every mention of it is an operand reference) and both tiers'
+guarded-boolean entry guard; the checked-leaf result slot, its exits, the
+captured-static capture declarations, the recursive-array worker entry, the
+inline array views and array-data guard, and the counted-trip /
+shrinking-window / recursive-partition guard declarations; and the irreducible
+dispatcher's island state assignment. `initialBytecodeChecks` joins the ambient
+names: the framed tier declares it in its outermost scope exactly as it
+declares `framelessEntry`.
+
+Three defects in the *recording* fell out of doing this, all of which had made
+a statement understate its own names:
+
+* `lmul`'s `e`...` + e`...`` stringified both templates and lost the operand
+  references of its two inputs;
+* the checkcast expansion's `let <value>;` recorded the name it declares as a
+  *read*;
+* every `catch (<value>)` an emitter wrote recorded its catch parameter as a
+  free read. A statement states the names it binds through `declares` now,
+  which `regionNames` folds into the range's declared set.
+
+Each of those made an outlined helper receive a name that does not exist at its
+call site, which is what firing the passes reported first.
+
+**Sources with records.** `jvmHotCallGraphFramedSource`,
+`jvmCheckedLeafDirectPositionalSource` and
+`jvmTrustedCheckedLeafDirectPositionalSource` publish fragments and
+declaration-name sets like the three positional variants; `variantNameOfSource`
+resolves them, and a framed node's unit is marked a generator because its
+statements can carry `yield`. The framed root receives the *canonical* body:
+the region composition splices into it by the markers the emitters wrote, and a
+body the renderer's own passes have already split into several functions is no
+longer what those markers describe.
+
+`jvmCheckedLeafInlineBody` is assembled per call site from the same statements
+and every one of its lines is recorded, but it is a function rather than a
+published source, so no fragment list is keyed by it.
+
+**What had to be fixed for the framed passes to fire, and for their cuts to be
+right.**
+
+* `regionStatementsFromFragments`'s `'use strict';` statement, the
+  `const plan = <plan>;` the compiler prefixes onto a restoring body, and the
+  blank line an emptied composition edit leaves carried no parts list, so
+  `liftOversizedUnitLocalsToEnvironment` declined every unit that contained one
+  -- which is every unit. They state their own parts now, and the lift refuses
+  to move an ambient name or one of this compiler's own `jvmRegion*` names into
+  an environment slot.
+* An opaque block a composition edit produced disqualified the whole unit. It
+  states a bound on the enclosing names it can mention now (`mentions`): every
+  slice it carries came out of the statements it replaced, and everything else
+  the compiler wrote is freshly minted, module-level or ambient. The lift pins
+  those names instead of declining the body. Nothing is relocated across such a
+  block either way. This is the one place where a pass relies on a stated
+  bound rather than on a record; giving the composition real records for what
+  it inserted -- §3's "next step" -- would replace it with a proof.
+* `recurseIntoGroup` split a group's body at *every* block continuation,
+  including ones nested deeper, and handed `walkList` statement lists that do
+  not balance -- which it then declined.
+* Several emitters write one condition over more than one recorded line
+  (`if (a &&` / `    b) {`), so a statement is not always a complete construct
+  and a run could be cut in the middle of one. A statement records the bracket
+  nesting it leaves open (`openDelta`, read off its own skeleton with strings
+  and comments masked) and `statementGroups` keeps the lines that finish a
+  construct in its group. Without this the first framed root the partitioner
+  ever cut was an unparseable module.
+* A body's `spillLocals` / `ssaMaterialize<n>` helpers close over that body's
+  `local<slot>` bindings, and a helper either pass extracts receives them by
+  value. A range that both calls one of those helpers and assigns a JVM slot
+  would spill the enclosing body's stale copy at exactly the point the
+  interpreter takes the state over; it is no longer extracted.
+* A later partitioning round can offer a run that already contains an earlier
+  segment's call site. Both segments would then use the one shared
+  `jvmRegionSegmentState<n>` array with unrelated index spaces. The nesting is
+  declined.
+
+The last three are what the measurements in §3 call the recovered capability:
+each was found by making a pass fire and comparing its output against the
+unpartitioned module, not by reading it.
 
 ## 3. Status
 
@@ -319,6 +396,10 @@ touches it. Two consequences, both measured in §3:
 * Stage F, the rest of the region-compiler half — landed. Sites 6, 8 and 9 are
   selections and rewrites over §4's records; `compileModule` assembles the
   module from units it owns.
+* Stage G — landed. Every prologue emitter records what it writes, the framed
+  root and the checked-leaf entries publish fragments, and the framed
+  environment lift, the framed partition and the renderer's own two passes all
+  fire.
 
 **No regex over generated JavaScript remains in
 `HotCallGraphRegionCompiler.js`.** The two `replace(/[^A-Za-z0-9…]/g, …)` calls
@@ -360,29 +441,35 @@ short by `frame`, `locals`, `stack` and `safePointBudget`.
 
 **Where the passes decline, and what that is worth.** A region body a
 composition edit touched carries opaque records there, and neither outlining
-nor partitioning will cut across one; a framed root and a checked-leaf source
-publish no records at all, so no structural pass touches them. Measured over
-`hotCallGraphRegion.test.js` + `jitCompiler.test.js`:
+nor partitioning will cut across one. Every published variant has records now,
+so the pass declines are about individual ranges rather than whole tiers.
+Measured over `hotCallGraphRegion.test.js` + `jitCompiler.test.js`:
 
-* At the default budgets nothing fires on either side -- 0 lifted names and 0
-  segments in all 12 module compiles, on `20214f1` and here alike -- and the
-  three region flags give `20214f1` 513 passing assertions and this branch 527
-  (the difference is this branch's new cases).
+* At the default budgets nothing fires on the region side -- 0 lifted names and
+  0 segments in all 29 module compiles -- and the emitted text is byte-identical
+  to master's over all 170 sources the two `hotCallGraph` test files produce.
 * Forced to the smallest budgets the options accept (16 KB units, 4 KB
-  segments), `20214f1` *does* fire: it lifts 24 and 13 names in two framed
-  roots and cuts 2, 6 and 4 segments -- and **miscompiles**, failing 7 of the
-  164 assertions in `hotCallGraphRegion.test.js` (the outlined-loop return, the
-  cold restoration frame order, the guarded-edge islands). This branch declines
-  every one of those cuts and passes 164/164 under the identical configuration.
-  On `e956619`, before site 3 started inserting callee bodies, none of them
-  fired at all, so the defect is newly reachable rather than newly introduced.
+  segments) with `JVM_ENABLE_HOT_CALL_GRAPH_FRAMED_PARTITION=1`, this branch
+  lifts 35 names into environment arrays and cuts 1 framed segment over that
+  corpus, and passes 164/164. `20214f1` fired there too and **miscompiled**,
+  failing 7 of the same 164 assertions; the earlier state of this branch
+  declined every cut and so also passed, but by doing nothing.
+* The new `FramedPartitionHarness` case, whose loop body carries a long
+  straight-line run, lifts 10 names and cuts 7 segments at those budgets and
+  computes the same scalar as the interpreter through both entries. The tenth
+  cut of that fixture before the nested-segment rule was the first wrong answer
+  the pass has ever produced here, and the nine before it were exact.
+* The renderer's own two passes are live: at the *default* budgets
+  `JVM_ENABLE_STRUCTURED_LOOP_OUTLINING=1` outlines one loop in the two JIT
+  corpora, and both flags together pass 2485/2485 at the default budgets and at
+  the smallest budgets the options accept.
 
-So the capability this branch gives up is one that, where it is currently
-reachable at all, emits wrong code. Recovering it soundly means giving the
-composition a record for what it inserted rather than an opaque one -- an
+The remaining decline is the opaque composition block: nothing is relocated
+across one, and the lift only avoids the names it may mention rather than the
+whole body. Giving the composition a record for what it inserted -- an
 inserted body already publishes its own fragments, so splicing those in place
-of the call's record is the next step -- and recording the canonical body's
-prologue emitters for the framed root.
+of the call's record -- is still the next step, and would turn the lift's
+stated bound into a proof.
 
 ## 4. What the renderer publishes for stage F
 
@@ -419,14 +506,18 @@ generated.jvmStructuredRegionLocalNames = {
 ```
 
 `<variantName>` is one of `jvmDirectPositionalSource`,
-`jvmInternalRegionPositionalSource` and `jvmRestoringDirectPositionalSource` —
-the three sources `HotCallGraphRegionCompiler.compileModule` composes. The
+`jvmInternalRegionPositionalSource`, `jvmRestoringDirectPositionalSource`,
+`jvmHotCallGraphFramedSource`, `jvmCheckedLeafDirectPositionalSource` and
+`jvmTrustedCheckedLeafDirectPositionalSource` — every source
+`HotCallGraphRegionCompiler.compileModule` composes a node out of. The
 contract, pinned by `test/structuredRegionFragments.test.js`:
 
 * The fragments' lines, joined in order with `"\n"`, are exactly the published
   source of that variant without its `'use strict';` directive. Late-bound
   sentinel expansions (`helpers.returnVoid()` → `ssaReturnVoid`) are applied to
-  the fragments as well.
+  the fragments as well. This is *checked* at publication against the source
+  the variant published, not assumed: a body a late expansion rewrote loses its
+  fragments rather than publishing a list that does not describe it.
 * A guest loop and a guest `try`/`catch` are each one fragment, at whatever
   depth they occur. Every other construct stays with the statements around it,
   so the list is a partition of the body in order.
@@ -457,6 +548,15 @@ contract, pinned by `test/structuredRegionFragments.test.js`:
   label, and the parts after it. Both are complete statements, so a consumer
   that relocates one replaces its own range by a block and leaves the guard
   the emitter wrote around it intact.
+* `declares` on a statement is the names it introduces besides `def`: the
+  parameters of a nested function it declares, and the parameter a `catch`
+  binds. A consumer folds them into the range's declared set, or it would pass
+  a name that does not exist at the call site.
+* `openDelta` is the bracket nesting the statement leaves open, read off its
+  own skeleton with strings and comments masked. It is nonzero when an emitter
+  wrote one construct over several recorded lines (`if (a &&` / `    b) {`),
+  and a consumer must keep the lines that finish the construct in the same
+  group.
 * `relocatable` is false when the statement may not be moved into a helper
   function: it opens a `switch`, carries a nested function, mentions
   `this`/`super`/`await`/`arguments`/`eval`/`var`, declares an ambient name
@@ -483,14 +583,11 @@ compiler-owned lists, and the last three `parse()` calls in the region
 compiler are gone.
 
 A variant that cannot publish a record for every one of its lines publishes no
-fragments at all, so a consumer never sees a partial list. The canonical
-continuation-tier body is exactly that case today: its prologue still carries
-lines no emitter recorded -- `const locals = frame.locals;`, the entry check,
-the `let local<slot>` declarations, the `spillLocals` arrow and the
-`ssaMaterialize*` helper declarations, 11-17 lines per body -- so
-`regionFragmentsOf` declines it and the renderer's own two calls into these
-passes are inert. Recording those five emitters is all that is needed to light
-them, and the framed region root, back up.
+fragments at all, so a consumer never sees a partial list. Every variant the
+region compiler composes a node out of does publish them now, the canonical
+continuation-tier body included; `JVM_JIT_VERIFY_STATEMENT_IR=1` audits the
+whole published source of each of them (§5) and reports 0 unrecorded lines
+over both JIT corpora.
 
 ## 5. The renderer's statement IR
 
@@ -521,7 +618,10 @@ with `{ref: name}` operand references.
   same substitution.
 * `JVM_JIT_VERIFY_STATEMENT_IR=1` re-checks a finished body the way the
   generated-scope verifier does: it reports any line no emitter recorded and
-  any record whose operands disagree with the names actually present. It
+  any record whose operands disagree with the names actually present. It covers
+  the *whole* published source of every variant -- the framed body, the direct,
+  internal and restoring positional bodies, and the four checked-leaf entries
+  -- rather than only the bodies a line-level pass happens to run over, and
   reports 0 issues over both JIT corpora. `scripts/statement-ir-audit.js` runs
   it over a test file.
 
