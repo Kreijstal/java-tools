@@ -50,3 +50,4 @@ examples/output/
 # Dependency archives
 *.jar
 *.zip
+docs/region-compiler-emission-plan.md

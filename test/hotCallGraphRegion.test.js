@@ -37,8 +37,9 @@ test('hot call-graph roots have a conservative structural size bound', (t) => {
     'an explicit structural experiment can widen the root bound');
   t.equal(widened.jit.hotCallGraphRegions.directSafePointBudget, 256,
     'a fused graph can use a browser-sized scheduler quantum');
-  t.notOk(ordinary.jit.hotCallGraphRegions.loopOutliningEnabled,
-    'post-render loop outlining remains disabled after its live rejection');
+  t.equal(ordinary.jit.hotCallGraphRegions.loopOutliningEnabled,
+    process.env.JVM_ENABLE_HOT_CALL_GRAPH_LOOP_OUTLINING === '1',
+    'post-render loop outlining stays off unless it is explicitly enabled');
   t.end();
 });
 
@@ -1324,6 +1325,12 @@ public final class GuardedInternalGraphRoot {
     structuredRunCounters: false,
     hotCallGraphRegions: true,
     profileMethods: false,
+    // The cold-island count below is a statement about the node body as it
+    // is emitted, so this case states that it measures the unpartitioned
+    // shape rather than inheriting a forced experiment from the environment.
+    hotCallGraphLinearPartition: false,
+    hotCallGraphFramedPartition: false,
+    hotCallGraphLoopOutlining: false,
   }});
   for (const owner of [className, operationName, alternateName]) {
     await jvm.loadClassByName(owner);
@@ -1382,5 +1389,134 @@ public final class GuardedInternalGraphRoot {
     'a different receiver takes canonical dispatch and preserves its override');
   t.equal(thread.callStack.size(), 0,
     'the cold polymorphic path retires its reconstructed Frames');
+  t.end();
+});
+
+// The framed root of a region is emitted from the renderer's continuation
+// body, which publishes statement fragments like every other variant. At the
+// default budgets the structural passes decline every cut; forced to the
+// smallest budgets the options accept they have to fire *and* be a pure
+// refactor, so this case compiles the same graph twice and compares both the
+// pass statistics and the observable result.
+test('a framed region root environment-lifts and partitions at forced budgets',
+  async (t) => {
+  const className = 'FramedPartitionHarness';
+  // A long straight-line run inside the loop, so a segment of the forced
+  // minimum size exists to cut; the calls around it keep the body a real
+  // multi-method region.
+  const grind = Array.from({length: 160}, (_unused, step) =>
+    `      scratch = ((scratch * ${3 + (step % 7)}) ^ ${step + 11}) + ` +
+    `${step * 13 + 5};`).join('\n');
+  const classpath = fixture(className, `
+public class FramedPartitionHarness {
+  static int leaf(int value, boolean bias) {
+    return value * 3 + (bias ? 1 : 2);
+  }
+  static int middle(int value, boolean bias) {
+    return leaf(value, bias) ^ 0x55aa;
+  }
+  static int throwingLeaf(int value, boolean bias) {
+    return 100 / value + (bias ? 0 : 1);
+  }
+  static int throwingMiddle(int value, boolean bias) {
+    return throwingLeaf(value, bias) + 1;
+  }
+  static int root(int[] values, int rounds, boolean bias) {
+    int sum = 0;
+    for (int round = 0; round < rounds; round++) {
+      for (int index = 0; index < values.length; index++) {
+        int scratch = values[index];
+${grind}
+        sum += scratch + middle(values[index], bias) +
+          throwingMiddle(values[index], bias);
+      }
+    }
+    return sum;
+  }
+}
+`);
+  t.teardown(() => fs.rmSync(classpath, {recursive: true, force: true}));
+
+  const compileGraph = async (options) => {
+    const jvm = new JVM({classpath, jit: {
+      warmupThreshold: 0,
+      structuredSsa: true,
+      structuredRunCounters: false,
+      hotCallGraphRegions: true,
+      profileMethods: false,
+      ...options,
+    }});
+    await jvm.loadClassByName(className);
+    jvm.classInitializationState.set(className, 'INITIALIZED');
+    const method = await jvm.findMethodInHierarchy(
+      className, 'root', '([IIZ)I');
+    jvm.jit.invocationCounts.set(method, 1);
+    const plan = jvm.jit.compileHotCallGraphRegion(method);
+    return {jvm, method, plan};
+  };
+
+  const forced = {
+    hotCallGraphFramedPartition: true,
+    hotCallGraphLinearPartitionUnitBytes: 16384,
+    hotCallGraphLinearPartitionSegmentBytes: 4096,
+  };
+  const baseline = await compileGraph({
+    hotCallGraphFramedPartition: false,
+    hotCallGraphLinearPartitionUnitBytes: 49152,
+    hotCallGraphLinearPartitionSegmentBytes: 32768,
+  });
+  const cut = await compileGraph(forced);
+
+  t.ok(baseline.plan?.body && baseline.plan.framedBody,
+    'the graph emits both a positional and a framed module');
+  t.equal(baseline.jvm.jit.hotCallGraphRegions.liftedEnvironmentNameCount, 0,
+    'no name is lifted at the default budgets');
+  t.equal(baseline.jvm.jit.hotCallGraphRegions.framedPartitionedSegmentCount,
+    0, 'no framed segment is cut at the default budgets');
+
+  t.ok(cut.plan?.body && cut.plan.framedBody,
+    'the same graph still emits both modules at the forced budgets');
+  t.ok(cut.jvm.jit.hotCallGraphRegions.liftedEnvironmentNameCount > 0,
+    'the forced budgets lift framed unit locals into an environment array');
+  t.ok(cut.jvm.jit.hotCallGraphRegions.framedPartitionedSegmentCount > 0,
+    'the forced budgets cut at least one framed segment');
+  t.ok(cut.plan.framedBody.jvmHotCallGraphRegionSource.includes(
+    'jvmRegionEnv0_'),
+  'the framed module declares the environment array it lifted into');
+  t.ok(cut.plan.framedBody.jvmHotCallGraphRegionSource.includes(
+    'jvmRegionSegment0_'),
+  'the framed module calls the segment helper it cut');
+
+  // Both modules must still be a pure refactor of the same graph.
+  const values = [2, 3, 5];
+  values.type = '[I';
+  const runPositional = ({jvm, plan}) => {
+    const thread = {
+      id: 0, status: 'runnable', pendingException: null,
+      callStack: new Stack(),
+    };
+    return plan.body(jvm.jit, values, 3, 1, thread, false);
+  };
+  t.equal(runPositional(cut), runPositional(baseline),
+    'the partitioned graph computes the identical scalar result');
+
+  const runFramed = ({jvm, method, plan}) => {
+    const thread = {
+      id: 0, status: 'runnable', pendingException: null,
+      callStack: new Stack(),
+    };
+    const parent = new Frame(method);
+    const entry = new Frame(method);
+    entry.className = className;
+    entry.locals.splice(0, 3, values, 3, 1);
+    thread.callStack.push(parent);
+    thread.callStack.push(entry);
+    const generated = jvm.jit.getGeneratedFunction(method);
+    const outcome = jvm.jit.runSelectedGeneratedFrame(
+      generated, entry, thread);
+    return {handled: Boolean(outcome?.handled), value: parent.stack.pop()};
+  };
+  t.deepEqual(runFramed(cut), runFramed(baseline),
+    'the framed module returns the identical value through the JVM entry');
   t.end();
 });
