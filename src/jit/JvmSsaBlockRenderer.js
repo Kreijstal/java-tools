@@ -382,6 +382,24 @@ function substituteParts(parts, replacements) {
 // did not record, or whose record disagrees with the operands actually
 // present. Nothing in the compiler decides what to emit from this scan; the
 // passes read the records, never the characters.
+const passFireCounts = new Map();
+function countPassFire(name) {
+  passFireCounts.set(name, (passFireCounts.get(name) || 0) + 1);
+}
+function reportPassFires() {
+  return [...passFireCounts.entries()].sort((a, b) => b[1] - a[1]);
+}
+if (typeof process !== "undefined" && process.env &&
+    process.env.JVM_PASS_FIRE_LOG) {
+  process.on("exit", () => {
+    try {
+      require("fs").appendFileSync(process.env.JVM_PASS_FIRE_LOG,
+        [...passFireCounts.entries()]
+          .map(([name, count]) => `${name} ${count}`).join("\n") + "\n");
+    } catch (error) { /* diagnostic only */ }
+  });
+}
+
 const statementIrAuditIssues = new Map();
 function auditStatementIrLines(lines, records, names, label) {
   const note = (issue, line) => {
@@ -1182,7 +1200,7 @@ class JvmSsaBlockRenderer {
     const positionalCallLateLinkVariable = (index) =>
       `ssaLateLinkPositional${index}`;
     const invariantPositionalRawVariable = (index) =>
-      `ssaInvariantPositionalRaw${index}`;
+      named(`ssaInvariantPositionalRaw${index}`);
     for (let index = 0; index < items.length; index += 1) {
       if (depths[index] === undefined || !normalReachableItems.has(index)) continue;
       const instruction = items[index]?.instruction;
@@ -1514,8 +1532,15 @@ class JvmSsaBlockRenderer {
       }
       if (typeof value === "string" && replacements.has(value)) {
         const replacement = replacements.get(value);
-        return renderParts(replacement instanceof Expr
-          ? replacement.parts : replacement);
+        const parts = replacement instanceof Expr
+          ? replacement.parts : replacement;
+        // A metadata operand keeps its reference identity: a token that still
+        // renders as `false /*token*/` is still that token, so a later proof
+        // can replace it again.
+        if (parts.length === 1 && typeof parts[0] !== "string") {
+          return parts[0].ref;
+        }
+        return renderParts(parts);
       }
       return value;
     };
@@ -4020,13 +4045,16 @@ class JvmSsaBlockRenderer {
               const provenLoad = normalizedArrayLoadExpression(
                 e`${arrayData}[${arrayIndex}]`, op, array, arrayKind);
               lines.push(
-                st`if (!${rangeMarker} && ${loadFailure}) {`,
+                stmt(e`if (!${rangeMarker} && ${loadFailure}) {`,
+                  {kind: "rangeGuardedAccess", guard: rangeMarker}),
                 ...materializeLines([...stack, array, arrayIndex], index, true).map((line) => `  ${line}`),
                 st`  ${out} = helpers.arrayLoad(${arrayIndex}, ${array}, frame, ${JSON.stringify(op)});`,
                 ...materializeUnwindReleaseLines("  "),
                 elseArm(""),
                 stmt(e`  ${out} = ${rangeMarker} ? ${provenLoad} : ${
-                  normalized};`, {kind: "assign", write: out}),
+                  normalized};`, {kind: "guardedLoad", write: out,
+                  guard: rangeMarker, target: out,
+                  proven: provenLoad, ordinary: normalized}),
                 blockEnd(""),
               );
               checkedPrimitiveArrayAccesses.add(`${arrayData}\0${arrayIndexInput}`);
@@ -4157,7 +4185,8 @@ class JvmSsaBlockRenderer {
               lines.push(
                 stmt(exprConcat(e`if (!${rangeMarker} && `,
                   e`${arrayIndexOutOfBounds(
-                    arrayIndex, e`${arrayData}.length`)}) {`)),
+                    arrayIndex, e`${arrayData}.length`)}) {`),
+                {kind: "rangeGuardedAccess", guard: rangeMarker}),
                 ...materializeLines([...stack, array, arrayIndex, stored], index, true)
                   .map((line) => `  ${line}`),
                 st`  helpers.arrayStore(${stored}, ${arrayIndex}, ${array}, frame, ${JSON.stringify(op)});`,
@@ -5744,7 +5773,7 @@ class JvmSsaBlockRenderer {
         if (/^iload(?:_[0-3])?$/.test(boundOp)) {
             boundSlot = localIndex(boundInstruction, boundOp);
             if (!Number.isInteger(boundSlot)) return null;
-            boundExpression = `local${boundSlot}`;
+            boundExpression = localName(boundSlot);
           } else if (boundOp === "getstatic") {
             // An entry-snapshotted, read-only scalar static is as invariant
             // as an unmodified bound local for this generated invocation.
@@ -5770,8 +5799,9 @@ class JvmSsaBlockRenderer {
               return null;
             }
             boundExpression = unconditionallyNonNullEntryArrayData.has(arrayData)
-              ? `${arrayData}.length`
-              : `(${arrayData} === null ? 0 : ${arrayData}.length)`;
+              ? operand(e`${arrayData}.length`)
+              : operand(
+                e`(${arrayData} === null ? 0 : ${arrayData}.length)`);
             loadInstruction =
               headerInstructions[headerInstructions.length - 4];
           } else {
@@ -6148,17 +6178,22 @@ class JvmSsaBlockRenderer {
           ...info,
           variable: named(`ssaRuntimeCoarseLoop${header}`),
           tripsVariable: named(`ssaRuntimeCoarseTrips${header}`),
-          tripsExpression:
-            `(local${info.slot} >= ${info.boundExpression} ? 0 : ` +
-            (info.increment === 1
-              ? `(${info.boundExpression} - local${info.slot})`
-              : `Math.ceil((${info.boundExpression} - local${info.slot}) / ` +
-                `${info.increment})`) + `)`,
-          condition:
-            `ssaRuntimeCoarseTrips${header} <= ${runtimeCoarseTripLimit}` +
-            (info.increment === 1 ? "" :
-              ` && local${info.slot} <= 2147483647 - ` +
-              `ssaRuntimeCoarseTrips${header} * ${info.increment}`),
+          tripsExpression: operand(exprConcat(
+            e`(${localName(info.slot)} >= ${info.boundExpression} ? 0 : `,
+            info.increment === 1
+              ? e`(${info.boundExpression} - ${localName(info.slot)})`
+              : exprConcat(
+                e`Math.ceil((${info.boundExpression} - ${
+                  localName(info.slot)}) / `,
+                e`${info.increment})`),
+            e`)`)),
+          condition: operand(exprConcat(
+            e`${named(`ssaRuntimeCoarseTrips${header}`)} <= ${
+              runtimeCoarseTripLimit}`,
+            info.increment === 1 ? "" : exprConcat(
+              e` && ${localName(info.slot)} <= 2147483647 - `,
+              e`${named(`ssaRuntimeCoarseTrips${header}`)} * ${
+                info.increment}`))),
         });
       }
     }
@@ -6631,16 +6666,24 @@ class JvmSsaBlockRenderer {
         }
       }
       if (!slots.size) continue;
-      const variable = `ssaInvariantDivisorGuard${header}`;
-      const trips = `(local${info.slot} >= ${info.boundExpression} ? 0 : ` +
-        (info.increment === 1
-          ? `(${info.boundExpression} - local${info.slot})`
-          : `Math.ceil((${info.boundExpression} - local${info.slot}) / ` +
-            `${info.increment})`) + `)`;
+      const variable = named(`ssaInvariantDivisorGuard${header}`);
+      const trips = exprConcat(
+        e`(${localName(info.slot)} >= ${info.boundExpression} ? 0 : `,
+        info.increment === 1
+          ? e`(${info.boundExpression} - ${localName(info.slot)})`
+          : exprConcat(
+            e`Math.ceil((${info.boundExpression} - ${
+              localName(info.slot)}) / `,
+            e`${info.increment})`),
+        e`)`);
       loopInvariantDivisorGuards.set(header, {
         variable,
-        declaration: `const ${variable} = (${trips} === 0 || ` +
-          [...slots].map((slot) => `local${slot} !== 0`).join(" && ") + ");",
+        declaration: constDecl(variable, exprConcat(
+          e`(${trips} === 0 || `,
+          ...[...slots].flatMap((slot, position) => [
+            position === 0 ? "" : " && ",
+            e`${localName(slot)} !== 0`,
+          ]), e`)`), {pure: true}),
       });
       loopInvariantDivisorGuardNonZeroLocals.set(variable, [...slots]);
       loopInvariantDivisorGuardCount += slots.size;
@@ -8682,8 +8725,12 @@ class JvmSsaBlockRenderer {
     const guardConjunction = (guards) => exprConcat(
       ...guards.flatMap((guard, position) =>
         position === 0 ? [e`${guard}`] : [" && ", e`${guard}`]));
-    const conditionLine = (condition, comparison = null) =>
-      stmt(e`if (${condition}) {`, {kind: "if", condition, comparison});
+    // `negated` records that the emitted test is the logical negation of the
+    // comparison it carries, which is how the branch was rendered when the
+    // compiler had no algebraic negation for it.
+    const conditionLine = (condition, comparison = null, negated = false) =>
+      stmt(e`if (${condition}) {`,
+        {kind: "if", condition, comparison, negated});
     const breakStatement = (label) => recordStatement(
       [`break ${label};`], {kind: "break", label});
     const expandContinuationFallbacks = (lines, continuationMode) =>
@@ -8696,6 +8743,7 @@ class JvmSsaBlockRenderer {
       });
     const specializeArrayRangeGuardedStores = (lines, guardVariables) => {
       if (!guardVariables.length) return lines;
+      const guards = new Set(guardVariables);
       const provenArrayData = new Set(guardVariables
         .map((variable) => arrayRangeGuardDataVariables.get(variable))
         .filter(Boolean));
@@ -8709,67 +8757,41 @@ class JvmSsaBlockRenderer {
           ...(arrayRangeGuardNonZeroLocals.get(variable) || []),
           ...(loopInvariantDivisorGuardNonZeroLocals.get(variable) || []),
         ]));
+      // This arm is dominated by `guard === true`, so the guarded load keeps
+      // only its proven expression. The statement recorded both arms, so the
+      // specialization re-emits it instead of cutting the ternary out of the
+      // rendered characters.
       const specializeGuardedValue = (line) => {
-        for (const variable of guardVariables) {
-          const marker = ` = ${variable} ? `;
-          const conditional = line.indexOf(marker);
-          let alternate = -1;
-          let nestedConditionalDepth = 0;
-          let quote = null;
-          let escaped = false;
-          for (let index = conditional + marker.length;
-            conditional >= 0 && index < line.length - 2; index += 1) {
-            const character = line[index];
-            if (quote) {
-              if (escaped) escaped = false;
-              else if (character === "\\") escaped = true;
-              else if (character === quote) quote = null;
-              continue;
-            }
-            if (character === '"' || character === "'" ||
-                character === "`") {
-              quote = character;
-              continue;
-            }
-            if (character === "?") {
-              nestedConditionalDepth += 1;
-              continue;
-            }
-            if (line.slice(index, index + 3) !== " : ") continue;
-            if (nestedConditionalDepth > 0) {
-              nestedConditionalDepth -= 1;
-              index += 2;
-              continue;
-            }
-            alternate = index;
-            break;
-          }
-          if (conditional < 0 || alternate <= conditional + marker.length) {
-            continue;
-          }
-          // This arm is dominated by `variable === true`. The successful
-          // checked-load expression is the text before the conditional's
-          // alternate separator; retaining the ternary costs one branch per
-          // pixel and prevents the engine from seeing an ordinary typed-array
-          // loop. Emission controls this single-line expression shape, so no
-          // guest syntax or identity participates in the rewrite.
-          return `${line.slice(0, conditional)} = ` +
-            `${line.slice(conditional + marker.length, alternate)};`;
+        const record = recordOf(line);
+        if (record?.kind !== "guardedLoad" || !guards.has(record.guard)) {
+          return line;
         }
-        return line;
+        return `${indentationOf(line)}${stmt(
+          e`${record.target} = ${record.proven};`,
+          {kind: "assign", write: record.target}).trim()}`;
+      };
+      const closeAt = (from, indentation, kind = "blockEnd") => {
+        for (let index = from; index < lines.length; index += 1) {
+          const record = recordOf(lines[index]);
+          if (record?.kind === kind &&
+              indentationOf(lines[index]) === indentation) return index;
+        }
+        return lines.length;
       };
       const output = [];
       for (let index = 0; index < lines.length; index += 1) {
         const line = lines[index];
-        const indentPrefix = /^\s*/.exec(line)?.[0] || "";
+        const indentPrefix = indentationOf(line);
         const trimmed = line.slice(indentPrefix.length);
-        const zeroGuard = /^if \((ssaValue\d+) === 0\) \{$/.exec(trimmed);
-        const zeroGuardSlot = zeroGuard && localLoads.get(zeroGuard[1]);
+        const record = recordOf(line);
+        const comparison = record?.kind === "if" ? record.comparison : null;
+        const zeroGuardValue = comparison?.cmp === "=== 0" &&
+          comparison.input !== undefined ? comparison.input : null;
+        const zeroGuardSlot = zeroGuardValue === null
+          ? null : localLoads.get(zeroGuardValue);
         if (Number.isInteger(zeroGuardSlot) &&
             provenNonZeroLocals.has(zeroGuardSlot)) {
-          const closeLine = `${indentPrefix}}`;
-          let close = index + 1;
-          while (close < lines.length && lines[close] !== closeLine) close += 1;
+          const close = closeAt(index + 1, indentPrefix);
           if (close < lines.length) {
             const key = `${zeroGuardSlot}\0${trimmed}`;
             if (!rangeDominatedArithmeticGuards.has(key)) {
@@ -8780,37 +8802,14 @@ class JvmSsaBlockRenderer {
             continue;
           }
         }
-        const inlineNonZeroGuard =
-          /^if \(!\(.+\(\((ssaValue\d+)\) !== 0\).+\) \{$/.exec(trimmed);
-        const inlineNonZeroSlot = inlineNonZeroGuard &&
-          localLoads.get(inlineNonZeroGuard[1]);
-        if (Number.isInteger(inlineNonZeroSlot) &&
-            provenNonZeroLocals.has(inlineNonZeroSlot)) {
-          const closeLine = `${indentPrefix}}`;
-          let close = index + 1;
-          while (close < lines.length && lines[close] !== closeLine) close += 1;
-          if (close < lines.length && lines.slice(index + 1, close).some(
-            (candidate) => candidate.includes(
-              "reason: 'guarded inline integer leaf'"))) {
-            const key = `${inlineNonZeroSlot}\0${trimmed}`;
-            if (!rangeDominatedArithmeticGuards.has(key)) {
-              rangeDominatedArithmeticGuards.add(key);
-              rangeDominatedArithmeticGuardCount += 1;
-            }
-            index = close;
-            continue;
-          }
-        }
-        const nonNullBranch =
-          /^if \(!\((ssaValue\d+) === null\)\) \{$/.exec(trimmed);
-        const nonNullReferenceSlot = nonNullBranch &&
-          entryReferenceLoads.get(nonNullBranch[1]);
+        const nonNullValue = comparison?.cmp === "=== null" &&
+          record.negated === true ? comparison.input : null;
+        const nonNullReferenceSlot = nonNullValue === undefined ||
+          nonNullValue === null ? null : entryReferenceLoads.get(nonNullValue);
         if (this.dominatedFieldReceiverChecksEnabled &&
             Number.isInteger(nonNullReferenceSlot) &&
             provenNonNullEntryReferences.has(nonNullReferenceSlot)) {
-          const closeLine = `${indentPrefix}}`;
-          let close = index + 1;
-          while (close < lines.length && lines[close] !== closeLine) close += 1;
+          const close = closeAt(index + 1, indentPrefix);
           if (close < lines.length) {
             const key = `${nonNullReferenceSlot}\0${trimmed}`;
             if (!dominatedEntryReferenceNullBranches.has(key)) {
@@ -8828,19 +8827,15 @@ class JvmSsaBlockRenderer {
             continue;
           }
         }
-        const nullBranch = /^if \((ssaValue\d+) === null\) \{$/.exec(trimmed);
-        const referenceSlot = nullBranch && entryReferenceLoads.get(nullBranch[1]);
+        const nullValue = comparison?.cmp === "=== null" &&
+          record.negated !== true ? comparison.input : null;
+        const referenceSlot = nullValue === undefined || nullValue === null
+          ? null : entryReferenceLoads.get(nullValue);
         if (this.dominatedFieldReceiverChecksEnabled &&
             Number.isInteger(referenceSlot) &&
             provenNonNullEntryReferences.has(referenceSlot)) {
-          const elseLine = `${indentPrefix}} else {`;
-          const closeLine = `${indentPrefix}}`;
-          let alternate = index + 1;
-          while (alternate < lines.length && lines[alternate] !== elseLine) {
-            alternate += 1;
-          }
-          let close = alternate + 1;
-          while (close < lines.length && lines[close] !== closeLine) close += 1;
+          const alternate = closeAt(index + 1, indentPrefix, "elseArm");
+          const close = closeAt(alternate + 1, indentPrefix);
           if (alternate < lines.length && close < lines.length) {
             const key = `${referenceSlot}\0${trimmed}`;
             if (!dominatedEntryReferenceNullBranches.has(key)) {
@@ -8858,11 +8853,8 @@ class JvmSsaBlockRenderer {
             continue;
           }
         }
-        const receiverCheck =
-          /^if \((ssaValue\d+) === null \|\| \1 === undefined\) \{$/.exec(
-            trimmed);
-        const receiverArrayData = receiverCheck &&
-          eagerFieldReceiverNullChecks.get(receiverCheck[1]);
+        const receiverArrayData = record?.kind === "nullCheck"
+          ? eagerFieldReceiverNullChecks.get(record.value) : null;
         if (this.dominatedFieldReceiverChecksEnabled &&
             receiverArrayData && provenArrayData.has(receiverArrayData)) {
           // The active loop version is dominated by an array-range predicate
@@ -8872,9 +8864,7 @@ class JvmSsaBlockRenderer {
           // invalidate the field before this access. Therefore the getfield
           // null path is impossible in this arm. Keep it verbatim in the slow
           // loop so a null receiver still materializes the exact getfield PC.
-          const closeLine = `${indentPrefix}}`;
-          let close = index + 1;
-          while (close < lines.length && lines[close] !== closeLine) close += 1;
+          const close = closeAt(index + 1, indentPrefix);
           if (close < lines.length) {
             const key = `${receiverArrayData}\0${trimmed}`;
             if (!dominatedFieldReceiverChecks.has(key)) {
@@ -8885,20 +8875,13 @@ class JvmSsaBlockRenderer {
             continue;
           }
         }
-        const guarded = guardVariables.some((variable) =>
-          trimmed.startsWith(`if (!${variable} && `));
-        if (!guarded) {
+        if (record?.kind !== "rangeGuardedAccess" ||
+            !guards.has(record.guard)) {
           output.push(line);
           continue;
         }
-        const elseLine = `${indentPrefix}} else {`;
-        const closeLine = `${indentPrefix}}`;
-        let alternate = index + 1;
-        while (alternate < lines.length && lines[alternate] !== elseLine) {
-          alternate += 1;
-        }
-        let close = alternate + 1;
-        while (close < lines.length && lines[close] !== closeLine) close += 1;
+        const alternate = closeAt(index + 1, indentPrefix, "elseArm");
+        const close = closeAt(alternate + 1, indentPrefix);
         if (alternate >= lines.length || close >= lines.length) {
           output.push(line);
           continue;
@@ -9293,8 +9276,13 @@ class JvmSsaBlockRenderer {
         // Emit the compiler's own negation of the branch condition when it
         // has one, instead of leaving `!(a !== b)` for a later text pass.
         const negated = plan.negatedCondition || e`!(${plan.condition})`;
+        // With an algebraic negation the comparison is the negated one; the
+        // `!(...)` wrapper keeps the original comparison and marks it negated.
+        const negatedComparison = plan.negatedCondition
+          ? plan.negatedComparison : plan.comparison;
+        const negatedIsWrapped = !plan.negatedCondition;
         if (thenLines.length === 0) {
-          return [conditionLine(negated, plan.negatedComparison),
+          return [conditionLine(negated, negatedComparison, negatedIsWrapped),
             ...indent(elseLines), blockEnd("")];
         }
         // The break a branch arm ends in is a compiler-owned statement; ask
@@ -9309,7 +9297,7 @@ class JvmSsaBlockRenderer {
           ? breakTarget(elseLines[elseLines.length - 1]) : null;
         if (thenBreak && thenBreak === elseBreak) {
           return [
-            conditionLine(negated, plan.negatedComparison),
+            conditionLine(negated, negatedComparison, negatedIsWrapped),
             ...indent(elseLines.slice(0, -1)),
             blockEnd(""),
             breakStatement(thenBreak),
@@ -11042,7 +11030,7 @@ class JvmSsaBlockRenderer {
     const directInvariantPositionalCallDeclarations =
       invariantPositionalCallDeclarationsFor(true);
     for (const index of invariantPositionalReceiverSlots.keys()) {
-      ssaValueNames.add(named(invariantPositionalRawVariable(index)));
+      ssaValueNames.add(invariantPositionalRawVariable(index));
     }
     const buildBody = (
       tree, entrySafePointBudget = safePointInitialBudget,
@@ -13211,4 +13199,5 @@ module.exports._test = {
   isIrreducibleError,
   unboundGeneratedSsaIdentifiers,
   reportStatementIrAudit,
+  reportPassFires,
 };
