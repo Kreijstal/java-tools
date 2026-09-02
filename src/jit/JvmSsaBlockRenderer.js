@@ -194,15 +194,16 @@ function unboundGeneratedSsaIdentifiers(source, candidates = null) {
 function normalizedArrayLoadExpression(raw, op, array, arrayKind = null) {
   switch (op) {
     case "baload":
-      if (arrayKind === "[Z") return `(${raw} ? 1 : 0)`;
-      if (arrayKind === "[B") return `((${raw} << 24) >> 24)`;
-      return `(${array}.type === "[Z" || ${array}.elementType === "boolean") ? ` +
-        `(${raw} ? 1 : 0) : ((${raw} << 24) >> 24)`;
-    case "caload": return `(${raw} & 0xffff)`;
-    case "saload": return `((${raw} << 16) >> 16)`;
-    case "iaload": return `((${raw}) | 0)`;
-    case "faload": return `Math.fround(${raw})`;
-    case "laload": return `BigInt.asIntN(64, BigInt(${raw}))`;
+      if (arrayKind === "[Z") return e`(${raw} ? 1 : 0)`;
+      if (arrayKind === "[B") return e`((${raw} << 24) >> 24)`;
+      return exprConcat(
+        e`(${array}.type === "[Z" || ${array}.elementType === "boolean") ? `,
+        e`(${raw} ? 1 : 0) : ((${raw} << 24) >> 24)`);
+    case "caload": return e`(${raw} & 0xffff)`;
+    case "saload": return e`((${raw} << 16) >> 16)`;
+    case "iaload": return e`((${raw}) | 0)`;
+    case "faload": return e`Math.fround(${raw})`;
+    case "laload": return e`BigInt.asIntN(64, BigInt(${raw}))`;
     case "aaload":
     case "daload":
     default:
@@ -213,15 +214,16 @@ function normalizedArrayLoadExpression(raw, op, array, arrayKind = null) {
 function normalizedArrayStoreExpression(value, op, array, arrayKind = null) {
   switch (op) {
     case "bastore":
-      if (arrayKind === "[Z") return `((${value}) & 1)`;
-      if (arrayKind === "[B") return `(((${value}) << 24) >> 24)`;
-      return `(${array}.type === "[Z" || ${array}.elementType === "boolean") ? ` +
-        `((${value}) & 1) : (((${value}) << 24) >> 24)`;
-    case "castore": return `((${value}) & 0xffff)`;
-    case "sastore": return `(((${value}) << 16) >> 16)`;
-    case "iastore": return `((${value}) | 0)`;
-    case "fastore": return `Math.fround(${value})`;
-    case "lastore": return `BigInt.asIntN(64, BigInt(${value}))`;
+      if (arrayKind === "[Z") return e`((${value}) & 1)`;
+      if (arrayKind === "[B") return e`(((${value}) << 24) >> 24)`;
+      return exprConcat(
+        e`(${array}.type === "[Z" || ${array}.elementType === "boolean") ? `,
+        e`((${value}) & 1) : (((${value}) << 24) >> 24)`);
+    case "castore": return e`((${value}) & 0xffff)`;
+    case "sastore": return e`(((${value}) << 16) >> 16)`;
+    case "iastore": return e`((${value}) | 0)`;
+    case "fastore": return e`Math.fround(${value})`;
+    case "lastore": return e`BigInt.asIntN(64, BigInt(${value}))`;
     case "aastore":
     case "dastore":
     default:
@@ -230,8 +232,172 @@ function normalizedArrayStoreExpression(value, op, array, arrayKind = null) {
 }
 
 function runtimeClassNameExpression(value) {
-  return `(typeof ${value} === "string" || ${value} instanceof String ` +
-    `? "java/lang/String" : (${value}._className || ${value}.type))`;
+  return exprConcat(
+    e`(typeof ${value} === "string" || ${value} instanceof String `,
+    e`? "java/lang/String" : (${value}._className || ${value}.type))`);
+}
+
+// ---------------------------------------------------------------------------
+// Statement IR
+//
+// The renderer emits JavaScript source text, and several optimizations used to
+// run over that text with regular expressions. They are ordinary compiler
+// passes -- copy propagation, alias substitution, dead-code elimination, load
+// folding, strength reduction -- so they belong on the compiler's own
+// representation instead.
+//
+// Every emitted statement is therefore built from a *parts list*: an ordered
+// sequence of opaque literal chunks and `{ref: name}` operand references. The
+// parts list is the statement's representation; rendering it is the last step.
+// A pass asks the record which names a statement defines and reads, and
+// produces a new statement by substituting operand references -- never by
+// matching or rewriting the rendered characters.
+//
+// Records are keyed by the trimmed rendered text, the same late-bound identity
+// idiom `methodIntegerOriginLines` and `checkedLeafOmittableLines` already use;
+// indentation is applied by the assembler and is not part of the identity.
+class Expr {
+  constructor(parts) { this.parts = parts; }
+  toString() { return renderParts(this.parts); }
+}
+
+function renderParts(parts) {
+  let text = "";
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index];
+    text += typeof part === "string" ? part : part.ref;
+  }
+  return text;
+}
+
+// The set of names the compile currently being rendered has minted. Only the
+// compiler's own names become operand references; anything else an emitter
+// interpolates is an opaque literal chunk. The renderer compiles one method at
+// a time, exactly like `currentMaterializationLocalValues` below.
+let activeEmittedNames = null;
+// Composite operands the simulator stages on the bytecode operand stack stay
+// strings, because the simulator compares and keys them by identity. Their
+// parts list is remembered here so an emitter that interpolates one keeps its
+// operand references instead of flattening it into characters.
+let activeOperandExpressions = null;
+
+function appendPartValue(parts, value) {
+  if (value instanceof Expr) {
+    for (let index = 0; index < value.parts.length; index += 1) {
+      parts.push(value.parts[index]);
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      appendPartValue(parts, value[index]);
+    }
+    return;
+  }
+  const text = typeof value === "string" ? value : String(value);
+  if (text === "") return;
+  if (activeEmittedNames !== null && activeEmittedNames.has(text)) {
+    parts.push({ref: text});
+    return;
+  }
+  const staged = activeOperandExpressions !== null
+    ? activeOperandExpressions.get(text) : undefined;
+  if (staged !== undefined) {
+    for (let index = 0; index < staged.length; index += 1) {
+      parts.push(staged[index]);
+    }
+    return;
+  }
+  parts.push(text);
+}
+
+function buildParts(strings, values) {
+  const parts = [];
+  for (let index = 0; index < strings.length; index += 1) {
+    if (strings[index] !== "") parts.push(strings[index]);
+    if (index < values.length) appendPartValue(parts, values[index]);
+  }
+  return parts;
+}
+
+// Tagged template for an expression: `e`${a} + ${b}`` records the operand
+// references instead of flattening them into characters.
+function e(strings, ...values) {
+  return new Expr(buildParts(strings, values));
+}
+
+// Concatenation of expression pieces. `+` on two tagged templates would
+// stringify both and lose their operand references.
+function exprConcat(...pieces) {
+  const parts = [];
+  for (let index = 0; index < pieces.length; index += 1) {
+    appendPartValue(parts, pieces[index]);
+  }
+  return new Expr(parts);
+}
+
+function partsReferences(parts) {
+  const names = [];
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index];
+    if (typeof part !== "string") names.push(part.ref);
+  }
+  return names;
+}
+
+// Replace operand references by parts lists. This is the only way a pass may
+// rewrite a statement.
+function substituteParts(parts, replacements) {
+  const out = [];
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index];
+    if (typeof part === "string") { out.push(part); continue; }
+    const replacement = replacements.get(part.ref);
+    if (replacement === undefined) { out.push(part); continue; }
+    const replacementParts = replacement instanceof Expr
+      ? replacement.parts : replacement;
+    for (let position = 0; position < replacementParts.length; position += 1) {
+      out.push(replacementParts[position]);
+    }
+  }
+  return out;
+}
+
+// Opt-in audit of the statement IR (JVM_JIT_VERIFY_STATEMENT_IR=1). Like the
+// generated-scope verifier it only re-checks a finished body: it scans the
+// rendered text for names the compile minted and reports any line the emitters
+// did not record, or whose record disagrees with the operands actually
+// present. Nothing in the compiler decides what to emit from this scan; the
+// passes read the records, never the characters.
+const statementIrAuditIssues = new Map();
+function auditStatementIrLines(lines, records, names, label) {
+  const note = (issue, line) => {
+    const key = `${issue}: ${line}`;
+    statementIrAuditIssues.set(key,
+      (statementIrAuditIssues.get(key) || 0) + 1);
+  };
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed === "") continue;
+    const record = records.get(trimmed);
+    if (!record) { note(`${label} unrecorded`, trimmed); continue; }
+    const present = [];
+    for (const match of trimmed.matchAll(/[A-Za-z_$][\w$]*/g)) {
+      if (names.has(match[0])) present.push(match[0]);
+    }
+    const declared = partsReferences(record.parts).sort();
+    present.sort();
+    if (declared.length !== present.length ||
+        declared.some((name, index) => present[index] !== name)) {
+      note(`${label} operand mismatch [${declared.join(",")}] vs [` +
+        `${present.join(",")}]`, trimmed);
+    }
+  }
+}
+
+function reportStatementIrAudit() {
+  return [...statementIrAuditIssues.entries()]
+    .sort((left, right) => right[1] - left[1]);
 }
 
 // A checked leaf leaves its body through one compiler-owned statement. When
@@ -721,6 +887,19 @@ class JvmSsaBlockRenderer {
   }
 
   compile(method) {
+    // One method is rendered at a time; a nested compile (a checked leaf's
+    // own body) must not leave the outer compile's name registry active.
+    const previousEmittedNames = activeEmittedNames;
+    const previousOperandExpressions = activeOperandExpressions;
+    try {
+      return this.compileMethodBody(method);
+    } finally {
+      activeEmittedNames = previousEmittedNames;
+      activeOperandExpressions = previousOperandExpressions;
+    }
+  }
+
+  compileMethodBody(method) {
     this.lastCompileError = null;
     this.lastRejectionReason = null;
     this.lastFailedSource = null;
@@ -1176,6 +1355,137 @@ class JvmSsaBlockRenderer {
         ssaValueNames.add(identifier);
       }
     }
+    // Every operand name this compile mints. `e`/`s` interpolations that are
+    // one of these become operand references in the statement IR; everything
+    // else is an opaque literal chunk. The registry only ever grows, and a
+    // missing entry costs an optimization, never correctness: an interpolated
+    // name the registry does not know stays inside a literal chunk and the
+    // statement is then treated as opaque by every pass.
+    const emittedNames = new Set([
+      "frame", "locals", "stack", "thread", "helpers", "plan",
+      "restorationDepth", "safePointBudget", "nestedEntryGuarded",
+      "framelessEntry", "inlineValue0", "inlineValue1", "inlineValue2",
+      "inlineValue3",
+      checkedLeafResultVariable,
+    ]);
+    for (let slot = 0; slot < localCount; slot += 1) {
+      emittedNames.add(`local${slot}`);
+    }
+    for (let index = 0; index < 64; index += 1) {
+      emittedNames.add(`argument${index}`);
+    }
+    for (const identifier of ssaValueNames) emittedNames.add(identifier);
+    const operandExpressions = new Map();
+    activeEmittedNames = emittedNames;
+    activeOperandExpressions = operandExpressions;
+    // Renders a composite operand once and remembers its parts, so that every
+    // later interpolation of the same operand text carries the same operand
+    // references.
+    const operand = (expression) => {
+      const text = String(expression);
+      if (expression instanceof Expr && !operandExpressions.has(text)) {
+        operandExpressions.set(text, expression.parts);
+      }
+      return text;
+    };
+    const named = (name) => { emittedNames.add(name); return name; };
+    const localName = (slot) => `local${slot}`;
+    // Expression form of `arrayDataExpression`: the operand is a compiler
+    // value (an SSA name or a staged expression), so the same purity choice is
+    // made on the compiler's own operand, and the result keeps its operand
+    // references instead of being flattened into characters.
+    const arrayDataExpr = (operand) => {
+      const parts = [];
+      appendPartValue(parts, operand);
+      const value = new Expr(parts);
+      // The operand is evaluated more than once, so only an operand
+      // reference -- a name this compile minted -- may be expanded inline.
+      if (parts.length !== 1 || typeof parts[0] === "string") {
+        return e`helpers.arrayData(${value})`;
+      }
+      return exprConcat(
+        e`(${value} === null || ${value} === undefined ? null : `,
+        e`${value}.elements ? ${value}.elements : `,
+        e`(Array.isArray(${value}) || ArrayBuffer.isView(${value}) ? `,
+        e`${value} : null))`);
+    };
+    // Statement records for every line this compile emits, keyed by the
+    // trimmed rendered text. Indentation is applied by the assembler and is
+    // not part of a statement's identity, exactly as the existing
+    // `checkedLeafOmittableLines` / `methodIntegerOriginLines` consumers
+    // already assume.
+    const statementRecords = new Map();
+    const recordStatement = (parts, meta) => {
+      const text = renderParts(parts);
+      const key = text.trim();
+      const record = {
+        key,
+        parts,
+        kind: meta?.kind || "statement",
+        def: meta?.def || null,
+        write: meta?.write || null,
+        exprParts: meta?.exprParts || null,
+        pure: meta?.pure === true,
+        rawArrayLoad: meta?.rawArrayLoad === true,
+        division: meta?.division === true,
+        pinned: meta?.pinned === true,
+      };
+      record.reads = partsReferences(record.exprParts || record.parts);
+      if (!record.exprParts && record.def) {
+        record.reads = record.reads.filter((name) => name !== record.def);
+      }
+      const existing = statementRecords.get(key);
+      // Identical text is the same statement; a genuinely ambiguous key would
+      // have to disagree about what it defines, and that never happens because
+      // the names are unique. Keep the first record and mark a disagreement
+      // ambiguous so the passes leave it alone.
+      if (existing && (existing.kind !== record.kind ||
+          existing.def !== record.def || existing.write !== record.write ||
+          existing.reads.length !== record.reads.length ||
+          existing.reads.some((name, index) => record.reads[index] !== name))) {
+        existing.ambiguous = true;
+        return text;
+      }
+      if (!existing) statementRecords.set(key, record);
+      return text;
+    };
+    // Generic statement: operand references are the interpolations the
+    // registry recognizes; the rest of the template is opaque text.
+    const st = (strings, ...values) =>
+      recordStatement(buildParts(strings, values), null);
+    // Statement built from an already-assembled expression, for the emitters
+    // that compose a long line out of several pieces.
+    const stmt = (expression, meta = null) => recordStatement(
+      expression instanceof Expr
+        ? expression.parts : buildParts(["", ""], [expression]), meta);
+    // A statement that introduces a binding. `pure` marks a right-hand side
+    // with no side effect that cannot throw, which is what makes propagation
+    // and dead-declaration removal legal.
+    const constDecl = (name, expression, meta = null) => {
+      const exprParts = expression instanceof Expr
+        ? expression.parts : buildParts(["", ""], [expression]);
+      return recordStatement(
+        [`const `, {ref: name}, " = ", ...exprParts, ";"],
+        {...(meta || {}), kind: "const", def: name, exprParts});
+    };
+    const letDecl = (name, expression = null, meta = null) => {
+      if (expression === null) {
+        return recordStatement([`let `, {ref: name}, ";"],
+          {kind: "letUninitialized", def: name, exprParts: []});
+      }
+      const exprParts = expression instanceof Expr
+        ? expression.parts : buildParts(["", ""], [expression]);
+      return recordStatement(
+        [`let `, {ref: name}, " = ", ...exprParts, ";"],
+        {...(meta || {}), kind: "let", def: name, exprParts});
+    };
+    const storeLocal = (name, expression, meta = null) => {
+      const exprParts = expression instanceof Expr
+        ? expression.parts : buildParts(["", ""], [expression]);
+      return recordStatement(
+        [{ref: name}, " = ", ...exprParts, ";"],
+        {...(meta || {}), kind: "store", write: name, exprParts});
+    };
     const value = () => {
       // SSA operand names are unique across every compile this renderer
       // performs, not merely within one method. A checked leaf is inserted
@@ -1187,6 +1497,7 @@ class JvmSsaBlockRenderer {
       const name = `ssaValue${this.nextSsaValue++}`;
       ssaValueNames.add(name);
       ownSsaValueNames.add(name);
+      emittedNames.add(name);
       return name;
     };
     // Bytecode stack staging would otherwise bind an operand that is already
@@ -1203,7 +1514,7 @@ class JvmSsaBlockRenderer {
         return input;
       }
       const out = value();
-      lines.push(`const ${out} = ${input};`);
+      lines.push(constDecl(out, e`${input}`, {pure: true}));
       return out;
     };
     const plans = [];
@@ -1220,7 +1531,7 @@ class JvmSsaBlockRenderer {
     const methodSpecializedCheckedCaptures = {};
     let hasOutlinedClippedLeaf = false;
     const specializedCheckedCapture = (cacheId, position) => {
-      const name = `ssaSpecializedCheckedCapture${cacheId}_${position}`;
+      const name = named(`ssaSpecializedCheckedCapture${cacheId}_${position}`);
       const cache = this.jit.checkedLeafCaptureCaches[cacheId];
       methodSpecializedCheckedCaptures[name] =
         cache?.[`specializedValue${position}`];
@@ -1461,7 +1772,7 @@ class JvmSsaBlockRenderer {
             descriptor: direct.descriptor,
             value: `ssaEntryStaticValue${number}`,
             data: direct.descriptor?.startsWith("[")
-              ? `ssaEntryStaticArrayData${number}` : null,
+              ? named(`ssaEntryStaticArrayData${number}`) : null,
             nullableTested: nullComparedStaticArrayLocations.has(key),
           };
           entryStaticReadCaches.set(key, cache);
@@ -1523,7 +1834,7 @@ class JvmSsaBlockRenderer {
           value: `ssaEntryStaticValue${number}`,
           valid: `ssaEntryStaticValid${number}`,
           data: plan.descriptor?.startsWith("[")
-            ? `ssaEntryStaticArrayData${number}` : null,
+            ? named(`ssaEntryStaticArrayData${number}`) : null,
         };
         entryStaticReadCaches.set(location, cache);
         lazy.entryReadCache = cache;
@@ -1552,10 +1863,10 @@ class JvmSsaBlockRenderer {
         const number = fieldReadCaches.size;
         const site = fieldSites.get(index);
         cache = {
-          object: `ssaFieldCache${number}Object`,
-          value: `ssaFieldCache${number}Value`,
-          valid: `ssaFieldCache${number}Valid`,
-          data: `ssaFieldCache${number}ArrayData`,
+          object: named(`ssaFieldCache${number}Object`),
+          value: named(`ssaFieldCache${number}Value`),
+          valid: named(`ssaFieldCache${number}Valid`),
+          data: named(`ssaFieldCache${number}ArrayData`),
           site,
           indexes: [],
           descriptor: this.jit.fieldSites[site]?.descriptor || null,
@@ -1610,7 +1921,7 @@ class JvmSsaBlockRenderer {
     } catch (_) {
       // Descriptor validation elsewhere will reject malformed methods.
     }
-    const entryArrayDataVariable = (slot) => `ssaEntryArrayData${slot}`;
+    const entryArrayDataVariable = (slot) => named(`ssaEntryArrayData${slot}`);
     const guardedEntryArrayData = new Set([
       ...[...entryArrayLocalSlots].map(entryArrayDataVariable),
       ...[...entryStaticReadCaches.values()]
@@ -2711,7 +3022,7 @@ class JvmSsaBlockRenderer {
       const entryDepth = depths[block.insns[0]];
       if (entryDepth === undefined) { plans[block.id] = { lines: [], terminal: true }; continue; }
       const stack = Array.from({ length: entryDepth }, (_unused, slot) =>
-        `ssaStack${block.id}_${slot}`);
+        named(`ssaStack${block.id}_${slot}`));
       const lines = [];
       const arrayViews = new Map();
       const arrayKinds = new Map();
@@ -2794,7 +3105,8 @@ class JvmSsaBlockRenderer {
           return cached;
         }
         const out = value();
-        lines.push(`const ${out} = local${slot};`);
+        lines.push(constDecl(out, e`${localName(slot)}`,
+          {pure: true, localSnapshot: slot}));
         const origin = {kind: "local", slot};
         integerOrigins.set(out, origin);
         methodIntegerOrigins.set(out, origin);
@@ -2867,7 +3179,7 @@ class JvmSsaBlockRenderer {
         const right = pop(), left = pop();
         if (left === null || right === null) { valid = false; return; }
         const out = value();
-        const line = `const ${out} = ${format(left, right)};`;
+        const line = constDecl(out, format(left, right), {pure: true});
         lines.push(line); stack.push(out);
         if (originOp) {
           const origin = {kind: originOp, left, right};
@@ -2876,7 +3188,7 @@ class JvmSsaBlockRenderer {
           if (plainFormat) {
             methodIntegerOriginLines.set(line, {
               name: out,
-              plain: `const ${out} = ${plainFormat(left, right)};`,
+              plain: constDecl(out, plainFormat(left, right), {pure: true}),
             });
           }
         }
@@ -3173,13 +3485,13 @@ class JvmSsaBlockRenderer {
             else if (this.localValueNumberingEnabled && localValues[slot] === input) {
               eliminatedLocalStoreCount += 1;
             }
-            else lines.push(`local${slot} = ${input};`);
+            else lines.push(storeLocal(localName(slot), e`${input}`));
             const persistentArrayView =
               persistentProducedArrayStoreViews.get(index) ||
               persistentStaticArrayStoreViews.get(index);
             if (persistentArrayView) {
-              lines.push(`${persistentArrayView.data} = ${
-                arrayViews.get(input) || `${arrayDataExpression(input)}`};`);
+              lines.push(st`${persistentArrayView.data} = ${
+                arrayViews.get(input) || arrayDataExpr(input)};`);
             }
             localValues[slot] = this.localValueNumberingEnabled ? input : null;
           }
@@ -3202,7 +3514,9 @@ class JvmSsaBlockRenderer {
           } else if (typeof resolved === "string") {
             // Java string constants are interned once per site at runtime.
             const out = value();
-            lines.push(`const ${out} = helpers.constantValue(${JSON.stringify(resolved)});`);
+            lines.push(constDecl(out,
+              e`helpers.constantValue(${JSON.stringify(resolved)})`,
+              {pure: true}));
             stack.push(out);
           } else valid = false;
         } else if (op === "ldc2_w") {
@@ -3274,12 +3588,13 @@ class JvmSsaBlockRenderer {
             const top = stagedValue(topInput, lines);
             const under = stagedValue(underInput, lines);
             if (!categoryOnePair) {
-              lines.push(`if (typeof ${top} === "bigint") {`,
+              lines.push(st`if (typeof ${top} === "bigint") {`,
                 ...materializeLines([...stack, under, top], index)
                   .map((line) => `  ${line}`),
-                "  helpers.skipJitOnce(frame);",
-                "  return { deopt: true, transient: true, " +
-                  "reason: 'category-2 dup2 in structured SSA' };", "}");
+                st`  helpers.skipJitOnce(frame);`,
+                stmt(exprConcat(e`  return { deopt: true, transient: true, `,
+                  e`reason: 'category-2 dup2 in structured SSA' };`)),
+                st`}`);
             }
             copyValueMetadata(topInput, top);
             copyValueMetadata(underInput, under);
@@ -3288,28 +3603,28 @@ class JvmSsaBlockRenderer {
         } else if (op === "pop") {
           if (pop() === null) valid = false;
         } else if (op === "iadd") {
-          binary((a, b) => `((${a} + ${b}) | 0)`, "iadd",
-            (a, b) => `(${a} + ${b})`);
+          binary((a, b) => e`((${a} + ${b}) | 0)`, "iadd",
+            (a, b) => e`(${a} + ${b})`);
         }
         else if (op === "isub") {
-          binary((a, b) => `((${a} - ${b}) | 0)`, "isub",
-            (a, b) => `(${a} - ${b})`);
+          binary((a, b) => e`((${a} - ${b}) | 0)`, "isub",
+            (a, b) => e`(${a} - ${b})`);
         }
         else if (op === "imul") {
-          binary((a, b) => `Math.imul(${a}, ${b})`, "imul",
-            (a, b) => `(${a} * ${b})`);
+          binary((a, b) => e`Math.imul(${a}, ${b})`, "imul",
+            (a, b) => e`(${a} * ${b})`);
         }
-        else if (op === "iand") binary((a, b) => `(${a} & ${b})`, "iand");
-        else if (op === "ior") binary((a, b) => `(${a} | ${b})`);
-        else if (op === "ixor") binary((a, b) => `(${a} ^ ${b})`);
+        else if (op === "iand") binary((a, b) => e`(${a} & ${b})`, "iand");
+        else if (op === "ior") binary((a, b) => e`(${a} | ${b})`);
+        else if (op === "ixor") binary((a, b) => e`(${a} ^ ${b})`);
         else if (op === "ishl") {
-          binary((a, b) => `(${a} << (${b} & 31))`, "ishl");
+          binary((a, b) => e`(${a} << (${b} & 31))`, "ishl");
         }
         else if (op === "ishr") {
-          binary((a, b) => `(${a} >> (${b} & 31))`, "ishr");
+          binary((a, b) => e`(${a} >> (${b} & 31))`, "ishr");
         }
         else if (op === "iushr") {
-          binary((a, b) => `((${a} >>> (${b} & 31)) | 0)`, "iushr");
+          binary((a, b) => e`((${a} >>> (${b} & 31)) | 0)`, "iushr");
         }
         else if (op === "ladd" || op === "lsub" || op === "lmul" ||
             op === "land" || op === "lor" || op === "lxor") {
@@ -3338,8 +3653,8 @@ class JvmSsaBlockRenderer {
             stack.push(out);
           } else {
             const out = value();
-            lines.push(`const ${out} = BigInt.asIntN(64, ` +
-              `BigInt(${left}) ${operator} BigInt(${right}));`);
+            lines.push(constDecl(out, e`BigInt.asIntN(64, ` +
+              e`BigInt(${left}) ${operator} BigInt(${right}))`, {pure: true}));
             stack.push(out);
           }
         }
@@ -3357,18 +3672,21 @@ class JvmSsaBlockRenderer {
           else {
             const out = value();
             const shifted = op === "lushr"
-              ? `BigInt.asUintN(64, BigInt(${longInput})) >> ` +
-                `(BigInt(${shiftInput}) & 63n)`
-              : `BigInt(${longInput}) ${op === "lshl" ? "<<" : ">>"} ` +
-                `(BigInt(${shiftInput}) & 63n)`;
-            lines.push(`const ${out} = BigInt.asIntN(64, ${shifted});`);
+              ? exprConcat(
+                e`BigInt.asUintN(64, BigInt(${longInput})) >> `,
+                e`(BigInt(${shiftInput}) & 63n)`)
+              : exprConcat(
+                e`BigInt(${longInput}) ${op === "lshl" ? "<<" : ">>"} `,
+                e`(BigInt(${shiftInput}) & 63n)`);
+            lines.push(constDecl(out, e`BigInt.asIntN(64, ${shifted})`,
+              {pure: true}));
             stack.push(out);
           }
         }
         else if (op === "lcmp") {
           binary((a, b) => {
-            const left = `BigInt(${a})`, right = `BigInt(${b})`;
-            return `(${left} < ${right} ? -1 : ${left} > ${right} ? 1 : 0)`;
+            const left = e`BigInt(${a})`, right = e`BigInt(${b})`;
+            return e`(${left} < ${right} ? -1 : ${left} > ${right} ? 1 : 0)`;
           });
         }
         else if (op === "ldiv" || op === "lrem") {
@@ -3376,31 +3694,32 @@ class JvmSsaBlockRenderer {
           if (divisorInput === null || dividendInput === null) valid = false;
           else {
             const dividend = value(), divisor = value(), out = value();
-            lines.push(`const ${dividend} = BigInt(${dividendInput});`,
-              `const ${divisor} = BigInt(${divisorInput});`,
-              `if (${divisor} === 0n) {`,
+            lines.push(constDecl(dividend, e`BigInt(${dividendInput})`,
+              {pure: true}),
+              constDecl(divisor, e`BigInt(${divisorInput})`, {pure: true}),
+              st`if (${divisor} === 0n) {`,
               ...materializeLines([...stack, dividend, divisor], index, true)
                 .map((line) => `  ${line}`),
-              '  throw { type: "java/lang/ArithmeticException", message: "/ by zero" };',
-              "}",
-              `const ${out} = BigInt.asIntN(64, ${dividend} ${
-                op === "ldiv" ? "/" : "%"} ${divisor});`);
+              st`  throw { type: "java/lang/ArithmeticException", message: "/ by zero" };`,
+              st`}`,
+              constDecl(out, e`BigInt.asIntN(64, ${dividend} ${
+                op === "ldiv" ? "/" : "%"} ${divisor})`, {pure: true}));
             stack.push(out);
           }
         }
-        else if (op === "dadd") binary((a, b) => `(${a} + ${b})`);
-        else if (op === "dsub") binary((a, b) => `(${a} - ${b})`);
-        else if (op === "dmul") binary((a, b) => `(${a} * ${b})`);
-        else if (op === "ddiv") binary((a, b) => `(${a} / ${b})`);
-        else if (op === "drem") binary((a, b) => `(${a} % ${b})`);
-        else if (op === "fadd") binary((a, b) => `Math.fround(${a} + ${b})`);
-        else if (op === "fsub") binary((a, b) => `Math.fround(${a} - ${b})`);
-        else if (op === "fmul") binary((a, b) => `Math.fround(${a} * ${b})`);
-        else if (op === "fdiv") binary((a, b) => `Math.fround(${a} / ${b})`);
-        else if (op === "frem") binary((a, b) => `Math.fround(${a} % ${b})`);
+        else if (op === "dadd") binary((a, b) => e`(${a} + ${b})`);
+        else if (op === "dsub") binary((a, b) => e`(${a} - ${b})`);
+        else if (op === "dmul") binary((a, b) => e`(${a} * ${b})`);
+        else if (op === "ddiv") binary((a, b) => e`(${a} / ${b})`);
+        else if (op === "drem") binary((a, b) => e`(${a} % ${b})`);
+        else if (op === "fadd") binary((a, b) => e`Math.fround(${a} + ${b})`);
+        else if (op === "fsub") binary((a, b) => e`Math.fround(${a} - ${b})`);
+        else if (op === "fmul") binary((a, b) => e`Math.fround(${a} * ${b})`);
+        else if (op === "fdiv") binary((a, b) => e`Math.fround(${a} / ${b})`);
+        else if (op === "frem") binary((a, b) => e`Math.fround(${a} % ${b})`);
         else if (op === "dcmpl" || op === "dcmpg" || op === "fcmpl" || op === "fcmpg") {
           const nan = op.endsWith("g") ? "1" : "-1";
-          binary((a, b) => `(${a} < ${b} ? -1 : ${a} > ${b} ? 1 : ${a} === ${b} ? 0 : ${nan})`);
+          binary((a, b) => e`(${a} < ${b} ? -1 : ${a} > ${b} ? 1 : ${a} === ${b} ? 0 : ${nan})`);
         }
         else if (op === "ineg" || op === "i2b" || op === "i2s" || op === "i2c" ||
             op === "dneg" || op === "fneg" || op === "i2d" || op === "f2d" ||
@@ -3413,29 +3732,29 @@ class JvmSsaBlockRenderer {
             // Match the generated baseline tier exactly (NaN -> 0, truncate
             // toward zero, wrap): tier-consistent narrowing keeps differential
             // hashes comparable across tiers.
-            const narrowed = `(Math.trunc(${input}) | 0)`;
+            const narrowed = operand(e`(Math.trunc(${input}) | 0)`);
             const expressions = {
-              ineg: `(-${input}) | 0`,
-              i2b: `((${input} << 24) >> 24)`,
-              i2s: `((${input} << 16) >> 16)`,
-              i2c: `(${input} & 0xffff)`,
-              dneg: `(-${input})`,
-              fneg: `Math.fround(-${input})`,
-              i2d: `${input}`,
-              f2d: `${input}`,
-              i2f: `Math.fround(${input})`,
-              d2f: `Math.fround(${input})`,
+              ineg: operand(e`(-${input}) | 0`),
+              i2b: operand(e`((${input} << 24) >> 24)`),
+              i2s: operand(e`((${input} << 16) >> 16)`),
+              i2c: operand(e`(${input} & 0xffff)`),
+              dneg: operand(e`(-${input})`),
+              fneg: operand(e`Math.fround(-${input})`),
+              i2d: operand(e`${input}`),
+              f2d: operand(e`${input}`),
+              i2f: operand(e`Math.fround(${input})`),
+              d2f: operand(e`Math.fround(${input})`),
               d2i: narrowed,
               f2i: narrowed,
               // BigInt conversion is pure.  Leaving it lazy preserves the
               // exact Java long representation for arbitrary consumers and
               // exception materialization while allowing a later typed SSA
               // node to eliminate it.
-              i2l: `BigInt(${input})`,
-              l2i: `Number(BigInt.asIntN(32, BigInt(${input})))`,
-              l2d: `Number(${input})`,
-              l2f: `Math.fround(Number(${input}))`,
-              lneg: `BigInt.asIntN(64, -BigInt(${input}))`,
+              i2l: operand(e`BigInt(${input})`),
+              l2i: operand(e`Number(BigInt.asIntN(32, BigInt(${input})))`),
+              l2d: operand(e`Number(${input})`),
+              l2f: operand(e`Math.fround(Number(${input}))`),
+              lneg: operand(e`BigInt.asIntN(64, -BigInt(${input}))`),
             };
             if (op === "i2l") {
               const expression = expressions[op];
@@ -3448,11 +3767,13 @@ class JvmSsaBlockRenderer {
               // For signed int a,b, split each into a signed high half and an
               // unsigned low half.  These four imul terms are exactly the low
               // 32 bits of (long)a*b >> 16, including negative products.
-              lines.push(`const ${out} = ((` +
-                `Math.imul((${left}) >> 16, (${right}) >> 16) << 16) + ` +
-                `Math.imul((${left}) >> 16, (${right}) & 65535) + ` +
-                `Math.imul((${left}) & 65535, (${right}) >> 16) + ` +
-                `(Math.imul((${left}) & 65535, (${right}) & 65535) >>> 16)) | 0;`);
+              lines.push(constDecl(out, exprConcat(
+                e`((`,
+                e`Math.imul((${left}) >> 16, (${right}) >> 16) << 16) + `,
+                e`Math.imul((${left}) >> 16, (${right}) & 65535) + `,
+                e`Math.imul((${left}) & 65535, (${right}) >> 16) + `,
+                e`(Math.imul((${left}) & 65535, (${right}) & 65535) >>> 16)) | 0`),
+                {pure: true}));
               stack.push(out);
             } else {
               // `i2d` and `f2d` are representationally the identity here, so
@@ -3477,12 +3798,14 @@ class JvmSsaBlockRenderer {
             } else if (dominatedNonZeroDivisionItems.has(index)) {
               cfgDominatedArithmeticGuardCount += 1;
             } else {
-              lines.push(`if (${divisor} === 0) {`,
+              lines.push(st`if (${divisor} === 0) {`,
                 ...materializeLines([...stack, dividend, divisor], index, true).map((line) => `  ${line}`),
-                '  throw { type: "java/lang/ArithmeticException", message: "/ by zero" };', "}");
+                st`  throw { type: "java/lang/ArithmeticException", message: "/ by zero" };`,
+                st`}`);
             }
-            const line = `const ${out} = ((${dividend} ${
-              op === "idiv" ? "/" : "%"} ${divisor}) | 0);`;
+            const line = constDecl(out, e`((${dividend} ${
+              op === "idiv" ? "/" : "%"} ${divisor}) | 0)`,
+            {pure: true, division: true});
             lines.push(line);
             const origin = {
               kind: op,
@@ -3494,7 +3817,8 @@ class JvmSsaBlockRenderer {
             if (op === "irem") {
               methodIntegerOriginLines.set(line, {
                 name: out,
-                plain: `const ${out} = (${dividend} % ${divisor});`,
+                plain: constDecl(out, e`(${dividend} % ${divisor})`,
+                  {pure: true, division: true}),
               });
             }
             stack.push(out);
@@ -3506,12 +3830,14 @@ class JvmSsaBlockRenderer {
           if (!Number.isInteger(slot) || slot < 0 || slot >= localCount || !Number.isInteger(increment)) {
             valid = false;
           } else if (!this.localValueNumberingEnabled) {
-            lines.push(`local${slot} = (local${slot} + ${increment}) | 0;`);
+            lines.push(storeLocal(localName(slot),
+              e`(${localName(slot)} + ${increment}) | 0`));
           } else {
             const previous = readLocal(slot);
             const out = value();
-            lines.push(`const ${out} = (${previous} + ${increment}) | 0;`);
-            lines.push(`local${slot} = ${out};`);
+            lines.push(constDecl(out, e`(${previous} + ${increment}) | 0`,
+              {pure: true}));
+            lines.push(storeLocal(localName(slot), e`${out}`));
             localValues[slot] = out;
           }
         } else if (op === "arraylength") {
@@ -5435,8 +5761,8 @@ class JvmSsaBlockRenderer {
           const tripLimit = runtimeCoarseTripLimitFor(info);
           runtimeCoarseCountedLoops.set(header, {
             ...info,
-            variable: `ssaRuntimeCoarseLoop${header}`,
-            tripsVariable: `ssaRuntimeCoarseTrips${header}`,
+            variable: named(`ssaRuntimeCoarseLoop${header}`),
+            tripsVariable: named(`ssaRuntimeCoarseTrips${header}`),
             tripsExpression:
               `(local${info.slot} >= ${info.boundExpression} ? 0 : ` +
               (info.increment === 1
@@ -5531,8 +5857,8 @@ class JvmSsaBlockRenderer {
       if (this.coarseCountedLoopSafePointsEnabled) {
         runtimeCoarseCountedLoops.set(header, {
           header, slot, loopBlocks, writtenSlots, postDecrement: true,
-          variable: `ssaRuntimeCoarseLoop${header}`,
-          tripsVariable: `ssaRuntimeCoarseTrips${header}`,
+          variable: named(`ssaRuntimeCoarseLoop${header}`),
+          tripsVariable: named(`ssaRuntimeCoarseTrips${header}`),
           tripsExpression: `Math.max(0, local${slot})`,
           condition: `ssaRuntimeCoarseTrips${header} <= ` +
             `${runtimeCoarseTripLimit}`,
@@ -5590,8 +5916,8 @@ class JvmSsaBlockRenderer {
             runtimeCoarseCountedLoops.has(header)) continue;
         runtimeCoarseCountedLoops.set(header, {
           ...info,
-          variable: `ssaRuntimeCoarseLoop${header}`,
-          tripsVariable: `ssaRuntimeCoarseTrips${header}`,
+          variable: named(`ssaRuntimeCoarseLoop${header}`),
+          tripsVariable: named(`ssaRuntimeCoarseTrips${header}`),
           tripsExpression:
             `(local${info.slot} >= ${info.boundExpression} ? 0 : ` +
             (info.increment === 1
@@ -6779,7 +7105,7 @@ class JvmSsaBlockRenderer {
       if (affineOffset !== 0 &&
           (outermostCountedLoop || outermostPostDecrementLoop ||
            info.postDecrement)) continue;
-      const variable = `ssaArrayRangeGuard${candidateIndex}`;
+      const variable = named(`ssaArrayRangeGuard${candidateIndex}`);
       let condition;
       let preamble = [];
       let declarationHeader = info.header;
@@ -9906,6 +10232,10 @@ class JvmSsaBlockRenderer {
     const compactCheckedLeafLines = (
       sourceLines, checkedLeafSemantics = true,
     ) => {
+      if (process.env.JVM_JIT_VERIFY_STATEMENT_IR) {
+        auditStatementIrLines(sourceLines, statementRecords, emittedNames,
+          checkedLeafSemantics ? "leaf" : "restoring");
+      }
       let lines = [...sourceLines];
       const inlineCheckedLeafLineIndexes = () => {
         const indexes = new Set();
@@ -10374,7 +10704,7 @@ class JvmSsaBlockRenderer {
     const directInvariantPositionalCallDeclarations =
       invariantPositionalCallDeclarationsFor(true);
     for (const index of invariantPositionalReceiverSlots.keys()) {
-      ssaValueNames.add(invariantPositionalRawVariable(index));
+      ssaValueNames.add(named(invariantPositionalRawVariable(index)));
     }
     const buildBody = (
       tree, entrySafePointBudget = safePointInitialBudget,
@@ -12554,4 +12884,5 @@ module.exports = JvmSsaBlockRenderer;
 module.exports._test = {
   isIrreducibleError,
   unboundGeneratedSsaIdentifiers,
+  reportStatementIrAudit,
 };
