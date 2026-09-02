@@ -13190,7 +13190,7 @@ class JvmSsaBlockRenderer {
           const tripVariables = countedRegionLoops.map((info) =>
             `ssaCheckedLeafTrips${info.header}`);
           checkedLeafTripDeclarations.push(
-            stmt(exprConcat(e`if (!(`,
+            returnStmt(exprConcat(e`if (!(`,
               ...tripVariables.flatMap((variable, position) => [
                 position === 0 ? "" : " && ",
                 e`${variable} <= ${runtimeCoarseTripLimit}`,
@@ -13198,7 +13198,7 @@ class JvmSsaBlockRenderer {
               e` && `,
               ...tripVariables.flatMap((variable, position) =>
                 [position === 0 ? "" : " * ", e`${variable}`]),
-              e` <= 1000000)) return helpers.asyncInvokeSentinel();`),
+              e` <= 1000000)) `), CHECKED_LEAF_BAIL_VALUE, "",
             {kind: "entryGuard"}),
           );
         }
@@ -13238,7 +13238,7 @@ class JvmSsaBlockRenderer {
                 e`${windowDelta} % ${shape.stride} === 0 && `,
                 e`${windowDelta} / ${shape.stride} - 1 <= ${maximumTrips})`))}`,
               blockEnd(),
-              stmt(e`if (!${windowGuard}) return helpers.asyncInvokeSentinel();`,
+              returnStmt(e`if (!${windowGuard}) `, CHECKED_LEAF_BAIL_VALUE, "",
                 {kind: "entryGuard"}),
             );
           } else {
@@ -13271,7 +13271,7 @@ class JvmSsaBlockRenderer {
                 e`${runtimeCoarseTripLimit} && ${windowInnerTrips} >= 0 && `,
                 e`${windowInnerTrips} <= ${runtimeCoarseTripLimit} && `,
                 e`${windowOuterTrips} * ${windowInnerTrips} <= 1000000)))`)),
-              stmt(e`if (!${windowGuard}) return helpers.asyncInvokeSentinel();`,
+              returnStmt(e`if (!${windowGuard}) `, CHECKED_LEAF_BAIL_VALUE, "",
                 {kind: "entryGuard"}),
             );
           }
@@ -13296,7 +13296,7 @@ class JvmSsaBlockRenderer {
               e`${partitionDelta} % ${shape.stride} === 0 && `,
               e`${partitionDelta} / ${shape.stride} <= ${
                 runtimeCoarseTripLimit})`)),
-            stmt(e`if (!${partitionGuard}) return helpers.asyncInvokeSentinel();`,
+            returnStmt(e`if (!${partitionGuard}) `, CHECKED_LEAF_BAIL_VALUE, "",
               {kind: "entryGuard"}),
           );
         }
@@ -13760,14 +13760,14 @@ class JvmSsaBlockRenderer {
                 ].map((slot) =>
                   constDecl(localName(slot), e`${entryArgumentValue(slot)}`)),
                 ...checkedLeafTripDeclarations,
-                stmt(exprConcat(e`return ssaRecursiveArrayWorker(`,
+                returnStmt("", exprConcat(e`ssaRecursiveArrayWorker(`,
                   ...[
                     entryArrayDataVariable(
                       recursiveArrayPartitionLeaf.arraySlot),
                     ...argumentNames.slice(1),
                   ].flatMap((name, position) =>
                     [position === 0 ? "" : ", ", e`${name}`]),
-                  e`);`), {kind: "checkedLeafReturn"}),
+                  e`)`), "", {kind: "checkedLeafReturn"}),
               ].filter(Boolean)
               : [
                 // The result slot precedes every guard: a lexical insertion
