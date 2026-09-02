@@ -293,33 +293,119 @@ function statementBytes(statements, from, to) {
 }
 
 /**
+ * The block scope each statement of a range sits in.
+ *
+ * A statement belongs to the scope that is open before it runs, and the
+ * nesting it opens or closes -- the delta its emitter recorded -- starts and
+ * ends the scopes inside it. A block continuation (`} else {`, `} catch (e)
+ * {`) ends one scope and starts a sibling of it, which its zero delta does
+ * not say on its own.
+ *
+ * A scope a nested function opened is marked as such: a name declared inside
+ * one is a different binding from an outer name of the same spelling, but so
+ * is the activation it belongs to, and a pass that reasons about the unit's
+ * own scope treats such a scope as one it cannot see into.
+ *
+ * Returns null when the deltas do not balance over the range, which makes
+ * every caller decline it rather than guess at its structure.
+ */
+function regionScopes(statements, from, to) {
+  const parents = [null];
+  const functions = new Set();
+  const scopeOf = [];
+  const stack = [0];
+  for (let index = from; index < to; index += 1) {
+    const statement = statements[index];
+    scopeOf.push(stack[stack.length - 1]);
+    const delta = statement.delta;
+    if (delta > 0) {
+      for (let step = 0; step < delta; step += 1) {
+        parents.push(stack[stack.length - 1]);
+        stack.push(parents.length - 1);
+        if (statement.opens === "function") {
+          functions.add(parents.length - 1);
+        }
+      }
+    } else if (delta < 0) {
+      for (let step = 0; step < -delta; step += 1) {
+        if (stack.length <= 1) return null;
+        stack.pop();
+      }
+    } else if (statement.continuesBlock && stack.length > 1) {
+      // The arm this statement opens is a sibling of the one it closes, so a
+      // name the previous arm declared is not in scope in it.
+      const parent = parents[stack[stack.length - 1]];
+      stack.pop();
+      parents.push(parent);
+      stack.push(parents.length - 1);
+    }
+  }
+  if (stack.length !== 1) return null;
+  const inFunction = (scope) => {
+    for (let at = scope; at !== null && at !== 0; at = parents[at]) {
+      if (functions.has(at)) return true;
+    }
+    return false;
+  };
+  return {parents, scopeOf, functions, inFunction};
+}
+
+/**
  * The names a statement range introduces, reads from an enclosing scope and
  * assigns there, in first-appearance order.
  *
+ * Declarations are resolved by block scope, not by a flat name set. A body a
+ * composition spliced a callee into carries the callee's own `local<slot>` /
+ * `ssaValue<n>` declarations inside a nested block, where they *shadow* the
+ * caller's names of the same spelling rather than colliding with them; a flat
+ * set would report such a name as bound for the whole range and hand a
+ * relocated statement the wrong binding -- or, for a name the callee alone
+ * declares, hand the call site a parameter that does not exist there.
+ *
  * Returns null when the range contains a statement whose names are unknown or
- * that may not be relocated: a region whose free-variable set cannot be
- * stated exactly is never extracted.
+ * that may not be relocated, or when its nesting does not balance: a region
+ * whose free-variable set cannot be stated exactly is never extracted.
  */
 function regionNames(statements, from, to) {
-  const declared = new Set();
+  const scopes = regionScopes(statements, from, to);
+  if (!scopes) return null;
+  const declaredIn = new Map();
   for (let index = from; index < to; index += 1) {
     const statement = statements[index];
     if (!statement.relocatable || statement.reads === null) return null;
-    if (statement.def) declared.add(statement.def);
-    for (const name of statement.declares || []) declared.add(name);
+    const scope = scopes.scopeOf[index - from];
+    for (const name of [...(statement.def ? [statement.def] : []),
+      ...(statement.declares || [])]) {
+      if (!declaredIn.has(name)) declaredIn.set(name, new Set());
+      declaredIn.get(name).add(scope);
+    }
   }
+  // A name is bound where it is used when some scope enclosing that use
+  // declares it. The range's own scope is 0, so a name declared there is
+  // bound everywhere in the range, exactly as before.
+  const boundAt = (name, scope) => {
+    const sites = declaredIn.get(name);
+    if (!sites) return false;
+    for (let at = scope; at !== null; at = scopes.parents[at]) {
+      if (sites.has(at)) return true;
+    }
+    return false;
+  };
+  const declared = new Set(
+    [...declaredIn.keys()].filter((name) => declaredIn.get(name).has(0)));
   const free = [];
   const seen = new Set();
   const written = new Set();
   for (let index = from; index < to; index += 1) {
     const statement = statements[index];
+    const scope = scopes.scopeOf[index - from];
     for (const name of statement.reads) {
-      if (declared.has(name) || seen.has(name)) continue;
+      if (boundAt(name, scope) || seen.has(name)) continue;
       seen.add(name);
       free.push(name);
     }
     for (const write of statement.writes || []) {
-      if (declared.has(write)) continue;
+      if (boundAt(write, scope)) continue;
       written.add(write);
       if (seen.has(write)) continue;
       seen.add(write);
@@ -503,18 +589,224 @@ function variantNameOfSource(generated, source) {
   return null;
 }
 
+// `const plan = <planName>;` is a statement the region compiler emits in
+// front of a restoring body it inlines, so it states its own facts.
+function restoringInlinePlanStatement(planName) {
+  return ownStatement(`const plan = ${planName};`,
+    {kind: "const", def: "plan",
+      parts: ["const ", {ref: "plan"}, ` = ${planName};`]});
+}
+
+/**
+ * One published insertion statement, retargeted onto the names a call site
+ * chose for this insertion.
+ *
+ * The text is produced the way the renderer's own assembler produces it: the
+ * two compiler-owned tokens the callee's exits carry -- both of which spell
+ * the callee's compile serial and occur nowhere else -- are expanded by exact
+ * identity. Everything else is a substitution over the record the emitter
+ * published: operand references, the label a jump names, and the parts a
+ * statement's exit or jump splits into.
+ *
+ * A label part loses its operand identity here. A label names a statement,
+ * not a value, so a relocated statement must never receive one as a helper
+ * parameter; the renderer keeps the operand identity because a compile-minted
+ * label is also a name its generated scope carries, and that is exactly what
+ * would make a partition helper take `jvmRegionInline7_3_return` as an
+ * argument the call site cannot supply.
+ */
+function retargetInsertionStatement(statement, indent, tokens) {
+  const {resultToken, resultName, labelToken, exitLabel} = tokens;
+  const labelNames = new Set();
+  const renameLabel = (label) => label === labelToken ? exitLabel : label;
+  const renameName = (name) => name === resultToken ? resultName : name;
+  const retargetParts = (parts) => {
+    if (!Array.isArray(parts)) return parts;
+    let changed = false;
+    const out = [];
+    for (const part of parts) {
+      if (typeof part === "string") { out.push(part); continue; }
+      if (part.label !== undefined) {
+        const label = renameLabel(part.label);
+        labelNames.add(label);
+        if (label !== part.label || part.ref !== undefined) changed = true;
+        out.push({label});
+        continue;
+      }
+      if (part.ref === resultToken) {
+        changed = true;
+        out.push({...part, ref: resultName});
+        continue;
+      }
+      out.push(part);
+    }
+    return changed ? out : parts;
+  };
+  const parts = retargetParts(statement.parts);
+  const jump = statement.jump ? {
+    kind: statement.jump.kind,
+    label: statement.jump.label ? renameLabel(statement.jump.label) : null,
+    before: retargetParts(statement.jump.before),
+    after: retargetParts(statement.jump.after),
+  } : null;
+  const exit = statement.exit ? {
+    before: retargetParts(statement.exit.before),
+    value: statement.exit.value
+      ? retargetParts(statement.exit.value) : statement.exit.value,
+    after: retargetParts(statement.exit.after),
+  } : null;
+  return {
+    ...statement,
+    text: `${indent}${statement.text.split(resultToken).join(resultName)
+      .split(labelToken).join(exitLabel)}`,
+    indent: `${indent}${statement.indent}`,
+    parts,
+    def: statement.def ? renameName(statement.def) : statement.def,
+    write: statement.write ? renameName(statement.write) : statement.write,
+    writes: (statement.writes || []).map(renameName),
+    reads: statement.reads === null ? null : statement.reads
+      .map(renameName).filter((name) => !labelNames.has(name)),
+    declares: statement.declares
+      ? statement.declares.map(renameName) : statement.declares,
+    // The bound an opaque record carries is a set of enclosing names, so it
+    // is retargeted exactly like the names that are known.
+    mentions: statement.mentions
+      ? statement.mentions.map(renameName) : statement.mentions,
+    label: statement.label ? renameLabel(statement.label) : statement.label,
+    jump,
+    exit,
+  };
+}
+
+/**
+ * The statement records behind one assembled insertion.
+ *
+ * The scaffold -- the result declaration, the argument staging, the labeled
+ * block and the declarations that bind the callee's parameters and entry
+ * guard inside it -- is emitted by this compiler, so it states its own facts.
+ * The body is the callee's own published records, retargeted and indented the
+ * way the assembler indents its text.
+ *
+ * The argument staging declarations are the one opaque part. An operand comes
+ * out of the caller's emitted call, where the renderer's own line passes may
+ * have rewritten it, so the region compiler never learned which names it
+ * mentions; a run that would contain one is declined, while everything the
+ * insertion introduces around it stays a record.
+ */
+function insertionStatements(insertion, options) {
+  const bodyStatements = options.statements;
+  if (!Array.isArray(bodyStatements) || !bodyStatements.length) return null;
+  const {argumentValues, resultName, exitLabel, namespace} = options;
+  const tokens = {
+    resultToken: insertion.resultToken, resultName,
+    labelToken: insertion.labelToken, exitLabel,
+  };
+  const out = [];
+  if (options.declareResult !== false) {
+    out.push(ownStatement(`let ${resultName};`,
+      {kind: "letUninitialized", def: resultName}));
+  }
+  argumentValues.forEach((value, index) => {
+    out.push(ownStatement(`const ${namespace}a${index} = ${value};`,
+      {kind: "const", def: `${namespace}a${index}`,
+        reads: null, relocatable: false}));
+  });
+  out.push(ownStatement(`${exitLabel}: {`,
+    {delta: 1, opens: "block", label: exitLabel}));
+  insertion.argumentNames.forEach((name, index) => {
+    out.push(ownStatement(`  const ${name} = ${namespace}a${index};`,
+      {kind: "const", def: name, reads: [`${namespace}a${index}`]}));
+  });
+  out.push(ownStatement(
+    `  const ${insertion.entryGuardName} = ${insertion.entryGuardValue};`,
+    {kind: "const", def: insertion.entryGuardName}));
+  for (const statement of bodyStatements) {
+    out.push(retargetInsertionStatement(statement, "  ", tokens));
+  }
+  out.push(ownStatement("}", {kind: "blockEnd", delta: -1}));
+  return out;
+}
+
+/**
+ * Assemble one published insertion at a call site, as both the text the
+ * caller splices in and the statement records behind that text.
+ *
+ * The text *is* the renderer's own `assemble` call, so a module composed
+ * through this function is byte-identical to one composed before it existed.
+ * The records are returned only when their joined text reproduces that body
+ * exactly; a body whose records cannot is spliced as one opaque record, which
+ * is what every insertion was before.
+ */
+function assembleInsertion(insertion, options) {
+  const source = insertion.assemble(options);
+  if (typeof source !== "string") return null;
+  const statements = insertionStatements(insertion, options);
+  return {
+    source,
+    statements: statements &&
+      statements.map((statement) => statement.text).join("\n") === source
+      ? statements : null,
+  };
+}
+
+/**
+ * The records an edit contributes in place of the statements it replaced.
+ *
+ * An edit that carries its own records replaces whole statements: it starts
+ * where the first one's text starts -- the assembler owns the indentation in
+ * front of it, which is why the edit does not span it -- and ends where the
+ * last one ends. The first spliced record inherits that indentation, exactly
+ * as the text splice leaves it in front of the replacement. Returns null when
+ * any of that does not hold, and the caller falls back to one opaque record.
+ */
+function spliceEditStatements(edit, statements, first, last, starts, endOf) {
+  if (!Array.isArray(edit.statements) || !edit.statements.length) return null;
+  const head = statements[first];
+  if (edit.start !== starts[first] + head.indent.length) return null;
+  if (edit.end !== endOf(last)) return null;
+  let replacedDelta = 0;
+  let replacedOpen = 0;
+  for (let index = first; index <= last; index += 1) {
+    replacedDelta += statements[index].delta;
+    replacedOpen += statements[index].openDelta || 0;
+  }
+  let splicedDelta = 0;
+  let splicedOpen = 0;
+  for (const statement of edit.statements) {
+    splicedDelta += statement.delta;
+    splicedOpen += statement.openDelta || 0;
+  }
+  if (replacedDelta !== splicedDelta) return null;
+  if (replacedOpen !== splicedOpen) return null;
+  const [firstStatement, ...rest] = edit.statements;
+  return [{
+    ...firstStatement,
+    text: `${head.indent}${firstStatement.text}`,
+    indent: `${head.indent}${firstStatement.indent}`,
+  }, ...rest];
+}
+
 /**
  * Keep a body's statement records in step with the edits that lowered its
  * call sites.
  *
  * `rewriteCallBindings` links a node by splicing text it built itself into
  * spans the renderer delimited with compiler-owned markers. The same edits
- * are applied here to the statement list: a statement an edit rewrote, and
- * every statement a multi-line edit spanned, become one opaque record whose
- * names are unknown, so no later pass relocates it or anything containing
- * it. An edit that deletes a statement outright -- an eliminated call binding
- * or a dropped run counter -- leaves an empty record instead, which is exactly
- * as relocatable as the blank line it emits.
+ * are applied here to the statement list.
+ *
+ * An edit that composed a callee's body into the caller carries the records
+ * behind the text it produced, and those are spliced in place of the
+ * statements the call span occupied: a composed body is therefore a flat
+ * sequence of real records, and the structural passes see inside it. Nested
+ * insertions come out flat too, because a composed callee's own records were
+ * spliced the same way before it was inserted.
+ *
+ * Every other edit -- a binding declaration replaced or dropped, a run
+ * counter removed, a call lowered to text this compiler wrote -- still merges
+ * the statements it touched into one opaque record whose names are unknown,
+ * so no later pass relocates it or anything containing it. An edit that
+ * deletes a statement outright leaves an empty record instead, which is
+ * exactly as relocatable as the blank line it emits.
  *
  * A merged record keeps the nesting delta of the statements it replaced: a
  * lowered call span and its replacement are both complete constructs. If that
@@ -561,8 +853,11 @@ function applyRegionStatementEdits(statements, edits, rewrittenSource) {
     if (previous && previous.last >= first) {
       previous.last = Math.max(previous.last, last);
       previous.growth += growth;
+      // Two edits landed in one span of statements, so neither one's records
+      // describe the whole span: the merged block stays opaque.
+      previous.edit = null;
     } else {
-      blocks.push({first, last, shift, growth});
+      blocks.push({first, last, shift, growth, edit});
     }
     shift += growth;
   }
@@ -617,6 +912,28 @@ function applyRegionStatementEdits(statements, edits, rewrittenSource) {
         mentioned.add(name);
         mentions.push(name);
       }
+    }
+    // An edit that composed a callee's body carries the records behind its
+    // own text, and those are spliced in place of the statements the call
+    // span occupied. They have to reproduce the text this edit actually
+    // produced: they do by construction -- the assembler checked it -- and
+    // checking it again here is what keeps the record list and the source the
+    // same body rather than two that merely started out equal.
+    //
+    // A spliced record that is itself opaque -- the argument staging the
+    // insertion writes around an operand the compiler never learned the names
+    // of -- inherits the block's bound, because everything the composition
+    // spliced came out of the statements it replaced.
+    const spliced = block.edit ? spliceEditStatements(
+      block.edit, statements, block.first, block.last, starts, endOf) : null;
+    if (spliced &&
+        spliced.map((statement) => statement.text).join("\n") === text) {
+      for (const statement of spliced) {
+        output.push(statement.reads === null && !statement.mentions
+          ? {...statement, mentions: bounded ? mentions : null} : statement);
+      }
+      index = block.last + 1;
+      continue;
     }
     output.push(text.trim() === ""
       ? ownStatement(text, {delta, openDelta, parts: [text]})
@@ -819,7 +1136,7 @@ function outlineLargeRegionLoops(unit, options = {}) {
               reads: [sharedStateName],
               exit: {
                 before: [`if (${sharedStateName}[0] === 1) `],
-                argument: [`${sharedStateName}[1]`],
+                value: [`${sharedStateName}[1]`],
                 after: [],
               },
             }),
@@ -877,6 +1194,13 @@ function outlineLargeRegionLoops(unit, options = {}) {
  * unit's top statement list are lifted, so per-iteration block scoping is
  * never disturbed. Lifting a `const` into a mutable slot is safe because
  * generated code never reassigns and never relies on TDZ.
+ *
+ * A body a composition spliced a callee into declares the callee's own
+ * `local<slot>` / `ssaValue<n>` inside a nested block, where they *shadow* the
+ * unit's top-level names of the same spelling. A reference inside such a block
+ * binds to the shadow and is left alone; the top-level name is still lifted,
+ * because the two are different bindings and always were -- before the splice
+ * they merely sat inside one opaque record where this pass could not see them.
  */
 function liftOversizedUnitLocalsToEnvironment(units, options = {}) {
   const maximumUnitBytes = Math.max(16384,
@@ -891,20 +1215,42 @@ function liftOversizedUnitLocalsToEnvironment(units, options = {}) {
     const envName = `jvmRegionEnv${namespace}_${unitIndex}`;
     const groups = statementGroups(unit.statements);
     if (!groups) return unit;
-    // One declaration site per name across the whole unit, or it stays local;
-    // and every statement has to be rewritable, or a reference could be left
-    // spelled the old way.
+    // The block scope each statement sits in, so a nested declaration is read
+    // as the shadow it is rather than as a second declaration of the same
+    // binding.
+    const scopes = regionScopes(unit.statements, 0, unit.statements.length);
+    if (!scopes) return unit;
+    // One declaration site per name in the unit's own top scope, or it stays
+    // local; and every statement has to be rewritable, or a reference could
+    // be left spelled the old way.
     const declarationCounts = new Map();
+    // The nested scopes that declare a name of their own. A reference inside
+    // one of them binds there, not to the lifted top-level name. A scope a
+    // nested function opened is not read as a shadow: its declaration still
+    // counts against the name, exactly as it did before this pass could see
+    // inside a composed block at all.
+    const shadowScopes = new Map();
+    const shadow = (name, scope) => {
+      if (!shadowScopes.has(name)) shadowScopes.set(name, new Set());
+      shadowScopes.get(name).add(scope);
+    };
     // A statement this pass cannot rewrite -- the opaque block a composition
     // edit produced -- keeps whatever spelling its names have, so no name it
     // may mention can move into an environment slot. The block states the
     // bound; when even that is unknown the whole unit is declined.
     const pinned = new Set();
-    for (const statement of unit.statements) {
+    for (let index = 0; index < unit.statements.length; index += 1) {
+      const statement = unit.statements[index];
+      const scope = scopes.scopeOf[index];
       if (statement.parts && statement.reads !== null) {
-        if (statement.def) {
+        const opaqueScope = scope === 0 || scopes.inFunction(scope);
+        if (statement.def && opaqueScope) {
           declarationCounts.set(statement.def,
             (declarationCounts.get(statement.def) || 0) + 1);
+        }
+        if (scope !== 0) {
+          for (const name of [...(statement.def ? [statement.def] : []),
+            ...(statement.declares || [])]) shadow(name, scope);
         }
         continue;
       }
@@ -942,9 +1288,31 @@ function liftOversizedUnitLocalsToEnvironment(units, options = {}) {
     for (const [name, slot] of slotIndex) {
       replacements.set(name, [`${envName}[${slot}]`]);
     }
+    // The substitution a statement in one scope sees. A lifted name a nested
+    // scope redeclares is dropped from the map that scope uses, so the
+    // shadow keeps its own spelling. Nothing is shadowed in the common case,
+    // and then every scope shares the one map.
+    const shadowed = [...slotIndex.keys()].some((name) =>
+      shadowScopes.has(name));
+    const replacementsByScope = new Map([[0, replacements]]);
+    const replacementsAt = (scope) => {
+      if (!shadowed) return replacements;
+      const cached = replacementsByScope.get(scope);
+      if (cached) return cached;
+      const parent = replacementsAt(scopes.parents[scope]);
+      const sites = [...slotIndex.keys()].filter((name) =>
+        shadowScopes.get(name)?.has(scope) && parent.has(name));
+      const map = sites.length ? new Map([...parent].filter(
+        ([name]) => !sites.includes(name))) : parent;
+      replacementsByScope.set(scope, map);
+      return map;
+    };
     const rewritten = [];
-    for (const statement of unit.statements) {
-      if (slotIndex.has(statement.def)) {
+    for (let index = 0; index < unit.statements.length; index += 1) {
+      const statement = unit.statements[index];
+      const scope = scopes.scopeOf[index];
+      const replacements = replacementsAt(scope);
+      if (slotIndex.has(statement.def) && replacements.has(statement.def)) {
         // The declaration becomes an in-place slot assignment: the
         // initializer keeps its own operands, which the same substitution
         // rewrites.
@@ -957,10 +1325,10 @@ function liftOversizedUnitLocalsToEnvironment(units, options = {}) {
           assignment.startsWith("=")
             ? `${envName}[${slotIndex.get(statement.def)}] ${assignment}`
             : ";"}`, {
-          reads: [...statement.reads.filter((name) => !slotIndex.has(name)),
-            envName],
+          reads: [...statement.reads.filter(
+            (name) => !replacements.has(name)), envName],
           writes: (statement.writes || []).filter(
-            (name) => !slotIndex.has(name)),
+            (name) => !replacements.has(name)),
           delta: statement.delta,
           openDelta: statement.openDelta || 0,
         }));
@@ -983,10 +1351,10 @@ function liftOversizedUnitLocalsToEnvironment(units, options = {}) {
           after: substituteRegionParts(statement.exit.after, replacements),
         } : null,
         def: statement.def,
-        write: slotIndex.has(statement.write) ? null : statement.write,
+        write: replacements.has(statement.write) ? null : statement.write,
         writes: (statement.writes || []).filter(
-          (name) => !slotIndex.has(name)),
-        reads: [...statement.reads.filter((name) => !slotIndex.has(name)),
+          (name) => !replacements.has(name)),
+        reads: [...statement.reads.filter((name) => !replacements.has(name)),
           envName],
       });
     }
@@ -1058,7 +1426,12 @@ function partitionOversizedLinearBlocks(units, options = {}) {
   let partitionedSourceBytes = 0;
   let attemptedRuns = 0;
   let oversizedStatements = 0;
-  const helperUnits = [];
+  // The helpers extracted out of each unit, emitted directly after it. A
+  // segment helper belongs to the unit it came out of exactly as an outlined
+  // loop's helper belongs to its node, and a consumer that reads one node
+  // function out of the module text finds the whole of what that node
+  // executes in one place.
+  const helperUnitsByUnit = new Map();
   // The helper names this pass has emitted so far, so a later round can tell
   // a run that already contains one of its own call sites.
   const emittedHelperNames = new Set();
@@ -1213,7 +1586,10 @@ function partitionOversizedLinearBlocks(units, options = {}) {
         }
 
         emittedHelperNames.add(helperName);
-        helperUnits.push(regionUnit({
+        if (!helperUnitsByUnit.has(unitIndex)) {
+          helperUnitsByUnit.set(unitIndex, []);
+        }
+        helperUnitsByUnit.get(unitIndex).push(regionUnit({
           name: helperName,
           partitionable: false,
           generator: runHasYield,
@@ -1267,7 +1643,7 @@ function partitionOversizedLinearBlocks(units, options = {}) {
             reads: [sharedStateName],
             exit: {
               before: [`if (${sharedStateName}[0] === 1) `],
-              argument: [`${sharedStateName}[1]`],
+              value: [`${sharedStateName}[1]`],
               after: [],
             },
           }));
@@ -1334,9 +1710,12 @@ function partitionOversizedLinearBlocks(units, options = {}) {
       // one list and starts the next, so a run never spans an `else` arm --
       // but only a continuation of *this* group's own construct does. A
       // continuation nested deeper belongs to a construct inside the body,
-      // and splitting there would hand `walkList` a statement list that does
-      // not balance, which it then declines. The depth is the nesting the
-      // statements themselves recorded.
+      // and splitting there would hand `walkList` ranges whose deltas do not
+      // balance, which `statementGroups` then declines -- which is why
+      // nothing was ever attempted inside a body containing a nested `else`.
+      // The depth is the nesting the statements themselves recorded; a group
+      // whose recorded nesting goes negative is not one this scan can read,
+      // so it is abandoned rather than cut at a guessed boundary.
       const recurseIntoGroup = (group) => {
         if (group.end - group.start <= 2) return;
         let start = group.start + 1;
@@ -1346,9 +1725,9 @@ function partitionOversizedLinearBlocks(units, options = {}) {
           if (depth === 0 && statement.continuesBlock) {
             walkList(start, index);
             start = index + 1;
-            continue;
           }
           depth += statement.delta;
+          if (depth < 0) return;
         }
         walkList(start, group.end - 1);
       };
@@ -1373,8 +1752,8 @@ function partitionOversizedLinearBlocks(units, options = {}) {
   return {
     units: [
       rawRegionUnit(`const ${sharedStateName} = [];`),
-      ...working,
-      ...helperUnits,
+      ...working.flatMap((unit, index) =>
+        [unit, ...(helperUnitsByUnit.get(index) || [])]),
     ],
     count: segmentCount,
     partitionedSourceBytes,
@@ -2203,16 +2582,21 @@ class HotCallGraphRegionCompiler {
       // composed callee brings with it at the same call pc.
       const namespace = insertion
         ? `jvmRegionInline${edge.pc}_${insertion.serial}_` : null;
-      const insertBody = (declareResult) => insertion?.assemble ? (
-        insertion.assemble({
+      const insertBody = (declareResult) => insertion?.assemble
+        ? assembleInsertion(insertion, {
           source: insertion.source,
+          // The records behind that source, so the composed body is spliced
+          // into the caller's statement list as real statements instead of
+          // one opaque record.
+          statements: insertion.statements,
           argumentValues: callArguments,
           resultName,
           exitLabel: `${namespace}return`,
           namespace,
           declareResult,
-        })) : null;
-      const inlineSource = insertBody(true);
+        }) : null;
+      const inlineAssembly = insertBody(true);
+      const inlineSource = inlineAssembly?.source || null;
       if (inlineEdges?.has(edge) && !inlineSource) {
         inlineFailureReasons.push({edge, reason: insertion
           ? "insertion-assembly-rejected" : "missing-published-insertion"});
@@ -2229,7 +2613,7 @@ class HotCallGraphRegionCompiler {
             regionText.slice(0, declarationAt) +
             regionText.slice(
               declarationAt + lowering.resultDeclaration.length);
-          const guardedBody = insertBody(false);
+          const guardedBody = insertBody(false)?.source || null;
           let guardedExecution = guardedBody;
           if (fallbackInlineEdges?.has(edge)) {
             if (!fastCall || !lowering.depthName) {
@@ -2284,7 +2668,13 @@ class HotCallGraphRegionCompiler {
         linkedFunctionNames.add(functionName);
       }
       loweredRanges.push(range);
-      edits.push({...range, replacement});
+      // A plain lexical insertion contributes the records behind its own
+      // text. A guarded fallback does not: its `if (!completed)` arm is the
+      // original checked call span, text this lowering rebuilt and holds no
+      // records for, so the whole replacement stays opaque.
+      edits.push({...range, replacement,
+        statements: effectiveInlineSource === inlineSource
+          ? inlineAssembly?.statements || null : null});
       replaced.add(rawName);
       if (!needsInlineFallback && dropsBindings) {
         for (const identifier of Object.values(edge.site.identifiers || {})) {
@@ -2398,8 +2788,8 @@ class HotCallGraphRegionCompiler {
    * insertable by construction; when any callee has no insertable form, the
    * parent gets none either and is linked as a region function instead.
    */
-  composeInsertion(base, prefix, node, functionNames, insertions,
-    fallbackInlineEdges = null) {
+  composeInsertion(base, prefix, prefixStatements, node, functionNames,
+    insertions, fallbackInlineEdges = null) {
     if (!base) return null;
     const edgeInsertions = new Map();
     for (const edge of node.edges) {
@@ -2412,7 +2802,17 @@ class HotCallGraphRegionCompiler {
       node.generated, false, new Set(node.edges), edgeInsertions,
       fallbackInlineEdges);
     if (!rewritten.source) return null;
-    return {...base, source: rewritten.source};
+    // The composed body's own records, kept in step by the same edits that
+    // produced its text. A parent that inserts this body splices these, so a
+    // callee inlined into a callee inlined into a caller arrives flat.
+    const baseStatements = base.statements
+      ? [...prefixStatements, ...base.statements] : null;
+    return {
+      ...base,
+      source: rewritten.source,
+      statements: baseStatements ? applyRegionStatementEdits(
+        baseStatements, rewritten.appliedEdits, rewritten.source) : null,
+    };
   }
 
   compileModule(plan, framedRoot = false) {
@@ -2496,7 +2896,7 @@ class HotCallGraphRegionCompiler {
               ?.jvmInternalRegionPositionalSource),
           rewritten.appliedEdits, rewritten.source));
         composedInternalInsertions.set(node, this.composeInsertion(
-          node.generated.jvmInternalRegionPositionalInsertion, "",
+          node.generated.jvmInternalRegionPositionalInsertion, "", [],
           node, functionNames, composedInternalInsertions));
         composedInternalLinkedNames.set(node, unionLinkedNames(
           rewritten.linkedFunctionNames,
@@ -2516,9 +2916,8 @@ class HotCallGraphRegionCompiler {
         node.generated.jvmRestoringDirectPositionalSource,
         node.generated.jvmStructuredRegionFragments
           ?.jvmRestoringDirectPositionalSource);
-      return body ? [ownStatement(`const plan = ${planName};`,
-        {kind: "const", def: "plan",
-          parts: ["const ", {ref: "plan"}, ` = ${planName};`]}), ...body] : null;
+      return body
+        ? [restoringInlinePlanStatement(planName), ...body] : null;
     };
     const exceptionalInlineSources = new Map();
     const exceptionalInlineStatements = new Map();
@@ -2550,6 +2949,9 @@ class HotCallGraphRegionCompiler {
       exceptionalInlineInsertions.set(node, restoringInsertion ? {
         ...restoringInsertion,
         source: `const plan = ${planName};\n${restoringInsertion.source}`,
+        statements: restoringInsertion.statements
+          ? [restoringInlinePlanStatement(planName),
+            ...restoringInsertion.statements] : null,
       } : null);
       exceptionalInlineLinkedNames.set(node, new Set());
       exceptionalInlineCosts.set(node, node.codeItems);
@@ -2598,6 +3000,7 @@ class HotCallGraphRegionCompiler {
         exceptionalInlineInsertions.set(node, this.composeInsertion(
           node.generated.jvmRestoringDirectPositionalInsertion,
           `const plan = ${planName};\n`,
+          [restoringInlinePlanStatement(planName)],
           node, functionNames, exceptionalInlineInsertions,
           new Set(node.edges)));
         exceptionalInlineLinkedNames.set(node, unionLinkedNames(
@@ -2948,9 +3351,7 @@ class HotCallGraphRegionCompiler {
         captures[planName] = this.restorationPlan(node);
         pushNodeDeclaration(
           [`function ${functionName}(${parameters.join(",")}) {`],
-          [ownStatement(`const plan = ${planName};`,
-            {kind: "const", def: "plan",
-              parts: ["const ", {ref: "plan"}, ` = ${planName};`]})]);
+          [restoringInlinePlanStatement(planName)]);
       } else {
         pushNodeDeclaration(
           [`function ${functionName}(${parameters.join(",")}) {`]);
@@ -3641,5 +4042,6 @@ module.exports.renderRegionUnit = renderRegionUnit;
 module.exports.ownStatement = ownStatement;
 module.exports.regionStatementsFromFragments = regionStatementsFromFragments;
 module.exports.applyRegionStatementEdits = applyRegionStatementEdits;
+module.exports.assembleInsertion = assembleInsertion;
 module.exports.pruneUnreachableRegionDeclarations =
   pruneUnreachableRegionDeclarations;
