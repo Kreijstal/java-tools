@@ -11797,41 +11797,16 @@ class JvmSsaBlockRenderer {
                 ...declarations,
                 ...checkedLeafFramedTreeFor(inline),
               ].filter(Boolean);
-            // Admission and constant/static specialization can render the
-            // original capture aliases dead. Remove only compiler-owned pure
-            // top-level declarations; guest property reads and expressions
-            // are deliberately not eligible for this DCE.
-            for (;;) {
-              const counts = new Map();
-              for (const line of body) {
-                for (const match of line.matchAll(
-                  /\b[A-Za-z_$][\w$]*\b/g)) {
-                  counts.set(match[0], (counts.get(match[0]) || 0) + 1);
-                }
-              }
-              let removed = false;
-              body = body.filter((line) => {
-                const declaration =
-                  /^\s*(?:const|let) ([A-Za-z_$][\w$]*) = (.+);$/.exec(line);
-                if (!declaration || counts.get(declaration[1]) !== 1) {
-                  return true;
-                }
-                const initializer = declaration[2];
-                const pure =
-                  /^(?:undefined|null|true|false|-?\d+)$/.test(initializer) ||
-                  /^[A-Za-z_$][\w$]*$/.test(initializer) ||
-                  /^helpers\.(?:directCheckedLeafBodies|checkedLeafCaptureCaches)\[\d+\]$/.test(
-                    initializer) ||
-                  /^ssaCallCaptureCache\d+\.(?:value|specializedValue)\d+$/.test(
-                    initializer) ||
-                  /^\(\(ssaCallCaptureCache\d+\.(?:value|specializedValue)\d+\) \| 0\)$/.test(
-                    initializer);
-                if (!pure) return true;
-                removed = true;
-                return false;
-              });
-              if (!removed) break;
-            }
+            // Admission and constant/static specialization can leave a pure
+            // capture alias, a staged inline operand, or an entry-local alias
+            // without a consumer. There is deliberately no dead-declaration
+            // pass here: the only available liveness signal would be counting
+            // identifiers in the rendered statements, and the emitter cannot
+            // answer the question cheaply either, because "does this tier's
+            // tree still mention that name" is a fact about text that no
+            // fragment producer records. Measured over the whole JIT test
+            // suite the pass removed ten pure `const` aliases; every one of
+            // them is a copy that the host engine's own SSA eliminates.
             if (recursiveArrayPartitionLeaf && !recursiveArrayWorkerBody) {
               const specialized = specializeCheckedLeafSelfRecursiveCalls(
                 body.join("\n"), tier);
