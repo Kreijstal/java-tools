@@ -277,14 +277,6 @@ class JVM {
         ? backpressureFrames : 2;
     this.awtWebGlPresentation = options.awtWebGlPresentation === true ||
       env.JVM_ENABLE_AWT_WEBGL_PRESENTATION === "1";
-    // A guest whose visible output is a software raster may complete far
-    // fewer drawImage presents than it produces observable raster changes
-    // (a catch-up scheduler runs many logic ticks per draw). The incremental
-    // presenter samples the last-presented raster at scheduler yields and
-    // publishes changed intermediate frames, so presented fps tracks raster
-    // activity rather than the guest's full-redraw cadence.
-    this.awtIncrementalPresentation = options.awtIncrementalPresentation === true ||
-      env.JVM_AWT_INCREMENTAL_PRESENTATION === '1';
     this._awtDroppedFrameBacklog = 0;
     this._awtPendingPresentationCount = 0;
     const configuredBurst = options.interpreterBurst ??
@@ -1051,10 +1043,6 @@ class JVM {
   // Hands the host its scheduler turn, taking the backpressured form when the
   // guest has been completing frames the host never got to present.
   _yieldHostTurn() {
-    if (this.awtIncrementalPresentation &&
-        typeof this._awtPresentIntermediate === "function") {
-      this._awtPresentIntermediate();
-    }
     const strategy = this._hostYieldStrategy();
     if (strategy === "presentation") return this._awaitPresentation();
     return yieldToEventLoop(0, strategy);
@@ -1067,17 +1055,6 @@ class JVM {
   // task) rather than through the continuously runnable message queue.
   _hostYieldStrategy() {
     const strategy = this.eventLoopYieldStrategy;
-    if (this._awtDirectPresentationPendingYield && hostPaintsBetweenTasks()) {
-      this._awtDirectPresentationPendingYield = false;
-      return "timer";
-    }
-    // An incremental raster change has just scheduled an in-progress AWT
-    // frame. Park this yield until that frame lands instead of immediately
-    // replenishing the browser's MessageChannel queue ahead of its paint
-    // phase. The presenter's bounded timer still releases hidden tabs.
-    if (this._awtIncrementalPresentationPending && hostPaintsBetweenTasks()) {
-      return "presentation";
-    }
     if (strategy !== "message-channel") return strategy;
     const limit = this.awtPresentationBackpressureFrames;
     if (!(limit > 0)) return strategy;

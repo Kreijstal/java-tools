@@ -241,7 +241,6 @@ function presentationStats(jvm) {
       webGlPresentations: 0,
       webGlDirectPresentations: 0,
       webGlFallbacks: 0,
-      incrementalDirectPresentations: 0,
       lastCompletedAt: null,
       recentCompletionGaps: [],
       lastPresentedAt: null,
@@ -378,7 +377,7 @@ function presentSoftSurface(jvm, comp) {
   return true;
 }
 
-function markSoftSurfaceDirty(jvm, comp, thread = null, immediate = false) {
+function markSoftSurfaceDirty(jvm, comp, thread = null) {
   if (!comp) return;
   if (jvm && thread) jvm._awtFrameProducerThread = thread;
   const completedAt = typeof performance !== 'undefined' && performance.now
@@ -395,31 +394,6 @@ function markSoftSurfaceDirty(jvm, comp, thread = null, immediate = false) {
     }
     stats.lastCompletedAt = completedAt;
     stats.dirtyMarks += 1;
-  }
-  // An incremental raster change is observed only at a cooperative JVM
-  // yield, after the mutating compiled region has materialized its effects.
-  // Upload that stable intermediate surface now instead of waiting for a
-  // requestAnimationFrame callback the browser may defer behind other task
-  // queues. The scheduler follows it with one timer-task yield so the
-  // browser still receives a rendering opportunity before the guest resumes.
-  if (immediate && comp._canvasElement &&
-      typeof requestAnimationFrame === 'function' &&
-      !comp._presentScheduled && presentSoftSurface(jvm, comp)) {
-    if (stats) {
-      stats.scheduled += 1;
-      stats.incrementalDirectPresentations += 1;
-    }
-    if (jvm) {
-      jvm._awtIncrementalPresentationPending = false;
-      jvm._awtDirectPresentationPendingYield = true;
-      jvm._awtDroppedFrameBacklog = 0;
-      const waiters = jvm._awtPresentationWaiters;
-      if (waiters && waiters.length) {
-        jvm._awtPresentationWaiters = [];
-        for (let index = 0; index < waiters.length; index += 1) waiters[index]();
-      }
-    }
-    return;
   }
   if (!comp._canvasElement || typeof requestAnimationFrame !== 'function') {
     // Headless jvm.js has no browser upload, but a completed software frame is
@@ -485,55 +459,6 @@ function markSoftSurfaceDirty(jvm, comp, thread = null, immediate = false) {
   // safe point, so Firefox gets that opportunity without a timer pretending
   // that an upload was displayed.
   requestAnimationFrame(present);
-}
-
-// Presents observable raster changes between guest drawImage calls. A
-// catch-up scheduler can run many logic ticks (each mutating the software
-// framebuffer the last present aliased) per full redraw; sampling those
-// rasters at scheduler yields keeps presented fps tracking raster activity.
-// Detection is workload-agnostic: rotating bounded sample sets, each phase
-// compared only with its own preceding signature, so an unchanged idle
-// surface never produces synthetic presentations while broad raster changes
-// are detected without hashing the complete framebuffer.
-function installIncrementalPresenter(jvm) {
-  if (!jvm || jvm._awtPresentIntermediate) return;
-  jvm._awtPresentIntermediate = () => {
-    if (!jvm._softCanvases) return;
-    for (const comp of jvm._softCanvases) {
-      const frame = comp && comp._lastFrame;
-      const pixels = frame && frame.pixels;
-      const count = pixels && pixels.length;
-      if (!count || comp._presentScheduled) continue;
-
-      const phase = ((comp._incrementalSamplePhase || 0) + 1) & 7;
-      comp._incrementalSamplePhase = phase;
-      let signature = (count ^ phase) | 0;
-      const samples = Math.min(256, count);
-      const stride = Math.max(1, Math.floor(count / samples));
-      let index = phase;
-      for (let sample = 0; sample < samples; sample += 1) {
-        signature = Math.imul(signature ^ (pixels[index % count] | 0),
-          0x45d9f3b) | 0;
-        index += stride;
-      }
-      const signatures = comp._incrementalSignatures ||
-        (comp._incrementalSignatures = new Int32Array(8));
-      const initialized = comp._incrementalSignatureInitialized || 0;
-      const bit = 1 << phase;
-      const changed = (initialized & bit) !== 0 &&
-        signatures[phase] !== signature;
-      signatures[phase] = signature;
-      comp._incrementalSignatureInitialized = initialized | bit;
-      if (!changed) continue;
-
-      comp._pixels = pixels;
-      comp._pixelsWidth = frame.width;
-      comp._pixelsHeight = frame.height;
-      jvm._awtIncrementalPresentationPending = true;
-      markSoftSurfaceDirty(jvm, comp,
-        jvm._awtFrameProducerThread || null, true);
-    }
-  };
 }
 
 function colorToRgb(colorObj) {
@@ -680,9 +605,6 @@ module.exports = {
       const raster = imageObj._raster;
       const pixels = raster && raster._dataBuffer && raster._dataBuffer._data;
       if (pixels && imageObj._width && imageObj._height) {
-        if (jvm && jvm.awtIncrementalPresentation) {
-          installIncrementalPresenter(jvm);
-        }
         let target = obj._component;
         if (!target && graphicsContext && graphicsContext.ctx && graphicsContext.ctx.canvas) {
           const canvas = graphicsContext.ctx.canvas;
