@@ -406,7 +406,7 @@ generated.jvmStructuredRegionFragments = {
           delta,               // the block nesting the statement opens/closes
           label,               // the label it introduces, or null
           jump,                // {kind, label, before, after} or null
-          exit,                // {before, argument, after} for a `return`
+          exit,                // {before, value, after} for a `return`
           yields, continuesBlock,
           opens,               // "loop" | "try" | "switch" | "block" | null
           relocatable } ] },
@@ -447,22 +447,25 @@ contract, pinned by `test/structuredRegionFragments.test.js`:
   list the emitter built (§5), so a consumer rewrites a statement by
   substituting operand references and rendering it again -- exactly what
   `rerenderStatement` does inside the renderer -- rather than by editing
-  characters. Everything else on the record is read off that parts list's own
-  skeleton: the literal chunks the emitter wrote, with each operand replaced
-  by one placeholder character and with string literals and comments masked
-  out, so a `;` inside `'/ by zero'` or a keyword inside a marker comment is
-  never read as syntax.
+  characters. `label`, `jump`, `exit`, `yields` and `opens` are stated by the
+  emitter that wrote the statement (§5); the rest is read off that parts
+  list's own skeleton: the literal chunks the emitter wrote, with each operand
+  and each label replaced by one placeholder character and with string
+  literals and comments masked out, so a `;` inside `'/ by zero'` or a keyword
+  inside a marker comment is never read as syntax.
 * `exit` and `jump` split a statement around the `return` or the
-  `break`/`continue` it carries, into the parts before it, its argument or
-  label, and the parts after it. Both are complete statements, so a consumer
-  that relocates one replaces its own range by a block and leaves the guard
-  the emitter wrote around it intact.
+  `break`/`continue` it carries, into the parts before it, its returned value
+  or its label, and the parts after it. The emitter states the split, so a
+  consumer that relocates one replaces its own range by a block and leaves the
+  guard the emitter wrote around it intact.
 * `relocatable` is false when the statement may not be moved into a helper
   function: it opens a `switch`, carries a nested function, mentions
   `this`/`super`/`await`/`arguments`/`eval`/`var`, declares an ambient name
   (the helper already receives that name as a parameter), carries both a
-  `return` and a jump or more than one of either, or lost its parts to a late
-  expansion the fragment could not follow.
+  `return` and a jump, was marked unrelocatable by its own emitter (an exit
+  composed with other effects in one statement, such as the checked-leaf
+  return), or lost its parts to a late expansion the fragment could not
+  follow.
 * `declares` never contains an ambient name. A tier declares those in its
   outermost scope, and a fragment that happens to contain the declaration
   still reports the name as ambient -- which is why declaring one is not
@@ -497,7 +500,10 @@ them, and the framed region root, back up.
 `src/jit/JvmSsaBlockRenderer.js` used to emit strings and then run its own
 optimizations over them with about fifty regular expressions. Every statement
 it emits is now built from a *parts list*: opaque literal chunks interleaved
-with `{ref: name}` operand references.
+with `{ref: name}` operand references and `{label: name}` label parts (a
+label the compile minted carries both, `{label, ref}`, so it keeps the
+operand identity it has as a generated name). The file contains no
+`new RegExp` and no regular expression over a rendered statement.
 
 * `e` is the expression tagged template, `exprConcat` joins pieces, and
   `st` / `constDecl` / `letDecl` / `storeLocal` / `stmt` record a statement.
@@ -515,15 +521,49 @@ with `{ref: name}` operand references.
   call a helper or `new`, does it divide, does it index, does it open a
   condition or a `try`, does it throw, does it mention the safe-point budget,
   and what lexical nesting does it open or close.
+* **Control flow is stated by the emitter, never read off the skeleton.** A
+  statement that leaves the generated function is recorded by `returnStmt`,
+  which states `exit: {kind: "return", before, value, after}` — the parts the
+  emitter wrote around the exit, the returned value's parts, and the parts
+  that close whatever `before` opened. A `break` or a `continue` is recorded
+  by `jumpStmt`, which states `jump: {kind, label, before, after}` the same
+  way. A label declaration states `label` and `declaresLabel`; a statement
+  that opens a construct whose jump semantics differ from ordinary nesting
+  states `opens` (`"switch"`); the emitters that write `yield` state
+  `yields: true`; and an emitter that composes an exit with other effects in
+  one statement states `relocatable: false`. `regionStatementOf` publishes
+  those fields as they stand. There is no `partsReturnPositions`,
+  `splitReturnParts`, `partsReturnSplit`, `partsJumpStatement`,
+  `partsOpensNamedConstruct`, `partsLabelName` or `partsYields`: a keyword
+  scan can only ever be as complete as the emitters it happens to know
+  about, and an emitter that grows a new exit form now has to say so.
+  What is still read off the skeleton is not control flow but *relocation
+  hostility* and *ambient names* — whether a statement carries a nested
+  function, mentions `this`/`super`/`await`/`arguments`/`eval`/`var`,
+  declares or assigns one of the names the tier's outermost scope owns.
+  Those are conservative properties of the activation a statement was
+  written in; over-reporting one costs an outlining opportunity, never
+  correctness.
 * A pass rewrites a statement only through `rerenderStatement`, which
-  substitutes operand references and records the result again. Marker
-  expansion (an array-range access token becoming its guard variable) is that
-  same substitution.
+  substitutes operand references and records the result again — including in
+  the statement's own `exit` and `jump` splits, which are parts lists of the
+  same statement. Marker expansion (an array-range access token becoming its
+  guard variable) is that same substitution. A pass that renames labels
+  substitutes label parts (`substituteLabelParts`), which is what the
+  insertable assembly does.
 * `JVM_JIT_VERIFY_STATEMENT_IR=1` re-checks a finished body the way the
-  generated-scope verifier does: it reports any line no emitter recorded and
-  any record whose operands disagree with the names actually present. It
-  reports 0 issues over both JIT corpora. `scripts/statement-ir-audit.js` runs
-  it over a test file.
+  generated-scope verifier does. It has two halves: it reports any line no
+  emitter recorded and any record whose operands disagree with the names
+  actually present; and it parses the finished body with acorn and reports,
+  per line, any disagreement between the exits, jumps, labels and yields the
+  records *declared* and the ones the parser *finds*. A body whose exits
+  leave the caller's activation (an insertable one) is wrapped in the labels
+  its records say it breaks out of, so it parses. It reports 0 issues over
+  `jitCompiler`, `hotCallGraphRegion`, `structuredRegionFragments` and
+  `hotCallGraphLinearPartition`; dropping the `exit` from `returnStmt`'s
+  record makes it report 581. `scripts/statement-ir-audit.js` runs it over a
+  test file. It is a test oracle: opt-in, never a compilation step, and
+  nothing the compiler emits depends on it.
 
 What still touches emitted characters in the renderer: the opt-in verifier
 above; the exact-identity token expansions the rule permits
@@ -590,23 +630,32 @@ Not by a fourth `insertable` arm per emitter, which is what §6 first proposed:
 that would have had to enumerate the exits, and the census below shows they are
 spread across `render`, the getstatic emitters and five `continuationFallbacks`
 entries, with more shapes reachable in bodies the corpora do not exercise. The
-transform is instead uniform, and it runs on the statement IR (§5), not on text:
+transform is instead uniform, and it runs on the statement IR (§5), not on text.
 
-* `partsReturnPositions(parts)` walks a statement's own *parts skeleton* — the
-  literal chunks the emitter wrote, with each operand reference standing for one
-  placeholder character — with rendered string literals excluded, and reports
-  every whole-word `return` outside one. An operand can neither supply nor split
-  the keyword, and the deopt reason `'structured SSA return with active child'`
-  is inside a string and is not reported.
-* `splitReturnParts(parts)` splits the statement into `before` / `value` /
-  `after` around exactly one such return, locating the terminating `;` the same
-  string-aware way. It handles both a whole-line `return { deopt: … };` and an
-  exit embedded in a one-line guard, `if (c) { return ssaAsyncInvoke; }`.
-* `insertableExitStatement` re-records the statement through `recordStatement`
-  as `{ <resultToken> = <value>; break <labelToken>; }`, so the insertable body
-  is statement IR like every other body. `JVM_JIT_VERIFY_STATEMENT_IR=1` audits
-  it explicitly (`internal-region-insertion` / `restoring-insertion` labels) and
-  reports 0 issues over both JIT corpora.
+The first version of it scanned the parts skeleton for the `return` keyword
+(`partsReturnPositions` / `splitReturnParts`). That was still text recovery:
+the skeleton is the compiler's own representation, but a keyword scan over it
+is only as complete as the emitters it happens to know about, and it cannot
+distinguish an exit an emitter *meant* from one it left behind. The exit is
+now stated at the emitter instead:
+
+* `returnStmt(before, value, after, meta)` is the one recorder for a statement
+  that leaves the generated function, and it states the split: the parts before
+  the exit, the returned value, and the parts that close whatever `before`
+  opened. It handles both a whole-line `return { deopt: … };` (before is the
+  indentation) and an exit embedded in a one-line guard,
+  `if (c) { return ssaAsyncInvoke; }` (before is `if (c) { `, after is ` }`).
+  Every emitter in the census below goes through it, as does every checked-leaf
+  bail: `leafBailStatement` and the eight guards that embed
+  `CHECKED_LEAF_BAIL_VALUE`.
+* `insertableBodyOf` therefore asks each statement whether it *has* an exit
+  rather than looking for one, and re-records it through
+  `insertableExitStatement` as `{ <resultToken> = <value>; break <labelToken>; }`,
+  so the insertable body is statement IR like every other body.
+  `JVM_JIT_VERIFY_STATEMENT_IR=1` audits it explicitly
+  (`internal-region-insertion` / `restoring-insertion` labels) and reports 0
+  issues over both JIT corpora — now including the acorn cross-check of §5,
+  which is what would catch an emitter that grew an exit without saying so.
 
 The caller therefore observes exactly the value it observes today, including the
 `{deopt: …}` object. The `checkedLeaf` arm was **not** reused: it delivers
@@ -618,13 +667,21 @@ the guarded-fallback shape in `rewriteCallBindings` distinguishes the two.
 A guest loop or block label is named after its header pc (`L1`, `L3`), so two
 unrelated bodies routinely declare the same one and nesting them is a syntax
 error — the first thing the change hit. The inserted copy renames every label it
-declares and every reference to it to `<label>_ssaInline<serial>`. The rename is
-driven by the label each statement *recorded* (`loopHeader`, `blockLabel`,
-`break`, `continue` all carry `label` meta); a statement that mentions one of the
-body's labels without having recorded one rejects the whole variant, because its
-jump would otherwise be left pointing at the caller's label. A renamed label
-stays a literal chunk and is not registered as an emitted name: it names a
-statement, not a value.
+declares and every reference to it to `<label>_ssaInline<serial>`.
+
+A label is a *part* of the statement that declares or jumps to it —
+`{label: name}`, or `{label, ref}` when the compile minted the name — so the
+rename is `substituteLabelParts`, a substitution over the compiler's own
+representation, and not the two `RegExp`s over literal chunks it used to be.
+`loopHeader`, `blockLabel`, `inlineLeafLabel`, `break` and `continue` all carry
+the label as a part and state it on the record (`declaresLabel` separates a
+declaration from a jump). A statement that spells one of the body's labels in
+its *literal text* without carrying it as a part rejects the whole variant,
+because its jump would otherwise be left pointing at the caller's label; that
+check is `partsMentionLiteralName`, the scan `partsAmbientNames` already
+performs, over a different set of compiler-owned names. A renamed label is a
+label part and is not registered as an emitted name: it names a statement, not
+a value.
 
 ### The fail-safe
 
@@ -634,17 +691,25 @@ linked as a region function instead of inlined — when
 * a line was never recorded by an emitter (a hand-assembled nested function such
   as the restoring tier's `function spillLocals() { … }`, whose returns belong
   to it and not to this activation),
-* a statement carries `yield` as a whole word,
-* a statement mentions one of the body's labels without having recorded it,
-* an exit cannot be represented as one assignment-and-break (two returns in one
-  statement, or a return whose value cannot be delimited),
+* a statement's emitter marked it `yields`,
+* a statement spells one of the body's labels in its literal text without
+  carrying it as a label part,
 * the body has no exits at all,
 * or the compile respecialized its self-recursive calls, which is a text splice
   over the joined module — the same condition that suppresses §4's fragments.
 
 Every one of these is an identity or metadata check over statement records, not
-a scan of generated text. An emitter that grows a new exit form loses inlining
-rather than escaping the caller's activation.
+a scan of generated text.
+
+One veto is gone with the keyword scan: `unsplittable-return`, which caught a
+statement carrying two returns or a return whose value could not be delimited.
+Nothing states such an exit, so nothing routes it — and an exit an emitter
+does not state is now an emitter defect rather than a shape the insertion
+declines. `JVM_JIT_VERIFY_STATEMENT_IR=1` is what catches it: its acorn
+cross-check reports every `return`, `break`, `continue`, label and `yield` the
+parser finds on a line whose record did not declare one, and the four JIT test
+files run it clean. That is the trade the change makes: the fail-safe moves
+from a scan that runs on every compile to an oracle that runs in the tests.
 
 `JVM_DEBUG_INSERTION_VETO=<file>` appends one line per rejection, naming the
 reason and the statement, so a body that stops being insertable can be traced
