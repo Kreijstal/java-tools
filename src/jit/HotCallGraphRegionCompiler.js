@@ -234,104 +234,95 @@ function inlineAtomicPositionalSource(source, argumentSources, resultName,
   ].filter(Boolean).join("\n");
 }
 
-function removeUnreachableRegionFunctions(source, rootName) {
-  let program;
-  try {
-    program = parse(source, {
-      ecmaVersion: "latest", ranges: true, allowReturnOutsideFunction: true,
-    });
-  } catch (_) {
-    return source;
-  }
-  const declarations = new Map(program.body
-    .filter((statement) => statement.type === "FunctionDeclaration" &&
-      statement.id?.type === "Identifier")
-    .map((statement) => [statement.id.name, statement]));
-  if (!declarations.has(rootName)) return source;
-  const dependencies = new Map();
-  for (const [name, declaration] of declarations) {
-    const values = new Set();
-    walkAst(declaration.body, (node, parent) => {
-      if (node.type !== "Identifier" || !declarations.has(node.name) ||
-          identifierIsPropertyName(node, parent)) return;
-      values.add(node.name);
-    });
-    dependencies.set(name, values);
-  }
-  const reachable = new Set([rootName]);
-  const pending = [rootName];
-  while (pending.length) {
-    for (const dependency of dependencies.get(pending.pop()) || []) {
-      if (reachable.has(dependency)) continue;
-      reachable.add(dependency);
-      pending.push(dependency);
+function unionLinkedNames(...groups) {
+  const merged = new Set();
+  for (const group of groups) {
+    if (!group) continue;
+    if (Array.isArray(group)) {
+      for (const nested of group) {
+        if (!nested) continue;
+        for (const name of nested) merged.add(name);
+      }
+      continue;
     }
+    for (const name of group) merged.add(name);
   }
-  return applySourceEdits(source, [...declarations]
-    .filter(([name]) => !reachable.has(name))
-    .map(([_name, declaration]) => ({
-      start: declaration.start,
-      end: declaration.end,
-      replacement: "",
-    }))) || source;
+  return merged;
 }
 
 /**
- * Split a region module into factory-scope declarations and a per-call entry.
+ * Drop the region declarations no entry statement can reach.
+ *
+ * This is a walk over the compiler's own emission plan, not over emitted
+ * text: every declaration entry carries the module-level names it was linked
+ * against (`references`, recorded by `rewriteCallBindings` as it lowered each
+ * call site and propagated through composed bodies), so reachability is a
+ * list operation. `references` may over-approximate -- an over-approximation
+ * only retains a declaration that could have been dropped, never unbinds a
+ * name.
+ */
+function pruneUnreachableRegionDeclarations(declarations, rootNames) {
+  const byName = new Map();
+  for (const declaration of declarations) {
+    if (declaration.name) byName.set(declaration.name, declaration);
+  }
+  const roots = [...rootNames].filter((name) => byName.has(name));
+  if (!roots.length) return declarations;
+  const reachable = new Set(roots);
+  const pending = [...roots];
+  while (pending.length) {
+    const declaration = byName.get(pending.pop());
+    for (const reference of declaration.references || []) {
+      if (reachable.has(reference) || !byName.has(reference)) continue;
+      reachable.add(reference);
+      pending.push(reference);
+    }
+  }
+  return declarations.filter((declaration) =>
+    !declaration.name || reachable.has(declaration.name));
+}
+
+/**
+ * Split an assembled region module plan into factory-scope declarations and a
+ * per-call entry.
  *
  * Every module-level helper is parameter-complete by construction (helpers,
  * arguments, thread, and state arrays all arrive as parameters), so the
  * function declarations never capture per-invocation bindings and can be
  * instantiated once in the enclosing factory instead of on every module
  * entry.  The protocol state arrays (`const jvmRegionSegmentState* = []`)
- * are also safe to share across invocations: every segment writes its
- * outcome only in its terminal epilogue and the caller consumes it
- * immediately after the call returns, so no guest call, scheduler yield, or
- * re-entrant module invocation can interleave between a write and its read.
+ * that the linear partitioner prepends to the declaration region are also
+ * safe to share across invocations: every segment writes its outcome only in
+ * its terminal epilogue and the caller consumes it immediately after the call
+ * returns, so no guest call, scheduler yield, or re-entrant module invocation
+ * can interleave between a write and its read.
  *
- * Anything unexpected at the top level (a `let`, a non-empty initializer, a
- * class) aborts the split and the module keeps its per-invocation shape.
+ * The split is a choice between two text regions the compiler assembled
+ * itself, not a recovery of top-level statement boundaries from the emitted
+ * module: `plan.hoistedSource` is the declaration region, `plan.entrySources`
+ * are the per-invocation statements in emission order, and
+ * `plan.entryDeclaredNames` are the bindings those statements introduce.
+ *
+ * A declaration evaluated once in the factory cannot close over a binding
+ * that is created again on every entry, so any entry-scope binding aborts the
+ * split and the module keeps its per-invocation shape. The fused module's
+ * safe-point counter (`let safePointBudget = N;`) is exactly such a binding
+ * and every node function reads it -- stage C made the module own that
+ * counter deliberately -- so the hoist is not taken for a region module as it
+ * is emitted today. The predicate is kept structural rather than deleted so
+ * that removing the module-scoped counter re-enables the hoist without
+ * reintroducing a parse.
  */
-function splitModuleSourceForFactoryHoist(moduleSource) {
-  let program;
-  try {
-    program = parse(moduleSource, {
-      ecmaVersion: "latest", allowReturnOutsideFunction: true,
-    });
-  } catch (_) {
-    return null;
-  }
-  const hoisted = [];
-  const entry = [];
-  for (const statement of program.body) {
-    if (statement.type === "FunctionDeclaration" &&
-        statement.id?.type === "Identifier") {
-      hoisted.push(statement);
-      continue;
-    }
-    if (statement.type === "ExpressionStatement" &&
-        statement.directive === "use strict") {
-      continue;
-    }
-    if (statement.type === "VariableDeclaration") {
-      if (statement.kind === "const" && statement.declarations.every(
-        (declarator) => declarator.id.type === "Identifier" &&
-          declarator.init?.type === "ArrayExpression" &&
-          declarator.init.elements.length === 0)) {
-        hoisted.push(statement);
-        continue;
-      }
-      return null;
-    }
-    if (statement.type === "ClassDeclaration") return null;
-    entry.push(statement);
-  }
-  if (!hoisted.length || !entry.length) return null;
-  const sliceOf = (node) => moduleSource.slice(node.start, node.end);
+function splitRegionModuleForFactoryHoist(plan) {
+  const hoistedSource = plan?.hoistedSource;
+  const entrySources = (plan?.entrySources || []).filter(Boolean);
+  if (typeof hoistedSource !== "string" || !hoistedSource.trim()) return null;
+  if (!entrySources.length) return null;
+  if ((plan.entryDeclaredNames || []).length) return null;
   return {
-    hoistedSource: hoisted.map(sliceOf).join("\n"),
-    entrySource: entry.map(sliceOf).join("\n"),
-    hoistedCount: hoisted.length,
+    hoistedSource,
+    entrySource: entrySources.join("\n"),
+    hoistedCount: Math.max(0, Number(plan.hoistedCount) || 0),
   };
 }
 
@@ -1837,6 +1828,12 @@ class HotCallGraphRegionCompiler {
     const edits = [];
     const replaced = new Set();
     const loweredRanges = [];
+    // Module-level region function names this body still references after
+    // lowering. The compiler records them as it links them; module-level
+    // reachability is therefore a walk over its own emission plan and never
+    // a re-parse of the emitted text.
+    const linkedFunctionNames = new Set();
+    const regionFunctionNames = new Set(functionNames.values());
     let lexicallyInlinedEdges = 0;
     let exceptionalInlinedEdges = 0;
     let compactInternalEdges = 0;
@@ -2012,6 +2009,7 @@ class HotCallGraphRegionCompiler {
           loweredRanges.push(range);
           edits.push({...range, replacement});
           replaced.add(rawName);
+          linkedFunctionNames.add(functionName);
           compactInternalEdges += 1;
           if (guardedRuntimeTarget) guardedInternalEdges += 1;
           if (dropsBindings) {
@@ -2123,6 +2121,8 @@ class HotCallGraphRegionCompiler {
       if (effectiveInlineSource) {
         lexicallyInlinedEdges += 1;
         if (fallbackInlineEdges?.has(edge)) exceptionalInlinedEdges += 1;
+      } else {
+        linkedFunctionNames.add(functionName);
       }
       loweredRanges.push(range);
       edits.push({...range, replacement});
@@ -2156,6 +2156,9 @@ class HotCallGraphRegionCompiler {
         if (editEveryOccurrence(declaration.text, eliminated
           ? "" : `${declaration.kind} ${name} = ${replacement};`) > 0) {
           replaced.add(name);
+          if (!eliminated && regionFunctionNames.has(replacement)) {
+            linkedFunctionNames.add(replacement);
+          }
         }
       }
     }
@@ -2186,6 +2189,7 @@ class HotCallGraphRegionCompiler {
     rewrittenParts.push(source.slice(sourceCursor));
     return {
       source: rewrittenParts.join(""),
+      linkedFunctionNames,
       lexicallyInlinedEdges,
       exceptionalInlinedEdges,
       compactInternalEdges,
@@ -2233,6 +2237,10 @@ class HotCallGraphRegionCompiler {
     const composedInternalSources = new Map();
     const composedInternalCosts = new Map();
     const composedInlineCounts = new Map();
+    // Which module-level node functions a composed body still calls. Composed
+    // bodies embed their callees' composed text, so the set is the union of
+    // what this body linked and what every embedded body linked.
+    const composedInternalLinkedNames = new Map();
     let compositionChanged = true;
     while (compositionChanged) {
       compositionChanged = false;
@@ -2247,6 +2255,7 @@ class HotCallGraphRegionCompiler {
             node.generated.jvmInternalRegionPositionalSource);
           composedInternalCosts.set(node, node.codeItems);
           composedInlineCounts.set(node, 0);
+          composedInternalLinkedNames.set(node, new Set());
           compositionChanged = true;
           continue;
         }
@@ -2272,6 +2281,10 @@ class HotCallGraphRegionCompiler {
         if (!rewritten.source) continue;
         if (rewritten.source.length > this.inlineSourceByteBudget) continue;
         composedInternalSources.set(node, rewritten.source);
+        composedInternalLinkedNames.set(node, unionLinkedNames(
+          rewritten.linkedFunctionNames,
+          node.edges.map((edge) =>
+            composedInternalLinkedNames.get(edge.node))));
         composedInternalCosts.set(node, expandedCost);
         composedInlineCounts.set(node, node.edges.reduce(
           (sum, edge) => sum + 1 +
@@ -2283,6 +2296,7 @@ class HotCallGraphRegionCompiler {
     const exceptionalInlineCosts = new Map();
     const exceptionalInlineCounts = new Map();
     const exceptionalInlinePlanNames = new Map();
+    const exceptionalInlineLinkedNames = new Map();
     for (let index = 0; index < plan.nodes.length; index += 1) {
       const node = plan.nodes[index];
       if (!node.effects.throws || node.effects.allocates ||
@@ -2296,6 +2310,7 @@ class HotCallGraphRegionCompiler {
       exceptionalInlineSources.set(node,
         `const plan = ${planName};\n` +
         node.generated.jvmRestoringDirectPositionalSource);
+      exceptionalInlineLinkedNames.set(node, new Set());
       exceptionalInlineCosts.set(node, node.codeItems);
       exceptionalInlineCounts.set(node, 0);
     }
@@ -2336,6 +2351,10 @@ class HotCallGraphRegionCompiler {
         if (!rewritten.source) continue;
         if (rewritten.source.length > this.inlineSourceByteBudget) continue;
         exceptionalInlineSources.set(node, rewritten.source);
+        exceptionalInlineLinkedNames.set(node, unionLinkedNames(
+          rewritten.linkedFunctionNames,
+          node.edges.map((edge) =>
+            exceptionalInlineLinkedNames.get(edge.node))));
         exceptionalInlineCosts.set(node, expandedCost);
         exceptionalInlineCounts.set(node, node.edges.reduce(
           (sum, edge) => sum + 1 +
@@ -2345,6 +2364,10 @@ class HotCallGraphRegionCompiler {
     }
     const inlineSourceForNode = (node) =>
       exceptionalInlineSources.get(node) || composedInternalSources.get(node);
+    const inlineLinkedNamesForNode = (node) =>
+      (exceptionalInlineSources.has(node)
+        ? exceptionalInlineLinkedNames.get(node)
+        : composedInternalLinkedNames.get(node)) || null;
     const inlineCostForNode = (node) =>
       exceptionalInlineSources.has(node)
         ? exceptionalInlineCosts.get(node) : composedInternalCosts.get(node);
@@ -2448,6 +2471,10 @@ class HotCallGraphRegionCompiler {
     for (const [node, planName] of exceptionalInlinePlanNames) {
       captures[planName] = this.restorationPlan(node);
     }
+    // The module's own emission plan: one entry per emitted module-level
+    // declaration group, carrying the name it declares and the module names
+    // it links against. Module-level reachability and the factory-hoist split
+    // are list operations over this plan.
     const declarations = [];
     const closedRestoringNodes = new Set();
     if (plan.closed) {
@@ -2483,13 +2510,19 @@ class HotCallGraphRegionCompiler {
         captures[planName] = this.restorationPlan(node);
         const parameters = ["helpers", ...argumentsList, "thread",
           "nestedEntryGuarded"];
-        declarations.push(
-          `function ${functionNames.get(node.method)}(${parameters.join(",")}) {`,
-          `return ${bodyName}(helpers,${planName},${
-            argumentsList.join(",")}${argumentsList.length ? "," : ""}` +
-            "thread,nestedEntryGuarded);",
-          "}",
-        );
+        const recursiveName = functionNames.get(node.method);
+        declarations.push({
+          name: recursiveName,
+          kind: "function",
+          references: [],
+          text: [
+            `function ${recursiveName}(${parameters.join(",")}) {`,
+            `return ${bodyName}(helpers,${planName},${
+              argumentsList.join(",")}${argumentsList.length ? "," : ""}` +
+              "thread,nestedEntryGuarded);",
+            "}",
+          ].join("\n"),
+        });
         continue;
       }
       const restoringSource =
@@ -2541,6 +2574,20 @@ class HotCallGraphRegionCompiler {
         this.lastRejectionReason = rewritten.error;
         return null;
       }
+      // Which module functions this node's emitted body still calls. A
+      // composed body carries the set recorded when it was composed; a body
+      // lowered here carries what this lowering linked, plus what every
+      // lexically inlined callee body had already linked. Loop outlining
+      // moves statements from this body into helpers emitted alongside it,
+      // so the node and its helpers share one reachability group and one
+      // reference set.
+      const nodeReferences = sourceAlreadyComposed
+        ? unionLinkedNames(source === exceptionalInlineSources.get(node)
+          ? exceptionalInlineLinkedNames.get(node)
+          : composedInternalLinkedNames.get(node))
+        : unionLinkedNames(rewritten.linkedFunctionNames,
+          node.edges.filter((edge) => inlineEdges.has(edge))
+            .map((edge) => inlineLinkedNamesForNode(edge.node)));
       const outlined = this.loopOutliningEnabled && !framedSource
         ? outlineLargeRegionLoops(rewritten.source, {
           minimumSourceBytes: this.loopOutlineSourceBytes,
@@ -2572,14 +2619,21 @@ class HotCallGraphRegionCompiler {
       elidedFieldCacheInvalidations +=
         rewritten.elidedFieldCacheInvalidations || 0;
       const functionName = functionNames.get(node.method);
-      declarations.push(...outlined.helperSources);
+      const pushNodeDeclaration = (lines) => {
+        declarations.push({
+          name: functionName,
+          kind: "function",
+          references: [...nodeReferences],
+          text: [...outlined.helperSources, ...lines].join("\n"),
+        });
+      };
       if (framedSource) {
-        declarations.push(
+        pushNodeDeclaration([
           `function* ${functionName}(` +
             "frame,thread,helpers,initialBytecodeChecks,framelessEntry) {",
           emittedSource,
           "}",
-        );
+        ]);
         continue;
       }
       const parameters = ["helpers", ...argumentsList, "thread",
@@ -2587,18 +2641,18 @@ class HotCallGraphRegionCompiler {
       if (source === restoringSource) {
         const planName = `jvmRegionPlan${index}`;
         captures[planName] = this.restorationPlan(node);
-        declarations.push(
+        pushNodeDeclaration([
           `function ${functionName}(${parameters.join(",")}) {`,
           `const plan = ${planName};`,
           emittedSource,
           "}",
-        );
+        ]);
       } else {
-        declarations.push(
+        pushNodeDeclaration([
           `function ${functionName}(${parameters.join(",")}) {`,
           emittedSource,
           "}",
-        );
+        ]);
       }
     }
     const rootArguments = plan.root.generated
@@ -2616,11 +2670,15 @@ class HotCallGraphRegionCompiler {
         "typeof argument0 !== 'string' && typeof argument0 !== 'function')) " +
         "return ssaAsyncInvoke;"
       : null;
-    // The directive prologue is this compiler's own, so it is attached after
-    // the source passes rather than located in their output.
-    const unprunedModuleSource = [
-      `let safePointBudget = ${this.directSafePointBudget};`,
-      ...declarations,
+    // The module is assembled from three regions the compiler owns: the
+    // per-entry safe-point counter, the declaration region, and the entry
+    // statements. Keeping them apart is what lets the factory-hoist split be
+    // a choice between two assembled texts instead of a re-parse of the
+    // finished module, and the directive prologue is attached at the end
+    // rather than located in the source passes' output.
+    const entryPrologueSource =
+      `let safePointBudget = ${this.directSafePointBudget};`;
+    const entryTailSource = [
       framedRoot
         ? `return ${rootName}(` +
           "frame,thread,helpers,initialBytecodeChecks,false);"
@@ -2632,16 +2690,24 @@ class HotCallGraphRegionCompiler {
         `return ${rootName}(helpers,${rootArguments.join(",")}${
           rootArguments.length ? "," : ""}thread,2);`,
     ].filter(Boolean).join("\n");
+    // Only the entry statements enter the module from outside, and they call
+    // exactly one node. Everything the root cannot reach through its recorded
+    // links is dropped before the source passes run, so no dead declaration
+    // is lifted, partitioned or measured.
+    const reachableDeclarations =
+      pruneUnreachableRegionDeclarations(declarations, [rootName]);
+    const declarationSource = reachableDeclarations
+      .map((declaration) => declaration.text).join("\n");
     // A framed root shares one function-scoped local namespace across the
     // whole body; lift it into an environment array first so partitioning
     // does not re-plumb hundreds of names through every segment boundary.
     const partitionStarted = this.jit.monotonicNow();
     const lifted = framedRoot && this.framedPartitionEnabled
-      ? liftOversizedUnitLocalsToEnvironment(unprunedModuleSource, {
+      ? liftOversizedUnitLocalsToEnvironment(declarationSource, {
         maximumUnitBytes: this.linearPartitionUnitBytes,
         namespace: "0",
       })
-      : {source: unprunedModuleSource, liftedNames: 0, units: 0};
+      : {source: declarationSource, liftedNames: 0, units: 0};
     this.liftedEnvironmentNameCount += lifted.liftedNames;
     const partitioned = (framedRoot
       ? this.framedPartitionEnabled : this.linearPartitionEnabled)
@@ -2651,7 +2717,7 @@ class HotCallGraphRegionCompiler {
         maximumSegments: this.linearPartitionMaxSegments,
         namespace: "0",
       })
-      : {source: unprunedModuleSource, count: 0, partitionedSourceBytes: 0};
+      : {source: lifted.source, count: 0, partitionedSourceBytes: 0};
     this.partitionPassMillis += this.jit.monotonicNow() - partitionStarted;
     this.partitionedSegmentCount += partitioned.count;
     this.partitionedSegmentSourceBytes += partitioned.partitionedSourceBytes;
@@ -2662,10 +2728,16 @@ class HotCallGraphRegionCompiler {
           this.moduleCompileCount}-${plan.root.method.name}.js`,
         partitioned.source);
     }
-    const moduleSource = `'use strict';\n${removeUnreachableRegionFunctions(
-      partitioned.source, rootName)}`;
+    const moduleSource = `'use strict';\n${entryPrologueSource}\n${
+      partitioned.source}\n${entryTailSource}`;
     const factorySplit = this.factoryHoistEnabled
-      ? splitModuleSourceForFactoryHoist(moduleSource) : null;
+      ? splitRegionModuleForFactoryHoist({
+        hoistedSource: partitioned.source,
+        entrySources: [entryPrologueSource, entryTailSource],
+        entryDeclaredNames: ["safePointBudget"],
+        hoistedCount: reachableDeclarations.length +
+          (partitioned.count > 0 ? 1 : 0),
+      }) : null;
     if (factorySplit) {
       this.factoryHoistedModuleCount += 1;
       this.factoryHoistedDeclarationCount += factorySplit.hoistedCount;
@@ -3257,5 +3329,7 @@ module.exports.partitionOversizedLinearBlocks =
 module.exports.outlineLargeRegionLoops = outlineLargeRegionLoops;
 module.exports.liftOversizedUnitLocalsToEnvironment =
   liftOversizedUnitLocalsToEnvironment;
-module.exports.splitModuleSourceForFactoryHoist =
-  splitModuleSourceForFactoryHoist;
+module.exports.splitRegionModuleForFactoryHoist =
+  splitRegionModuleForFactoryHoist;
+module.exports.pruneUnreachableRegionDeclarations =
+  pruneUnreachableRegionDeclarations;

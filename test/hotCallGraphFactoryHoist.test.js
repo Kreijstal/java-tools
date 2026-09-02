@@ -2,11 +2,17 @@
 
 const test = require("tape");
 const {
-  splitModuleSourceForFactoryHoist,
+  splitRegionModuleForFactoryHoist,
+  pruneUnreachableRegionDeclarations,
 } = require("../src/jit/HotCallGraphRegionCompiler");
 
-const MODULE_SOURCE = [
-  "'use strict';",
+// The region compiler assembles a module out of three regions it owns: the
+// per-entry prologue, the declaration region (node functions, loop-outline
+// helpers, and the partitioner's segment helpers and state arrays) and the
+// entry statements. The split is a choice between those assembled texts, so
+// these fixtures are declaration/entry *plans*, not module source to be
+// re-parsed.
+const DECLARATION_SOURCE = [
   "const jvmRegionSegmentState0 = [];",
   "function jvmRegionNode0(helpers, value, thread) {",
   "  jvmRegionSegment0_0(value, jvmRegionSegmentState0);",
@@ -16,15 +22,27 @@ const MODULE_SOURCE = [
   "function jvmRegionNode1(helpers, value, thread) {",
   "  return value + helpers.bias;",
   "}",
-  "if (!jvmRegionGuard(thread, helpers)) {",
-  "  return helpers.asyncInvokeSentinel();",
-  "}",
-  "return jvmRegionNode0(helpers, seed, thread);",
   "function jvmRegionSegment0_0(value, state) {",
   "  state[0] = 0;",
   "  state[2] = value * 2;",
   "}",
 ].join("\n");
+
+const ENTRY_SOURCES = [
+  "if (!jvmRegionGuard(thread, helpers)) {\n" +
+    "  return helpers.asyncInvokeSentinel();\n}",
+  "return jvmRegionNode0(helpers, seed, thread);",
+];
+
+function planOf(overrides = {}) {
+  return {
+    hoistedSource: DECLARATION_SOURCE,
+    entrySources: ENTRY_SOURCES,
+    entryDeclaredNames: [],
+    hoistedCount: 4,
+    ...overrides,
+  };
+}
 
 function instantiate(split, captures) {
   const captureNames = Object.keys(captures);
@@ -36,7 +54,7 @@ function instantiate(split, captures) {
 }
 
 test("factory hoist separates declarations from the entry tail", (t) => {
-  const split = splitModuleSourceForFactoryHoist(MODULE_SOURCE);
+  const split = splitRegionModuleForFactoryHoist(planOf());
   t.ok(split, "module splits");
   t.equal(split.hoistedCount, 4,
     "three functions and one state array hoist");
@@ -52,7 +70,7 @@ test("factory hoist separates declarations from the entry tail", (t) => {
 });
 
 test("hoisted module behaves identically across repeated entries", (t) => {
-  const split = splitModuleSourceForFactoryHoist(MODULE_SOURCE);
+  const split = splitRegionModuleForFactoryHoist(planOf());
   const guardCalls = [];
   const entry = instantiate(split, {
     jvmRegionGuard: (thread) => {
@@ -74,22 +92,23 @@ test("hoisting preserves reentrant state-array protocol", (t) => {
   // A segment whose body re-enters the module before its own epilogue
   // writes must not observe the inner invocation's outcome: the outer
   // epilogue overwrites the shared array after the inner burst completes.
-  const source = [
-    "'use strict';",
-    "const jvmRegionSegmentState0 = [];",
-    "function jvmRegionNode0(helpers, depth, thread) {",
-    "  jvmRegionSegment0_0(helpers, depth, thread, jvmRegionSegmentState0);",
-    "  return jvmRegionSegmentState0[2];",
-    "}",
-    "function jvmRegionSegment0_0(helpers, depth, thread, state) {",
-    "  let inner = 0;",
-    "  if (depth > 0) inner = helpers.reenter(depth - 1);",
-    "  state[0] = 0;",
-    "  state[2] = inner + depth;",
-    "}",
-    "return jvmRegionNode0(helpers, seed, thread);",
-  ].join("\n");
-  const split = splitModuleSourceForFactoryHoist(source);
+  const split = splitRegionModuleForFactoryHoist(planOf({
+    hoistedSource: [
+      "const jvmRegionSegmentState0 = [];",
+      "function jvmRegionNode0(helpers, depth, thread) {",
+      "  jvmRegionSegment0_0(helpers, depth, thread, jvmRegionSegmentState0);",
+      "  return jvmRegionSegmentState0[2];",
+      "}",
+      "function jvmRegionSegment0_0(helpers, depth, thread, state) {",
+      "  let inner = 0;",
+      "  if (depth > 0) inner = helpers.reenter(depth - 1);",
+      "  state[0] = 0;",
+      "  state[2] = inner + depth;",
+      "}",
+    ].join("\n"),
+    entrySources: ["return jvmRegionNode0(helpers, seed, thread);"],
+    hoistedCount: 3,
+  }));
   t.ok(split, "reentrant module splits");
   const entry = instantiate(split, {});
   const helpers = {reenter: (depth) => entry(helpers, depth, "runnable")};
@@ -99,15 +118,18 @@ test("hoisting preserves reentrant state-array protocol", (t) => {
 });
 
 test("generator declarations hoist for framed modules", (t) => {
-  const source = [
-    "'use strict';",
-    "function* jvmRegionNode0(frame, thread, helpers, checks, frameless) {",
-    "  yield 'suspend';",
-    "  return frame + 1;",
-    "}",
-    "return jvmRegionNode0(frame, thread, helpers, checks, false);",
-  ].join("\n");
-  const split = splitModuleSourceForFactoryHoist(source);
+  const split = splitRegionModuleForFactoryHoist(planOf({
+    hoistedSource: [
+      "function* jvmRegionNode0(frame, thread, helpers, checks, frameless) {",
+      "  yield 'suspend';",
+      "  return frame + 1;",
+      "}",
+    ].join("\n"),
+    entrySources: [
+      "return jvmRegionNode0(frame, thread, helpers, checks, false);",
+    ],
+    hoistedCount: 1,
+  }));
   t.ok(split, "framed module splits");
   const factory = new Function(
     `"use strict";\n${split.hoistedSource}\n` +
@@ -120,68 +142,58 @@ test("generator declarations hoist for framed modules", (t) => {
   t.end();
 });
 
-test("unexpected top-level shapes abort the split", (t) => {
-  t.equal(splitModuleSourceForFactoryHoist(
-    "'use strict';\nlet counter = 0;\nfunction f() { return counter; }\n" +
-    "return f();"), null, "top-level let aborts");
-  t.equal(splitModuleSourceForFactoryHoist(
-    "'use strict';\nconst plan = {mutable: true};\n" +
-    "function f() { return plan; }\nreturn f();"), null,
-  "const with non-empty initializer aborts");
-  t.equal(splitModuleSourceForFactoryHoist(
-    "'use strict';\nreturn 1;"), null,
-  "module without declarations does not split");
-  t.equal(splitModuleSourceForFactoryHoist(
-    "'use strict';\nfunction f() { return 1; }"), null,
-  "module without an entry tail does not split");
-  t.equal(splitModuleSourceForFactoryHoist("function f( {"), null,
-    "unparsable source aborts");
+test("a per-entry binding aborts the split", (t) => {
+  // Declarations evaluated once in the factory cannot close over a binding
+  // re-created on every entry. The module-owned safe-point counter is such a
+  // binding, which is why an emitted region module does not hoist today.
+  t.equal(splitRegionModuleForFactoryHoist(planOf({
+    entryDeclaredNames: ["safePointBudget"],
+    entrySources: ["let safePointBudget = 1000;", ...ENTRY_SOURCES],
+  })), null, "an entry-scope binding aborts");
+  t.equal(splitRegionModuleForFactoryHoist(planOf({hoistedSource: ""})), null,
+    "module without declarations does not split");
+  t.equal(splitRegionModuleForFactoryHoist(planOf({entrySources: []})), null,
+    "module without an entry tail does not split");
+  t.equal(splitRegionModuleForFactoryHoist(null), null,
+    "a missing plan aborts");
   t.end();
 });
 
-test("real partitioned module shape splits with shared helper identity",
+test("unreachable region declarations are pruned from the emission plan",
   (t) => {
-    // Mirrors the emitted layout: directive, state array, node functions,
-    // guard tail, then partition helpers appended after the tail.
-    const source = [
-      "'use strict';",
-      "const jvmRegionSegmentState0 = [];",
-      "function jvmRegionNode0(helpers, value, thread) {",
-      "  jvmRegionSegment0_0(value, jvmRegionSegmentState0);",
-      "  if (jvmRegionSegmentState0[0] === 2) throw jvmRegionSegmentState0[1];",
-      "  return jvmRegionSegmentState0[2];",
-      "}",
-      "if (!jvmRegionGuard(thread, helpers)) {",
-      "  return helpers.asyncInvokeSentinel();",
-      "}",
-      "return jvmRegionNode0(helpers, seed, thread);",
-      "function jvmRegionSegment0_0(value, state) {",
-      "  try {",
-      "    state[0] = 0;",
-      "    state[2] = helpersFree(value);",
-      "  } catch (error) {",
-      "    state[0] = 2;",
-      "    state[1] = error;",
-      "  }",
-      "}",
-    ].join("\n");
-    const split = splitModuleSourceForFactoryHoist(source);
-    t.ok(split, "helpers appended after the tail still hoist");
-    const seen = [];
-    const entry = instantiate(split, {
-      jvmRegionGuard: () => true,
-      helpersFree: (value) => {
-        // Function.caller is unavailable in strict mode; observe shared
-        // instantiation through a stable closure-scope side channel
-        // instead: the hoisted segment function is the same object on
-        // every entry exactly when declarations evaluate once.
-        seen.push(value);
-        return value + 100;
-      },
-    });
-    const helpers = {asyncInvokeSentinel: () => "async"};
-    t.equal(entry(helpers, 1, "runnable"), 101, "first entry");
-    t.equal(entry(helpers, 2, "runnable"), 102, "second entry");
-    t.deepEqual(seen, [1, 2], "capture sees both entries");
+    const declarations = [
+      {name: "jvmRegionNode0", kind: "function",
+        references: ["jvmRegionNode2"], text: "root"},
+      {name: "jvmRegionNode1", kind: "function",
+        references: ["jvmRegionNode3"], text: "dead"},
+      {name: "jvmRegionNode2", kind: "function",
+        references: [], text: "callee"},
+      {name: "jvmRegionNode3", kind: "function",
+        references: [], text: "dead-callee"},
+    ];
+    t.deepEqual(
+      pruneUnreachableRegionDeclarations(declarations, ["jvmRegionNode0"])
+        .map((declaration) => declaration.name),
+      ["jvmRegionNode0", "jvmRegionNode2"],
+      "only the root's transitive closure survives");
+    t.deepEqual(
+      pruneUnreachableRegionDeclarations(declarations, ["jvmRegionNodeX"])
+        .map((declaration) => declaration.name),
+      ["jvmRegionNode0", "jvmRegionNode1", "jvmRegionNode2", "jvmRegionNode3"],
+      "an unknown root keeps every declaration");
     t.end();
   });
+
+test("reference cycles terminate and stay reachable", (t) => {
+  const declarations = [
+    {name: "a", kind: "function", references: ["b"], text: "a"},
+    {name: "b", kind: "function", references: ["a", "c"], text: "b"},
+    {name: "c", kind: "function", references: ["b"], text: "c"},
+    {name: "d", kind: "function", references: ["d"], text: "d"},
+  ];
+  t.deepEqual(
+    pruneUnreachableRegionDeclarations(declarations, ["a"])
+      .map((declaration) => declaration.name),
+    ["a", "b", "c"], "self- and mutual recursion do not loop or leak");
+  t.end();
+});
