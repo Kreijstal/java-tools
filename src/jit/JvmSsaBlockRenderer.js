@@ -12118,11 +12118,12 @@ class JvmSsaBlockRenderer {
         const restoringPrologue = [
           restoringInitializationGuardDeclaration,
           directGuard,
-          constDecl(named("restorationDepth"),
-            e`thread.callStack.items.length`),
-          letDecl(named("frame"), e`null`),
-          letDecl(named("locals"), e`null`),
-          letDecl(named("stack"), e`null`),
+          // These four are ambient, not operands: every tier declares them in
+          // its outermost scope and no pass renames or removes one.
+          st`const restorationDepth = thread.callStack.items.length;`,
+          st`let frame = null;`,
+          st`let locals = null;`,
+          st`let stack = null;`,
         ].filter(Boolean);
         // The restoring tier wraps its whole body in one compiler-owned
         // try/catch. That wrapper is scaffolding, not a guest exception
