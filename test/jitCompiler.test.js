@@ -692,6 +692,183 @@ test('oversized loop policy selects Wasm by structure, not guest identity', (t) 
   t.end();
 });
 
+test('a synchronous generated caller enters a Wasm-owned callee in place', (t) => {
+  const jvm = new JVM({ jit: { warmupThreshold: 0 } });
+  const method = (name, descriptor) => ({
+    name, descriptor, flags: ['private', 'static'],
+    attributes: [{ type: 'code', code: {
+      localsSize: '1', stackSize: '1',
+      codeItems: [{labelDef: 'L0:', instruction: 'nop'}],
+      exceptionTable: [],
+    } }],
+  });
+  const callee = method('ownedByWasm', '(I)I');
+  const parent = new Frame(method('caller', '()V'));
+  parent.className = 'WasmOwnedHarness';
+  const thread = {
+    status: 'runnable', pendingException: null, callStack: new Stack(),
+  };
+  thread.callStack.push(parent);
+  const site = {
+    op: 'invokestatic', descriptor: '(I)I', params: ['I'], returnType: 'I',
+  };
+  const target = { method: callee, lookupClass: 'WasmOwnedHarness' };
+  const invoke = () => {
+    parent.stack.items.length = 0;
+    parent.stack.items.push(41);
+    return jvm.jit.tryInvokeResolvedTarget(site, target, parent, thread);
+  };
+  let nestedRuns = 0;
+  let nestedResult = null;
+  jvm.jit.wasmJit.enabled = true;
+  jvm.jit.wasmJit.runNested = (child) => {
+    nestedRuns += 1;
+    t.equal(child.locals[0], 41, 'the child frame carries the argument');
+    t.equal(thread.callStack.items[thread.callStack.items.length - 1], child,
+      'the child is on the call stack when the module runs');
+    if (nestedResult.returned) thread.callStack.pop();
+    return nestedResult;
+  };
+
+  t.equal(invoke(), jvm.jit.asyncInvokeSentinel(),
+    'a callee with neither tier still takes the asynchronous path');
+  t.equal(parent.stack.items.length, 1,
+    'a declined call leaves the caller operands untouched');
+  t.equal(nestedRuns, 0, 'no Wasm entry without a ready module');
+
+  const entryMeta = (fullyCompiled) => ({
+    fullyCompiled, blockOfItem: new Map([[0, 0]]), externalEntry: new Set([0]),
+  });
+  jvm.jit.wasmJit.state.set(callee, {
+    status: 'ready', runs: 0, exits: 0,
+    meta: {fullyCompiled: false, blockOfItem: new Map([[0, 0]]),
+      externalEntry: new Set()},
+  });
+  t.equal(invoke(), jvm.jit.asyncInvokeSentinel(),
+    'a module without an external entry at pc 0 is not entered');
+  t.equal(nestedRuns, 0, 'the entry-less module is skipped before any child is built');
+  jvm.jit.wasmJit.state.set(callee, {
+    status: 'ready', runs: 0, exits: 0, meta: entryMeta(false),
+  });
+  nestedResult = { returned: true, isVoid: false, value: 42 };
+  t.equal(invoke(), 42, 'a ready module completes the call in place');
+  t.equal(nestedRuns, 1, 'the nested protocol ran once');
+  t.equal(parent.stack.items.length, 0, 'the argument was consumed');
+  t.equal(thread.callStack.items.length, 1, 'the child was withdrawn');
+  t.equal(jvm.jit.wasmOwnedSyncCalleeRuns, 1, 'the in-place run is counted');
+
+  nestedResult = { exited: true, deopted: true };
+  const exited = invoke();
+  t.ok(exited && exited.deopt && exited.transient,
+    'a partial exit is a transient deopt');
+  t.equal(exited.jvmPositionalChild, thread.callStack.items[1],
+    'the materialized child stays on the stack for the scheduler');
+  t.equal(exited.jvmPositionalChild.jitGeneratedReturnParent, parent,
+    'the child returns its value to the generated parent');
+  thread.callStack.pop();
+
+  nestedResult = { handled: false };
+  const declined = invoke();
+  t.ok(declined && declined.deopt && declined.transient,
+    'a module withdrawn after the readiness check is a transient deopt');
+  t.equal(declined.jvmPositionalChild.pc, 0,
+    'the untouched child resumes from its entry');
+  t.equal(declined.jvmPositionalChild.locals[0], 41,
+    'the untouched child keeps its argument');
+  t.equal(jvm.jit.wasmOwnedSyncCalleeDeclined, 1, 'the decline is counted');
+  thread.callStack.pop();
+
+  jvm.jit.wasmJit.state.set(callee, {
+    status: 'ready', runs: 64, exits: 64, meta: entryMeta(false),
+  });
+  t.equal(invoke(), jvm.jit.asyncInvokeSentinel(),
+    'an exit storm retires the module from synchronous entry');
+  t.equal(nestedRuns, 3, 'the storming module is not entered');
+  t.end();
+});
+
+test('a synchronous site resolves a target for a Wasm-owned callee the JavaScript tiers reject', (t) => {
+  const owner = 'WasmOwnedSiteOwner';
+  const callee = {
+    className: owner, name: 'ownedByWasm', descriptor: '(I)I',
+    flags: ['public'], attributes: [{type: 'code', code: {
+      codeItems: [
+        {labelDef: 'L0:', instruction: 'iload_1'},
+        {labelDef: 'L1:', instruction: 'ireturn'},
+      ],
+      exceptionTable: [], localsSize: '2', stackSize: '1',
+    }}],
+  };
+  const callerMethod = {
+    className: owner, name: 'caller', descriptor: '()V',
+    flags: ['static'], attributes: [{type: 'code', code: {
+      codeItems: [], exceptionTable: [], localsSize: '0', stackSize: '0',
+    }}],
+  };
+  const jvm = new JVM({jit: {warmupThreshold: 0}});
+  jvm.classes[owner] = {
+    staticFields: new Map(),
+    ast: {classes: [{superClassName: null, items: [
+      {type: 'method', method: callee},
+    ]}]},
+  };
+  jvm.classInitializationState.set(owner, 'INITIALIZED');
+  // The JavaScript tiers reject this callee outright, whatever its bytecode.
+  jvm.jit.isSupported = () => false;
+  jvm.jit.isShortSupportedHelper = () => false;
+  jvm.jit.isCodegenSupported = () => false;
+  const siteId = jvm.jit.registerSyncCallSite('invokevirtual', {
+    arg: ['Method', owner, ['ownedByWasm', '(I)I']],
+  }, callerMethod, 0);
+  const site = jvm.jit.syncCallSites[siteId];
+  const caller = new Frame(callerMethod);
+  caller.className = owner;
+  const thread = {status: 'runnable', pendingException: null, callStack: new Stack()};
+  thread.callStack.push(caller);
+  const invoke = () => {
+    caller.stack.items.length = 0;
+    caller.stack.items.push({type: owner, fields: {}}, 41);
+    return jvm.jit.tryInvokeSyncAt(siteId, caller, thread);
+  };
+
+  t.equal(invoke(), jvm.jit.asyncInvokeSentinel(),
+    'without a ready module the rejected callee takes the asynchronous path');
+  t.equal(site.targets.size, 0, 'no target is cached for it');
+  t.equal(caller.stack.items.length, 2, 'the operands are left for the interpreter');
+
+  let nestedRuns = 0;
+  jvm.jit.wasmJit.enabled = true;
+  jvm.jit.wasmJit.state.set(callee, {
+    status: 'ready', runs: 0, exits: 0, meta: {
+      fullyCompiled: true, blockOfItem: new Map([[0, 0]]),
+      externalEntry: new Set([0]),
+    },
+  });
+  jvm.jit.wasmJit.runNested = (child) => {
+    nestedRuns += 1;
+    t.equal(child.method, callee, 'the child frame is the Wasm-owned callee');
+    t.equal(child.locals[1], 41, 'the argument sits in the child locals');
+    thread.callStack.pop();
+    return {returned: true, isVoid: false, value: 42};
+  };
+  t.equal(invoke(), 42, 'a ready module gives the site a target and completes the call');
+  t.equal(nestedRuns, 1, 'the module ran once');
+  const target = site.targets.get(owner);
+  t.ok(target && target.method === callee, 'the target is cached by receiver type');
+  t.equal(target.generated, undefined, 'no JavaScript body is attached');
+  t.equal(caller.stack.items.length, 0, 'the receiver and argument are consumed');
+  t.equal(invoke(), 42, 'the cached target takes the monomorphic fast path');
+  t.equal(nestedRuns, 2, 'the module ran again through the fast slot');
+  t.equal(jvm.jit.wasmOwnedSyncCalleeRuns, 2, 'both in-place runs are counted');
+
+  jvm.jit.wasmJit.state.get(callee).status = 'cold';
+  t.equal(invoke(), jvm.jit.asyncInvokeSentinel(),
+    'a withdrawn module sends the cached target back to the asynchronous path');
+  t.equal(caller.stack.items.length, 2, 'operands stay intact for the interpreter');
+  t.equal(nestedRuns, 2, 'a cold module is not entered');
+  t.end();
+});
+
 test('long-arithmetic loop policy selects Wasm by opcode shape, not method identity', (t) => {
   const jvm = new JVM({ jit: { warmupThreshold: 0 } });
   const shape = (name, longOps = 8, length = 256, backward = true) => {

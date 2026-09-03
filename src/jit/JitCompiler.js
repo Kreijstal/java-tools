@@ -279,6 +279,11 @@ class JitCompiler {
       options.readyWasmPositionalReleaseThreshold)
       ? options.readyWasmPositionalReleaseThreshold : 64;
     this.readyWasmPositionalReleaseCount = 0;
+    // Synchronous generated calls that entered a callee the Wasm tier owns
+    // outright (no synchronous JavaScript body exists for it).
+    this.wasmOwnedSyncCalleeRuns = 0;
+    this.wasmOwnedSyncCalleeExits = 0;
+    this.wasmOwnedSyncCalleeDeclined = 0;
     this.framePositionalCallsEnabled =
       options.framePositionalCalls === true ||
       Boolean(typeof process !== "undefined" && process.env &&
@@ -887,6 +892,29 @@ class JitCompiler {
     // to take ownership instead of repeatedly crossing Wasm -> interpreter.
     if (this.hasWasmExitStorm(method)) return false;
     return true;
+  }
+
+  // A callee whose only executable tier is a ready Wasm module. The scheduler
+  // enters such a method directly, so no JavaScript body carrying the
+  // synchronous flag is ever produced for it, and a synchronous generated
+  // caller used to hand every call back to the interpreter as a deopt. A
+  // partial module counts too: its exit costs exactly the deopt the caller
+  // would have paid anyway, and the exit-storm veto retires it if that
+  // becomes the rule rather than the exception.
+  hasReadyWasmModuleForSynchronousCall(method) {
+    if (!method || method.name === "<init>" || method.name === "<clinit>") {
+      return false;
+    }
+    const state = this.wasmJit.enabled ? this.wasmJit.state.get(method) : null;
+    if (!state || state.status !== "ready" || !state.meta) return false;
+    // A partial module may not contain the method's entry block at all; the
+    // nested runner would refuse it on every call ("no-external-entry-at-pc"
+    // in the census), each refusal costing a materialized child and a deopt.
+    const meta = state.meta;
+    const entryBlock = meta.blockOfItem ? meta.blockOfItem.get(0) : undefined;
+    if (entryBlock === undefined || !meta.externalEntry ||
+        !meta.externalEntry.has(entryBlock)) return false;
+    return !this.hasWasmExitStorm(method);
   }
 
   hasPreparedFullWasmUpgrade(method) {
@@ -1531,7 +1559,7 @@ class JitCompiler {
     const rows = [...this.methodRunCounts.entries()]
       .sort((a, b) => b[1] - a[1])
       .slice(0, Math.max(0, limit));
-    console.error(`JIT generated=${this.generatedRunCount} sync=${this.syncGeneratedRunCount} inlined=${this.syncInlinedCallCount} intrinsics=${this.syncIntrinsicCallCount} eagerMonomorphicLinks=${this.eagerMonomorphicCallLinkCount} hotGraphModules=${this.hotCallGraphRegions.moduleCompileCount} hotGraphRuns=${this.hotCallGraphRegions.runCount} hotGraphFallbacks=${this.hotCallGraphRegions.guardFallbackCount} syncOperandUnderflowFallbacks=${this.syncOperandUnderflowFallbackCount} reusedFrames=${this.syncReusedFrameCount} adaptiveWholeMethod=${this.adaptiveWholeMethodPromotionCount} adaptiveEscalations=${this.adaptiveWholeMethodEscalationCount} structuredSsa=${this.structuredSsa.totalRunCount} structuredSsaSafePoints=${this.structuredSsa.safePointCount} structuredLazyStatics=${this.structuredSsa.lazyStaticTargetLinkCount} structuredSplitMethods=${this.structuredSsa.splitMethodCount} structuredSplitBlocks=${this.structuredSsa.splitBlockCount} inlineLoopRegions=${this.inlineLoopRegionRunCount} inlineLoopOsr=${this.inlineLoopRegionOsrCount} scalarLoops=${this.scalarLoopRunCount} scalarSafePoints=${this.scalarLoopSafePointCount} scalarSsa=${this.scalarSsaRunCount} scalarArrayViews=${this.scalarSsaArrayViewCount} scalarEliminatedReads=${this.scalarSsaEliminatedReadCount} scalarThreadedEdges=${this.scalarSsaThreadedEdgeCount} runner=${this.runnerRunCount}`);
+    console.error(`JIT generated=${this.generatedRunCount} sync=${this.syncGeneratedRunCount} inlined=${this.syncInlinedCallCount} intrinsics=${this.syncIntrinsicCallCount} eagerMonomorphicLinks=${this.eagerMonomorphicCallLinkCount} hotGraphModules=${this.hotCallGraphRegions.moduleCompileCount} hotGraphRuns=${this.hotCallGraphRegions.runCount} hotGraphFallbacks=${this.hotCallGraphRegions.guardFallbackCount} syncOperandUnderflowFallbacks=${this.syncOperandUnderflowFallbackCount} reusedFrames=${this.syncReusedFrameCount} wasmOwnedSyncCallees=${this.wasmOwnedSyncCalleeRuns}/${this.wasmOwnedSyncCalleeExits}/${this.wasmOwnedSyncCalleeDeclined} adaptiveWholeMethod=${this.adaptiveWholeMethodPromotionCount} adaptiveEscalations=${this.adaptiveWholeMethodEscalationCount} structuredSsa=${this.structuredSsa.totalRunCount} structuredSsaSafePoints=${this.structuredSsa.safePointCount} structuredLazyStatics=${this.structuredSsa.lazyStaticTargetLinkCount} structuredSplitMethods=${this.structuredSsa.splitMethodCount} structuredSplitBlocks=${this.structuredSsa.splitBlockCount} inlineLoopRegions=${this.inlineLoopRegionRunCount} inlineLoopOsr=${this.inlineLoopRegionOsrCount} scalarLoops=${this.scalarLoopRunCount} scalarSafePoints=${this.scalarLoopSafePointCount} scalarSsa=${this.scalarSsaRunCount} scalarArrayViews=${this.scalarSsaArrayViewCount} scalarEliminatedReads=${this.scalarSsaEliminatedReadCount} scalarThreadedEdges=${this.scalarSsaThreadedEdgeCount} runner=${this.runnerRunCount}`);
     for (const [method, count] of rows) {
       const deopts = this.methodDeoptCounts.get(method) || 0;
       console.error(`  ${count.toLocaleString()} runs ${method}${deopts ? ` (${deopts} deopt)` : ""}`);
@@ -7367,7 +7395,14 @@ class JitCompiler {
       const structuralIntrinsic = op === "invokestatic"
         ? this.getSynchronousIntrinsic(method, descriptor)
         : null;
-      if (!normallySupported && !structuralIntrinsic) {
+      // A method the JavaScript tiers reject can still be owned by a ready
+      // Wasm module: the scheduler runs it there, but without a target this
+      // site never reached the resolved-target dispatcher, and every call
+      // from a synchronous caller was a deopt. Give it a target with no
+      // JavaScript body; the dispatcher enters the module in place.
+      const wasmOwned = !normallySupported && !structuralIntrinsic &&
+        this.hasReadyWasmModuleForSynchronousCall(method);
+      if (!normallySupported && !structuralIntrinsic && !wasmOwned) {
         return ASYNC_INVOKE;
       }
       target = {
@@ -7648,7 +7683,13 @@ class JitCompiler {
       }
       return value;
     }
-    if (!generated || !generated.jvmSynchronous) return ASYNC_INVOKE;
+    const synchronousGenerated = Boolean(generated && generated.jvmSynchronous);
+    // Readiness is decided here, before any operand is consumed, so a callee
+    // that qualifies for neither entry leaves the caller's stack intact for
+    // the asynchronous path.
+    const wasmOwnedCallee = !synchronousGenerated &&
+      this.hasReadyWasmModuleForSynchronousCall(method);
+    if (!synchronousGenerated && !wasmOwnedCallee) return ASYNC_INVOKE;
 
     // A generated caller can reach a small reference cleanup through the
     // generic resolved-target path before its emitted call-site closure has
@@ -7656,7 +7697,7 @@ class JitCompiler {
     // cleanup: the same verified positional body used by linked callers can
     // consume the parent's operands directly and reconstruct a child only on
     // its guarded deopt/exception path.
-    if (returnType === "void" &&
+    if (synchronousGenerated && returnType === "void" &&
         this.isReferenceFieldHelperJsPreferred(method)) {
       const positional = this.getPositionalGeneratedInvoker(site, target);
       if (typeof positional === "function") {
@@ -7689,7 +7730,7 @@ class JitCompiler {
     const child = target.freeFrame || new Frame(method);
     if (target.freeFrame && this.profileMethods) this.syncReusedFrameCount += 1;
     target.freeFrame = null;
-    generated.jvmClearStructuredContinuation?.(child);
+    generated?.jvmClearStructuredContinuation?.(child);
     child.pc = 0;
     // Verified bytecode cannot read a non-parameter local before storing it, so
     // normal execution does not need to erase every slot in a recycled frame.
@@ -7756,25 +7797,46 @@ class JitCompiler {
     // and the method's Wasm state remains permanently cold. A partial exit
     // keeps the materialized child on the stack and hands scheduling back to
     // the verified parent continuation.
-    if (this.wasmJit.enabled &&
+    // A callee the Wasm tier owns outright takes the same nested protocol:
+    // it is the only tier that can complete this call in place.
+    if (wasmOwnedCallee ||
+        (this.wasmJit.enabled &&
         this.isOversizedLoopMethod(method) &&
         (!this.preparedCodegenMethods.has(method) ||
           this.hasReadyFullWasm(method) ||
           this.hasPreparedFullWasmUpgrade(method)) &&
-        !this.hasWasmExitStorm(method)) {
+        !this.hasWasmExitStorm(method))) {
       const wasmResult = this.wasmJit.runNested(child, thread);
       if (wasmResult.returned) {
+        if (wasmOwnedCallee) this.wasmOwnedSyncCalleeRuns += 1;
         target.freeFrame = child;
         if (returnType === "V" || wasmResult.isVoid) return RETURN_VOID;
         return wasmResult.value;
       }
       if (wasmResult.exited) {
+        if (wasmOwnedCallee) this.wasmOwnedSyncCalleeExits += 1;
         child.jitGeneratedReturnParent = frame;
         child.jitGeneratedReturnType = returnType;
         return {
           deopt: true,
           transient: true,
           reason: `wasm-first synchronous callee exit ${lookupClass}.` +
+            `${method.name}${descriptor}`,
+          jvmPositionalChild: child,
+        };
+      }
+      if (wasmOwnedCallee) {
+        // Nothing ran: the module was withdrawn between the readiness check
+        // and entry (a dependency-world recompile, a debugger attaching).
+        // The child is a complete interpreter frame at pc 0 on the stack, so
+        // hand it to the scheduler exactly as a contended monitor entry does.
+        this.wasmOwnedSyncCalleeDeclined += 1;
+        child.jitGeneratedReturnParent = frame;
+        child.jitGeneratedReturnType = returnType;
+        return {
+          deopt: true,
+          transient: true,
+          reason: `wasm-owned synchronous callee declined ${lookupClass}.` +
             `${method.name}${descriptor}`,
           jvmPositionalChild: child,
         };
