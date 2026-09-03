@@ -812,6 +812,9 @@ class MethodTranslator {
     // is what they name; its class is usually initialized well before it.
     const implKey = (implClassName) => `${implClassName}.${name}${descriptor}`;
     const readyOrThrow = (implClassName) => {
+      const self = this.wasmJit.selfLinkState(
+        this.method, this.className, implClassName, name, descriptor);
+      if (self) return self;
       const st = this.wasmJit.findReadyInstance(implClassName, name, descriptor);
       if (!st) {
         throw new Unsupported(`invoke ${owner}.${name} impl ${implClassName} not ready`,
@@ -996,6 +999,10 @@ class MethodTranslator {
       } catch (err) {
         if (partial && err instanceof NestedDeopt) {
           if (stats) stats.deopts += 1;
+          if (this.wasmJit && this.wasmJit.debug) {
+            console.error(`[wasmjit] nested callee ${key} unwound through a nested deopt`
+              + ` (${err.frames.map((f) => `${f.className || '?'}.${f.method && f.method.name}@${f.pc}`).join(' <- ') || 'no frames'})`);
+          }
           err.frames.push(frame);
           if (frame === scratchFrames.get(calleeSt)) scratchFrames.delete(calleeSt);
           spillCallerSlots(all);
@@ -1028,6 +1035,11 @@ class MethodTranslator {
       if (status !== -1) {
         if (!partial) throw new Error(`wasmjit: nested callee ${key} exited at ${status}`);
         if (stats) stats.deopts += 1;
+        if (this.wasmJit && this.wasmJit.debug) {
+          console.error(`[wasmjit] nested callee ${key} exited at pc ${status}`
+            + ` (${(meta.demoteReasons && meta.demoteReasons.get(meta.blockOfItem
+              ? meta.blockOfItem.get(status) : undefined)) || 'no demote reason'})`);
+        }
         frame.pc = status;
         if (frame === scratchFrames.get(calleeSt)) scratchFrames.delete(calleeSt);
         spillCallerSlots(all);
@@ -3132,7 +3144,13 @@ class WasmJit {
       // Callee links want the most-complete module, which is not always the
       // primary: a structured module with demoted blocks deopts per call
       // where a fully-compiled dispatcher module would run through.
-      const rank = (m) => (m.fullyCompiled ? 2 : m.normalFlowFullyCompiled ? 1 : 0);
+      // Completeness only counts for a module a link can use at all: a
+      // dispatcher module that boxes a type-conflicted slot reads that slot
+      // through frame imports and is refused by every link site, so
+      // preferring it here left a linkable structured module unused and the
+      // caller waiting forever on a "not ready" callee.
+      const rank = (m) => (m.boxedCount ? -1
+        : m.fullyCompiled ? 2 : m.normalFlowFullyCompiled ? 1 : 0);
       st.callee = st.osr && rank(st.osr.meta) > rank(st.meta) ? st.osr : null;
       st.status = 'ready';
       this.jit.publishWasmTargetReady?.(frame.method);
@@ -3198,6 +3216,9 @@ class WasmJit {
           (primary.arrayCacheCount ? ` ${primary.arrayCacheCount} array caches` : '') +
           (structuredMeta ? ` structured${st.osr ? '+osr' : ''}` : '') +
           (primary.inlinedCalls ? ` +${primary.inlinedCalls} inlined` : '') +
+          (primary.speculations ? ` spec=${primary.speculations}` : '') +
+          (primary.uncoveredItems ? ` uncovered=${primary.uncoveredItems}` : '') +
+          (primary.fullyCompiled ? '' : primary.normalFlowFullyCompiled ? ' normal-flow-only' : ' partial') +
           (primary.demoteReasons.size ? ` (exits: ${[...primary.demoteReasons.values()].join('; ')})` : ''));
       }
     } catch (err) {
@@ -3687,6 +3708,29 @@ class WasmJit {
     return allowPartial && cm.externalEntry.has(0) ? st : null;
   }
 
+  // A method that calls itself can never find a ready module for that
+  // callee while it is the method being compiled: its own state is
+  // 'compiling', the site demotes, and the finished module then exits at
+  // every recursive call — for good, because the retry that its own
+  // readiness triggers compiles it into the same shape. A quicksort helper
+  // on the Geoblox synthesizer path exited this way on every sound it
+  // generated and dragged its whole caller chain back to the interpreter.
+  // Link such a site to the method's own state instead: the runtime import
+  // reads `st.callee || st` at call time, when the module is ready, and
+  // recursion through one site already gets a throwaway frame under the
+  // partial-callee protocol. The site still counts as deoptable, so callers
+  // link this module under that same protocol.
+  selfLinkState(method, className, implClassName, name, descriptor) {
+    if (!method || implClassName !== className || method.name !== name ||
+        method.descriptor !== descriptor) return null;
+    if ((method.flags || []).includes('synchronized')) return null;
+    const st = this.state.get(method);
+    if (!st || st.status !== 'compiling') return null;
+    if (!st.method) st.method = method;
+    st.targetClassName = className;
+    return st;
+  }
+
   // Instance-method counterpart of findReadyStatic for devirtualized sites.
   // No <clinit> gate: an instance method only runs on an existing object,
   // whose class was initialized at instantiation, so linking cannot bypass
@@ -3709,17 +3753,23 @@ class WasmJit {
     if (st.status === 'cold' && this.calleeRetryAllowed(st)) {
       this.compile({ method, className }, st, { asCallee: true });
     }
-    if (!st || st.status !== 'ready') return null;
+    const unlinkable = (why) => {
+      if (this.debug) {
+        console.error(`[wasmjit] instance callee ${className}.${name}${descriptor} not linkable: ${why}`);
+      }
+      return null;
+    };
+    if (!st || st.status !== 'ready') return unlinkable(`status ${st ? st.status : 'none'}`);
     const cm = (st.callee || st).meta;
-    if (cm.boxedCount) return null;
+    if (cm.boxedCount) return unlinkable(`${cm.boxedCount} boxed slots`);
     // Guarded speculative modules are excluded like findReadyStatic. Guard-
     // elided modules (specSites without speculations) ARE returned: every
     // instance-dispatch runner revalidates them per call
     // (revalidateNestedCallee) and has a miss/deopt path when the baked
     // world grew, while raw direct links exclude them at eligibility.
-    if (cm.speculations) return null;
+    if (cm.speculations) return unlinkable(`${cm.speculations} guarded speculations`);
     if (cm.fullyCompiled || cm.normalFlowFullyCompiled) return st;
-    return cm.externalEntry.has(0) ? st : null;
+    return cm.externalEntry.has(0) ? st : unlinkable('partial module without a pc-0 entry');
   }
 
   // Captured nested-dispatch targets bypass prepare()'s speculation gate.

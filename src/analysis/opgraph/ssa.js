@@ -269,6 +269,9 @@ function buildSsaOrThrow(input, options) {
 }
 
 function imposeKind(value, kind, what) {
+  // An instruction that loads or stores this value fixes its kind for good.
+  // Only merge-derived phi kinds (see fillPhiArgs) stay provisional.
+  value.kindObserved = true;
   if (value.kind === null) { value.kind = kind; return; }
   if (value.kind === kind) return;
   if (value.kind === CONFLICT) reject(`${what} reads a kind-conflicted slot`);
@@ -476,8 +479,10 @@ function fillPhiArgs(blocks, rpo, isJoin, makeValue, paramSlots) {
         phi.args = sources.map((pred) => pred.slotDefsOut.get(slot) || undefValue());
         if (seed) phi.args.unshift(seed.get(slot) || undefValue());
         const merged = phi.args.reduce((kind, arg) => mergeKind(kind, arg.kind), null);
-        if (phi.kind === null) phi.kind = merged;
-        else if (merged !== null && merged !== phi.kind) {
+        if (phi.kind === null) {
+          phi.kind = merged;
+          if (merged !== null) phi.kindMerged = true;
+        } else if (merged !== null && merged !== phi.kind) {
           reject(`local phi kind mismatch: loaded as ${phi.kind}, joins to ${merged}`);
         }
       }
@@ -499,18 +504,35 @@ function fillPhiArgs(blocks, rpo, isJoin, makeValue, paramSlots) {
   // end of the array those slots held.
   //
   // Iterate to a fixpoint so every phi carrying a defined value gets its kind.
-  // Only null kinds are filled; an already-kinded phi keeps its kind, and a
-  // genuine CONFLICT stays CONFLICT (still excluded from spills, which is the
-  // documented behaviour for type-conflicted joins).
+  //
+  // A kind taken from a merge is provisional: it was computed while some of
+  // the arguments were still unkinded, so an argument that is kinded later
+  // can turn the join into a CONFLICT. Verified bytecode can never read such
+  // a join (the verifier merges the slot to unusable), so a merge-kinded phi
+  // that becomes conflicted is a dead slot join and is re-labelled CONFLICT
+  // like every other type-conflicted join. A kind fixed by a load or store
+  // (kindObserved) is not provisional: an argument that disagrees with it is
+  // a contradiction of the verifier and rejects the method. Without the
+  // revisit, a dead join in a method whose slot is reused as int in one loop
+  // and float in another kept its first-seen float kind while carrying an
+  // int-kinded argument, and the emitter rejected the whole method for a
+  // phi copy that would never have executed.
   let kindsChanged = true;
   while (kindsChanged) {
     kindsChanged = false;
     for (const blockId of rpo) {
       for (const phi of blocks[blockId].phis) {
-        if (phi.kind !== null || !phi.args || !phi.args.length) continue;
+        if (!phi.args || !phi.args.length) continue;
+        if (phi.kind !== null && !phi.kindMerged) continue;
         const merged = phi.args.reduce(
           (kind, arg) => mergeKind(kind, arg ? arg.kind : null), null);
-        if (merged !== null) { phi.kind = merged; kindsChanged = true; }
+        if (merged === null || merged === phi.kind) continue;
+        if (phi.kind !== null && phi.kindObserved) {
+          reject(`local phi kind mismatch: loaded as ${phi.kind}, joins to ${merged}`);
+        }
+        phi.kind = merged;
+        phi.kindMerged = true;
+        kindsChanged = true;
       }
     }
   }

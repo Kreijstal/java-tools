@@ -616,3 +616,158 @@ test('a call dependency retains the deferred callee root cause', (t) => {
   ], 'the method identity and its concrete class dependency are both retained');
   t.end();
 });
+
+const CONFLICT_SLOT_FIXTURE = `
+public class ConflictSlotLink {
+  static final class Scaler {
+    int mul(int x) {
+      int r;
+      { int k = x * 3; r = k + 1; }
+      if (r < 0) return 0;
+      try { float f = r * 0.5f; r = (int) f; } catch (RuntimeException e) { r = -1; }
+      return r & 0xffff;
+    }
+  }
+  public static int drive(int[] out, int n) {
+    Scaler s = new Scaler();
+    int sum = 0;
+    for (int i = 0; i < n; i++) {
+      sum = (sum + s.mul(sum + i)) & 0xfffff;
+    }
+    out[0] = sum;
+    return sum;
+  }
+}
+`;
+
+function referenceConflictDrive(n) {
+  let sum = 0;
+  for (let i = 0; i < n; i += 1) {
+    let r = ((sum + i) * 3 + 1) | 0;
+    r = r < 0 ? 0 : Math.trunc(Math.fround(r * 0.5)) & 0xffff;
+    sum = (sum + r) & 0xfffff;
+  }
+  return sum;
+}
+
+test('a callee whose dispatcher module boxes a reused slot still links through its structured module', async (t) => {
+  // javac gives the block-scoped int and float the same slot. The dispatcher
+  // lowering boxes such a slot (frame imports), which no link site accepts;
+  // the structured lowering types it through SSA and stays linkable. The
+  // callee-module choice must not hand the boxed module to the linker just
+  // because it covers the handler block the structured module leaves out.
+  const { jvm, thread } = await makeHarness(t, 'ConflictSlotLink', CONFLICT_SLOT_FIXTURE, {
+    JVM_WASM_STRUCTURED: '1',
+    JVM_WASM_INSTANCE_INLINE: '0',
+  });
+  await jvm.loadClassByName('ConflictSlotLink$Scaler');
+  jvm.classInitializationState.set('ConflictSlotLink$Scaler', 'INITIALIZED');
+  const n = 6000;
+  const expected = referenceConflictDrive(n);
+  const out = [0];
+  out.type = '[I';
+  for (let round = 0; round < 3; round += 1) {
+    await invoke(jvm, thread, 'ConflictSlotLink', 'drive', '([II)I', [out, n]);
+    t.equal(out[0], expected, `round ${round} matches the JS reference`);
+  }
+  const callee = stateOf(jvm, 'ConflictSlotLink$Scaler.mul(I)I');
+  t.ok(callee, 'mul compiled as a callee');
+  const linkedMeta = callee && (callee.callee || callee).meta;
+  t.equal(linkedMeta && linkedMeta.boxedCount, 0, 'the module offered to links has no boxed slot');
+  t.ok(jvm.jit.wasmJit.findReadyInstance('ConflictSlotLink$Scaler', 'mul', '(I)I'),
+    'mul is linkable');
+  const caller = stateOf(jvm, 'ConflictSlotLink.drive([II)I');
+  t.ok(caller, 'drive compiled to wasm');
+  t.ok(caller.meta.deoptableCalls >= 1, 'the invokevirtual site linked as an instance call');
+  t.equal([...(caller.meta.demoteReasons || new Map()).values()]
+    .filter((reason) => /no ready impl|not ready/.test(reason)).length, 0,
+  'drive did not demote the call for a missing callee');
+  t.end();
+});
+
+const SELF_RECURSIVE_FIXTURE = `
+public class SelfLink {
+  static final class Sorter {
+    final int[] keys;
+    Sorter(int n) {
+      keys = new int[n];
+      for (int i = 0; i < n; i++) keys[i] = (i * 7919 + 13) % 101;
+    }
+    private void sort(int lo, int hi) {
+      if (lo >= hi) return;
+      int pivot = keys[(lo + hi) >>> 1];
+      int i = lo;
+      int j = hi;
+      while (i <= j) {
+        while (keys[i] < pivot) i++;
+        while (keys[j] > pivot) j--;
+        if (i <= j) {
+          int t = keys[i]; keys[i] = keys[j]; keys[j] = t;
+          i++; j--;
+        }
+      }
+      sort(lo, j);
+      sort(i, hi);
+    }
+    int checksum() {
+      int sum = 0;
+      for (int i = 0; i < keys.length; i++) sum = (sum * 31 + keys[i]) & 0xfffff;
+      return sum;
+    }
+  }
+  public static int drive(int[] out, int rounds) {
+    int sum = 0;
+    for (int r = 0; r < rounds; r++) {
+      Sorter s = new Sorter(64);
+      s.sort(0, 63);
+      sum = (sum + s.checksum()) & 0xfffff;
+    }
+    out[0] = sum;
+    return sum;
+  }
+}
+`;
+
+function referenceSelfDrive(rounds) {
+  let sum = 0;
+  for (let r = 0; r < rounds; r += 1) {
+    const keys = [];
+    for (let i = 0; i < 64; i += 1) keys.push((i * 7919 + 13) % 101);
+    keys.sort((a, b) => a - b);
+    let check = 0;
+    for (let i = 0; i < keys.length; i += 1) check = (Math.imul(check, 31) + keys[i]) & 0xfffff;
+    sum = (sum + check) & 0xfffff;
+  }
+  return sum;
+}
+
+test('a self-recursive instance method links its own call and stays in wasm', async (t) => {
+  // While sort is being compiled its own state is not ready, so the
+  // recursive call used to demote its block and the finished module exited
+  // at that call on every invocation. The site now links to the method's own
+  // state, which the import resolves at call time.
+  const { jvm, thread } = await makeHarness(t, 'SelfLink', SELF_RECURSIVE_FIXTURE, {
+    JVM_WASM_STRUCTURED: '1',
+    JVM_WASM_INSTANCE_INLINE: '0',
+  });
+  await jvm.loadClassByName('SelfLink$Sorter');
+  jvm.classInitializationState.set('SelfLink$Sorter', 'INITIALIZED');
+  const rounds = 400;
+  const expected = referenceSelfDrive(rounds);
+  const out = [0];
+  out.type = '[I';
+  for (let round = 0; round < 3; round += 1) {
+    await invoke(jvm, thread, 'SelfLink', 'drive', '([II)I', [out, rounds]);
+    t.equal(out[0], expected, `round ${round} matches the JS reference`);
+  }
+  const sorter = stateOf(jvm, 'SelfLink$Sorter.sort(II)V');
+  t.ok(sorter, 'sort compiled to wasm');
+  const sorterMeta = sorter && (sorter.callee || sorter).meta;
+  t.ok(sorterMeta && sorterMeta.normalFlowFullyCompiled,
+    'the recursive call did not demote a normal-flow block');
+  t.equal([...((sorterMeta && sorterMeta.demoteReasons) || new Map()).values()]
+    .filter((reason) => /not ready|no ready impl/.test(reason)).length, 0,
+  'no block waits on the method itself');
+  t.equal(sorter.nestedDeopts || 0, 0, 'no recursive call exited the module');
+  t.end();
+});

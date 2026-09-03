@@ -1909,6 +1909,9 @@ class StructuredWasmCompiler {
     // See the matching site in WasmJit: these wait on the impl METHOD.
     const implKey = (implClassName) => `${implClassName}.${name}${descriptor}`;
     const readyOrThrow = (implClassName) => {
+      const self = this.wasmJit.selfLinkState(
+        this.method, this.className, implClassName, name, descriptor);
+      if (self) return self;
       const st = this.wasmJit.findReadyInstance(implClassName, name, descriptor);
       if (!st) {
         throw new Unsupported(`invoke ${owner}.${name} impl ${implClassName} not ready`,
@@ -2215,6 +2218,10 @@ class StructuredWasmCompiler {
       status = calleeMod.run(...full);
     } catch (err) {
       if (partial && err instanceof NestedDeopt) {
+        if (this.wasmJit.debug) {
+          console.error(`[wasmjit] nested callee ${calleeSt.key} unwound through a nested deopt`
+            + ` (${err.frames.map((f) => `${f.className || '?'}.${f.method && f.method.name}@${f.pc}`).join(' <- ') || 'no frames'})`);
+        }
         err.frames.push(frame);
         if (frame === scratchFrames.get(calleeSt)) scratchFrames.delete(calleeSt);
         box.pendingFrames = err.frames;
@@ -2244,6 +2251,13 @@ class StructuredWasmCompiler {
     }
     if (status !== -1) {
       if (!partial) throw new Error(`wasmjit: nested callee exited at ${status}`);
+      if (this.wasmJit.debug) {
+        const deeper = meta.box.pendingFrames;
+        console.error(`[wasmjit] nested callee ${calleeSt.key} exited at pc ${status}`
+          + ` (${(meta.demoteReasons && meta.demoteReasons.get(meta.blockOfItem
+            ? meta.blockOfItem.get(status) : undefined)) || 'no demote reason'}`
+          + `${deeper ? `; parked ${deeper.map((f) => `${f.className || '?'}.${f.method && f.method.name}@${f.pc}`).join(' <- ')}` : ''})`);
+      }
       frame.pc = status;
       if (frame === scratchFrames.get(calleeSt)) scratchFrames.delete(calleeSt);
       // the callee's own call-site deopt may have parked deeper frames

@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const { buildSsa } = require('../src/analysis/opgraph/ssa');
 const { buildOp02Graph } = require('../src/analysis/opgraph/op02');
+const { CONFLICT } = require('../src/analysis/opgraph/ssaTypes');
 
 const STATIC_II_I = { name: 'f', descriptor: '(II)I', flags: ['static'] };
 
@@ -333,5 +334,58 @@ test('ssa kinds a loop-carried phi whose back-edge arg is itself a phi', (t) => 
     }
   }
   t.deepEqual(unkinded, [], 'no phi with a real argument is left unkinded');
+  t.end();
+});
+
+test('ssa re-labels a merge-kinded dead join that later conflicts', (t) => {
+  // Slot 1 is an int counter in the first loop and a float accumulator in the
+  // second. The second loop's header joins the int (reaching it through the
+  // outer loop-header phi, which is only kinded on a later fixpoint pass)
+  // with the float. Nothing reads that join before slot 1 is stored again,
+  // so it is dead; the provisional float kind it takes on the first pass must
+  // give way to CONFLICT once the int argument is kinded, or the emitter
+  // rejects the whole method for a phi copy that never executes.
+  const fn = build([
+    { pc: 0, labelDef: 'Louter:', instruction: 'iload_0' },
+    { pc: 1, instruction: { op: 'ifeq', arg: 'Lfloat' } },
+    { pc: 2, instruction: 'iconst_0' },
+    { pc: 3, instruction: 'istore_1' },
+    { pc: 4, labelDef: 'Linner:', instruction: 'iload_1' },
+    { pc: 5, instruction: { op: 'bipush', arg: '3' } },
+    { pc: 6, instruction: { op: 'if_icmpge', arg: 'Lnext' } },
+    { pc: 7, instruction: { op: 'iinc', arg: ['1', '1'] } },
+    { pc: 8, instruction: { op: 'goto', arg: 'Linner' } },
+    { pc: 9, labelDef: 'Lnext:', instruction: { op: 'iinc', arg: ['0', '-1'] } },
+    { pc: 10, instruction: { op: 'goto', arg: 'Louter' } },
+    { pc: 11, labelDef: 'Lfloat:', instruction: 'fconst_1' },
+    { pc: 12, instruction: 'fstore_1' },
+    { pc: 13, instruction: 'fload_1' },
+    { pc: 14, instruction: 'fload_1' },
+    { pc: 15, instruction: 'fadd' },
+    { pc: 16, instruction: 'fstore_1' },
+    { pc: 17, instruction: { op: 'iinc', arg: ['0', '1'] } },
+    { pc: 18, instruction: 'iload_0' },
+    { pc: 19, instruction: { op: 'ifgt', arg: 'Lfloat' } },
+    { pc: 20, instruction: 'iconst_0' },
+    { pc: 21, instruction: 'ireturn' },
+  ], { name: 'f', descriptor: '(I)I', flags: ['static'] });
+  t.notOk(fn.rejected, `accepted: ${fn.rejected || ''}`);
+  const slotPhis = [];
+  for (const block of fn.blocks) {
+    for (const phi of block.phis) {
+      if (phi.origin && phi.origin.slot === 1) slotPhis.push(phi);
+    }
+  }
+  const conflicted = slotPhis.filter((phi) => phi.kind === CONFLICT);
+  t.ok(conflicted.length >= 1, 'the int/float join is a conflicted (dead) phi');
+  for (const phi of slotPhis) {
+    if (phi.kind === CONFLICT || phi.kind === null) continue;
+    for (const arg of phi.args) {
+      if (!arg || arg.kind === null || arg.kind === CONFLICT) continue;
+      t.equal(arg.kind, phi.kind,
+        `kinded phi ${phi.id} (${phi.kind}) only joins ${phi.kind} arguments`);
+    }
+  }
+  t.ok(slotPhis.some((phi) => phi.kind === 'I'), 'the counter loop phi is int');
   t.end();
 });
