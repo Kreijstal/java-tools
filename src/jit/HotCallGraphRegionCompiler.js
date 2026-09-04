@@ -3133,6 +3133,14 @@ class HotCallGraphRegionCompiler {
     for (const [node, planName] of exceptionalInlinePlanNames) {
       captures[planName] = this.restorationPlan(node);
     }
+    // Each composed body names the field sites, call sites and class
+    // initialization guards it reads as captures rather than reloading them
+    // from `helpers` per call. The names carry global site ids, so nodes that
+    // share a record share the binding and none of them collide.
+    for (const node of plan.nodes) {
+      Object.assign(captures,
+        node.generated?.jvmStructuredLinkRecordCaptures || {});
+    }
     // The module's own emission plan: one entry per emitted module-level
     // declaration group, carrying the name it declares and the module names
     // it links against. Module-level reachability and the factory-hoist split

@@ -497,6 +497,9 @@ class JitCompiler {
       Boolean(typeof process !== "undefined" && process.env &&
         process.env.JVM_ENABLE_RENDERER_PIPELINE === "1");
     this.scalarLoopsEnabled = options.scalarLoops !== false;
+    // Diagnostic: per-method tally of fast-tier versus resume-body entries.
+    this.resumeDispatchStats = options.profileResumeDispatch === true
+      ? new Map() : null;
     this.scalarGuestBodiesEnabled = this.rendererPipelineEnabled || options.scalarGuestBodies === true ||
       Boolean(typeof process !== "undefined" && process.env &&
         process.env.JVM_ENABLE_SCALAR_GUEST_BODIES === "1");
@@ -3580,7 +3583,40 @@ class JitCompiler {
       if (!resume) resume = this.compileBaselineMethod(method);
     } catch (_) { resume = null; }
     if (!resume || resume.jvmSynchronous !== true) return fast;
-    const dispatcher = function (
+    // Which branch a method actually takes is not visible from the codegen
+    // cache: the dispatcher copies the fast tier's flags, so a body that
+    // resumes into `resume` on every entry still reports its fast tier.
+    // Counting is off unless a diagnostic run asks for it.
+    const stats = this.resumeDispatchStats;
+    const statsKey = stats
+      ? `${method?.className || this.jvm.findClassNameForMethod?.(method) ||
+        "unknown"}.${method?.name || "?"}${method?.descriptor || ""}` : null;
+    const dispatcher = stats ? function (
+      frame, thread, helpers, initialBytecodeChecks, framelessEntry,
+    ) {
+      const structuredEntry = frame.pc === 0 ||
+        fast.jvmHasStructuredContinuation?.(frame);
+      let row = stats.get(statsKey);
+      if (!row) {
+        row = {fast: 0, resume: 0, entryPc: [], outcomes: {}};
+        stats.set(statsKey, row);
+      }
+      if (structuredEntry) row.fast += 1; else row.resume += 1;
+      if (!structuredEntry) {
+        return resume(frame, thread, helpers, initialBytecodeChecks);
+      }
+      // What the fast body did with the entry. A body that returns a deopt
+      // without yielding stores no continuation, so the frame's next entry
+      // arrives at a non-zero pc and can never be routed back here.
+      if (row.entryPc.length < 8) row.entryPc.push(frame.pc);
+      const outcome = fast(
+        frame, thread, helpers, initialBytecodeChecks, framelessEntry);
+      const key = outcome && outcome.deopt
+        ? `deopt:${outcome.reason || "?"}${outcome.transient ? " (transient)" : ""}`
+        : outcome && outcome.returned ? "returned" : "value";
+      row.outcomes[key] = (row.outcomes[key] || 0) + 1;
+      return outcome;
+    } : function (
       frame, thread, helpers, initialBytecodeChecks, framelessEntry,
     ) {
       return frame.pc === 0 || fast.jvmHasStructuredContinuation?.(frame)
@@ -8625,6 +8661,9 @@ class JitCompiler {
       noThrow: true,
       inlineBody: generated.jvmStructuredRecursiveArrayPartitionCheckedLeaf
         ? null : generated.jvmCheckedLeafInlineBody || null,
+      // A caller that inserts that body lexically emits the callee's own
+      // statements, so it must bind the link records those statements name.
+      linkRecordCaptures: generated.jvmStructuredLinkRecordCaptures || null,
       captures: typeof capturedBody === "function" &&
         Array.isArray(capturedPlan?.captures)
         ? capturedPlan.captures : [],

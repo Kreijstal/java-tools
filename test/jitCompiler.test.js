@@ -9490,8 +9490,13 @@ public class ScalarFeatureHarness {
     '.cell.value /* staticBias:I */'),
   'direct static access reads the live value cell of the canonical field map');
   t.ok(structured.generated.jvmStructuredSource.includes(
-    'structuredSsa.classInitializationGuards'),
+    'ssaLinkClassGuard'),
   'structured entry uses an epoch-keyed class-initialization proof');
+  t.ok(Object.entries(
+    structured.generated.jvmStructuredLinkRecordCaptures || {})
+    .some(([name, record]) => name.startsWith('ssaLinkClassGuard') &&
+      record && Array.isArray(record.owners)),
+  'the guard record is bound once as a capture, not reloaded per call');
   t.notOk(structured.generated.jvmStructuredSource.includes(
     'classInitializationState.get('),
   'the hot structured entry does not repeat class-state map lookups');

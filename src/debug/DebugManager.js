@@ -13,6 +13,12 @@ class DebugManager {
     // in any method, so existing callers are unaffected.
     this.strictBreakpointLocations = new Map();
     this.jitDeoptedClasses = new Set();
+    // `jitDeoptedClasses.size`, mirrored as a plain field. Generated call
+    // entries read it once per call to skip the set lookup in the common case
+    // where the debugger has deoptimized nothing; a runtime that does not
+    // maintain the field simply leaves the comparison false and performs the
+    // original membership test.
+    this.jitDeoptedClassCount = 0;
   }
 
   enable() {
@@ -87,6 +93,7 @@ class DebugManager {
       classNames.add(location.className);
       this.breakpointLocations.set(pc, classNames);
       this.jitDeoptedClasses.add(location.className);
+      this.jitDeoptedClassCount = this.jitDeoptedClasses.size;
     }
   }
 
@@ -112,6 +119,7 @@ class DebugManager {
     this.breakpointLocations.clear();
     this.strictBreakpointLocations.clear();
     this.jitDeoptedClasses.clear();
+    this.jitDeoptedClassCount = 0;
   }
 
   rebuildJitDeoptedClasses() {
@@ -121,6 +129,7 @@ class DebugManager {
         this.jitDeoptedClasses.add(className);
       }
     }
+    this.jitDeoptedClassCount = this.jitDeoptedClasses.size;
   }
 
   isClassJitDeopted(className) {

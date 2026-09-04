@@ -471,8 +471,8 @@ function isPartsWordCharacter(character) {
       character === "_" || character === "$");
 }
 
-function partsWriteImpureCall(parts) {
-  const skeleton = partsSkeleton(parts);
+function partsWriteImpureCall(parts, builtSkeleton = null) {
+  const skeleton = builtSkeleton === null ? partsSkeleton(parts) : builtSkeleton;
   if (skeleton.includes("helpers.")) return true;
   let position = skeleton.indexOf("new");
   while (position >= 0) {
@@ -486,8 +486,8 @@ function partsWriteImpureCall(parts) {
 // The ambient names a statement mentions. They are declared by the tier's
 // outermost scope rather than by any statement, so they are not operands; an
 // outlined unit still has to receive them.
-function partsAmbientNames(parts) {
-  const skeleton = partsSkeleton(parts);
+function partsAmbientNames(parts, builtSkeleton = null) {
+  const skeleton = builtSkeleton === null ? partsSkeleton(parts) : builtSkeleton;
   const found = [];
   for (let index = 0; index < AMBIENT_GENERATED_NAMES.length; index += 1) {
     const name = AMBIENT_GENERATED_NAMES[index];
@@ -709,24 +709,24 @@ function partsContinuesBlock(parts) {
 
 // Whether the statement the emitter wrote is a conditional that opens a
 // block: `if (<condition>) {`.
-function partsOpenCondition(parts) {
-  const skeleton = partsSkeleton(parts);
+function partsOpenCondition(parts, builtSkeleton = null) {
+  const skeleton = builtSkeleton === null ? partsSkeleton(parts) : builtSkeleton;
   return skeleton.trimStart().startsWith("if (") && skeleton.endsWith(") {");
 }
 
 // Whether the emitter opened a `try` or wrote a `throw` in this statement.
-function partsWriteThrowOrTry(parts) {
-  const skeleton = partsSkeleton(parts);
+function partsWriteThrowOrTry(parts, builtSkeleton = null) {
+  const skeleton = builtSkeleton === null ? partsSkeleton(parts) : builtSkeleton;
   return skeleton.includes("throw ") || skeleton.includes("try {");
 }
 
-function partsWriteDivision(parts) {
-  const skeleton = partsSkeleton(parts);
+function partsWriteDivision(parts, builtSkeleton = null) {
+  const skeleton = builtSkeleton === null ? partsSkeleton(parts) : builtSkeleton;
   return skeleton.includes(" / ") || skeleton.includes(" % ");
 }
 
-function partsWriteIndex(parts) {
-  const skeleton = partsSkeleton(parts);
+function partsWriteIndex(parts, builtSkeleton = null) {
+  const skeleton = builtSkeleton === null ? partsSkeleton(parts) : builtSkeleton;
   let open = -1;
   for (let index = 0; index < skeleton.length; index += 1) {
     const character = skeleton[index];
@@ -1237,6 +1237,8 @@ class JvmSsaBlockRenderer {
     this.guardedBooleanMethodCount = 0;
     this.guardedBooleanSiteCount = 0;
     this.guardedBooleanFallbackCount = 0;
+    this.continuationPcMismatchCount = 0;
+    this.continuationBytecodeCheckCount = 0;
     this.fieldBackedArrayContinuationFallbackCount = 0;
     this.restoredDirectExceptionFrameCount = 0;
     this.restoringDirectRunCount = 0;
@@ -1976,22 +1978,35 @@ class JvmSsaBlockRenderer {
       // names and contribute no operator, bracket or keyword -- and they are
       // what the propagation and dead-declaration passes ask about.
       const subject = record.exprParts || parts;
-      record.pure = !partsWriteImpureCall(subject);
-      record.division = partsWriteDivision(subject);
-      record.indexed = partsWriteIndex(subject);
+      // Every predicate below reads the same blanked-operand skeleton, and
+      // building it is linear in the statement's text. Build one per parts
+      // array and hand it to each of them: the emitters call this once per
+      // emitted statement, so a rebuild per predicate was eight passes over
+      // the same characters. A sampled GeoBlox logo-to-menu boot spends 15%
+      // of its wall time in JS codegen, and `recordStatement` carried the
+      // largest single self-time share of it.
+      const partsSkeletonText = partsSkeleton(parts);
+      const subjectSkeleton = subject === parts
+        ? partsSkeletonText : partsSkeleton(subject);
+      record.pure = !partsWriteImpureCall(subject, subjectSkeleton);
+      record.division = partsWriteDivision(subject, subjectSkeleton);
+      record.indexed = partsWriteIndex(subject, subjectSkeleton);
       record.rawArrayLoad = partsLoadEntryArrayElement(
         subject, entryArrayDataNames);
-      record.throwsOrTries = partsWriteThrowOrTry(parts);
-      record.conditional = partsOpenCondition(parts);
+      record.throwsOrTries = partsWriteThrowOrTry(parts, partsSkeletonText);
+      record.conditional = partsOpenCondition(parts, partsSkeletonText);
       // `safePointBudget` is ambient rather than an operand, so the entry
       // scaffold's sweep asks the statement whether it mentions the budget.
       record.usesSafePointBudget =
-        partsSkeleton(parts).includes("safePointBudget");
+        partsSkeletonText.includes("safePointBudget");
       // `helpers.returnVoid()` is late-bound to a captured constant before a
       // capture-free body is created, so it is not a runtime helper call.
-      record.callsRuntimeHelper = partsSkeleton(parts)
-        .split("helpers.returnVoid()").join("").includes("helpers.");
-      record.ambientReads = partsAmbientNames(parts);
+      // The split/join only has to run for a statement that mentions a helper
+      // at all; most statements mention none and answer on the `includes`.
+      record.callsRuntimeHelper = partsSkeletonText.includes("helpers.") &&
+        partsSkeletonText
+          .split("helpers.returnVoid()").join("").includes("helpers.");
+      record.ambientReads = partsAmbientNames(parts, partsSkeletonText);
       // The lexical nesting this statement opens or closes. It is a property
       // of the statement the emitter built, measured on the literal chunks it
       // wrote itself: operand references are names and never contain braces.
@@ -2658,6 +2673,34 @@ class JvmSsaBlockRenderer {
         cache?.[`specializedValue${position}`];
       return name;
     };
+    // Runtime records a generated body would otherwise reload through
+    // `helpers` on every call. A field site, a sync call site and a class
+    // initialization guard are each registered once and never replaced, so
+    // the container lookup is invariant for the life of the body while their
+    // mutable fields (`staticTarget`, `fastPositional`) are not. Bind the
+    // record itself as a capture and keep only those fields on the per-call
+    // path: a three-load chain per call becomes one closure read, and linking
+    // and re-resolution stay exactly as observable as before. Capture names
+    // carry the global site id, so two bodies composed into one module bind
+    // the same record under the same name.
+    const linkRecordCaptures = {};
+    const capturedLinkRecord = (name, value) => {
+      linkRecordCaptures[named(name)] = value;
+      return name;
+    };
+    const capturedFieldSite = (site) =>
+      capturedLinkRecord(`ssaLinkFieldSite${site}`, this.jit.fieldSites[site]);
+    const capturedSyncCallSite = (id) =>
+      capturedLinkRecord(`ssaLinkCallSite${id}`, this.jit.syncCallSites[id]);
+    const capturedClassInitializationGuard = (id) =>
+      capturedLinkRecord(`ssaLinkClassGuard${id}`,
+        this.classInitializationGuards[id]);
+    // A checked leaf inserted lexically brings its own statements into this
+    // body, so this body binds the callee's link records as well as its own.
+    for (const site of callSites.values()) {
+      Object.assign(linkRecordCaptures,
+        site.directCheckedLeaf?.linkRecordCaptures || {});
+    }
     const continuationFallbacks = new Map();
     const directPositionalLineAlternatives = new Map();
     const directEntryStaticReadFallbacks = new Map();
@@ -2959,6 +3002,9 @@ class JvmSsaBlockRenderer {
         };
         entryStaticReadCaches.set(location, cache);
         lazy.entryReadCache = cache;
+        // Only the lazy site that owns a cache is named by the cache's
+        // declarations; sites that merely share it never appear again.
+        lazy.referenced = true;
       }
     }
     const hasNullableStaticArrayControl =
@@ -3331,11 +3377,21 @@ class JvmSsaBlockRenderer {
         op === "aload" && Number(instruction?.arg) === 0;
     };
     const assignedReferenceLocals = new Set();
+    // Method-wide integer local writes. A slot absent from this set holds the
+    // same value at every program point as it did at method entry, which is
+    // what lets an entry-emitted guard name it directly.
+    const assignedIntegerLocals = new Set();
     for (const item of items) {
       const instruction = item?.instruction;
       const op = opOf(instruction);
       if (/^astore(?:_[0-3])?$/.test(op)) {
         assignedReferenceLocals.add(localIndex(instruction, op));
+      }
+      if (/^istore(?:_[0-3])?$/.test(op)) {
+        assignedIntegerLocals.add(localIndex(instruction, op));
+      }
+      if (op === "iinc") {
+        assignedIntegerLocals.add(Number(instruction.varnum ?? instruction.arg));
       }
     }
     const directlyLoadsEntryReference = (index) => {
@@ -5570,6 +5626,7 @@ class JvmSsaBlockRenderer {
               const cache = lazy.entryReadCache;
               const emitted = cache &&
                   this.directEntryStaticLinkingEnabled ? [] : lines;
+              if (emitted === lines) lazy.referenced = true;
               const prefix = cache ? "  " : "";
               emitted.push(letDecl(out));
               if (cache) {
@@ -5592,7 +5649,7 @@ class JvmSsaBlockRenderer {
                 returnStmt(`${prefix}    `,
                   e`{ deopt: true, transient: true, reason: 'class initialization in structured SSA getstatic' }`),
                 st`${prefix}  }`,
-                st`${prefix}  ${lazy.variable} = helpers.fieldSites[${site}].staticTarget;`,
+                st`${prefix}  ${lazy.variable} = ${capturedFieldSite(site)}.staticTarget;`,
                 st`${prefix}  if (${lazy.variable}) helpers.structuredSsa.lazyStaticTargetLinkCount += 1;`,
                 st`${prefix}}`);
               if (cache) {
@@ -6699,6 +6756,17 @@ class JvmSsaBlockRenderer {
           e`${object}.fields[${cache.denseSlot}] : `,
           e`${object}.fields[${JSON.stringify(cache.directKey)}])`)
         : e`${object}.fields[${JSON.stringify(cache.directKey)}]`;
+    // Several eager caches usually read the same receiver back to back. The
+    // storage container and its dense/sparse shape are one fact about that
+    // object, so read them once for the group instead of re-loading `.fields`
+    // and re-running Array.isArray for every field.
+    const hoistedFieldValueExpression = (cache, storage, dense) =>
+      Number.isInteger(cache.denseSlot)
+        ? exprConcat(
+          e`(${dense} ? `,
+          e`${storage}[${cache.denseSlot}] : `,
+          e`${storage}[${JSON.stringify(cache.directKey)}])`)
+        : e`${storage}[${JSON.stringify(cache.directKey)}]`;
     const guardedDirectFieldReadExpression = (cache, object) => exprConcat(
       e`(${object}.fields && `,
       e`(Array.isArray(${object}.fields) || `,
@@ -6775,7 +6843,7 @@ class JvmSsaBlockRenderer {
             e`${lazy.variable}.fields.get(${lazy.variable}.key) : `,
             e`${lazy.variable}.fields[${lazy.variable}.key]`);
           return [
-            st`${lazy.variable} = helpers.fieldSites[${lazy.site}].staticTarget;`,
+            st`${lazy.variable} = ${capturedFieldSite(lazy.site)}.staticTarget;`,
             st`${cache.valid} = Boolean(${lazy.variable});`,
             stmt(e`${cache.value} = ${cache.valid} ? ${read} : undefined;`),
             ...(cache.data
@@ -6816,6 +6884,61 @@ class JvmSsaBlockRenderer {
         return Number.isInteger(number) ? number | 0 : null;
       }
       return null;
+    };
+    // A preheader value computed only from integer constants and entry
+    // scalars that the method never writes holds the same value at method
+    // entry as it does at the preheader, so an entry-emitted checked-leaf
+    // guard may name it. The candidate run is simulated as a small stack
+    // machine over pure integer bytecodes; a call, a field read, or a
+    // division that can throw is simply not in the table, so the run fails to
+    // reduce to a single value and the caller keeps the literal-only path.
+    const entryPureIntegerScalars = new Set(
+      ["boolean", "byte", "char", "short", "int"]);
+    const entryPureIntegerBinaries = new Map([
+      // Java int arithmetic wraps, so the widening JS operators are narrowed
+      // back to int32 explicitly; the bitwise operators already are.
+      ["iadd", (left, right) => e`(${left} + ${right} | 0)`],
+      ["isub", (left, right) => e`(${left} - ${right} | 0)`],
+      ["imul", (left, right) => e`Math.imul(${left}, ${right})`],
+      ["iand", (left, right) => e`(${left} & ${right})`],
+      ["ior", (left, right) => e`(${left} | ${right})`],
+      ["ixor", (left, right) => e`(${left} ^ ${right})`],
+      ["ishl", (left, right) => e`(${left} << ${right})`],
+      ["ishr", (left, right) => e`(${left} >> ${right})`],
+      ["iushr", (left, right) => e`(${left} >>> ${right} | 0)`],
+    ]);
+    const entryPureIntegerExpression = (instructions) => {
+      const stack = [];
+      for (const instruction of instructions) {
+        const op = opOf(instruction);
+        const constant = constantInstructionValue(instruction);
+        if (constant !== null) {
+          stack.push(operand(e`${constant}`));
+          continue;
+        }
+        if (/^iload(?:_[0-3])?$/.test(op)) {
+          const slot = localIndex(instruction, op);
+          if (!Number.isInteger(slot) ||
+              !entryPureIntegerScalars.has(entryScalarKinds.get(slot)) ||
+              assignedIntegerLocals.has(slot)) return null;
+          stack.push(operand(e`${localName(slot)}`));
+          continue;
+        }
+        if (op === "ineg") {
+          if (stack.length < 1) return null;
+          stack.push(operand(e`(-${stack.pop()} | 0)`));
+          continue;
+        }
+        const binary = entryPureIntegerBinaries.get(op);
+        if (!binary || stack.length < 2) return null;
+        const right = stack.pop();
+        const left = stack.pop();
+        stack.push(operand(binary(left, right)));
+      }
+      // Any instruction outside the table ends the run, so a simulation that
+      // never underflowed consumed only what the run itself pushed: the top
+      // of the stack is exactly the value the following store writes.
+      return stack.length ? stack[stack.length - 1] : null;
     };
     const countedLoopInfo = (node) => {
       if (!node || node.t !== "loop") return null;
@@ -6940,6 +7063,11 @@ class JvmSsaBlockRenderer {
       }
 
       let initial = null;
+      // Set when the induction variable starts from a runtime value that is
+      // nonetheless already computable at method entry, so a guard emitted
+      // before the body runs can still bound the trip count. `initial` stays
+      // literal-only; every existing consumer of it is unaffected.
+      let initialExpression = null;
       const preheaderInsns = cfg.blocks[preheaders[0]].insns;
       for (let position = 1; position < preheaderInsns.length; position += 1) {
         const store = items[preheaderInsns[position]]?.instruction;
@@ -6948,6 +7076,16 @@ class JvmSsaBlockRenderer {
             localIndex(store, storeOp) !== slot) continue;
         initial = constantInstructionValue(
           items[preheaderInsns[position - 1]]?.instruction);
+        const run = [];
+        for (let scan = position - 1; scan >= 0; scan -= 1) {
+          const instruction = items[preheaderInsns[scan]]?.instruction;
+          const op = opOf(instruction);
+          if (constantInstructionValue(instruction) === null &&
+              !/^iload(?:_[0-3])?$/.test(op) && op !== "ineg" &&
+              !entryPureIntegerBinaries.has(op)) break;
+          run.unshift(instruction);
+        }
+        initialExpression = entryPureIntegerExpression(run);
       }
       let increment = null;
       let writes = 0;
@@ -7006,6 +7144,7 @@ class JvmSsaBlockRenderer {
           increment <= 0) return null;
       return {
         header, slot, bound, boundSlot, boundExpression, increment, initial,
+        initialExpression,
         loopBlocks, writtenSlots, backedges, preheader: preheaders[0],
         bodyOnTaken,
       };
@@ -8482,6 +8621,10 @@ class JvmSsaBlockRenderer {
       let condition;
       let preamble = [];
       let declarationHeader = info.header;
+      // Set by the affine branches whose condition is widened to the whole
+      // [min, max] offset span used against this array and index local, so a
+      // later pass can wire the sibling accesses to this one guard.
+      let coveredOffsets = null;
       if (candidate.kind === "indirect-entry-array") {
         const matchingStore = {
           iaload: "iastore",
@@ -8567,6 +8710,16 @@ class JvmSsaBlockRenderer {
         }
       } else if (candidate.kind === "affine-local") {
         const indexSlot = candidate.slots[0];
+        // A start value the method can already compute from never-written
+        // entry scalars can be named at an enclosing loop header exactly as a
+        // literal can, which is what a hoisted (and therefore trusted) range
+        // guard needs. The bound must be method-invariant for the same
+        // reason: the hoisted guard is evaluated once, outside this loop.
+        const entryPureStart = !Number.isInteger(info.initial) &&
+          info.initialExpression !== null &&
+          (info.boundSlot === null ||
+            !assignedIntegerLocals.has(info.boundSlot))
+          ? info.initialExpression : null;
         const directCountedInduction = indexSlot === info.slot;
         const step = directCountedInduction
           ? String(info.increment) : affineLocalStep(info, indexSlot);
@@ -8596,7 +8749,8 @@ class JvmSsaBlockRenderer {
           ? outermostPostDecrementLoop : null;
         let countedOuterSkipSlot = null;
         if (!info.postDecrement && !cyclic && step !== null &&
-            outermostCountedLoop && info.initial === 0) {
+            outermostCountedLoop &&
+            (info.initial === 0 || entryPureStart !== null)) {
           const outerOnlyWrites = [];
           for (const loopBlock of outermostCountedLoop.loopBlocks) {
             if (info.loopBlocks.has(loopBlock)) continue;
@@ -8642,7 +8796,9 @@ class JvmSsaBlockRenderer {
           // start it must not be hoisted across an enclosing loop.
           const literalInitial = Number.isInteger(info.initial);
           const inductionStart = literalInitial
-            ? e`${info.initial}` : e`${localName(info.slot)}`;
+            ? e`${info.initial}`
+            : entryPureStart !== null
+              ? e`${entryPureStart}` : e`${localName(info.slot)}`;
           const remaining =
             e`(${info.boundExpression} - ${inductionStart})`;
           const trips = exprConcat(e`(${remaining} <= 0 ? 0 : `,
@@ -8660,7 +8816,13 @@ class JvmSsaBlockRenderer {
             e`${last} >= ${first} && ${last} <= 2147483647 && `,
             runtimeTerminationGuard,
             e`${last} < ${candidate.arrayData}.length))`));
-          if (literalInitial && outermostCountedLoop && info.initial === 0) {
+          coveredOffsets = {
+            min: minimumAffineOffset, max: maximumAffineOffset,
+            blocks: info.loopBlocks,
+          };
+          if (outermostCountedLoop &&
+              (literalInitial && info.initial === 0 ||
+                entryPureStart !== null)) {
             declarationHeader = outermostCountedLoop.header;
           }
         } else if (packed) {
@@ -8676,6 +8838,10 @@ class JvmSsaBlockRenderer {
             e`${runtimeCoarseTripLimit} && ${first} >= 0 && ${end} >= `,
             e`${first} && ${end} <= ${candidate.arrayData}.length && `,
             e`${end} <= 2147483647))`));
+          coveredOffsets = {
+            min: minimumAffineOffset, max: maximumAffineOffset,
+            blocks: info.loopBlocks,
+          };
         } else if (carried) {
           const trips = sharedCountedTrips(info, preamble);
           const first = e`${minimumAffineOffset}`;
@@ -8687,6 +8853,10 @@ class JvmSsaBlockRenderer {
             e`${runtimeCoarseTripLimit} && ${first} >= 0 && ${last} >= `,
             e`${first} && ${last} < ${candidate.arrayData}.length && `,
             e`${last} <= 2147483647))`));
+          coveredOffsets = {
+            min: minimumAffineOffset, max: maximumAffineOffset,
+            blocks: info.loopBlocks,
+          };
         } else if (info.postDecrement && step !== null) {
           const trips = e`Math.max(0, ${localName(info.slot)})`;
           const last = e`(${localName(indexSlot)} + (${trips} - 1) * ${
@@ -8744,8 +8914,12 @@ class JvmSsaBlockRenderer {
             e`${outermostCountedLoop.boundExpression} ? 0 : `,
             e`(${outermostCountedLoop.boundExpression} - `,
             e`${localName(outermostCountedLoop.slot)}))`);
-          const innerTripsExpression =
-            e`Math.max(0, ${info.boundExpression})`;
+          // `Math.max(0, bound)` is the zero-start specialization of the
+          // general trip form; a runtime start needs the general one.
+          const innerTripsExpression = entryPureStart === null
+            ? e`Math.max(0, ${info.boundExpression})`
+            : e`(${entryPureStart} >= ${info.boundExpression} ? 0 : ${
+              info.boundExpression} - ${entryPureStart})`;
           const outerTrips = named(`${prefix}OuterTrips`);
           const innerTrips = named(`${prefix}InnerTrips`);
           const rowStride = named(`${prefix}RowStride`);
@@ -8757,7 +8931,8 @@ class JvmSsaBlockRenderer {
               localName(countedOuterSkipSlot)}`, {pure: true}),
             constDecl(last, exprConcat(
               e`${localName(indexSlot)} + (${outerTrips} - 1) * `,
-              e`${rowStride} + (${innerTrips} - 1) * ${stepExpression}`),
+              e`${rowStride} + (${innerTrips} - 1) * ${stepExpression} + `,
+              e`${maximumAffineOffset}`),
             {pure: true}),
           );
           condition = operand(exprConcat(
@@ -8766,8 +8941,13 @@ class JvmSsaBlockRenderer {
             e`${innerTrips} <= ${runtimeCoarseTripLimit} && ${
               stepExpression} >= 0 && `,
             e`${localName(countedOuterSkipSlot)} >= 0 && `,
-            e`${localName(indexSlot)} >= 0 && ${last} < `,
+            e`${localName(indexSlot)} + ${minimumAffineOffset} >= 0 && `,
+            e`${last} < `,
             e`${candidate.arrayData}.length && ${last} <= 2147483647))`));
+          coveredOffsets = {
+            min: minimumAffineOffset, max: maximumAffineOffset,
+            blocks: info.loopBlocks,
+          };
           declarationHeader = outermostCountedLoop.header;
         } else if (postDecrementOuter && writesInPostDecrementOuter === 1) {
           const outerTrips =
@@ -8950,11 +9130,13 @@ class JvmSsaBlockRenderer {
           plan.lines = substituteInLines(plan.lines,
             new Map([[candidate.marker, [{ref: existingGuard}]]]));
         }
+        if (coveredOffsets) candidate.coveredOffsets = coveredOffsets;
         coalescedArrayRangeGuardCount += 1;
         continue;
       }
       arrayRangeGuardByCondition.set(guardKey, variable);
       candidate.rangeGuardVariable = variable;
+      if (coveredOffsets) candidate.coveredOffsets = coveredOffsets;
       const declarations =
         arrayRangeGuardDeclarations.get(declarationHeader) || [];
       declarations.push(...preamble.map((line) =>
@@ -9011,6 +9193,30 @@ class JvmSsaBlockRenderer {
         if (!plan?.lines) continue;
         plan.lines = substituteInLines(plan.lines,
           new Map([[candidate.marker, [{ref: variable}]]]));
+      }
+    }
+    // A widened guard already proves every access it collected offsets from.
+    // Those siblings are skipped above precisely because the base candidate
+    // covers them, so wire them to its guard instead of leaving a per-access
+    // check that no proof will ever discharge.
+    for (const candidate of arrayRangeCheckCandidates) {
+      if (candidate.rangeGuardVariable || candidate.kind !== "affine-local" ||
+          !Number.isInteger(candidate.slots?.[0])) continue;
+      const offset = candidate.offset || 0;
+      const base = arrayRangeCheckCandidates.find((other) =>
+        other !== candidate && other.kind === "affine-local" &&
+        other.rangeGuardVariable && other.coveredOffsets &&
+        other.arrayData === candidate.arrayData &&
+        other.slots?.[0] === candidate.slots[0] &&
+        other.coveredOffsets.blocks.has(candidate.block) &&
+        offset >= other.coveredOffsets.min &&
+        offset <= other.coveredOffsets.max);
+      if (!base) continue;
+      candidate.rangeGuardVariable = base.rangeGuardVariable;
+      for (const plan of plans) {
+        if (!plan?.lines) continue;
+        plan.lines = substituteInLines(plan.lines,
+          new Map([[candidate.marker, [{ref: base.rangeGuardVariable}]]]));
       }
     }
     if (typeof process !== "undefined" &&
@@ -9837,7 +10043,11 @@ class JvmSsaBlockRenderer {
         const fallback = continuationFallbacks.get(line.trim());
         if (!fallback) return [line];
         const prefix = line.slice(0, line.length - line.trimStart().length);
-        return (continuationMode ? fallback.continuation : fallback.ordinary)
+        // A site may decline to offer a distinct continuation arm; it then
+        // keeps the ordinary lines in both modes.
+        return (continuationMode
+          ? fallback.continuation || fallback.ordinary
+          : fallback.ordinary)
           .map((fallbackLine) => `${prefix}${fallbackLine}`);
       });
     const specializeArrayRangeGuardedStores = (lines, guardVariables) => {
@@ -10304,7 +10514,9 @@ class JvmSsaBlockRenderer {
           if (!fallback) return [line];
           const selected = checkedLeafOnly && fallback.checkedLeaf
             ? fallback.checkedLeaf
-            : continuationMode ? fallback.continuation : fallback.ordinary;
+            : continuationMode
+              ? fallback.continuation || fallback.ordinary
+              : fallback.ordinary;
           return expandLines(selected);
         });
         const lines = expandLines(specializeDeferredStaticArrayAccessLines(
@@ -10824,8 +11036,7 @@ class JvmSsaBlockRenderer {
       ? this.registerClassInitializationGuard(directStaticOwners) : -1;
     const staticInitializationGuardDeclaration = staticInitializationGuardId >= 0
       ? constDecl(named("ssaClassInitializationGuard"),
-        e`helpers.structuredSsa.classInitializationGuards[${
-          staticInitializationGuardId}]`)
+        e`${capturedClassInitializationGuard(staticInitializationGuardId)}`)
       : null;
     const staticEntryGuard = staticInitializationGuardId >= 0
       ? returnStmt(exprConcat(
@@ -10841,9 +11052,15 @@ class JvmSsaBlockRenderer {
       .filter((direct) => !direct.entryReadCache)
       .map((direct) => constDecl(named(direct.variable),
         e`helpers.directStaticTargets[${direct.targetId}].fields`));
-    const lazyStaticDeclarations = [...lazyStaticSites.values()].map((lazy) =>
-      letDecl(named(lazy.variable),
-        e`helpers.fieldSites[${lazy.site}].staticTarget`));
+    // Several getstatic bytecodes usually read the same field. The first one
+    // owns the entry read cache and the rest share it, so their own target
+    // declarations are never named again: emitting them costs one property
+    // load per call on every entry, on a body that may be called per pixel.
+    const lazyStaticDeclarations = [...lazyStaticSites.values()]
+      .filter((lazy) => lazy.referenced)
+      .map((lazy) =>
+        letDecl(named(lazy.variable),
+          e`${capturedFieldSite(lazy.site)}.staticTarget`));
     const entryStaticReadDeclarations =
       [...entryStaticReadCaches.values()].flatMap((cache) => {
         if (cache.lazy) {
@@ -10927,7 +11144,7 @@ class JvmSsaBlockRenderer {
             returnStmt(
               e`  if (${cache.value} === helpers.staticDeopt()) { `,
               CHECKED_LEAF_BAIL_VALUE, " }"),
-            st`  ${lazy.variable} = helpers.fieldSites[${lazy.site}].staticTarget;`,
+            st`  ${lazy.variable} = ${capturedFieldSite(lazy.site)}.staticTarget;`,
             stmt(exprConcat(e`  if (${lazy.variable}) `,
               e`helpers.structuredSsa.lazyStaticTargetLinkCount += 1;`)),
             blockEnd(""),
@@ -11018,7 +11235,7 @@ class JvmSsaBlockRenderer {
         if (forceCanonicalCalls) {
           lines.push(
             declare("const", positionalCallSiteVariable(index),
-              e`helpers.syncCallSites[${site.id}]`),
+              e`${capturedSyncCallSite(site.id)}`),
             ...captureLines,
             declare("const", positionalCallLateLinkVariable(index), "false"),
             declare("let", positionalCallTargetVariable(index), "null"),
@@ -11039,13 +11256,17 @@ class JvmSsaBlockRenderer {
         } else {
           lines.push(
             declare("const", positionalCallSiteVariable(index),
-              e`helpers.syncCallSites[${site.id}]`),
+              e`${capturedSyncCallSite(site.id)}`),
             declare("const", positionalCallLateLinkVariable(index), "true"),
             declare("let", positionalCallTargetVariable(index), exprConcat(
               e`!helpers.profileMethods && `,
               e`${positionalCallSiteVariable(index)} && `,
               e`${positionalCallSiteVariable(index)}.fastPositional && `,
               e`(${positionalCallSiteVariable(index)}.fastPositional.debugGuarded || `,
+              // No class has been deoptimized for the debugger, so the set
+              // membership test cannot succeed: skip the call and the string
+              // hash it performs on the per-call entry path.
+              e`helpers.jvm.debugManager.jitDeoptedClassCount === 0 || `,
               e`!helpers.jvm.debugManager.isClassJitDeopted(`,
               e`${positionalCallSiteVariable(index)}.fastPositional.lookupClass)) `,
               e`? ${positionalCallSiteVariable(index)}.fastPositional : null`)),
@@ -11207,11 +11428,19 @@ class JvmSsaBlockRenderer {
             localName(slot)} === undefined || `,
           e`!${localName(slot)}.fields) `), CHECKED_LEAF_BAIL_VALUE),
       );
+      // The bail above already proved the container exists, and nothing
+      // between these reads can replace it.
+      const storage = named(`ssaFieldStorage${slot}`);
+      const dense = named(`ssaFieldStorageDense${slot}`);
+      restoringDirectFieldCacheInitializations.push(
+        constDecl(storage, e`${localName(slot)}.fields`),
+        constDecl(dense, e`Array.isArray(${storage})`),
+      );
       for (const cache of caches) {
         restoringDirectFieldCacheInitializations.push(
           stmt(e`${cache.object} = ${localName(slot)};`),
           stmt(exprConcat(e`${cache.value} = `,
-            e`${directFieldValueExpression(cache, localName(slot))};`)),
+            e`${hoistedFieldValueExpression(cache, storage, dense)};`)),
         );
       }
       // allocateObject may leave never-assigned Java fields absent from the
@@ -12425,8 +12654,17 @@ class JvmSsaBlockRenderer {
             return null;
           }
         }
+        // Every tier of this method binds the same invariant link records, so
+        // the emitters that reference one never have to thread the capture
+        // through their own construction site. A tier's own captures win on
+        // name collision; the link names carry global site ids and cannot
+        // collide with them.
+        const [ownerOverride = null, asynchronous = false, generator = false,
+          captures = null, hoistedSource = null] = options;
         return this.jit.createGeneratedFunction(
-          method, tier, parameters, source, ...options);
+          method, tier, parameters, source, ownerOverride, asynchronous,
+          generator, {...linkRecordCaptures, ...(captures || {})},
+          hoistedSource);
       };
       const generatedBody = createStructuredFunction("structured-ssa",
         ["frame", "thread", "helpers", "initialBytecodeChecks", "framelessEntry"], generatedSource,
@@ -12481,8 +12719,7 @@ class JvmSsaBlockRenderer {
           named("ssaDirectClassInitializationGuard");
         const directInitializationGuardDeclaration = constDecl(
           directGuardVariable,
-          e`helpers.structuredSsa.classInitializationGuards[${
-            directInitializationGuardId}]`);
+          e`${capturedClassInitializationGuard(directInitializationGuardId)}`);
         const directInitializationCondition = operand(exprConcat(
           e`((${directGuardVariable}.classEpoch !== `,
           e`(helpers.jvm.classEpoch || 0) || `,
@@ -12669,8 +12906,8 @@ class JvmSsaBlockRenderer {
           named("ssaRestoringClassInitializationGuard");
         const restoringInitializationGuardDeclaration = constDecl(
           restoringGuardVariable,
-          e`helpers.structuredSsa.classInitializationGuards[${
-            restoringInitializationGuardId}]`);
+          e`${capturedClassInitializationGuard(
+            restoringInitializationGuardId)}`);
         const restoringInitializationCondition = operand(exprConcat(
           e`((${restoringGuardVariable}.classEpoch !== `,
           e`(helpers.jvm.classEpoch || 0) || `,
@@ -12760,8 +12997,15 @@ class JvmSsaBlockRenderer {
           this.loopInlineRestoringSpillsEnabled &&
           structured.loopHeaders.size > 0 && spillSlots.length <= 48 &&
           restoringSpillCallCount > 0 && !inlinedRestoringSpills;
-        captureFreeRestoringSpills = structured.loopHeaders.size > 0 &&
-          (inlinedRestoringSpills || outlinedCaptureFreeRestoringSpills);
+        // The capture-free restoration helper takes its values as an
+        // argument array, so nothing escapes into a closure and an acyclic
+        // body has the same reason to use it as a looping one: duplicating
+        // the frame-rebuild statements at every cold spill site is what makes
+        // a small guest method render as tens of kilobytes of JavaScript, and
+        // the host JIT declines to inline a callee that large into its hot
+        // caller.
+        captureFreeRestoringSpills =
+          inlinedRestoringSpills || outlinedCaptureFreeRestoringSpills;
         const restoringRenderedWithSpills = captureFreeRestoringSpills
           ? restoringRendered : inlineMaterializeCalls(restoringRendered);
         // Entry arguments are also ordinary JVM locals.  Do not mention a
@@ -12840,7 +13084,13 @@ class JvmSsaBlockRenderer {
               ];
             }
             if (record?.kind !== "materialize") return [line];
-            if (record.unwind) {
+            // The locals-free unwind frame is a property of looping bodies,
+            // whose cold sites this rewriter has always owned. Acyclic bodies
+            // reach it only because outlining now applies to them too, and
+            // they previously materialized full locals inline; keep that
+            // observable Frame state rather than silently dropping locals as
+            // a side effect of a code-size change.
+            if (record.unwind && structured.loopHeaders.size > 0) {
               return [
                 `${prefix}${stmt(exprConcat(
                   e`[frame, locals, stack] = `,
@@ -13172,20 +13422,39 @@ class JvmSsaBlockRenderer {
           countedRegionLoops.length > 1 &&
           countedRegionLoops.length <= 3 &&
           countedRegionLoops.every((info, index) =>
-            info.initial === 0 && info.increment === 1 &&
+            // A start value the method can already compute at entry bounds the
+            // nest just as well as a literal zero. Such a loop's bound must be
+            // invariant method-wide, not merely across the region's loops,
+            // because the entry guard is the only place the trip product is
+            // checked and `CHECKED_LEAF_BAIL_VALUE` returns before the body.
+            (info.initial === 0 ||
+              info.initialExpression !== null &&
+              (info.boundSlot === null ||
+                !assignedIntegerLocals.has(info.boundSlot))) &&
+            info.increment === 1 &&
             (info.boundSlot === null || countedRegionLoops.every((other) =>
               !other.writtenSlots.has(info.boundSlot))) &&
             (index === 0 ||
               countedRegionLoops[index - 1].loopBlocks.has(info.header))) &&
-          arrayRangeCheckCandidates.every((_candidate, index) =>
-            trustedHoistedRangeGuards.has(`ssaArrayRangeGuard${index}`));
+          // Coalesced candidates share the first candidate's guard variable,
+          // so the trust question is about the guard each candidate actually
+          // ended up under -- not about the name its own index would have
+          // produced, which is never declared once the condition is shared.
+          arrayRangeCheckCandidates.every((candidate) =>
+            trustedHoistedRangeGuards.has(candidate.rangeGuardVariable));
         const checkedLeafTripDeclarations = [];
         if (nestedRuntimeCountedRegion) {
           for (const info of countedRegionLoops) {
             checkedLeafCoarseLoopHeaders.add(info.header);
+            // `Math.max(0, bound)` is the specialization of the general trip
+            // form to a zero start; a runtime start needs the general one.
+            const start = info.initial === 0 ? null : info.initialExpression;
             checkedLeafTripDeclarations.push(
               constDecl(named(`ssaCheckedLeafTrips${info.header}`),
-                e`Math.max(0, ${info.boundExpression})`));
+                start === null
+                  ? e`Math.max(0, ${info.boundExpression})`
+                  : e`(${start} >= ${info.boundExpression} ? 0 : ${
+                    info.boundExpression} - ${start})`));
           }
           const tripVariables = countedRegionLoops.map((info) =>
             `ssaCheckedLeafTrips${info.header}`);
@@ -14198,6 +14467,15 @@ class JvmSsaBlockRenderer {
                   helpers.structuredSsa
                     .fieldBackedArrayContinuationFallbackCount += 1;
                 }
+                // Which condition retired the continuation. A retired
+                // continuation is only rebuilt when the frame re-enters at
+                // pc 0, so for a frame that never returns this decides
+                // whether the method runs its fast body again at all.
+                if (continuation.pc !== frame.pc) {
+                  helpers.structuredSsa.continuationPcMismatchCount += 1;
+                } else if (bytecodeChecks) {
+                  helpers.structuredSsa.continuationBytecodeCheckCount += 1;
+                }
                 helpers.skipJitOnce(frame);
                 return {
                   deopt: true, transient: true,
@@ -14267,6 +14545,15 @@ class JvmSsaBlockRenderer {
               if (fieldBackedArrayChanged) {
                 helpers.structuredSsa
                   .fieldBackedArrayContinuationFallbackCount += 1;
+              }
+              // Which condition retired the continuation. A retired
+              // continuation is only rebuilt when the frame re-enters at
+              // pc 0, so for a frame that never returns this decides
+              // whether the method runs its fast body again at all.
+              if (continuation.pc !== frame.pc) {
+                helpers.structuredSsa.continuationPcMismatchCount += 1;
+              } else if (bytecodeChecks) {
+                helpers.structuredSsa.continuationBytecodeCheckCount += 1;
               }
               helpers.skipJitOnce(frame);
               return {
@@ -14528,6 +14815,11 @@ class JvmSsaBlockRenderer {
         {length: regionArgumentCount},
         (_unused, index) => `argument${index}`,
       );
+      // The invariant link records this body's statements name. A consumer
+      // that composes those statements into a module of its own binds them
+      // alongside its own captures; the names carry global site ids, so two
+      // composed bodies agree on both the name and the record behind it.
+      generated.jvmStructuredLinkRecordCaptures = {...linkRecordCaptures};
       generated.jvmStructuredRegionCallSites = [...callSites.values()].map(
         (site) => ({
           id: site.id,
