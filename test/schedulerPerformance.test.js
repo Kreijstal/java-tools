@@ -190,6 +190,97 @@ test('AWT input handlers supersede a continuously runnable frame producer', (t) 
   t.end();
 });
 
+test('a withheld runnable thread ends the frame-producer priority after a bounded wait',
+  async (t) => {
+  const jvm = new JVM({ schedulerStarvationMs: 20 });
+  const producer = { id: 1, status: 'runnable', callStack: new Stack() };
+  const worker = { id: 2, status: 'runnable', callStack: new Stack() };
+  jvm.threads = [producer, worker];
+  jvm.currentThreadIndex = 1;
+  jvm._awtFrameProducerThread = producer;
+
+  t.equal(jvm._prepareSchedulerTick().thread, producer,
+    'the producer keeps its turn while the worker has waited only briefly');
+  jvm._advanceSchedulerThread();
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  t.equal(jvm._prepareSchedulerTick().thread, worker,
+    'a worker withheld past the bound is scheduled instead of the producer');
+  jvm._advanceSchedulerThread();
+  t.equal(jvm._prepareSchedulerTick().thread, producer,
+    'relief is round-robin, so the producer still runs inside the relief turn');
+  t.ok(jvm._schedulerReliefActive, 'relief lasts for the rest of the host turn');
+
+  await jvm._yieldHostTurn();
+  t.notOk(jvm._schedulerReliefActive, 'a new host turn ends the relief');
+  jvm.currentThreadIndex = 1;
+  t.equal(jvm._prepareSchedulerTick().thread, producer,
+    'the turn after a relief turn belongs to the producer even while starved');
+  await jvm._yieldHostTurn();
+  jvm.currentThreadIndex = 1;
+  t.equal(jvm._prepareSchedulerTick().thread, worker,
+    'a still-starved worker gets the next turn: relief alternates with priority');
+
+  jvm._schedulerReliefActive = false;
+  jvm._schedulerReliefCooldown = false;
+  producer.status = 'SLEEPING';
+  jvm.currentThreadIndex = 1;
+  t.equal(jvm._prepareSchedulerTick().thread, worker,
+    'a sleeping producer lets the worker run without relief');
+  t.equal(worker._withheldSince, undefined,
+    'service during the producer\'s own sleep resets the starvation clock');
+  producer.status = 'runnable';
+  jvm.currentThreadIndex = 1;
+  t.equal(jvm._prepareSchedulerTick().thread, producer,
+    'the producer regains priority with a fresh starvation clock');
+  t.end();
+});
+
+test('deterministic clocks keep the frame-producer priority without wall time', (t) => {
+  const jvm = new JVM({ fakeTime: 1000, schedulerStarvationMs: 0 });
+  const producer = { id: 1, status: 'runnable', callStack: new Stack() };
+  const worker = { id: 2, status: 'runnable', callStack: new Stack() };
+  jvm.threads = [producer, worker];
+  jvm.currentThreadIndex = 1;
+  jvm._awtFrameProducerThread = producer;
+  t.equal(jvm._prepareSchedulerTick().thread, producer);
+  jvm._advanceSchedulerThread();
+  t.equal(jvm._prepareSchedulerTick().thread, producer,
+    'a replayable clock never switches to relief');
+  t.end();
+});
+
+test('an exception escaping a helper thread terminates only that thread', (t) => {
+  const jvm = new JVM();
+  const main = { id: 0, status: 'runnable', callStack: new Stack() };
+  const helper = { id: 1, status: 'runnable', callStack: new Stack(),
+    javaThread: { name: 'Audio' } };
+  main.callStack.push({ method: { name: 'run' }, instructions: [], pc: 0 });
+  jvm.threads = [main, helper];
+  const quiet = console.error;
+  const reported = [];
+  console.error = (...values) => reported.push(values[0]);
+  try {
+    jvm.handleException({ type: 'java/lang/ArrayIndexOutOfBoundsException', message: '7' }, -1, helper);
+  } finally {
+    console.error = quiet;
+  }
+  t.equal(helper.status, 'terminated', 'the throwing thread dies');
+  t.equal(main.status, 'runnable', 'the rest of the program keeps running');
+  t.ok(/Exception in thread "Audio" java.lang.ArrayIndexOutOfBoundsException: 7/.test(reported[0]),
+    'the report names the thread and the exception');
+
+  main.callStack.items.length = 0;
+  helper.status = 'terminated';
+  console.error = () => {};
+  try {
+    t.throws(() => jvm.handleException({ type: 'java/lang/RuntimeException' }, -1, main),
+      'the last live thread still surfaces its exception to the embedder');
+  } finally {
+    console.error = quiet;
+  }
+  t.end();
+});
+
 test('scheduler stack limit is configurable for recursive-call diagnostics', (t) => {
   const configured = new JVM({ maxStackDepth: 73 });
   const invalid = new JVM({ maxStackDepth: 0 });

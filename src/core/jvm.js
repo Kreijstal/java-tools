@@ -257,6 +257,17 @@ class JVM {
     this.awtStructuredYieldGraceMs = Math.max(0,
       Number.isFinite(Number(configuredAwtStructuredGrace))
         ? Number(configuredAwtStructuredGrace) : 0);
+    // A runnable guest thread that the frame-producer priority has withheld
+    // from the CPU for this long switches the rest of the current host turn
+    // to plain round-robin. See _schedulerStarvationRelief.
+    const configuredStarvation = options.schedulerStarvationMs ??
+      env.JVM_SCHEDULER_STARVATION_MS;
+    this.schedulerStarvationMs =
+      Number.isFinite(Number(configuredStarvation)) &&
+        Number(configuredStarvation) >= 0
+        ? Number(configuredStarvation) : 100;
+    this._schedulerReliefActive = false;
+    this._schedulerReliefCooldown = false;
     const configuredYieldStrategy =
       options.eventLoopYieldStrategy ?? env.JVM_EVENT_LOOP_YIELD_STRATEGY;
     this.eventLoopYieldStrategy = configuredYieldStrategy === "timer"
@@ -1043,10 +1054,15 @@ class JVM {
 
   // Hands the host its scheduler turn, taking the backpressured form when the
   // guest has been completing frames the host never got to present.
-  _yieldHostTurn() {
+  async _yieldHostTurn() {
     const strategy = this._hostYieldStrategy();
-    if (strategy === "presentation") return this._awaitPresentation();
-    return yieldToEventLoop(0, strategy);
+    if (strategy === "presentation") await this._awaitPresentation();
+    else await yieldToEventLoop(0, strategy);
+    // A fresh host turn restores the frame-producer priority; a turn that
+    // follows a relief turn keeps it even for still-starved threads, so a
+    // hogging producer and its helpers alternate turns.
+    this._schedulerReliefCooldown = this._schedulerReliefActive;
+    this._schedulerReliefActive = false;
   }
 
   // Selects the host yield task for the next scheduler boundary. See
@@ -1569,7 +1585,8 @@ class JVM {
     // still run while the animation thread sleeps between frames, matching
     // native JVM concurrency without assigning a workload-specific priority.
     const frameProducer = this._awtFrameProducerThread;
-    if (frameProducer && frameProducer.status === "runnable") {
+    if (frameProducer && frameProducer.status === "runnable" &&
+        !this._schedulerStarvationRelief(frameProducer)) {
       const producerIndex = this.threads.indexOf(frameProducer);
       if (producerIndex >= 0) this.currentThreadIndex = producerIndex;
     }
@@ -1601,7 +1618,56 @@ class JVM {
       }
     }
 
+    // Service outside a relief turn means the producer yielded on its own;
+    // service inside one keeps the starvation clock running so relief turns
+    // alternate with priority turns for as long as the producer hogs the CPU.
+    if (thread._withheldSince !== undefined && !this._schedulerReliefActive) {
+      thread._withheldSince = undefined;
+    }
     return { thread, callStack: thread.callStack, schedulerNow };
+  }
+
+  // The frame-producer priority in _prepareSchedulerTick assumes the host
+  // hands the scheduler turns often enough that the producer's own sleeps and
+  // waits are observed, which is when other threads run. A host that wakes
+  // the guest rarely (a hidden browser tab clamps every timer to once per
+  // second and never presents a frame) lets the producer sleep and wake again
+  // inside one gap, so at every turn it is runnable and the priority becomes
+  // permanent: the connection worker, the socket reader and the disk loader
+  // never execute, and the producer itself then spins forever polling for
+  // their results. A visible tab shows the same shape whenever the producer
+  // computes continuously without sleeping (the loading screen synthesizes
+  // music on the draw thread for minutes): a native JVM would run the helpers
+  // on other cores. Bound the wait instead: once a runnable thread has been
+  // withheld for schedulerStarvationMs of wall time, the rest of the current
+  // host turn is scheduled round-robin, and while the starvation persists
+  // relief turns alternate with priority turns. Deterministic clocks never
+  // consult wall time, so replays keep the plain priority.
+  _schedulerStarvationRelief(frameProducer) {
+    if (this._schedulerReliefActive) return true;
+    if (this.clock && this.clock.enabled && !this.clock.realtime) return false;
+    const threads = this.threads;
+    let now = 0;
+    let starved = false;
+    for (let index = 0; index < threads.length; index += 1) {
+      const thread = threads[index];
+      if (thread === frameProducer) continue;
+      if (thread.status !== "runnable") {
+        if (thread._withheldSince !== undefined) {
+          thread._withheldSince = undefined;
+        }
+        continue;
+      }
+      if (now === 0) now = Date.now();
+      if (thread._withheldSince === undefined) {
+        thread._withheldSince = now;
+      } else if (now - thread._withheldSince >= this.schedulerStarvationMs) {
+        starved = true;
+      }
+    }
+    if (!starved || this._schedulerReliefCooldown) return false;
+    this._schedulerReliefActive = true;
+    return true;
   }
 
   _advanceSchedulerThread() {
@@ -3221,8 +3287,27 @@ class JVM {
     }
     const callStack = thread.callStack;
     if (callStack.isEmpty()) {
-      console.error("Unhandled exception:", exception);
-      throw exception;
+      // The exception escaped the thread's outermost frame. HotSpot reports
+      // it and terminates that thread only; the JVM keeps running the others.
+      // Stop the scheduler with the exception solely when no other thread is
+      // left alive, which keeps command-line programs whose main throws
+      // failing the way they always did.
+      const otherAlive = this.threads.some((candidate) =>
+        candidate !== thread && candidate.status !== "terminated");
+      const guestName = thread.javaThread && thread.javaThread.name;
+      const threadName = guestName === undefined || guestName === null
+        ? (thread.name || `Thread-${thread.id}`)
+        : String(guestName.value !== undefined ? guestName.value : guestName);
+      const detail = exception && exception.message;
+      const message = detail === undefined || detail === null ? ""
+        : String(detail.value !== undefined ? detail.value : detail);
+      const type = exception && exception.type
+        ? exception.type.replace(/\//g, ".") : "java.lang.Throwable";
+      console.error(`Exception in thread "${threadName}" ${type}${
+        message ? `: ${message}` : ""}`, exception);
+      if (!otherAlive) throw exception;
+      thread.status = "terminated";
+      return;
     }
     const frame = callStack.peek();
 
