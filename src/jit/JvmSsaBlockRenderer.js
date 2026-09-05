@@ -87,14 +87,21 @@ function parseGeneratedStatements(source) {
 // JVM_JIT_VERIFY_GENERATED=1 asks for it (or when a test calls it directly).
 // It is a check, never a transformation: nothing in the compiler reads back
 // the JavaScript it has emitted in order to decide what to emit.
-function unboundGeneratedSsaIdentifiers(source, candidates = null) {
+function unboundGeneratedSsaIdentifiers(source, candidates = null,
+  externallyBound = null) {
   const program = parseGeneratedStatements(source);
   const nodeScopes = new WeakMap();
   const declarationIdentifiers = new WeakSet();
   const createScope = (parent) => ({parent, bindings: new Set()});
   const rootScope = createScope(null);
-  const isCandidate = (name) => candidates
-    ? candidates.has(name) : name.startsWith("ssaValue");
+  // Names the finished body does not declare because its caller supplies
+  // them: the generated function's own parameters and its captures.
+  if (externallyBound) for (const name of externallyBound) {
+    rootScope.bindings.add(name);
+  }
+  const isCandidate = (name) => typeof candidates === "function"
+    ? candidates(name)
+    : candidates ? candidates.has(name) : name.startsWith("ssaValue");
   const visitChildren = (node, visit) => {
     for (const key in node) {
       if (key === "start" || key === "end" || key === "loc" ||
@@ -2745,6 +2752,14 @@ class JvmSsaBlockRenderer {
     let eliminatedStructuredBlockCount = 0;
     let restoringRangeGuardDeoptCount = 0;
     let restoringCoarseLoopDeoptCount = 0;
+    // Two-arm loop versioning copies the rendered body into both arms, so a
+    // versioned loop nested inside another versioned loop doubles the emitted
+    // code at every nesting level (Deko Bloko's va.d rendered 256 copies of
+    // its innermost loops: a 7.3 MB restoring body for a 226 KB method).
+    // Only the innermost versioned loops keep their fast arm; an enclosing
+    // loop whose body already holds one stays a single polled loop.
+    let versionedLoopCount = 0;
+    let nestedVersionedLoopSuppressionCount = 0;
     let rangeDominatedArithmeticGuardCount = 0;
     const rangeDominatedArithmeticGuards = new Set();
     const lexicalVoidFastPathSites = new Set();
@@ -3765,9 +3780,16 @@ class JvmSsaBlockRenderer {
     })();
     let lastMaterializeWasUnwindCompact = false;
     const materializeLines = (operandValues, pc, unwindOnly = false) => {
-      if (currentMaterializationLocalValues) {
-        materializationLocalValuesByPc.set(
-          pc, [...currentMaterializationLocalValues]);
+      // The slot values a cold site restores are the ones current *at that
+      // site*, so the site's own statement carries them. The by-pc map cannot:
+      // the tree is rendered more than once (framed, direct, restoring) and
+      // every render mints its own SSA names, so a later render's snapshot
+      // silently replaces an earlier one under the same pc and a consumer
+      // reading it back names values its own body never declared.
+      const materializationLocals = currentMaterializationLocalValues
+        ? [...currentMaterializationLocalValues] : null;
+      if (materializationLocals) {
+        materializationLocalValuesByPc.set(pc, materializationLocals);
       }
       lastMaterializeWasUnwindCompact = false;
       if (!this.materializeOutliningEnabled) {
@@ -3789,7 +3811,7 @@ class JvmSsaBlockRenderer {
         return [
           stmt(exprConcat(e`ssaMaterializeUnwind${operandValues.length}(`,
             argumentListExpression([pc, ...operandValues]), e`);`),
-          {kind: "materialize", unwind: true, pc,
+          {kind: "materialize", unwind: true, pc, materializationLocals,
             operands: operandValues.map((expression) => e`${expression}`)}),
         ];
       }
@@ -3798,7 +3820,7 @@ class JvmSsaBlockRenderer {
       return [
         stmt(exprConcat(e`ssaMaterialize${operandValues.length}(`,
           argumentListExpression([pc, ...operandValues]), e`);`),
-        {kind: "materialize", unwind: false, pc,
+        {kind: "materialize", unwind: false, pc, materializationLocals,
           operands: operandValues.map((expression) => e`${expression}`)}),
       ];
     };
@@ -10760,9 +10782,12 @@ class JvmSsaBlockRenderer {
           ...rangeGuards,
           ...(invariantDivisorGuard ? [invariantDivisorGuard.variable] : []),
         ];
+        const versionedLoopsBeforeBody = versionedLoopCount;
         const loopBody = render(node.body, continuationMode, directPositional,
           currentLoopSafePointBudget, checkedLeafOnly, rangeBailout,
           loopSafePointBudgetOverrides);
+        const bodyHoldsVersionedLoop =
+          versionedLoopCount !== versionedLoopsBeforeBody;
         const countedLoop = canonicalCountedLoop(header, node.label, loopBody) ||
           canonicalPostDecrementLoop(node.label, loopBody);
         const emittedLoopBody = countedLoop ? countedLoop.body : loopBody;
@@ -10975,6 +11000,11 @@ class JvmSsaBlockRenderer {
               ...specializedUnpolledLoop,
             ];
           }
+          if (bodyHoldsVersionedLoop) {
+            nestedVersionedLoopSuppressionCount += 1;
+            return [...prefix, ...polledLoop];
+          }
+          versionedLoopCount += 1;
           return [
             ...prefix,
             st`if (${fastLoopCondition}) {`,
@@ -11601,7 +11631,14 @@ class JvmSsaBlockRenderer {
     const declaredLocals = [...new Set([
       ...renderedLocalSlots,
       ...spillSlots.filter((slot) => !immutableEntryLocals.has(slot)),
+      // An invariant positional receiver guard reads its slot by lexical
+      // name at the head of the body. The slot is proven unassigned, so the
+      // rendered tree may hold its value under an SSA name and never mention
+      // `localN` -- but the guard still names it, and a name no declaration
+      // binds is a ReferenceError the first time the guard runs.
+      ...invariantPositionalReceiverSlots.values(),
     ])].sort((a, b) => a - b);
+    const declaredLocalSlots = new Set(declaredLocals);
     const entryArrayDataSlots = [...entryArrayLocalSlots]
       .filter((slot) =>
         declaredLocals.includes(slot) &&
@@ -12508,7 +12545,12 @@ class JvmSsaBlockRenderer {
     ) => [...invariantPositionalReceiverSlots]
       .filter(([index]) => !omitSelfRecursive ||
         !callSites.get(index)?.selfRecursive)
-      .map(([index, slot]) => constDecl(
+      // A slot the declarations above do not bind cannot be read here. That
+      // only happens when a later render registers a receiver this list was
+      // already built without; the guard then simply declines the fast path.
+      .map(([index, slot]) => !declaredLocalSlots.has(slot)
+        ? constDecl(invariantPositionalRawVariable(index), e`null`)
+        : constDecl(
         invariantPositionalRawVariable(index), exprConcat(
           e`${positionalCallRawInvokeVariable(index)} && `,
           e`${positionalCallRawInvokeVariable(index)}.jvmInlineInteger === true && `,
@@ -13025,11 +13067,13 @@ class JvmSsaBlockRenderer {
         }
         const restoringFrameSlots = [...restoringFrameEntries.keys()];
         const restoringFrameValues = [...restoringFrameEntries.values()];
+        const restoringFrameValuesFrom = (known) =>
+          restoringFrameSlots.map((slot, index) =>
+            known[slot] ?? restoringFrameValues[index]);
         const restoringFrameValuesAt = (pc) => {
           const known = materializationLocalValuesByPc.get(pc);
           if (!known) return restoringFrameValues;
-          return restoringFrameSlots.map((slot, index) =>
-            known[slot] ?? restoringFrameValues[index]);
+          return restoringFrameValuesFrom(known);
         };
         restoringFrameSlotCount = restoringFrameSlots.length;
         const restoringFrameLayoutId = captureFreeRestoringSpills
@@ -13100,9 +13144,13 @@ class JvmSsaBlockRenderer {
                   argumentListExpression(record.operands), e`]);`))}`,
               ];
             }
-            const frameValues = Number.isInteger(record.pc)
-              ? restoringFrameValuesAt(record.pc)
-              : restoringFrameValues;
+            // Prefer the snapshot this very statement recorded: it names
+            // values of this render, in scope where the statement stands.
+            const frameValues = record.materializationLocals
+              ? restoringFrameValuesFrom(record.materializationLocals)
+              : Number.isInteger(record.pc)
+                ? restoringFrameValuesAt(record.pc)
+                : restoringFrameValues;
             return [
               `${prefix}${stmt(exprConcat(
                 e`[frame, locals, stack] = `,
@@ -15053,6 +15101,9 @@ class JvmSsaBlockRenderer {
         restoringRangeGuardDeoptCount;
       generated.jvmStructuredRestoringCoarseLoopDeoptCount =
         restoringCoarseLoopDeoptCount;
+      generated.jvmStructuredVersionedLoopCount = versionedLoopCount;
+      generated.jvmStructuredNestedVersionedLoopSuppressionCount =
+        nestedVersionedLoopSuppressionCount;
       generated.jvmStructuredRangeDominatedArithmeticGuardCount =
         rangeDominatedArithmeticGuardCount;
       generated.jvmStructuredLoopInvariantDivisorGuardCount =
@@ -15146,6 +15197,8 @@ class JvmSsaBlockRenderer {
 }
 
 module.exports = JvmSsaBlockRenderer;
+module.exports.unboundGeneratedSsaIdentifiers =
+  unboundGeneratedSsaIdentifiers;
 module.exports._test = {
   isIrreducibleError,
   unboundGeneratedSsaIdentifiers,

@@ -8,6 +8,7 @@ const {
 } = require("../instructions/object");
 const WasmJit = require("./WasmJit");
 const JvmSsaBlockRenderer = require("./JvmSsaBlockRenderer");
+const { unboundGeneratedSsaIdentifiers } = JvmSsaBlockRenderer;
 const HotCallGraphRegionCompiler = require("./HotCallGraphRegionCompiler");
 const monoArray = require("./monoArray");
 const {
@@ -551,6 +552,9 @@ class JitCompiler {
       ? { ...options, structuredSsa: true }
       : options;
     this.structuredSsa = new JvmSsaBlockRenderer(this, regionOptions);
+    // Free-name reports collected when JVM_JIT_VERIFY_FREE_NAMES asks for
+    // them, so a test can assert on the finding instead of the console line.
+    this.freeNameReports = [];
     // A method's independently selected tier is not necessarily the best
     // representation when that method becomes part of a closed hot graph.
     // Keep graph-owned structured lowering separate from the canonical
@@ -2041,6 +2045,33 @@ class JitCompiler {
     } catch { /* dump only */ }
   }
 
+  // A generated body that reads a name nothing binds is a codegen defect:
+  // the free identifier only surfaces as a ReferenceError the first time that
+  // path executes, on whichever guest thread happens to reach it, and a cold
+  // deopt path can hide one for minutes. This re-checks the finished body
+  // with the renderer's scope-correct verifier and reports what it finds. It
+  // is opt-in (JVM_JIT_VERIFY_FREE_NAMES=1) and no compilation step reads it.
+  verifyGeneratedFreeNames(labeled, method, tier, ownerOverride, parameters,
+    captureNames, hoistedSource) {
+    let unbound = [];
+    try {
+      unbound = unboundGeneratedSsaIdentifiers(
+        `${hoistedSource ? `${hoistedSource}\n` : ""}${labeled.source}`,
+        // Every name an emitter mints for a value or a JVM slot, whichever
+        // emitter minted it: a body may read a slot by lexical name even
+        // where the rendered tree kept that slot's value under an SSA name.
+        (name) => /^(ssa|local\d|argument\d|inline|nested)/.test(name),
+        [...parameters, ...captureNames]);
+    } catch { return; }
+    if (!unbound.length) return;
+    const owner = ownerOverride || method?.className ||
+      this.jvm.findClassNameForMethod?.(method) || "unknown";
+    this.freeNameReports.push({ owner, method: method?.name, tier, unbound });
+    console.error(`[jit] free name(s) in generated ${owner}.${
+      method?.name || "unknown"}${method?.descriptor || ""} tier=${tier}: ${
+      unbound.join(",")}`);
+  }
+
   createGeneratedFunction(method, tier, parameters, source,
     ownerOverride = null, asynchronous = false, generator = false,
     captures = null, hoistedSource = null) {
@@ -2053,6 +2084,11 @@ class JitCompiler {
         process.env.JVM_DUMP_GENERATED_DIR) {
       this.dumpGeneratedSource(labeled, method, tier, ownerOverride,
         hoistedSource);
+    }
+    if (typeof process !== "undefined" && process.env &&
+        process.env.JVM_JIT_VERIFY_FREE_NAMES) {
+      this.verifyGeneratedFreeNames(labeled, method, tier, ownerOverride,
+        parameters, captures ? Object.keys(captures) : [], hoistedSource);
     }
     // Function constructors themselves remain anonymous in Gecko profiles.
     // Return a named literal so stack sampling exposes the guest identity.
