@@ -95,7 +95,7 @@ function withEnv(t, vars) {
 async function makeHarness(t, className, source, extraEnv = {}) {
   withEnv(t, { JVM_WASM_JIT: '1', JVM_WASM_STRUCTURED: '1', ...extraEnv });
   const classpath = compileJavaFixture(t, className, source);
-  const jvm = new JVM({ classpath, jit: { warmupThreshold: 100 } });
+  const jvm = new JVM({ classpath, jit: {compileWorker: false,  warmupThreshold: 100 } });
   await jvm.loadClassByName(className);
   jvm.classInitializationState.set(className, 'INITIALIZED');
   const thread = {

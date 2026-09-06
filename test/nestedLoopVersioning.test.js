@@ -56,7 +56,7 @@ public class ${className} {
 }
 `);
   t.teardown(() => fs.rmSync(classpath, {recursive: true, force: true}));
-  const jvm = new JVM({classpath, jit: {warmupThreshold: 0, structuredSsa: true}});
+  const jvm = new JVM({classpath, jit: {compileWorker: false, warmupThreshold: 0, structuredSsa: true}});
   await jvm.loadClassByName(className);
   jvm.classInitializationState.set(className, 'INITIALIZED');
   const method = await jvm.findMethodInHierarchy(className, 'fill', '([F[FIII)V');
@@ -77,7 +77,7 @@ public class ${className} {
   const originalWrite = process.stdout.write;
   process.stdout.write = (chunk) => { output += String(chunk); return true; };
   try {
-    const runner = new JVM({classpath, jit: {warmupThreshold: 0, structuredSsa: true}});
+    const runner = new JVM({classpath, jit: {compileWorker: false, warmupThreshold: 0, structuredSsa: true}});
     await runner.run(className);
   } finally {
     process.stdout.write = originalWrite;

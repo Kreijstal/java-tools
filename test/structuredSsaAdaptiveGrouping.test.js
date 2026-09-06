@@ -55,7 +55,7 @@ public final class AdaptiveGroupingHarness {
 `);
     execFileSync('javac', ['-g', '-d', directory, source]);
 
-    const jvm = new JVM({classpath: [directory], interpreterBurst: 256, jit: {
+    const jvm = new JVM({classpath: [directory], interpreterBurst: 256, jit: {compileWorker: false, 
       warmupThreshold: 0,
       structuredSsa: true,
       adaptiveFramelessPositional: true,

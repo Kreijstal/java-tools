@@ -12,7 +12,8 @@ const {
   loadClassByPath,
   loadClassByPathSync: loadConvertedClass,
 } = require("./classLoader");
-const { parseDescriptor } = require("../parsing/typeParser");
+const { parseDescriptor, objectTypesInDescriptor } =
+  require("../parsing/typeParser");
 const { primitiveTypeDescriptors, arrayPrimitiveTypeDescriptors } = require("./constants");
 const {
   formatInstruction,
@@ -181,6 +182,9 @@ class JVM {
     this.threads = [];
     this.currentThreadIndex = 0;
     this.classes = {}; // className -> { ast, constantPool }
+    // run() prepares everything before main() unless this is false. See the
+    // preparation block in run().
+    this.prepareBeforeMain = options.prepareBeforeMain !== false;
     this._methodClassNames = new WeakMap();
     this._indexedMethodClassData = new Map();
     // Bumped on every class registration; closed-world analyses (class
@@ -751,8 +755,38 @@ class JVM {
       callStack: new CallStack(),
       status: "runnable",
       pendingException: null,
+      // Scheduler bookkeeping, declared up front so every thread object keeps
+      // one hidden class (the scheduler used to add and delete these per
+      // sleep/wait/join transition).
+      sleepUntil: undefined,
+      joiningOn: undefined,
+      waitingForClassInitialization: undefined,
+      waitingOn: undefined,
+      waitDeadline: undefined,
+      blockingOn: undefined,
+      waitLockCount: undefined,
     };
     this.threads.push(mainThread);
+
+    // Everything that happens before main() is free: nothing the guest can
+    // observe has started. What costs is compiling AFTER main(), which shows
+    // up as loading time and as fps stalls during play. So preparation runs
+    // here by default -- preload the classpath, compile every method, and
+    // drain the compile worker -- before any class initializer has run.
+    //
+    // Opt out with run(main, {prepare: false}) or new JVM({prepareBeforeMain:
+    // false}), which is what an A/B against the old lifecycle needs.
+    if (options.prepare !== false && this.prepareBeforeMain !== false) {
+      await this.precompileInitializedClasses({
+        preloadClasspath: true,
+        initializedOnly: false,
+        effectful: true,
+        wasm: true,
+      });
+      // Nothing eligible is left to compile, so a later compile would be a
+      // stall with no upside.
+      this.jit?.wasmJit?.freezeCompilation?.();
+    }
 
     // Initialize the main class before running main method or creating applet
     // This ensures static blocks execute before main method starts
@@ -1124,6 +1158,7 @@ class JVM {
           continue;
         }
         const scheduled = this._prepareSchedulerTick();
+        if (this.jit.hotnessEnabled) this.jit.hotnessTick(Date.now());
         const timingSample = this._beginSchedulerTiming(scheduled);
         const fastResult = this._tryExecuteSynchronousJitTick(scheduled);
         let result;
@@ -1262,15 +1297,53 @@ class JVM {
     const previousEffectfulPreparation = this.jit.effectfulPreparationActive;
     if (compileEffectful) this.jit.effectfulPreparationActive = true;
     try {
+      // Who compiles this pass depends on whether the guest is paused for it.
+      //
+      // `effectful` preparation is the ahead-of-main pass: the guest has not
+      // started, so there is nothing for the worker to overlap with and no
+      // stall to remove. Routing it through the worker was strictly slower --
+      // every body paid serializeGeneratedResult there and
+      // materializeGeneratedResult here, and since getGeneratedFunction
+      // returns null once a method is queued, the pass then blocked on
+      // whenIdle() while ONE worker thread, which also pays its own JVM boot
+      // and classpath preload, did work this thread could have done directly.
+      // Measured on ProducerConsumer (311 methods): 1.49 s compiling locally
+      // vs 2.09 s through the worker, the main thread idle for the difference.
+      // Skipping preparation entirely puts both arms on the guest's own 1.0 s
+      // sleep floor, which is what isolated the cost to this loop.
+      //
+      // A seed pass while the guest IS running is the opposite case and still
+      // queues: that is Phase 1.3's "seed the queue with every method", and
+      // there the whole point is that this thread does not stop to compile.
+      const compileLocally = options.compileLocally !== undefined
+        ? options.compileLocally === true
+        : compileEffectful;
       for (const {method} of methods) {
         this.jit.getGeneratedFunction(method, {
           allowEffectfulCalls: compileEffectful,
+          compileLocally,
         });
         completed += 1;
         if (typeof options.onProgress === "function") {
           options.onProgress({completed, total: methods.length, tier: "javascript"});
         }
         await yieldToEventLoop(0, this.eventLoopYieldStrategy);
+      }
+      if (!compileLocally && this.jit.compileWorker?.enabled) {
+        // The pass above only QUEUED the work, so the cache is still empty.
+        // Preparation has to mean "everything is compiled" or the guest starts
+        // against an empty cache: wait for the worker to drain, then build
+        // whatever it declined, locally and unconditionally.
+        await this.jit.compileWorker.whenIdle();
+        for (const {method} of methods) {
+          if (this.jit.codegenCache.has(method)) continue;
+          this.jit.getGeneratedFunction(method, {
+            allowEffectfulCalls: compileEffectful,
+            compileLocally: true,
+          });
+          await yieldToEventLoop(0, this.eventLoopYieldStrategy);
+        }
+        await this.jit.compileWorker.whenIdle();
       }
       if (compileWasm && this.jit.wasmJit?.enabled) {
         for (const {className, method} of methods) {
@@ -1354,7 +1427,79 @@ class JVM {
       }
       await yieldToEventLoop(0, this.eventLoopYieldStrategy);
     }
-    return {classes: completed};
+    const referenced = await this.preloadReferencedClasses(onProgress);
+    return {classes: completed, referencedClasses: referenced};
+  }
+
+  // Class names a loaded class links to. The constant pool is the canonical
+  // list -- a class file names every class it references there -- so this
+  // reads the pool instead of scavenging the converted AST for things that
+  // look like class references:
+  //   tag 7  Class       -> its name
+  //   tag 12 NameAndType -> the object types named by its descriptor
+  // plus the superclass and interfaces from the class header.
+  //
+  // Enumerating the classpath finds the guest's own classes but not the JRE
+  // classes they refer to, and those are what keep being registered after
+  // main() otherwise.
+  collectReferencedClassNames(classData, into) {
+    const pool = classData?.constantPool;
+    if (Array.isArray(pool)) {
+      const utf8 = (index) => {
+        const entry = pool[index];
+        return entry && entry.tag === 1 ? entry.info?.bytes : null;
+      };
+      for (const entry of pool) {
+        if (!entry || !entry.info) continue;
+        if (entry.tag === 7) {
+          const name = utf8(entry.info.name_index);
+          if (name) into.add(name);
+        } else if (entry.tag === 12) {
+          for (const name of objectTypesInDescriptor(
+            utf8(entry.info.descriptor_index))) {
+            into.add(name);
+          }
+        }
+      }
+    }
+    const header = classData?.ast?.classes?.[0];
+    if (!header) return;
+    for (const key of ["superClass", "superClassName"]) {
+      if (typeof header[key] === "string") into.add(header[key]);
+    }
+    for (const name of header.interfaces || []) {
+      if (typeof name === "string") into.add(name);
+    }
+  }
+
+  // Load the transitive closure of what the already-loaded classes refer to.
+  // Free: this runs before main().
+  async preloadReferencedClasses(onProgress = null) {
+    let loaded = 0;
+    for (let round = 0; round < 8; round += 1) {
+      const wanted = new Set();
+      for (const classData of Object.values(this.classes)) {
+        this.collectReferencedClassNames(classData, wanted);
+      }
+      const missing = [...wanted].filter((name) =>
+        name && !name.startsWith("[") && !this.classes[name]);
+      if (!missing.length) break;
+      for (const name of missing) {
+        try {
+          await this.loadClassByName(name);
+        } catch (error) {
+          // A name that cannot be resolved here would not have resolved
+          // during the run either; leave it to the ordinary failure path.
+        }
+        loaded += 1;
+        if (typeof onProgress === "function") {
+          onProgress({completed: loaded, total: missing.length,
+            tier: "class-load-referenced"});
+        }
+        await yieldToEventLoop(0, this.eventLoopYieldStrategy);
+      }
+    }
+    return loaded;
   }
 
   enqueueAwtEventInvocation(listener, methodName, descriptor, event, coalesce = false) {
@@ -1392,6 +1537,16 @@ class JVM {
             callStack: new CallStack(),
             status: 'terminated',
             pendingException: null,
+        // Scheduler bookkeeping, declared up front so every thread object keeps
+        // one hidden class (the scheduler used to add and delete these per
+        // sleep/wait/join transition).
+        sleepUntil: undefined,
+        joiningOn: undefined,
+        waitingForClassInitialization: undefined,
+        waitingOn: undefined,
+        waitDeadline: undefined,
+        blockingOn: undefined,
+        waitLockCount: undefined,
           };
           this._awtEventThread = thread;
           this.threads.push(thread);
@@ -1517,17 +1672,17 @@ class JVM {
     for (const t of this.threads) {
       if (t.status === "SLEEPING" && schedulerNow >= t.sleepUntil) {
         t.status = "runnable";
-        delete t.sleepUntil;
+        t.sleepUntil = undefined;
       }
       if (t.status === "JOINING" && t.joiningOn.status === "terminated") {
         t.status = "runnable";
-        delete t.joiningOn;
+        t.joiningOn = undefined;
       }
       if (t.status === "CLASS_INITIALIZATION_WAIT" &&
           this.classInitializationState.get(t.waitingForClassInitialization) !==
             "INITIALIZING") {
         t.status = "runnable";
-        delete t.waitingForClassInitialization;
+        t.waitingForClassInitialization = undefined;
       }
       if (
         t.status === "BLOCKED" &&
@@ -1546,8 +1701,8 @@ class JVM {
         }
         t.status = "WAIT_REACQUIRE";
         t.blockingOn = monitor;
-        delete t.waitingOn;
-        delete t.waitDeadline;
+        t.waitingOn = undefined;
+        t.waitDeadline = undefined;
       }
       if (t.status === "WAIT_REACQUIRE" && t.blockingOn && !t.blockingOn.isLocked) {
         // Execution resumes AFTER the wait call, so acquire on the thread's
@@ -1555,8 +1710,8 @@ class JVM {
         t.blockingOn.isLocked = true;
         t.blockingOn.lockOwner = t.id;
         t.blockingOn.lockCount = t.waitLockCount || 1;
-        delete t.blockingOn;
-        delete t.waitLockCount;
+        t.blockingOn = undefined;
+        t.waitLockCount = undefined;
         t.status = "runnable";
       }
     }
@@ -1861,6 +2016,10 @@ class JVM {
       if (callStack.items[callStack.items.length - 1] !== entryFrame ||
           thread.status !== "runnable") break;
     }
+    if (this.jit.hotnessEnabled && executedBytecodes > 0) {
+      this.jit.recordHotness(entryFrame.method,
+        executedBytecodes * this.jit.hotnessBytecodeWeight);
+    }
     if (this.threads.length > 0) this._advanceSchedulerThread();
     return TICK_CONTINUE;
   }
@@ -2109,6 +2268,10 @@ class JVM {
       this._advanceSchedulerThread();
     }
 
+    if (this.jit.hotnessEnabled && executedBytecodes > 0) {
+      this.jit.recordHotness(frame.method,
+        executedBytecodes * this.jit.hotnessBytecodeWeight);
+    }
     return { completed: false, bytecodes: executedBytecodes };
   }
 
@@ -2753,14 +2916,14 @@ class JVM {
   completeClassInitialization(frame) {
     const className = frame && frame.initializingClassName;
     if (!className) return;
-    delete frame.initializingClassName;
+    frame.initializingClassName = undefined;
     this._markClassInitialized(className);
   }
 
   failClassInitialization(frame) {
     const className = frame && frame.initializingClassName;
     if (!className) return;
-    delete frame.initializingClassName;
+    frame.initializingClassName = undefined;
     this._setClassInitializationState(className, "ERRONEOUS");
     this.classInitializationOwners.delete(className);
     this._wakeClassInitializationWaiters(className);
@@ -3701,6 +3864,16 @@ class JVM {
           id: threadState.id,
           status: threadState.status,
           callStack: new CallStack(),
+          // Scheduler bookkeeping, declared up front so every thread object keeps
+          // one hidden class (the scheduler used to add and delete these per
+          // sleep/wait/join transition).
+          sleepUntil: undefined,
+          joiningOn: undefined,
+          waitingForClassInitialization: undefined,
+          waitingOn: undefined,
+          waitDeadline: undefined,
+          blockingOn: undefined,
+          waitLockCount: undefined,
         };
         for (const frameState of threadState.callStack) {
           const method = await this.findMethodInHierarchy(

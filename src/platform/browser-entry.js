@@ -146,7 +146,47 @@ class BrowserJVMDebug {
     setFileProvider(this.fileProvider);
     
     // Create the real debug controller with rewind history enabled and classpath set to root
-    this.debugController = new DebugController({ rewindHistorySize: 50, classpath: ['.'] });
+    // Stock Firefox (154) never Ion-compiles a generator whose resume point
+    // sits inside a loop, and every structured continuation body yields at
+    // its loop safe points, so those bodies stayed in the baseline tier for
+    // the whole session (measured: 100 s at the Deko Bloko menu, 0 Ion
+    // samples in any function* body, Ion in every plain-function body). The
+    // ordinary adaptive body is a plain function that materializes the exact
+    // frame at a safe point and re-enters at the loop header, so canonical
+    // entries run through it; the generator remains for pending
+    // continuations.
+    this.debugController = new DebugController({
+      rewindHistorySize: 50, classpath: ['.'],
+      // Host-turn quantum. The 8 ms default made a 170 ms game frame unwind
+      // and rebuild the whole Java stack about twenty times (each safe point
+      // materializes every frame, and every level then re-enters through the
+      // resume dispatcher and a baseline tail); measured at the Deko Bloko
+      // menu as ~1000 scheduler entries and ~190 baseline hand-offs per
+      // second. One frame of a 24 fps game is ~42 ms, so a 40 ms quantum
+      // keeps input latency within a frame while letting a frame render in
+      // one activation.
+      eventLoopYieldMs: 40,
+      wasmHeap: true,
+      wasmHeapMb: 128,
+      wasmFields: true,
+      jit: {
+        // Wasm backend features the environment would otherwise gate
+        // (process.env is empty in the bundle): the structured backend and
+        // direct wasm->wasm links, used when the page selects wasm-first.
+        wasm: {
+          structured: true,
+          directStaticLink: true,
+          directInstanceLink: true,
+          checkcast: true,
+          // Let a method whose module covers it end to end run in Wasm
+          // even when the JS tier's shape predicates would keep it.
+          preferFullCoverage: true,
+        },
+        compiledCallChains: true,
+        ordinaryAdaptiveFramelessPositional: true,
+        ordinaryAdaptiveCallChainSafePointBudget: 1,
+      },
+    });
     this.isReady = false;
   }
 

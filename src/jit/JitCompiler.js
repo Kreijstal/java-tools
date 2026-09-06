@@ -1,6 +1,8 @@
 const { arrayDataExpression } = require("./arrayDataExpression");
 const { inlineIntegerArgumentName } = require("./inlineIntegerNames");
 const Frame = require("../core/frame");
+const { ShadowCompiler } = require("./ShadowCompiler");
+const { CompileWorkerClient } = require("./CompileWorkerClient");
 const { ASYNC_METHOD_SENTINEL } = require("../core/constants");
 const { parseDescriptor } = require("../parsing/typeParser");
 const {
@@ -33,6 +35,84 @@ const { buildCfgFromCode } = require("../decompiler/structurer");
 const { capturesBooleanStatic, isNoOpExceptionHandler } = WasmJit._test;
 
 const RETURN_VOID = Symbol("jit.return.void");
+
+// In a generator SpiderMonkey's bytecode for every non-local exit (`yield`,
+// `return`, `break`, `continue`) grows by about four bytes per `let`/`const`
+// binding in scope at that point, while `var` bindings and plain functions
+// pay nothing (measured with the Debugger API on JavaScript-C157: a yield
+// under 200 block-scoped constants costs 870 bytes instead of 67). A
+// structured body declares every SSA value that way and exits deep inside
+// them, so its exits were a third of its bytecode, and Ion refuses any script
+// above 100,000 bytecode bytes: the hot glyph and sprite loops ran in the
+// baseline tier forever. Generated names are unique per body (versioned
+// loops re-declare the same names only in sibling blocks), so hoisting them
+// to `var` changes no value; the rewrite is refused wholesale when a name
+// would shadow one of an enclosing block, the one case where it could.
+// Nested plain functions keep their declarations; nested `function*`
+// declarations (the framed nodes of a hot call-graph module) are rewritten.
+const GENERATED_BLOCK_DECLARATION = /^(\s*)(const|let) ([A-Za-z_$][\w$]*)(\s*=|;)/;
+const GENERATED_FUNCTION_OPENER =
+  /^(async\s+)?function\b|[\s(,=:]function\b|=>\s*\{/;
+function hoistGeneratorDeclarations(source, rootIsGenerator) {
+  if (typeof source !== "string" || source.length === 0) {
+    return { source, rewritten: 0, shadowed: false };
+  }
+  const lines = source.split("\n");
+  const functions = [{ generator: rootIsGenerator, scopes: [new Set()] }];
+  const braceStack = [];
+  let rewritten = 0;
+  let shadowed = false;
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index];
+    const trimmed = line.trim();
+    const current = functions[functions.length - 1];
+    if (current.generator) {
+      const match = GENERATED_BLOCK_DECLARATION.exec(line);
+      if (match) {
+        const name = match[3];
+        for (let depth = 0; depth < current.scopes.length - 1; depth++) {
+          if (current.scopes[depth].has(name)) shadowed = true;
+        }
+        current.scopes[current.scopes.length - 1].add(name);
+        lines[index] = `${match[1]}var ${
+          line.slice(match[1].length + match[2].length + 1)}`;
+        rewritten += 1;
+      }
+    }
+    let opens = 0;
+    for (let at = 0; at < trimmed.length; at++) {
+      const character = trimmed.charCodeAt(at);
+      if (character === 123) opens += 1;
+      else if (character === 125) opens -= 1;
+    }
+    if (opens > 0) {
+      let pushed = 0;
+      if (GENERATED_FUNCTION_OPENER.test(trimmed)) {
+        functions.push({
+          generator: /function\*/.test(trimmed), scopes: [new Set()] });
+        braceStack.push("function");
+        pushed = 1;
+      }
+      const inner = functions[functions.length - 1];
+      for (; pushed < opens; pushed++) {
+        inner.scopes.push(new Set());
+        braceStack.push("block");
+      }
+    } else if (opens < 0) {
+      for (let closed = 0; closed < -opens && braceStack.length; closed++) {
+        const kind = braceStack.pop();
+        if (kind === "function") {
+          if (functions.length > 1) functions.pop();
+        } else {
+          const inner = functions[functions.length - 1];
+          if (inner.scopes.length > 1) inner.scopes.pop();
+        }
+      }
+    }
+  }
+  if (shadowed) return { source, rewritten: 0, shadowed: true };
+  return { source: lines.join("\n"), rewritten, shadowed: false };
+}
 const STATIC_DEOPT = Symbol("jit.static.deopt");
 const ASYNC_INVOKE = Symbol("jit.invoke.async");
 const NO_MEMO_KEY = Symbol("jit.memo.no-key");
@@ -99,6 +179,45 @@ class JitCompiler {
     // the interpreter.
     this.loopWarmupThreshold = process.env.JVM_JIT_LOOP_WARMUP
       ? Number(process.env.JVM_JIT_LOOP_WARMUP) : 0;
+    // Hotness sampler (docs/plan-linear-runtime.md, Phase 1.1). When on, no
+    // threshold decides whether a method may compile: every interpreted entry
+    // and every interpreted bytecode burst credits a per-method score, a
+    // periodic tick halves every score and compiles only the top-N uncompiled
+    // methods. Loop-free methods are eligible; a loop-bearing method is merely
+    // credited faster. Deopt/re-entry tier selection is untouched: a method
+    // with a published body still runs it.
+    // Phase 1.4: route every compile through the in-process shadow compiler
+    // and the worker message protocol (JVM_JIT_SHADOW_COMPILE=1). Off by
+    // default; it exists so the protocol is exercised by ordinary runs.
+    this.shadowCompiler = new ShadowCompiler(this, options);
+    // The real compile worker (JVM_JIT_COMPILE_WORKER=1). When it is on, a
+    // method the main thread would have compiled is queued instead and runs
+    // interpreted until its body arrives; the queue is ordered by hotness.
+    this.compileWorker = new CompileWorkerClient(this, options);
+    this.hotnessEnabled = options.hotness ??
+      (typeof process !== "undefined" && process.env &&
+        process.env.JVM_JIT_HOTNESS === "1");
+    this.hotness = new Map();
+    this.hotnessTopN = Number(options.hotnessTopN ??
+      (process.env.JVM_JIT_HOTNESS_TOP || 4));
+    this.hotnessTickMs = Number(options.hotnessTickMs ??
+      (process.env.JVM_JIT_HOTNESS_TICK_MS || 50));
+    // One interpreted bytecode is worth this fraction of an entry.
+    this.hotnessBytecodeWeight = Number(options.hotnessBytecodeWeight ??
+      (process.env.JVM_JIT_HOTNESS_BYTECODE_WEIGHT || 1 / 32));
+    // Below this decayed score a method is not worth a synchronous compile
+    // (one entry-equivalent). The worker of Phase 1.2 can drop it to 0.
+    this.hotnessMinScore = Number(options.hotnessMinScore ??
+      (process.env.JVM_JIT_HOTNESS_MIN_SCORE || 1));
+    // Diagnostic: keep compile-on-first-entry for loop-bearing methods while
+    // the sampler gates the rest (a long-running interpreted loop cannot
+    // change tier mid-frame, so deferring its compile strands it).
+    this.hotnessLoopsOnSight = options.hotnessLoopsOnSight ??
+      (process.env.JVM_JIT_HOTNESS_LOOPS_ON_SIGHT === "1");
+    this.hotnessLastTickAt = 0;
+    this.hotnessTickCount = 0;
+    this.hotnessSelectedCount = 0;
+    this.hotnessCompiledCount = 0;
     this.codegenEnabled = options.codegen !== false;
     this.codegenCache = new WeakMap();
     this.stableGeneratedEntries = new WeakMap();
@@ -153,6 +272,8 @@ class JitCompiler {
     this.codegenCompileErrors = new WeakMap();
     this.syncCallSites = [];
     this.nextSyncCallSiteId = 1;
+    // caller method -> "op|class|name|descriptor|pc" -> its warmed site.
+    this.syncCallSitesByCaller = new WeakMap();
     this.legacySyncCallSites = new Map();
     this.generatedTargetsByMethod = new WeakMap();
     this.generatedTargetUpgradePublicationCount = 0;
@@ -551,6 +672,13 @@ class JitCompiler {
     const regionOptions = this.rendererPipelineEnabled
       ? { ...options, structuredSsa: true }
       : options;
+    this.generatorVarDeclarationsEnabled =
+      options.generatorVarDeclarations !== false &&
+      !(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DISABLE_GENERATOR_VAR_DECLARATIONS === "1");
+    this.generatorVarDeclarationRewrites = 0;
+    this.generatorVarDeclarationShadowedBodies = 0;
+    this.structuredResumeHandoffCount = 0;
     this.structuredSsa = new JvmSsaBlockRenderer(this, regionOptions);
     // Free-name reports collected when JVM_JIT_VERIFY_FREE_NAMES asks for
     // them, so a test can assert on the finding instead of the console line.
@@ -586,7 +714,7 @@ class JitCompiler {
       return false;
     }
     if (frame.jitSkipOnce) {
-      delete frame.jitSkipOnce;
+      frame.jitSkipOnce = undefined;
       return false;
     }
     if (this.deoptedMethods.has(frame.method)) {
@@ -608,20 +736,82 @@ class JitCompiler {
     }
     const count = (this.invocationCounts.get(frame.method) || 0) + 1;
     this.invocationCounts.set(frame.method, count);
-    if (count < this.warmupThreshold && !this.hasBackwardBranch(frame.method)) {
-      return false;
-    }
-    // Loop-bearing methods otherwise compile on sight; JVM_JIT_LOOP_WARMUP
-    // makes them serve a (shorter) warmup too, to measure how much of the
-    // compile bill is methods that are touched once and never get hot.
-    if (this.loopWarmupThreshold && count < this.loopWarmupThreshold) {
-      return false;
+    if (this.hotnessEnabled) {
+      // The sampler owns the "compile now" decision: a method runs a body
+      // that is already published, or one the tick selected; otherwise it
+      // keeps interpreting and only accrues heat.
+      this.recordHotness(frame.method, 1);
+      if (!publishedGenerated && !this.codegenCache.has(frame.method) &&
+          !this.isHotnessSelected(frame.method) &&
+          !(this.hotnessLoopsOnSight && this.hasBackwardBranch(frame.method))) {
+        return false;
+      }
+    } else {
+      if (count < this.warmupThreshold && !this.hasBackwardBranch(frame.method)) {
+        return false;
+      }
+      // Loop-bearing methods otherwise compile on sight; JVM_JIT_LOOP_WARMUP
+      // makes them serve a (shorter) warmup too, to measure how much of the
+      // compile bill is methods that are touched once and never get hot.
+      if (this.loopWarmupThreshold && count < this.loopWarmupThreshold) {
+        return false;
+      }
     }
     const supported = publishedGenerated || (codegenEligible
       ? this.isCodegenSupported(frame.method)
       : this.isSupported(frame.method));
     if (!supported) frame.jitJsDisabled = true;
     return supported;
+  }
+
+  recordHotness(method, weight) {
+    if (!this.hotnessEnabled || !method) return;
+    let entry = this.hotness.get(method);
+    if (entry === undefined) {
+      entry = { score: 0, selected: false };
+      this.hotness.set(method, entry);
+    }
+    entry.score += weight;
+  }
+
+  isHotnessSelected(method) {
+    const entry = this.hotness.get(method);
+    return entry !== undefined && entry.selected;
+  }
+
+  // Called by the scheduler loop. Every hotnessTickMs: halve all scores,
+  // then compile the top-N uncompiled methods by score. Compiles are still
+  // synchronous here (Phase 1.2 moves them to a worker); the tick bounds how
+  // many happen per period, and the ranking decides which.
+  hotnessTick(now) {
+    if (!this.hotnessEnabled) return 0;
+    if (now - this.hotnessLastTickAt < this.hotnessTickMs) return 0;
+    this.hotnessLastTickAt = now;
+    this.hotnessTickCount += 1;
+    const candidates = [];
+    for (const [method, entry] of this.hotness) {
+      entry.score *= 0.5;
+      if (entry.score < 0.01) { this.hotness.delete(method); continue; }
+      if (entry.selected || entry.score < this.hotnessMinScore ||
+          this.codegenCache.has(method) || this.deoptedMethods.has(method)) continue;
+      candidates.push([entry.score, method, entry]);
+    }
+    if (candidates.length === 0) return 0;
+    candidates.sort((a, b) => b[0] - a[0]);
+    let compiled = 0;
+    for (const [, method, entry] of candidates.slice(0, this.hotnessTopN)) {
+      entry.selected = true;
+      this.hotnessSelectedCount += 1;
+      if (!this.isCodegenSupported(method) && !this.isSupported(method)) continue;
+      let generated = null;
+      try {
+        generated = this.getGeneratedFunction(method);
+      } catch (_) {
+        generated = null;
+      }
+      if (generated) { compiled += 1; this.hotnessCompiledCount += 1; }
+    }
+    return compiled;
   }
 
   // "Does this method have a loop the JIT may act on" — an ELIGIBILITY answer,
@@ -732,7 +922,7 @@ class JitCompiler {
       const ownsStructuredContinuation = Boolean(
         retainedGenerated?.jvmHasOwnedStructuredContinuation?.(frame) ||
         retainedGenerated?.jvmHotCallGraphHasOwnedContinuation?.(frame));
-      delete frame.jitSkipOnce;
+      frame.jitSkipOnce = undefined;
       if (!ownsStructuredContinuation) return UNHANDLED_RESULT;
     }
     // Ask the wasm gate before any JS tier can win, so the census can account
@@ -1152,9 +1342,13 @@ class JitCompiler {
     // same-class call-free plotting helper that itself touches primitive
     // arrays is the same locality argument one call deeper: from Wasm it
     // costs a nested-call import per pixel on top of the element imports.
+    // With the linear heap the locality argument is gone: Wasm reads the
+    // same memory with raw loads. When the embedder also prefers Wasm over
+    // whole-method JS, let raster loops reach the Wasm tier.
     const preferred = primitiveArrayAccesses >= 2 && nativeLongOps === 0 &&
       calls === 0 && this.hasBackwardBranch(method) &&
-      this.isCodegenSupported(method);
+      this.isCodegenSupported(method) &&
+      !(this.jvm.wasmHeap && !this.preferWholeMethodJs);
     this.importedArrayLoopJsMethods.set(method, preferred);
     return preferred;
   }
@@ -1522,8 +1716,8 @@ class JitCompiler {
     if (result && result.returned) {
       const explicitReturnParent = frame.jitGeneratedReturnParent;
       const explicitReturnType = frame.jitGeneratedReturnType;
-      delete frame.jitGeneratedReturnParent;
-      delete frame.jitGeneratedReturnType;
+      frame.jitGeneratedReturnParent = undefined;
+      frame.jitGeneratedReturnType = undefined;
       if (isReflectiveTarget(thread, frame)) {
         completeReflectiveCall(
           thread,
@@ -1546,7 +1740,7 @@ class JitCompiler {
             parentPc: returnParent?.pc ?? null,
             valueType: result.value === null ? "null" : typeof result.value,
           }));
-          delete frame.jitFrameHandoffTrace;
+          frame.jitFrameHandoffTrace = undefined;
         }
       } else if (explicitReturnParent && explicitReturnType !== "void") {
         console.error("[jit-generated-return-underflow]", {
@@ -1671,6 +1865,24 @@ class JitCompiler {
       }
       return cached;
     }
+    // Phase 1.2: the main thread does not compile. The method is queued and
+    // keeps running in the interpreter/baseline tier until the worker's body
+    // arrives and is published through the ordinary upgrade path. The
+    // deopt-to-generated_sync path does not come through here and stays
+    // synchronous, exactly as the plan requires.
+    //
+    // `compileLocally` opts out. The worker exists to keep compilation off the
+    // main thread WHILE THE GUEST RUNS; a caller that is not racing the guest
+    // -- ahead-of-main preparation -- has nothing to overlap with, so routing
+    // through the worker only adds serialize/deserialize on both sides and
+    // then blocks waiting for a single thread to do work this one could have
+    // done directly.
+    if (this.compileWorker.enabled && options.compileLocally !== true &&
+        this.compileWorker.enqueue(method, {
+      preparedWholeMethod: options.allowEffectfulCalls === true,
+    })) {
+      return null;
+    }
     if (this.codegenCompiling.has(method)) return null;
     this.codegenCompiling.add(method);
     try {
@@ -1678,6 +1890,9 @@ class JitCompiler {
         preparedWholeMethod: options.allowEffectfulCalls === true,
       });
       this.codegenCache.set(method, generated);
+      if (generated && process.env.JVM_JIT_RESULT_CENSUS) {
+        this.recordResultCensus(method, generated);
+      }
       if (generated && options.allowEffectfulCalls === true) {
         this.preparedCodegenMethods.add(method);
       }
@@ -2026,7 +2241,8 @@ class JitCompiler {
     return { source: `${source}\n//# sourceURL=${url}`, url, functionName };
   }
 
-  dumpGeneratedSource(labeled, method, tier, ownerOverride, hoistedSource) {
+  dumpGeneratedSource(labeled, method, tier, ownerOverride, hoistedSource,
+    captures = null) {
     const owner = ownerOverride || method?.className ||
       this.jvm.findClassNameForMethod?.(method) || "unknown";
     const name = method?.name || "unknown";
@@ -2042,6 +2258,55 @@ class JitCompiler {
         .replace(/[^A-Za-z0-9_.$-]/g, "_");
       fs.writeFileSync(`${dir}/${safe}.js`,
         `${hoistedSource ? `${hoistedSource}\n` : ""}${labeled.source}\n`);
+      // Sidecar: what each captured link record denotes, so a dumped body
+      // can be re-bound outside the runtime (offline kernel benchmarks).
+      if (captures && process.env.JVM_DUMP_GENERATED_CAPTURES) {
+        const describe = (name, value) => {
+          let m;
+          if ((m = /^ssaLinkStaticCell(\d+)$/.exec(name))) {
+            const target = this.directStaticTargets[Number(m[1])];
+            let className = null;
+            for (const [cn, data] of Object.entries(this.jvm.classes)) {
+              if (data?.staticFields === target?.fields) { className = cn; break; }
+            }
+            return { kind: "staticCell", className, key: target?.key ?? null,
+              valueType: value && typeof value.value === "object" && value.value !== null
+                ? (value.value.type || (ArrayBuffer.isView(value.value) ? "typed" : "object"))
+                : typeof value?.value };
+          }
+          if ((m = /^ssaLinkCallSite(\d+)$/.exec(name))) {
+            const site = this.syncCallSites[Number(m[1])];
+            return { kind: "callSite", op: site?.op, className: site?.declaredClassName,
+              methodName: site?.methodName, descriptor: site?.descriptor,
+              fastPositional: Boolean(site?.fastPositional),
+              fastPositionalRaw: Boolean(site?.fastPositional?.rawInvoke) };
+          }
+          if ((m = /^ssaLinkFieldSite(\d+)$/.exec(name))) {
+            const site = this.fieldSites[Number(m[1])];
+            return { kind: "fieldSite", className: site?.className,
+              fieldName: site?.fieldName, descriptor: site?.descriptor };
+          }
+          if (/^ssaLinkClassGuard\d+$/.test(name)) {
+            return { kind: "classGuard", owners: value?.owners || [] };
+          }
+          if ((m = /^ssaLinkStaticTarget(\d+)$/.exec(name))) {
+            const target = this.directStaticTargets[Number(m[1])];
+            return { kind: "staticTarget", className: target?.siteClassName ?? null,
+              key: target?.key ?? null };
+          }
+          if (/^ssaLinkRestoringLayout\d+$/.test(name)) {
+            return { kind: "restoringLayout",
+              slots: Array.isArray(value) ? [...value] : null };
+          }
+          return { kind: typeof value === "function" ? "function" : "other" };
+        };
+        const sidecar = {};
+        for (const [name, value] of Object.entries(captures)) {
+          sidecar[name] = describe(name, value);
+        }
+        fs.writeFileSync(`${dir}/${safe}.captures.json`,
+          JSON.stringify(sidecar, null, 1));
+      }
     } catch { /* dump only */ }
   }
 
@@ -2075,6 +2340,25 @@ class JitCompiler {
   createGeneratedFunction(method, tier, parameters, source,
     ownerOverride = null, asynchronous = false, generator = false,
     captures = null, hoistedSource = null) {
+    if (this.generatorVarDeclarationsEnabled &&
+        (generator || tier.startsWith("hot-call-graph"))) {
+      const hoisted = hoistGeneratorDeclarations(source, generator);
+      if (hoisted.shadowed) {
+        this.generatorVarDeclarationShadowedBodies += 1;
+      } else {
+        source = hoisted.source;
+        this.generatorVarDeclarationRewrites += hoisted.rewritten;
+      }
+      if (hoistedSource) {
+        const hoistedHelpers = hoistGeneratorDeclarations(hoistedSource, false);
+        if (hoistedHelpers.shadowed) {
+          this.generatorVarDeclarationShadowedBodies += 1;
+        } else {
+          hoistedSource = hoistedHelpers.source;
+          this.generatorVarDeclarationRewrites += hoistedHelpers.rewritten;
+        }
+      }
+    }
     const labeled = this.generatedSource(method, tier, source, ownerOverride);
     // Reading a miscompile means reading the code that was generated. The
     // sourceURL only names it inside a debugger, so JVM_DUMP_GENERATED_DIR
@@ -2083,7 +2367,7 @@ class JitCompiler {
     if (typeof process !== "undefined" && process.env &&
         process.env.JVM_DUMP_GENERATED_DIR) {
       this.dumpGeneratedSource(labeled, method, tier, ownerOverride,
-        hoistedSource);
+        hoistedSource, captures);
     }
     if (typeof process !== "undefined" && process.env &&
         process.env.JVM_JIT_VERIFY_FREE_NAMES) {
@@ -2103,6 +2387,850 @@ class JitCompiler {
       `${labeled.source}\n}`);
     const generated = factory(...captureNames.map((name) => captures[name]));
     generated.jvmSourceUrl = labeled.url;
+    // What a compile worker would send back instead of the live function
+    // (docs/plan-linear-runtime.md, Phase 1.2): the text plus a symbolic
+    // description of every captured link record. rebindGeneratedFunction
+    // rebuilds an equivalent function from exactly this on any JIT instance.
+    generated.jvmParameters = parameters;
+    generated.jvmTier = tier;
+    generated.jvmGenerator = generator;
+    generated.jvmAsynchronous = asynchronous;
+    generated.jvmHoistedSource = hoistedSource;
+    generated.jvmCaptureDescriptors = captures
+      ? this.describeLinkRecords(captures) : null;
+    // The text that was compiled, after the generator declaration hoisting;
+    // `jvmStructuredSource` keeps the emitter's own output.
+    generated.jvmGeneratedSource = labeled.source;
+    return generated;
+  }
+
+  // Diagnostic (JVM_JIT_RESULT_CENSUS=<file>): append one line per compiled
+  // result describing every own property of the generated object, so the
+  // worker result protocol can be checked against what compiles really make.
+  recordResultCensus(method, generated) {
+    const fs = require("fs");
+    const describe = (value) => {
+      if (typeof value === "function") {
+        return value.jvmCaptureDescriptors ? "fn:text" :
+          value.jvmGeneratedSource ? "fn:text-nocaps" : "fn:native";
+      }
+      if (value === null || value === undefined) return String(value);
+      if (typeof value !== "object") return typeof value;
+      if (Array.isArray(value)) {
+        return `array[${value.length}]<${[...new Set(value.map(describe))].join("|")}>`;
+      }
+      if (value instanceof Map) return `map[${value.size}]`;
+      if (value instanceof Set) return `set[${value.size}]`;
+      const ctor = value.constructor?.name;
+      if (ctor && ctor !== "Object") return `object:${ctor}`;
+      const keys = Object.keys(value);
+      return `object{${keys.slice(0, 12).join(",")}${keys.length > 12 ? ",…" : ""}}`;
+    };
+    const props = {};
+    props["<self>"] = describe(generated);
+    for (const key of Object.keys(generated)) props[key] = describe(generated[key]);
+    const owner = this.jvm.findClassNameForMethod?.(method) || method.className || "?";
+    fs.appendFileSync(process.env.JVM_JIT_RESULT_CENSUS,
+      JSON.stringify({ method: `${owner}.${method.name}${method.descriptor}`, props }) + "\n");
+  }
+
+  // ---- symbolic link records (Phase 1.2 protocol) ----
+  // A generated body closes over live runtime records by capture name. The
+  // name encodes the record kind and its id in THIS JIT's tables; a worker's
+  // ids mean nothing here, so a result crosses threads as descriptors and is
+  // interned into the receiving JIT's own tables by internLinkRecords.
+  describeLinkRecord(name, value) {
+    let m;
+    if ((m = /^ssaLinkStaticCell(\d+)$/.exec(name))) {
+      const target = this.directStaticTargets[Number(m[1])];
+      return { kind: "staticCell", className: target?.siteClassName ?? null,
+        key: target?.key ?? null };
+    }
+    if ((m = /^ssaLinkCallSite(\d+)$/.exec(name))) {
+      const site = this.syncCallSites[Number(m[1])];
+      return { kind: "callSite", op: site?.op, className: site?.declaredClassName,
+        methodName: site?.methodName, descriptor: site?.descriptor,
+        callerPc: site?.callerPc ?? null };
+    }
+    if ((m = /^ssaLinkFieldSite(\d+)$/.exec(name))) {
+      const site = this.fieldSites[Number(m[1])];
+      return { kind: "fieldSite", className: site?.className,
+        fieldName: site?.fieldName, descriptor: site?.descriptor };
+    }
+    if (/^ssaLinkClassGuard\d+$/.test(name)) {
+      return { kind: "classGuard", owners: value?.owners || [] };
+    }
+    if ((m = /^ssaLinkStaticTarget(\d+)$/.exec(name))) {
+      const target = this.directStaticTargets[Number(m[1])];
+      return { kind: "staticTarget", className: target?.siteClassName ?? null,
+        key: target?.key ?? null };
+    }
+    if ((m = /^ssaLinkRestoringLayout(\d+)$/.exec(name))) {
+      // Plain data - a list of local slot indices - so it crosses by value
+      // instead of being re-resolved against the receiving JVM the way a
+      // field or call site is.
+      const slots = Array.isArray(value)
+        ? value : this.structuredSsa.restoringFrameLayouts[Number(m[1])];
+      return { kind: "restoringLayout",
+        slots: Array.isArray(slots) ? [...slots] : null };
+    }
+    if (name === "ssaAsyncInvoke") return { kind: "sentinel", which: "asyncInvoke" };
+    if (name === "ssaReturnVoid") return { kind: "sentinel", which: "returnVoid" };
+    return { kind: "unknown", name };
+  }
+
+  // A region call site is plain data except `resolvedMethod`, which is a live
+  // method object and so sinks the whole array through jsonSafeValue. Describe
+  // it the way a call site is described - owner, name, descriptor - and
+  // re-resolve it against the receiving JVM's own class table on arrival.
+  describeMethodReference(target) {
+    if (!target || typeof target !== "object") return null;
+    const className = this.jvm.findClassNameForMethod?.(target) ||
+      target.className || null;
+    if (!className || !target.name || !target.descriptor) return null;
+    return { className, name: target.name, descriptor: target.descriptor };
+  }
+
+  resolveMethodReference(ref) {
+    if (!ref || !ref.className) return null;
+    const items = this.jvm.classes[ref.className]?.ast?.classes?.[0]?.items;
+    if (!Array.isArray(items)) return null;
+    for (const item of items) {
+      const candidate = item?.method;
+      if (candidate && candidate.name === ref.name &&
+          candidate.descriptor === ref.descriptor) {
+        return candidate;
+      }
+    }
+    return null;
+  }
+
+  describeRegionCallSites(sites) {
+    if (!Array.isArray(sites)) return null;
+    const out = [];
+    for (const site of sites) {
+      const resolved = site.resolvedMethod
+        ? this.describeMethodReference(site.resolvedMethod) : null;
+      // A site that names a method we cannot describe must not be shipped
+      // half-formed: the caller refuses the whole result instead.
+      if (site.resolvedMethod && !resolved) return null;
+      const projected = { ...site, resolvedMethod: null,
+        resolvedMethodRef: resolved };
+      const safe = JitCompiler.jsonSafeValue(projected);
+      if (!safe.ok) return null;
+      out.push(safe.value);
+    }
+    return out;
+  }
+
+  internRegionCallSites(described) {
+    if (!Array.isArray(described)) return null;
+    const out = [];
+    for (const site of described) {
+      const ref = site.resolvedMethodRef || null;
+      const resolved = ref ? this.resolveMethodReference(ref) : null;
+      if (ref && !resolved) return null;
+      const { resolvedMethodRef, ...rest } = site;
+      out.push({ ...rest, resolvedMethod: resolved });
+    }
+    return out;
+  }
+
+  describeLinkRecords(captures) {
+    const out = {};
+    for (const [name, value] of Object.entries(captures)) {
+      out[name] = this.describeLinkRecord(name, value);
+    }
+    return out;
+  }
+
+  // Build live records for descriptors on this JIT. Returns {captures,
+  // renames}: the body text refers to the worker's ids, so every renamed
+  // record is bound under its ORIGINAL capture name (the name is only a
+  // binding identifier inside the generated function) and the local id is
+  // kept in renames for diagnostics. Throws when a record cannot be resolved
+  // here (class not loaded, static not yet present); the caller re-queues.
+  // Returns null when a descriptor cannot be bound to THIS JIT's tables --
+  // most often a static of a class this thread has not loaded yet, which the
+  // worker could compile against because it preloads the whole classpath.
+  // That is an ordinary refusal, not an error: the caller drops the result and
+  // the method is compiled locally later, when the class is here. Throwing
+  // instead killed the process, because the only caller on the worker path is
+  // an async 'message' handler with nothing above it to catch.
+  internLinkRecords(descriptors, callerMethod = null) {
+    const captures = {};
+    const renames = {};
+    const refuse = (reason) => {
+      this.lastTransportRefusal = reason;
+      return null;
+    };
+    for (const [name, d] of Object.entries(descriptors)) {
+      switch (d.kind) {
+        case "staticCell": {
+          const [fieldName, descriptor] = String(d.key).split(":");
+          const fieldSiteId = this.registerFieldSite(
+            ["Field", d.className, [fieldName, descriptor]]);
+          const direct = this.registerDirectStaticTarget(fieldSiteId, false);
+          const cell = direct ? this.directStaticTargets[direct.targetId].cell : null;
+          if (!cell) {
+            return refuse(`cannot intern static cell ${d.className}.${d.key}`);
+          }
+          captures[name] = cell;
+          renames[name] = `ssaLinkStaticCell${direct.targetId}`;
+          break;
+        }
+        case "callSite": {
+          const id = this.registerSyncCallSite(d.op,
+            { arg: ["Method", d.className, [d.methodName, d.descriptor]] },
+            callerMethod, d.callerPc);
+          captures[name] = this.syncCallSites[id];
+          renames[name] = `ssaLinkCallSite${id}`;
+          break;
+        }
+        case "fieldSite": {
+          const id = this.registerFieldSite(
+            ["Field", d.className, [d.fieldName, d.descriptor]]);
+          captures[name] = this.fieldSites[id];
+          renames[name] = `ssaLinkFieldSite${id}`;
+          break;
+        }
+        case "classGuard": {
+          const id = this.structuredSsa.registerClassInitializationGuard(d.owners);
+          captures[name] = this.structuredSsa.classInitializationGuards[id];
+          renames[name] = `ssaLinkClassGuard${id}`;
+          break;
+        }
+        case "staticTarget": {
+          const [fieldName, descriptor] = String(d.key).split(":");
+          const fieldSiteId = this.registerFieldSite(
+            ["Field", d.className, [fieldName, descriptor]]);
+          const direct = this.registerDirectStaticTarget(fieldSiteId, false);
+          const target = direct
+            ? this.directStaticTargets[direct.targetId] : null;
+          if (!target) {
+            return refuse(
+              `cannot intern static target ${d.className}.${d.key}`);
+          }
+          captures[name] = target;
+          renames[name] = `ssaLinkStaticTarget${direct.targetId}`;
+          break;
+        }
+        case "restoringLayout": {
+          if (!Array.isArray(d.slots)) {
+            return refuse(`cannot intern restoring layout ${name}`);
+          }
+          const id = this.structuredSsa.registerRestoringFrameLayout(d.slots);
+          captures[name] = this.structuredSsa.restoringFrameLayouts[id];
+          renames[name] = `ssaLinkRestoringLayout${id}`;
+          break;
+        }
+        case "sentinel":
+          captures[name] = d.which === "asyncInvoke"
+            ? this.asyncInvokeSentinel() : this.returnVoid();
+          break;
+        default:
+          return refuse(
+            `cannot intern capture ${name}: ${JSON.stringify(d)}`);
+      }
+    }
+    return { captures, renames };
+  }
+
+  // Rebuild a generated function from its text and descriptors alone, as the
+  // main thread will for a worker result. Nothing is read from the original
+  // function except that text and metadata.
+  rebindGeneratedFunction(generated, method) {
+    const spec = this.serializeTextBody(generated);
+    if (!spec) {
+      throw new Error("generated function carries no capture descriptors");
+    }
+    return this.materializeTextBody(spec, method);
+  }
+
+  // ---- worker result protocol (Phase 1.2) ----
+  // A compile produces one JavaScript object per method: several generated
+  // function tiers plus ~150 metadata properties. serializeGeneratedResult
+  // turns that into plain data a structured clone can carry;
+  // materializeGeneratedResult rebuilds an equivalent object on the receiving
+  // JIT, interning every link record into ITS tables. Nothing is read back
+  // from the sending JIT's live objects.
+
+  // One generated function as text + symbolic captures.
+  serializeTextBody(fn) {
+    if (typeof fn !== "function" || !fn.jvmGeneratedSource ||
+        !Array.isArray(fn.jvmParameters)) {
+      return null;
+    }
+    return {
+      name: fn.name || null,
+      parameters: [...fn.jvmParameters],
+      tier: fn.jvmTier || null,
+      generator: fn.jvmGenerator === true,
+      asynchronous: fn.jvmAsynchronous === true,
+      hoistedSource: fn.jvmHoistedSource || null,
+      source: fn.jvmGeneratedSource,
+      sourceUrl: fn.jvmSourceUrl || null,
+      captures: fn.jvmCaptureDescriptors || {},
+    };
+  }
+
+  materializeTextBody(spec, method) {
+    const interned = this.internLinkRecords(spec.captures || {}, method);
+    if (!interned) return null;
+    const { captures } = interned;
+    const names = Object.keys(captures);
+    const prefix = spec.generator ? "function* "
+      : spec.asynchronous ? "async function " : "function ";
+    const factory = new Function(...names, `"use strict"; ${
+      spec.hoistedSource ? `\n${spec.hoistedSource}\n` : ""}return ${prefix}` +
+      `${spec.name || "rebound"}(${(spec.parameters || []).join(",")}) {\n` +
+      `${spec.source}\n}`);
+    const fn = factory(...names.map((name) => captures[name]));
+    fn.jvmParameters = spec.parameters;
+    fn.jvmTier = spec.tier;
+    fn.jvmGenerator = spec.generator;
+    fn.jvmAsynchronous = spec.asynchronous;
+    fn.jvmHoistedSource = spec.hoistedSource;
+    fn.jvmGeneratedSource = spec.source;
+    fn.jvmCaptureDescriptors = spec.captures;
+    if (spec.sourceUrl) fn.jvmSourceUrl = spec.sourceUrl;
+    return fn;
+  }
+
+  // Plain-data projection of one metadata property. Live objects a receiving
+  // thread cannot be handed (methods, ASTs, statement assemblers) are refused
+  // here and reported in the payload's `dropped` list rather than silently
+  // shipped as null.
+  static jsonSafeValue(value, depth = 0) {
+    if (value === null || value === undefined) return { ok: true, value: null };
+    const type = typeof value;
+    if (type === "string" || type === "boolean") return { ok: true, value };
+    if (type === "number") {
+      return Number.isFinite(value) ? { ok: true, value } : { ok: false };
+    }
+    if (type === "bigint") return { ok: true, value: { __bigint: String(value) } };
+    if (type === "function" || type === "symbol") return { ok: false };
+    if (depth > 8) return { ok: false };
+    if (value instanceof Set) {
+      const out = [];
+      for (const entry of value) {
+        const projected = JitCompiler.jsonSafeValue(entry, depth + 1);
+        if (!projected.ok) return { ok: false };
+        out.push(projected.value);
+      }
+      return { ok: true, value: { __set: out } };
+    }
+    if (value instanceof Map) return { ok: false };
+    if (Array.isArray(value)) {
+      const out = [];
+      for (const entry of value) {
+        const projected = JitCompiler.jsonSafeValue(entry, depth + 1);
+        if (!projected.ok) return { ok: false };
+        out.push(projected.value);
+      }
+      return { ok: true, value: out };
+    }
+    if (Object.getPrototypeOf(value) !== Object.prototype &&
+        Object.getPrototypeOf(value) !== null) {
+      return { ok: false };
+    }
+    const out = {};
+    for (const [key, entry] of Object.entries(value)) {
+      const projected = JitCompiler.jsonSafeValue(entry, depth + 1);
+      if (!projected.ok) return { ok: false };
+      out[key] = projected.value;
+    }
+    return { ok: true, value: out };
+  }
+
+  static reviveJsonValue(value) {
+    if (value === null || typeof value !== "object") return value;
+    if (Array.isArray(value)) return value.map(JitCompiler.reviveJsonValue);
+    if (Array.isArray(value.__set)) {
+      return new Set(value.__set.map(JitCompiler.reviveJsonValue));
+    }
+    if (typeof value.__bigint === "string") return BigInt(value.__bigint);
+    const out = {};
+    for (const [key, entry] of Object.entries(value)) {
+      out[key] = JitCompiler.reviveJsonValue(entry);
+    }
+    return out;
+  }
+
+  // Properties the receiving side rebuilds itself (wrapper closures) or that
+  // only the region compiler consumes and cannot cross a thread.
+  static get transportRebuiltKeys() {
+    return new Set([
+      "jvmHasStructuredContinuation", "jvmHasOwnedStructuredContinuation",
+      "jvmClearStructuredContinuation", "jvmHotCallGraphWrapGenerator",
+      "jvmHotCallGraphHasContinuation", "jvmHotCallGraphHasOwnedContinuation",
+      "jvmStructuredFramedBody", "jvmAdaptiveGeneratedBody",
+      "jvmAdaptivePositionalBody", "jvmFastBody", "jvmResumeBodyFn",
+      "toString", "jvmStructuredLinkRecordCaptures",
+    ]);
+  }
+
+  // `options.provenance` is the world the REQUESTER told this compile to
+  // assume. A worker must stamp its result with that, not with its own
+  // incidental counters: the shadow JVM's class epoch and initialized set are
+  // its own bookkeeping and mean nothing on the requesting thread.
+  serializeGeneratedResult(generated, options = {}) {
+    if (typeof generated !== "function") return null;
+    if (generated.jvmResumeBody === true &&
+        typeof generated.jvmFastBody === "function" &&
+        typeof generated.jvmResumeBodyFn === "function") {
+      // withResumeBody's dispatcher is a closure over two tiers and copies
+      // the fast tier's own properties. Ship the two tiers; the receiver
+      // rebuilds the same dispatcher.
+      const legOptions = { ...options, siteTablesSince: null };
+      const fast = this.serializeGeneratedResult(
+        generated.jvmFastBody, legOptions);
+      const resume = this.serializeGeneratedResult(
+        generated.jvmResumeBodyFn, legOptions);
+      if (!fast || !resume) return null;
+      return { kind: "resume-dispatcher", fast, resume,
+        provenance: this.stampResultProvenance(options.provenance),
+        siteTables: options.siteTablesSince
+          ? this.describeSiteTablesSince(options.siteTablesSince) : null,
+        scalarResume: generated.jvmScalarResumeBody === true };
+    }
+    const payload = { kind: null, bodies: {}, data: {}, dropped: [],
+      provenance: this.stampResultProvenance(options.provenance),
+      siteTables: options.siteTablesSince
+        ? this.describeSiteTablesSince(options.siteTablesSince) : null };
+    if (generated.jvmStructuredSsa === true) {
+      const framed = this.serializeTextBody(
+        generated.jvmStructuredFramedBody || generated);
+      if (!framed) return null;
+      payload.kind = "structured";
+      payload.bodies.framed = framed;
+      payload.bodies.adaptive =
+        this.serializeTextBody(generated.jvmAdaptiveGeneratedBody);
+      payload.shape = generated.jvmStructuredWrapperShape || null;
+      payload.speculation = generated.jvmStructuredSpeculation || null;
+      if (!payload.shape || !payload.speculation) return null;
+    } else {
+      const own = this.serializeTextBody(generated);
+      if (!own) return null;
+      payload.kind = "plain";
+      payload.bodies.own = own;
+    }
+    payload.linkRecordCaptures = generated.jvmStructuredLinkRecordCaptures
+      ? this.describeLinkRecords(generated.jvmStructuredLinkRecordCaptures)
+      : null;
+    for (const key of Object.keys(generated)) {
+      if (JitCompiler.transportRebuiltKeys.has(key)) continue;
+      const value = generated[key];
+      if (typeof value === "function") {
+        const spec = this.serializeTextBody(value);
+        if (spec) payload.bodies[key] = spec;
+        else payload.dropped.push(key);
+        continue;
+      }
+      if (key === "jvmStructuredRegionCallSites") {
+        const described = this.describeRegionCallSites(value);
+        if (described) payload.regionCallSites = described;
+        else payload.dropped.push(key);
+        continue;
+      }
+      const projected = JitCompiler.jsonSafeValue(value);
+      if (projected.ok) payload.data[key] = projected.value;
+      else payload.dropped.push(key);
+    }
+    // Reporting a dropped key is not enough: nothing consumed that list, so a
+    // body installed on the receiving side with metadata missing. That is a
+    // silent wrong-value bug, not a crash - a dropped jvmStructuredRegionCallSites
+    // leaves the region call unable to resolve its callee, it yields the void
+    // sentinel, and the sentinel is then used as an array index. Refuse the
+    // whole result instead; the caller already treats null as "cannot
+    // transport" and compiles on the main thread.
+    const fatalDrops = payload.dropped.filter(
+      (key) => !JitCompiler.transportOptionalKeys.has(key));
+    if (fatalDrops.length > 0) {
+      this.lastTransportRefusal =
+        `dropped metadata: ${fatalDrops.join(", ")}`;
+      return null;
+    }
+    return payload;
+  }
+
+  // ---- site id space (Phase 1.2) ----
+  // Captures carry most link records symbolically, but the emitters also
+  // write bare table indices into the generated text on their slow paths
+  // (`helpers.getFieldAt(7, ...)`, `helpers.directStaticTargets[3]`,
+  // `restoreDirectFrame(2, ...)`). Rewriting that text on arrival is not an
+  // option -- generated JavaScript is never reparsed here -- so the two JITs
+  // share one id space instead: a compile is granted ids at or above the
+  // requester's current watermark, and the result carries every entry it
+  // allocated so the requester can place them at exactly those indices.
+  siteIdWatermark() {
+    return {
+      fieldSites: Math.max(this.nextFieldSiteId, this.fieldSites.length),
+      syncCallSites: Math.max(this.nextSyncCallSiteId,
+        this.syncCallSites.length),
+      directStaticTargets: this.directStaticTargets.length,
+      classInitializationGuards:
+        this.structuredSsa.classInitializationGuards.length,
+      restoringFrameLayouts: this.structuredSsa.restoringFrameLayouts.length,
+      // Tables the generated text also indexes by bare id, but which the
+      // protocol cannot rebuild yet. They are watermarked so a compile that
+      // allocated into one can be refused instead of transported: a body that
+      // reaches `helpers.directJreIntrinsics[3]` on the receiving JIT would
+      // find someone else's entry, or nothing.
+      directJreIntrinsics: this.directJreIntrinsics.length,
+      directJreInitializationTokens: this.directJreInitializationTokens.length,
+      checkedLeafCaptureCaches: this.checkedLeafCaptureCaches.length,
+      inlineLoopRegions: this.inlineLoopRegions.length,
+    };
+  }
+
+  // Which id-indexed tables this protocol can carry across threads. Anything
+  // else that a compile allocated into makes its result untransportable.
+  // Metadata a receiving thread may legitimately do without. These are
+  // optimization inputs whose consumers already null-guard them: losing
+  // jvmRestoringDirectPositionalInsertion costs a lexical inline (see
+  // HotCallGraphRegionCompiler's `restoringInsertion ? ... :` guard), it does
+  // not change what the body computes. Every OTHER dropped key refuses the
+  // result - a body that runs without metadata it depends on is a silent
+  // wrong-value bug, which is how a dropped region call site produced the
+  // void sentinel as an array index.
+  static get transportOptionalKeys() {
+    return new Set(["jvmRestoringDirectPositionalInsertion"]);
+  }
+
+  static get transportableSiteTables() {
+    return ["fieldSites", "syncCallSites", "directStaticTargets",
+      "classInitializationGuards", "restoringFrameLayouts"];
+  }
+
+  // Names the tables a compile allocated into that cannot cross, or [] when
+  // the result is transportable.
+  untransportableTableGrowth(base) {
+    const now = this.siteIdWatermark();
+    const carried = new Set(JitCompiler.transportableSiteTables);
+    return Object.keys(now).filter((table) =>
+      !carried.has(table) && now[table] > (base[table] ?? 0));
+  }
+
+  // Move this JIT's allocators to or above `watermark`, so nothing it
+  // allocates from now on can collide with an id the requester already uses.
+  reserveSiteIdSpace(watermark) {
+    const grow = (array, length) => {
+      while (array.length < length) array.push(undefined);
+    };
+    this.nextFieldSiteId = Math.max(this.nextFieldSiteId, watermark.fieldSites);
+    grow(this.fieldSites, watermark.fieldSites);
+    this.nextSyncCallSiteId = Math.max(this.nextSyncCallSiteId,
+      watermark.syncCallSites);
+    grow(this.syncCallSites, watermark.syncCallSites);
+    grow(this.directStaticTargets, watermark.directStaticTargets);
+    grow(this.structuredSsa.classInitializationGuards,
+      watermark.classInitializationGuards);
+    grow(this.structuredSsa.restoringFrameLayouts,
+      watermark.restoringFrameLayouts);
+    return this.siteIdWatermark();
+  }
+
+  // Every table entry allocated at or after `from`, as plain data.
+  describeSiteTablesSince(from) {
+    const tables = { fieldSites: [], syncCallSites: [], directStaticTargets: [],
+      classInitializationGuards: [], restoringFrameLayouts: [] };
+    for (let id = from.fieldSites; id < this.fieldSites.length; id += 1) {
+      const site = this.fieldSites[id];
+      if (!site) continue;
+      tables.fieldSites.push({ index: id, className: site.className,
+        fieldName: site.fieldName, descriptor: site.descriptor });
+    }
+    for (let id = from.syncCallSites; id < this.syncCallSites.length; id += 1) {
+      const site = this.syncCallSites[id];
+      if (!site) continue;
+      tables.syncCallSites.push({ index: id, op: site.op,
+        className: site.declaredClassName, methodName: site.methodName,
+        descriptor: site.descriptor, callerPc: site.callerPc ?? null });
+    }
+    for (let id = from.directStaticTargets;
+      id < this.directStaticTargets.length; id += 1) {
+      const target = this.directStaticTargets[id];
+      if (!target) continue;
+      tables.directStaticTargets.push({ index: id,
+        fieldSiteId: target.siteFieldSiteId ?? null,
+        forWrite: target.siteForWrite === true });
+    }
+    const guards = this.structuredSsa.classInitializationGuards;
+    for (let id = from.classInitializationGuards; id < guards.length; id += 1) {
+      if (!guards[id]) continue;
+      tables.classInitializationGuards.push(
+        { index: id, owners: [...(guards[id].owners || [])] });
+    }
+    const layouts = this.structuredSsa.restoringFrameLayouts;
+    for (let id = from.restoringFrameLayouts; id < layouts.length; id += 1) {
+      if (!layouts[id]) continue;
+      tables.restoringFrameLayouts.push(
+        { index: id, slots: [...layouts[id]] });
+    }
+    return tables;
+  }
+
+  // Rebuild each described entry from THIS JVM's world and put it at the
+  // sender's index. Returns null on success, else the reason it could not be
+  // placed -- an occupied slot that denotes something else means the two
+  // id spaces have diverged and the result must not be installed.
+  placeSiteTables(tables, callerMethod = null) {
+    if (!tables) return null;
+    const grow = (array, index) => {
+      while (array.length <= index) array.push(undefined);
+    };
+    // A worker compiles into fresh ids above the requester's watermark, so
+    // every call site it describes is new here -- and cold. The requester may
+    // already own a WARMED site for the same call: the same op, target and
+    // caller pc in the same caller method, carrying the fastPositional link
+    // and PIC entries it learned by running. Registering a second, empty site
+    // at the transported index silently un-warms the method, and the first
+    // entry into the new body takes generic dispatch.
+    //
+    // So an arriving site is aliased to the warmed one whenever the identity
+    // matches exactly. Identity includes the caller method, so two callers of
+    // the same target never share a PIC.
+    const warmedCallSites = (callerMethod &&
+      this.syncCallSitesByCaller.get(callerMethod)) || new Map();
+    for (const entry of tables.fieldSites || []) {
+      const existing = this.fieldSites[entry.index];
+      if (existing) {
+        if (existing.className !== entry.className ||
+            existing.fieldName !== entry.fieldName ||
+            existing.descriptor !== entry.descriptor) {
+          return `field site ${entry.index} is already ${existing.className}.` +
+            `${existing.fieldName}`;
+        }
+        continue;
+      }
+      const id = this.registerFieldSite(
+        ["Field", entry.className, [entry.fieldName, entry.descriptor]]);
+      grow(this.fieldSites, entry.index);
+      this.fieldSites[entry.index] = this.fieldSites[id];
+    }
+    for (const entry of tables.syncCallSites || []) {
+      const existing = this.syncCallSites[entry.index];
+      if (existing) {
+        if (existing.declaredClassName !== entry.className ||
+            existing.methodName !== entry.methodName ||
+            existing.descriptor !== entry.descriptor) {
+          return `call site ${entry.index} is already ` +
+            `${existing.declaredClassName}.${existing.methodName}`;
+        }
+        continue;
+      }
+      const warmed = warmedCallSites.get(`${entry.op}|${entry.className}|` +
+        `${entry.methodName}|${entry.descriptor}|${entry.callerPc ?? null}`);
+      if (warmed) {
+        grow(this.syncCallSites, entry.index);
+        this.syncCallSites[entry.index] = warmed;
+        continue;
+      }
+      const id = this.registerSyncCallSite(entry.op,
+        { arg: ["Method", entry.className, [entry.methodName, entry.descriptor]] },
+        callerMethod, entry.callerPc);
+      grow(this.syncCallSites, entry.index);
+      this.syncCallSites[entry.index] = this.syncCallSites[id];
+    }
+    for (const entry of tables.directStaticTargets || []) {
+      if (this.directStaticTargets[entry.index]) continue;
+      if (entry.fieldSiteId === null) {
+        return `direct static target ${entry.index} has no field site`;
+      }
+      const direct = this.registerDirectStaticTarget(
+        entry.fieldSiteId, entry.forWrite);
+      if (!direct) {
+        return `direct static target ${entry.index} does not resolve here`;
+      }
+      grow(this.directStaticTargets, entry.index);
+      this.directStaticTargets[entry.index] =
+        this.directStaticTargets[direct.targetId];
+    }
+    const guards = this.structuredSsa.classInitializationGuards;
+    for (const entry of tables.classInitializationGuards || []) {
+      if (guards[entry.index]) continue;
+      const id = this.structuredSsa.registerClassInitializationGuard(
+        entry.owners);
+      grow(guards, entry.index);
+      guards[entry.index] = guards[id];
+    }
+    const layouts = this.structuredSsa.restoringFrameLayouts;
+    for (const entry of tables.restoringFrameLayouts || []) {
+      if (layouts[entry.index]) continue;
+      grow(layouts, entry.index);
+      layouts[entry.index] = [...entry.slots];
+    }
+    return null;
+  }
+
+  // ---- staleness (Phase 1.3) ----
+  // What a compile assumed about the world. A worker compiles against a
+  // snapshot; by the time the result arrives the main thread may have loaded
+  // classes or initialized more of them, and a speculation the compile made
+  // may no longer hold. The compiled code's own guards re-verify the
+  // per-site facts (class-initialization guards start at epoch -1, the
+  // guarded-boolean entry guard re-reads its cell), so this check covers the
+  // decisions that have no runtime guard: which classes existed at all.
+  // Whether a body this JIT produces baked a link against the set of loaded
+  // classes with no runtime guard of its own. See resultStalenessReason.
+  resultIsEpochSensitive() {
+    return this.eagerMonomorphicCallsEnabled === true;
+  }
+
+  // The requester's snapshot describes the world the compile was asked
+  // about, but only the JIT that actually built the body knows whether it
+  // baked an epoch-sensitive link, so it stamps that itself.
+  stampResultProvenance(requested) {
+    const provenance = requested || this.captureResultProvenance();
+    return { ...provenance, epochSensitive: provenance.epochSensitive === true ||
+      this.resultIsEpochSensitive() };
+  }
+
+  captureResultProvenance() {
+    return {
+      epochSensitive: this.resultIsEpochSensitive(),
+      classEpoch: this.jvm.classEpoch,
+      classInitializationEpoch: this.jvm.classInitializationEpoch,
+      initializedClasses: [...this.jvm.classInitializationState]
+        .filter(([, state]) => state === "INITIALIZED")
+        .map(([className]) => className),
+    };
+  }
+
+  // Returns null when the result is still valid here, else a reason string.
+  // A result that is stale is not repaired: the caller re-queues the method.
+  resultStalenessReason(payload) {
+    const provenance = payload?.provenance;
+    if (!provenance) return "result carries no provenance";
+    // Classes the compile treated as initialized must still be initialized
+    // here. Initialization is monotone within one JVM, so the failing case in
+    // practice is a shadow JVM that reported more than the main thread has.
+    for (const className of provenance.initializedClasses) {
+      if (this.jvm.classInitializationState.get(className) !== "INITIALIZED") {
+        return `class ${className} is not initialized on this thread`;
+      }
+    }
+    // A moved class epoch means classes were registered since the compile.
+    // A new class can add a receiver type to a site this body linked
+    // monomorphically, so a body compiled against an older world is only
+    // admitted when the epoch is unchanged.
+    // A moved class epoch is NOT by itself a reason to drop the body. The
+    // epoch counts every class registration, and during a boot that happens
+    // continuously, so an asynchronous compile essentially always loses this
+    // race -- a worker run measured 172 of 498 finished bodies discarded here
+    // and recompiled on the main thread, which is exactly the work Phase 1.2
+    // exists to move off it.
+    //
+    // What the epoch protects is a link baked against "the set of classes
+    // that exist", with no runtime check of its own. A transported result
+    // does not carry one: its call sites arrive cold (describeSiteTablesSince
+    // carries op/class/name/descriptor/pc, and placeSiteTables rebuilds them
+    // through registerSyncCallSite with empty targets/jreTargets), its field
+    // sites and direct static targets are re-resolved here, static dispatch
+    // has no receiver to be wrong about, class-initialization guards start at
+    // epoch -1 and re-verify, and both speculation kinds -- guarded static
+    // booleans and field-backed array ranges -- re-read their cell at entry.
+    // There is no class-hierarchy devirtualization in this JIT to invalidate.
+    // Speculative monomorphic wasm links are the real epoch consumer and drop
+    // their own specok flag synchronously in bumpClassEpoch.
+    //
+    // Eager monomorphic call linking is the exception: it primes fastPositional
+    // from the world as it stands, so while it is on the strict check stays.
+    if (provenance.epochSensitive &&
+        this.jvm.classEpoch !== provenance.classEpoch) {
+      return `class epoch moved ${provenance.classEpoch} -> ` +
+        `${this.jvm.classEpoch}`;
+    }
+    return null;
+  }
+
+  materializeGeneratedResult(payload, method, options = {}) {
+    if (!payload) return null;
+    if (options.checkStaleness !== false && payload.provenance) {
+      const stale = this.resultStalenessReason(payload);
+      if (stale) {
+        this.staleTransportedResults = (this.staleTransportedResults || 0) + 1;
+        this.lastStaleTransportReason = stale;
+        return null;
+      }
+    }
+    if (payload.siteTables) {
+      const conflict = this.placeSiteTables(payload.siteTables, method);
+      if (conflict) {
+        this.staleTransportedResults = (this.staleTransportedResults || 0) + 1;
+        this.lastStaleTransportReason = conflict;
+        return null;
+      }
+    }
+    if (payload.kind === "resume-dispatcher") {
+      const fast = this.materializeGeneratedResult(
+        payload.fast, method, { checkStaleness: false });
+      const resume = this.materializeGeneratedResult(
+        payload.resume, method, { checkStaleness: false });
+      if (!fast || !resume) return null;
+      return this.buildResumeDispatcher(fast, resume, method);
+    }
+    const wrappers = require("./JvmSsaBlockRenderer").structuredWrappers;
+    let generated;
+    let framedBody = null;
+    let adaptivePositionalBody = null;
+    if (payload.kind === "structured") {
+      framedBody = this.materializeTextBody(payload.bodies.framed, method);
+      if (!framedBody) return null;
+      const state = wrappers.createStructuredSpeculationState(
+        this, payload.speculation);
+      const adaptiveGeneratedBody = payload.bodies.adaptive
+        ? this.materializeTextBody(payload.bodies.adaptive, method) : null;
+      if (payload.bodies.adaptive && !adaptiveGeneratedBody) return null;
+      if (adaptiveGeneratedBody) {
+        adaptivePositionalBody = payload.shape.ordinaryAdaptive
+          ? adaptiveGeneratedBody
+          : wrappers.wrapAdaptiveStructuredBody(adaptiveGeneratedBody, state);
+      }
+      generated = payload.shape.useContinuations
+        ? wrappers.wrapFramedStructuredBody(framedBody, state, {
+          itemCount: payload.shape.itemCount,
+          ordinaryAdaptiveCanonical: payload.shape.ordinaryAdaptiveCanonical,
+          adaptivePositionalBody,
+        })
+        : framedBody;
+      if (payload.shape.useContinuations) {
+        wrappers.attachStructuredContinuationHelpers(generated, framedBody);
+      }
+    } else {
+      generated = this.materializeTextBody(payload.bodies.own, method);
+      if (!generated) return null;
+    }
+    for (const [key, value] of Object.entries(payload.data)) {
+      generated[key] = JitCompiler.reviveJsonValue(value);
+    }
+    if (payload.regionCallSites) {
+      const sites = this.internRegionCallSites(payload.regionCallSites);
+      if (!sites) {
+        this.lastTransportRefusal = "region call site target not resolvable";
+        return null;
+      }
+      generated.jvmStructuredRegionCallSites = sites;
+    }
+    for (const [key, spec] of Object.entries(payload.bodies)) {
+      if (key === "framed" || key === "adaptive" || key === "own") continue;
+      const body = this.materializeTextBody(spec, method);
+      if (!body) return null;
+      generated[key] = body;
+    }
+    if (payload.linkRecordCaptures) {
+      const interned = this.internLinkRecords(
+        payload.linkRecordCaptures, method);
+      if (!interned) return null;
+      generated.jvmStructuredLinkRecordCaptures = interned.captures;
+    }
+    if (payload.kind === "structured") {
+      generated.jvmStructuredFramedBody = framedBody;
+      generated.jvmAdaptivePositionalBody = adaptivePositionalBody;
+      generated.jvmStructuredWrapperShape = payload.shape;
+      generated.jvmStructuredSpeculation = payload.speculation;
+    }
     return generated;
   }
 
@@ -2975,6 +4103,14 @@ class JitCompiler {
   }
 
   _compileMethodUntimed(method, options = {}) {
+    if (this.shadowCompiler.enabled) {
+      // The compile is performed by a separate JVM and arrives as plain data.
+      // A refusal (not mirrored, refused there, stale on arrival) falls back
+      // to compiling here, exactly as a worker result that misses its window
+      // would.
+      const transported = this.shadowCompiler.compile(method, options);
+      if (transported) return transported;
+    }
     const tracePattern = typeof process !== "undefined" && process.env
       ? process.env.JVM_TRACE_JIT_METHOD || "" : "";
     const traceIdentity = tracePattern
@@ -3619,6 +4755,21 @@ class JitCompiler {
       if (!resume) resume = this.compileBaselineMethod(method);
     } catch (_) { resume = null; }
     if (!resume || resume.jvmSynchronous !== true) return fast;
+    return this.buildResumeDispatcher(fast, resume, method);
+  }
+
+  // The dispatcher withResumeBody publishes, built from two finished tiers.
+  // materializeGeneratedResult calls this too, so a worker-compiled pair is
+  // wrapped by exactly the same code as a locally compiled one.
+  buildResumeDispatcher(fast, resume, method) {
+    // The resume body finishes an invocation the fast body left at a pc it
+    // does not accept (after a child suspended, say). Left alone it would
+    // run the rest of that invocation in the baseline tier: the Deko Bloko
+    // asset unpacker spent 86% of its loading phase there. The baseline body
+    // consults this set at every loop header it reaches and hands the frame
+    // back at the first accepted one.
+    method.jvmStructuredResumePcs = fast.jvmStructuredResumePcs instanceof Set
+      ? fast.jvmStructuredResumePcs : null;
     // Which branch a method actually takes is not visible from the codegen
     // cache: the dispatcher copies the fast tier's flags, so a body that
     // resumes into `resume` on every entry still reports its fast tier.
@@ -3631,7 +4782,8 @@ class JitCompiler {
       frame, thread, helpers, initialBytecodeChecks, framelessEntry,
     ) {
       const structuredEntry = frame.pc === 0 ||
-        fast.jvmHasStructuredContinuation?.(frame);
+        fast.jvmHasStructuredContinuation?.(frame) ||
+        fast.jvmStructuredResumePcs?.has(frame.pc) === true;
       let row = stats.get(statsKey);
       if (!row) {
         row = {fast: 0, resume: 0, entryPc: [], outcomes: {}};
@@ -3655,7 +4807,8 @@ class JitCompiler {
     } : function (
       frame, thread, helpers, initialBytecodeChecks, framelessEntry,
     ) {
-      return frame.pc === 0 || fast.jvmHasStructuredContinuation?.(frame)
+      return frame.pc === 0 || fast.jvmHasStructuredContinuation?.(frame) ||
+        fast.jvmStructuredResumePcs?.has(frame.pc) === true
         ? fast(frame, thread, helpers, initialBytecodeChecks, framelessEntry)
         : resume(frame, thread, helpers, initialBytecodeChecks);
     };
@@ -4343,12 +5496,37 @@ class JitCompiler {
       syncCallTraceIdentity.includes(syncCallTracePattern));
     this.compileDirectInlineCount = 0;
     let directInlineCount = 0;
+    // Targets of backward branches: the loop headers at which this body
+    // offers the frame back to a structured fast body (see withResumeBody).
+    const backEdgeTargets = new Set();
+    codeItems.forEach((item, index) => {
+      const instruction = item && item.instruction;
+      const op = getOp(instruction);
+      if (!op || typeof instruction !== "object") return;
+      const targets = [];
+      if (/^(goto|goto_w|if[a-z_]*|jsr|jsr_w)$/.test(op)) {
+        targets.push(instruction.arg);
+      } else if (op === "tableswitch") {
+        targets.push(...(instruction.labels || []), instruction.defaultLbl);
+      } else if (op === "lookupswitch") {
+        targets.push(instruction.arg?.defaultLabel,
+          ...((instruction.arg?.pairs || []).filter(Array.isArray)
+            .map(([, label]) => label)));
+      }
+      for (const label of targets) {
+        const target = typeof label === "string"
+          ? this.compileLabelMap.get(label) : undefined;
+        if (target !== undefined && target <= index) backEdgeTargets.add(target);
+      }
+    });
     const body = [
       '"use strict";',
       "const locals = frame.locals;",
       "const stack = frame.stack.items;",
       "let sp = stack.length;",
       "let pc = frame.pc;",
+      "const handoffPcs = frame.method.jvmStructuredResumePcs || null;",
+      "const handoffEntry = pc;",
       "let bytecodesUntilYield = 10000;",
       "let bytecodeChecks = initialBytecodeChecks === undefined ? helpers.needsBytecodeChecks() : initialBytecodeChecks;",
       // Prime stride, as in the runner, so successive probes land on different
@@ -4373,6 +5551,20 @@ class JitCompiler {
     try {
       codeItems.forEach((item, index) => {
         body.push(`case ${index}:`);
+        if (synchronous && backEdgeTargets.has(index)) {
+          body.push(
+            // The per-frame cap bounds a fast body that keeps declining the
+            // frame at this header (each decline interprets one bytecode and
+            // returns here): progress is still made, only slower.
+            `if (handoffPcs !== null && ${index} !== handoffEntry && ` +
+              `handoffPcs.has(${index}) && ` +
+              "(frame.jvmResumeHandoffs = (frame.jvmResumeHandoffs | 0) + 1) " +
+              "<= 100000) { " +
+              `helpers.materializeCached(frame, locals, stack, sp, ${index}); ` +
+              "helpers.structuredResumeHandoffCount += 1; " +
+              "return { deopt: true, transient: true, " +
+              "reason: 'structured resume handoff' }; }");
+        }
         const loopRegion = loopRegionsByHeader.get(index);
         if (loopRegion) {
           if (loopRegion.scalarBounded) {
@@ -5926,9 +7118,20 @@ class JitCompiler {
     return false;
   }
 
+  // An id indexes the table of the JIT that COMPILED the body. Once a body is
+  // transported from a compile worker, the receiving JIT's `fieldSites` is a
+  // different table, so a bare index reads the wrong site or none at all -
+  // that is the "Unknown generated field site" failure. Bodies therefore
+  // capture the record symbolically (`ssaLinkFieldSite<id>`, rebound on
+  // arrival) and call the *Site form; this id form stays for host-side callers
+  // that legitimately hold an index into their own table.
   getFieldAt(id, objRef) {
     const site = this.fieldSites[id];
     if (!site) throw new Error(`Unknown generated field site ${id}`);
+    return this.getFieldAtSite(site, objRef);
+  }
+
+  getFieldAtSite(site, objRef) {
     if (objRef === null || objRef === undefined) {
       throw { type: "java/lang/NullPointerException", message: null };
     }
@@ -5954,6 +7157,10 @@ class JitCompiler {
   putFieldAt(id, objRef, value) {
     const site = this.fieldSites[id];
     if (!site) throw new Error(`Unknown generated field site ${id}`);
+    return this.putFieldAtSite(site, objRef, value);
+  }
+
+  putFieldAtSite(site, objRef, value) {
     if (objRef === null || objRef === undefined) {
       throw { type: "java/lang/NullPointerException", message: null };
     }
@@ -6020,7 +7227,10 @@ class JitCompiler {
     if (forWrite) {
       const classData = this.jvm.classes[site.className];
       if (classData && classData.staticFields) {
-        return { kind: "map", fields: classData.staticFields, key };
+        // No cell for a key the store does not hold yet: a cell write
+        // would bypass the Map.set that creates the key, and generic reads
+        // resolve fields by key existence.
+        return { kind: "map", fields: classData.staticFields, key, cell: null };
       }
     }
     return null;
@@ -6034,10 +7244,25 @@ class JitCompiler {
       target = this.resolveStaticFieldSite(site, forWrite);
     }
     if (!target || (forWrite && target.kind !== "map")) return null;
+    // A target resolved before the class ran <clinit> (a putstatic site,
+    // say) was created without a cell; the store hands one out for a key
+    // that does not exist yet and keeps it current once the key is set.
+    if (!target.cell && target.kind === "map" &&
+        typeof target.fields.cell === "function" &&
+        target.fields.has(target.key)) {
+      target.cell = target.fields.cell(target.key);
+    }
     site.staticTarget = target;
     target.initializationToken = site.initializationToken;
     target.versionCell = this.getStaticFieldVersionCell(
       target.fields, target.key);
+    target.siteClassName = site.className;
+    target.siteDescriptor = site.descriptor;
+    // Provenance for the worker protocol: a target is a live resolution of
+    // one field site, so a receiving JIT rebuilds it from these rather than
+    // copying an object that points into this JVM's static store.
+    target.siteFieldSiteId = id;
+    target.siteForWrite = forWrite === true;
     const targetId = this.directStaticTargets.length;
     this.directStaticTargets.push(target);
     return { targetId, kind: target.kind, key: target.key,
@@ -6365,7 +7590,7 @@ class JitCompiler {
     callerPc = null) {
     const [, declaredClassName, [methodName, descriptor]] = instruction.arg;
     const id = this.nextSyncCallSiteId++;
-    this.syncCallSites[id] = {
+    const site = {
       op,
       declaredClassName,
       methodName,
@@ -6378,6 +7603,20 @@ class JitCompiler {
       targets: new Map(),
       jreTargets: new Map(),
     };
+    this.syncCallSites[id] = site;
+    // placeSiteTables has to find the warmed site for an arriving one by
+    // identity. Scanning the whole table for it is quadratic once the table
+    // is large -- a real boot reaches six figures of sites -- so the lookup
+    // it needs is maintained here, at the one place sites are allocated.
+    if (callerMethod) {
+      let byCaller = this.syncCallSitesByCaller.get(callerMethod);
+      if (!byCaller) {
+        byCaller = new Map();
+        this.syncCallSitesByCaller.set(callerMethod, byCaller);
+      }
+      byCaller.set(`${op}|${declaredClassName}|${methodName}|` +
+        `${descriptor}|${site.callerPc}`, site);
+    }
     return id;
   }
 
@@ -6590,9 +7829,17 @@ class JitCompiler {
     };
   }
 
+  // The bare id form indexes the compiling JIT's table. A transported body
+  // whose text said `tryInvokeSyncAt(1025, ...)` reached a completely
+  // different call site here - the capture had been rebound to another id -
+  // and invoking the wrong target returned the void sentinel, which the body
+  // then used as an array index. Generated code passes the captured record.
   tryInvokeSyncAt(id, frame, thread) {
+    return this.tryInvokeSyncAtSite(this.syncCallSites[id], frame, thread, id);
+  }
+
+  tryInvokeSyncAtSite(site, frame, thread, id = site?.id) {
     this.hotCallGraphRegions.recordGenericCallSite(id, frame);
-    const site = this.syncCallSites[id];
     if (!site) return ASYNC_INVOKE;
     if (this.debugNonTopInvoke) {
       const items = thread?.callStack?.items || [];
@@ -7504,6 +8751,12 @@ class JitCompiler {
       if (normallySupported && !target.intrinsic && !target.inlineIntegerRegion) {
         target.generated = this.getGeneratedFunction(method);
         this.trackGeneratedTarget(method, target, site);
+      } else if (wasmOwned) {
+        // A Wasm-owned target has no JavaScript body yet. Track it anyway so a
+        // later adaptive compile of the callee publishes its synchronous body
+        // here; otherwise the site returns the asynchronous handoff on every
+        // call once the module stops being ready.
+        this.trackGeneratedTarget(method, target, site);
       }
       site.targets.set(targetClassName, target);
       if (op === "invokestatic" && target.intrinsic) {
@@ -7761,7 +9014,26 @@ class JitCompiler {
     // the asynchronous path.
     const wasmOwnedCallee = !synchronousGenerated &&
       this.hasReadyWasmModuleForSynchronousCall(method);
-    if (!synchronousGenerated && !wasmOwnedCallee) return ASYNC_INVOKE;
+    if (!synchronousGenerated && !wasmOwnedCallee) {
+      // The target may predate the callee's compile (for example a target
+      // created while a Wasm module was ready, or before adaptive admission).
+      // Adopt an already cached synchronous body instead of handing every
+      // call back to the scheduler; this never compiles anything here.
+      const cached = !generated && !intrinsic && !inlineIntegerRegion &&
+        this.isCodegenSupported(method) ? this.codegenCache.get(method) : null;
+      if (cached && cached.jvmSynchronous) {
+        this.publishGeneratedTargetUpgrade(method, cached, { regionEntryOnly: true });
+        if (target.generated !== cached) {
+          target.generated = cached;
+          target.positionalInvoker = undefined;
+          target.preferFrameless = false;
+          target.framelessRejected = false;
+        }
+        this.lateLinkedGeneratedTargetCount = (this.lateLinkedGeneratedTargetCount | 0) + 1;
+        return this.tryInvokeResolvedTarget(site, target, frame, thread);
+      }
+      return ASYNC_INVOKE;
+    }
 
     // A generated caller can reach a small reference cleanup through the
     // generic resolved-target path before its emitted call-site closure has
@@ -9439,6 +10711,7 @@ JitCompiler.debugInvokeTrace = (() => {
 })();
 
 module.exports = JitCompiler;
+module.exports.hoistGeneratorDeclarations = hoistGeneratorDeclarations;
 module.exports._test = {
   bytecodeLocalSlot,
   localReadBeforeWrite,

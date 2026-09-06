@@ -45,9 +45,33 @@ function parseDescriptor(descriptor) {
   }
 }
 
+// The internal class names a descriptor names, e.g.
+// "(Ljava/lang/String;[I)Lfoo/Bar;" -> ["java/lang/String", "foo/Bar"].
+//
+// parseDescriptor is the wrong tool for this: it returns DISPLAY types
+// ("java.lang.String", with "[]" suffixes), so a caller that needs to load the
+// class would have to convert back. This keeps the internal form.
+//
+// Every object type in a descriptor starts with 'L' at a type position and
+// ends at the next ';'. No primitive code is 'L', and an 'L' inside a class
+// name is skipped over because the scan resumes past the terminator.
+function objectTypesInDescriptor(descriptor) {
+  const names = [];
+  if (typeof descriptor !== 'string') return names;
+  for (let index = 0; index < descriptor.length; index += 1) {
+    if (descriptor[index] !== 'L') continue;
+    const end = descriptor.indexOf(';', index);
+    if (end === -1) break;
+    names.push(descriptor.slice(index + 1, end));
+    index = end;
+  }
+  return names;
+}
+
 function descriptorToString(descriptorAST) {
   const params = descriptorAST.params.join(', ');
   return `${descriptorAST.returnType}(${params})`;
 }
 
-module.exports = { parseDescriptor, descriptorToString };
+module.exports = { parseDescriptor, descriptorToString,
+  objectTypesInDescriptor };

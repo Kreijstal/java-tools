@@ -2345,6 +2345,11 @@ class WasmJit {
     this.jit = jit;
     const env = (typeof process !== 'undefined' && process.env) || {};
     const browserDefault = typeof window !== 'undefined' && typeof document !== 'undefined';
+    // Embedders (the browser bundle has an empty process.env) switch the
+    // backend features through JVM options: jit.wasm = { structured,
+    // directStaticLink, directInstanceLink, checkcast }. An option that is
+    // set wins over its environment variable.
+    const wasmOptions = (jvm && jvm.jitOptions && jvm.jitOptions.wasm) || {};
     this.enabled = (env.JVM_WASM_JIT === '1' || browserDefault) && typeof WebAssembly !== 'undefined' &&
       !env.JVM_TRACE && env.JVM_PROFILE_HOT_METHODS !== '1';
     // Browser launchers may explicitly finish an ahead-of-time preparation
@@ -2373,24 +2378,24 @@ class WasmJit {
     this.failedCompileRetryMinMs = env.JVM_WASM_FAILED_RETRY_MIN_MS === undefined
       ? 50 : Number(env.JVM_WASM_FAILED_RETRY_MIN_MS);
     this.retryBackoffMax = Math.max(1, Number(env.JVM_WASM_JIT_RETRY_BACKOFF_MAX || 4096));
-    this.structuredEnabled = env.JVM_WASM_STRUCTURED === '1';
+    this.structuredEnabled = wasmOptions.structured ?? (env.JVM_WASM_STRUCTURED === '1');
     this.instanceLinkEnabled = env.JVM_WASM_DEVIRT !== '0';
     // Direct wasm->wasm static links: eligible fully-compiled callees are
     // called through their runv export with no JS bridge on the path.
-    this.directStaticLinkEnabled = env.JVM_WASM_DIRECT_STATIC_LINK === '1';
+    this.directStaticLinkEnabled = wasmOptions.directStaticLink ?? (env.JVM_WASM_DIRECT_STATIC_LINK === '1');
     // Direct wasm->wasm instance links: a monomorphic-in-practice site calls
     // its single ready fully-compiled target through runv behind an in-wasm
     // null check (invokespecial) or a one-import receiver-class guard
     // (invokevirtual/invokeinterface); every other receiver falls back to
     // the generic dispatch import.
-    this.directInstanceLinkEnabled = env.JVM_WASM_DIRECT_INSTANCE_LINK === '1';
+    this.directInstanceLinkEnabled = wasmOptions.directInstanceLink ?? (env.JVM_WASM_DIRECT_INSTANCE_LINK === '1');
     // Closed polymorphic sites can classify the externref once, then call the
     // selected raw Wasm export directly. This removes the JS nested-call
     // wrapper while retaining the generic import for null, late, partial, and
     // otherwise unlinked targets.
     this.importStatsEnabled = env.JVM_WASM_IMPORT_STATS === '1';
     this.lateInstanceTargetsEnabled = env.JVM_DISABLE_WASM_LATE_INSTANCE_TARGETS !== '1';
-    this.checkcastEnabled = env.JVM_WASM_CHECKCAST === '1';
+    this.checkcastEnabled = wasmOptions.checkcast ?? (env.JVM_WASM_CHECKCAST === '1');
     // How many times a ready-but-partial module may be rebuilt after the class
     // world grows. Bounded because unbounded rebuilding is the "recompile
     // storm" that previously measured -1.4 to -2.4 fps; 0 disables it.
@@ -2433,7 +2438,8 @@ class WasmJit {
     }
     // See probeFullCoverage(). Opt-in: it makes the gate compile modules the
     // JS tier might still win, which is a real up-front cost.
-    this.preferFullCoverage = env.JVM_WASM_PREFER_FULL_COVERAGE === '1';
+    this.preferFullCoverage = wasmOptions.preferFullCoverage ??
+      (env.JVM_WASM_PREFER_FULL_COVERAGE === '1');
     // Bisection aid: restrict the preference to a comma-separated list of
     // `Class.name(desc)ret` keys, so one miscompiling method can be isolated
     // without disabling the whole policy.
@@ -2620,6 +2626,11 @@ class WasmJit {
       const threshold = dependencyChanged ? 1 : (st.retryAfter || this.warmupThreshold);
       // hasBackwardBranch is eligibility-aware and already excludes
       // opaque-control methods; see the note on it in JitCompiler.
+      // The hotness sampler (JVM_JIT_HOTNESS) governs the JS tiers only. An
+      // earlier version let "selected" replace this gate; the Wasm tier then
+      // compiled methods before their dependencies were ready, retried them
+      // module after module, and va.d(I)[F ran on the JS structured tier
+      // with 15% GC instead of on Wasm (Deko Bloko boot 65 s -> 97-113 s).
       if (st.entries < threshold || !this.jit.hasBackwardBranch(frame.method)) {
         if (this.census) {
           this._censusNote(frame,

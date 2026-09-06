@@ -24,8 +24,9 @@ function regionFunctionNames(source) {
 }
 
 test('hot call-graph roots have a conservative structural size bound', (t) => {
-  const ordinary = new JVM({jit: {hotCallGraphRegions: true}});
-  const widened = new JVM({jit: {
+  const ordinary = new JVM({jit: {compileWorker: false, profileMethods: false, hotCallGraphRegions: true}});
+  const widened = new JVM({jit: {compileWorker: false, 
+    profileMethods: false,
     hotCallGraphRegions: true,
     hotCallGraphMaxRootCodeItems: 4096,
     hotCallGraphDirectSafePointBudget: 256,
@@ -45,7 +46,8 @@ test('hot call-graph roots have a conservative structural size bound', (t) => {
 
 test('hot call-graph roots compile whole SSA before local loop extraction',
   (t) => {
-  const jvm = new JVM({jit: {
+  const jvm = new JVM({jit: {compileWorker: false, 
+    profileMethods: false,
     structuredSsa: true,
     hotCallGraphRegions: true,
   }});
@@ -75,7 +77,8 @@ test('hot call-graph roots compile whole SSA before local loop extraction',
 });
 
 test('a hot graph can own SSA independently of a cached ordinary tier', (t) => {
-  const jvm = new JVM({jit: {
+  const jvm = new JVM({jit: {compileWorker: false, 
+    profileMethods: false,
     structuredSsa: true,
     hotCallGraphRegions: true,
     graphOwnedStructuredCandidates: true,
@@ -116,7 +119,8 @@ test('a hot graph can own SSA independently of a cached ordinary tier', (t) => {
 });
 
 test('graph-owned SSA remains an explicit experiment', (t) => {
-  const jvm = new JVM({jit: {
+  const jvm = new JVM({jit: {compileWorker: false, 
+    profileMethods: false,
     structuredSsa: true,
     hotCallGraphRegions: true,
   }});
@@ -140,7 +144,8 @@ test('graph-owned SSA remains an explicit experiment', (t) => {
 });
 
 test('bounded call-free array leaves are graph-owned by structure', (t) => {
-  const jvm = new JVM({jit: {
+  const jvm = new JVM({jit: {compileWorker: false, 
+    profileMethods: false,
     structuredSsa: true,
     hotCallGraphRegions: true,
   }});
@@ -205,7 +210,8 @@ public class GraphOwnedCallee {
 }
 `);
   t.teardown(() => fs.rmSync(classpath, {recursive: true, force: true}));
-  const jvm = new JVM({classpath, jit: {
+  const jvm = new JVM({classpath, jit: {compileWorker: false, 
+    profileMethods: false,
     warmupThreshold: 0,
     structuredSsa: true,
     hotCallGraphRegions: true,
@@ -261,7 +267,8 @@ public class ${className} {
 }
 `);
   t.teardown(() => fs.rmSync(classpath, {recursive: true, force: true}));
-  const jvm = new JVM({classpath, jit: {
+  const jvm = new JVM({classpath, jit: {compileWorker: false, 
+    profileMethods: false,
     warmupThreshold: 0,
     structuredSsa: true,
     structuredRunCounters: false,
@@ -316,7 +323,8 @@ public class ${className} {
 
 test('a late structured upgrade is region-audited at its next stable entry',
   (t) => {
-  const jvm = new JVM({jit: {
+  const jvm = new JVM({jit: {compileWorker: false, 
+    profileMethods: false,
     warmupThreshold: 2,
     structuredSsa: true,
     hotCallGraphRegions: true,
@@ -484,7 +492,7 @@ public class GenericCallGraphLoop {
 }
 `);
   t.teardown(() => fs.rmSync(classpath, {recursive: true, force: true}));
-  const jvm = new JVM({classpath, jit: {
+  const jvm = new JVM({classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
     structuredRunCounters: false,
@@ -876,15 +884,15 @@ public class GenericCallGraphLoop {
     cachedFieldRoot, {forceExpansion: true});
   t.ok(cachedFieldPlan?.backendEligible,
     'an exact final receiver edge closes the instance-field region');
-  const originalTryInvokeSyncAt = jvm.jit.tryInvokeSyncAt.bind(jvm.jit);
+  const originalTryInvokeSyncAt = jvm.jit.tryInvokeSyncAtSite.bind(jvm.jit);
   let genericRegionCalls = 0;
-  jvm.jit.tryInvokeSyncAt = (...args) => {
+  jvm.jit.tryInvokeSyncAtSite = (...args) => {
     genericRegionCalls += 1;
     return originalTryInvokeSyncAt(...args);
   };
   t.equal(cachedFieldPlan.body(jvm.jit, receiver, 5, thread, false), 105,
     'the narrowed cache effects preserve the exact scalar result');
-  jvm.jit.tryInvokeSyncAt = originalTryInvokeSyncAt;
+  jvm.jit.tryInvokeSyncAtSite = originalTryInvokeSyncAt;
   t.equal(genericRegionCalls, 0,
     'an exact virtual edge calls its local region node without dispatch');
   t.equal(receiver.fields[`${className}.mutated`], 5,
@@ -897,13 +905,13 @@ public class GenericCallGraphLoop {
   thread.callStack.push(cachedFramedParent);
   thread.callStack.push(cachedFramedRoot);
   let cachedFramedGenericCalls = 0;
-  jvm.jit.tryInvokeSyncAt = (...args) => {
+  jvm.jit.tryInvokeSyncAtSite = (...args) => {
     cachedFramedGenericCalls += 1;
     return originalTryInvokeSyncAt(...args);
   };
   const cachedFramedResult = jvm.jit.runSelectedGeneratedFrame(
     cachedFieldPlan.framedBody, cachedFramedRoot, thread);
-  jvm.jit.tryInvokeSyncAt = originalTryInvokeSyncAt;
+  jvm.jit.tryInvokeSyncAtSite = originalTryInvokeSyncAt;
   t.ok(cachedFramedResult?.handled,
     'the profiled exact virtual edge executes from a framed module root');
   t.equal(cachedFramedGenericCalls, 0,
@@ -972,15 +980,15 @@ public class GenericCallGraphLoop {
   framedFrame.locals.splice(0, 4, markers, values, 7, 1);
   thread.callStack.push(framedParent);
   thread.callStack.push(framedFrame);
-  const originalFramedTryInvoke = jvm.jit.tryInvokeSyncAt.bind(jvm.jit);
+  const originalFramedTryInvoke = jvm.jit.tryInvokeSyncAtSite.bind(jvm.jit);
   let framedGenericCalls = 0;
-  jvm.jit.tryInvokeSyncAt = (...args) => {
+  jvm.jit.tryInvokeSyncAtSite = (...args) => {
     framedGenericCalls += 1;
     return originalFramedTryInvoke(...args);
   };
   const framedResult = jvm.jit.runSelectedGeneratedFrame(
     framedGenerated, framedFrame, thread);
-  jvm.jit.tryInvokeSyncAt = originalFramedTryInvoke;
+  jvm.jit.tryInvokeSyncAtSite = originalFramedTryInvoke;
   t.ok(framedResult?.handled,
     'the framed call-graph entry completes through normal JVM return state');
   t.equal(framedGenericCalls, 0,
@@ -1053,7 +1061,7 @@ public final class GenericFloatFilterGraph {
   t.teardown(() => fs.rmSync(classpath, {recursive: true, force: true}));
   const expected = Number(execFileSync(
     'java', ['-cp', classpath, className], {encoding: 'utf8'}).trim());
-  const jvm = new JVM({classpath, jit: {
+  const jvm = new JVM({classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
     structuredRunCounters: false,
@@ -1147,7 +1155,7 @@ public final class DynamicCallGraphLoop {
 }
 `);
   t.teardown(() => fs.rmSync(classpath, {recursive: true, force: true}));
-  const jvm = new JVM({classpath, jit: {
+  const jvm = new JVM({classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
     structuredRunCounters: false,
@@ -1319,7 +1327,7 @@ public final class GuardedInternalGraphRoot {
 }
 `);
   t.teardown(() => fs.rmSync(classpath, {recursive: true, force: true}));
-  const jvm = new JVM({classpath, jit: {
+  const jvm = new JVM({classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
     structuredRunCounters: false,
@@ -1438,7 +1446,7 @@ ${grind}
   t.teardown(() => fs.rmSync(classpath, {recursive: true, force: true}));
 
   const compileGraph = async (options) => {
-    const jvm = new JVM({classpath, jit: {
+    const jvm = new JVM({classpath, jit: {compileWorker: false, 
       warmupThreshold: 0,
       structuredSsa: true,
       structuredRunCounters: false,

@@ -20,7 +20,11 @@ function field(name, descriptor) {
 function denseJvm() {
   const jvm = new JVM({
     denseInstanceFields: true,
-    jit: { warmupThreshold: 0, profileMethods: false },
+    // These cases compile synthetic methods that exist only in this test's AST,
+    // then call the body directly. The compile worker cannot mirror a method
+    // with no class file behind it, and getGeneratedFunction returns null once
+    // the worker accepts a method, so codegen assertions must compile in-thread.
+    jit: { warmupThreshold: 0, profileMethods: false, compileWorker: false },
   });
   jvm.classes.DenseBase = {
     staticFields: new Map(),
@@ -108,7 +112,7 @@ test('generated JavaScript reads and writes dense fields directly', (t) => {
 });
 
 test('Wasm field imports resolve dense slots for classes loaded after compile', (t) => {
-  const jvm = new JVM({ denseInstanceFields: true });
+  const jvm = new JVM({ denseInstanceFields: true, jit: { compileWorker: false } });
   const functions = [];
   const registry = {
     importIndexByName: new Map(),

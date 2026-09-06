@@ -172,7 +172,7 @@ function substituteRegionParts(parts, replacements) {
 // of the statement that wrote it -- so a pass that rewrites references by
 // operand substitution can never relocate one, and must never try.
 const REGION_AMBIENT_NAMES = new Set([
-  "helpers", "frame", "locals", "stack", "thread", "plan",
+  "helpers", "frame", "locals", "stack", "ssaRestoredFrame", "thread", "plan",
   "restorationDepth", "safePointBudget", "nestedEntryGuarded",
   "framelessEntry", "initialBytecodeChecks",
 ]);
@@ -1687,6 +1687,16 @@ function partitionOversizedLinearBlocks(units, options = {}) {
               head.reads === null) {
             flush(index);
             runStart = index + 1;
+            // The head itself can never move, but the statement lists its
+            // construct owns are still ordinary runs. Descending is what
+            // keeps a framed root partitionable once the resume dispatcher
+            // wraps its whole body in one `switch (ssaResumePc)`: that group
+            // is a single non-relocatable head holding every loop the pass
+            // exists to cut.
+            if (bytes > targetSegmentBytes) {
+              oversizedStatements += 1;
+              recurseIntoGroup(group);
+            }
             continue;
           }
           if (bytes > targetSegmentBytes) {

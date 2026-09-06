@@ -5,6 +5,15 @@ class DebugController {
   constructor(options = {}) {
     this.options = {
       rewindHistorySize: 0,
+      // A debug session must observe faithful lazy class loading: the
+      // deferred-breakpoint feature exists precisely because a class is not
+      // loaded until something references it. The ahead-of-main preparation
+      // pass preloads the classpath and its transitive references, which arms
+      // such a breakpoint immediately and hides the pending state the user is
+      // meant to see. Debugging is not throughput-sensitive - the JIT is
+      // usually disabled here too - so preparation stays off unless a caller
+      // asks for it explicitly via the spread below.
+      prepareBeforeMain: false,
       ...options,
     };
     this.jvm = new JVM(this.options);

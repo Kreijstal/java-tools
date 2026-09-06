@@ -2,6 +2,8 @@ const Stack = require('./stack');
 
 const FRAME_MONITOR_KIND = Symbol('frame.monitorKind');
 
+const { STRUCTURED_CONTINUATION } = require('./constants');
+
 class Frame {
   constructor(method) {
     this.method = method;
@@ -39,6 +41,27 @@ class Frame {
       this.exceptionTable = [];
     }
     this.pc = 0;
+    // Every property any tier may later store on a frame is declared here, in
+    // one fixed order, and is never deleted (writers store undefined instead).
+    // Frames are the hottest objects in the runtime and flow through shared
+    // helpers (invoke, run, materialize); when they arrived with a dozen
+    // different hidden classes those helpers' property accesses went
+    // megamorphic and Ion bailed out on shape guards (measured at the Deko
+    // Bloko menu: 9 distinct key orders among 23 live frames, ~20% of self
+    // time in shared megamorphic stubs).
+    this.className = undefined;
+    this.jitSkipOnce = undefined;
+    this.jitJsDisabled = undefined;
+    this.jitAdaptiveEntryCounted = undefined;
+    this.jitGeneratedReturnParent = undefined;
+    this.jitGeneratedReturnType = undefined;
+    this.jitStableGeneratedEntry = undefined;
+    this.jvmResumeHandoffs = undefined;
+    this.jitFrameHandoffTrace = undefined;
+    this.initializingClassName = undefined;
+    this.inUse = false;
+    this.resumedAt = undefined;
+    this[STRUCTURED_CONTINUATION] = undefined;
   }
 }
 

@@ -61,7 +61,7 @@ test('graph handoffs discard an impossible stale primitive above a receiver',
       codeItems: [], exceptionTable: [], localsSize: '0', stackSize: '0',
     }}],
   };
-  const jvm = new JVM({jit: {
+  const jvm = new JVM({jit: {compileWorker: false, 
     warmupThreshold: 0, hotCallGraphRegions: true,
   }});
   jvm.classes[owner] = {
@@ -123,7 +123,7 @@ test('substantial call-bearing loops prefer whole call-graph lowering', (t) => {
       ],
     }}],
   };
-  const jvm = new JVM({jit: {hotCallGraphRegions: true}});
+  const jvm = new JVM({jit: {compileWorker: false, hotCallGraphRegions: true}});
   t.ok(jvm.jit.isCallGraphStructuredFirstMethod(method),
     'bytecode size, call density, and a backedge select the complete CFG');
   t.ok(jvm.jit.isWholeMethodJsEntryPreferred(method),
@@ -179,7 +179,7 @@ public class GeneratedReturnGuardHarness {
   public static int value() { return 7; }
 }
 `);
-  const jvm = new JVM({classpath, jit: {warmupThreshold: 0}});
+  const jvm = new JVM({classpath, jit: {compileWorker: false, warmupThreshold: 0}});
   await jvm.loadClassByName('GeneratedReturnGuardHarness');
   const method = await jvm.findMethodInHierarchy(
     'GeneratedReturnGuardHarness', 'value', '()I');
@@ -218,7 +218,7 @@ public class GeneratedInvokeChildGuardHarness {
   public static int caller() { return child(); }
 }
 `);
-  const jvm = new JVM({classpath, jit: {warmupThreshold: 0}});
+  const jvm = new JVM({classpath, jit: {compileWorker: false, warmupThreshold: 0}});
   await jvm.loadClassByName('GeneratedInvokeChildGuardHarness');
   const method = await jvm.findMethodInHierarchy(
     'GeneratedInvokeChildGuardHarness', 'caller', '()I');
@@ -232,12 +232,12 @@ public class GeneratedInvokeChildGuardHarness {
     callStack: new Stack(),
   };
   thread.callStack.push(frame);
-  const originalInvoke = jvm.jit.tryInvokeSyncAt;
-  jvm.jit.tryInvokeSyncAt = () => {
+  const originalInvoke = jvm.jit.tryInvokeSyncAtSite;
+  jvm.jit.tryInvokeSyncAtSite = () => {
     thread.callStack.push(activeChild);
     return jvm.jit.returnVoid();
   };
-  t.teardown(() => { jvm.jit.tryInvokeSyncAt = originalInvoke; });
+  t.teardown(() => { jvm.jit.tryInvokeSyncAtSite = originalInvoke; });
 
   let result;
   t.doesNotThrow(() => { result = generated(frame, thread, jvm.jit, false); },
@@ -262,7 +262,7 @@ public class GeneratedAsyncChildGuardHarness {
   public static int caller(int value) { child(value); return value + 1; }
 }
 `);
-  const jvm = new JVM({classpath, jit: {warmupThreshold: 0}});
+  const jvm = new JVM({classpath, jit: {compileWorker: false, warmupThreshold: 0}});
   await jvm.loadClassByName('GeneratedAsyncChildGuardHarness');
   const method = await jvm.findMethodInHierarchy(
     'GeneratedAsyncChildGuardHarness', 'caller', '(I)I');
@@ -277,9 +277,9 @@ public class GeneratedAsyncChildGuardHarness {
     callStack: new Stack(),
   };
   thread.callStack.push(frame);
-  const originalInvoke = jvm.jit.tryInvokeSyncAt;
+  const originalInvoke = jvm.jit.tryInvokeSyncAtSite;
   let consumesInvocation = true;
-  jvm.jit.tryInvokeSyncAt = (_id, caller, currentThread) => {
+  jvm.jit.tryInvokeSyncAtSite = (_id, caller, currentThread) => {
     if (consumesInvocation) {
       caller.stack.pop();
       activeChild.jitGeneratedReturnParent = caller;
@@ -289,7 +289,7 @@ public class GeneratedAsyncChildGuardHarness {
     currentThread.callStack.push(activeChild);
     return jvm.jit.asyncInvokeSentinel();
   };
-  t.teardown(() => { jvm.jit.tryInvokeSyncAt = originalInvoke; });
+  t.teardown(() => { jvm.jit.tryInvokeSyncAtSite = originalInvoke; });
 
   const result = generated(frame, thread, jvm.jit, false);
   t.ok(result?.deopt && result.transient,
@@ -326,7 +326,7 @@ public class StructuredReturnGuardHarness {
   public static int value() { return 11; }
 }
 `);
-  const jvm = new JVM({classpath, jit: {
+  const jvm = new JVM({classpath, jit: {compileWorker: false, 
     warmupThreshold: 0, structuredSsa: true,
   }});
   await jvm.loadClassByName('StructuredReturnGuardHarness');
@@ -369,7 +369,7 @@ public final class WasmOsrChildHandoffHarness {
   }
 }
 `);
-  const jvm = new JVM({classpath, jit: {
+  const jvm = new JVM({classpath, jit: {compileWorker: false, 
     warmupThreshold: 0, inlineLoopRegions: false, structuredSsa: false,
   }});
   await jvm.loadClassByName('WasmOsrChildHandoffHarness');
@@ -458,7 +458,7 @@ public class StructuredLocalSpillHarness {
   }
 }
 `);
-  const jvm = new JVM({classpath, jit: {
+  const jvm = new JVM({classpath, jit: {compileWorker: false, 
     warmupThreshold: 0, structuredSsa: true,
   }});
   await jvm.loadClassByName('StructuredLocalSpillHarness');
@@ -605,7 +605,7 @@ test('Wasm value imports preserve JavaScript boolean fields', (t) => {
 });
 
 test('oversized loop policy selects Wasm by structure, not guest identity', (t) => {
-  const jvm = new JVM({ jit: { warmupThreshold: 0 } });
+  const jvm = new JVM({ jit: {compileWorker: false,  warmupThreshold: 0 } });
   const shape = (name, length = 2048, backward = true) => ({
     name,
     descriptor: '()V',
@@ -633,7 +633,7 @@ test('oversized loop policy selects Wasm by structure, not guest identity', (t) 
     'constructors retain their observable initialization policy');
   t.equal(jvm.jit.oversizedWasmFirstMethodCount, 1,
     'the runtime counter records structurally selected methods once');
-  const lowered = new JVM({ jit: {
+  const lowered = new JVM({ jit: {compileWorker: false, 
     warmupThreshold: 0, oversizedWasmFirstCodeItems: 128,
     wasmRelaxedReferenceReturns: true, wasmStructured: true,
     wasmCheckcast: true, wasmDirectStaticLink: true,
@@ -693,7 +693,7 @@ test('oversized loop policy selects Wasm by structure, not guest identity', (t) 
 });
 
 test('a synchronous generated caller enters a Wasm-owned callee in place', (t) => {
-  const jvm = new JVM({ jit: { warmupThreshold: 0 } });
+  const jvm = new JVM({ jit: {compileWorker: false,  warmupThreshold: 0 } });
   const method = (name, descriptor) => ({
     name, descriptor, flags: ['private', 'static'],
     attributes: [{ type: 'code', code: {
@@ -805,7 +805,7 @@ test('a synchronous site resolves a target for a Wasm-owned callee the JavaScrip
       codeItems: [], exceptionTable: [], localsSize: '0', stackSize: '0',
     }}],
   };
-  const jvm = new JVM({jit: {warmupThreshold: 0}});
+  const jvm = new JVM({jit: {compileWorker: false, warmupThreshold: 0}});
   jvm.classes[owner] = {
     staticFields: new Map(),
     ast: {classes: [{superClassName: null, items: [
@@ -870,7 +870,7 @@ test('a synchronous site resolves a target for a Wasm-owned callee the JavaScrip
 });
 
 test('long-arithmetic loop policy selects Wasm by opcode shape, not method identity', (t) => {
-  const jvm = new JVM({ jit: { warmupThreshold: 0 } });
+  const jvm = new JVM({ jit: {compileWorker: false,  warmupThreshold: 0 } });
   const shape = (name, longOps = 8, length = 256, backward = true) => {
     const codeItems = Array.from({ length }, (_unused, index) => ({
       labelDef: index === 0 ? 'Lentry:' : `L${index}:`,
@@ -905,7 +905,7 @@ test('long-arithmetic loop policy selects Wasm by opcode shape, not method ident
 
 test('dense nested array kernels select Wasm without guest-name matching', (t) => {
   const jvm = new JVM({
-    jit: { warmupThreshold: 0, arrayKernelWasmFirst: true },
+    jit: {compileWorker: false,  warmupThreshold: 0, arrayKernelWasmFirst: true },
   });
   const shape = (name, {
     primitiveArrayAccesses = 24, referenceArrayAccesses = 0,
@@ -991,7 +991,7 @@ test('dense nested array kernels select Wasm without guest-name matching', (t) =
 });
 
 test('imported-array raster loops keep JavaScript across intrinsic and plotter calls', (t) => {
-  const jvm = new JVM({ jit: { warmupThreshold: 0 } });
+  const jvm = new JVM({ jit: {compileWorker: false,  warmupThreshold: 0 } });
   const loopWith = (name, call, { arrayAccesses = 2 } = {}) => ({
     name, descriptor: '(IIIIII)V', flags: ['final'],
     className: 'ArbitraryRotatedBlitOwner',
@@ -1089,7 +1089,7 @@ public class ReferenceCursorHarness {
   }
 }
 `);
-  const jvm = new JVM({classpath, jit: {warmupThreshold: 0}});
+  const jvm = new JVM({classpath, jit: {compileWorker: false, warmupThreshold: 0}});
   const classData = await jvm.loadClassByName('ReferenceCursorHarness');
   const method = jvm.findMethod(classData, 'step',
     '(I)LReferenceCursorHarness;');
@@ -1217,7 +1217,7 @@ public class ReferenceCursorHarness {
 
 test('large dynamic primitive-array loops select structured JavaScript first',
   (t) => {
-    const jvm = new JVM({ jit: { profileMethods: false } });
+    const jvm = new JVM({ jit: {compileWorker: false,  profileMethods: false } });
     const shape = (name, {
       length = 384, primitiveArrayAccesses = 32,
       dynamicCalls = 2, backward = true,
@@ -1310,7 +1310,7 @@ test('Wasm identifies captured boolean statics without method-name gates', (t) =
     'an unused obfuscator flag does not demote a call-dense hot loop');
   method.descriptor = '()V';
   method.flags = ['static'];
-  const compatibilityJvm = new JVM({ jit: { profileMethods: false } });
+  const compatibilityJvm = new JVM({ jit: {compileWorker: false,  profileMethods: false } });
   t.notOk(compatibilityJvm.jit.isSupported(method),
     'call-dense captured control stays on the canonical interpreter');
   t.notOk(compatibilityJvm.jit.codegenSupportCache.has(method),
@@ -1344,7 +1344,7 @@ public class StructuredByteArrays {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0, profileMethods: false,
   } });
   await jvm.loadClassByName('StructuredByteArrays');
@@ -1449,7 +1449,7 @@ public class InlineArrayRegionHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0, profileMethods: false,
   } });
   await jvm.loadClassByName('InlineArrayRegionHarness');
@@ -1550,7 +1550,7 @@ test('monitor-bearing methods isolate scalar-bounded byte-copy regions', (t) => 
       ],
     } }],
   };
-  const jvm = new JVM({ jit: {
+  const jvm = new JVM({ jit: {compileWorker: false, 
     structuredSsa: true,
     profileMethods: false,
     scalarBoundedInlineRegions: true,
@@ -1620,7 +1620,7 @@ public class ClassLiteralLoopHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0, structuredSsa: false, profileMethods: false,
   } });
   await jvm.loadClassByName('ClassLiteralLoopHarness');
@@ -1667,7 +1667,7 @@ public class StructuredCastHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0, structuredSsa: true, profileMethods: false,
   } });
   await jvm.loadClassByName('StructuredCastHarness');
@@ -1741,7 +1741,7 @@ test('Wasm modules expose arbitrary guest identities to native profilers', (t) =
 });
 
 test('sampled generated-method timing attributes arbitrary method identities', (t) => {
-  const jvm = new JVM({ jit: {
+  const jvm = new JVM({ jit: {compileWorker: false, 
     warmupThreshold: 0, profileMethods: false, profileTimings: true,
     methodTimingSampleRate: 1,
   } });
@@ -1759,7 +1759,7 @@ test('sampled generated-method timing attributes arbitrary method identities', (
 });
 
 test('unsampled generated-method timing avoids guest identity formatting', (t) => {
-  const jvm = new JVM({ jit: {
+  const jvm = new JVM({ jit: {compileWorker: false, 
     warmupThreshold: 0, profileMethods: false, profileTimings: true,
     methodTimingSampleRate: 1_000_000_000,
   } });
@@ -1780,7 +1780,7 @@ test('unsampled generated-method timing avoids guest identity formatting', (t) =
 });
 
 test('method-entry tracing remains inactive until a target identity is configured', (t) => {
-  const jvm = new JVM({ jit: {
+  const jvm = new JVM({ jit: {compileWorker: false, 
     warmupThreshold: 0, profileMethods: false, profileTimings: false,
   } });
   const method = { name: 'arbitraryEntry', descriptor: '()V', attributes: [] };
@@ -1809,7 +1809,7 @@ test('method-entry tracing remains inactive until a target identity is configure
 });
 
 test('generated bodies expose profiler identities without runtime probes', (t) => {
-  const jvm = new JVM({ jit: { profileMethods: false } });
+  const jvm = new JVM({ jit: {compileWorker: false,  profileMethods: false } });
   const method = { name: 'renamedHotBody', descriptor: '([II)V' };
   const labeled = jvm.jit.generatedSource(method, 'structured-ssa',
     '"use strict"; return 7;', 'ArbitraryOwner');
@@ -1834,7 +1834,7 @@ test('generated bodies expose profiler identities without runtime probes', (t) =
 });
 
 test('exclusive region timing subtracts nested generated and fused time', (t) => {
-  const jvm = new JVM({ jit: { profileMethods: false } });
+  const jvm = new JVM({ jit: {compileWorker: false,  profileMethods: false } });
   const jit = jvm.jit;
   jit.exclusiveTimingsEnabled = true;
   jit.exclusiveTimingRootKey = 'ArbitraryRoot.work()V';
@@ -1869,7 +1869,7 @@ test('exclusive region timing subtracts nested generated and fused time', (t) =>
 });
 
 test('generated JIT supports generic long fixed-point multiply and shift helpers', (t) => {
-  const jvm = new JVM({ jit: { warmupThreshold: 0, profileMethods: false } });
+  const jvm = new JVM({ jit: {compileWorker: false,  warmupThreshold: 0, profileMethods: false } });
   const instructions = [
     'iload_0', 'i2l', 'iload_1', 'i2l', 'lmul', 'iload_2', 'lshr', 'l2i', 'ireturn',
   ];
@@ -1901,7 +1901,7 @@ test('generated JIT supports generic long fixed-point multiply and shift helpers
 });
 
 test('structured SSA supports generic long fixed-point arithmetic', (t) => {
-  const jvm = new JVM({ jit: {
+  const jvm = new JVM({ jit: {compileWorker: false, 
     warmupThreshold: 0, profileMethods: false, structuredSsa: true,
   } });
   const instructions = [
@@ -1937,7 +1937,7 @@ test('structured SSA supports generic long fixed-point arithmetic', (t) => {
     t.equal(result.value, expected,
       `structured long arithmetic preserves ${left} * ${right} >> ${shift}`);
   }
-  const gatedJvm = new JVM({ jit: {
+  const gatedJvm = new JVM({ jit: {compileWorker: false, 
     warmupThreshold: 0, profileMethods: false, structuredSsa: true,
     structuredLongOpcodes: false,
   } });
@@ -1948,7 +1948,7 @@ test('structured SSA supports generic long fixed-point arithmetic', (t) => {
 });
 
 test('structured SSA exactly scalarizes constant-16 fixed-point products', (t) => {
-  const jvm = new JVM({ jit: {
+  const jvm = new JVM({ jit: {compileWorker: false, 
     warmupThreshold: 0, profileMethods: false, structuredSsa: true,
   } });
   const instructions = [
@@ -1974,7 +1974,7 @@ test('structured SSA exactly scalarizes constant-16 fixed-point products', (t) =
   t.equal(generated.jvmStructuredFixedPointScalarizationCount, 1,
     'the generated metadata reports one typed fixed-point graph');
 
-  const comparisonJvm = new JVM({ jit: {
+  const comparisonJvm = new JVM({ jit: {compileWorker: false, 
     warmupThreshold: 0, profileMethods: false, structuredSsa: true,
     structuredFixedPointScalarization: false,
   } });
@@ -2023,7 +2023,7 @@ public final class BlockArrayDataViewHarness {
   }
 }
 `);
-  const jvm = new JVM({classpath, jit: {
+  const jvm = new JVM({classpath, jit: {compileWorker: false, 
     warmupThreshold: 0, structuredSsa: true, profileMethods: false,
     structuredBlockArrayDataViews: true,
   }});
@@ -2080,7 +2080,7 @@ public final class BlockArrayDataViewHarness {
   t.equal(missing.frame.pc, loadPcs[0],
     'the first null load records its exact bytecode PC');
 
-  const gatedJvm = new JVM({classpath, jit: {
+  const gatedJvm = new JVM({classpath, jit: {compileWorker: false, 
     warmupThreshold: 0, structuredSsa: true, profileMethods: false,
     structuredBlockArrayDataViews: false,
   }});
@@ -2096,7 +2096,7 @@ public final class BlockArrayDataViewHarness {
 });
 
 test('structured SSA normalizes descriptor scalar locals at entry', (t) => {
-  const jvm = new JVM({ jit: {
+  const jvm = new JVM({ jit: {compileWorker: false, 
     warmupThreshold: 0, profileMethods: false, structuredSsa: true,
   } });
   const method = {
@@ -2124,7 +2124,7 @@ test('structured SSA normalizes descriptor scalar locals at entry', (t) => {
 });
 
 test('structured SSA renders verified lookup switches', (t) => {
-  const jvm = new JVM({ jit: {
+  const jvm = new JVM({ jit: {compileWorker: false, 
     warmupThreshold: 0, profileMethods: false, structuredSsa: true,
   } });
   const method = {
@@ -2159,7 +2159,7 @@ test('structured SSA renders verified lookup switches', (t) => {
     t.equal(generated(frame, thread, jvm.jit, false).value, expected,
       `lookup selector ${selector} takes the verified target`);
   }
-  const gatedJvm = new JVM({ jit: {
+  const gatedJvm = new JVM({ jit: {compileWorker: false, 
     warmupThreshold: 0, profileMethods: false, structuredSsa: true,
     structuredSwitches: false,
   } });
@@ -2180,7 +2180,7 @@ test('structured SSA renders verified lookup switches', (t) => {
 });
 
 test('structured SSA renders verified table switches', (t) => {
-  const jvm = new JVM({ jit: {
+  const jvm = new JVM({ jit: {compileWorker: false, 
     warmupThreshold: 0, profileMethods: false, structuredSsa: true,
   } });
   const method = {
@@ -2234,7 +2234,7 @@ test('unsafe constructor loop admission is structured-only', (t) => {
       localsSize: '2', stackSize: '2', exceptionTable: [],
     }}],
   };
-  const jvm = new JVM({jit: {
+  const jvm = new JVM({jit: {compileWorker: false, 
     structuredSsa: true, structuredUnsafeConstructorCallers: true,
   }});
   jvm.jit.hasOnlyJitSafeInitializationCalls = () => false;
@@ -2270,7 +2270,7 @@ test('unsafe constructor loop admission is structured-only', (t) => {
   jvm.jit.compileBaselineMethod = originalBaselineCompile;
   jvm.jit.structuredSsa.compile = originalCompile;
 
-  const gatedJvm = new JVM({jit: {
+  const gatedJvm = new JVM({jit: {compileWorker: false, 
     structuredSsa: true, structuredUnsafeConstructorCallers: false,
   }});
   gatedJvm.jit.hasOnlyJitSafeInitializationCalls = () => false;
@@ -2325,7 +2325,7 @@ public final class ConstructedReaderLoopHarness {
 `);
   const jvm = new JVM({
     classpath,
-    jit: {
+    jit: {compileWorker: false, 
       warmupThreshold: 0,
       preferWholeMethodJs: true,
       structuredSsa: true,
@@ -2396,7 +2396,7 @@ test('generated JIT admits call-free post-increment field helpers structurally',
       localsSize: '1', stackSize: '3', exceptionTable: [],
     } }],
   };
-  const jvm = new JVM({ jit: { warmupThreshold: 0, profileMethods: false } });
+  const jvm = new JVM({ jit: {compileWorker: false,  warmupThreshold: 0, profileMethods: false } });
   jvm.classes.ArbitraryCounter = {
     staticFields: new Map(),
     ast: { classes: [{ superClassName: null, items: [] }] },
@@ -2440,7 +2440,7 @@ test('generated JIT admits call-free post-increment field helpers structurally',
     alternateObject.fields, 'ArbitraryCounter.value'),
   'generated putfield does not invent the direct slot on unusual objects');
 
-  const disabled = new JVM({ jit: {
+  const disabled = new JVM({ jit: {compileWorker: false, 
     warmupThreshold: 0, profileMethods: false, postIncrementHelpers: false,
   } });
   t.notOk(disabled.jit.isSupported(method),
@@ -2449,7 +2449,7 @@ test('generated JIT admits call-free post-increment field helpers structurally',
 });
 
 test('initialized static fields stay on the synchronous generated fast path', (t) => {
-  const jvm = new JVM({ jit: { warmupThreshold: 0 } });
+  const jvm = new JVM({ jit: {compileWorker: false,  warmupThreshold: 0 } });
   jvm.classes.FastStatics = {
     staticFields: new Map([['value:I', 41]]),
     ast: { classes: [{ superClassName: null }] },
@@ -2468,7 +2468,7 @@ test('initialized static fields stay on the synchronous generated fast path', (t
 });
 
 test('resolved class initialization uses stable hot-site tokens', (t) => {
-  const jvm = new JVM({ jit: { warmupThreshold: 0 } });
+  const jvm = new JVM({ jit: {compileWorker: false,  warmupThreshold: 0 } });
   jvm.classes.ArbitraryStaticOwner = {
     ast: { classes: [{ superClassName: null, items: [] }] },
     staticFields: new Map([['value:I', 37]]),
@@ -2498,7 +2498,7 @@ test('resolved class initialization uses stable hot-site tokens', (t) => {
 });
 
 test('interpreted warm getstatic sites reuse class-initialization tokens', (t) => {
-  const jvm = new JVM({ jit: { enabled: false } });
+  const jvm = new JVM({ jit: {compileWorker: false,  enabled: false } });
   jvm.classes.ArbitraryStaticOwner = {
     ast: { classes: [{ superClassName: null, items: [] }] },
     staticFields: new Map([['value:I', 19]]),
@@ -2528,7 +2528,7 @@ test('interpreted warm getstatic sites reuse class-initialization tokens', (t) =
 });
 
 test('generated call sites execute proven synchronous JRE leaves directly', (t) => {
-  const jvm = new JVM({ jit: { warmupThreshold: 0 } });
+  const jvm = new JVM({ jit: {compileWorker: false,  warmupThreshold: 0 } });
   const instruction = {
     op: 'invokevirtual',
     arg: ['Method', 'java/lang/String', ['charAt', '(I)C']],
@@ -2577,7 +2577,7 @@ test('generated call sites execute proven synchronous JRE leaves directly', (t) 
 });
 
 test('generated call sites share resolved positional ABI templates', (t) => {
-  const jvm = new JVM({ jit: { warmupThreshold: 0 } });
+  const jvm = new JVM({ jit: {compileWorker: false,  warmupThreshold: 0 } });
   const method = {
     name: 'compute', descriptor: '(I)I', flags: ['static'],
     attributes: [{ type: 'code', code: {
@@ -2608,7 +2608,7 @@ test('generated call sites share resolved positional ABI templates', (t) => {
 });
 
 test('legacy synchronous probes retain their resolved call site', (t) => {
-  const jvm = new JVM({ jit: { warmupThreshold: 0 } });
+  const jvm = new JVM({ jit: {compileWorker: false,  warmupThreshold: 0 } });
   const instruction = {
     op: 'invokevirtual',
     arg: ['Method', 'java/lang/String', ['charAt', '(I)C']],
@@ -2640,7 +2640,7 @@ test('legacy synchronous probes retain their resolved call site', (t) => {
 });
 
 test('polymorphic JRE sites retain each resolved receiver target', (t) => {
-  const jvm = new JVM({ jit: { warmupThreshold: 0 } });
+  const jvm = new JVM({ jit: {compileWorker: false,  warmupThreshold: 0 } });
   const instruction = {
     op: 'invokevirtual',
     arg: ['Method', 'ArbitraryBase', ['value', '()I']],
@@ -2678,7 +2678,7 @@ test('polymorphic JRE sites retain each resolved receiver target', (t) => {
 });
 
 test('generated instance-call operand underflow falls back before callee execution', (t) => {
-  const jvm = new JVM({ jit: { warmupThreshold: 0 } });
+  const jvm = new JVM({ jit: {compileWorker: false,  warmupThreshold: 0 } });
   const caller = {
     name: 'caller', descriptor: '(I)V',
     attributes: [{ type: 'code', code: {
@@ -2751,7 +2751,7 @@ test('generated instance-call operand underflow falls back before callee executi
 });
 
 test('deoptimized generated children return to their recorded parent frame', (t) => {
-  const jvm = new JVM({ jit: { warmupThreshold: 0 } });
+  const jvm = new JVM({ jit: {compileWorker: false,  warmupThreshold: 0 } });
   const method = (name, descriptor) => ({
     name, descriptor,
     attributes: [{ type: 'code', code: {
@@ -2831,7 +2831,7 @@ test('deoptimized generated children return to their recorded parent frame', (t)
 });
 
 test('ad-hoc static generated calls carry initialization tokens', (t) => {
-  const jvm = new JVM({ jit: { warmupThreshold: 0 } });
+  const jvm = new JVM({ jit: {compileWorker: false,  warmupThreshold: 0 } });
   jvm.classInitializationState.set('ArbitraryStaticTarget', 'INITIALIZED');
   const instruction = {
     op: 'invokestatic',
@@ -2859,7 +2859,7 @@ test('ad-hoc static generated calls carry initialization tokens', (t) => {
 });
 
 test('JRE-published final intrinsics receive generated operands positionally', (t) => {
-  const jvm = new JVM({ jit: {
+  const jvm = new JVM({ jit: {compileWorker: false, 
     warmupThreshold: 0, profileMethods: false, structuredSsa: false,
   } });
   const method = {
@@ -2907,7 +2907,7 @@ test('JRE-published final intrinsics receive generated operands positionally', (
 });
 
 test('JRE-published static intrinsics bypass dispatch after initialization', (t) => {
-  const jvm = new JVM({ jit: {
+  const jvm = new JVM({ jit: {compileWorker: false, 
     warmupThreshold: 0, profileMethods: false, structuredSsa: true,
   } });
   const method = {
@@ -2975,7 +2975,7 @@ test('runtime-resolved generated callees receive structured SSA operands positio
       exceptionTable: [], localsSize: '3', stackSize: '3',
     } }],
   };
-  const jvm = new JVM({ jit: {
+  const jvm = new JVM({ jit: {compileWorker: false, 
     warmupThreshold: 0,
     profileMethods: false,
     preferWholeMethodJs: true,
@@ -3008,13 +3008,13 @@ test('runtime-resolved generated callees receive structured SSA operands positio
   t.ok(site?.fastPositional?.invoke,
     'ordinary JVM virtual resolution installs a fixed-arity positional entry');
 
-  const generic = jvm.jit.tryInvokeSyncAt;
-  jvm.jit.tryInvokeSyncAt = () => {
+  const generic = jvm.jit.tryInvokeSyncAtSite;
+  jvm.jit.tryInvokeSyncAtSite = () => {
     throw new Error('generic call dispatch should not run after monomorphic resolution');
   };
   t.equal(execute(41).value, 42,
     'the warmed call feeds SSA operands directly without generic dispatch');
-  jvm.jit.tryInvokeSyncAt = generic;
+  jvm.jit.tryInvokeSyncAtSite = generic;
   const positional = site.fastPositional.invoke;
   const deopt = {
     deopt: true,
@@ -3077,7 +3077,7 @@ test('acyclic reference-returning callees execute positionally without child Fra
       exceptionTable: [], localsSize: '3', stackSize: '3',
     } }],
   };
-  const jvm = new JVM({ jit: {
+  const jvm = new JVM({ jit: {compileWorker: false, 
     warmupThreshold: 0,
     profileMethods: false,
     profileTimings: true,
@@ -3141,7 +3141,7 @@ test('contended synchronized frameless entries restore above their caller', (t) 
       exceptionTable: [], localsSize: '1', stackSize: '1',
     } }],
   };
-  const jvm = new JVM({ jit: {
+  const jvm = new JVM({ jit: {compileWorker: false, 
     warmupThreshold: 0, preferWholeMethodJs: true, structuredSsa: true,
   } });
   jvm.classes.ArbitrarySynchronizedOwner = {
@@ -3229,7 +3229,7 @@ test('acyclic call-bearing structured bodies retain their scalar entry', (t) => 
       exceptionTable: [], localsSize: '0', stackSize: '1',
     } }],
   };
-  const jvm = new JVM({ jit: {
+  const jvm = new JVM({ jit: {compileWorker: false, 
     warmupThreshold: 0, preferWholeMethodJs: true, structuredSsa: true,
   } });
   jvm.classes.ArbitraryCallBearingOwner = {
@@ -3325,7 +3325,7 @@ test('private generated callees cache invokespecial positionally', (t) => {
       exceptionTable: [], localsSize: '2', stackSize: '2',
     } }],
   };
-  const jvm = new JVM({ jit: {
+  const jvm = new JVM({ jit: {compileWorker: false, 
     warmupThreshold: 0,
     profileMethods: false,
     preferWholeMethodJs: true,
@@ -3366,13 +3366,13 @@ test('private generated callees cache invokespecial positionally', (t) => {
   t.ok(site?.fastPositional?.invoke,
     'monomorphic special target publishes a fixed-arity positional entry');
 
-  const generic = jvm.jit.tryInvokeSyncAt;
-  jvm.jit.tryInvokeSyncAt = () => {
+  const generic = jvm.jit.tryInvokeSyncAtSite;
+  jvm.jit.tryInvokeSyncAtSite = () => {
     throw new Error('generic call dispatch should not run after special resolution');
   };
   t.equal(execute(41).result.value, 42,
     'warmed private call feeds SSA operands without generic dispatch');
-  jvm.jit.tryInvokeSyncAt = generic;
+  jvm.jit.tryInvokeSyncAtSite = generic;
 
   const nullRun = execute(7, null);
   t.equal(nullRun.error?.type, 'java/lang/NullPointerException',
@@ -3402,7 +3402,7 @@ public final class ArbitraryRestoringRaster {
   }
 }
 `);
-    const jvm = new JVM({ classpath, jit: {
+    const jvm = new JVM({ classpath, jit: {compileWorker: false, 
       warmupThreshold: 0,
       profileMethods: false,
       preferWholeMethodJs: true,
@@ -3463,8 +3463,8 @@ public final class ArbitraryRestoringRaster {
     const reusableFrame = target.freeFrame;
     t.ok(reusableFrame, 'the resolving call leaves one reusable canonical frame');
 
-    const generic = jvm.jit.tryInvokeSyncAt;
-    jvm.jit.tryInvokeSyncAt = () => {
+    const generic = jvm.jit.tryInvokeSyncAtSite;
+    jvm.jit.tryInvokeSyncAtSite = () => {
       throw new Error('generic call dispatch should not run after scalar resolution');
     };
     const warm = execute(1, 1, 3);
@@ -3510,7 +3510,7 @@ public final class ArbitraryRestoringRaster {
       'the restored arithmetic frame has the exact division PC');
     t.deepEqual(arithmeticChild.stack.items, [84, 0],
       'the restored arithmetic operands remain in JVM order');
-    jvm.jit.tryInvokeSyncAt = generic;
+    jvm.jit.tryInvokeSyncAtSite = generic;
 
     const direct = site.fastPositional.invoke;
     const guardThread = {
@@ -3536,8 +3536,10 @@ public final class ArbitraryRestoringRaster {
     t.equal(destination[0], 1234,
       'debugger fallback occurs before the array side effect');
     jvm.debugManager.disable();
-    t.ok(jvm.jit.structuredSsa.restoredDirectExceptionFrameCount >= 2,
-      'runtime diagnostics count lazily restored exception frames');
+    // The restoring body no longer wraps itself in a try/catch (Ion kept
+    // every local in the frame for a function containing any try block, ~3.5x
+    // slower); the exact-PC frame restorations asserted above happen at the
+    // throwing site itself, so there is no separate handler-side count.
     t.end();
   });
 
@@ -3565,7 +3567,7 @@ public final class ArbitraryDirectArrayLoop {
   }
 }
 `);
-    const jvm = new JVM({ classpath, jit: {
+    const jvm = new JVM({ classpath, jit: {compileWorker: false, 
       warmupThreshold: 0,
       profileMethods: false,
       preferWholeMethodJs: true,
@@ -3633,8 +3635,8 @@ public final class ArbitraryDirectArrayLoop {
     'the successful loop does not capture scalar locals in a spill closure');
     const reusableFrame = target.freeFrame;
 
-    const generic = jvm.jit.tryInvokeSyncAt;
-    jvm.jit.tryInvokeSyncAt = () => {
+    const generic = jvm.jit.tryInvokeSyncAtSite;
+    jvm.jit.tryInvokeSyncAtSite = () => {
       throw new Error('generic dispatch should not run for the warmed array loop');
     };
     const warm = execute(destination, 0, 2, 30);
@@ -3682,7 +3684,7 @@ public final class ArbitraryDirectArrayLoop {
       'the inner store retains its exact array, index, and value locals');
     t.deepEqual(restored.stack.items, [destination, 16, 28],
       'the inner store retains the exact failing array-store operands');
-    jvm.jit.tryInvokeSyncAt = generic;
+    jvm.jit.tryInvokeSyncAtSite = generic;
     t.end();
   });
 
@@ -3710,7 +3712,7 @@ public final class ArbitraryOutlinedDirectArrayLoop {
   }
 }
 `);
-    const jvm = new JVM({ classpath, jit: {
+    const jvm = new JVM({ classpath, jit: {compileWorker: false, 
       warmupThreshold: 0,
       profileMethods: false,
       preferWholeMethodJs: true,
@@ -3765,7 +3767,7 @@ public final class ArbitraryOutlinedDirectArrayLoop {
     t.equal(target.generated.jvmStructuredRestoringFrameSlotCount, 5,
     'restoration retains four entry arguments and one distinct spill slot exactly once');
     t.ok(target.generated.jvmRestoringDirectPositionalSource.includes(
-      'materializeDirectFrame('),
+      'materializeDirectFrameSlots('),
     'throwing operations call the capture-free materialization helper');
     t.notOk(target.generated.jvmRestoringDirectPositionalSource.includes(
       'function spillLocals()'),
@@ -3826,7 +3828,7 @@ public final class ArbitraryReferenceArrayLoop {
   }
 }
 `);
-    const jvm = new JVM({ classpath, jit: {
+    const jvm = new JVM({ classpath, jit: {compileWorker: false, 
       warmupThreshold: 0,
       profileMethods: false,
       preferWholeMethodJs: true,
@@ -3883,14 +3885,14 @@ public final class ArbitraryReferenceArrayLoop {
       site?.fastPositional?.invoke,
     'reference parameters, arraylength, and reference comparison publish the direct ABI');
     const reusableFrame = target.freeFrame;
-    const generic = jvm.jit.tryInvokeSyncAt;
-    jvm.jit.tryInvokeSyncAt = () => {
+    const generic = jvm.jit.tryInvokeSyncAtSite;
+    jvm.jit.tryInvokeSyncAtSite = () => {
       throw new Error('generic dispatch should not run for the warmed reference loop');
     };
     try {
       execute(destination, expected, expected);
     } finally {
-      jvm.jit.tryInvokeSyncAt = generic;
+      jvm.jit.tryInvokeSyncAtSite = generic;
     }
     t.deepEqual(destination.slice(), [0, 1, 2, 3],
       'the warmed direct entry observes reference identity exactly');
@@ -3937,7 +3939,7 @@ public final class ArbitraryReferenceStaticWrapper {
   }
 }
 `);
-    const jvm = new JVM({ classpath, jit: {
+    const jvm = new JVM({ classpath, jit: {compileWorker: false, 
       warmupThreshold: 0,
       profileMethods: false,
       preferWholeMethodJs: true,
@@ -3989,14 +3991,14 @@ public final class ArbitraryReferenceStaticWrapper {
     t.equal(owner.staticFields.get('total:I'), 121,
       'the direct entry observes a changed reference and links the live branch');
     const reusableFrame = target.freeFrame;
-    const generic = jvm.jit.tryInvokeSyncAt;
-    jvm.jit.tryInvokeSyncAt = () => {
+    const generic = jvm.jit.tryInvokeSyncAtSite;
+    jvm.jit.tryInvokeSyncAtSite = () => {
       throw new Error('generic dispatch should not run for the warmed wrapper');
     };
     try {
       execute(1, 1, 1, true);
     } finally {
-      jvm.jit.tryInvokeSyncAt = generic;
+      jvm.jit.tryInvokeSyncAtSite = generic;
     }
     t.equal(owner.staticFields.get('total:I'), 224,
       'the fully warmed wrapper and children avoid generic call dispatch');
@@ -4020,7 +4022,7 @@ public final class ArbitraryEagerMonomorphicCallHarness {
   }
 }
 `);
-  const jvm = new JVM({classpath, jit: {
+  const jvm = new JVM({classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     profileMethods: false,
     preferWholeMethodJs: true,
@@ -4044,7 +4046,10 @@ public final class ArbitraryEagerMonomorphicCallHarness {
   t.match(generated.jvmStructuredSource,
     /let ssaFastPositionalInvoke\d+ = /,
     'the generated region captures a scalar positional target');
-  t.match(generated.jvmStructuredSource, /isClassJitDeopted/,
+  // The body-wide fast-path flag folds the debugger deoptimization test
+  // (any deoptimized class keeps every positional target off the fast path).
+  t.match(generated.jvmStructuredSource,
+    /jitDeoptedClassCount === 0|isClassJitDeopted/,
     'the immutable target remains guarded by debugger deoptimization');
 
   const frame = new Frame(caller);
@@ -4057,8 +4062,8 @@ public final class ArbitraryEagerMonomorphicCallHarness {
   };
   thread.callStack.push(frame);
   let genericCalls = 0;
-  const tryInvokeSyncAt = jvm.jit.tryInvokeSyncAt;
-  jvm.jit.tryInvokeSyncAt = function (...args) {
+  const tryInvokeSyncAt = jvm.jit.tryInvokeSyncAtSite;
+  jvm.jit.tryInvokeSyncAtSite = function (...args) {
     genericCalls += 1;
     return tryInvokeSyncAt.apply(this, args);
   };
@@ -4067,7 +4072,7 @@ public final class ArbitraryEagerMonomorphicCallHarness {
     jvm._nextEventLoopYieldAt = Date.now() + 60000;
     result = generated(frame, thread, jvm.jit, false);
   } finally {
-    jvm.jit.tryInvokeSyncAt = tryInvokeSyncAt;
+    jvm.jit.tryInvokeSyncAtSite = tryInvokeSyncAt;
   }
   t.deepEqual(result, {returned: true, value: 1},
     'eager lowering preserves the complete Java result');
@@ -4078,7 +4083,7 @@ public final class ArbitraryEagerMonomorphicCallHarness {
   t.equal(thread.callStack.size(), 0,
     'successful intermethod execution leaves no child Frame');
 
-  const disabledJvm = new JVM({classpath, jit: {
+  const disabledJvm = new JVM({classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     profileMethods: false,
     preferWholeMethodJs: true,
@@ -4098,7 +4103,7 @@ public final class ArbitraryEagerMonomorphicCallHarness {
   t.equal(disabledJvm.jit.eagerMonomorphicCallLinkCount, 0,
     'the disabled path records no eager link');
 
-  const uninitializedJvm = new JVM({classpath, jit: {
+  const uninitializedJvm = new JVM({classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     profileMethods: false,
     preferWholeMethodJs: true,
@@ -4138,7 +4143,7 @@ public final class ArbitraryEffectfulInstanceWrapper {
   }
 }
 `);
-    const jvm = new JVM({ classpath, jit: {
+    const jvm = new JVM({ classpath, jit: {compileWorker: false, 
       warmupThreshold: 0,
       profileMethods: false,
       preferWholeMethodJs: true,
@@ -4187,15 +4192,15 @@ public final class ArbitraryEffectfulInstanceWrapper {
       'the entry is emitted generically rather than by a semantic oracle');
 
     const reusableFrame = target.freeFrame;
-    const generic = jvm.jit.tryInvokeSyncAt;
-    jvm.jit.tryInvokeSyncAt = () => {
+    const generic = jvm.jit.tryInvokeSyncAtSite;
+    jvm.jit.tryInvokeSyncAtSite = () => {
       throw new Error('generic dispatch should not run for the warmed wrapper');
     };
     let warm;
     try {
       warm = execute(4);
     } finally {
-      jvm.jit.tryInvokeSyncAt = generic;
+      jvm.jit.tryInvokeSyncAtSite = generic;
     }
     t.deepEqual(warm, {returned: true, value: 30},
       'the warmed call reloads the field after its effectful child');
@@ -4225,7 +4230,7 @@ public final class ArbitraryNumericStateLeaf {
   }
 }
 `);
-    const jvm = new JVM({ classpath, jit: {
+    const jvm = new JVM({ classpath, jit: {compileWorker: false, 
       warmupThreshold: 0,
       profileMethods: false,
       preferWholeMethodJs: true,
@@ -4264,15 +4269,15 @@ public final class ArbitraryNumericStateLeaf {
       ?.jvmRestoringDirectPositionalBody, 'function',
     'a verified internal floating-point expression publishes the scalar ABI');
 
-    const generic = jvm.jit.tryInvokeSyncAt;
-    jvm.jit.tryInvokeSyncAt = () => {
+    const generic = jvm.jit.tryInvokeSyncAtSite;
+    jvm.jit.tryInvokeSyncAtSite = () => {
       throw new Error('generic dispatch should not run for the warmed leaf');
     };
     try {
       t.deepEqual(execute(65536), {returned: true, value: 2},
         'the warmed call feeds operands directly into generated JavaScript');
     } finally {
-      jvm.jit.tryInvokeSyncAt = generic;
+      jvm.jit.tryInvokeSyncAtSite = generic;
     }
     t.end();
   });
@@ -4295,7 +4300,7 @@ public class ArbitraryArrayStateLeaf {
 }
 `);
   const jvm = new JVM({
-    classpath, jit: { warmupThreshold: 0, preferWholeMethodJs: true },
+    classpath, jit: {compileWorker: false,  warmupThreshold: 0, preferWholeMethodJs: true },
   });
   await jvm.loadClassByName('ArbitraryArrayStateLeaf');
   jvm.classInitializationState.set('ArbitraryArrayStateLeaf', 'INITIALIZED');
@@ -4348,7 +4353,7 @@ public final class ArbitraryPureIntrinsicFieldLoop {
   }
 }
 `);
-    const jvm = new JVM({ classpath, jit: {
+    const jvm = new JVM({ classpath, jit: {compileWorker: false, 
       warmupThreshold: 0,
       profileMethods: false,
       preferWholeMethodJs: true,
@@ -4364,8 +4369,10 @@ public final class ArbitraryPureIntrinsicFieldLoop {
       'an arbitrarily named intrinsic caller selects structured SSA');
     t.ok(generated?.jvmStructuredFieldReadCacheCount > 0,
       'the repeated instance read creates a field cache');
+    // Validity is an epoch stamp: the declaration stamps 0 and a guest
+    // call would bump `ssaFieldCacheEpoch`; a pure intrinsic does neither.
     t.equal((generated.jvmStructuredSource.match(
-      /ssaFieldCache0Valid = false/g) || []).length, 1,
+      /ssaFieldCache0Valid = 0/g) || []).length, 1,
     'an explicitly pure intrinsic only initializes, and never invalidates, the field cache');
 
     const receiver = {
@@ -4402,7 +4409,7 @@ public class ArbitraryConditionalStateLeaf {
 }
 `);
   const jvm = new JVM({
-    classpath, jit: { warmupThreshold: 0, preferWholeMethodJs: true },
+    classpath, jit: {compileWorker: false,  warmupThreshold: 0, preferWholeMethodJs: true },
   });
   await jvm.loadClassByName('ArbitraryConditionalStateLeaf');
   jvm.classInitializationState.set('ArbitraryConditionalStateLeaf', 'INITIALIZED');
@@ -4430,7 +4437,7 @@ public class ArbitraryConditionalStateLeaf {
 });
 
 test('generated field sites preserve inherited instance and static storage', (t) => {
-  const jvm = new JVM({ jit: { warmupThreshold: 0 } });
+  const jvm = new JVM({ jit: {compileWorker: false,  warmupThreshold: 0 } });
   jvm.classes.FieldBase = {
     staticFields: new Map([['shared:I', 7]]),
     ast: { classes: [{ superClassName: null }] },
@@ -4466,7 +4473,7 @@ test('generated field sites preserve inherited instance and static storage', (t)
 });
 
 test('structural primitive array-copy intrinsic preserves overlap semantics', (t) => {
-  const jvm = new JVM({ jit: { warmupThreshold: 0 } });
+  const jvm = new JVM({ jit: {compileWorker: false,  warmupThreshold: 0 } });
   const prefix = [
     'aload_0', 'aload_2', 'if_acmpne', 'iload_1', 'iload_3',
     'if_icmpne', 'return', 'iload_3', 'iload_1', 'if_icmple',
@@ -4600,7 +4607,7 @@ public final class ColdLinkedStaticLoopHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     profileMethods: false,
     structuredSsa: true,
@@ -4722,7 +4729,7 @@ public final class CyclicArrayRangeHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
   } });
@@ -4845,7 +4852,7 @@ public final class NestedCyclicArrayRangeHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
     checkedLeafDirectPositional: true,
@@ -5063,7 +5070,7 @@ public final class RenamedShrinkingWindowHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
     checkedLeafDirectPositional: true,
@@ -5222,7 +5229,7 @@ public final class RenamedRecursivePartitionHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
     checkedLeafDirectPositional: true,
@@ -5303,7 +5310,7 @@ public final class TransactionalAcyclicLeafHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
     checkedLeafDirectPositional: true,
@@ -5383,7 +5390,7 @@ public final class CrossingDivisionHarness {
   }
 }
 `);
-    const jvm = new JVM({ classpath, jit: {
+    const jvm = new JVM({ classpath, jit: {compileWorker: false, 
       warmupThreshold: 0, structuredSsa: true,
     } });
     await jvm.loadClassByName(className);
@@ -5433,7 +5440,7 @@ public final class ScaledCarriedArrayRangeHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
   } });
@@ -5503,7 +5510,7 @@ public final class CoalescedArrayRangeHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
   } });
@@ -5553,7 +5560,7 @@ public final class ArbitraryRecursivePartition {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
   } });
@@ -5602,7 +5609,7 @@ public final class GenericPostIncrementReader {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
   } });
@@ -5652,7 +5659,7 @@ public final class GenericReferenceArrayAssignment {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
   } });
@@ -5714,7 +5721,7 @@ public final class InstanceRecursivePartition {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
   } });
@@ -5799,7 +5806,7 @@ public final class RecursiveSchedulerHandoffHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
   } });
@@ -5849,7 +5856,7 @@ public final class HandledReturnHandoffHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
   } });
@@ -5892,7 +5899,7 @@ public final class ContinuationStaticRefreshHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
   } });
@@ -5954,7 +5961,7 @@ public final class NullableStaticArrayBranchHarness {
   }
 }
 `);
-  const jvm = new JVM({classpath, jit: {
+  const jvm = new JVM({classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
   }});
@@ -6020,7 +6027,7 @@ public final class NestedRasterShape {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
     profileMethods: false,
@@ -6090,7 +6097,7 @@ public final class ReporterGuardedIntegerHelper {
   }
 }
 `);
-  const jvm = new JVM({classpath, jit: {
+  const jvm = new JVM({classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
     profileMethods: false,
@@ -6126,7 +6133,7 @@ public final class LateStaticLinkShape {
   }
 }
 `);
-    const jvm = new JVM({ classpath, jit: {
+    const jvm = new JVM({ classpath, jit: {compileWorker: false, 
       warmupThreshold: 0,
       structuredSsa: true,
     } });
@@ -6269,7 +6276,7 @@ public final class ArbitraryStaticSummaryLoop {
   }
 }
 `);
-    const jvm = new JVM({ classpath, jit: {
+    const jvm = new JVM({ classpath, jit: {compileWorker: false, 
       warmupThreshold: 0,
       structuredSsa: true,
     } });
@@ -6426,7 +6433,7 @@ public class ArbitraryPureIntegralLeaf {
 `);
   const jvm = new JVM({
     classpath,
-    jit: {
+    jit: {compileWorker: false, 
       warmupThreshold: 0,
       structuredSsa: true,
       preferWholeMethodJs: true,
@@ -6502,7 +6509,7 @@ function scalarIntegerLoopMethod(name = 'nameDoesNotMatter', exceptionTable = []
 }
 
 test('scalar integer loops are selected by verified structure and spill at safe points', (t) => {
-  const jvm = new JVM({ jit: { warmupThreshold: 0, profileMethods: false } });
+  const jvm = new JVM({ jit: {compileWorker: false,  warmupThreshold: 0, profileMethods: false } });
   // Force the "yield due" side of the safe-point policy so the spill path is
   // exercised deterministically; quantum continuation has its own test.
   jvm._nextEventLoopYieldAt = 0;
@@ -6539,14 +6546,14 @@ test('scalar integer loops are selected by verified structure and spill at safe 
   const guarded = scalarIntegerLoopMethod('guarded', [{ handlerLbl: 'Lreturn' }]);
   t.equal(jvm.jit.compileScalarIntegerLoop(guarded), null,
     'an exception table rejects the scalar tier');
-  const disabled = new JVM({ jit: { scalarLoops: false, profileMethods: false } });
+  const disabled = new JVM({ jit: {compileWorker: false,  scalarLoops: false, profileMethods: false } });
   t.equal(disabled.jit.compileScalarIntegerLoop(method), null,
     'the scalar tier can be disabled for differential measurement');
   t.end();
 });
 
 test('safe points continue the quantum when the scheduler has nothing due', (t) => {
-  const jvm = new JVM({ jit: { warmupThreshold: 0, profileMethods: false } });
+  const jvm = new JVM({ jit: {compileWorker: false,  warmupThreshold: 0, profileMethods: false } });
   jvm._nextEventLoopYieldAt = Date.now() + 60000;
   const method = scalarIntegerLoopMethod('arbitraryObfuscatedName');
   const generated = jvm.jit.compileScalarIntegerLoop(method);
@@ -6590,7 +6597,7 @@ test('safe points continue the quantum when the scheduler has nothing due', (t) 
 });
 
 test('scalar loop debugger entry guard falls back before side effects', (t) => {
-  const jvm = new JVM({ jit: { warmupThreshold: 0, profileMethods: false } });
+  const jvm = new JVM({ jit: {compileWorker: false,  warmupThreshold: 0, profileMethods: false } });
   const method = scalarIntegerLoopMethod();
   const generated = jvm.jit.compileScalarIntegerLoop(method);
   const frame = new Frame(method);
@@ -6648,7 +6655,7 @@ function invertedCountedLoopMethod() {
 }
 
 test('structured SSA recognizes javac inverted counted-loop layout', (t) => {
-  const jvm = new JVM({ jit: {
+  const jvm = new JVM({ jit: {compileWorker: false, 
     structuredSsa: true,
     structuredAtomicBoundedLoops: false,
     profileMethods: false,
@@ -6675,7 +6682,7 @@ test('structured SSA recognizes javac inverted counted-loop layout', (t) => {
 });
 
 test('structured JVM SSA feeds operand values across block joins', (t) => {
-  const jvm = new JVM({ jit: { structuredSsa: true, profileMethods: false } });
+  const jvm = new JVM({ jit: {compileWorker: false,  structuredSsa: true, profileMethods: false } });
   const method = structuredSsaJoinMethod();
   const generated = jvm.jit.structuredSsa.compile(method);
   t.ok(generated?.jvmStructuredSsa, 'verified reducible loop selects the structured SSA renderer');
@@ -6696,7 +6703,7 @@ test('structured JVM SSA feeds operand values across block joins', (t) => {
   t.equal(jvm.jit.structuredSsa.runCount, 1, 'successful structured entries are counted');
   t.equal(callStack.size(), 0, 'normal return removes the generated frame');
 
-  const combined = new JVM({ jit: { rendererPipeline: true, profileMethods: false } });
+  const combined = new JVM({ jit: {compileWorker: false,  rendererPipeline: true, profileMethods: false } });
   t.ok(combined.jit.scalarGuestBodiesEnabled &&
       combined.jit.structuredSsa.enabled,
     'renderer-pipeline composes the generic scalar and structured SSA tiers');
@@ -6721,7 +6728,7 @@ test('structured JVM SSA emits acyclic regions as ordinary functions', (t) => {
       ],
     } }],
   };
-  const jvm = new JVM({ jit: { structuredSsa: true } });
+  const jvm = new JVM({ jit: {compileWorker: false,  structuredSsa: true } });
   const generated = jvm.jit.structuredSsa.compile(method);
   t.ok(generated?.jvmStructuredSsa,
     'verified acyclic control flow selects the SSA block renderer');
@@ -6761,7 +6768,7 @@ public class StructuredStaticArrayHarness {
 `);
   const jvm = new JVM({
     classpath,
-    jit: { warmupThreshold: 0, structuredSsa: true, preferWholeMethodJs: true },
+    jit: {compileWorker: false,  warmupThreshold: 0, structuredSsa: true, preferWholeMethodJs: true },
   });
   await jvm.loadClassByName('StructuredStaticArrayHarness');
   const owner = jvm.classes.StructuredStaticArrayHarness;
@@ -6817,7 +6824,7 @@ test('structured JVM SSA folds constant entry stores into exact local declaratio
       localsSize: '4', stackSize: '2', exceptionTable: [],
     } }],
   };
-  const jvm = new JVM({ jit: { structuredSsa: true, profileMethods: false } });
+  const jvm = new JVM({ jit: {compileWorker: false,  structuredSsa: true, profileMethods: false } });
   const generated = jvm.jit.structuredSsa.compile(method);
   t.ok(generated?.jvmStructuredSsa, 'loop with a constant prologue selects structured SSA');
   t.ok(generated.jvmStructuredSource.includes('let local2 = 0;') &&
@@ -6890,7 +6897,7 @@ test('structured JVM SSA guards and folds initialized boolean static control flo
       localsSize: '2', stackSize: '2', exceptionTable: [],
     } }],
   };
-  const jvm = new JVM({ jit: { structuredSsa: true, profileMethods: false } });
+  const jvm = new JVM({ jit: {compileWorker: false,  structuredSsa: true, profileMethods: false } });
   jvm.classes.ArbitraryFlags = {
     staticFields: new Map([['enabled:Z', 0]]),
     ast: { classes: [{ superClassName: null, items: [] }] },
@@ -7101,7 +7108,7 @@ test('structured JVM SSA prunes immutable local copies of guarded booleans', (t)
       localsSize: '3', stackSize: '2', exceptionTable: [],
     } }],
   };
-  const jvm = new JVM({ jit: { structuredSsa: true, profileMethods: false } });
+  const jvm = new JVM({ jit: {compileWorker: false,  structuredSsa: true, profileMethods: false } });
   jvm.classes.UnrelatedRasterOptions = {
     staticFields: new Map([['diagnostics:Z', 0]]),
     ast: { classes: [{ superClassName: null, items: [] }] },
@@ -7156,7 +7163,7 @@ test('integer leaf inlining ignores unreachable diagnostic catch tails', (t) => 
       exceptionTable: [{ start: 'Lstart', end: 'Lend', handler: 'Lhandler', catchType: 0 }],
     } }],
   };
-  const jvm = new JVM({ jit: { profileMethods: false } });
+  const jvm = new JVM({ jit: {compileWorker: false,  profileMethods: false } });
   const plan = jvm.jit.getInlineIntegerPlan(method, ['int', 'int'], 'int');
   t.ok(plan && plan.result,
     'a non-throwing normal CFG is inlined despite an obfuscator catch tail');
@@ -7185,7 +7192,7 @@ public final class GuardedIntegerLeafHarness {
   }
 }
 `);
-  const jvm = new JVM({classpath, jit: {
+  const jvm = new JVM({classpath, jit: {compileWorker: false, 
     warmupThreshold: 0, structuredSsa: true, profileMethods: false,
   }});
   const classData = await jvm.loadClassByName(className);
@@ -7266,7 +7273,7 @@ test('counted-loop proofs follow a dominating split induction update', (t) => {
       localsSize: '5', stackSize: '3', exceptionTable: [],
     } }],
   };
-  const jvm = new JVM({ jit: { structuredSsa: true, profileMethods: false } });
+  const jvm = new JVM({ jit: {compileWorker: false,  structuredSsa: true, profileMethods: false } });
   jvm.classes.SplitBackedgeOptions = {
     staticFields: new Map([['diagnostics:Z', 0]]),
     ast: { classes: [{ superClassName: null, items: [] }] },
@@ -7315,14 +7322,14 @@ test('structured JVM SSA splits bounded irreducible integer regions without name
       localsSize: '3', stackSize: '2', exceptionTable: [],
     } }],
   };
-  const island = new JVM({ jit: { structuredSsa: true, profileMethods: false } });
+  const island = new JVM({ jit: {compileWorker: false,  structuredSsa: true, profileMethods: false } });
   const islandGenerated = island.jit.structuredSsa.compile(method);
   t.ok(islandGenerated?.jvmStructuredDispatchIslands === 1 &&
       islandGenerated.jvmStructuredSplitBlocks === 0,
     'dispatch islands make the multi-entry CFG reducible by default without cloning');
   t.equal(island.jit.structuredSsa.dispatchIslandMethodCount, 1,
     'the island compilation is counted');
-  const jvm = new JVM({ jit: { structuredSsa: true, structuredDispatchIslands: false,
+  const jvm = new JVM({ jit: {compileWorker: false,  structuredSsa: true, structuredDispatchIslands: false,
     structuredIrreducibleSplitting: true, profileMethods: false } });
   const generated = jvm.jit.structuredSsa.compile(method);
   t.ok(generated?.jvmStructuredSsa, 'controlled splitting makes the multi-entry CFG reducible');
@@ -7374,7 +7381,7 @@ test('structured JVM SSA recognizes bundled irreducibility errors structurally',
 });
 
 test('structured JVM SSA materializes operand joins at safe points and guards debug entry', (t) => {
-  const jvm = new JVM({ jit: { structuredSsa: true, profileMethods: false } });
+  const jvm = new JVM({ jit: {compileWorker: false,  structuredSsa: true, profileMethods: false } });
   // Force the "yield due" side of the safe-point policy so the spill path is
   // exercised deterministically; quantum continuation has its own test.
   jvm._nextEventLoopYieldAt = 0;
@@ -7439,7 +7446,7 @@ public class ArbitraryAssetWork {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0, structuredSsa: true, compiledCallChains: true,
     ordinaryAdaptiveFramelessPositional: true,
     profileMethods: false, eagerMonomorphicCalls: false,
@@ -7495,9 +7502,9 @@ public class ArbitraryAssetWork {
   };
   jvm.threads = [thread];
   jvm.currentThreadIndex = 0;
-  const originalTryInvoke = jvm.jit.tryInvokeSyncAt.bind(jvm.jit);
+  const originalTryInvoke = jvm.jit.tryInvokeSyncAtSite.bind(jvm.jit);
   let canonicalCalls = 0;
-  jvm.jit.tryInvokeSyncAt = (...args) => {
+  jvm.jit.tryInvokeSyncAtSite = (...args) => {
     canonicalCalls += 1;
     return originalTryInvoke(...args);
   };
@@ -7558,7 +7565,7 @@ public class FloatByteConversionHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
     hotCallGraphRegions: true,
@@ -7626,7 +7633,7 @@ public final class ArbitraryCompiledCallChain {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
     compiledCallChains: true,
@@ -7681,7 +7688,7 @@ public final class ArbitraryCompiledCallChain {
   t.equal(thread.callStack.size(), 0,
     'exception completion leaves no virtual or canonical frame behind');
 
-  const disabledJvm = new JVM({ classpath, jit: {
+  const disabledJvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
     compiledCallChains: false,
@@ -7723,7 +7730,7 @@ public final class ArbitraryHotGraphRegion {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0, structuredSsa: true,
     hotCallGraphRegions: true, profileMethods: false,
   } });
@@ -7784,7 +7791,7 @@ public final class SequentialLoopBudgetShape {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0, structuredSsa: true, profileMethods: false,
   } });
   await jvm.loadClassByName(className);
@@ -7827,7 +7834,7 @@ public final class SequentialLoopBudgetShape {
 });
 
 test('structured JVM SSA preserves lexical continuations across scheduler yields', (t) => {
-  const jvm = new JVM({ jit: {
+  const jvm = new JVM({ jit: {compileWorker: false, 
     structuredSsa: true, scalarLoops: true, profileMethods: false,
   } });
   jvm._nextEventLoopYieldAt = 0;
@@ -7862,7 +7869,7 @@ test('structured JVM SSA preserves lexical continuations across scheduler yields
 });
 
 test('adaptive positional SSA retains its iterator after a wall-clock yield', (t) => {
-  const jvm = new JVM({ jit: {
+  const jvm = new JVM({ jit: {compileWorker: false, 
     structuredSsa: true, scalarLoops: true,
     adaptiveFramelessPositional: true,
     adaptiveFramelessBudgetMultiplier: 1,
@@ -7898,7 +7905,7 @@ test('adaptive positional SSA retains its iterator after a wall-clock yield', (t
 });
 
 test('adaptive positional SSA can use an ordinary guarded function', (t) => {
-  const jvm = new JVM({ jit: {
+  const jvm = new JVM({ jit: {compileWorker: false, 
     structuredSsa: true, scalarLoops: true,
     adaptiveFramelessPositional: true,
     ordinaryAdaptiveFramelessPositional: true,
@@ -7979,7 +7986,7 @@ public final class StructuredRecurrenceRangeHarness {
 }
 `);
   const descriptor = '([I[IIIIIII)V';
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
   } });
@@ -8071,7 +8078,7 @@ public final class StructuredBitBoundedRangeHarness {
 }
 `);
   const descriptor = '([I[IIII)V';
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
   } });
@@ -8146,7 +8153,7 @@ public final class StructuredConstantStepRangeHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
   } });
@@ -8212,7 +8219,7 @@ public final class StructuredPositiveStrideRangeHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
   } });
@@ -8282,7 +8289,7 @@ public final class StructuredFieldArrayRangeHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
   } });
@@ -8396,7 +8403,7 @@ public final class StructuredLateStaticArrayRangeHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
   } });
@@ -8494,7 +8501,7 @@ public final class StructuredProducedArrayLocalHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
     structuredProducedArrayLocalViews: true,
@@ -8553,7 +8560,7 @@ public final class StructuredProducedArrayLocalHarness {
     (item.instruction?.op || item.instruction) === 'newarray');
   t.equal(negative.frame.pc, newarrayPc,
     'allocation failure records the exact newarray PC');
-  const disabledJvm = new JVM({ classpath, jit: {
+  const disabledJvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
     structuredProducedArrayLocalViews: false,
@@ -8589,7 +8596,7 @@ public final class LoopInvariantStaticArrayHarness {
   }
 }
 `);
-  const jvm = new JVM({classpath, jit: {
+  const jvm = new JVM({classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
     structuredLoopInvariantStaticArrayViews: true,
@@ -8651,7 +8658,7 @@ public final class LoopInvariantStaticArrayHarness {
   t.equal(bounds.frame.pc, loadPc,
     'the hoisted reference retains the exact failing load PC');
 
-  const disabledJvm = new JVM({classpath, jit: {
+  const disabledJvm = new JVM({classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
   }});
@@ -8682,7 +8689,7 @@ public final class StructuredConsecutiveLoopRangeHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
   } });
@@ -8760,7 +8767,7 @@ public final class StructuredIndirectFieldArrayHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
   } });
@@ -8890,7 +8897,7 @@ public final class StructuredFieldArrayAliasHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
   } });
@@ -8958,7 +8965,7 @@ public final class StructuredAliasFallbackHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
   } });
@@ -9032,7 +9039,7 @@ public final class StructuredInlineScopeHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     structuredSsa: true,
   } });
@@ -9080,7 +9087,7 @@ public class StructuredAtomicHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     rendererPipeline: true,
     structuredSsa: true,
@@ -9155,7 +9162,7 @@ public class StructuredAtomicHarness {
 });
 
 test('structured continuations serialize canonical state and invalidate after interpretation', (t) => {
-  const jvm = new JVM({ jit: {
+  const jvm = new JVM({ jit: {compileWorker: false, 
     structuredSsa: true, scalarLoops: true, profileMethods: false,
   } });
   jvm._nextEventLoopYieldAt = 0;
@@ -9194,7 +9201,7 @@ test('structured continuations serialize canonical state and invalidate after in
 });
 
 test('structured JVM SSA keeps a bounded wall-clock slice under thread contention', (t) => {
-  const jvm = new JVM({ jit: { structuredSsa: true, profileMethods: false } });
+  const jvm = new JVM({ jit: {compileWorker: false,  structuredSsa: true, profileMethods: false } });
   const current = { status: 'runnable' };
   const competing = { status: 'runnable' };
   jvm.threads = [current, competing];
@@ -9239,7 +9246,7 @@ test('generated quanta compare realtime fake-clock deadlines in guest time', (t)
   const jvm = new JVM({
     fakeTime: fakeEpoch,
     fakeTimeRealtime: true,
-    jit: { structuredSsa: true, profileMethods: false },
+    jit: {compileWorker: false,  structuredSsa: true, profileMethods: false },
   });
   const current = { status: 'runnable' };
   const sleeping = {
@@ -9262,7 +9269,7 @@ test('generated quanta compare realtime fake-clock deadlines in guest time', (t)
 
   const deterministic = new JVM({
     fakeTime: fakeEpoch,
-    jit: { structuredSsa: true, profileMethods: false },
+    jit: {compileWorker: false,  structuredSsa: true, profileMethods: false },
   });
   const deterministicThread = { status: 'runnable' };
   deterministic.threads = [deterministicThread];
@@ -9273,7 +9280,7 @@ test('generated quanta compare realtime fake-clock deadlines in guest time', (t)
 });
 
 test('scalar loop arithmetic exceptions materialize precise frame state', (t) => {
-  const jvm = new JVM({ jit: { warmupThreshold: 0, profileMethods: false } });
+  const jvm = new JVM({ jit: {compileWorker: false,  warmupThreshold: 0, profileMethods: false } });
   const instructions = [
     'iconst_0', 'istore_2', 'iload_2', 'iload_0',
     { op: 'if_icmpge', arg: 'Lreturn' },
@@ -9360,7 +9367,7 @@ public class ScalarFeatureHarness {
   async function run(scalarLoops, scalarGuestBodies = scalarLoops,
       scalarSsaOptimizations = true, wrappedValues = false,
       structuredSsa = false, ordinaryAdaptive = false) {
-    const jvm = new JVM({ classpath, jit: {
+    const jvm = new JVM({ classpath, jit: {compileWorker: false, 
       warmupThreshold: 0, preferWholeMethodJs: true, profileMethods: false, scalarLoops,
       scalarGuestBodies, scalarSsaOptimizations, structuredSsa,
       ordinaryAdaptiveFramelessPositional: ordinaryAdaptive,
@@ -9476,7 +9483,7 @@ public class ScalarFeatureHarness {
   t.ok(structured.generated?.jvmStructuredFieldReadCacheCount >= 2,
     'call-bearing loops cache non-volatile fields between effect boundaries');
   t.ok(structured.generated?.jvmStructuredSource.includes(
-    'ssaFieldCache0Valid = false'),
+    'ssaFieldCacheEpoch = (ssaFieldCacheEpoch + 1) | 0'),
   'calls invalidate cached field values before another guest effect');
   t.ok(structured.repeatedGenerated?.jvmStructuredFieldReadCacheCount >= 2,
     'call-free structured loops cache non-volatile fields by receiver identity');
@@ -9486,8 +9493,8 @@ public class ScalarFeatureHarness {
     'normal synchronous calls defer parent Frame materialization');
   t.notOk(structured.generated.jvmStructuredSource.includes('getStaticSyncAt'),
     'initialized static target is read directly without the generic helper');
-  t.ok(structured.generated.jvmStructuredSource.includes(
-    '.cell.value /* staticBias:I */'),
+  t.ok(/ssaLinkStaticCell\d+\.value \/\* staticBias:I \*\//.test(
+    structured.generated.jvmStructuredSource),
   'direct static access reads the live value cell of the canonical field map');
   t.ok(structured.generated.jvmStructuredSource.includes(
     'ssaLinkClassGuard'),
@@ -9649,7 +9656,7 @@ test('baseline generated float comparisons preserve JVM NaN ordering', (t) => {
         localsSize: '2', stackSize: '2', exceptionTable: [],
       }}],
     };
-    const jvm = new JVM({jit: {structuredSsa: false, scalarLoops: false}});
+    const jvm = new JVM({jit: {compileWorker: false, structuredSsa: false, scalarLoops: false}});
     const generated = jvm.jit.compileBaselineMethod(method);
     const frame = new Frame(method);
     frame.className = 'FloatCompareHarness';
@@ -9689,7 +9696,7 @@ public class StructuredCatchHarness {
   }
 }
 `);
-    const jvm = new JVM({ classpath, jit: {
+    const jvm = new JVM({ classpath, jit: {compileWorker: false, 
       warmupThreshold: 0, structuredSsa: true, profileMethods: false,
     } });
     await jvm.loadClassByName('StructuredCatchHarness');
@@ -9784,7 +9791,7 @@ function fusedShapeMethod(name, descriptor, targetDescriptor, callCount, options
 
 
 test('structured callers feed a deoptimized non-void child return into SSA', (t) => {
-  const jvm = new JVM({ jit: {
+  const jvm = new JVM({ jit: {compileWorker: false, 
     warmupThreshold: 0, structuredSsa: true,
   } });
   const call = {
@@ -9814,7 +9821,7 @@ test('structured callers feed a deoptimized non-void child return into SSA', (t)
     } }],
   };
   const activeChild = new Frame(caller);
-  jvm.jit.tryInvokeSyncAt = (_id, frame, currentThread) => {
+  jvm.jit.tryInvokeSyncAtSite = (_id, frame, currentThread) => {
     frame.stack.items.length = 0;
     currentThread.callStack.push(activeChild);
     return { deopt: true, transient: true, reason: 'deoptimized value child' };
@@ -9853,7 +9860,7 @@ test('structured callers feed a deoptimized non-void child return into SSA', (t)
 
 test('retained structured continuations precede stale interpreter-step requests',
   (t) => {
-  const jvm = new JVM({ jit: {
+  const jvm = new JVM({ jit: {compileWorker: false, 
     warmupThreshold: 0, structuredSsa: true,
   } });
   const caller = {
@@ -9883,7 +9890,7 @@ test('retained structured continuations precede stale interpreter-step requests'
     } }],
   };
   const activeChild = new Frame(caller);
-  jvm.jit.tryInvokeSyncAt = (_id, frame, currentThread) => {
+  jvm.jit.tryInvokeSyncAtSite = (_id, frame, currentThread) => {
     frame.stack.items.length = 0;
     currentThread.callStack.push(activeChild);
     return { deopt: true, transient: true, reason: 'retained child' };
@@ -9919,7 +9926,7 @@ test('retained structured continuations precede stale interpreter-step requests'
 
 test('structured callers own non-void children left by ordinary call results',
   (t) => {
-  const jvm = new JVM({ jit: {
+  const jvm = new JVM({ jit: {compileWorker: false, 
     warmupThreshold: 0, structuredSsa: true,
   } });
   const caller = {
@@ -9950,7 +9957,7 @@ test('structured callers own non-void children left by ordinary call results',
   };
   const activeChild = new Frame(caller);
   activeChild.className = 'ArbitrarySchedulerVisibleChild';
-  jvm.jit.tryInvokeSyncAt = (_id, frame, currentThread) => {
+  jvm.jit.tryInvokeSyncAtSite = (_id, frame, currentThread) => {
     frame.stack.items.length = 0;
     currentThread.callStack.push(activeChild);
     return jvm.jit.returnVoid();
@@ -9986,7 +9993,7 @@ test('structured callers own non-void children left by ordinary call results',
 
 test('structured child linking distinguishes a restored caller from its child',
   (t) => {
-  const jvm = new JVM({ jit: { warmupThreshold: 0 } });
+  const jvm = new JVM({ jit: {compileWorker: false,  warmupThreshold: 0 } });
   const method = {
     name: 'restoredStructuredCaller', descriptor: '()V', flags: ['static'],
     attributes: [{ type: 'code', code: {
@@ -10114,7 +10121,7 @@ test('structured child linking distinguishes a restored caller from its child',
 });
 
 test('frameless structured call exceptions retain invoke operands without a child', (t) => {
-  const jvm = new JVM({ jit: {
+  const jvm = new JVM({ jit: {compileWorker: false, 
     warmupThreshold: 0, structuredSsa: true,
   } });
   const caller = {
@@ -10149,9 +10156,9 @@ test('frameless structured call exceptions retain invoke operands without a chil
   callStack.push(outer);
   const thread = { status: 'runnable', callStack };
   const thrown = new Error('arbitrary positional call failure');
-  const originalInvoke = jvm.jit.tryInvokeSyncAt;
-  jvm.jit.tryInvokeSyncAt = () => { throw thrown; };
-  t.teardown(() => { jvm.jit.tryInvokeSyncAt = originalInvoke; });
+  const originalInvoke = jvm.jit.tryInvokeSyncAtSite;
+  jvm.jit.tryInvokeSyncAtSite = () => { throw thrown; };
+  t.teardown(() => { jvm.jit.tryInvokeSyncAtSite = originalInvoke; });
 
   let observed;
   try {
@@ -10173,7 +10180,7 @@ test('frameless structured call exceptions retain invoke operands without a chil
   const rejected = {
     deopt: true, transient: true, reason: 'arbitrary admission rejection',
   };
-  jvm.jit.tryInvokeSyncAt = () => rejected;
+  jvm.jit.tryInvokeSyncAtSite = () => rejected;
   const deoptimized = generated(frame, thread, jvm.jit, false, true);
   t.equal(deoptimized, rejected,
     'the original admission deoptimization is propagated');
@@ -10221,7 +10228,7 @@ test('JIT produces same PyramidApplet mock drawing operations as interpreter', a
 });
 
 test('JIT bytecode safe point deopts at breakpoint with materialized frame state', async (t) => {
-  const jvm = new JVM({ classpath: 'sources', jit: { warmupThreshold: 0 } });
+  const jvm = new JVM({ classpath: 'sources', jit: {compileWorker: false,  warmupThreshold: 0 } });
   await jvm.loadClassByName('PyramidApplet');
   const method = await jvm.findMethodInHierarchy('PyramidApplet', 'dot', '([D[D)D');
   const frame = new Frame(method);
@@ -10260,7 +10267,7 @@ public class GeneratedNumericHarness {
 }
 `);
 
-  const jvm = new JVM({ classpath, jit: { warmupThreshold: 0 } });
+  const jvm = new JVM({ classpath, jit: {compileWorker: false,  warmupThreshold: 0 } });
   await jvm.loadClassByName('GeneratedNumericHarness');
   const thread = {
     id: 0,
@@ -10299,7 +10306,7 @@ test('whole-method preference admits the complete JavaScript capability set', (t
       localsSize: '1', stackSize: '2', exceptionTable: [],
     } }],
   };
-  const jvm = new JVM({ jit: {
+  const jvm = new JVM({ jit: {compileWorker: false, 
     warmupThreshold: 0,
     preferWholeMethodJs: true,
   } });
@@ -10371,7 +10378,7 @@ public class GeneratedInheritedFieldHarness extends GeneratedInheritedFieldBase 
 }
 `);
 
-  const jvm = new JVM({ classpath, jit: { warmupThreshold: 0 } });
+  const jvm = new JVM({ classpath, jit: {compileWorker: false,  warmupThreshold: 0 } });
   await jvm.loadClassByName('GeneratedInheritedFieldHarness');
   await jvm.loadClassByName('GeneratedInheritedFieldBase');
   const thread = {
@@ -10410,7 +10417,7 @@ public class GeneratedFallbackHarness {
 }
 `);
 
-  const jvm = new JVM({ classpath, jit: { warmupThreshold: 0 } });
+  const jvm = new JVM({ classpath, jit: {compileWorker: false,  warmupThreshold: 0 } });
   jvm.jit.codegenUnavailable = true;
   await jvm.loadClassByName('GeneratedFallbackHarness');
   const thread = {
@@ -10447,7 +10454,7 @@ public class IntegerLoopJitHarness {
 }
 `);
 
-  const jvm = new JVM({ classpath, jit: { warmupThreshold: 0 } });
+  const jvm = new JVM({ classpath, jit: {compileWorker: false,  warmupThreshold: 0 } });
   await jvm.loadClassByName('IntegerLoopJitHarness');
   const thread = {
     id: 0,
@@ -10484,7 +10491,7 @@ public class WideIncrementJitHarness {
 }
 `);
 
-  const jvm = new JVM({ classpath, jit: { warmupThreshold: 0 } });
+  const jvm = new JVM({ classpath, jit: {compileWorker: false,  warmupThreshold: 0 } });
   await jvm.loadClassByName('WideIncrementJitHarness');
   const thread = {
     id: 0,
@@ -10518,7 +10525,7 @@ public class NestedGeneratedJitHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: { warmupThreshold: 100 } });
+  const jvm = new JVM({ classpath, jit: {compileWorker: false,  warmupThreshold: 100 } });
   await jvm.loadClassByName('NestedGeneratedJitHarness');
   const thread = {
     id: 0,
@@ -10532,9 +10539,11 @@ public class NestedGeneratedJitHarness {
   const out = [0, 0, 0, 0];
   await invoke(jvm, thread, 'NestedGeneratedJitHarness', 'compute', '([I)V', [out]);
   t.deepEqual(out, [0, 3, 6, 9], 'nested generated calls preserve results');
-  t.equal(jvm.jit.generatedRunCount, 2,
+  // The caller's baseline resume body hands the frame back to the
+  // structured body at the loop header, which is one more generated run.
+  t.equal(jvm.jit.generatedRunCount, 3,
     'caller and first helper cross the initial class-initialization boundary');
-  t.equal(jvm.jit.syncGeneratedRunCount, 2,
+  t.equal(jvm.jit.syncGeneratedRunCount, 3,
     'generated caller and helper complete synchronously without Promise handoffs');
   t.equal(jvm.jit.syncInlinedCallCount, 3,
     'remaining integer leaf calls execute inline without child frames');
@@ -10552,7 +10561,7 @@ public class SynchronousExecuteHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     preferWholeMethodJs: true,
     profileMethods: false,
@@ -10783,7 +10792,7 @@ public class DirectIntegerInlineHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0, preferWholeMethodJs: true, profileMethods: false,
     structuredSsa: false,
   } });
@@ -10847,7 +10856,7 @@ public class DirectIntegerInlineHarness {
   t.equal(scopedGuardedOut[0], scopedGuardedExpected,
     'branch-local inline values remain available to later guards and results');
 
-  const structuredJvm = new JVM({ classpath, jit: {
+  const structuredJvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0, preferWholeMethodJs: true, profileMethods: false,
     structuredSsa: true,
   } });
@@ -10902,7 +10911,7 @@ public class DirectIntegerInlineHarness {
     'debug deoptimization restores the earliest unexecuted bytecode PC');
   thread.callStack.pop();
 
-  const coldJvm = new JVM({ classpath, jit: {
+  const coldJvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0, preferWholeMethodJs: true, profileMethods: false,
     structuredSsa: false,
   } });
@@ -10950,7 +10959,7 @@ public class IntermethodCallJitHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0, preferWholeMethodJs: true, profileMethods: true,
     structuredSsa: false,
   } });
@@ -11030,7 +11039,7 @@ test('large acyclic call decision trees enter generic structured SSA', (t) => {
       exceptionTable: [],
     } }],
   };
-  const jvm = new JVM({ jit: {
+  const jvm = new JVM({ jit: {compileWorker: false, 
     structuredSsa: true,
     profileMethods: false,
   } });
@@ -11071,7 +11080,7 @@ test('Wasm leaves constructors and class initializers atomic', (t) => {
     if (previous === undefined) delete process.env.JVM_WASM_JIT;
     else process.env.JVM_WASM_JIT = previous;
   });
-  const jvm = new JVM({ jit: { warmupThreshold: 100 } });
+  const jvm = new JVM({ jit: {compileWorker: false,  warmupThreshold: 100 } });
   const frame = (name) => ({ method: { name }, instructions: [{}] });
   const method = (name) => ({
     name,
@@ -11092,7 +11101,7 @@ test('Wasm leaves constructors and class initializers atomic', (t) => {
 test('ordinary generated call sites reuse canonical positional adapters', (t) => {
   t.equal(new JVM().jit.framePositionalCallsEnabled, false,
     'dispatcher-side positional calls remain an explicit experiment');
-  const jvm = new JVM({jit: {
+  const jvm = new JVM({jit: {compileWorker: false, 
     warmupThreshold: 0,
     framePositionalCalls: true,
   }});
@@ -11151,7 +11160,7 @@ test('ordinary generated call sites reuse canonical positional adapters', (t) =>
 
 test('canonical positional adapters never recycle frames with active children',
   (t) => {
-  const jvm = new JVM({jit: {warmupThreshold: 0}});
+  const jvm = new JVM({jit: {compileWorker: false, warmupThreshold: 0}});
   const method = {
     className: 'PositionalActiveChildTarget',
     name: 'value', descriptor: '()I', flags: ['static'],
@@ -11196,7 +11205,7 @@ test('canonical positional adapters never recycle frames with active children',
 
 test('resolved generated targets never recycle frames with active children',
   (t) => {
-  const jvm = new JVM({jit: {warmupThreshold: 0}});
+  const jvm = new JVM({jit: {compileWorker: false, warmupThreshold: 0}});
   const method = {
     className: 'ResolvedActiveChildTarget',
     name: 'value', descriptor: '()I', flags: ['static'],
@@ -11269,7 +11278,7 @@ public final class PositionalQuantumPollHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     preferWholeMethodJs: true,
     structuredSsa: true,
@@ -11340,7 +11349,7 @@ public final class PositionalQuantumPollHarness {
 });
 
 test('frame positional deoptimization links the canonical child return', (t) => {
-  const jvm = new JVM({jit: {warmupThreshold: 0}});
+  const jvm = new JVM({jit: {compileWorker: false, warmupThreshold: 0}});
   const method = {name: 'parent', descriptor: '()V', flags: ['static'],
     attributes: [{type: 'code', code: {codeItems: [{instruction: 'return'}],
       exceptionTable: [], localsSize: '0', stackSize: '1'}}]};
@@ -11423,7 +11432,7 @@ test('restoring positional callers materialize post-call state before child retu
       exceptionTable: [], localsSize: '1', stackSize: '2',
     }}],
   };
-  const jvm = new JVM({jit: {
+  const jvm = new JVM({jit: {compileWorker: false, 
     warmupThreshold: 0, preferWholeMethodJs: true, structuredSsa: true,
     profileMethods: false, profileTimings: false,
   }});
@@ -11521,7 +11530,7 @@ public class GeneratedTransientCallJitHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: { warmupThreshold: 100 } });
+  const jvm = new JVM({ classpath, jit: {compileWorker: false,  warmupThreshold: 100 } });
   await jvm.loadClassByName('GeneratedTransientCallJitHarness');
   const thread = {
     id: 0,
@@ -11536,7 +11545,10 @@ public class GeneratedTransientCallJitHarness {
   out.type = '[I';
   await invoke(jvm, thread, 'GeneratedTransientCallJitHarness', 'compute', '([I)V', [out]);
   t.deepEqual(out.slice(0, 3), [11, 21, 31], 'unsupported child calls preserve results');
-  t.equal(jvm.jit.generatedRunCount, 4,
+  // After each interpreted child the caller's baseline resume body runs
+  // to the loop header and hands the frame back to the structured body,
+  // so every child costs two generated runs of the caller.
+  t.equal(jvm.jit.generatedRunCount, 7,
     'caller resumes generated execution after each interpreted child');
   const callerMethod = await jvm.findMethodInHierarchy(
     'GeneratedTransientCallJitHarness', 'compute', '([I)V');
@@ -11561,7 +11573,7 @@ public class GeneratedArrayCloneJitHarness {
 `);
   const jvm = new JVM({
     classpath,
-    jit: { warmupThreshold: 0, experimentalControlFlow: true },
+    jit: {compileWorker: false,  warmupThreshold: 0, experimentalControlFlow: true },
   });
   await jvm.loadClassByName('GeneratedArrayCloneJitHarness');
   const thread = {
@@ -11602,7 +11614,7 @@ public class GeneratedInterfaceJitHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: { warmupThreshold: 100 } });
+  const jvm = new JVM({ classpath, jit: {compileWorker: false,  warmupThreshold: 100 } });
   await jvm.loadClassByName('GeneratedInterfaceJitHarness');
   await jvm.loadClassByName('GeneratedInterfaceJitHarness$Fixed');
   const thread = {
@@ -11652,7 +11664,7 @@ public class InlineGetterFieldHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: { warmupThreshold: 100 } });
+  const jvm = new JVM({ classpath, jit: {compileWorker: false,  warmupThreshold: 100 } });
   await jvm.loadClassByName('InlineGetterFieldHarness');
   await jvm.loadClassByName('InlineGetterFieldHarness$Counter');
   const thread = {
@@ -11697,7 +11709,7 @@ public class GeneratedIntegerArrayLoopHarness {
 }
 `);
 
-  const jvm = new JVM({ classpath, jit: { warmupThreshold: 100 } });
+  const jvm = new JVM({ classpath, jit: {compileWorker: false,  warmupThreshold: 100 } });
   await jvm.loadClassByName('GeneratedIntegerArrayLoopHarness');
   const thread = {
     id: 0,
@@ -11732,7 +11744,7 @@ public class GeneratedShortArrayJitHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: { warmupThreshold: 100 } });
+  const jvm = new JVM({ classpath, jit: {compileWorker: false,  warmupThreshold: 100 } });
   await jvm.loadClassByName('GeneratedShortArrayJitHarness');
   const thread = {
     id: 0,
@@ -11765,7 +11777,7 @@ public class GeneratedLongJitHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: { warmupThreshold: 0 } });
+  const jvm = new JVM({ classpath, jit: {compileWorker: false,  warmupThreshold: 0 } });
   await jvm.loadClassByName('GeneratedLongJitHarness');
   const thread = {
     id: 0,
@@ -11801,7 +11813,7 @@ public class GeneratedFloatLoopHarness {
 `);
 
   async function run(jit) {
-    const jvm = new JVM({ classpath, jit });
+    const jvm = new JVM({ classpath, jit: { compileWorker: false, ...jit } });
     await jvm.loadClassByName('GeneratedFloatLoopHarness');
     const thread = {
       id: 0,
@@ -11846,7 +11858,7 @@ public class WasmLongCarryHarness {
     else process.env.JVM_WASM_JIT = previous;
   });
 
-  const jvm = new JVM({ classpath, jit: { warmupThreshold: 100 } });
+  const jvm = new JVM({ classpath, jit: {compileWorker: false,  warmupThreshold: 100 } });
   await jvm.loadClassByName('WasmLongCarryHarness');
   jvm.classInitializationState.set('WasmLongCarryHarness', 'INITIALIZED');
   const thread = {
@@ -11914,7 +11926,7 @@ public class WasmFieldCacheHarness {
     else process.env.JVM_WASM_JIT = previous;
   });
 
-  const jvm = new JVM({ classpath, jit: { warmupThreshold: 100 } });
+  const jvm = new JVM({ classpath, jit: {compileWorker: false,  warmupThreshold: 100 } });
   await jvm.loadClassByName('WasmFieldCacheHarness');
   jvm.classInitializationState.set('WasmFieldCacheHarness', 'INITIALIZED');
   const thread = {
@@ -11975,7 +11987,7 @@ public class WasmWriteSummaryHarness {
     else process.env.JVM_WASM_JIT = previous;
   });
 
-  const jvm = new JVM({ classpath, jit: { warmupThreshold: 100 } });
+  const jvm = new JVM({ classpath, jit: {compileWorker: false,  warmupThreshold: 100 } });
   await jvm.loadClassByName('WasmWriteSummaryHarness');
   jvm.classInitializationState.set('WasmWriteSummaryHarness', 'INITIALIZED');
   const thread = {
@@ -12050,7 +12062,7 @@ public class WasmPartialLinkHarness {
     else process.env.JVM_WASM_JIT = previous;
   });
 
-  const jvm = new JVM({ classpath, jit: { warmupThreshold: 100 } });
+  const jvm = new JVM({ classpath, jit: {compileWorker: false,  warmupThreshold: 100 } });
   await jvm.loadClassByName('WasmPartialLinkHarness');
   jvm.classInitializationState.set('WasmPartialLinkHarness', 'INITIALIZED');
   jvm.classes.WasmPartialLinkHarness.staticFields.set('diag:Z', false);
@@ -12106,7 +12118,7 @@ public class WasmLinkedHelperHarness {
     else process.env.JVM_WASM_JIT = previous;
   });
 
-  const jvm = new JVM({ classpath, jit: { warmupThreshold: 100 } });
+  const jvm = new JVM({ classpath, jit: {compileWorker: false,  warmupThreshold: 100 } });
   await jvm.loadClassByName('WasmLinkedHelperHarness');
   jvm.classInitializationState.set('WasmLinkedHelperHarness', 'INITIALIZED');
   const thread = {
@@ -12156,7 +12168,7 @@ public class WasmLinkedReporterHelperHarness {
     else process.env.JVM_WASM_JIT = previous;
   });
 
-  const jvm = new JVM({ classpath, jit: { warmupThreshold: 100 } });
+  const jvm = new JVM({ classpath, jit: {compileWorker: false,  warmupThreshold: 100 } });
   await jvm.loadClassByName('WasmLinkedReporterHelperHarness');
   jvm.classInitializationState.set('WasmLinkedReporterHelperHarness', 'INITIALIZED');
   const thread = {
@@ -12212,7 +12224,7 @@ public class WasmReporterHarness {
     else process.env.JVM_WASM_JIT = previous;
   });
 
-  const jvm = new JVM({ classpath, jit: { warmupThreshold: 100 } });
+  const jvm = new JVM({ classpath, jit: {compileWorker: false,  warmupThreshold: 100 } });
   await jvm.loadClassByName('WasmReporterHarness');
   jvm.classInitializationState.set('WasmReporterHarness', 'INITIALIZED');
   const thread = {
@@ -12295,7 +12307,7 @@ test('whole-method JS tier accepts invoke loops with rethrow-only handlers', (t)
       exceptionTable: [{ startLbl: 'Lstart', endLbl: 'Lend', handlerLbl: 'Lhandler' }],
     } }],
   };
-  const jvm = new JVM({ jit: { preferWholeMethodJs: true } });
+  const jvm = new JVM({ jit: {compileWorker: false,  preferWholeMethodJs: true } });
 
   t.ok(jvm.jit.hasOnlyNoOpExceptionHandlers(method, codeItems),
     'bare rethrow handler is proven semantically transparent');
@@ -12325,7 +12337,7 @@ public class WasmDeferredHarness {
     else process.env.JVM_WASM_JIT = previous;
   });
 
-  const jvm = new JVM({ classpath, jit: { warmupThreshold: 100 } });
+  const jvm = new JVM({ classpath, jit: {compileWorker: false,  warmupThreshold: 100 } });
   await jvm.loadClassByName('WasmDeferredHarness');
   jvm.classInitializationState.set('WasmDeferredHarness', 'INITIALIZED');
   const method = await jvm.findMethodInHierarchy('WasmDeferredHarness', 'compute', '([I)V');
@@ -12383,7 +12395,7 @@ public class WasmCheckedHandlerHarness {
     else process.env.JVM_WASM_JIT = previous;
   });
 
-  const jvm = new JVM({ classpath, jit: { warmupThreshold: 0 } });
+  const jvm = new JVM({ classpath, jit: {compileWorker: false,  warmupThreshold: 0 } });
   await jvm.loadClassByName('WasmCheckedHandlerHarness');
   jvm.classInitializationState.set('WasmCheckedHandlerHarness', 'INITIALIZED');
   const thread = {
@@ -12461,7 +12473,7 @@ public class WasmBeforeDeoptHarness {
 
   const jvm = new JVM({
     classpath,
-    jit: { warmupThreshold: 0, preferWholeMethodJs: true },
+    jit: {compileWorker: false,  warmupThreshold: 0, preferWholeMethodJs: true },
   });
   await jvm.loadClassByName('WasmBeforeDeoptHarness');
   jvm.classInitializationState.set('WasmBeforeDeoptHarness', 'INITIALIZED');
@@ -12501,7 +12513,7 @@ public class DebugJitHarness {
 }
 `);
 
-  const jvm = new JVM({ classpath, jit: { warmupThreshold: 0 } });
+  const jvm = new JVM({ classpath, jit: {compileWorker: false,  warmupThreshold: 0 } });
   await jvm.loadClassByName('DebugJitHarness');
   const method = await jvm.findMethodInHierarchy('DebugJitHarness', 'compute', '([II)V');
   const frame = new Frame(method);
@@ -12552,7 +12564,7 @@ class SelectiveOtherHotClass {
 }
 `);
 
-  const jvm = new JVM({ classpath, jit: { warmupThreshold: 0 } });
+  const jvm = new JVM({ classpath, jit: {compileWorker: false,  warmupThreshold: 0 } });
   await jvm.loadClassByName('SelectiveDeoptHarness');
   await jvm.loadClassByName('SelectiveOtherHotClass');
   const thread = {
@@ -12630,7 +12642,7 @@ public class JitExceptionHarness {
 
   const jvm = new JVM({
     classpath,
-    jit: { warmupThreshold: 0, experimentalControlFlow: true },
+    jit: {compileWorker: false,  warmupThreshold: 0, experimentalControlFlow: true },
   });
   await jvm.loadClassByName('JitExceptionHarness');
   const thread = {
@@ -12710,7 +12722,7 @@ public class GeneratedRejectHarness implements Runnable {
 }
 `);
 
-  const safeJvm = new JVM({ classpath, jit: { warmupThreshold: 0 } });
+  const safeJvm = new JVM({ classpath, jit: {compileWorker: false,  warmupThreshold: 0 } });
   await safeJvm.loadClassByName('GeneratedRejectHarness');
   const safeMethod = await safeJvm.findMethodInHierarchy('GeneratedRejectHarness', 'compute', '([I)V');
   t.notOk(safeJvm.jit.isCodegenSupported(safeMethod),
@@ -12729,7 +12741,7 @@ public class GeneratedRejectHarness implements Runnable {
 
   const experimentalJvm = new JVM({
     classpath,
-    jit: { warmupThreshold: 0, experimentalControlFlow: true },
+    jit: {compileWorker: false,  warmupThreshold: 0, experimentalControlFlow: true },
   });
   await experimentalJvm.loadClassByName('GeneratedRejectHarness');
   const experimentalMethod = await experimentalJvm.findMethodInHierarchy(
@@ -12780,7 +12792,7 @@ public class AdaptiveConstructorCallerHarness {
 `);
   const jvm = new JVM({
     classpath,
-    jit: {
+    jit: {compileWorker: false, 
       warmupThreshold: 0,
       preferWholeMethodJs: true,
       adaptiveConstructorCallers: true,
@@ -12872,7 +12884,7 @@ public class AdaptiveComplexConstructorHarness {
 `);
   const jvm = new JVM({
     classpath,
-    jit: {
+    jit: {compileWorker: false, 
       preferWholeMethodJs: true,
       adaptiveConstructorCallers: true,
       adaptiveCodegenThreshold: 4,
@@ -12929,7 +12941,7 @@ public class StructuredInstanceofHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     preferWholeMethodJs: true,
     rendererPipeline: true,
@@ -13069,7 +13081,7 @@ public class GeneratedLoopConstructorHarness {
 `);
   const jvm = new JVM({
     classpath,
-    jit: {
+    jit: {compileWorker: false, 
       warmupThreshold: 0,
       preferWholeMethodJs: true,
       rendererPipeline: true,
@@ -13282,7 +13294,7 @@ public class GeneratedLoopConstructorHarness {
 
   const disabledJvm = new JVM({
     classpath,
-    jit: {
+    jit: {compileWorker: false, 
       preferWholeMethodJs: true,
       rendererPipeline: true,
       hotLoopConstructors: false,
@@ -13313,7 +13325,7 @@ public class AdaptiveOneShotCallerHarness {
 `);
   const jvm = new JVM({
     classpath,
-    jit: {
+    jit: {compileWorker: false, 
       warmupThreshold: 100,
       preferWholeMethodJs: false,
       adaptiveConstructorCallers: true,
@@ -13360,7 +13372,7 @@ public class AdaptiveOneShotCallerHarness {
 
   const wasmJvm = new JVM({
     classpath,
-    jit: {
+    jit: {compileWorker: false, 
       preferWholeMethodJs: false,
       adaptiveConstructorCallers: true,
       adaptiveCodegenTimeThresholdMs: 1,
@@ -13387,14 +13399,14 @@ public class AdaptiveOneShotCallerHarness {
   t.notOk(wasmJvm.jit.prefersWholeMethodJs(wasmMethod),
     'the adaptive policy does not steal a method handled by Wasm');
 
-  const defaultEscalationJvm = new JVM({ jit: {
+  const defaultEscalationJvm = new JVM({ jit: {compileWorker: false, 
     preferWholeMethodJs: false,
   } });
   defaultEscalationJvm.jit.promoteAdaptiveCodegen({});
   t.ok(defaultEscalationJvm.jit.preferWholeMethodJs,
     'one independently hot JavaScript method stops ordinary partial-Wasm probes');
 
-  const escalationJvm = new JVM({ jit: {
+  const escalationJvm = new JVM({ jit: {compileWorker: false, 
     preferWholeMethodJs: false,
     adaptiveWholeMethodEscalationThreshold: 2,
   } });
@@ -13423,7 +13435,7 @@ public class GeneratedDupX2Harness {
 `);
   const jvm = new JVM({
     classpath,
-    jit: {
+    jit: {compileWorker: false, 
       warmupThreshold: 0,
       preferWholeMethodJs: true,
       profileMethods: true,
@@ -13472,7 +13484,7 @@ public final class GeneratedDup2X2Harness {
 `);
   const jvm = new JVM({
     classpath,
-    jit: {
+    jit: {compileWorker: false, 
       warmupThreshold: 0,
       preferWholeMethodJs: true,
       profileMethods: true,
@@ -13518,7 +13530,7 @@ public final class RenamedDup2AliasHarness {
 `);
   const jvm = new JVM({
     classpath,
-    jit: {
+    jit: {compileWorker: false, 
       warmupThreshold: 0,
       structuredSsa: true,
       preferWholeMethodJs: true,
@@ -13576,7 +13588,7 @@ public class GeneratedPostIncrementCallHarness {
 `);
   const jvm = new JVM({
     classpath,
-    jit: {
+    jit: {compileWorker: false, 
       warmupThreshold: 0,
       preferWholeMethodJs: true,
       postIncrementHelpers: true,
@@ -13637,7 +13649,7 @@ public class GeneratedMonitorWaitHarness {
 
   const jvm = new JVM({
     classpath,
-    jit: { warmupThreshold: 0, experimentalControlFlow: true },
+    jit: {compileWorker: false,  warmupThreshold: 0, experimentalControlFlow: true },
   });
   await jvm.loadClassByName('GeneratedMonitorWaitHarness');
   const method = await jvm.findMethodInHierarchy('GeneratedMonitorWaitHarness', 'compute', '([I)V');
@@ -13665,7 +13677,7 @@ public class GeneratedMonitorJitHarness {
 `);
   const jvm = new JVM({
     classpath,
-    jit: { warmupThreshold: 0, structuredSsa: true },
+    jit: {compileWorker: false,  warmupThreshold: 0, structuredSsa: true },
   });
   await jvm.loadClassByName('GeneratedMonitorJitHarness');
   const method = await jvm.findMethodInHierarchy(
@@ -13752,7 +13764,7 @@ public class MonitorCallIslandHarness {
 }
 `);
 
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     effectfulMonitorCodegen: true,
   } });
@@ -13813,7 +13825,7 @@ public class JitClassLiteralHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: { warmupThreshold: 1 } });
+  const jvm = new JVM({ classpath, jit: {compileWorker: false,  warmupThreshold: 1 } });
   await jvm.loadClassByName('JitClassLiteralHarness');
   const thread = {
     id: 0,
@@ -13851,7 +13863,7 @@ public final class WasmOsrModuleSelectionHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: { warmupThreshold: 0 } });
+  const jvm = new JVM({ classpath, jit: {compileWorker: false,  warmupThreshold: 0 } });
   await jvm.loadClassByName(className);
   const method = await jvm.findMethodInHierarchy(className, 'spin', '(I)I');
 
@@ -13947,7 +13959,7 @@ public final class RestoringSyncFallbackHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
+  const jvm = new JVM({ classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     profileMethods: false,
     structuredSsa: true,
@@ -14015,7 +14027,7 @@ test('a transient deopt takes one canonical interpreter step before every JIT ti
       localsSize: '0', stackSize: '0',
     }}],
   };
-  const jvm = new JVM({jit: {warmupThreshold: 0}});
+  const jvm = new JVM({jit: {compileWorker: false, warmupThreshold: 0}});
   const frame = new Frame(method);
   const thread = {
     id: 0, status: 'runnable', pendingException: null, callStack: new Stack(),
@@ -14183,7 +14195,7 @@ public final class PreparedWholeMethodUpgradeHarness {
   }
 }
 `);
-  const jvm = new JVM({classpath, jit: {
+  const jvm = new JVM({classpath, jit: {compileWorker: false, 
     warmupThreshold: 0,
     profileMethods: false,
     structuredSsa: true,

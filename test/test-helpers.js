@@ -56,6 +56,12 @@ async function runTest(className, expectedOutput, t, options = {}) {
   try {
     const jvm = new JVM({
       classpath: 'sources',
+      // These tests exercise guest semantics against a 1s budget, not the
+      // ahead-of-main preparation pass. Preparation compiles the whole
+      // 175-class `sources` classpath on both tiers (~1.1s measured), which
+      // alone exceeds that budget. Tests that want it pass
+      // prepareBeforeMain: true, which wins via the spread below.
+      prepareBeforeMain: false,
       ...jvmOptions,
       jreOverrides: {
         "testing/MockOutputStream": {
