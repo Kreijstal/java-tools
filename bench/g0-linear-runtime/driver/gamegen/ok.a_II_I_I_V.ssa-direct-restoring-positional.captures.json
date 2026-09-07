@@ -1,0 +1,97 @@
+{
+ "ssaLinkStaticCell6339": {
+  "kind": "staticCell",
+  "className": "ok",
+  "key": "a:I",
+  "valueType": "number"
+ },
+ "ssaLinkStaticCell6340": {
+  "kind": "staticCell",
+  "className": "ok",
+  "key": "e:I",
+  "valueType": "number"
+ },
+ "ssaLinkStaticCell6341": {
+  "kind": "staticCell",
+  "className": "ok",
+  "key": "h:I",
+  "valueType": "number"
+ },
+ "ssaLinkStaticCell6342": {
+  "kind": "staticCell",
+  "className": "hk",
+  "key": "h:I",
+  "valueType": "number"
+ },
+ "ssaLinkStaticCell6343": {
+  "kind": "staticCell",
+  "className": "hk",
+  "key": "c:I",
+  "valueType": "number"
+ },
+ "ssaLinkStaticCell6344": {
+  "kind": "staticCell",
+  "className": "hk",
+  "key": "c:I",
+  "valueType": "number"
+ },
+ "ssaLinkStaticCell6345": {
+  "kind": "staticCell",
+  "className": "hk",
+  "key": "c:I",
+  "valueType": "number"
+ },
+ "ssaLinkStaticCell6346": {
+  "kind": "staticCell",
+  "className": "hk",
+  "key": "c:I",
+  "valueType": "number"
+ },
+ "ssaLinkClassGuard634": {
+  "kind": "classGuard",
+  "owners": [
+   "ok",
+   "hk"
+  ]
+ },
+ "ssaLinkCallSite9955": {
+  "kind": "callSite",
+  "op": "invokestatic",
+  "className": "ok",
+  "methodName": "a",
+  "descriptor": "()V",
+  "fastPositional": false,
+  "fastPositionalRaw": false
+ },
+ "ssaLinkCallSite9956": {
+  "kind": "callSite",
+  "op": "invokestatic",
+  "className": "ok",
+  "methodName": "b",
+  "descriptor": "()Z",
+  "fastPositional": false,
+  "fastPositionalRaw": false
+ },
+ "ssaLinkCallSite9957": {
+  "kind": "callSite",
+  "op": "invokestatic",
+  "className": "hk",
+  "methodName": "c",
+  "descriptor": "(IIIII)V",
+  "fastPositional": false,
+  "fastPositionalRaw": false
+ },
+ "ssaLinkClassGuard635": {
+  "kind": "classGuard",
+  "owners": [
+   "ok",
+   "hk"
+  ]
+ },
+ "ssaReturnVoid": {
+  "kind": "other"
+ },
+ "ssaAsyncInvoke": {
+  "kind": "other"
+ }
+}

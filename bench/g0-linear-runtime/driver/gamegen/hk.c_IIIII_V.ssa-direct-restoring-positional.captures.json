@@ -1,0 +1,92 @@
+{
+ "ssaLinkStaticCell6555": {
+  "kind": "staticCell",
+  "className": "hk",
+  "key": "h:I",
+  "valueType": "number"
+ },
+ "ssaLinkStaticCell6556": {
+  "kind": "staticCell",
+  "className": "hk",
+  "key": "b:I",
+  "valueType": "number"
+ },
+ "ssaLinkStaticCell6557": {
+  "kind": "staticCell",
+  "className": "hk",
+  "key": "c:I",
+  "valueType": "number"
+ },
+ "ssaLinkStaticCell6558": {
+  "kind": "staticCell",
+  "className": "hk",
+  "key": "c:I",
+  "valueType": "number"
+ },
+ "ssaLinkStaticCell6559": {
+  "kind": "staticCell",
+  "className": "hk",
+  "key": "c:I",
+  "valueType": "number"
+ },
+ "ssaLinkStaticCell6560": {
+  "kind": "staticCell",
+  "className": "hk",
+  "key": "g:I",
+  "valueType": "number"
+ },
+ "ssaLinkStaticCell6561": {
+  "kind": "staticCell",
+  "className": "hk",
+  "key": "g:I",
+  "valueType": "number"
+ },
+ "ssaLinkStaticCell6562": {
+  "kind": "staticCell",
+  "className": "hk",
+  "key": "j:I",
+  "valueType": "number"
+ },
+ "ssaLinkStaticCell6563": {
+  "kind": "staticCell",
+  "className": "hk",
+  "key": "l:[I",
+  "valueType": "[I"
+ },
+ "ssaLinkStaticCell6564": {
+  "kind": "staticCell",
+  "className": "hk",
+  "key": "l:[I",
+  "valueType": "[I"
+ },
+ "ssaLinkStaticCell6565": {
+  "kind": "staticCell",
+  "className": "hk",
+  "key": "l:[I",
+  "valueType": "[I"
+ },
+ "ssaLinkStaticCell6566": {
+  "kind": "staticCell",
+  "className": "hk",
+  "key": "l:[I",
+  "valueType": "[I"
+ },
+ "ssaLinkClassGuard654": {
+  "kind": "classGuard",
+  "owners": [
+   "hk"
+  ]
+ },
+ "ssaLinkClassGuard655": {
+  "kind": "classGuard",
+  "owners": [
+   "hk"
+  ]
+ },
+ "ssaReturnVoid": {
+  "kind": "other"
+ },
+ "ssaAsyncInvoke": {
+  "kind": "other"
+ }
+}

@@ -1,3 +1,4 @@
+const { writeField } = require('../../../core/objectModel');
 module.exports = {
   super: 'java/awt/Component',
   fields: {
@@ -43,7 +44,7 @@ function normalizeText(value) {
 
 function setField(obj) {
   obj.fields = obj.fields || {};
-  obj.fields['java/awt/TextField.text'] = obj.text;
+  writeField(obj.fields, 'java/awt/TextField.text', obj.text);
 }
 
 function addListener(obj, listener) {

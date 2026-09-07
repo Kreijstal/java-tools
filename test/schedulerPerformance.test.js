@@ -5,6 +5,7 @@ const { JVM } = require('../src/core/jvm');
 const instructions = require('../src/instructions');
 const Frame = require('../src/core/frame');
 const Stack = require('../src/core/stack');
+const { readField } = require('../src/core/objectModel');
 
 test('idle scheduler waits instead of spinning zero-delay tasks', (t) => {
   const jvm = new JVM({ eventLoopYieldMs: 16 });
@@ -461,8 +462,8 @@ test('interpreter applies dup2_x1 category-2 semantics to doubles', async (t) =>
 
   const result = await jvm.executeTick({ allowBurst: true });
   t.equal(result.bytecodes, 7, 'the complete bytecode shape executes in one quantum');
-  t.equal(pair.fields['Pair.first'], 6.25, 'the first putfield receives the double');
-  t.equal(pair.fields['Pair.second'], 6.25, 'the duplicated double reaches the second putfield');
+  t.equal(readField(pair.fields, 'Pair.first'), 6.25, 'the first putfield receives the double');
+  t.equal(readField(pair.fields, 'Pair.second'), 6.25, 'the duplicated double reaches the second putfield');
   t.equal(thread.callStack.size(), 0, 'the method returns with a balanced operand stack');
   t.end();
 });

@@ -18,6 +18,7 @@
     "benchmark:jvm:ssa-fixed-point": "node scripts/benchmarkSsaFixedPoint.js",
     "benchmark:pcm-push:firefox": "node scripts/benchmarkJavaPcmPushFirefox.js",
     "benchmark:jvm:ssa-span-kernel": "node scripts/benchmarkSsaSpanKernel.js",
+    "benchmark:phase1-worker": "node scripts/benchmarkPhase1Worker.js",
     "test:all": "npm test && npm run test:playwright",
     "serve": "node scripts/serve.js",
     "run:jar": "node scripts/runJar.js",

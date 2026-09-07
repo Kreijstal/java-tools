@@ -1,4 +1,5 @@
 const { withThrows } = require('../../helpers');
+const { writeField } = require('../../../core/objectModel');
 
 function readOne(jvm, obj) {
   const readMethod = jvm._jreFindMethod(obj.type, 'read', '()I');
@@ -60,7 +61,7 @@ module.exports = {
     '<init>(Ljava/io/InputStream;)V': (jvm, obj, args) => {
       const inputStream = args[0];
       obj.in = inputStream;
-      if (obj.fields) obj.fields['java/io/FilterInputStream.in'] = inputStream;
+      if (obj.fields) writeField(obj.fields, 'java/io/FilterInputStream.in', inputStream);
     },
     
     'read([BII)I': (jvm, obj, args) => {

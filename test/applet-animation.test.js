@@ -2,6 +2,7 @@ const test = require('tape');
 const { JVM } = require('../src/core/jvm');
 const Frame = require('../src/core/frame');
 const Stack = require('../src/core/stack');
+const { readField } = require('../src/core/objectModel');
 
 async function invoke(jvm, thread, className, methodName, descriptor, locals) {
   const method = await jvm.findMethodInHierarchy(className, methodName, descriptor);
@@ -39,7 +40,7 @@ test('PyramidApplet start creates animator thread with applet runnable target', 
   await invoke(jvm, thread, 'PyramidApplet', 'start', '()V', [applet]);
 
   t.equal(jvm.threads.length, 2, 'start() should create an animator thread');
-  const animator = applet.fields['PyramidApplet.animator'];
+  const animator = readField(applet.fields, 'PyramidApplet.animator');
   t.ok(animator, 'applet should store the animator Thread object');
   t.equal(animator.name, 'GridOrbit', 'Thread(Runnable, String) should preserve the supplied name');
   t.equal(animator.runnable, applet, 'Thread(Runnable, String) should preserve the applet runnable target');

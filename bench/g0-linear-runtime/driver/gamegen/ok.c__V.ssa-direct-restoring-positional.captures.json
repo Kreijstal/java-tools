@@ -1,0 +1,26 @@
+{
+ "ssaLinkStaticCell6461": {
+  "kind": "staticCell",
+  "className": "ok",
+  "key": "d:I",
+  "valueType": "number"
+ },
+ "ssaLinkClassGuard643": {
+  "kind": "classGuard",
+  "owners": [
+   "ok"
+  ]
+ },
+ "ssaLinkClassGuard644": {
+  "kind": "classGuard",
+  "owners": [
+   "ok"
+  ]
+ },
+ "ssaReturnVoid": {
+  "kind": "other"
+ },
+ "ssaAsyncInvoke": {
+  "kind": "other"
+ }
+}

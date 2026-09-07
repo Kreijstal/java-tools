@@ -1,3 +1,4 @@
+const { readField } = require('../../../../core/objectModel');
 module.exports = {
   super: 'javax/sound/sampled/Line$Info',
   fields: {
@@ -10,7 +11,7 @@ module.exports = {
       const [lineClass, formats, minBufferSize, maxBufferSize] = args;
       const lineInfoClassDef = jvm.jre['javax/sound/sampled/Line$Info'];
       lineInfoClassDef.methods['<init>(Ljava/lang/Class;)V'](jvm, obj, [lineClass]);
-      obj.fields['javax/sound/sampled/DataLine$Info'] = {
+      readField(obj.fields, 'javax/sound/sampled/DataLine$Info') = {
         formats,
         minBufferSize,
         maxBufferSize,

@@ -1,3 +1,4 @@
+const { writeField } = require('../../../core/objectModel');
 module.exports = {
   super: 'java/awt/Component',
   staticFields: {
@@ -30,6 +31,6 @@ function initLabel(obj, text, alignment) {
 
 function setFields(obj) {
   obj.fields = obj.fields || {};
-  obj.fields['java/awt/Label.text'] = obj.text;
-  obj.fields['java/awt/Label.alignment'] = obj.alignment;
+  writeField(obj.fields, 'java/awt/Label.text', obj.text);
+  writeField(obj.fields, 'java/awt/Label.alignment', obj.alignment);
 }

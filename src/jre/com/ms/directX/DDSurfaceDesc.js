@@ -1,3 +1,4 @@
+const { writeField } = require('../../../../core/objectModel');
 module.exports = {
   super: 'java/lang/Object',
   fields: {
@@ -13,10 +14,10 @@ module.exports = {
       obj.rgbBitCount = 0;
       obj.refreshRate = 0;
       obj.fields = obj.fields || {};
-      obj.fields['com/ms/directX/DDSurfaceDesc.width'] = 0;
-      obj.fields['com/ms/directX/DDSurfaceDesc.height'] = 0;
-      obj.fields['com/ms/directX/DDSurfaceDesc.rgbBitCount'] = 0;
-      obj.fields['com/ms/directX/DDSurfaceDesc.refreshRate'] = 0;
+      writeField(obj.fields, 'com/ms/directX/DDSurfaceDesc.width', 0);
+      writeField(obj.fields, 'com/ms/directX/DDSurfaceDesc.height', 0);
+      writeField(obj.fields, 'com/ms/directX/DDSurfaceDesc.rgbBitCount', 0);
+      writeField(obj.fields, 'com/ms/directX/DDSurfaceDesc.refreshRate', 0);
     },
   },
 };

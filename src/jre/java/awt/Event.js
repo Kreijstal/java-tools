@@ -1,3 +1,4 @@
+const { writeField } = require('../../../core/objectModel');
 module.exports = {
   super: 'java/lang/Object',
   fields: {
@@ -85,13 +86,13 @@ function initializeEvent(obj, values) {
   obj.arg = values.arg ?? null;
   obj.clickCount = values.clickCount || 0;
   obj.fields = obj.fields || {};
-  obj.fields['java/awt/Event.target'] = obj.target;
-  obj.fields['java/awt/Event.when'] = when;
-  obj.fields['java/awt/Event.id'] = obj.id;
-  obj.fields['java/awt/Event.x'] = obj.x;
-  obj.fields['java/awt/Event.y'] = obj.y;
-  obj.fields['java/awt/Event.key'] = obj.key;
-  obj.fields['java/awt/Event.modifiers'] = obj.modifiers;
-  obj.fields['java/awt/Event.arg'] = obj.arg;
-  obj.fields['java/awt/Event.clickCount'] = obj.clickCount;
+  writeField(obj.fields, 'java/awt/Event.target', obj.target);
+  writeField(obj.fields, 'java/awt/Event.when', when);
+  writeField(obj.fields, 'java/awt/Event.id', obj.id);
+  writeField(obj.fields, 'java/awt/Event.x', obj.x);
+  writeField(obj.fields, 'java/awt/Event.y', obj.y);
+  writeField(obj.fields, 'java/awt/Event.key', obj.key);
+  writeField(obj.fields, 'java/awt/Event.modifiers', obj.modifiers);
+  writeField(obj.fields, 'java/awt/Event.arg', obj.arg);
+  writeField(obj.fields, 'java/awt/Event.clickCount', obj.clickCount);
 }

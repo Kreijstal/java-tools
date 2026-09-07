@@ -1,3 +1,4 @@
+const { enumerateFieldKeys, readField } = require('../../../core/objectModel');
 function ensureSet(obj) {
   if (!(obj.set instanceof Set)) {
     if (obj.items instanceof Set) obj.set = obj.items;
@@ -23,8 +24,8 @@ function fieldValue(obj, name) {
   if (!obj) return undefined;
   if (Object.prototype.hasOwnProperty.call(obj, name)) return obj[name];
   if (obj.fields) {
-    const exact = Object.keys(obj.fields).find((key) => key.endsWith(`.${name}`));
-    if (exact) return obj.fields[exact];
+    const exact = enumerateFieldKeys(obj.fields).find((key) => key.endsWith(`.${name}`));
+    if (exact) return readField(obj.fields, exact);
   }
   return undefined;
 }

@@ -132,6 +132,9 @@ const CONVERT = {
   i2b: [OP.i32_extend8_s], i2s: [OP.i32_extend16_s],
 };
 
+// Mirrors WasmJit's constant; see docs/phase1-linked-call-abi.md 2.
+const LINKED_CALL_ABI_VERSION = 1;
+
 class StructuredWasmCompiler {
   constructor(jvm, method, className, wasmJit) {
     this.jvm = jvm;
@@ -139,6 +142,11 @@ class StructuredWasmCompiler {
     this.className = className;
     this.wasmJit = wasmJit;
     this.importFns = [];
+    // Typed symbolic dependencies of this artifact, one per linked call site.
+    // See docs/phase1-linked-call-abi.md. This backend carries its own copy of
+    // the static-call lowering, so it needs its own record; a linker that read
+    // only WasmJit's would miss every structured artifact.
+    this.linkBindings = [];
     this.importDecls = [];
     this.importIndexByName = new Map();
     this.box = {
@@ -523,6 +531,10 @@ class StructuredWasmCompiler {
       externalEntry: new Set([0]),
       demoteReasons: this.demoted,
       demoteBlockers: this.demoteBlockers,
+      // Identity of the lowered artifact, independent of link state; see the
+      // matching field in WasmJit's meta.
+      artifactId: this.artifactIdentity(),
+      linkBindings: this.linkBindings,
       blockCount: cfg.n,
       fullyCompiled: normalFlowFullyCompiled && table.length === 0,
       normalFlowFullyCompiled,
@@ -1780,6 +1792,28 @@ class StructuredWasmCompiler {
   // that can never exit (fully compiled, no deoptable calls) is called with
   // a junk frame; any other ready callee takes the scratch-frame nested-call
   // protocol (runNested) behind a deoptable site.
+  // FNV-1a over the method's own name, descriptor and instruction stream,
+  // tagged with the linked-call ABI version. Reads nothing about callees or
+  // runtime tier state.
+  artifactIdentity() {
+    let h = 0x811c9dc5;
+    const mix = (str) => {
+      for (let i = 0; i < str.length; i++) {
+        h ^= str.charCodeAt(i);
+        h = Math.imul(h, 0x01000193) >>> 0;
+      }
+      h ^= 0x5f; h = Math.imul(h, 0x01000193) >>> 0;
+    };
+    mix((this.method && this.method.name) || '');
+    mix((this.method && this.method.descriptor) || '');
+    for (const it of (this.items || [])) {
+      if (!it) continue;
+      mix(String(it.op || ''));
+      if (it.arg !== undefined) mix(String(it.arg));
+    }
+    return `v${LINKED_CALL_ABI_VERSION}:${h.toString(16)}`;
+  }
+
   staticCallImport(node) {
     const [, className, [name, descriptor]] = node.imm;
     if (className === 'java/lang/Math') return addMathImport(this, { arg: node.imm });
@@ -1794,10 +1828,6 @@ class StructuredWasmCompiler {
     const calleeSt = this.wasmJit &&
       this.wasmJit.findReadyStatic(className, name, descriptor, true);
     const linked = calleeSt && (calleeSt.callee || calleeSt);
-    if (!linked) {
-      throw new Unsupported(`invoke ${className}.${name} callee not ready`,
-        this.wasmJit.methodLinkBlockers(className, name, descriptor));
-    }
     // java arg slot -> position in the wasm arg list
     const argPosBySlot = new Map();
     let slot = 0;
@@ -1805,6 +1835,87 @@ class StructuredWasmCompiler {
     const wParams = params.map(descToWasm);
     const results = ret === 'V' ? [] : [descToWasm(ret)];
     const key = `${className}.${name}${descriptor}`;
+    // Recorded before the direct/bridge choice: the dependency is on the
+    // method under this descriptor, which is what a linker must resolve. Which
+    // of the two shapes the site ends up using is a property of the callee
+    // that was ready, and is exactly what should stop being baked in here.
+    // Three-state, decided before anything is emitted: 'unknown' is a call
+    // whose artifact may still appear, 'incompatible' one that provably will
+    // not. Only the first may be lowered as a late-bound call; the second has
+    // to demote its block, because a trampoline that can never resolve would
+    // install a caller that exits Wasm on every invocation.
+    const klass = linked ? 'compatible'
+      : (this.wasmJit
+        ? this.wasmJit.staticLinkClassification(className, name, descriptor)
+        : 'incompatible');
+    // `lateBound` is set below, only on the path that actually emits an
+    // lcall_ trampoline. A binding is recorded for every static call site,
+    // including one whose block is about to be demoted -- so `pending` alone
+    // does NOT mean "a trampoline is waiting on this", and anything reasoning
+    // about per-call deopt risk has to read lateBound instead.
+    const binding = {
+      kind: 'static', className, name, descriptor, key,
+      params: wParams.slice(), results: results.slice(),
+      pending: !linked, classification: klass, lateBound: false,
+    };
+    this.linkBindings.push(binding);
+    if (!linked && klass === 'incompatible') {
+      // The pre-existing refusal, unchanged: same message, same recoverable
+      // blocker list. The classification decides trampoline-or-refuse; it does
+      // not get to reclassify how an existing refusal is retried.
+      throw new Unsupported(`invoke ${className}.${name} callee not ready`,
+        this.wasmJit.methodLinkBlockers(className, name, descriptor));
+    }
+    // UNKNOWN: the callee owns no module yet. Emit a late-bound call rather
+    // than demoting the block. Codegen states the dependency; resolving it is
+    // the runtime's job (docs/phase1-linked-call-abi.md 3).
+    //
+    // This is NOT the same as a callee that provably cannot satisfy the
+    // contract -- that stays a refusal below, because waiting cannot fix it.
+    if (!linked) {
+      const pendingFrames = new Map();
+      const pendingDummy = dummyRet(ret);
+      binding.lateBound = true;
+      // Resolved-link cache. findReadyStatic rebuilds the owning class's
+      // method list (filter + map + find over every item) on each call, which
+      // a late-bound site would otherwise pay on every invocation. The state
+      // object it returns is stable across recompiles -- runNested re-reads
+      // `callee || st` per call -- so the only thing that can invalidate this
+      // binding is the callee compiling into a shape findReadyStatic would now
+      // reject. That is bounded by the compile epoch, so re-resolve on a bump
+      // and cache otherwise.
+      let bound = null;
+      let boundEpoch = -1;
+      const fn = (...args) => {
+        // allowOnDemand: we are executing in the owning runtime now, so the
+        // callee may be compiled here even when codegen was forbidden to.
+        if (bound === null || boundEpoch !== this.wasmJit.compileEpoch) {
+          bound = this.wasmJit.findReadyStatic(className, name, descriptor, true, true);
+          boundEpoch = this.wasmJit.compileEpoch;
+          // The binding is the linker's record of this dependency; keeping it
+          // current is what makes `pending` mean "still unresolved" to anyone
+          // reading meta.linkBindings rather than "was unresolved at codegen".
+          if (bound) binding.pending = false;
+        }
+        const st = bound;
+        if (!st || !(st.callee || st).meta) {
+          // Still nothing to call. Nothing has run, so flag 1 sends the
+          // interpreter back to re-execute the invoke with full dispatch --
+          // the same protocol revalidateNestedCallee uses, and the reason
+          // exactly-once holds here without extra machinery.
+          this.box.deoptFlag = 1;
+          return pendingDummy;
+        }
+        return this.runNested(
+          st, className, args, argPosBySlot, pendingFrames, pendingDummy,
+        );
+      };
+      return {
+        idx: this.addImport(`lcall_${key}`.replace(/[^\w]/g, '_'), wParams, results, fn),
+        writes,
+        deoptable: true,
+      };
+    }
     // Direct wasm->wasm link through the callee's runv export: no JS bridge
     // on the path. EH callers keep the bridge (their import wrapper records
     // thrown exceptions for catch_all classification); non-identity slot

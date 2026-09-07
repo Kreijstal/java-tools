@@ -1,0 +1,31 @@
+{
+ "ssaLinkStaticCell6301": {
+  "kind": "staticCell",
+  "className": "ke",
+  "key": "h:[I",
+  "valueType": "[I"
+ },
+ "ssaLinkStaticCell6302": {
+  "kind": "staticCell",
+  "className": "qg",
+  "key": "b:[I",
+  "valueType": "[I"
+ },
+ "ssaLinkClassGuard628": {
+  "kind": "classGuard",
+  "owners": [
+   "ke",
+   "qg"
+  ]
+ },
+ "ssaLinkClassGuard629": {
+  "kind": "classGuard",
+  "owners": [
+   "ke",
+   "qg"
+  ]
+ },
+ "ssaAsyncInvoke": {
+  "kind": "other"
+ }
+}

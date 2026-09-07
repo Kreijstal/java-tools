@@ -1,10 +1,7 @@
 const {
   classInitializationTokenFor,
 } = require('./utils');
-const {
-  newFields, loadHierarchy, makeObjectRef, hasField, enumerateFieldKeys,
-  readField, writeField,
-} = require('../core/objectModel');
+const { enumerateFieldKeys, hasField, loadHierarchy, makeObjectRef, newFields, readField, writeField } = require('../core/objectModel');
 
 // Guest-object fast path first. `objRef instanceof String` is only ever true
 // for a boxed String, but it costs a prototype walk on every other object, and
@@ -515,7 +512,7 @@ module.exports = {
         targetClassName,
         runtimeClassName: runtimeClassName(objRef),
         keys: objRef && typeof objRef === 'object' ? Object.keys(objRef) : [],
-        fieldKeys: objRef && objRef.fields ? Object.keys(objRef.fields) : [],
+        fieldKeys: objRef && objRef.fields ? enumerateFieldKeys(objRef.fields) : [],
       });
     }
     throw {

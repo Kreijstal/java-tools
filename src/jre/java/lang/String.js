@@ -2,14 +2,15 @@ const { withThrows } = require('../../helpers');
 const LongClass = require('./Long');
 const FloatClass = require('./Float');
 const DoubleClass = require('./Double');
+const { enumerateFieldKeys, readField } = require('../../../core/objectModel');
 
 
 function fieldStringValue(obj, fieldName) {
   if (!obj || !obj.fields) return null;
-  const keys = Object.keys(obj.fields).filter((key) => key.endsWith(`.${fieldName}`));
+  const keys = enumerateFieldKeys(obj.fields).filter((key) => key.endsWith(`.${fieldName}`));
   keys.sort((a, b) => (a.startsWith('java/lang/Enum.') ? 1 : 0) - (b.startsWith('java/lang/Enum.') ? 1 : 0));
   for (const key of keys) {
-    const value = obj.fields[key];
+    const value = readField(obj.fields, key);
     if (value === null || value === undefined) continue;
     if (typeof value === 'string') return value;
     if (value && Object.prototype.hasOwnProperty.call(value, 'value')) return String(value.value);

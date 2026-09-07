@@ -1,7 +1,8 @@
+const { writeField } = require('../../../core/objectModel');
 function setFields(obj) {
   obj.fields = obj.fields || {};
-  obj.fields['java/awt/Point.x'] = obj.x;
-  obj.fields['java/awt/Point.y'] = obj.y;
+  writeField(obj.fields, 'java/awt/Point.x', obj.x);
+  writeField(obj.fields, 'java/awt/Point.y', obj.y);
 }
 
 module.exports = {

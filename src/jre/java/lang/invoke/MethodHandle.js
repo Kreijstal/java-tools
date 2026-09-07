@@ -5,6 +5,36 @@ const {
   hasField, readField, writeField,
 } = require('../../../../core/objectModel');
 
+// docs/refactor.md 2.4: route JS-side runtime field access through the
+// object-model accessors rather than indexing `fields` directly.
+//
+// This file reached guest objects through both a qualified `Class.name` key and
+// a bare `name` fallback, by plain property access. That is correct for a plain
+// field map and silently wrong for the other two representations: a dense
+// layout stores fields in an ARRAY at numeric slots, so `fields[name] = value`
+// lands as a string property on that array and is invisible to every reader
+// afterwards. MethodHandles then reported the field as absent -- which is
+// exactly what `seldom-used-features` observes with JVM_DENSE_INSTANCE_FIELDS=1.
+//
+// The bare-name fallback is kept, because JRE shims key their maps that way,
+// but it now goes through the accessors too.
+function readHandleField(fields, qualifiedKey, name) {
+  if (!fields) return undefined;
+  if (hasField(fields, qualifiedKey)) return readField(fields, qualifiedKey);
+  if (hasField(fields, name)) return readField(fields, name);
+  return undefined;
+}
+
+function writeHandleField(fields, qualifiedKey, name, value) {
+  if (!fields) return false;
+  if (hasField(fields, qualifiedKey)) { writeField(fields, qualifiedKey, value); return true; }
+  if (hasField(fields, name)) { writeField(fields, name, value); return true; }
+  // Neither key is declared: this is not a laid-out guest object, so create the
+  // qualified entry the interpreter's putfield would have produced.
+  writeField(fields, qualifiedKey, value);
+  return true;
+}
+
 function javaStringValue(value) {
   if (typeof value === "string") return value;
   if (value && value.value !== undefined) return value.value;
@@ -213,11 +243,9 @@ module.exports = {
 
       if (handle.kind === "getField") {
         const fieldKey = `${handle.targetClass}.${handle.targetFieldName}`;
-        const value = arg && arg.fields && hasField(arg.fields, fieldKey)
-          ? readField(arg.fields, fieldKey)
-          : arg && arg.fields
-            ? arg.fields[handle.targetFieldName]
-            : undefined;
+        const value = arg && arg.fields
+          ? readHandleField(arg.fields, fieldKey, handle.targetFieldName)
+          : undefined;
         if (handle.targetDescriptor === "I") {
           return jvm.jre["java/lang/Integer"].staticMethods["valueOf(I)Ljava/lang/Integer;"](jvm, null, [value || 0]);
         }
@@ -237,8 +265,7 @@ module.exports = {
       if (handle.kind === "putField") {
         const fieldKey = `${handle.targetClass}.${handle.targetFieldName}`;
         if (!receiver.fields) receiver.fields = {};
-        receiver.fields[fieldKey] = value;
-        receiver.fields[handle.targetFieldName] = value;
+        writeHandleField(receiver.fields, fieldKey, handle.targetFieldName, value);
         return null;
       }
 
@@ -463,7 +490,9 @@ module.exports = {
       try {
         if (handle.kind === "putField") {
           // Set the field value
-          receiver.fields[handle.targetFieldName] = value;
+          writeHandleField(receiver.fields,
+            `${handle.targetClass}.${handle.targetFieldName}`,
+            handle.targetFieldName, value);
           return null; // void return
         }
 
@@ -493,7 +522,9 @@ module.exports = {
       try {
         if (handle.kind === "getField") {
           // Get the field value
-          return receiver.fields[handle.targetFieldName];
+          return readHandleField(receiver.fields,
+            `${handle.targetClass}.${handle.targetFieldName}`,
+            handle.targetFieldName);
         }
 
         throw {
@@ -626,17 +657,9 @@ module.exports = {
           // Get the field value directly from the object
           // Field names are stored with class prefix in the fields object
           const fieldKey = `${handle.targetClass}.${handle.targetFieldName}`;
-          if (receiver.fields && receiver.fields[fieldKey] !== undefined) {
-            return receiver.fields[fieldKey];
-          }
-
-          // Fallback to just the field name
-          if (
-            receiver.fields &&
-            receiver.fields[handle.targetFieldName] !== undefined
-          ) {
-            return receiver.fields[handle.targetFieldName];
-          }
+          const existing = readHandleField(
+            receiver.fields, fieldKey, handle.targetFieldName);
+          if (existing !== undefined) return existing;
 
           throw {
             type: 'java/lang/NoSuchFieldError',
@@ -650,18 +673,8 @@ module.exports = {
           // Set the field value directly on the object
           // Field names are stored with class prefix in the fields object
           const fieldKey = `${handle.targetClass}.${handle.targetFieldName}`;
-          if (receiver.fields) {
-            receiver.fields[fieldKey] = value;
-          } else {
-            receiver.fields = { [fieldKey]: value };
-          }
-
-          // Also set the field name without class prefix for compatibility
-          if (receiver.fields) {
-            receiver.fields[handle.targetFieldName] = value;
-          } else {
-            receiver.fields = { [handle.targetFieldName]: value };
-          }
+          if (!receiver.fields) receiver.fields = {};
+          writeHandleField(receiver.fields, fieldKey, handle.targetFieldName, value);
           return null; // void return
         }
 
@@ -779,11 +792,15 @@ module.exports = {
           return result;
         } else if (handle.kind === "getField") {
           // Field getter
-          const fieldValue = receiver.fields[handle.targetFieldName];
+          const fieldValue = readHandleField(receiver.fields,
+            `${handle.targetClass}.${handle.targetFieldName}`,
+            handle.targetFieldName);
           return fieldValue;
         } else if (handle.kind === "putField") {
           // Field setter - arg1 is the value
-          receiver.fields[handle.targetFieldName] = arg1;
+          writeHandleField(receiver.fields,
+            `${handle.targetClass}.${handle.targetFieldName}`,
+            handle.targetFieldName, arg1);
           return null; // void return
         }
 

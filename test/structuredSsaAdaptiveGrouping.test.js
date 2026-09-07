@@ -6,6 +6,7 @@ const {execFileSync} = require('child_process');
 const {JVM} = require('../src/core/jvm');
 const Frame = require('../src/core/frame');
 const Stack = require('../src/core/stack');
+const { readField } = require('../src/core/objectModel');
 
 test('adaptive SSA preserves destructive two-phase indexing across yields',
   async (t) => {
@@ -121,10 +122,10 @@ public final class AdaptiveGroupingHarness {
       .filter((tag) => tag === 3).length;
     t.equal(owner.staticFields.get('sink:I'), 430000 + expectedCount,
       'the nested caller observes the complete grouping result');
-    t.equal(finalState.fields[
-      'AdaptiveGroupingHarness$State.groups'].length, 43,
+    t.equal(readField(finalState.fields,
+      'AdaptiveGroupingHarness$State.groups').length, 43,
     'the maximum group is not confused with the 256-entry scratch table');
-    t.equal(finalState.fields['AdaptiveGroupingHarness$State.tags'], null,
+    t.equal(readField(finalState.fields, 'AdaptiveGroupingHarness$State.tags'), null,
       'the source array is cleared only after all indexed reads complete');
     const generated = jvm.jit.structuredSsa.compile(index);
     if (!generated) {

@@ -1,3 +1,4 @@
+const { enumerateFieldKeys, readField } = require('../core/objectModel');
 const resolvedClassInitializationToken = Symbol('resolvedClassInitializationToken');
 
 function classInitializationTokenFor(jvm, instruction, className) {
@@ -78,9 +79,9 @@ function _aload(frame, kind) {
         process.env.JVM_DEBUG_NULL_ARRAY === "1") {
       const receiver = frame.locals && frame.locals[0];
       const fields = receiver && receiver.fields
-        ? Object.fromEntries(Object.entries(receiver.fields).map(([key, fieldValue]) => [
+        ? Object.fromEntries(enumerateFieldKeys(receiver.fields).map((key) => [
           key,
-          diagnosticScalar(fieldValue),
+          diagnosticScalar(readField(receiver.fields, key)),
         ]))
         : null;
       console.error("[null-array-load]", JSON.stringify({
@@ -148,9 +149,9 @@ function _astore(frame, kind) {
         process.env.JVM_DEBUG_NULL_ARRAY === "1") {
       const receiver = frame.locals && frame.locals[0];
       const fields = receiver && receiver.fields
-        ? Object.fromEntries(Object.entries(receiver.fields).map(([key, fieldValue]) => [
+        ? Object.fromEntries(enumerateFieldKeys(receiver.fields).map((key) => [
           key,
-          diagnosticScalar(fieldValue),
+          diagnosticScalar(readField(receiver.fields, key)),
         ]))
         : null;
       console.error("[null-array-store]", JSON.stringify({

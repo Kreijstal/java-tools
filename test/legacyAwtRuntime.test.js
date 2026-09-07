@@ -15,6 +15,7 @@ const TextField = require('../src/jre/java/awt/TextField');
 const StringClass = require('../src/jre/java/lang/String');
 const awt = require('../src/platform/awt');
 const legacyEvents = require('../src/jre/java/awt/legacyEvents');
+const { readField } = require('../src/core/objectModel');
 
 function element(tagName = 'div') {
   return {
@@ -66,12 +67,12 @@ test('legacy Event constants and constructors match java.awt.Event', (t) => {
   const fullEvent = {};
   Event.methods['<init>(Ljava/lang/Object;JIIIIILjava/lang/Object;)V'](
     {}, fullEvent, [target, 123n, 501, 7, 9, 65, 3, arg]);
-  t.equal(fullEvent.fields['java/awt/Event.when'], 123n);
-  t.equal(fullEvent.fields['java/awt/Event.x'], 7);
-  t.equal(fullEvent.fields['java/awt/Event.y'], 9);
-  t.equal(fullEvent.fields['java/awt/Event.key'], 65);
-  t.equal(fullEvent.fields['java/awt/Event.modifiers'], 3);
-  t.equal(fullEvent.fields['java/awt/Event.arg'], arg);
+  t.equal(readField(fullEvent.fields, 'java/awt/Event.when'), 123n);
+  t.equal(readField(fullEvent.fields, 'java/awt/Event.x'), 7);
+  t.equal(readField(fullEvent.fields, 'java/awt/Event.y'), 9);
+  t.equal(readField(fullEvent.fields, 'java/awt/Event.key'), 65);
+  t.equal(readField(fullEvent.fields, 'java/awt/Event.modifiers'), 3);
+  t.equal(readField(fullEvent.fields, 'java/awt/Event.arg'), arg);
   t.end();
 });
 
@@ -188,7 +189,7 @@ test('legacy guest calls restore reflective state and browser posts serialize', 
   try {
     const event = legacyEvents.makeEvent({ id: 501, target: source });
     t.equal(event.when, 4242);
-    t.equal(event.fields['java/awt/Event.when'], 4242n);
+    t.equal(readField(event.fields, 'java/awt/Event.when'), 4242n);
   } finally {
     Date.now = originalNow;
   }

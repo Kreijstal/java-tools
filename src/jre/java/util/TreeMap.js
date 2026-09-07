@@ -1,3 +1,4 @@
+const { enumerateFieldKeys, readField } = require('../../../core/objectModel');
 function ensureMap(obj) {
   if (!(obj.map instanceof Map)) obj.map = obj.entries instanceof Map ? obj.entries : new Map();
   obj.entries = obj.map;
@@ -16,9 +17,9 @@ function unwrapComparable(value) {
   if (typeof value === 'number' || typeof value === 'string') return value;
   if (Object.prototype.hasOwnProperty.call(value, 'value')) return value.value;
   if (value.fields) {
-    const numericField = Object.keys(value.fields).find((key) =>
+    const numericField = enumerateFieldKeys(value.fields).find((key) =>
       /\.(address|value)(?::[JI])?$/.test(key));
-    if (numericField !== undefined) return value.fields[numericField];
+    if (numericField !== undefined) return readField(value.fields, numericField);
   }
   if (value.type === 'java/lang/String' || value instanceof String) return String(value);
   if (typeof value.toString === 'function') return value.toString();

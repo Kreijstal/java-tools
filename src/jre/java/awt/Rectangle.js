@@ -1,3 +1,4 @@
+const { readField, writeField } = require('../../../core/objectModel');
 module.exports = {
   super: 'java/lang/Object',
   fields: {
@@ -32,8 +33,8 @@ module.exports = {
       const dim = args[0] || {};
       obj.x = 0;
       obj.y = 0;
-      obj.width = dim.width || (dim.fields && dim.fields['java/awt/Dimension.width']) || 0;
-      obj.height = dim.height || (dim.fields && dim.fields['java/awt/Dimension.height']) || 0;
+      obj.width = dim.width || (dim.fields && readField(dim.fields, 'java/awt/Dimension.width')) || 0;
+      obj.height = dim.height || (dim.fields && readField(dim.fields, 'java/awt/Dimension.height')) || 0;
       setFields(obj);
     },
   },
@@ -41,8 +42,8 @@ module.exports = {
 
 function setFields(obj) {
   obj.fields = obj.fields || {};
-  obj.fields['java/awt/Rectangle.x'] = obj.x;
-  obj.fields['java/awt/Rectangle.y'] = obj.y;
-  obj.fields['java/awt/Rectangle.width'] = obj.width;
-  obj.fields['java/awt/Rectangle.height'] = obj.height;
+  writeField(obj.fields, 'java/awt/Rectangle.x', obj.x);
+  writeField(obj.fields, 'java/awt/Rectangle.y', obj.y);
+  writeField(obj.fields, 'java/awt/Rectangle.width', obj.width);
+  writeField(obj.fields, 'java/awt/Rectangle.height', obj.height);
 }

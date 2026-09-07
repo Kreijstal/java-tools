@@ -27,7 +27,7 @@ function initButton(jvm, obj, label) {
 
 function setField(obj) {
   obj.fields = obj.fields || {};
-  obj.fields['java/awt/Button.label'] = obj.label;
+  writeField(obj.fields, 'java/awt/Button.label', obj.label);
 }
 
 function dispatchClick(jvm, obj) {
@@ -35,6 +35,7 @@ function dispatchClick(jvm, obj) {
   // (handleEvent/action overrides). Falls back to ActionListener if the
   // event is not consumed anywhere.
   const { postActionEvent } = require('./legacyEvents');
+const { writeField } = require('../../../core/objectModel');
   postActionEvent(jvm, obj, obj.label || '').catch((error) => {
     console.error('AWT Button legacy action dispatch failed:', error);
     return false;

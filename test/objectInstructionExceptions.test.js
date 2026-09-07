@@ -5,6 +5,7 @@ const Stack = require('../src/core/stack');
 const objectInstructions = require('../src/instructions/object');
 const loads = require('../src/instructions/loads');
 const stores = require('../src/instructions/stores');
+const { readField } = require('../src/core/objectModel');
 
 function frameWith(...values) {
   const stack = new Stack();
@@ -40,7 +41,7 @@ test('null field receivers throw catchable Java exceptions', (t) => {
   );
   const synthetic = { type: 'Owner' };
   objectInstructions.putfield(frameWith(synthetic, 7), field, { classes: {} });
-  t.equal(synthetic.fields['Owner.value'], 7,
+  t.equal(readField(synthetic.fields, 'Owner.value'), 7,
     'synthetic Java objects lazily acquire field storage');
   t.end();
 });

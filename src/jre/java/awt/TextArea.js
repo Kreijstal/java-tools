@@ -1,3 +1,4 @@
+const { writeField } = require('../../../core/objectModel');
 // java.awt.TextArea - Multi-line text editing component
 
 module.exports = {
@@ -54,5 +55,5 @@ function initTextArea(obj, text, rows, cols, scrollbars) {
 
 function setField(obj) {
   obj.fields = obj.fields || {};
-  obj.fields['java/awt/TextArea.text'] = obj.text;
+  writeField(obj.fields, 'java/awt/TextArea.text', obj.text);
 }

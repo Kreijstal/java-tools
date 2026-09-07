@@ -1,0 +1,23 @@
+{
+ "ssaLinkCallSite9970": {
+  "kind": "callSite",
+  "op": "invokestatic",
+  "className": "ok",
+  "methodName": "a",
+  "descriptor": "([IIIII[I[I)V",
+  "fastPositional": false,
+  "fastPositionalRaw": false
+ },
+ "ssaLinkClassGuard642": {
+  "kind": "classGuard",
+  "owners": [
+   "ok"
+  ]
+ },
+ "ssaReturnVoid": {
+  "kind": "other"
+ },
+ "ssaAsyncInvoke": {
+  "kind": "other"
+ }
+}

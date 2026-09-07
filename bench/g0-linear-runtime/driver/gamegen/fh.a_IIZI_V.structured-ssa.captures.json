@@ -1,0 +1,112 @@
+{
+ "ssaLinkStaticCell6287": {
+  "kind": "staticCell",
+  "className": "client",
+  "key": "A:Z",
+  "valueType": "number"
+ },
+ "ssaLinkStaticCell6288": {
+  "kind": "staticCell",
+  "className": "rb",
+  "key": "n:[I",
+  "valueType": "[I"
+ },
+ "ssaLinkStaticCell6289": {
+  "kind": "staticCell",
+  "className": "rb",
+  "key": "n:[I",
+  "valueType": "[I"
+ },
+ "ssaLinkStaticCell6290": {
+  "kind": "staticCell",
+  "className": "rb",
+  "key": "n:[I",
+  "valueType": "[I"
+ },
+ "ssaLinkStaticCell6291": {
+  "kind": "staticCell",
+  "className": "bb",
+  "key": "f:I",
+  "valueType": "number"
+ },
+ "ssaLinkStaticCell6292": {
+  "kind": "staticCell",
+  "className": "rb",
+  "key": "n:[I",
+  "valueType": "[I"
+ },
+ "ssaLinkStaticCell6293": {
+  "kind": "staticCell",
+  "className": "rb",
+  "key": "n:[I",
+  "valueType": "[I"
+ },
+ "ssaLinkClassGuard627": {
+  "kind": "classGuard",
+  "owners": [
+   "client",
+   "rb",
+   "bb"
+  ]
+ },
+ "ssaLinkCallSite9915": {
+  "kind": "callSite",
+  "op": "invokestatic",
+  "className": "ke",
+  "methodName": "a",
+  "descriptor": "(II)I",
+  "fastPositional": false,
+  "fastPositionalRaw": false
+ },
+ "ssaLinkCallSite9916": {
+  "kind": "callSite",
+  "op": "invokestatic",
+  "className": "h",
+  "methodName": "a",
+  "descriptor": "(IB)I",
+  "fastPositional": false,
+  "fastPositionalRaw": false
+ },
+ "ssaLinkCallSite9917": {
+  "kind": "callSite",
+  "op": "invokestatic",
+  "className": "ke",
+  "methodName": "a",
+  "descriptor": "(II)I",
+  "fastPositional": false,
+  "fastPositionalRaw": false
+ },
+ "ssaLinkCallSite9918": {
+  "kind": "callSite",
+  "op": "invokestatic",
+  "className": "h",
+  "methodName": "a",
+  "descriptor": "(IB)I",
+  "fastPositional": false,
+  "fastPositionalRaw": false
+ },
+ "ssaLinkCallSite9919": {
+  "kind": "callSite",
+  "op": "invokestatic",
+  "className": "ok",
+  "methodName": "a",
+  "descriptor": "([III)V",
+  "fastPositional": false,
+  "fastPositionalRaw": false
+ },
+ "ssaLinkCallSite9920": {
+  "kind": "callSite",
+  "op": "invokestatic",
+  "className": "ok",
+  "methodName": "a",
+  "descriptor": "([III)V",
+  "fastPositional": false,
+  "fastPositionalRaw": false
+ },
+ "ssaAsyncInvoke": {
+  "kind": "other"
+ },
+ "ssaReturnVoid": {
+  "kind": "other"
+ }
+}

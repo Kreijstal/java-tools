@@ -56,6 +56,10 @@ const jvmDebugConfig = {
       "node:buffer": require.resolve("buffer/"),
       "node:process": require.resolve("process/browser"),
       "speaker": false,
+      // The compile worker resolves this at runtime and checks the shape, so
+      // an empty module is the correct browser answer: the client then builds
+      // a Web Worker instead.
+      "worker_threads": false,
       // Additional node-fetch dependencies
       "fetch-blob": false,
       "formdata-polyfill": false,
@@ -90,4 +94,22 @@ const ideUiConfig = {
   devtool: 'source-map'
 };
 
-module.exports = [jvmDebugConfig, ideUiConfig];
+// The compile worker of Phase 1, as a browser Worker script. It is a separate
+// bundle because a Worker is loaded from its own URL: it cannot share the page
+// bundle, and the page must be told where this one lands
+// (window.JVM_COMPILE_WORKER_URL, or the compileWorkerUrl jit option).
+const compileWorkerConfig = {
+  mode: 'production',
+  target: 'webworker',
+  entry: './src/jit/compileWorkerThread.js',
+  output: {
+    filename: 'jvm-compile-worker.js',
+    path: path.resolve(__dirname, 'dist')
+  },
+  module: jvmDebugConfig.module,
+  resolve: jvmDebugConfig.resolve,
+  plugins: jvmDebugConfig.plugins,
+  devtool: 'source-map'
+};
+
+module.exports = [jvmDebugConfig, ideUiConfig, compileWorkerConfig];

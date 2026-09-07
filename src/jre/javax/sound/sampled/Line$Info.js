@@ -1,3 +1,4 @@
+const { readField } = require('../../../../core/objectModel');
 module.exports = {
   super: 'java/lang/Object',
   fields: {
@@ -6,12 +7,12 @@ module.exports = {
   methods: {
     '<init>(Ljava/lang/Class;)V': (jvm, obj, args) => {
       const [lineClass] = args;
-      obj.fields['javax/sound/sampled/Line$Info'] = {
+      readField(obj.fields, 'javax/sound/sampled/Line$Info') = {
         lineClass,
       };
     },
     'getLineClass()Ljava/lang/Class;': (jvm, obj, args) => {
-      return obj.fields['javax/sound/sampled/Line$Info']['lineClass'];
+      return readField(obj.fields, 'javax/sound/sampled/Line$Info')['lineClass'];
     },
   },
 };

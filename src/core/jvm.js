@@ -185,6 +185,14 @@ class JVM {
     // run() prepares everything before main() unless this is false. See the
     // preparation block in run().
     this.prepareBeforeMain = options.prepareBeforeMain !== false;
+    // False until run() hands control to guest code. THE boundary the
+    // measurement contract is written against: before it, compiling on this
+    // thread is free because nothing the guest can observe has started; after
+    // it, the same compile is a stall the guest pays for. "The guest is
+    // paused" and "this pass is effectful" are NOT this test -- a pass can be
+    // effectful long after main() began -- so policy that decides who
+    // compiles must read this and not the pass flags.
+    this.guestStarted = false;
     this._methodClassNames = new WeakMap();
     this._indexedMethodClassData = new Map();
     // Bumped on every class registration; closed-world analyses (class
@@ -334,11 +342,33 @@ class JVM {
     this.jitOptions = options.jit || {};
     this.jit = new JitCompiler(this, this.jitOptions);
 
-    // Make fs and path available for JreBootstrap (only in Node.js environment)
-    if (typeof window === "undefined") {
+    // Make fs and path available for JreBootstrap, where there is a real
+    // filesystem to reach.
+    //
+    // This used to test `typeof window === "undefined"` and call that "Node".
+    // A Web Worker is a browser with no `window`, so a bundled worker passed
+    // the test, took webpack's `"fs": false` stub -- an empty object, which is
+    // truthy -- and died in the JVM constructor on `fs.readdirSync is not a
+    // function`. That made the compile worker impossible to construct in a
+    // browser, which is the one host the fps objective is stated for. Ask
+    // whether the capability is there instead of guessing from a global.
+    if (fs && typeof fs.readdirSync === "function" &&
+        path && typeof path.join === "function") {
       this.fs = fs;
       this.path = path;
     }
+
+    // docs/refactor.md 2.2 justifies the collector with "approximately
+    // 1.5 MB/min menu growth" from a bump allocator that never frees. That is
+    // a recorded historical figure, not something this worktree has measured,
+    // and 2.6 asks for bounded live heap under a stable menu workload -- which
+    // needs a growth curve, not a single number. Opt in with
+    // JVM_WASM_HEAP_SAMPLE_MS and an output path; off by default, because an
+    // always-on sampler is the kind of cost that distorts what it measures.
+    //
+    // Started here rather than beside the heap's construction: the sampler
+    // writes files, so it must run after `this.fs` is established above.
+    this._startWasmHeapSampler(env);
 
     // Initialize JNI system
     this.jni = new JNI(this);
@@ -785,8 +815,29 @@ class JVM {
       });
       // Nothing eligible is left to compile, so a later compile would be a
       // stall with no upside.
-      this.jit?.wasmJit?.freezeCompilation?.();
+      //
+      // 0.3: preparation ending must not by itself freeze all future tier
+      // upgrades. The plan permits exactly this as an "execution-only mode
+      // using prepared bodies" -- but a mode is a choice with a lever and a
+      // measurable alternative, not a consequence nobody can turn off, and an
+      // exit criterion met by switching runtime optimization off is not met.
+      // It stays the default only while runtime Wasm optimization is still
+      // synchronous: no Wasm result crosses the compile worker yet, so an
+      // unfrozen tier compiles on the guest's own thread and trades this
+      // contract for the 0.2 one. Set JVM_JIT_WASM_EXECUTION_ONLY=0 to run
+      // the alternative and measure what the freeze actually buys.
+      if (process.env.JVM_JIT_WASM_EXECUTION_ONLY !== "0") {
+        this.jit?.wasmJit?.freezeCompilation?.();
+      } else if (this.jit?.wasmJit) {
+        this.jit.wasmJit.executionOnlyDeclined = true;
+      }
     }
+
+    // Everything below this line is the measured runtime: the main class's
+    // <clinit> is guest code, so the boundary is here and not at the main()
+    // invocation further down. Set it even when preparation was skipped --
+    // opting out of preparation does not make later inline compilation free.
+    this.guestStarted = true;
 
     // Initialize the main class before running main method or creating applet
     // This ensures static blocks execute before main method starts
@@ -821,6 +872,11 @@ class JVM {
       mainFrame.locals[0] = this.createStringArray(mainArgs);
       mainThread.callStack.push(mainFrame);
     }
+
+    // The Phase 1 boundary: everything above this point is preparation and
+    // costs nothing; any synchronous JIT compile from here on is a stall and
+    // is counted as postMainSyncCompile* by the JIT (docs/phase1-worker-audit.md).
+    this.jit?.markMainStarted?.();
 
     if (!this.debugManager.debugMode || !this.debugManager.isPaused) {
       await this.execute();
@@ -1086,6 +1142,51 @@ class JVM {
     }
   }
 
+  // Periodic wasm-heap usage samples, written as JSON. Self-contained so no
+  // launcher needs to know about it.
+  _startWasmHeapSampler(env) {
+    if (!this.wasmHeap) return;
+    const periodMs = Number(env.JVM_WASM_HEAP_SAMPLE_MS);
+    const out = env.JVM_WASM_HEAP_SAMPLE_OUT;
+    if (!Number.isFinite(periodMs) || periodMs <= 0 || !out) return;
+    // Capability, not environment: a bundled worker has no filesystem but does
+    // have a `process` shim, and webpack's `fs` stub is a truthy empty object.
+    // See the note on `this.fs` above -- that exact assumption crashed a real
+    // browser run.
+    const fsModule = this.fs;
+    if (!fsModule || typeof fsModule.writeFileSync !== "function") return;
+    // One launcher run means several JVMs, and they are not all in different
+    // processes: the parent builds one, the spawned child that runs the guest
+    // builds another, and the compile worker builds a shadow JVM in a worker
+    // *thread* -- same pid. Every one of them inherits this configuration, so
+    // any shared output path gets overwritten by whichever idle JVM writes
+    // last, which reads exactly like "the heap never grew". Tag each file with
+    // pid, thread and a random token so no two samplers can collide, and let
+    // the reader pick the JVM that actually allocated.
+    let threadId = 0;
+    try { threadId = require("worker_threads").threadId || 0; } catch (e) { /* no worker_threads */ }
+    const token = Math.random().toString(16).slice(2, 8);
+    const pid = (typeof process !== "undefined" && process.pid) || "unknown";
+    const target = `${out}.${pid}-t${threadId}-${token}.json`;
+    const startedAt = Date.now();
+    const samples = [];
+    const timer = setInterval(() => {
+      const usage = this.wasmHeap.usage();
+      samples.push({ atMs: Date.now() - startedAt, ...usage });
+      try {
+        fsModule.writeFileSync(target, JSON.stringify({
+          pid, threadId, periodMs, startedAt: new Date(startedAt).toISOString(), samples,
+        }, null, 2));
+      } catch (error) {
+        // A sampler must never take the run down with it.
+        clearInterval(timer);
+      }
+    }, periodMs);
+    // Never hold the process open for a diagnostic.
+    if (typeof timer.unref === "function") timer.unref();
+    this._wasmHeapSampleTimer = timer;
+  }
+
   // Hands the host its scheduler turn, taking the backpressured form when the
   // guest has been completing frames the host never got to present.
   async _yieldHostTurn() {
@@ -1315,9 +1416,15 @@ class JVM {
       // A seed pass while the guest IS running is the opposite case and still
       // queues: that is Phase 1.3's "seed the queue with every method", and
       // there the whole point is that this thread does not stop to compile.
+      //
+      // The test is `guestStarted`, not `effectful`. Those coincide for the
+      // ahead-of-main pass that produced the measurement above, but they are
+      // different properties: an effectful pass reached after main() has begun
+      // is runtime work, and compiling it inline would be exactly the
+      // synchronous post-main compile the contract forbids.
       const compileLocally = options.compileLocally !== undefined
         ? options.compileLocally === true
-        : compileEffectful;
+        : !this.guestStarted;
       for (const {method} of methods) {
         this.jit.getGeneratedFunction(method, {
           allowEffectfulCalls: compileEffectful,
@@ -1329,11 +1436,19 @@ class JVM {
         }
         await yieldToEventLoop(0, this.eventLoopYieldStrategy);
       }
-      if (!compileLocally && this.jit.compileWorker?.enabled) {
+      if (!compileLocally && !this.guestStarted &&
+          this.jit.compileWorker?.enabled) {
         // The pass above only QUEUED the work, so the cache is still empty.
         // Preparation has to mean "everything is compiled" or the guest starts
         // against an empty cache: wait for the worker to drain, then build
         // whatever it declined, locally and unconditionally.
+        //
+        // Only before main(). Draining the queue is a wait for optimization
+        // and the local rebuild is a synchronous compile; both are free while
+        // the guest has not started and are forbidden once it has. A seed pass
+        // during execution leaves its work queued and returns -- the methods
+        // keep running in whatever tier they already have, which is the point
+        // of seeding asynchronously.
         await this.jit.compileWorker.whenIdle();
         for (const {method} of methods) {
           if (this.jit.codegenCache.has(method)) continue;

@@ -1,3 +1,4 @@
+const { writeField } = require('../../../core/objectModel');
 module.exports = {
   super: 'java/awt/Component',
   fields: {
@@ -27,8 +28,8 @@ function initCheckbox(obj, label, state) {
 
 function setFields(obj) {
   obj.fields = obj.fields || {};
-  obj.fields['java/awt/Checkbox.label'] = obj.label;
-  obj.fields['java/awt/Checkbox.state'] = obj.state;
+  writeField(obj.fields, 'java/awt/Checkbox.label', obj.label);
+  writeField(obj.fields, 'java/awt/Checkbox.state', obj.state);
 }
 
 function addListener(obj, listener) {

@@ -1,3 +1,4 @@
+const { readField } = require('../../../../core/objectModel');
 // Shared line construction for AudioSystem and Mixer. Both are legal ways for
 // a client to reach a SourceDataLine, and they must hand back the same shape:
 // the format negotiated through DataLine.Info has to survive, because clients
@@ -17,7 +18,7 @@ function newJavaObject(jvm, type, fields) {
 
 function lineClassName(info) {
   const lineInfo = info && info.fields &&
-    info.fields['javax/sound/sampled/Line$Info'];
+    readField(info.fields, 'javax/sound/sampled/Line$Info');
   const lineClass = lineInfo && lineInfo.lineClass;
   if (!lineClass || !lineClass._classData) return null;
   return lineClass._classData.ast.classes[0].className;
@@ -28,7 +29,7 @@ function isSourceDataLineInfo(info) {
 }
 
 function createSourceDataLine(jvm, info) {
-  const dataLineInfo = info.fields['javax/sound/sampled/DataLine$Info'];
+  const dataLineInfo = readField(info.fields, 'javax/sound/sampled/DataLine$Info');
   const formats = dataLineInfo && dataLineInfo.formats;
   const formatElements = formats && (formats.elements || formats);
   const line = newJavaObject(jvm, 'javax/sound/sampled/SourceDataLine');

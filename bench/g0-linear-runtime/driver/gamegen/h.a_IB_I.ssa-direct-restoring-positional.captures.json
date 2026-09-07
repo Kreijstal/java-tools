@@ -1,0 +1,31 @@
+{
+ "ssaLinkStaticCell6305": {
+  "kind": "staticCell",
+  "className": "h",
+  "key": "f:Ljava/lang/String;",
+  "valueType": "java/lang/String"
+ },
+ "ssaLinkStaticCell6306": {
+  "kind": "staticCell",
+  "className": "qg",
+  "key": "f:[I",
+  "valueType": "[I"
+ },
+ "ssaLinkClassGuard630": {
+  "kind": "classGuard",
+  "owners": [
+   "h",
+   "qg"
+  ]
+ },
+ "ssaLinkClassGuard631": {
+  "kind": "classGuard",
+  "owners": [
+   "h",
+   "qg"
+  ]
+ },
+ "ssaAsyncInvoke": {
+  "kind": "other"
+ }
+}

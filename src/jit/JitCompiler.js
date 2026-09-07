@@ -13,9 +13,7 @@ const JvmSsaBlockRenderer = require("./JvmSsaBlockRenderer");
 const { unboundGeneratedSsaIdentifiers } = JvmSsaBlockRenderer;
 const HotCallGraphRegionCompiler = require("./HotCallGraphRegionCompiler");
 const monoArray = require("./monoArray");
-const {
-  newFields, makeObjectRef, hasField, denseSlotFor, readField, writeField,
-} = require("../core/objectModel");
+const { denseSlotFor, enumerateFieldKeys, hasField, makeObjectRef, newFields, readField, writeField } = require('../core/objectModel');
 const {
   normalizeArrayLoad,
   normalizeArrayStore,
@@ -218,6 +216,53 @@ class JitCompiler {
     this.hotnessTickCount = 0;
     this.hotnessSelectedCount = 0;
     this.hotnessCompiledCount = 0;
+    // Phase 1 observability (docs/phase1-worker-audit.md): synchronous
+    // compilation on the main thread, split by whether it happened before or
+    // after main() started. postMain is the number that matters -- compiling
+    // after main() is a stall. `markMainStarted` is called by jvm.run() at
+    // the main() boundary; nothing here reads it except the accounting.
+    this.mainStarted = false;
+    // Methods the worker could not take after main(), which therefore keep
+    // their current tier instead of being compiled on the guest's thread.
+    this.workerUnservedPostMainCount = 0;
+    // Asks and methods are very different numbers here. One hot method that
+    // the worker will not serve is asked again on every cache miss, so the
+    // ask count says how much the guest wanted it, and the method count says
+    // how much of the program is actually stranded. Reporting only the first
+    // reads like a fleet of lost methods when it is one method in a loop.
+    this.workerUnservedPostMainMethods = new WeakSet();
+    this.workerUnservedPostMainMethodCount = 0;
+    this.preMainSyncCompileCount = 0;
+    this.preMainSyncCompileMs = 0;
+    this.postMainSyncCompileCount = 0;
+    this.postMainSyncCompileMs = 0;
+    // Nested synchronous compiles (a compile that triggers another compile)
+    // overlap in time; the aggregate stall-time counter must count only the
+    // outermost interval once, so this tracks the nesting depth.
+    this.syncCompileDepth = 0;
+    // tier -> {count, inclusiveMs} for post-main compiles only. `inclusiveMs`
+    // includes nested compiles, so its per-tier sums are inclusive and are
+    // NOT comparable to postMainSyncCompileMs, which is outermost-only.
+    this.postMainSyncCompileByTier = new Map();
+    // Phase 1 observability (docs/phase1-worker-audit.md, task 2): main-thread
+    // work after a worker result arrives, split into phases. Attempts include
+    // rejected and superseded results (their materialization still occupied
+    // the main thread); installs are successful publishes only.
+    this.installStats = {
+      validationMs: 0,
+      descriptorBindingMs: 0,
+      newFunctionMs: 0,
+      wasmInstantiationMs: 0,
+      publicationMs: 0,
+      totalInstallMs: 0,
+      installCount: 0,
+      largestInstallMs: 0,
+      attemptCount: 0,
+      preMainAttemptCount: 0,
+      preMainAttemptMs: 0,
+      postMainAttemptCount: 0,
+      postMainAttemptMs: 0,
+    };
     this.codegenEnabled = options.codegen !== false;
     this.codegenCache = new WeakMap();
     this.stableGeneratedEntries = new WeakMap();
@@ -838,6 +883,28 @@ class JitCompiler {
       this.hasControlFlowBackedge(method, codeItems);
     this.backwardBranchCache.set(method, backward);
     return backward;
+  }
+
+  // A method the Wasm tier may consider even though it has no loop
+  // (docs/refactor.md 3.3, "Loop-free methods as optimization candidates").
+  //
+  // This is deliberately NOT `!hasBackwardBranch(method)`. That predicate
+  // fuses two different refusals: "no backedge" and "opaque control flow
+  // requires the interpreter". The second one is load-bearing -- opening it
+  // miscompiled tombracer -- so it stays closed here. Only the genuinely
+  // loop-free, non-opaque method becomes a candidate, and hotness still
+  // decides when it is compiled.
+  isLoopFreeWasmCandidate(method) {
+    if (this.loopFreeCandidateCache === undefined) {
+      this.loopFreeCandidateCache = new WeakMap();
+    }
+    const known = this.loopFreeCandidateCache.get(method);
+    if (known !== undefined) return known;
+    const codeItems = this.getCodeItems(method);
+    const candidate = !this.requiresOpaqueControlInterpreter(method, codeItems) &&
+      !this.hasControlFlowBackedge(method, codeItems);
+    this.loopFreeCandidateCache.set(method, candidate);
+    return candidate;
   }
 
   hasControlFlowBackedge(method, codeItems = this.getCodeItems(method)) {
@@ -1877,11 +1944,34 @@ class JitCompiler {
     // through the worker only adds serialize/deserialize on both sides and
     // then blocks waiting for a single thread to do work this one could have
     // done directly.
-    if (this.compileWorker.enabled && options.compileLocally !== true &&
-        this.compileWorker.enqueue(method, {
-      preparedWholeMethod: options.allowEffectfulCalls === true,
-    })) {
-      return null;
+    if (this.compileWorker.enabled && options.compileLocally !== true) {
+      if (this.compileWorker.enqueue(method, {
+        preparedWholeMethod: options.allowEffectfulCalls === true,
+      })) {
+        return null;
+      }
+      // The queue would not take it. Section 0.2: a refused, stale or failed
+      // compile leaves the current executable tier intact and does NOT
+      // authorize synchronous compilation -- "a queue that returns null must
+      // mean continue executing the current tier", not "compile locally now".
+      // So after main() the method keeps running in whatever tier it has.
+      // Before main() there is no guest to stall and the local compiler is
+      // still the right answer, which is why this is not an unconditional
+      // rule. Counted, because the cost of honouring the contract is a method
+      // that may stay interpreted for the rest of the run.
+      // Only when the worker actually considered this method and turned it
+      // down. A send that never reached a worker, or a method the queue never
+      // saw, leaves no one else to build the body, and stranding it would be a
+      // permanent tier loss rather than the deferral 0.2 describes.
+      if (this.jvm && this.jvm.guestStarted &&
+          this.compileWorker.declinedByRefusal.has(method)) {
+        this.workerUnservedPostMainCount += 1;
+        if (!this.workerUnservedPostMainMethods.has(method)) {
+          this.workerUnservedPostMainMethods.add(method);
+          this.workerUnservedPostMainMethodCount += 1;
+        }
+        return null;
+      }
     }
     if (this.codegenCompiling.has(method)) return null;
     this.codegenCompiling.add(method);
@@ -1902,6 +1992,9 @@ class JitCompiler {
       }
       return generated;
     } catch (err) {
+      // The post-main sync-compile assertion is a debugging/test mode and must
+      // not be silently swallowed into "stay interpreted".
+      if (err && err.jitAssertNoPostMainSyncCompile) throw err;
       this.codegenCompileErrors.set(method, err);
       return null;
     } finally {
@@ -1921,6 +2014,8 @@ class JitCompiler {
         this.regionStructuredCandidateCompiling.has(method) ||
         !this.canCompileSynchronously(method)) return null;
     this.regionStructuredCandidateCompiling.add(method);
+    const guard = this.startSynchronousCompile(method,
+      "getStructuredRegionCandidate");
     try {
       const candidate = this.structuredSsa.compile(method);
       if (!candidate?.jvmStructuredSsa) return null;
@@ -1928,9 +2023,11 @@ class JitCompiler {
       this.regionStructuredCandidateCompileCount += 1;
       return candidate;
     } catch (error) {
+      if (error && error.jitAssertNoPostMainSyncCompile) throw error;
       this.codegenCompileErrors.set(method, error);
       return null;
     } finally {
+      guard.finish("structured-region-candidate");
       this.regionStructuredCandidateCompiling.delete(method);
     }
   }
@@ -1972,7 +2069,13 @@ class JitCompiler {
   }
 
   compileHotCallGraphRegion(method, options) {
-    return this.hotCallGraphRegions.compile(method, options);
+    const guard = this.startSynchronousCompile(method,
+      "compileHotCallGraphRegion");
+    try {
+      return this.hotCallGraphRegions.compile(method, options);
+    } finally {
+      guard.finish("hot-call-graph-region");
+    }
   }
 
   maybeExpandHotCallGraphRegion(site) {
@@ -2225,6 +2328,149 @@ class JitCompiler {
       return Number(process.hrtime.bigint()) / 1e6;
     }
     return Date.now();
+  }
+
+  // ---- Phase 1 post-main synchronous compile accounting ----
+  // Marks the boundary every Phase 1 number is measured against: work before
+  // this point is free (preparation), work after it is a stall.
+  markMainStarted() {
+    this.mainStarted = true;
+  }
+
+  methodIdentity(method) {
+    const owner = this.jvm.findClassNameForMethod?.(method) ||
+      method?.className || "unknown";
+    return `${owner}.${method?.name || "?"}${method?.descriptor || ""}`;
+  }
+
+  syncCompileEnvironment() {
+    if (this._syncCompileEnvironment) return this._syncCompileEnvironment;
+    const env = (typeof process !== "undefined" && process.env) || {};
+    this._syncCompileEnvironment = {
+      trace: env.JVM_JIT_TRACE_POST_MAIN_SYNC_COMPILE === "1",
+      assert: env.JVM_JIT_ASSERT_NO_POST_MAIN_SYNC_COMPILE === "1",
+    };
+    return this._syncCompileEnvironment;
+  }
+
+  classifyGeneratedTier(generated) {
+    if (!generated) return "none";
+    if (generated.jvmHotCallGraphFramedSource) return "hot-call-graph";
+    if (generated.jvmDirectIntrinsicKind) return "direct-intrinsic";
+    if (generated.jvmStructuredSsa) return "structured-ssa";
+    if (generated.jvmScalarLoop) return "scalar-loop";
+    if (generated.jvmSynchronous) return "generated-sync";
+    return "generated-async";
+  }
+
+  // The opt-in debug guard. It is checked BEFORE any compiler work so a
+  // prohibited post-main compile never runs; it is separate from the timing
+  // accounting, which must never throw.
+  assertNoPostMainSyncCompile(method, entryPath) {
+    if (!this.mainStarted) return;
+    const { assert } = this.syncCompileEnvironment();
+    if (!assert) return;
+    const identity = this.methodIdentity(method);
+    const error = new Error(
+      "JVM_JIT_ASSERT_NO_POST_MAIN_SYNC_COMPILE: synchronous compile " +
+      `after main() — ${identity} entryPath=${entryPath}`);
+    error.jitAssertNoPostMainSyncCompile = {
+      method: identity,
+      descriptor: method?.descriptor ?? null,
+      tier: entryPath,
+      caller: entryPath,
+    };
+    throw error;
+  }
+
+  // Begin one synchronous compile interval. The assertion runs first (before
+  // any state or compiler work); the returned token's finish() finalizes the
+  // accounting and never throws. Nesting is tracked so the aggregate
+  // stall-time counter only adds the outermost interval.
+  startSynchronousCompile(method, entryPath) {
+    this.assertNoPostMainSyncCompile(method, entryPath);
+    const outermost = this.syncCompileDepth === 0;
+    this.syncCompileDepth += 1;
+    const start = this.monotonicNow();
+    return {
+      finish: (tier) => this.finishSynchronousCompile(method, tier,
+        entryPath, start, outermost),
+    };
+  }
+
+  finishSynchronousCompile(method, tier, entryPath, start, outermost) {
+    const ms = this.monotonicNow() - start;
+    this.syncCompileDepth -= 1;
+    if (this.mainStarted) {
+      this.postMainSyncCompileCount += 1;
+      if (outermost) this.postMainSyncCompileMs += ms;
+      const row = this.postMainSyncCompileByTier.get(tier) ||
+        { count: 0, inclusiveMs: 0 };
+      row.count += 1;
+      row.inclusiveMs += ms;
+      this.postMainSyncCompileByTier.set(tier, row);
+    } else {
+      this.preMainSyncCompileCount += 1;
+      if (outermost) this.preMainSyncCompileMs += ms;
+    }
+    if (!this.mainStarted) return;
+    if (!this.syncCompileEnvironment().trace) return;
+    console.error("[jit-post-main-sync-compile] " + JSON.stringify({
+      method: this.methodIdentity(method),
+      descriptor: method?.descriptor ?? null,
+      tier,
+      entryPath,
+      ms: Math.round(ms * 1000) / 1000,
+      outermost,
+    }));
+  }
+
+  // The counters plus a per-tier post-main census, as plain data. Per-tier
+  // inclusiveMs includes nested compiles and is NOT comparable to
+  // postMainSyncCompileMs (outermost-only elapsed stall time).
+  syncCompileCensus() {
+    return {
+      mainStarted: this.mainStarted,
+      preMainSyncCompileCount: this.preMainSyncCompileCount,
+      preMainSyncCompileMs: this.preMainSyncCompileMs,
+      postMainSyncCompileCount: this.postMainSyncCompileCount,
+      postMainSyncCompileMs: this.postMainSyncCompileMs,
+      workerUnservedPostMainCount: this.workerUnservedPostMainCount,
+      workerUnservedPostMainMethodCount: this.workerUnservedPostMainMethodCount,
+      postMainSyncCompileByTier: Object.fromEntries(
+        [...this.postMainSyncCompileByTier.entries()].map(([tier, row]) =>
+          [tier, { count: row.count, inclusiveMs: row.inclusiveMs }])),
+    };
+  }
+
+  // Task 2: accumulate the main-thread cost of turning a worker result back
+  // into a body. `attempt` covers every result that reached materialization
+  // (installed, stale, superseded); `installed` is successful publishes only.
+  recordResultInstallTiming(breakdown, { installed = false } = {}) {
+    const s = this.installStats;
+    s.validationMs += breakdown.validationMs || 0;
+    s.descriptorBindingMs += breakdown.descriptorBindingMs || 0;
+    s.newFunctionMs += breakdown.newFunctionMs || 0;
+    s.wasmInstantiationMs += breakdown.wasmInstantiationMs || 0;
+    s.publicationMs += breakdown.publicationMs || 0;
+    s.totalInstallMs += breakdown.totalInstallMs || 0;
+    const total = breakdown.totalInstallMs || 0;
+    s.attemptCount += 1;
+    if (this.mainStarted) {
+      s.postMainAttemptCount += 1;
+      s.postMainAttemptMs += total;
+    } else {
+      s.preMainAttemptCount += 1;
+      s.preMainAttemptMs += total;
+    }
+    if (installed) {
+      s.installCount += 1;
+      s.largestInstallMs = Math.max(s.largestInstallMs, total);
+    }
+  }
+
+  installCensus() {
+    return { ...this.installStats };
   }
 
   generatedSource(method, tier, source, ownerOverride = null) {
@@ -2674,8 +2920,11 @@ class JitCompiler {
     };
   }
 
-  materializeTextBody(spec, method) {
+  materializeTextBody(spec, method, timings = null) {
+    const t0 = this.monotonicNow();
     const interned = this.internLinkRecords(spec.captures || {}, method);
+    const t1 = this.monotonicNow();
+    if (timings) timings.descriptorBindingMs += t1 - t0;
     if (!interned) return null;
     const { captures } = interned;
     const names = Object.keys(captures);
@@ -2686,6 +2935,7 @@ class JitCompiler {
       `${spec.name || "rebound"}(${(spec.parameters || []).join(",")}) {\n` +
       `${spec.source}\n}`);
     const fn = factory(...names.map((name) => captures[name]));
+    if (timings) timings.newFunctionMs += this.monotonicNow() - t1;
     fn.jvmParameters = spec.parameters;
     fn.jvmTier = spec.tier;
     fn.jvmGenerator = spec.generator;
@@ -3146,17 +3396,26 @@ class JitCompiler {
   }
 
   materializeGeneratedResult(payload, method, options = {}) {
+    // Task 2: `options.timings` receives the per-phase main-thread cost of
+    // turning a worker's plain data back into a runnable body.
+    const timings = options.timings || null;
+    const mark = () => this.monotonicNow();
     if (!payload) return null;
+    let phaseStart = mark();
     if (options.checkStaleness !== false && payload.provenance) {
       const stale = this.resultStalenessReason(payload);
       if (stale) {
+        if (timings) timings.validationMs += mark() - phaseStart;
         this.staleTransportedResults = (this.staleTransportedResults || 0) + 1;
         this.lastStaleTransportReason = stale;
         return null;
       }
     }
+    if (timings) timings.validationMs += mark() - phaseStart;
     if (payload.siteTables) {
+      phaseStart = mark();
       const conflict = this.placeSiteTables(payload.siteTables, method);
+      if (timings) timings.descriptorBindingMs += mark() - phaseStart;
       if (conflict) {
         this.staleTransportedResults = (this.staleTransportedResults || 0) + 1;
         this.lastStaleTransportReason = conflict;
@@ -3165,9 +3424,9 @@ class JitCompiler {
     }
     if (payload.kind === "resume-dispatcher") {
       const fast = this.materializeGeneratedResult(
-        payload.fast, method, { checkStaleness: false });
+        payload.fast, method, { checkStaleness: false, timings });
       const resume = this.materializeGeneratedResult(
-        payload.resume, method, { checkStaleness: false });
+        payload.resume, method, { checkStaleness: false, timings });
       if (!fast || !resume) return null;
       return this.buildResumeDispatcher(fast, resume, method);
     }
@@ -3176,12 +3435,12 @@ class JitCompiler {
     let framedBody = null;
     let adaptivePositionalBody = null;
     if (payload.kind === "structured") {
-      framedBody = this.materializeTextBody(payload.bodies.framed, method);
+      framedBody = this.materializeTextBody(payload.bodies.framed, method, timings);
       if (!framedBody) return null;
       const state = wrappers.createStructuredSpeculationState(
         this, payload.speculation);
       const adaptiveGeneratedBody = payload.bodies.adaptive
-        ? this.materializeTextBody(payload.bodies.adaptive, method) : null;
+        ? this.materializeTextBody(payload.bodies.adaptive, method, timings) : null;
       if (payload.bodies.adaptive && !adaptiveGeneratedBody) return null;
       if (adaptiveGeneratedBody) {
         adaptivePositionalBody = payload.shape.ordinaryAdaptive
@@ -3199,14 +3458,16 @@ class JitCompiler {
         wrappers.attachStructuredContinuationHelpers(generated, framedBody);
       }
     } else {
-      generated = this.materializeTextBody(payload.bodies.own, method);
+      generated = this.materializeTextBody(payload.bodies.own, method, timings);
       if (!generated) return null;
     }
     for (const [key, value] of Object.entries(payload.data)) {
       generated[key] = JitCompiler.reviveJsonValue(value);
     }
     if (payload.regionCallSites) {
+      phaseStart = mark();
       const sites = this.internRegionCallSites(payload.regionCallSites);
+      if (timings) timings.descriptorBindingMs += mark() - phaseStart;
       if (!sites) {
         this.lastTransportRefusal = "region call site target not resolvable";
         return null;
@@ -3215,13 +3476,15 @@ class JitCompiler {
     }
     for (const [key, spec] of Object.entries(payload.bodies)) {
       if (key === "framed" || key === "adaptive" || key === "own") continue;
-      const body = this.materializeTextBody(spec, method);
+      const body = this.materializeTextBody(spec, method, timings);
       if (!body) return null;
       generated[key] = body;
     }
     if (payload.linkRecordCaptures) {
+      phaseStart = mark();
       const interned = this.internLinkRecords(
         payload.linkRecordCaptures, method);
+      if (timings) timings.descriptorBindingMs += mark() - phaseStart;
       if (!interned) return null;
       generated.jvmStructuredLinkRecordCaptures = interned.captures;
     }
@@ -3943,9 +4206,9 @@ class JitCompiler {
     const seen = [];
     (frame.locals || []).forEach((item, slot) => {
       if (!item || typeof item !== "object" || !item.fields) return;
-      for (const key of Object.keys(item.fields)) {
+      for (const key of enumerateFieldKeys(item.fields)) {
         if (!fields.includes(String(key).split(".").pop())) continue;
-        seen.push(`${slot}:${key}=${item.fields[key]}`);
+        seen.push(`${slot}:${key}=${readField(item.fields, key)}`);
       }
     });
     const thread = this.jvm.threads?.[this.jvm.currentThreadIndex];
@@ -4013,15 +4276,19 @@ class JitCompiler {
   }
 
   compileMethod(method, options = {}) {
-    const t0 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+    const guard = this.startSynchronousCompile(method, "compileMethod");
+    const t0 = this.monotonicNow();
+    let generated = null;
     try {
-      return this._compileMethodUntimed(method, options);
+      generated = this._compileMethodUntimed(method, options);
+      return generated;
     } finally {
-      const ms = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0;
+      const ms = this.monotonicNow() - t0;
       if (!this.codegenStats) this.codegenStats = new Map();
       const e = this.codegenStats.get(method) || { ms: 0, count: 0 };
       e.ms += ms; e.count += 1;
       this.codegenStats.set(method, e);
+      guard.finish(this.classifyGeneratedTier(generated));
     }
   }
 
@@ -6286,8 +6553,8 @@ class JitCompiler {
           }
           const fields = {};
           if (held.fields && depth <= 6) {
-            for (const [key, value] of Object.entries(held.fields)) {
-              fields[key] = encode(value, depth + 1);
+            for (const key of enumerateFieldKeys(held.fields)) {
+              fields[key] = encode(readField(held.fields, key), depth + 1);
             }
           }
           return { __id: id, __guest: held.type || held._className || null,
@@ -6899,10 +7166,10 @@ class JitCompiler {
             (locals || []).forEach((item, slot) => {
               if (!item || typeof item !== "object" || !item.fields) return;
               const picked = {};
-              for (const key of Object.keys(item.fields)) {
+              for (const key of enumerateFieldKeys(item.fields)) {
                 const name = String(key).split(".").pop();
                 if (wanted.has(name) || wanted.has(String(key))) {
-                  picked[key] = scalar(item.fields[key]);
+                  picked[key] = scalar(readField(item.fields, key));
                 }
               }
               if (Object.keys(picked).length) {
@@ -7003,9 +7270,9 @@ class JitCompiler {
         };
         const receiver = frame.locals && frame.locals[0];
         const fields = receiver && receiver.fields
-          ? Object.fromEntries(Object.entries(receiver.fields).map(([key, fieldValue]) => [
+          ? Object.fromEntries(enumerateFieldKeys(receiver.fields).map((key) => [
             key,
-            diagnosticScalar(fieldValue),
+            diagnosticScalar(readField(receiver.fields, key)),
           ]))
           : null;
         console.error("[null-array-store:jitted]", JSON.stringify({
@@ -7450,8 +7717,13 @@ class JitCompiler {
       throw { type: "java/lang/NullPointerException", message: null };
     }
     if (objRef.fields) {
+      // resolveInstanceFieldKey returns the declared string key. Under a dense
+      // layout `fields` is an array and that key only reaches storage through
+      // readField, which maps it to its numeric slot; indexing directly lands
+      // on a string property nothing else reads. The *AtSite pair below already
+      // routes this way -- these two helpers were the remaining direct path.
       const fieldKey = resolveInstanceFieldKey(this.jvm, objRef, className, fieldName);
-      return fieldKey ? objRef.fields[fieldKey] : undefined;
+      return fieldKey ? readField(objRef.fields, fieldKey) : undefined;
     }
     return objRef[`${className}.${fieldName}`] ?? objRef[fieldName];
   }
@@ -7463,7 +7735,7 @@ class JitCompiler {
     }
     if (!objRef.fields) objRef.fields = {};
     const fieldKey = resolveInstanceFieldKey(this.jvm, objRef, className, fieldName) || `${className}.${fieldName}`;
-    objRef.fields[fieldKey] = value;
+    writeField(objRef.fields, fieldKey, value);
   }
 
   getStatic(arg, thread) {

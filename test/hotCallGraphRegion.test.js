@@ -7,6 +7,7 @@ const {parse} = require('acorn');
 const {JVM} = require('../src/core/jvm');
 const Stack = require('../src/core/stack');
 const Frame = require('../src/core/frame');
+const { readField, writeField } = require('../src/core/objectModel');
 
 function fixture(className, source) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'jvm-region-'));
@@ -795,7 +796,7 @@ public class GenericCallGraphLoop {
   const staticReceivers = jvm.jit.newReferenceArray(2, className);
   for (let index = 0; index < staticReceivers.length; index += 1) {
     staticReceivers[index] = jvm.jit.allocateObject(className);
-    staticReceivers[index].fields[`${className}.stable`] = 7 + index;
+    writeField(staticReceivers[index].fields, `${className}.stable`, 7 + index);
   }
   classData.staticFields.set(
     `fixedReceivers:[L${className};`, staticReceivers);
@@ -879,7 +880,7 @@ public class GenericCallGraphLoop {
     thread.callStack.pop();
   }
   thread.callStack.pop();
-  receiver.fields[`${className}.mutated`] = 0;
+  writeField(receiver.fields, `${className}.mutated`, 0);
   const cachedFieldPlan = jvm.jit.compileHotCallGraphRegion(
     cachedFieldRoot, {forceExpansion: true});
   t.ok(cachedFieldPlan?.backendEligible,
@@ -895,9 +896,9 @@ public class GenericCallGraphLoop {
   jvm.jit.tryInvokeSyncAtSite = originalTryInvokeSyncAt;
   t.equal(genericRegionCalls, 0,
     'an exact virtual edge calls its local region node without dispatch');
-  t.equal(receiver.fields[`${className}.mutated`], 5,
+  t.equal(readField(receiver.fields, `${className}.mutated`), 5,
     'the child field write remains visible on every iteration');
-  receiver.fields[`${className}.mutated`] = 0;
+  writeField(receiver.fields, `${className}.mutated`, 0);
   const cachedFramedParent = new Frame(cachedFieldRoot);
   const cachedFramedRoot = new Frame(cachedFieldRoot);
   cachedFramedRoot.className = className;
@@ -918,7 +919,7 @@ public class GenericCallGraphLoop {
     'the framed exact virtual edge removes its redundant PIC scaffold');
   t.equal(cachedFramedParent.stack.pop(), 63,
     'direct framed lowering preserves the child result');
-  t.equal(receiver.fields[`${className}.mutated`], 3,
+  t.equal(readField(receiver.fields, `${className}.mutated`), 3,
     'direct framed lowering preserves receiver field writes');
   thread.callStack.items.length = 0;
 

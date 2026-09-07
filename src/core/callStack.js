@@ -1,4 +1,5 @@
 const Stack = require('./stack');
+const { enumerateFieldKeys, readField } = require('./objectModel');
 
 // ACC_SYNCHRONIZED is not expressed in bytecode: the monitor is implied by the
 // method flag, so the runtime owns entering and leaving it. A frame can retire
@@ -49,9 +50,9 @@ function traceInvoke(frame) {
   const seen = [];
   (frame.locals || []).forEach((item, slot) => {
     if (!item || typeof item !== "object" || !item.fields) return;
-    for (const key of Object.keys(item.fields)) {
+    for (const key of enumerateFieldKeys(item.fields)) {
       if (!DEBUG_INVOKE_FIELDS.includes(String(key).split(".").pop())) continue;
-      seen.push(`${slot}:${key}=${item.fields[key]}`);
+      seen.push(`${slot}:${key}=${readField(item.fields, key)}`);
     }
   });
   debugInvokeSeq += 1;

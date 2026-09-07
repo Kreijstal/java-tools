@@ -1,3 +1,4 @@
+const { enumerateFieldKeys, readField } = require('../../../core/objectModel');
 function javaString(value) {
   if (value === null || value === undefined) return null;
   if (typeof value === 'string') return value;
@@ -13,9 +14,9 @@ function fieldValue(obj, name) {
   if (!obj) return undefined;
   if (Object.prototype.hasOwnProperty.call(obj, name)) return obj[name];
   if (obj.fields) {
-    const exact = Object.keys(obj.fields).find((key) =>
+    const exact = enumerateFieldKeys(obj.fields).find((key) =>
       key.endsWith(`.${name}`) || key.includes(`.${name}:`));
-    if (exact) return obj.fields[exact];
+    if (exact) return readField(obj.fields, exact);
   }
   return undefined;
 }
@@ -142,7 +143,7 @@ function canonicalKey(key, jvm, seen = new WeakSet()) {
     if (seen.has(key)) return identityKey(key);
     seen.add(key);
     const fields = valueHashFields.map((name) =>
-      `${name}=${canonicalKey(key.fields[name], jvm, seen)}`);
+      `${name}=${canonicalKey(readField(key.fields, name), jvm, seen)}`);
     seen.delete(key);
     return `${type}:{${fields.join(',')}}`;
   }

@@ -23,6 +23,7 @@ const controlHandlers = require('../src/instructions/control');
 const Frame = require('../src/core/frame');
 const Stack = require('../src/core/stack');
 const awt = require('../src/platform/awt');
+const { readField, writeField } = require('../src/core/objectModel');
 
 const WASM_TRY_TABLE_SUPPORTED = supportsWasmTryTable();
 
@@ -1123,36 +1124,36 @@ public class ReferenceCursorHarness {
   jvm.currentThreadIndex = 0;
   await invoke(jvm, thread, 'ReferenceCursorHarness', 'step',
     '(I)LReferenceCursorHarness;', [receiver, 1]);
-  t.equal(receiver.fields['ReferenceCursorHarness.cursor'], tail,
+  t.equal(readField(receiver.fields, 'ReferenceCursorHarness.cursor'), tail,
     'generated cursor execution advances the reference link');
   t.equal(classData.staticFields.get('diagnostic:I'), -122,
     'the admitted primitive static side effect is preserved');
   const unlink = jvm.findMethod(classData, 'unlink', '(Z)V');
   t.ok(jvm.jit.isReferenceFieldHelperJsPreferred(unlink),
     'the same structural rule selects a bounded void link mutator');
-  receiver.fields['ReferenceCursorHarness.cursor'] = value;
-  value.fields['ReferenceCursorHarness.cursor'] = tail;
+  writeField(receiver.fields, 'ReferenceCursorHarness.cursor', value);
+  writeField(value.fields, 'ReferenceCursorHarness.cursor', tail);
   await invoke(jvm, thread, 'ReferenceCursorHarness', 'unlink', '(Z)V',
     [receiver, 0]);
-  t.equal(receiver.fields['ReferenceCursorHarness.cursor'], null,
+  t.equal(readField(receiver.fields, 'ReferenceCursorHarness.cursor'), null,
     'generated void helper clears the receiver link');
-  t.equal(value.fields['ReferenceCursorHarness.cursor'], null,
+  t.equal(readField(value.fields, 'ReferenceCursorHarness.cursor'), null,
     'generated void helper preserves the nested link update');
   const clear = jvm.findMethod(classData, 'clear', '(I)V');
   t.ok(jvm.jit.isReferenceFieldHelperJsPreferred(clear),
     'bounded reference-field cleanup needs no preceding field read');
-  receiver.fields['ReferenceCursorHarness.head'] = head;
-  receiver.fields['ReferenceCursorHarness.cursor'] = value;
+  writeField(receiver.fields, 'ReferenceCursorHarness.head', head);
+  writeField(receiver.fields, 'ReferenceCursorHarness.cursor', value);
   await invoke(jvm, thread, 'ReferenceCursorHarness', 'clear', '(I)V',
     [receiver, 1]);
-  t.equal(receiver.fields['ReferenceCursorHarness.head'], null,
+  t.equal(readField(receiver.fields, 'ReferenceCursorHarness.head'), null,
     'generated cleanup clears its first reference field');
-  t.equal(receiver.fields['ReferenceCursorHarness.cursor'], null,
+  t.equal(readField(receiver.fields, 'ReferenceCursorHarness.cursor'), null,
     'generated cleanup clears its second reference field');
   t.equal(classData.staticFields.get('diagnostic:I'), 41,
     'generated cleanup preserves its primitive static side effect');
-  receiver.fields['ReferenceCursorHarness.head'] = head;
-  receiver.fields['ReferenceCursorHarness.cursor'] = value;
+  writeField(receiver.fields, 'ReferenceCursorHarness.head', head);
+  writeField(receiver.fields, 'ReferenceCursorHarness.cursor', value);
   classData.staticFields.set('diagnostic:I', 0);
   const parent = new Frame(method);
   parent.className = 'ReferenceCursorHarness';
@@ -1165,15 +1166,15 @@ public class ReferenceCursorHarness {
   }, jvm, thread);
   t.equal(thread.callStack.size(), depth,
     'the synchronous interpreter invokes the positional helper without a child frame');
-  t.equal(receiver.fields['ReferenceCursorHarness.head'], null,
+  t.equal(readField(receiver.fields, 'ReferenceCursorHarness.head'), null,
     'the interpreter positional edge preserves the first field clear');
-  t.equal(receiver.fields['ReferenceCursorHarness.cursor'], null,
+  t.equal(readField(receiver.fields, 'ReferenceCursorHarness.cursor'), null,
     'the interpreter positional edge preserves the second field clear');
   t.equal(classData.staticFields.get('diagnostic:I'), 41,
     'the interpreter positional edge preserves the static effect');
-  head.fields['ReferenceCursorHarness.head'] = head;
-  receiver.fields['ReferenceCursorHarness.head'] = head;
-  receiver.fields['ReferenceCursorHarness.cursor'] = value;
+  writeField(head.fields, 'ReferenceCursorHarness.head', head);
+  writeField(receiver.fields, 'ReferenceCursorHarness.head', head);
+  writeField(receiver.fields, 'ReferenceCursorHarness.cursor', value);
   const empty = jvm.findMethod(classData, 'empty', '(I)Z');
   t.ok(jvm.jit.isReferenceFieldHelperJsPreferred(empty),
     'the structural rule selects a bounded scalar reference-field predicate');
@@ -1191,10 +1192,10 @@ public class ReferenceCursorHarness {
     'the interpreter field predicate avoids a child frame');
   t.equal(parent.stack.pop(), 1,
     'the interpreter positional edge returns the scalar result');
-  t.equal(receiver.fields['ReferenceCursorHarness.cursor'], value,
+  t.equal(readField(receiver.fields, 'ReferenceCursorHarness.cursor'), value,
     'the fast scalar path preserves untaken field effects');
-  receiver.fields['ReferenceCursorHarness.head'] = head;
-  receiver.fields['ReferenceCursorHarness.cursor'] = value;
+  writeField(receiver.fields, 'ReferenceCursorHarness.head', head);
+  writeField(receiver.fields, 'ReferenceCursorHarness.cursor', value);
   classData.staticFields.set('diagnostic:I', 0);
   parent.stack.items.push(receiver, 1);
   const resolvedDepth = thread.callStack.size();
@@ -1203,7 +1204,7 @@ public class ReferenceCursorHarness {
   }, thread);
   t.equal(thread.callStack.size(), resolvedDepth,
     'the resolved-target path also avoids a child frame');
-  t.equal(receiver.fields['ReferenceCursorHarness.cursor'], null,
+  t.equal(readField(receiver.fields, 'ReferenceCursorHarness.cursor'), null,
     'the resolved-target positional edge preserves cleanup effects');
   const clearCode = clear.attributes.find(attribute => attribute.type === 'code')
     .code.codeItems;
@@ -2414,7 +2415,7 @@ test('generated JIT admits call-free post-increment field helpers structurally',
   const result = generated(frame, { status: 'runnable', callStack: stack }, jvm.jit, false);
   t.deepEqual(result, { returned: true, value: 41 },
     'post-increment returns the value that preceded the field write');
-  t.equal(object.fields['ArbitraryCounter.value'], 42,
+  t.equal(readField(object.fields, 'ArbitraryCounter.value'), 42,
     'post-increment stores the incremented value');
 
   const alternateObject = {
@@ -2434,7 +2435,7 @@ test('generated JIT admits call-free post-increment field helpers structurally',
   );
   t.equal(alternateResult.value, 9,
     'generated putfield reads an alternate owner-qualified slot');
-  t.equal(alternateObject.fields['LegacyCounter.value'], 10,
+  t.equal(readField(alternateObject.fields, 'LegacyCounter.value'), 10,
     'generated putfield updates the resolved alternate slot');
   t.notOk(Object.prototype.hasOwnProperty.call(
     alternateObject.fields, 'ArbitraryCounter.value'),
@@ -4204,7 +4205,7 @@ public final class ArbitraryEffectfulInstanceWrapper {
     }
     t.deepEqual(warm, {returned: true, value: 30},
       'the warmed call reloads the field after its effectful child');
-    t.equal(receiver.fields[`${className}.value`], 17,
+    t.equal(readField(receiver.fields, `${className}.value`), 17,
       'the child mutation remains visible to the positional caller');
     t.equal(target.freeFrame, reusableFrame,
       'the warmed instance wrapper creates no child Frame');
@@ -4462,7 +4463,7 @@ test('generated field sites preserve inherited instance and static storage', (t)
   t.equal(jvm.jit.getFieldAt(instanceSite, object), 11,
     'field site resolves inherited instance storage');
   jvm.jit.putFieldAt(instanceSite, object, 12);
-  t.equal(object.fields['FieldBase.value'], 12,
+  t.equal(readField(object.fields, 'FieldBase.value'), 12,
     'cached instance field site writes the resolved owner slot');
   t.equal(jvm.jit.getStaticSyncAt(staticSite), 7,
     'static field site resolves inherited static storage');
@@ -5354,15 +5355,15 @@ public final class TransactionalAcyclicLeafHarness {
   t.deepEqual(destination.slice(), [77, 77, 4, 77],
     'the admitted leaf preserves the final Java store');
 
-  receiver.fields[`${className}.source`] = values.slice(0, 1);
-  receiver.fields[`${className}.source`].type = '[I';
+  writeField(receiver.fields, `${className}.source`, values.slice(0, 1));
+  readField(receiver.fields, `${className}.source`).type = '[I';
   t.equal(checked(jvm.jit, receiver, 2, thread, true),
     jvm.jit.asyncInvokeSentinel(),
   'a source bounds failure returns to canonical execution');
   t.deepEqual(destination.slice(), [77, 77, 4, 77],
     'source rejection occurs before the destination effect');
-  receiver.fields[`${className}.source`] = values;
-  receiver.fields[`${className}.divisor`] = 0;
+  writeField(receiver.fields, `${className}.source`, values);
+  writeField(receiver.fields, `${className}.divisor`, 0);
   t.equal(checked(jvm.jit, receiver, 1, thread, true),
     jvm.jit.asyncInvokeSentinel(),
   'division by zero returns to precise canonical execution');
@@ -5626,8 +5627,8 @@ public final class GenericPostIncrementReader {
   values[0] = 4;
   values[1] = -7;
   values[2] = 9;
-  receiver.fields[`${className}.cursor`] = 1;
-  receiver.fields[`${className}.values`] = values;
+  writeField(receiver.fields, `${className}.cursor`, 1);
+  writeField(receiver.fields, `${className}.values`, values);
   const thread = {
     status: 'runnable', pendingException: null, callStack: new Stack(),
   };
@@ -5640,7 +5641,7 @@ public final class GenericPostIncrementReader {
   const result = generated.jvmRestoringDirectPositionalBody(
     jvm.jit, plan, receiver, 27, thread, true);
   t.equal(result, -7, 'the old cursor value indexes the array');
-  t.equal(receiver.fields[`${className}.cursor`], 2,
+  t.equal(readField(receiver.fields, `${className}.cursor`), 2,
     'the incremented cursor is stored once');
   t.equal(thread.callStack.size(), 0,
     'normal execution does not materialize an omitted Frame');
@@ -6374,7 +6375,7 @@ public final class ArbitraryStaticSummaryLoop {
     t.equal(executeInstance(
       writingInstanceLoop, writingInstanceGenerated, 3).value, 33,
     'the private writing callee remains visible on later iterations');
-    t.equal(receiver.fields[`${className}.scale`], 4,
+    t.equal(readField(receiver.fields, `${className}.scale`), 4,
       'selective receiver caching never hides the private callee write');
     t.end();
   });
@@ -8842,7 +8843,7 @@ public final class StructuredIndirectFieldArrayHarness {
   const yieldedLocals = yieldingFrame.locals.slice();
   const reboundOutput = new Array(4).fill(0);
   reboundOutput.type = '[I';
-  receiver.fields[`${className}.output`] = reboundOutput;
+  writeField(receiver.fields, `${className}.output`, reboundOutput);
   const invalidated = generated(
     yieldingFrame, yieldingThread, jvm.jit, false);
   t.ok(invalidated?.deopt && invalidated.transient,
@@ -8858,7 +8859,7 @@ public final class StructuredIndirectFieldArrayHarness {
   t.equal(jvm.jit.structuredSsa
     .fieldBackedArrayContinuationFallbackCount, 1,
   'field-backed continuation invalidation is counted');
-  receiver.fields[`${className}.output`] = output;
+  writeField(receiver.fields, `${className}.output`, output);
 
   const invalidIndexes = [2, 9, 3, 1];
   invalidIndexes.type = '[S';
@@ -9640,8 +9641,8 @@ test('structured JVM SSA covers double arithmetic and putfield', (t) => {
   t.equal(structured.result.returned, true, 'structured loop returns normally');
   t.deepEqual(structured.result, baseline.result,
     'structured double arithmetic matches the baseline generated tier');
-  t.equal(structured.receiver.fields['DoubleHolder.total'],
-    baseline.receiver.fields['DoubleHolder.total'],
+  t.equal(readField(structured.receiver.fields, 'DoubleHolder.total'),
+    readField(baseline.receiver.fields, 'DoubleHolder.total'),
     'structured putfield stores the same narrowed value');
   t.end();
 });
@@ -10401,7 +10402,7 @@ public class GeneratedInheritedFieldHarness extends GeneratedInheritedFieldBase 
 
   await invoke(jvm, thread, 'GeneratedInheritedFieldHarness', 'sync', '()V', [object]);
 
-  t.equal(object.fields['GeneratedInheritedFieldHarness.output'], 56,
+  t.equal(readField(object.fields, 'GeneratedInheritedFieldHarness.output'), 56,
     'subclass-owned getfield resolves the inherited storage slot');
   t.ok(jvm.jit.generatedRunCount > 0, 'method runs through generated code');
   t.end();
@@ -11687,7 +11688,7 @@ public class InlineGetterFieldHarness {
   // the inlined read is a real load each time rather than a value captured
   // once: each iteration must see the write the previous one made.
   t.deepEqual(out, [5, 7, 9, 11], 'each inlined read observes the preceding write');
-  t.equal(value.fields['InlineGetterFieldHarness$Counter.value'], 13,
+  t.equal(readField(value.fields, 'InlineGetterFieldHarness$Counter.value'), 13,
     'the field ends at its final written value');
   t.equal(jvm.jit.runnerRunCount, 0, 'the inlined getter avoids the bytecode runner');
   t.end();
@@ -12913,8 +12914,8 @@ public class AdaptiveComplexConstructorHarness {
       '([I)V', [owner, out]);
     t.equal(out[0], 10 + invocation * 9,
       `constructor receiver and array result survive invocation ${invocation + 1}`);
-    t.ok(owner.fields['AdaptiveComplexConstructorHarness.box']
-      .fields['AdaptiveComplexConstructorHarness$ComplexBox.values'],
+    t.ok(readField(readField(owner.fields, 'AdaptiveComplexConstructorHarness.box').fields,
+      'AdaptiveComplexConstructorHarness$ComplexBox.values'),
     `constructor field initialization survives invocation ${invocation + 1}`);
   }
 
@@ -13114,7 +13115,7 @@ public class GeneratedLoopConstructorHarness {
     'GeneratedLoopConstructorHarness$Values');
   await invoke(jvm, thread, 'GeneratedLoopConstructorHarness$Values',
     '<init>', '(I)V', [receiver, 100]);
-  t.equal(receiver.fields['GeneratedLoopConstructorHarness$Values.sum'], 4950,
+  t.equal(readField(receiver.fields, 'GeneratedLoopConstructorHarness$Values.sum'), 4950,
     'generated constructor preserves superclass and loop field effects');
   t.ok(jvm.jit.codegenCache.get(constructor)?.jvmStructuredSsa,
     'the hot constructor uses the structured SSA body');
@@ -13141,8 +13142,8 @@ public class GeneratedLoopConstructorHarness {
   await invoke(jvm, thread,
     'GeneratedLoopConstructorHarness$WrappedAssignment', '<init>',
     '(Ljava/lang/Object;)V', [wrappedReceiver, wrappedValue]);
-  t.equal(wrappedReceiver.fields[
-    'GeneratedLoopConstructorHarness$WrappedAssignment.value'], wrappedValue,
+  t.equal(readField(wrappedReceiver.fields,
+    'GeneratedLoopConstructorHarness$WrappedAssignment.value'), wrappedValue,
   'the generated wrapped constructor preserves its field assignment');
   t.ok(jvm.jit.codegenCache.get(wrappedConstructor)?.jvmStructuredSsa,
     'the wrapped constructor retains the initialization-safe structured body');
@@ -13167,8 +13168,8 @@ public class GeneratedLoopConstructorHarness {
   await invoke(jvm, thread,
     'GeneratedLoopConstructorHarness$RethrowingValues', '<init>', '([I)V',
     [rethrowingReceiver, [3, 5, 7, 11]]);
-  t.equal(rethrowingReceiver.fields[
-    'GeneratedLoopConstructorHarness$RethrowingValues.sum'], 26,
+  t.equal(readField(rethrowingReceiver.fields,
+    'GeneratedLoopConstructorHarness$RethrowingValues.sum'), 26,
   'the generated protected constructor preserves its loop effects');
   t.ok(jvm.jit.codegenCache.get(rethrowingConstructor)?.jvmStructuredSsa,
     'the protected constructor executes through structured SSA');
@@ -13626,9 +13627,9 @@ public class GeneratedPostIncrementCallHarness {
   await invoke(jvm, thread, 'GeneratedPostIncrementCallHarness', 'read',
     '([BZ)I', [instance, values, 1]);
 
-  t.equal(instance.fields['GeneratedPostIncrementCallHarness.index'], 2,
+  t.equal(readField(instance.fields, 'GeneratedPostIncrementCallHarness.index'), 2,
     'post-increment updates the receiver exactly once per read');
-  t.equal(instance.fields['GeneratedPostIncrementCallHarness.calls'], 1,
+  t.equal(readField(instance.fields, 'GeneratedPostIncrementCallHarness.calls'), 1,
     'the generated call branch executes exactly once');
   t.ok(jvm.jit.generatedRunCount > 0,
     'the mixed helper executes in generated JavaScript');

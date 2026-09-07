@@ -13,6 +13,7 @@ const { execFileSync } = require('child_process');
 const { JVM } = require('../src/core/jvm');
 const Frame = require('../src/core/frame');
 const Stack = require('../src/core/stack');
+const { readField, writeField } = require('../src/core/objectModel');
 
 function compileJavaFixture(t, className, source) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'instance-inline-fixture-'));
@@ -185,7 +186,7 @@ test('structured field caches: fills hit, putfield kills, runs stay fresh', asyn
   // s = sum of (f0 - i): wrong (n * f0) if the putfield fails to kill the cache
   await invoke(jvm, thread, 'InstInline', 'drain', '([ILBase;I)I', [out, base, n]);
   t.equal(out[0], (100000 * n - (n * (n - 1)) / 2) | 0, 'read-decrement loop is exact');
-  t.equal(base.fields['Base.f'], 100000 - n, 'field visibly decremented');
+  t.equal(readField(base.fields, 'Base.f'), 100000 - n, 'field visibly decremented');
   const meta = metaOf(jvm, 'InstInline.drain([ILBase;I)I');
   t.ok(meta && meta.structured, 'drain compiled by the structured backend');
   const caching = process.env.JVM_DISABLE_WASM_FIELD_CACHE !== '1';
@@ -197,7 +198,7 @@ test('structured field caches: fills hit, putfield kills, runs stay fresh', asyn
   else t.equal(meta.fieldCacheCount, 0, 'kill switch leaves no cache entries');
 
   // caches are per-run locals: a mutation between invokes must be seen
-  base.fields['Base.f'] = 9;
+  writeField(base.fields, 'Base.f', 9);
   await invoke(jvm, thread, 'InstInline', 'drive', '([ILBase;I)I', [out, base, n]);
   t.equal(out[0], expectedSum(9, n), 'fresh run reads the mutated field');
   const drive = metaOf(jvm, 'InstInline.drive([ILBase;I)I');

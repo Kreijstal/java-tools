@@ -1,0 +1,62 @@
+{
+ "ssaLinkStaticCell6567": {
+  "kind": "staticCell",
+  "className": "hk",
+  "key": "b:I",
+  "valueType": "number"
+ },
+ "ssaLinkStaticCell6568": {
+  "kind": "staticCell",
+  "className": "hk",
+  "key": "h:I",
+  "valueType": "number"
+ },
+ "ssaLinkClassGuard656": {
+  "kind": "classGuard",
+  "owners": [
+   "hk"
+  ]
+ },
+ "ssaLinkCallSite10084": {
+  "kind": "callSite",
+  "op": "invokespecial",
+  "className": "java/lang/IllegalStateException",
+  "methodName": "<init>",
+  "descriptor": "()V",
+  "fastPositional": false,
+  "fastPositionalRaw": false
+ },
+ "ssaLinkCallSite10085": {
+  "kind": "callSite",
+  "op": "invokestatic",
+  "className": "ok",
+  "methodName": "c",
+  "descriptor": "()V",
+  "fastPositional": false,
+  "fastPositionalRaw": false
+ },
+ "ssaLinkCallSite10086": {
+  "kind": "callSite",
+  "op": "invokestatic",
+  "className": "ok",
+  "methodName": "b",
+  "descriptor": "([III)V",
+  "fastPositional": false,
+  "fastPositionalRaw": false
+ },
+ "ssaLinkCallSite10087": {
+  "kind": "callSite",
+  "op": "invokestatic",
+  "className": "ok",
+  "methodName": "a",
+  "descriptor": "(II[I[I)V",
+  "fastPositional": false,
+  "fastPositionalRaw": false
+ },
+ "ssaAsyncInvoke": {
+  "kind": "other"
+ },
+ "ssaReturnVoid": {
+  "kind": "other"
+ }
+}

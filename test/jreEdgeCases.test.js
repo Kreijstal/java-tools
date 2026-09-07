@@ -43,6 +43,7 @@ const Collectors = require('../src/jre/java/util/stream/Collectors');
 const Stream = require('../src/jre/java/util/stream/Stream');
 const ActionEvent = require('../src/jre/java/awt/event/ActionEvent');
 const SoftReference = require('../src/jre/java/lang/ref/SoftReference');
+const { readField } = require('../src/core/objectModel');
 
 function completedConsumerImage(width, height, pixels) {
   const image = {type: 'java/awt/Image'};
@@ -797,7 +798,7 @@ test('reflective fields use normal JVM instance storage', (t) => {
   'Field.get reads the owner-qualified instance slot');
   ReflectField.methods['setBoolean(Ljava/lang/Object;Z)V'](
     null, booleanField, [object, 0]);
-  t.equal(object.fields['ui.w'], 0,
+  t.equal(readField(object.fields, 'ui.w'), 0,
     'Field.setBoolean writes the owner-qualified instance slot');
   t.end();
 });

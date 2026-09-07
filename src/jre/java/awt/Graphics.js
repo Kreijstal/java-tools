@@ -247,9 +247,24 @@ function presentationStats(jvm) {
       lastPresentedCompletionAt: null,
       recentPresentationGaps: [],
       recentFrameTimings: [],
+      // docs/refactor.md 0.5 item 1 judges the runtime on the whole run's
+      // frame distribution, separately for the logo and the menu. The windows
+      // above are 256 entries of "how is it going right now" and carry no
+      // clock a harness could attribute a frame to a phase with, so they
+      // cannot answer that. Opt in with JVM_FRAME_TRACE=1 and every
+      // presentation is kept instead, stamped on the same wall clock the
+      // launcher marks its phase boundaries with.
+      presentationTrace: framePresentationTraceEnabled() ? [] : null,
     };
   }
   return jvm._awtPresentationStats;
+}
+
+// Off by default: an unbounded per-frame array is exactly the kind of cost
+// that would distort the measurement it exists to take.
+function framePresentationTraceEnabled() {
+  return typeof process !== 'undefined' && process.env &&
+    process.env.JVM_FRAME_TRACE === '1';
 }
 
 function recordPresentation(stats, completedAt = null, uploadMs = 0) {
@@ -263,6 +278,11 @@ function recordPresentation(stats, completedAt = null, uploadMs = 0) {
     if (stats.recentPresentationGaps.length > 256) {
       stats.recentPresentationGaps.shift();
     }
+  }
+  if (stats.presentationTrace && presentationGapMs !== null) {
+    // The gap comes from the monotonic clock; the stamp is wall time only so
+    // the harness can say which phase the frame belongs to.
+    stats.presentationTrace.push({ atMs: Date.now(), gapMs: presentationGapMs });
   }
   const completionGapMs = completedAt === null ||
       stats.lastPresentedCompletionAt === null

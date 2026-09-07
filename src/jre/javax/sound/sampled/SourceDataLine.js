@@ -1,8 +1,9 @@
 const { createAudioOutput } = require('../../../../platform/audio');
 const { withThrows } = require('../../../helpers');
+const { readField } = require('../../../../core/objectModel');
 
 function getFormatFields(format) {
-  return format.fields["javax/sound/sampled/AudioFormat"];
+  return readField(format.fields, "javax/sound/sampled/AudioFormat");
 }
 
 function toOutputOptions(formatFields, bufferSize) {

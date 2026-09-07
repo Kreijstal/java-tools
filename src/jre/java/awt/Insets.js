@@ -1,3 +1,4 @@
+const { writeField } = require('../../../core/objectModel');
 module.exports = {
   super: 'java/lang/Object',
   fields: {
@@ -13,10 +14,10 @@ module.exports = {
       obj.bottom = args[2];
       obj.right = args[3];
       obj.fields = obj.fields || {};
-      obj.fields['java/awt/Insets.top'] = obj.top;
-      obj.fields['java/awt/Insets.left'] = obj.left;
-      obj.fields['java/awt/Insets.bottom'] = obj.bottom;
-      obj.fields['java/awt/Insets.right'] = obj.right;
+      writeField(obj.fields, 'java/awt/Insets.top', obj.top);
+      writeField(obj.fields, 'java/awt/Insets.left', obj.left);
+      writeField(obj.fields, 'java/awt/Insets.bottom', obj.bottom);
+      writeField(obj.fields, 'java/awt/Insets.right', obj.right);
     },
   },
 };

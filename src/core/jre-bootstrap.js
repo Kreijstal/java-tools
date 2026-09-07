@@ -114,7 +114,11 @@ class JreBootstrap {
     }
 
     // Add other JRE classes that extend Object directly - only in Node.js environment
-    if (typeof window === "undefined" && jvm.fs && jvm.path) {
+    // Capability, not environment: see the note on `this.fs` in jvm.js. A
+    // bundler's `fs` stub is an object with no methods, and a Web Worker has
+    // no `window` to give it away.
+    if (jvm.fs && typeof jvm.fs.readdirSync === "function" &&
+        jvm.path && typeof jvm.path.join === "function") {
       const jrePath = jvm.path.join(__dirname, "..", "jre");
       const walk = (dir, prefix) => {
         const files = jvm.fs.readdirSync(dir);

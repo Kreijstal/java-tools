@@ -1,0 +1,151 @@
+{
+ "ssaLinkStaticCell6347": {
+  "kind": "staticCell",
+  "className": "ok",
+  "key": "d:I",
+  "valueType": "number"
+ },
+ "ssaLinkStaticCell6348": {
+  "kind": "staticCell",
+  "className": "ok",
+  "key": "g:I",
+  "valueType": "number"
+ },
+ "ssaLinkStaticCell6349": {
+  "kind": "staticCell",
+  "className": "ok",
+  "key": "b:I",
+  "valueType": "number"
+ },
+ "ssaLinkStaticCell6350": {
+  "kind": "staticCell",
+  "className": "ok",
+  "key": "c:I",
+  "valueType": "number"
+ },
+ "ssaLinkStaticCell6351": {
+  "kind": "staticCell",
+  "className": "ok",
+  "key": "h:I",
+  "valueType": "number"
+ },
+ "ssaLinkStaticCell6352": {
+  "kind": "staticCell",
+  "className": "ok",
+  "key": "d:I",
+  "valueType": "number"
+ },
+ "ssaLinkStaticCell6353": {
+  "kind": "staticCell",
+  "className": "ok",
+  "key": "f:[I",
+  "valueType": "[I"
+ },
+ "ssaLinkStaticCell6354": {
+  "kind": "staticCell",
+  "className": "hk",
+  "key": "h:I",
+  "valueType": "number"
+ },
+ "ssaLinkStaticCell6355": {
+  "kind": "staticCell",
+  "className": "hk",
+  "key": "h:I",
+  "valueType": "number"
+ },
+ "ssaLinkStaticCell6356": {
+  "kind": "staticCell",
+  "className": "ok",
+  "key": "d:I",
+  "valueType": "number"
+ },
+ "ssaLinkStaticCell6357": {
+  "kind": "staticCell",
+  "className": "ok",
+  "key": "f:[I",
+  "valueType": "[I"
+ },
+ "ssaLinkStaticCell6358": {
+  "kind": "staticCell",
+  "className": "ok",
+  "key": "f:[I",
+  "valueType": "[I"
+ },
+ "ssaLinkStaticCell6359": {
+  "kind": "staticCell",
+  "className": "ok",
+  "key": "f:[I",
+  "valueType": "[I"
+ },
+ "ssaLinkStaticCell6360": {
+  "kind": "staticCell",
+  "className": "ok",
+  "key": "f:[I",
+  "valueType": "[I"
+ },
+ "ssaLinkStaticCell6361": {
+  "kind": "staticCell",
+  "className": "ok",
+  "key": "f:[I",
+  "valueType": "[I"
+ },
+ "ssaLinkStaticCell6362": {
+  "kind": "staticCell",
+  "className": "ok",
+  "key": "f:[I",
+  "valueType": "[I"
+ },
+ "ssaLinkStaticCell6363": {
+  "kind": "staticCell",
+  "className": "ok",
+  "key": "c:I",
+  "valueType": "number"
+ },
+ "ssaLinkStaticCell6364": {
+  "kind": "staticCell",
+  "className": "ok",
+  "key": "b:I",
+  "valueType": "number"
+ },
+ "ssaLinkStaticCell6365": {
+  "kind": "staticCell",
+  "className": "ok",
+  "key": "g:I",
+  "valueType": "number"
+ },
+ "ssaLinkStaticCell6366": {
+  "kind": "staticCell",
+  "className": "ok",
+  "key": "h:I",
+  "valueType": "number"
+ },
+ "ssaLinkClassGuard636": {
+  "kind": "classGuard",
+  "owners": [
+   "ok",
+   "hk"
+  ]
+ },
+ "ssaLinkCallSite9961": {
+  "kind": "callSite",
+  "op": "invokestatic",
+  "className": "ok",
+  "methodName": "a",
+  "descriptor": "(II)V",
+  "fastPositional": false,
+  "fastPositionalRaw": false
+ },
+ "ssaLinkClassGuard637": {
+  "kind": "classGuard",
+  "owners": [
+   "ok",
+   "hk"
+  ]
+ },
+ "ssaReturnVoid": {
+  "kind": "other"
+ },
+ "ssaAsyncInvoke": {
+  "kind": "other"
+ }
+}

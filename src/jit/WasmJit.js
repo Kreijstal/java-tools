@@ -175,6 +175,11 @@ function capturesBooleanStatic(method) {
 
 
 
+// Version of the linked-call contract (docs/phase1-linked-call-abi.md 2).
+// Part of an artifact's identity: an artifact compiled against one contract
+// must not be linked by a runtime that speaks another.
+const LINKED_CALL_ABI_VERSION = 1;
+
 class MethodTranslator {
   constructor(jvm, method, className, wasmJit) {
     this.jvm = jvm;
@@ -198,6 +203,13 @@ class MethodTranslator {
 
     this.importFns = [];        // JS functions in index order
     this.importDecls = [];      // {name, params:[wasmtype], results:[wasmtype]}
+    // Typed symbolic dependencies of this artifact, one per linked call site.
+    // The runtime linker's input: what this module needs, named by method and
+    // shape, independent of which module happened to be compiled when the
+    // caller was lowered. The concrete binding still lives in the import
+    // closure today; moving it here is what lets a caller be relinked instead
+    // of recompiled.
+    this.linkBindings = [];
     this.importIndexByName = new Map();
     this.box = {
       frame: null, ret: undefined,
@@ -602,6 +614,28 @@ class MethodTranslator {
   // and unwinds with NestedDeopt. Runtime counters veto callees whose
   // "never" path turns out hot, and the caller's periodic recompile then
   // drops the link.
+  // FNV-1a over the method's own instructions and descriptor, tagged with the
+  // linked-call ABI version. Reads nothing about callees or runtime tier
+  // state, which is the property that makes it survive relinking.
+  artifactIdentity() {
+    let h = 0x811c9dc5;
+    const mix = (str) => {
+      for (let i = 0; i < str.length; i++) {
+        h ^= str.charCodeAt(i);
+        h = Math.imul(h, 0x01000193) >>> 0;
+      }
+      h ^= 0x5f; h = Math.imul(h, 0x01000193) >>> 0;
+    };
+    mix(this.method.name);
+    mix(this.method.descriptor);
+    for (const it of this.items) {
+      if (!it) continue;
+      mix(String(it.op || ''));
+      if (it.arg !== undefined) mix(String(it.arg));
+    }
+    return `v${LINKED_CALL_ABI_VERSION}:${h.toString(16)}`;
+  }
+
   compiledCallee(ins, itemIndex, underTypes) {
     const [, className, [name, descriptor]] = ins.arg;
     const { params, ret } = parseMethodDescriptor(descriptor);
@@ -610,9 +644,23 @@ class MethodTranslator {
     }
     const calleeSt = this.wasmJit &&
       this.wasmJit.findReadyStatic(className, name, descriptor, true);
-    if (!calleeSt || (calleeSt.callee || calleeSt).meta.boxedCount) {
+    // "Not compiled yet" and "cannot satisfy the call contract" are different
+    // states and must not share a refusal (docs/phase1-linked-call-abi.md 3).
+    //
+    // UNKNOWN: the callee owns no module. Recoverable, and blockedOn names the
+    // callee so the gate rebuilds when exactly that moves.
+    if (!calleeSt) {
       throw new Unsupported(`invoke ${className}.${name} callee not ready`,
         this.wasmJit.methodLinkBlockers(className, name, descriptor));
+    }
+    // INCOMPATIBLE: the callee HAS a module and that module boxes values, so
+    // it cannot meet the contract. This was previously fused with the case
+    // above and inherited its blocker set, which always contains the callee's
+    // own key (methodLinkBlockers seeds it), so the gate kept re-running a
+    // refusal that waiting cannot resolve. Permanent, like the usedEh and
+    // linkVetoed refusals below.
+    if ((calleeSt.callee || calleeSt).meta.boxedCount) {
+      throw new Unsupported(`invoke ${className}.${name} callee boxes values`);
     }
     const calleeMeta = (calleeSt.callee || calleeSt).meta;
     if (calleeMeta.usedEh) {
@@ -649,6 +697,11 @@ class MethodTranslator {
         const importName = `dcall_${key}`.replace(/[^\w]/g, '_');
         const wParams = params.map(descToWasm);
         const wResults = ret === 'V' ? [T.i32] : [T.i32, descToWasm(ret)];
+        this.linkBindings.push({
+          kind: 'static-direct', className, name, descriptor, importName,
+          site: itemIndex, partial: false,
+          params: wParams.slice(), results: wResults.slice(),
+        });
         return {
           argTypes: wParams,
           underTypes: [],
@@ -766,6 +819,11 @@ class MethodTranslator {
     // partial sites need a distinct import per call site: the resume pc is
     // baked into the closure
     const importName = `call_${key}${partial ? `_${itemIndex}` : ''}`.replace(/[^\w]/g, '_');
+    this.linkBindings.push({
+      kind: 'static-bridge', className, name, descriptor, importName,
+      site: itemIndex, partial,
+      params: wParams.slice(), results: results.slice(),
+    });
     return {
       argTypes: wParams.slice(underCount),
       underTypes: unders,
@@ -2314,6 +2372,14 @@ class MethodTranslator {
       externalEntry: this.externalEntry,
       demoteReasons: this.demoteReasons,
       demoteBlockers: this.demoteBlockers,
+      // Identity of the lowered artifact, deliberately independent of link
+      // state: the method's own bytecode and descriptor plus the ABI version.
+      // Two compilations of the same method under the same contract share it
+      // even if different callees happened to be ready. NOT yet a complete
+      // cache key -- compiler options and layout assumptions must join it
+      // before it is used to reuse work across runs.
+      artifactId: this.artifactIdentity(),
+      linkBindings: this.linkBindings,
       blockCount: this.blockStarts.length,
       fullyCompiled: this.supportedBlocks.size === this.blockStarts.length,
       normalFlowFullyCompiled: this.normalFlowFullyCompiled,
@@ -2357,6 +2423,24 @@ class WasmJit {
     // Ready modules continue to run; cold/dependency-invalidated methods use
     // the existing JS/interpreter fallback until compilation is thawed.
     this.compilationFrozen = false;
+    this.executionOnlyDeclined = false;
+    // docs/refactor.md 1.5 asks for an audit of every post-main compile entry
+    // path, Wasm tier triggers included. `compilationFrozen` gates exactly one
+    // of them -- the warmup path in `prepare`. Callee linking and the two
+    // storm recompiles reach the compiler without consulting it, so a run can
+    // report no post-main Wasm compilation and still have four open doors.
+    // Count what actually happens, per entry path, always: a limitation that
+    // leaves no trace in a census reads as an absence of demand.
+    this.postMainCompilesByEntry = new Map();
+    this.postMainRefusedByEntry = new Map();
+    // Enforcement is opt-in and off by default. No Wasm result crosses the
+    // compile worker yet (1.6), so refusing here does not move the work off
+    // the thread -- it only takes the tier away, and the plan's standing rule
+    // is to preserve working tiers through the migration. This exists so the
+    // contract can be tested, and so the cost of honouring it is measurable
+    // before it is made the default.
+    this.refusePostMainCompiles =
+      env.JVM_JIT_REFUSE_POST_MAIN_WASM === '1';
     this.debug = env.JVM_DEBUG_WASMJIT === '1';
     this.traceMethodPattern = env.JVM_TRACE_WASM_METHOD || '';
     this.traceExitsOnly = env.JVM_TRACE_WASM_EXITS_ONLY === '1';
@@ -2369,6 +2453,30 @@ class WasmJit {
     // Loop-bearing methods compile on first sight: warmup by invocation count
     // never fires for methods invoked once with a multi-minute loop (va.d).
     this.warmupThreshold = Number(env.JVM_WASM_JIT_WARMUP || 1);
+    // Call count at which a loop-free method becomes eligible (0 disables it,
+    // which is the historical behaviour and stays the default until the
+    // browser gate can measure it). Much higher than warmupThreshold on
+    // purpose: a method with no loop pays its whole compile cost per call, so
+    // it has to be genuinely hot before the tier is worth spending on it.
+    this.loopFreeThreshold = Number(
+      (wasmOptions.loopFreeThreshold ?? env.JVM_WASM_LOOPFREE_WARMUP) || 0);
+    // Ordinary constructors as compilation candidates (docs/refactor.md 3.3
+    // asks for this exclusion to be audited "without conflating ordinary
+    // constructors with class-initialization ordering and side effects").
+    //
+    // <clinit> is never included, and that is the half the original comment
+    // was really about: class initialization has observable all-or-nothing
+    // ordering against the INITIALIZED flag, and a partial exit inside it can
+    // publish default field values to another thread. An ordinary <init> has
+    // no such flag. A partial exit inside a constructor leaves the object
+    // exactly as half-built as an interpreter preempted at the same pc, which
+    // is a state the runtime already produces on every safepoint.
+    //
+    // Off by default until the browser gate can measure it; at the Deko Bloko
+    // menu this exclusion refused 452 methods and one constructor,
+    // ui.<init>(Lwl;Lpl;)V, accounted for 111,635 of the refusals alone.
+    this.ctorCompileEnabled = wasmOptions.compileConstructors ??
+      (env.JVM_WASM_CTOR === '1');
     // A deferred compile is not retried (blockers unresolved) until this many
     // times its own failed wall time has elapsed. 0 disables the budget.
     this.failedCompileRetryFactor = env.JVM_WASM_FAILED_RETRY_FACTOR === undefined
@@ -2383,6 +2491,13 @@ class WasmJit {
     // Direct wasm->wasm static links: eligible fully-compiled callees are
     // called through their runv export with no JS bridge on the path.
     this.directStaticLinkEnabled = wasmOptions.directStaticLink ?? (env.JVM_WASM_DIRECT_STATIC_LINK === '1');
+    // Worker mode: lower a caller without being allowed to compile its callees
+    // on demand. This is the state a compile worker is actually in -- it holds
+    // bytecode, not the owning runtime's tier state -- and it is what makes
+    // UNKNOWN a real state rather than a transient one that findReadyStatic
+    // resolves by compiling the callee itself.
+    this.noOnDemandCalleeCompile = wasmOptions.noOnDemandCalleeCompile ??
+      (env.JVM_WASM_NO_ONDEMAND_CALLEE === '1');
     // Direct wasm->wasm instance links: a monomorphic-in-practice site calls
     // its single ready fully-compiled target through runv behind an in-wasm
     // null check (invokespecial) or a one-import receiver-class guard
@@ -2409,6 +2524,18 @@ class WasmJit {
     this.structuredCompiles = 0;
     this.runCount = 0;
     this.compileEpoch = 0;
+    // Pending-link registry: callee key -> Set of caller states that lowered a
+    // late-bound call to it. meta.linkBindings has recorded these dependencies
+    // since Phase 1, but nothing in src/ read them, so "pending" meant "was
+    // unresolved at codegen" and a caller kept its trampoline for the rest of
+    // the session even once the callee became directly linkable. Re-linking is
+    // bounded for the same reason depRecompileLimit is: an unbounded re-link
+    // on every resolution is the recompile storm measured at -1.4 to -2.4 fps.
+    this.pendingLinkWaiters = new Map();
+    this.pendingLinkRelinks = 0;
+    this.pendingLinkResolved = 0;
+    this.relinkOnResolveLimit = env.JVM_WASM_RELINK_LIMIT === undefined
+      ? 0 : Number(env.JVM_WASM_RELINK_LIMIT);
     // debug-only runtime counters keyed by call-site import name
     this.siteStats = this.debug ? new Map() : null;
     if (this.siteStats && typeof process !== 'undefined' && process.on) {
@@ -2562,6 +2689,22 @@ class WasmJit {
     return st;
   }
 
+  // What actually reached the Wasm compiler after main(), by entry path, and
+  // what was refused when enforcement is on. Plain data for the launcher's
+  // Phase 1 report.
+  postMainCompileCensus() {
+    return {
+      enforcing: this.refusePostMainCompiles,
+      frozen: this.compilationFrozen,
+      // Whether the freeze is the mode in force, so a census that reports no
+      // post-main Wasm compilation says which of the two reasons applies:
+      // nothing asked, or the tier was switched off after preparation.
+      executionOnly: this.compilationFrozen && !this.executionOnlyDeclined,
+      compiled: Object.fromEntries(this.postMainCompilesByEntry),
+      refused: Object.fromEntries(this.postMainRefusedByEntry),
+    };
+  }
+
   freezeCompilation() {
     this.compilationFrozen = true;
   }
@@ -2576,8 +2719,17 @@ class WasmJit {
     // Object construction and class initialization have observable all-or-
     // nothing ordering. A partial Wasm exit around new/invokespecial can leave
     // an allocated object visible without having run the rest of <init>.
-    if (frame.method.name === '<init>' || frame.method.name === '<clinit>') {
-      if (this.census) this._censusNote(frame, 'ctor-or-clinit');
+    // Split in the census, because the plan (3.3) requires this exclusion be
+    // audited "without conflating ordinary constructors with class-
+    // initialization ordering and side effects", and a single fused reason
+    // cannot tell them apart. Both stay excluded here; the split is what makes
+    // the size of each half measurable.
+    if (frame.method.name === '<clinit>') {
+      if (this.census) this._censusNote(frame, 'clinit');
+      return null;
+    }
+    if (frame.method.name === '<init>' && !this.ctorCompileEnabled) {
+      if (this.census) this._censusNote(frame, 'ctor');
       return null;
     }
     const debug = this.jvm.debugManager;
@@ -2631,18 +2783,37 @@ class WasmJit {
       // compiled methods before their dependencies were ready, retried them
       // module after module, and va.d(I)[F ran on the JS structured tier
       // with 15% GC instead of on Wasm (Deko Bloko boot 65 s -> 97-113 s).
-      if (st.entries < threshold || !this.jit.hasBackwardBranch(frame.method)) {
-        if (this.census) {
-          this._censusNote(frame,
-            st.entries < threshold ? 'below-warmup' : 'no-supported-backedge');
+      // Loop-free methods (docs/refactor.md 3.3). The earlier broad removal of
+      // this gate was reverted; the replacement is the queue-priority model the
+      // plan asks for -- a loop-free method is a candidate, but a much higher
+      // call count decides WHEN it compiles, so the tier is spent on methods
+      // the game actually runs rather than on every leaf it touches once.
+      //
+      // The census that motivated this: at the Deko Bloko menu, 88,835 of the
+      // gate's refusals across 468 methods were 'no-supported-backedge', and
+      // the per-frame drivers section 3.4 names (fh.a(I)V, hn.f(I)V) are among
+      // them. Opaque-control methods are NOT included -- see
+      // isLoopFreeWasmCandidate for why that half of the old predicate stays.
+      const loopFree = !this.jit.hasBackwardBranch(frame.method);
+      if (loopFree) {
+        if (!this.loopFreeThreshold ||
+            !this.jit.isLoopFreeWasmCandidate(frame.method)) {
+          if (this.census) this._censusNote(frame, 'no-supported-backedge');
+          return null;
         }
+        if (st.entries < this.loopFreeThreshold) {
+          if (this.census) this._censusNote(frame, 'below-loopfree-warmup');
+          return null;
+        }
+      } else if (st.entries < threshold) {
+        if (this.census) this._censusNote(frame, 'below-warmup');
         return null;
       }
       if (this.compilationFrozen) {
         if (this.census) this._censusNote(frame, 'compilation-frozen');
         return null;
       }
-      this.compile(frame, st);
+      this.compile(frame, st, { entryPath: 'warmup' });
       if (st.status !== 'ready') {
         if (this.census) {
           this._censusNote(frame, st.status === 'failed'
@@ -2891,6 +3062,21 @@ class WasmJit {
   }
 
   compile(frame, st, options = {}) {
+    // Every entry path lands here, so this is where the post-main question is
+    // answerable for all of them rather than for the one `prepare` guards.
+    const entryPath = options.entryPath ||
+      (options.asCallee ? 'callee-link' : 'warmup');
+    if (this.jvm && this.jvm.guestStarted) {
+      if (this.refusePostMainCompiles) {
+        this.postMainRefusedByEntry.set(entryPath,
+          (this.postMainRefusedByEntry.get(entryPath) || 0) + 1);
+        // The method keeps whatever tier it already has, which is the only
+        // contract-legal outcome while the result cannot be built elsewhere.
+        return;
+      }
+      this.postMainCompilesByEntry.set(entryPath,
+        (this.postMainCompilesByEntry.get(entryPath) || 0) + 1);
+    }
     // Diagnostic: accumulate wall time per module compile (JVM_JIT_COMPILE_STATS
     // census reads `compileStats`). Cheap enough to stay on.
     const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
@@ -2898,6 +3084,9 @@ class WasmJit {
     const parentNested = this._compileNestedMs || 0;
     this._compileNestedMs = 0;
     const statusBefore = st && st.status;
+    // Phase 1 guard before any Wasm compiler work runs.
+    const guard = this.jit.startSynchronousCompile(
+      frame && frame.method, "wasm-compile");
     try {
       return this._compileUntimed(frame, st, options);
     } finally {
@@ -2920,6 +3109,8 @@ class WasmJit {
       const outcome = `${statusBefore}->${st && st.status}:${(st && st.status !== 'ready' && st.lastCompileError) || ''}`;
       e.outcomes[outcome] = (e.outcomes[outcome] || 0) + 1;
       this.compileStats.set(key, e);
+      // Phase 1 observability: the Wasm tier is a synchronous compile too.
+      guard.finish('wasm');
     }
   }
 
@@ -3100,7 +3291,22 @@ class WasmJit {
         // only demote (uncompilable callee), and vice versa.
         const hasCompiledLoop = (meta && this.hasSupportedBackwardBranch(frame.method, meta)) ||
           (structuredMeta && this.hasSupportedBackwardBranch(frame.method, structuredMeta));
-        if (!hasCompiledLoop) {
+        // The loop requirement is an economic rule, not a correctness one: it
+        // exists because standalone entry costs a call and a materialization,
+        // and a method with no loop cannot amortize that within one call. Heat
+        // is the other way to pay for it (docs/refactor.md 3.3, "under the
+        // queue-priority model"), so a method that has been entered
+        // loopFreeThreshold times may be admitted without a loop -- but only
+        // if the module covers it END TO END. A partial module here would exit
+        // on the entry it was just admitted for, which is strictly worse than
+        // the tier it replaces.
+        const paidForByHeat = !hasCompiledLoop && this.loopFreeThreshold > 0 &&
+          st.entries >= this.loopFreeThreshold &&
+          this.jit.isLoopFreeWasmCandidate(frame.method) &&
+          !!primary && primary.externalEntry.has(0) && !primary.boxedCount &&
+          (primary.fullyCompiled || primary.normalFlowFullyCompiled);
+        if (paidForByHeat) this.loopFreeAdmissions = (this.loopFreeAdmissions || 0) + 1;
+        if (!hasCompiledLoop && !paidForByHeat) {
           if (this.debug && meta && meta.demoteReasons.size) {
             const details = [...meta.demoteReasons.entries()]
               .map(([block, reason]) => `${block}:${reason}`).join(', ');
@@ -3122,6 +3328,12 @@ class WasmJit {
           throw new Unsupported('no compiled loop',
             loopDependencyOnly ? [...loopBlockers] : null);
         }
+      }
+      const linkVerdict = this.pendingLinkVerdict(primary);
+      if (linkVerdict && linkVerdict.unresolvable === linkVerdict.pending) {
+        // Every late-bound site in this module is now provably dead. Installing
+        // it would publish a caller that leaves Wasm on each of those calls.
+        throw new Unsupported('every pending link became unresolvable', null);
       }
       validatingBytes = primary.bytes;
       const module = new WebAssembly.Module(primary.bytes);
@@ -3164,6 +3376,8 @@ class WasmJit {
         : m.fullyCompiled ? 2 : m.normalFlowFullyCompiled ? 1 : 0);
       st.callee = st.osr && rank(st.osr.meta) > rank(st.meta) ? st.osr : null;
       st.status = 'ready';
+      this.registerPendingLinks(st, primary);
+      this.resolvePendingLinks(st);
       this.jit.publishWasmTargetReady?.(frame.method);
       // Stamped before this compile's own epoch bump, so "ready at epoch E"
       // always compares strictly less than any later compile's start epoch.
@@ -3449,7 +3663,7 @@ class WasmJit {
         if (st.exits % 20000 === 0 && (st.recompiles || 0) < 3) {
           // pick up callee vetoes after a deopt storm
           st.recompiles = (st.recompiles || 0) + 1;
-          this.compile(frame, st);
+          this.compile(frame, st, { entryPath: 'deopt-storm-recompile' });
         }
         return { handled: true, deopted: true };
       }
@@ -3523,7 +3737,7 @@ class WasmJit {
     // compile ordering for later methods.
     if (st.exits % 20000 === 0 && (st.recompiles || 0) < 3 && meta.demoteReasons.size) {
       st.recompiles = (st.recompiles || 0) + 1;
-      this.compile(frame, st);
+      this.compile(frame, st, { entryPath: 'exit-storm-recompile' });
     }
     return { handled: true };
   }
@@ -3682,7 +3896,133 @@ class WasmJit {
     return [...blockers];
   }
 
-  findReadyStatic(className, name, descriptor, allowPartial = false) {
+  // allowOnDemand overrides worker mode. noOnDemandCalleeCompile is a
+  // CODEGEN policy -- what a lowering may assume is available -- not a runtime
+  // one. A late-bound call resolving itself at execution time is running in
+  // the owning runtime, so it may compile the callee then.
+  // Three-state classification for a static call site
+  // (docs/phase1-linked-call-abi.md 3), decided without compiling anything.
+  //
+  //   'compatible'   an artifact exists and satisfies the linked-call ABI
+  //   'unknown'      no artifact yet; waiting or compiling could still produce one
+  //   'incompatible' provably cannot satisfy the ABI, whatever happens later
+  //
+  // Only 'incompatible' may change the caller's emitted shape. 'unknown' is
+  // what the late-bound trampoline exists for, and conflating the two is the
+  // coupling this whole phase removes -- but so is treating 'incompatible' as
+  // 'unknown', which installs a caller that exits Wasm on every invocation.
+  staticLinkClassification(className, name, descriptor) {
+    const cd = this.jvm.classes[className];
+    const clsAst = cd && cd.ast && cd.ast.classes[0];
+    // A JRE-native or unloaded class owns no bytecode this backend compiles,
+    // so there is no artifact to wait for. That is a verdict, not a delay.
+    if (!clsAst) return 'incompatible';
+    const method = clsAst.items.filter((i) => i.type === 'method').map((i) => i.method)
+      .find((m) => m.name === name && m.descriptor === descriptor);
+    if (!method) return 'incompatible';
+    const flags = method.flags || [];
+    if (!flags.includes('static')) return 'incompatible';
+    // Structural and permanent: a linked call runs the body with no frame, so
+    // it has nowhere to hold a monitor, and native/abstract have no body here.
+    if (flags.includes('synchronized')) return 'incompatible';
+    if (flags.includes('native') || flags.includes('abstract')) return 'incompatible';
+    if (this.jit && this.jit.jitDenied && this.jit.jitDenied(method)) return 'incompatible';
+    const st = this.state.get(method);
+    if (!st) return 'unknown';
+    if (st.status === 'failed') return 'incompatible';
+    if (st.status !== 'ready') {
+      // Already attempted and refused with nothing recorded to wait on. That
+      // is the same permanent/recoverable split Unsupported.blockedOn draws:
+      // a refusal naming no blocker cannot be resolved by waiting, so it is a
+      // verdict. StructuredDemote.slow ("no supported blocks") is this case --
+      // it stays cold forever, and a trampoline for it would be a call that
+      // deopts on every execution.
+      if (st.lastCompileError &&
+          !(st.calleeBlockers && st.calleeBlockers.length)) return 'incompatible';
+      return 'unknown';
+    }
+    const cm = (st.callee || st).meta;
+    if (!cm) return 'unknown';
+    if (cm.boxedCount) return 'incompatible';
+    if (cm.speculations || (cm.specSites && cm.specSites.length)) return 'incompatible';
+    if (cm.fullyCompiled || cm.normalFlowFullyCompiled) return 'compatible';
+    // An artifact exists but covers too little to be entered as a callee.
+    // That is a property of what was produced, not of when it was asked for,
+    // so it is a verdict rather than a delay. Mirrors findReadyStatic's
+    // allowPartial tail deliberately: the two must not be able to disagree.
+    return cm.externalEntry && cm.externalEntry.has(0) ? 'compatible' : 'incompatible';
+  }
+
+  // Record which callees a freshly installed caller is still waiting on.
+  // Returns the number of unresolved bindings, which is what the publication
+  // gate reasons about.
+  registerPendingLinks(st, meta) {
+    if (!meta || !meta.linkBindings) return 0;
+    let pending = 0;
+    for (const binding of meta.linkBindings) {
+      // A demoted block records a pending binding too; only a lowered
+      // trampoline is actually waiting on the callee at runtime.
+      if (!binding.pending || !binding.lateBound) continue;
+      pending += 1;
+      let waiters = this.pendingLinkWaiters.get(binding.key);
+      if (!waiters) {
+        waiters = new Set();
+        this.pendingLinkWaiters.set(binding.key, waiters);
+      }
+      waiters.add(st);
+    }
+    return pending;
+  }
+
+  // A callee just became ready. Every caller that lowered a late-bound call to
+  // it can now reach it directly; the trampoline's own cache picks that up on
+  // its next epoch check, so correctness needs nothing here. Recompiling the
+  // caller is what turns the bridge back into a direct dcall_/call_, and that
+  // is the part that is bounded and off by default.
+  resolvePendingLinks(st) {
+    if (!st || !st.key) return 0;
+    const waiters = this.pendingLinkWaiters.get(st.key);
+    if (!waiters) return 0;
+    this.pendingLinkWaiters.delete(st.key);
+    this.pendingLinkResolved += waiters.size;
+    if (!this.relinkOnResolveLimit) return waiters.size;
+    for (const caller of waiters) {
+      if (this.pendingLinkRelinks >= this.relinkOnResolveLimit) break;
+      if (!caller || caller.status !== 'ready' || caller === st) continue;
+      // Re-arm exactly the existing dependency-recompile path rather than
+      // inventing a second one; it already carries the storm bounds.
+      caller.depRecompilePending = true;
+      this.pendingLinkRelinks += 1;
+    }
+    return waiters.size;
+  }
+
+  // Publication gate. Between codegen and install a pending callee can be
+  // compiled on demand and refused, which turns an UNKNOWN binding the
+  // trampoline was allowed to emit into one that can never resolve. Such a
+  // site deopts on every execution -- the shape section 5 of the linked-call
+  // ABI forbids installing. Recheck here rather than trusting the codegen-time
+  // classification, and refuse only when NO pending binding can ever resolve,
+  // so a caller with one live dependency still installs.
+  pendingLinkVerdict(meta) {
+    if (!meta || !meta.linkBindings) return null;
+    // Same rule as registerPendingLinks: a refused call site left a pending
+    // binding behind but demoted its block, so it cannot deopt per call and
+    // must not make the module unpublishable.
+    const pending = meta.linkBindings.filter((b) => b.pending && b.lateBound);
+    if (!pending.length) return null;
+    const blockers = [];
+    let unresolvable = 0;
+    for (const binding of pending) {
+      const klass = this.staticLinkClassification(
+        binding.className, binding.name, binding.descriptor);
+      if (klass === 'incompatible') unresolvable += 1;
+      else blockers.push(`${binding.className}.${binding.name}${binding.descriptor}`);
+    }
+    return { pending: pending.length, unresolvable, blockers };
+  }
+
+  findReadyStatic(className, name, descriptor, allowPartial = false, allowOnDemand = false) {
     const cd = this.jvm.classes[className];
     const clsAst = cd && cd.ast && cd.ast.classes[0];
     if (!clsAst) return null;
@@ -3696,14 +4036,16 @@ class WasmJit {
     let st = this.state.get(method);
     if (!st) st = this.methodState({ method });
     if (!st.method) st.method = method; // partial-link deopts materialize a Frame
-    if (st.status === 'cold' && this.calleeRetryAllowed(st)) {
+    if (st.status === 'cold' && (allowOnDemand || !this.noOnDemandCalleeCompile) &&
+        this.calleeRetryAllowed(st)) {
       const hasClassInitializer = clsAst.items
         .filter((i) => i.type === 'method')
         .some((i) => i.method.name === '<clinit>');
       // Linking must not bypass an observable class initializer. Classes with
       // no <clinit> are safe because their initialization has no Java code.
       if (!hasClassInitializer || this.jvm.classInitializationState.get(className) === 'INITIALIZED') {
-        this.compile({ method, className }, st, { asCallee: true });
+        this.compile({ method, className }, st,
+          { asCallee: true, entryPath: 'static-callee-link' });
       }
     }
     if (!st || st.status !== 'ready') return null;
@@ -3761,8 +4103,9 @@ class WasmJit {
     if (!st) st = this.methodState({ method });
     if (!st.method) st.method = method;
     st.targetClassName = className;
-    if (st.status === 'cold' && this.calleeRetryAllowed(st)) {
-      this.compile({ method, className }, st, { asCallee: true });
+    if (st.status === 'cold' && !this.noOnDemandCalleeCompile && this.calleeRetryAllowed(st)) {
+      this.compile({ method, className }, st,
+        { asCallee: true, entryPath: 'instance-callee-link' });
     }
     const unlinkable = (why) => {
       if (this.debug) {

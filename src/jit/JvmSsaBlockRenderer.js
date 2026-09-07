@@ -12536,10 +12536,20 @@ class JvmSsaBlockRenderer {
     // rendered text therefore confuses child locals with the caller's JVM
     // slots. Derive caller mutability from its verified bytecodes instead;
     // folded entry stores already live in the declaration and are excluded.
+    //
+    // Reachability is deliberately NOT consulted here. `normalReachableItems`
+    // excludes exception handlers, because a handler is not a successor in the
+    // normal CFG -- correct for asking what the normal region *does*, and
+    // wrong for asking what may be *written* during this activation. A slot
+    // assigned only inside a catch block looked immutable, so its entry
+    // constant was spilled back over the value the interpreter had been
+    // accumulating: `catch (E e) { caught++; }` around a loop ended with
+    // caught == 0, silently, because every materialization reset locals[2] to
+    // its entry literal. Any store anywhere in the method makes the slot
+    // mutable; that can only shrink this set, never grow it.
     const callerAssignedLocalSlots = new Set();
     for (let index = 0; index < items.length; index += 1) {
-      if (!normalReachableItems.has(index) ||
-          foldedEntryStoreIndexes.has(index)) continue;
+      if (foldedEntryStoreIndexes.has(index)) continue;
       const instruction = items[index]?.instruction;
       const op = opOf(instruction);
       const slot = op === "iinc"
