@@ -1179,11 +1179,17 @@ class JvmSsaBlockRenderer {
     this.coldExitValue = null;
     this.coldContinue = {structuredColdContinue: true};
     this.compactColdCallSiteCount = 0;
+    this.guardVoidCallCompletion = options.structuredGuardVoidCallCompletion === true;
+    this.compactRestoringVoidCalls = options.structuredCompactRestoringVoidCalls === true;
+    this.wideCaptureFreeRestoring = options.structuredWideCaptureFreeRestoring === true;
+    this.normalPathArrayOptionality = options.normalPathArrayOptionality === true;
     this.compactFieldCacheInvalidationCount = 0;
     this.coarseCountedLoopSafePointsEnabled =
       options.structuredCoarseCountedLoopSafePoints !== false &&
       !(typeof process !== "undefined" && process.env &&
         process.env.JVM_DISABLE_STRUCTURED_COARSE_COUNTED_SAFEPOINTS === "1");
+    // Experimental until cold and sustained browser playback both pass.
+    this.boundedAdaptivePollingEnabled = options.structuredBoundedAdaptivePolling === true;
     this.versionedRuntimeCoarseLoopsEnabled =
       options.structuredVersionedRuntimeCoarseLoops !== false &&
       !(typeof process !== "undefined" && process.env &&
@@ -1526,7 +1532,7 @@ class JvmSsaBlockRenderer {
       materializeAfter();
       yield { deopt: true, transient: true, structuredResumePc: resumePc,
         structuredResumeOwnsFrame: true,
-        reason: 'active child in structured SSA callee' };
+        callHandoff: true, reason: 'active child in structured SSA callee' };
       depth = thread.callStack.items.length;
       if (!returnsVoid) out = frame.stack.items.pop();
     }
@@ -1535,11 +1541,11 @@ class JvmSsaBlockRenderer {
       helpers.skipJitOnce(frame);
       if (!returnsVoid) {
         this.coldExitValue = { deopt: true, transient: true,
-          reason: 'asynchronous structured SSA callee' };
+          callHandoff: true, reason: 'asynchronous structured SSA callee' };
         return this.coldExit;
       }
       yield { deopt: true, transient: true, structuredResumePc: resumePc,
-        reason: 'asynchronous structured SSA callee' };
+        callHandoff: true, reason: 'asynchronous structured SSA callee' };
     }
     if (out && out.deopt) {
       if (frame === null && (out.jvmPositionalChild ||
@@ -1568,14 +1574,14 @@ class JvmSsaBlockRenderer {
       materializeAfter();
       yield { deopt: true, transient: true, structuredResumePc: resumePc,
         structuredResumeOwnsFrame: true,
-        reason: 'structured SSA callee left active child' };
+        callHandoff: true, reason: 'structured SSA callee left active child' };
       depth = thread.callStack.items.length;
       if (!returnsVoid) out = frame.stack.items.pop();
     }
     if (thread.status !== 'runnable') {
       materializeYielded();
       yield { deopt: true, transient: true, structuredResumePc: resumePc,
-        reason: 'thread yielded in structured SSA callee' };
+        callHandoff: true, reason: 'thread yielded in structured SSA callee' };
     }
     return out;
   }
@@ -1619,14 +1625,14 @@ class JvmSsaBlockRenderer {
           frame, thread, depth, returnType, siteId)) {
       materializeAfter();
       return { deopt: true, transient: true,
-        reason: 'asynchronous structured SSA callee left active child',
+        callHandoff: true, reason: 'asynchronous structured SSA callee left active child',
         jvmPositionalChild: frame };
     }
     if (out === sentinel) {
       materializeBefore();
       helpers.skipJitOnce(frame);
       return { deopt: true, transient: true,
-        reason: 'asynchronous structured SSA callee' };
+        callHandoff: true, reason: 'asynchronous structured SSA callee' };
     }
     if (out && out.deopt) {
       if (frame === null && (out.jvmPositionalChild ||
@@ -1650,16 +1656,60 @@ class JvmSsaBlockRenderer {
         helpers.linkStructuredCallChild(frame, thread, depth, returnType)) {
       materializeAfter();
       return { deopt: true, transient: true,
-        reason: 'structured SSA callee left active child',
+        callHandoff: true, reason: 'structured SSA callee left active child',
         jvmPositionalChild: frame };
     }
     if (thread.status !== 'runnable') {
       materializeYielded();
       return { deopt: true, transient: true,
-        reason: 'thread yielded in structured SSA callee',
+        callHandoff: true, reason: 'thread yielded in structured SSA callee',
         jvmPositionalChild: frame };
     }
     return this.coldContinue;
+  }
+
+  // Entered only on a non-normal void completion. Snapshot arrays and these
+  // restoration closures are allocated on that cold path, never per span.
+  coldRestoringVoidCall(frame, thread, out, depth, siteId, pc,
+    layout, plan, restorationDepth, values, operands, belowCount) {
+    const helpers = this.jit;
+    const restore = (after) => {
+      frame = this.materializeDirectFrameSlots(layout, plan, thread,
+        restorationDepth, frame, values, pc + (after ? 1 : 0),
+        after ? operands.slice(0, belowCount) : operands)[0];
+    };
+    const handoff = (reason) => ({deopt: true, transient: true,
+      callHandoff: true, reason, jvmPositionalChild: frame});
+    if (out === helpers.asyncInvokeSentinel()) {
+      if (thread.callStack.items.length > depth) {
+        if (frame === null) restore(true);
+        if (helpers.linkStructuredCallChild(frame, thread, depth, 'void', siteId)) {
+          restore(true);
+          return handoff('asynchronous structured SSA callee left active child');
+        }
+      }
+      restore(false);
+      helpers.skipJitOnce(frame);
+      return {deopt: true, transient: true, callHandoff: true,
+        reason: 'asynchronous structured SSA callee'};
+    }
+    if (out && out.deopt) {
+      if (frame === null && (out.jvmPositionalChild || thread.callStack.items.length > depth)) restore(true);
+      if (!helpers.linkStructuredCallChild(frame, thread, depth, 'void', undefined, out.jvmPositionalChild)) {
+        restore(false);helpers.skipJitOnce(frame);return out;
+      }
+      restore(true);out.jvmPositionalChild = frame;return out;
+    }
+    if (thread.callStack.items.length > depth) {
+      if (frame === null) restore(true);
+      if (helpers.linkStructuredCallChild(frame, thread, depth, 'void')) {
+        restore(true);return handoff('structured SSA callee left active child');
+      }
+    }
+    if (thread.status !== 'runnable') {
+      restore(true);return handoff('thread yielded in structured SSA callee');
+    }
+    return {continued: true, frame};
   }
 
   // If the helper following an unwind-only materialization returns instead
@@ -2009,7 +2059,13 @@ class JvmSsaBlockRenderer {
         const fieldSite = this.jit.registerFieldSite(instruction.arg);
         fieldSites.set(index, fieldSite);
         if (op === "getstatic" || op === "putstatic") {
-          const direct = this.jit.registerDirectStaticTarget(fieldSite, op === "putstatic");
+          // Resolving storage is not proof that <clinit> has run. In
+          // particular, putstatic can resolve an empty cold store during
+          // preparation. Only initialized owners are covered by the entry
+          // guard; cold accesses must retain their bytecode-local handoff.
+          const direct = this.jit.fieldSites[fieldSite].initializationToken.initialized
+            ? this.jit.registerDirectStaticTarget(fieldSite, op === "putstatic")
+            : null;
           if (direct) {
             direct.variable = named(
               `ssaStaticFields${directStaticSites.size}`);
@@ -2068,6 +2124,8 @@ class JvmSsaBlockRenderer {
         const directJre = this.jit.getCompileTimeDirectJre(op, instruction);
         const inline = directJre || !isStatic
           ? null : this.jit.getCompileTimeIntegerLeaf(instruction, true);
+        const inlineInitializationSite = inline?.requiresInitializationGuard
+          ? this.jit.registerSyncCallSite(op, instruction, method, index) : null;
         if (inline?.className) directStaticOwners.add(inline.className);
         const directIntrinsic = directJre || !isStatic || inline
           ? null : this.jit.getCompileTimeSynchronousIntrinsic(instruction);
@@ -2105,6 +2163,7 @@ class JvmSsaBlockRenderer {
           returnsVoid: descriptor.returnType === "void",
           directJre,
           inline,
+          inlineInitializationSite,
           directIntrinsic,
           directCheckedLeaf,
           checkedLeafCaptureCacheId,
@@ -2768,7 +2827,12 @@ class JvmSsaBlockRenderer {
       for (const line of bodyLines) {
         if (line.trim() === "") { lines.push(line); continue; }
         const record = recordOf(line);
-        if (!record || record.foreign) return veto("unrecorded", line);
+        // Integer-leaf plans are emitted by the verified, expression-only
+        // planner: their statements contain no return/yield/labels. They are
+        // foreign only to this recorder, not opaque arbitrary JS bodies.
+        if (!record || record.foreign &&
+            !(this.jit.singleSiteInlineExperiment && record.verifiedIntegerInlineStatement))
+          return veto("unrecorded", line);
         // A generator body cannot be inserted into a caller's activation.
         // The emitters that write `yield` say so on the record.
         if (record.yields) return veto("yield", line);
@@ -2833,7 +2897,7 @@ class JvmSsaBlockRenderer {
       };
       published.assemble = ({
         source = published.source, argumentValues, resultName, exitLabel,
-        namespace, declareResult = true,
+        namespace, declareResult = true, entryGuardValue = published.entryGuardValue,
       }) => {
         if (typeof source !== "string" || typeof resultName !== "string" ||
             typeof exitLabel !== "string" ||
@@ -2858,7 +2922,7 @@ class JvmSsaBlockRenderer {
           `${exitLabel}: {`,
           ...published.argumentNames.map((name, index) =>
             `  const ${name} = ${namespace}a${index};`),
-          `  const ${published.entryGuardName} = ${published.entryGuardValue};`,
+          `  const ${published.entryGuardName} = ${entryGuardValue};`,
           ...retargeted.split("\n").map((line) => `  ${line}`),
           "}",
         ].filter((line) => line !== null).join("\n");
@@ -3398,6 +3462,12 @@ class JvmSsaBlockRenderer {
     const firstParameterLoadIndex = new Map();
     let firstArrayNullTestIndex = null;
     for (let index = 0; index < items.length; index += 1) {
+      // Handler-only diagnostics do not make a normal-path array optional.
+      // Exceptional execution materializes and resumes outside this region;
+      // it does not consume the region's cached array storage. Still include
+      // handlers reachable through an ordinary CFG edge.
+      if (this.normalPathArrayOptionality &&
+          !normalReachableItems.has(index)) continue;
       const instruction = items[index]?.instruction;
       const op = opOf(instruction);
       if (!/^aload(?:_[0-3])?$/.test(op)) continue;
@@ -4166,6 +4236,16 @@ class JvmSsaBlockRenderer {
       return (pc) => ranges.every(([from, to]) => pc < from || pc >= to);
     })();
     let lastMaterializeWasUnwindCompact = false;
+    const caughtCallExpression = (fn, receiver, args, entry = null) => exprConcat(
+      e`${entry || e`helpers.caughtCallEntries[${args.length}]`}(${fn}, ${receiver}`,
+      args.length ? e`, ` : e``, argumentListExpression(args), e`)`);
+    const caughtAssignmentHeader = (out, caught, normal, wrapped, pinned = false) =>
+      this.jit.caughtRuntimeCalls && !this.jit.hotCallGraphRegions.enabled && !pinned
+        ? [stmt(e`${out} = ${wrapped};`, {kind: 'assign', write: out}),
+          st`if (${out} !== null && typeof ${out} === 'object' && ${out}.marker === helpers.caughtCallMarker) {`,
+          `  ${constDecl(caught, e`${out}.error`)}`]
+        : [stmt(e`try { ${out} = ${normal}; } catch (${caught}) {`,
+          {opens: 'try', pinned, declares: [caught]})];
     const materializeLines = (operandValues, pc, unwindOnly = false) => {
       // The slot values a cold site restores are the ones current *at that
       // site*, so the site's own statement carries them. The by-pc map cannot:
@@ -5732,8 +5812,9 @@ class JvmSsaBlockRenderer {
             const count = stagedValue(countInput, lines);
             const out = value(), caught = value();
             lines.push(letDecl(out),
-              stmt(e`try { ${out} = helpers.newPrimitiveArray(${count}, ${JSON.stringify(instruction.arg)}); } catch (${caught}) {`,
-                {opens: "try", declares: [caught]}),
+              ...caughtAssignmentHeader(out, caught,
+                e`helpers.newPrimitiveArray(${count}, ${JSON.stringify(instruction.arg)})`,
+                caughtCallExpression(e`helpers.newPrimitiveArray`, e`helpers`, [count, JSON.stringify(instruction.arg)])),
               ...materializeLines([...stack, count], index, true).map((line) => `  ${line}`),
               st`  throw ${caught};`, blockEnd(""));
             stack.push(out);
@@ -5745,8 +5826,9 @@ class JvmSsaBlockRenderer {
             const count = stagedValue(countInput, lines);
             const out = value(), caught = value();
             lines.push(letDecl(out),
-              stmt(e`try { ${out} = helpers.newReferenceArray(${count}, ${JSON.stringify(instruction.arg)}); } catch (${caught}) {`,
-                {opens: "try", declares: [caught]}),
+              ...caughtAssignmentHeader(out, caught,
+                e`helpers.newReferenceArray(${count}, ${JSON.stringify(instruction.arg)})`,
+                caughtCallExpression(e`helpers.newReferenceArray`, e`helpers`, [count, JSON.stringify(instruction.arg)])),
               ...materializeLines([...stack, count], index, true).map((line) => `  ${line}`),
               st`  throw ${caught};`, blockEnd(""));
             stack.push(out);
@@ -5804,8 +5886,9 @@ class JvmSsaBlockRenderer {
               {kind: "const", def: source}),
               st`  if (${source} !== ${target}) {`,
               `    ${letDecl(checked)}`,
-              `    ${stmt(e`try { ${checked} = helpers.tryCheckCastSourceSync(${source}, ${target}); } catch (${caught}) {`,
-                {opens: "try", declares: [caught]})}`,
+              ...caughtAssignmentHeader(checked, caught,
+                e`helpers.tryCheckCastSourceSync(${source}, ${target})`,
+                caughtCallExpression(e`helpers.tryCheckCastSourceSync`, e`helpers`, [source, target])).map(line => `    ${line}`),
               ...materializeLines(stack, index).map((line) => `  ${line}`),
               st`  throw ${caught};`, blockEnd(""),
               st`    if (${checked} === helpers.asyncInvokeSentinel()) {`,
@@ -6173,11 +6256,9 @@ class JvmSsaBlockRenderer {
                   e`{ deopt: true, transient: true, reason: 'class initialization at direct structured JRE call' }`),
                 blockEnd(""),
               ] : []), letDecl(out),
-              stmt(exprConcat(
-                e`try { ${out} = helpers.directJreIntrinsics[${
-                  site.directJre.id}](`,
-                argumentListExpression(args), e`); } catch (${caught}) {`),
-              {opens: "try", declares: [caught]}),
+              ...caughtAssignmentHeader(out, caught,
+                exprConcat(e`helpers.directJreIntrinsics[${site.directJre.id}](`, argumentListExpression(args), e`)`),
+                caughtCallExpression(e`helpers.directJreIntrinsics[${site.directJre.id}]`, e`helpers.directJreIntrinsics`, args)),
               ...materializeLines(callStack, index).map((line) => `  ${line}`),
               st`  throw ${caught};`, blockEnd(""));
               if (!site.returnsVoid) stack.push(out);
@@ -6185,6 +6266,13 @@ class JvmSsaBlockRenderer {
           }
           else if (site.inline) {
             const callStack = [...stack];
+            if (site.inlineInitializationSite !== null && site.inlineInitializationSite !== undefined) {
+              lines.push(st`if (!${capturedSyncCallSite(site.inlineInitializationSite)}.initializationToken.initialized) {`,
+                ...materializeLines(callStack, index).map(line => `  ${line}`),
+                st`  helpers.skipJitOnce(frame);`,
+                returnStmt("  ", e`{ deopt: true, transient: true, reason: 'cold prepared integer inline' }`),
+                blockEnd(""));
+            }
             const args = new Array(site.inline.paramCount);
             for (let argument = args.length - 1; argument >= 0; argument -= 1) {
               args[argument] = pop();
@@ -6202,7 +6290,8 @@ class JvmSsaBlockRenderer {
                   e`  const ${inlineIntegerArgumentName(position)} = ${
                     argument};`)),
                 ...site.inline.statements.map((statement) =>
-                  stmt(`  ${statement}`, {foreign: true})));
+                  stmt(`  ${statement}`, {foreign: true,
+                    verifiedIntegerInlineStatement: true})));
               if (site.inline.guards?.length) {
                 const guard = site.inline.guards.join(" && ");
                 lines.push(stmt(`  if (!(${guard})) {`, {foreign: true}),
@@ -6273,7 +6362,7 @@ class JvmSsaBlockRenderer {
                 ...materializeLines(stack, index + 1).map((line) => `    ${line}`),
                 stmt(e`    yield { deopt: true, transient: true, structuredResumePc: ${
                   index + 1
-                }, structuredResumeOwnsFrame: true, reason: 'active child in structured SSA callee' };`,
+                }, structuredResumeOwnsFrame: true, callHandoff: true, reason: 'active child in structured SSA callee' };`,
                 {yields: true}),
                 st`    ${callStackDepth} = thread.callStack.items.length;`,
                 ...(site.returnsVoid ? [] : [
@@ -6284,7 +6373,7 @@ class JvmSsaBlockRenderer {
                 ...materializeLines(stack, index + 1).map((line) => `    ${line}`),
                 returnStmt("    ", exprConcat(
                   e`{ deopt: true, transient: true, `,
-                  e`reason: 'asynchronous structured SSA callee left active child', `,
+                  e`callHandoff: true, reason: 'asynchronous structured SSA callee left active child', `,
                   e`jvmPositionalChild: frame }`)),
               ],
               checkedLeaf: [leafBailStatement("    ")],
@@ -6298,14 +6387,14 @@ class JvmSsaBlockRenderer {
                   st`  helpers.skipJitOnce(frame);`,
                   stmt(e`  yield { deopt: true, transient: true, structuredResumePc: ${
                     index + 1
-                  }, reason: 'asynchronous structured SSA callee' };`,
+                  }, callHandoff: true, reason: 'asynchronous structured SSA callee' };`,
                   {yields: true}),
                 ],
                 ordinary: [
                   ...materializeLines(callStack, index).map((line) => `  ${line}`),
                   st`  helpers.skipJitOnce(frame);`,
                   returnStmt("  ",
-                    e`{ deopt: true, transient: true, reason: 'asynchronous structured SSA callee' }`),
+                    e`{ deopt: true, transient: true, callHandoff: true, reason: 'asynchronous structured SSA callee' }`),
                 ],
                 checkedLeaf: [leafBailStatement()],
               });
@@ -6313,8 +6402,9 @@ class JvmSsaBlockRenderer {
             const fallbackLines = [
               ...(deferMaterialization
                 ? stageOperandLines(callStack) : materializeLines(callStack, index + 1)),
-              stmt(e`try { ${out} = helpers.tryInvokeSyncAtSite(${capturedSyncCallSite(site.id)}, frame, thread); } catch (${caught}) {`,
-                {opens: "try", declares: [caught]}),
+              ...caughtAssignmentHeader(out, caught,
+                e`helpers.tryInvokeSyncAtSite(${capturedSyncCallSite(site.id)}, frame, thread)`,
+                caughtCallExpression(e`helpers.tryInvokeSyncAtSite`, e`helpers`, [capturedSyncCallSite(site.id), e`frame`, e`thread`])),
               ...materializeCallExceptionLines(
                 callStack, stack, index, callStackDepth)
                 .map((line) => `  ${line}`),
@@ -6709,6 +6799,10 @@ class JvmSsaBlockRenderer {
                     ? exprConcat(argumentListExpression(regionMarkedOperands),
                       ", ") : "",
                   e`thread, ${nestedEntryGuarded}) : `,
+                  ...(this.jit.rawRestoringCalls && !this.jit.hotCallGraphRegions.enabled && !site.selfRecursive ? [
+                    e`${positionalInvoke}.jvmRawRestoringBody ? ${positionalInvoke}.jvmRawRestoringBody(helpers, ${positionalInvoke}.jvmRawRestoringPlan, `,
+                    argumentListExpression(args), args.length ? ", " : "", e`thread, true) : `,
+                  ] : []),
                   e`${positionalInvoke}(`,
                   argumentListExpression(args),
                   args.length ? ", " : "", e`thread, true)`));
@@ -6788,7 +6882,7 @@ class JvmSsaBlockRenderer {
                     st`    safePointBudget = ${
                       this.jit.positionalCallSafePointPollBudget};`,
                     stmt(exprConcat(
-                      e`    yield { deopt: true, transient: true, `,
+                      e`    yield { deopt: true, transient: true, cooperativeSuspension: true, `,
                       e`reason: 'structured SSA positional quantum' };`),
                     {yields: true}),
                     // A frameless positional caller is restored onto the JVM
@@ -6882,9 +6976,12 @@ class JvmSsaBlockRenderer {
                   // operand names recorded here, so those operands are pinned.
                   {kind: "assign", write: out, pinned: site.selfRecursive}),
                 ] : [
-                  stmt(e`  try { ${out} = ${selfRecursiveMarker}${
-                    positionalRawCall}; } catch (${caught}) {`,
-                  {opens: "try", pinned: site.selfRecursive, declares: [caught]}),
+                  ...caughtAssignmentHeader(out, caught,
+                    e`${selfRecursiveMarker}${positionalRawCall}`,
+                    exprConcat(e`${positionalRawInvoke} ? `,
+                      caughtCallExpression(positionalRawInvoke, e`undefined`, [e`helpers`, ...args, ...positionalRawCaptures, e`thread`, e`true`], positionalRawCaptures.length ? null : e`${capturedSyncCallSite(site.id)}.caughtRawEntry`),
+                      e` : `, caughtCallExpression(positionalInvoke, e`undefined`, [...args, e`thread`, e`true`], e`${capturedSyncCallSite(site.id)}.caughtEntry`)),
+                    site.selfRecursive).map(line => `  ${line}`),
                   st`    /*${regionHandlerMarkers.start}*/`,
                   ...materializeCallExceptionLines(
                     callStack, stack, index,
@@ -6938,7 +7035,7 @@ class JvmSsaBlockRenderer {
                 ...materializeLines(callStack, index).map((line) => `  ${line}`),
                 st`  helpers.skipJitOnce(frame);`,
                 returnStmt("  ",
-                  e`{ deopt: true, transient: true, reason: 'asynchronous structured SSA callee' }`),
+                  e`{ deopt: true, transient: true, callHandoff: true, reason: 'asynchronous structured SSA callee' }`),
               ]), blockEnd(""));
             const deoptCallMarker = named(
               `__JVM_DEOPT_CALL_${index}_${site.id}__`);
@@ -6991,7 +7088,7 @@ class JvmSsaBlockRenderer {
                 ...materializeLines(stack, index + 1).map((line) => `    ${line}`),
                 stmt(e`    yield { deopt: true, transient: true, structuredResumePc: ${
                   index + 1
-                }, structuredResumeOwnsFrame: true, reason: 'structured SSA callee left active child' };`,
+                }, structuredResumeOwnsFrame: true, callHandoff: true, reason: 'structured SSA callee left active child' };`,
                 {yields: true}),
                 st`    ${callStackDepth} = thread.callStack.items.length;`,
                 ...(site.returnsVoid ? [] : [
@@ -7002,7 +7099,7 @@ class JvmSsaBlockRenderer {
                 ...materializeLines(stack, index + 1).map((line) => `    ${line}`),
                 returnStmt("    ", exprConcat(
                   e`{ deopt: true, transient: true, `,
-                  e`reason: 'structured SSA callee left active child', `,
+                  e`callHandoff: true, reason: 'structured SSA callee left active child', `,
                   e`jvmPositionalChild: frame }`)),
               ],
               checkedLeaf: [leafBailStatement("    ")],
@@ -7027,20 +7124,27 @@ class JvmSsaBlockRenderer {
                 ...materializeLines(stack, index + 1).map((line) => `  ${line}`),
                 stmt(e`  yield { deopt: true, transient: true, structuredResumePc: ${
                   index + 1
-                }, reason: 'thread yielded in structured SSA callee' };`,
+                }, callHandoff: true, reason: 'thread yielded in structured SSA callee' };`,
                 {yields: true}),
               ],
               ordinary: [
                 ...materializeLines(stack, index + 1).map((line) => `  ${line}`),
                 returnStmt("  ", exprConcat(
                   e`{ deopt: true, transient: true, `,
-                  e`reason: 'thread yielded in structured SSA callee', `,
+                  e`callHandoff: true, reason: 'thread yielded in structured SSA callee', `,
                   e`jvmPositionalChild: frame }`)),
               ],
               checkedLeaf: [leafBailStatement()],
             });
             coldLines.push(st`if (thread.status !== 'runnable') {`,
               st`${yieldedCallMarker}`, blockEnd(""));
+            // Only the canonical void result with no active child, runnable
+            // thread and no restored caller can bypass completion handling.
+            // All other outcomes retain the original ordered handoff logic.
+            if (this.guardVoidCallCompletion && site.returnsVoid && !site.selfRecursive) {
+              coldLines.unshift(st`if (${out} !== helpers.returnVoid() || frame !== null || thread.callStack.items.length > ${callStackDepth} || thread.status !== 'runnable') {`);
+              coldLines.push(blockEnd(""));
+            }
             const compactColdCallLines = () => {
               if (!this.compactCallColdPathsEnabled ||
                   !this.materializeOutliningEnabled || site.selfRecursive) {
@@ -7118,7 +7222,14 @@ class JvmSsaBlockRenderer {
               });
               continuationFallbacks.set(coldDirectMarker, {
                 continuation: coldLines,
-                ordinary: coldLines,
+                ordinary: this.compactRestoringVoidCalls && site.returnsVoid &&
+                    !this.jit.hotCallGraphRegions.enabled &&
+                    JSON.stringify(beforeRecord.materializationLocals) === JSON.stringify(afterRecord.materializationLocals)
+                  ? [stmt(e`/* restoring void completion ${index} ${site.id} ${out} */`, {
+                    kind: 'restoringVoidCompletion', out, callStackDepth,
+                    siteId: site.id, pc: index, beforeRecord, afterRecord,
+                    fallback: coldLines,
+                  })] : coldLines,
                 checkedLeaf: coldLines,
               });
               const coldMarkerLine = st`${coldMarker}`;
@@ -11088,8 +11199,12 @@ class JvmSsaBlockRenderer {
       }
       return [...pcs, ...collectResumeEntries(node.body)];
     };
+    // Preparation must retain the same verified resume entries as runtime
+    // compilation. Disabling them here makes prepared loops fall back after
+    // scheduler yields and withholds ordinary compiled-chain eligibility.
+    // The conflict and coverage checks below still govern admission.
     const activeResumePcs = new Set(
-      this.framedResumeEntryEnabled && !this.jit.effectfulPreparationActive
+      this.framedResumeEntryEnabled
         ? collectResumeEntries(structured.tree) : []);
     const initialResumePcCount = activeResumePcs.size;
     // Headers the structural walk reached before any render; the render's
@@ -11623,7 +11738,7 @@ class JvmSsaBlockRenderer {
             ...(continuationMode ? [
               ...invalidateFieldCacheLines,
               st`safePointBudget = ${currentLoopSafePointBudget};`,
-              stmt(e`yield { deopt: true, transient: true, reason: 'structured SSA continuation' };`,
+              stmt(e`yield { deopt: true, transient: true, cooperativeSuspension: true, reason: 'structured SSA continuation' };`,
                 {yields: true}),
               ...refreshEntryStaticCacheLines,
               ...refreshEagerFieldCacheLines,
@@ -11636,7 +11751,7 @@ class JvmSsaBlockRenderer {
               // accepts it and the rest of the invocation crawls through the
               // interpreter one deopt per bytecode.
               returnStmt("",
-                e`{ deopt: true, transient: true, reason: 'structured SSA safe point' }`),
+                e`{ deopt: true, transient: true, cooperativeSuspension: true, reason: 'structured SSA safe point' }`),
             ]),
           ]),
           blockEnd(""),
@@ -11733,7 +11848,14 @@ class JvmSsaBlockRenderer {
         const polledLoop = [
           loopHeaderLine(),
           ...(coarse ? [] : [
-            stmt(exprConcat(e`  if (`, runtimeCoarse
+            // Re-entry can traverse enclosing loops before reaching the
+            // saved inner header. Locals still describe that inner PC: a
+            // poll here must not materialize them at an enclosing header.
+            // Coarse loop charges may already have exhausted the budget.
+            // The target's resume entry clears ssaResumePc and reenables
+            // polling at the first semantically valid boundary.
+            stmt(exprConcat(e`  if (`, holdsResumeEntry
+              ? e`ssaResumePc === 0 && ` : "", runtimeCoarse
               ? e`!${runtimeCoarse.variable} && ` : "",
             e`--safePointBudget <= 0) {`)),
             ...indent(indent(materialize)), blockEnd("  "),
@@ -11976,7 +12098,9 @@ class JvmSsaBlockRenderer {
       .filter((lazy) => lazy.referenced)
       .map((lazy) =>
         letDecl(named(lazy.variable),
-          e`${capturedFieldSite(lazy.site)}.staticTarget`));
+          exprConcat(
+            e`${capturedFieldSite(lazy.site)}.initializationToken.initialized ? `,
+            e`${capturedFieldSite(lazy.site)}.staticTarget : null`)));
     const entryStaticReadDeclarations =
       [...entryStaticReadCaches.values()].flatMap((cache) => {
         if (cache.lazy) {
@@ -13210,6 +13334,19 @@ class JvmSsaBlockRenderer {
           if (trailing?.kind !== "break" ||
               trailing.label !== opening.label ||
               indentationOf(lines[end - 1]) !== `${indentation}  `) continue;
+          // A trailing break does not prove it is the sole exit. An earlier
+          // conditional break still needs this label (and skips the rest of
+          // the block). Consult semantic jump records before deleting it.
+          let otherExit = false;
+          for (let index = start + 1; index < end - 1; index += 1) {
+            const record = recordAt(index);
+            if (record?.label === opening.label &&
+                (record.kind === "break" || record.kind === "continue")) {
+              otherExit = true;
+              break;
+            }
+          }
+          if (otherExit) continue;
           lines.splice(end - 1, 2);
           lines.splice(start, 1);
           for (let index = start; index < end - 2; index += 1) {
@@ -14079,7 +14216,8 @@ class JvmSsaBlockRenderer {
             restoringSpillInlineCost <= this.loopInlineRestoringSpillBudget;
         outlinedCaptureFreeRestoringSpills =
           this.loopInlineRestoringSpillsEnabled &&
-          structured.loopHeaders.size > 0 && spillSlots.length <= 48 &&
+          structured.loopHeaders.size > 0 &&
+          (spillSlots.length <= 48 || this.wideCaptureFreeRestoring) &&
           restoringSpillCallCount > 0 && !inlinedRestoringSpills;
         // The capture-free restoration helper takes its values as an
         // argument array, so nothing escapes into a closure and an acyclic
@@ -14091,7 +14229,8 @@ class JvmSsaBlockRenderer {
         captureFreeRestoringSpills =
           inlinedRestoringSpills || outlinedCaptureFreeRestoringSpills;
         const restoringRenderedWithSpills = captureFreeRestoringSpills
-          ? restoringRendered : inlineMaterializeCalls(restoringRendered);
+          ? restoringRendered : inlineMaterializeCalls(expandContinuationFallbacks(restoringRendered.flatMap(line =>
+            recordOf(line)?.kind === 'restoringVoidCompletion' ? recordOf(line).fallback : [line]), false));
         // Entry arguments are also ordinary JVM locals.  Do not mention a
         // slot twice in a cold restoring-frame array merely because it is
         // both an argument and subsequently assigned.  Besides avoiding
@@ -14169,6 +14308,19 @@ class JvmSsaBlockRenderer {
           restoringRenderedTree = restoringRenderedTree.flatMap((line) => {
             const record = recordOf(line);
             const prefix = indentationOf(line);
+            if (record?.kind === 'restoringVoidCompletion') {
+              const frameValues = record.beforeRecord.materializationLocals
+                ? restoringFrameValuesFrom(record.beforeRecord.materializationLocals)
+                : restoringFrameValuesAt(record.pc);
+              return [
+                `${prefix}${st`if (${record.out} !== helpers.returnVoid() || frame !== null || thread.callStack.items.length > ${record.callStackDepth} || thread.status !== 'runnable') {`}`,
+                `${prefix}${stmt(exprConcat(e`  const ssaColdCompletion = helpers.structuredSsa.coldRestoringVoidCall(frame, thread, ${record.out}, ${record.callStackDepth}, ${capturedSyncCallSite(record.siteId)}.id, ${record.pc}, ${restoringFrameLayoutCapture}, plan, restorationDepth, [`,
+                  argumentListExpression(frameValues), e`], [`, argumentListExpression(record.beforeRecord.operands), e`], ${record.afterRecord.operands.length});`))}`,
+                `${prefix}${st`  if (!ssaColdCompletion.continued) return ssaColdCompletion;`}`,
+                `${prefix}${st`  frame = ssaColdCompletion.frame; locals = frame === null ? null : frame.locals; stack = frame === null ? null : frame.stack.items;`}`,
+                `${prefix}${blockEnd('')}`,
+              ];
+            }
             if (record?.kind === "materializeRelease") {
               return [
                 `${prefix}${stmt(exprConcat(e`frame = `,
@@ -14185,7 +14337,7 @@ class JvmSsaBlockRenderer {
             // they previously materialized full locals inline; keep that
             // observable Frame state rather than silently dropping locals as
             // a side effect of a code-size change.
-            if (record.unwind && structured.loopHeaders.size > 0) {
+            if (record.unwind && structured.loopHeaders.size > 0 && spillSlots.length <= 48) {
               return [
                 `${prefix}${stmt(exprConcat(
                   e`ssaRestoredFrame = `,
@@ -15523,15 +15675,17 @@ class JvmSsaBlockRenderer {
           safePointInitialBudget * adaptiveBudgetMultiplier,
           configuredCallChainBudget,
         ));
-        // Per-loop work weighting normally clamps the shared counter on loop
-        // entry. Scale those exact loop budgets with the adaptive quantum;
-        // otherwise every loop immediately overwrites the enlarged entry
-        // budget with its canonical value and the multiplier is inert.
+        // Adaptive activation budgets must not inflate the interval between
+        // wall-clock checks. Checking an unexpired deadline does not spill the
+        // activation; continueStructuredQuantum retains its scalar state.
+        // Keep the existing work weighting, bounded by the configured host
+        // polling limit even when compiled chains request a very large budget.
         const adaptiveLoopBudgetScale =
           adaptiveSafePointBudget / safePointInitialBudget;
         const adaptiveLoopSafePointBudgets = new Map(
           [...loopPollBudgets].map(([header, budget]) => [header,
-            Math.min(100_000_000,
+            Math.min(this.boundedAdaptivePollingEnabled
+              ? this.jit.structuredLoopSafePointMaxBudget : 100_000_000,
               Math.max(budget, Math.floor(
                 budget * adaptiveLoopBudgetScale))),
           ]),

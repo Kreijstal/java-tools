@@ -352,16 +352,14 @@ test('after main(), a method the worker will not take keeps its tier',
   t.end();
 });
 
-test('after main(), a send that never reached a worker still compiles here',
+test('legacy control: a send that never reached a worker still compiles here',
   async (t) => {
-  // The other half of the rule above, and the one that matters on the target:
-  // a browser has no `worker_threads`, so every send throws and every method
-  // is declined. Withholding the local compile there would not defer the work
-  // to anyone -- there is no queue -- it would strand the method in the
-  // interpreter for the rest of the run.
+  // Preserve the old behavior as an explicit A/B control, not the desired
+  // no-stall contract. backgroundCodegenRequests.test.js checks the new policy.
   const classpath = compileProbe(t, 'jit-postmain-nosend-');
   const jvm = new JVM({ classpath, prepareBeforeMain: false,
-    jit: { profileMethods: true, compileWorker: true, warmupThreshold: 0 } });
+    jit: { profileMethods: true, compileWorker: true, warmupThreshold: 0,
+      backgroundCodegen: false } });
   t.teardown(() => jvm.jit.compileWorker.dispose());
   await jvm.loadClassByName('HotnessProbe');
   const client = jvm.jit.compileWorker;

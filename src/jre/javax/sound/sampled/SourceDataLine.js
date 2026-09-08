@@ -85,7 +85,7 @@ function toAudioBytes(buffer, offset, len) {
   return new Uint8Array(slice);
 }
 
-function openWithFormat(obj, format) {
+function openWithFormat(obj, format, jvm) {
   const formatFields = format &&
     format.fields &&
     getFormatFields(format);
@@ -97,6 +97,7 @@ function openWithFormat(obj, format) {
   }
 
   const outputOptions = toOutputOptions(formatFields, obj.requestedBufferSize);
+  outputOptions.cooperativeRefill = !!jvm?.audioRefillPolicy;
   obj.drainModel = createDrainModel(outputOptions);
 
   try {
@@ -127,11 +128,11 @@ module.exports = {
   super: "javax/sound/sampled/DataLine",
   methods: {
     "open()V": withThrows((jvm, obj) => {
-      openWithFormat(obj, obj.requestedFormat);
+      openWithFormat(obj, obj.requestedFormat, jvm);
     }, ["javax/sound/sampled/LineUnavailableException"]),
     "open(Ljavax/sound/sampled/AudioFormat;)V": withThrows((jvm, obj, args) => {
       const [format] = args;
-      openWithFormat(obj, format);
+      openWithFormat(obj, format, jvm);
     }, ["javax/sound/sampled/LineUnavailableException"]),
     "open(Ljavax/sound/sampled/AudioFormat;I)V": (jvm, obj, args) => {
       obj.requestedBufferSize = Number(args[1]);
@@ -157,7 +158,8 @@ module.exports = {
         if (obj.drainModel) {
           obj.drainModel.accept(nowMillis(jvm), len);
         }
-        if (thread && obj.audioOutput &&
+        jvm.audioRefillPolicy?.completed(thread, obj.audioOutput);
+        if (!jvm.audioRefillPolicy && thread && obj.audioOutput &&
             typeof obj.audioOutput.queuedSeconds === "function" &&
             obj.audioOutput.context?.state !== "suspended" &&
             obj.audioOutput.queuedSeconds() < 0.04) {
@@ -176,7 +178,7 @@ module.exports = {
         };
       }
     }, ["java/lang/IllegalStateException", "java/io/IOException"], []),
-    "available()I": (jvm, obj, args) => {
+    "available()I": (jvm, obj, args, thread) => {
       // A discard sink drains instantaneously. Reporting it as permanently
       // empty makes games spend every cycle decoding audio that nobody can
       // hear. In explicitly headless mode, model a full output buffer so the
@@ -188,6 +190,7 @@ module.exports = {
         return 0;
       }
       if (obj.audioOutput && typeof obj.audioOutput.available === "function") {
+        jvm.audioRefillPolicy?.requested(thread, obj.audioOutput);
         return Math.max(0, Number(obj.audioOutput.available()) | 0);
       }
       if (obj.drainModel) {

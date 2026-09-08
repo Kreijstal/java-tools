@@ -34,6 +34,19 @@ const { capturesBooleanStatic, isNoOpExceptionHandler } = WasmJit._test;
 
 const RETURN_VOID = Symbol("jit.return.void");
 
+// Built during JVM construction, before guest execution. Fixed arity avoids
+// an argument-array allocation on successful calls; only throws allocate.
+function makeCaughtCallEntries(marker) {
+  return Array.from({length: 37}, (_, arity) => makeCaughtCallEntry(marker, arity));
+}
+function makeCaughtCallEntry(marker, arity) {
+    const args = Array.from({length: arity}, (_, i) => `a${i}`);
+    return new Function('marker', `return function caughtRuntimeCall${arity}(fn, receiver${args.length ? ', ' + args.join(', ') : ''}) {
+      try { return fn.call(receiver${args.length ? ', ' + args.join(', ') : ''}); }
+      catch (error) { return {marker, error}; }
+    };`)(marker);
+}
+
 // In a generator SpiderMonkey's bytecode for every non-local exit (`yield`,
 // `return`, `break`, `continue`) grows by about four bytes per `let`/`const`
 // binding in scope at that point, while `var` bindings and plain functions
@@ -222,6 +235,10 @@ class JitCompiler {
     // after main() is a stall. `markMainStarted` is called by jvm.run() at
     // the main() boundary; nothing here reads it except the accounting.
     this.mainStarted = false;
+    // Migration policy: execution-side generated-body requests never run an
+    // optimizer after main. Kept explicit until all entry paths and browser
+    // installation costs have passed the runtime acceptance gate.
+    this.backgroundCodegen = options.backgroundCodegen === true;
     // Methods the worker could not take after main(), which therefore keep
     // their current tier instead of being compiled on the guest's thread.
     this.workerUnservedPostMainCount = 0;
@@ -281,6 +298,8 @@ class JitCompiler {
     // runtime heat promotes it. Keep that structural proof separate from the
     // adaptive heat policy so preparation does not alter global tier choices.
     this.preparedCodegenMethods = new WeakSet();
+    this.singleSiteInlineExperiment = options.singleSiteInlineExperiment || null;
+    this.checkedSpanExperiment = options.checkedSpanExperiment || null;
     this.preparedCodegenDeopts = new Map();
     this.effectfulPreparationActive = false;
     // Explicit preparation is intended to remain valid across later lifecycle
@@ -366,6 +385,10 @@ class JitCompiler {
     // every site during asset loading. Cache the unbound template by resolved
     // method and ABI shape; each site still binds its own live linkage plan.
     this.positionalGeneratedEntryTemplates = new WeakMap();
+    // Scheduler suspension is not failed optimization. Keep this new call
+    // policy opt-in until whole-route browser acceptance has passed.
+    this.retainFramelessAfterSuspension = options.retainFramelessAfterSuspension === true;
+    this.cooperativeCallSuspensionCount = 0;
     this.positionalJreEntryTemplates = new WeakMap();
     this.positionalGeneratedTemplateCompileCount = 0;
     this.positionalGeneratedTemplateReuseCount = 0;
@@ -491,6 +514,7 @@ class JitCompiler {
         (typeof process !== "undefined" && process.env &&
           process.env.JVM_ADAPTIVE_FRAMELESS_BUDGET_MULTIPLIER) ?? 8) || 8));
     this.inlineIntegerRegionCache = new WeakMap();
+    this.inlineFinalReceiverCalls = options.inlineFinalReceiverCalls === true;
     this.directInlineIntegerRegionCache = new WeakMap();
     this.inlineIntegerPlanCache = new WeakMap();
     this.inlineIntegerPositionalPlanCache = new WeakMap();
@@ -673,6 +697,14 @@ class JitCompiler {
     this.scalarSsaOptimizationsEnabled = options.scalarSsaOptimizations === true ||
       Boolean(typeof process !== "undefined" && process.env &&
         process.env.JVM_ENABLE_SCALAR_SSA === "1");
+    this.scalarPositionalCallsEnabled = options.scalarPositionalCalls === true;
+    this.prepareColdIntegerInlines = options.prepareColdIntegerInlines === true;
+    this.preparedLoopLeafWasm = options.preparedLoopLeafWasm === true;
+    this.preparedCompleteWasm = options.preparedCompleteWasm === true;
+    this.rawRestoringCalls = options.rawRestoringCalls === true;
+    this.caughtRuntimeCalls = options.caughtRuntimeCalls === true;
+    this.caughtCallMarker = Symbol('jit.caught.call');
+    this.caughtCallEntries = this.caughtRuntimeCalls ? makeCaughtCallEntries(this.caughtCallMarker) : null;
     this.postIncrementHelpersEnabled = options.postIncrementHelpers !== false &&
       !(typeof process !== "undefined" && process.env &&
         process.env.JVM_DISABLE_POST_INCREMENT_HELPERS === "1");
@@ -1182,9 +1214,40 @@ class JitCompiler {
   }
 
   hasPreparedFullWasmUpgrade(method) {
-    return this.preparedCodegenMethods.has(method) &&
-      this.isOversizedLoopMethod(method) &&
+    return this.hasPreparedLoopLeafWasmUpgrade(method) || this.hasPreparedNormalFlowWasmUpgrade(method) ||
+      this.preparedCodegenMethods.has(method) &&
+      (this.isOversizedLoopMethod(method) ||
+        this.wasmJit.synchronizedInstanceLinksEnabled &&
+          (method.flags || []).includes('synchronized') &&
+          !(method.flags || []).includes('static') &&
+          this.hasBackwardBranch(method)) &&
       this.hasReadyFullWasmModule(method);
+  }
+
+  hasPreparedLoopLeafWasmUpgrade(method) {
+    if (!(this.preparedLoopLeafWasm || this.preparedCompleteWasm) || !this.preparedCodegenMethods.has(method) ||
+        !this.hasBackwardBranch(method)) return false;
+    if (normalFlowContainsInvoke(this.getCodeItems(method)) &&
+        !(this.preparedCompleteWasm && this.wasmJit.methodState({method}).meta?.fullyCompiled === true)) return false;
+    // Full, call-free bodies avoid the per-child cross-backend handoff cost.
+    // Preparation supplies executable code; this only selects an existing
+    // module and retains ordinary fuel/exception exits and exit-storm guards.
+    return this.hasReadyFullWasmModule(method) && !this.hasWasmExitStorm(method);
+  }
+
+  hasPreparedNormalFlowWasmUpgrade(method) {
+    // This is frame-entry selection, not permission to raw-link an EH body.
+    // Complete normal flow can run in the prepared module while a throw still
+    // exits through its canonical Frame/exception table. Keep this in the
+    // opt-in compiled call-chain experiment until the browser gate passes.
+    if (!this.wasmJit.normalFlowPreparedUpgradesEnabled ||
+        !this.preparedCodegenMethods.has(method) ||
+        !this.hasBackwardBranch(method)) return false;
+    const state = this.wasmJit.enabled && this.wasmJit.state.get(method);
+    const meta = state?.status === 'ready' && state.meta;
+    return Boolean(meta && meta.normalFlowFullyCompiled &&
+      meta.externalEntry?.has(0) &&
+      !this.hasWasmExitStorm(method));
   }
 
   hasWasmExitStorm(method) {
@@ -1848,14 +1911,26 @@ class JitCompiler {
   }
 
   getGeneratedFunction(method, options = {}) {
-    if (options.allowEffectfulCalls === true) {
-      this.nonSpeculativeStaticBooleanMethods.add(method);
-    }
     const preparedEffectful = options.allowEffectfulCalls === true ||
       this.preparedCodegenMethods.has(method);
     if (!this.codegenEnabled || this.codegenUnavailable ||
         !this.isCodegenSupported(method, preparedEffectful)) {
       return null;
+    }
+    if (this.backgroundCodegen && (this.mainStarted || this.jvm.guestStarted)) {
+      const cached = this.codegenCache.get(method) || null;
+      if (!cached || options.allowEffectfulCalls === true) {
+        this.requestBackgroundGeneratedBody(method, {
+          preparedWholeMethod: options.allowEffectfulCalls === true,
+          replacementOf: cached,
+        });
+      }
+      // Neither compileLocally nor a preparation request overrides the runtime
+      // boundary. A cached body stays published throughout the worker request.
+      return cached;
+    }
+    if (options.allowEffectfulCalls === true) {
+      this.nonSpeculativeStaticBooleanMethods.add(method);
     }
     if (this.codegenCache.has(method)) {
       const cached = this.codegenCache.get(method);
@@ -2030,6 +2105,19 @@ class JitCompiler {
       guard.finish("structured-region-candidate");
       this.regionStructuredCandidateCompiling.delete(method);
     }
+  }
+
+  requestBackgroundGeneratedBody(method, options = {}) {
+    if (!method || !this.codegenEnabled || this.codegenUnavailable ||
+        !this.isCodegenSupported(method, options.preparedWholeMethod === true ||
+          this.preparedCodegenMethods.has(method))) return false;
+    if (this.compileWorker.enqueue(method, options)) return true;
+    this.workerUnservedPostMainCount += 1;
+    if (!this.workerUnservedPostMainMethods.has(method)) {
+      this.workerUnservedPostMainMethods.add(method);
+      this.workerUnservedPostMainMethodCount += 1;
+    }
+    return false;
   }
 
   isGraphOwnedStructuredLeafCandidate(method) {
@@ -4480,12 +4568,25 @@ class JitCompiler {
   }
 
   scheduleStructuredCacheUpgrade(method, cached) {
+    if (this.backgroundCodegen && (this.mainStarted || this.jvm.guestStarted)) {
+      this.requestBackgroundGeneratedBody(method, {
+        preparedWholeMethod: true, replacementOf: cached,
+      });
+      return;
+    }
     if (this.structuredConstructorUpgradePending.has(method)) return;
     this.structuredConstructorUpgradePending.add(method);
     const upgrade = () => {
       this.structuredConstructorUpgradePending.delete(method);
       if (this.codegenCache.get(method) !== cached ||
           this.codegenCompiling.has(method)) return;
+      // main may have started since this callback was scheduled.
+      if (this.backgroundCodegen && (this.mainStarted || this.jvm.guestStarted)) {
+        this.requestBackgroundGeneratedBody(method, {
+          preparedWholeMethod: true, replacementOf: cached,
+        });
+        return;
+      }
       this.codegenCompiling.add(method);
       try {
         const structured = this.structuredSsa.compile(method);
@@ -5222,6 +5323,18 @@ class JitCompiler {
     let arrayViewCount = 0;
     let eliminatedReadCount = 0;
     let threadedEdgeCount = 0;
+    const localSlots = [...usedLocals].sort((a, b) => a - b);
+    // Large resumable methods used to repeat every local assignment at
+    // every exceptional edge. Keep that cold code outside the hot function
+    // without capturing its scalar locals in an environment object.
+    const outlineSpills = localSlots.length >= 8;
+    const spillAssignments = localSlots.map((index) =>
+      `locals[${index}] = local${index};`);
+    const spillArguments = localSlots.map((index) => `local${index}`);
+    const hoistedSpillSource = outlineSpills
+      ? `function scalarSpillLocals(locals, ${spillArguments.join(", ")}) {\n` +
+        spillAssignments.join("\n") + "\n}"
+      : null;
     const body = [
       '"use strict";',
       "const locals = frame.locals;",
@@ -5242,8 +5355,9 @@ class JitCompiler {
       "while (true) {",
       "switch (pc) {",
     ];
-    const spillLocals = () => [...usedLocals].sort((a, b) => a - b)
-      .map((index) => `locals[${index}] = local${index};`);
+    const spillLocals = () => outlineSpills
+      ? [`scalarSpillLocals(locals, ${spillArguments.join(", ")});`]
+      : spillAssignments;
     const saveStack = (expressions) => [
       ...expressions.map((expression, index) => `stack[${index}] = ${expression};`),
       `stack.length = ${expressions.length};`,
@@ -5577,7 +5691,9 @@ class JitCompiler {
                 body.push(...saveStack(beforeCall), `frame.pc = ${index + 1};`);
                 const value = temp();
                 const caught = temp();
-                body.push(`let ${value}; try { ${value} = helpers.tryInvokeSyncAt(${site.id}, frame, thread); } catch (${caught}) {`);
+                const scalarInvoke = this.scalarPositionalCallsEnabled
+                  ? "tryInvokeScalarStaticAt" : "tryInvokeSyncAt";
+                body.push(`let ${value}; try { ${value} = helpers.${scalarInvoke}(${site.id}, frame, thread); } catch (${caught}) {`);
                 body.push(...materialize(beforeCall, index));
                 body.push(`throw ${caught};`, "}");
                 body.push(`if (${value} === helpers.asyncInvokeSentinel()) {`);
@@ -5701,7 +5817,8 @@ class JitCompiler {
     try {
       const generated = this.createGeneratedFunction(method,
         ssaOptimizations ? "scalar-ssa" : "scalar",
-        ["frame", "thread", "helpers", "initialBytecodeChecks"], body.join("\n"));
+        ["frame", "thread", "helpers", "initialBytecodeChecks"], body.join("\n"),
+        null, false, false, null, hoistedSpillSource);
       generated.jvmSynchronous = true;
       generated.jvmScalarLoop = true;
       generated.jvmScalarSsa = ssaOptimizations;
@@ -7863,6 +7980,7 @@ class JitCompiler {
     const [, declaredClassName, [methodName, descriptor]] = instruction.arg;
     const id = this.nextSyncCallSiteId++;
     const site = {
+      id,
       op,
       declaredClassName,
       methodName,
@@ -7876,6 +7994,16 @@ class JitCompiler {
       jreTargets: new Map(),
     };
     this.syncCallSites[id] = site;
+    if (this.caughtRuntimeCalls) {
+      const arity = site.params.length + (op === 'invokestatic' ? 0 : 1) + 2;
+      // Give each prepared call site its own host feedback, not a global
+      // megamorphic bridge shared by every Java method of the same arity.
+      // Late sites use the already-existing generic entry; never generate
+      // an optimization synchronously after guest execution starts.
+      const prepared = !this.mainStarted && !this.jvm.guestStarted;
+      site.caughtEntry = prepared ? makeCaughtCallEntry(this.caughtCallMarker, arity) : this.caughtCallEntries[arity];
+      site.caughtRawEntry = prepared ? makeCaughtCallEntry(this.caughtCallMarker, arity + 1) : this.caughtCallEntries[arity + 1];
+    }
     // placeSiteTables has to find the warmed site for an arriving one by
     // identity. Scanning the whole table for it is quadratic once the table
     // is large -- a real boot reaches six figures of sites -- so the lookup
@@ -8108,6 +8236,23 @@ class JitCompiler {
   // then used as an array index. Generated code passes the captured record.
   tryInvokeSyncAt(id, frame, thread) {
     return this.tryInvokeSyncAtSite(this.syncCallSites[id], frame, thread, id);
+  }
+
+  // Scalar callers already have a canonical parent Frame. Reuse the same
+  // positional ABI and child-linking protocol as structured callers instead
+  // of allocating a canonical child for every small static call. Read the
+  // live link on every invocation so tier publication remains observable.
+  tryInvokeScalarStaticAt(id, frame, thread) {
+    const site = this.syncCallSites[id];
+    const target = site?.op === "invokestatic" ? site.fastPositional : null;
+    if (target && !this.profileMethods && !this.needsBytecodeChecks() &&
+        site.initializationToken?.initialized &&
+        (target.debugGuarded ||
+          !this.jvm.debugManager.isClassJitDeopted(target.lookupClass))) {
+      const result = this.tryInvokeFramePositional(site, target.invoke, frame, thread);
+      if (result !== ASYNC_INVOKE) return result;
+    }
+    return this.tryInvokeSyncAt(id, frame, thread);
   }
 
   tryInvokeSyncAtSite(site, frame, thread, id = site?.id) {
@@ -8410,8 +8555,13 @@ class JitCompiler {
     // (see readyWasmProvenUnusedForTarget).
     const preparedFullWasmUpgrade = method &&
       this.hasPreparedFullWasmUpgrade(method);
-    if (preparedFullWasmUpgrade || method && this.hasReadyFullWasm(method) &&
-        !this.readyWasmProvenUnusedForTarget(target, method)) return null;
+    // The resolved dispatcher executes an admitted integer region before
+    // considering Wasm. Its scalar entry must follow that same selection:
+    // vetoing it here only forces frame materialization on every call and
+    // still executes the identical integer region, never the Wasm body.
+    if (!target.inlineIntegerRegion && (preparedFullWasmUpgrade ||
+        method && this.hasReadyFullWasm(method) &&
+        !this.readyWasmProvenUnusedForTarget(target, method))) return null;
     if (target.positionalInvoker) return target.positionalInvoker;
     const positionalTracePattern = typeof process !== "undefined" && process.env
       ? process.env.JVM_TRACE_POSITIONAL_GENERATED || "" : "";
@@ -8544,6 +8694,14 @@ class JitCompiler {
       };
       target.positionalInvoker =
         generated.jvmRestoringDirectPositionalBody.bind(null, this, plan);
+      if (this.singleSiteInlineExperiment || this.checkedSpanExperiment) {
+        target.positionalInvoker.jvmInlineRestoringPlan = plan;
+        target.positionalInvoker.jvmInlineRestoringBody = generated.jvmRestoringDirectPositionalBody;
+      }
+      if (this.rawRestoringCalls) {
+        target.positionalInvoker.jvmRawRestoringBody = generated.jvmRestoringDirectPositionalBody;
+        target.positionalInvoker.jvmRawRestoringPlan = plan;
+      }
       target.positionalInvoker.jvmDebugGuarded = true;
       // The restoring scalar ABI reconstructs an omitted child Frame at the
       // precise throwing operation. Its caller must therefore retain the
@@ -8717,9 +8875,18 @@ class JitCompiler {
       "  if (jit.generatedDeoptTrace) jit.recordGeneratedDeoptTrace(child, 0, result);",
       "  if (useFrameless) {",
       "    plan.restoreFrame(thread, baseDepth, child);",
-      "    if (adaptiveFrameless) {",
+      // Scheduler suspension and a materialized callee handoff are normal
+      // execution outcomes, not evidence that this method's fast ABI is
+      // invalid. Only explicit producer metadata permits retention: a
+      // transient speculation failure must still reject the fast entry.
+      // The restored activation remains scheduler-owned in either case.
+      "    if (adaptiveFrameless && jit.retainFramelessAfterSuspension &&",
+      "        (result.cooperativeSuspension === true || result.callHandoff === true)) {",
+      "      jit.cooperativeCallSuspensionCount += 1;",
+      "    } else if (adaptiveFrameless) {",
       "      target.preferFrameless = false;",
       "      target.framelessRejected = true;",
+      "      target.framelessRejectionReason = result.reason || 'unspecified deoptimization';",
       "    }",
       "  } else if (adaptiveFrameless && !target.framelessRejected &&",
       "      result.reason === 'structured SSA continuation') {",
@@ -9417,7 +9584,8 @@ class JitCompiler {
     // it is the only tier that can complete this call in place.
     if (wasmOwnedCallee ||
         (this.wasmJit.enabled &&
-        this.isOversizedLoopMethod(method) &&
+        (this.isOversizedLoopMethod(method) ||
+          this.hasPreparedFullWasmUpgrade(method)) &&
         (!this.preparedCodegenMethods.has(method) ||
           this.hasReadyFullWasm(method) ||
           this.hasPreparedFullWasmUpgrade(method)) &&
@@ -10056,13 +10224,24 @@ class JitCompiler {
           index = target - 1;
           continue;
         }
-        if (op === "invokestatic") {
-          const target = this.resolveInlineIntegerStaticTarget(instruction);
+        if (op === "invokestatic" ||
+            (op === "invokevirtual" && this.inlineFinalReceiverCalls)) {
+          const instanceCall = op === "invokevirtual";
+          const target = instanceCall
+            ? this.resolveInlineIntegerFinalReceiverTarget(method, instruction)
+            : this.resolveInlineIntegerStaticTarget(instruction);
           if (!target) return null;
           const callArgs = new Array(target.params.length);
           for (let argument = target.params.length - 1; argument >= 0; argument -= 1) {
             callArgs[argument] = pop();
             if (callArgs[argument] === null) return null;
+          }
+          if (instanceCall) {
+            // Only this, already checked at the outer call boundary. Another
+            // object would require its own null/type and exception proof.
+            const receiver = pop();
+            if (receiverSlots !== 1 || receiver !== args[0]) return null;
+            callArgs.unshift(receiver);
           }
           const value = this.emitInlineIntegerMethod(target.method, target.params,
             target.returnType, callArgs, state, depth + 1);
@@ -10125,6 +10304,24 @@ class JitCompiler {
     }
   }
 
+  resolveInlineIntegerFinalReceiverTarget(caller, instruction) {
+    if (!instruction || !Array.isArray(instruction.arg) ||
+        !Array.isArray(instruction.arg[2])) return null;
+    const [, className, [methodName, descriptor]] = instruction.arg;
+    // Same final owner means no override, cross-class initialization or extra
+    // debugger dependency is hidden inside the outer guarded call entry.
+    if (this.jvm.findClassNameForMethod(caller) !== className) return null;
+    const classData = this.jvm.classes[className];
+    if (!classData?.ast?.classes?.[0]?.flags?.includes("final")) return null;
+    const method = this.jvm.findMethod(classData, methodName, descriptor);
+    if (!method || this.jvm.findClassNameForMethod(method) !== className ||
+        (method.flags || []).some(flag =>
+          ["static", "synchronized", "native", "abstract"].includes(flag))) return null;
+    const parsed = parseDescriptor(descriptor);
+    if (parsed.returnType !== "int" || !parsed.params.every(type => type === "int")) return null;
+    return { method, ...parsed };
+  }
+
   resolveInlineIntegerStaticTarget(instruction) {
     if (!instruction || !Array.isArray(instruction.arg) ||
         !Array.isArray(instruction.arg[2])) return null;
@@ -10143,11 +10340,18 @@ class JitCompiler {
     if (!instruction || !Array.isArray(instruction.arg) ||
         !Array.isArray(instruction.arg[2])) return null;
     const [, className, [methodName, descriptor]] = instruction.arg;
-    if (this.jvm.classInitializationState.get(className) !== "INITIALIZED") return null;
+    const cold = this.jvm.classInitializationState.get(className) !== "INITIALIZED";
+    // Only the structured emitter has a per-invoke initialization fallback.
+    // Planning must never execute <clinit> or make scalar emitters skip it.
+    if (cold && !(positional && this.prepareColdIntegerInlines)) return null;
     const classData = this.jvm.classes[className];
     if (!classData) return null;
     const method = this.jvm.findMethod(classData, methodName, descriptor);
     if (!method || !(method.flags || []).includes("static")) return null;
+    if (cold && (method.className || this.jvm.findClassNameForMethod(method)) !== className) return null;
+    if (cold && ((method.flags || []).some(flag =>
+        ["synchronized", "native", "abstract"].includes(flag)) ||
+        (Number(method.accessFlags) & 0x0520) !== 0)) return null;
     const { params, returnType } = parseDescriptor(descriptor);
     const plan = this.getInlineIntegerPlan(
       method, params, returnType, positional);
@@ -10158,6 +10362,7 @@ class JitCompiler {
       guards: plan.guards,
       paramCount: params.length,
       className,
+      requiresInitializationGuard: cold,
     };
   }
 

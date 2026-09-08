@@ -270,6 +270,9 @@ class CompileWorkerClient {
     this.queued.add(method);
     this.demand.set(method, 1);
     this.queue.push({ method, className,
+      // Receiving-runtime identity only: never transported to the worker.
+      // Publication may replace this exact body, but never a newer winner.
+      replacementOf: options.replacementOf || null,
       preparedWholeMethod: options.preparedWholeMethod === true });
     this.stats.queued += 1;
     this.pump();
@@ -435,11 +438,16 @@ class CompileWorkerClient {
         } else {
           this.decline(found, { refused: true });
         }
-      } else if (!this.jit.codegenCache.has(found)) {
+      } else if (!this.jit.codegenCache.get(found) ||
+          (foundRecord?.entry?.replacementOf &&
+            this.jit.codegenCache.get(found) === foundRecord.entry.replacementOf)) {
         // Publish exactly as a local compile would, so callers relink through
         // the ordinary upgrade path rather than a second mechanism.
         const publicationStart = this.jit.monotonicNow();
         this.jit.codegenCache.set(found, generated);
+        if (foundRecord?.entry?.preparedWholeMethod) {
+          this.jit.preparedCodegenMethods.add(found);
+        }
         this.jit.publishGeneratedTargetUpgrade?.(found, generated);
         const publicationMs = this.jit.monotonicNow() - publicationStart;
         const totalInstallMs = this.jit.monotonicNow() - installStart;

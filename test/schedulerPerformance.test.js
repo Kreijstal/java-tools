@@ -191,6 +191,60 @@ test('AWT input handlers supersede a continuously runnable frame producer', (t) 
   t.end();
 });
 
+test('a depleted audio queue receives its refill turn ahead of rendering', (t) => {
+  const jvm = new JVM();
+  const producer = {status: 'runnable', callStack: new Stack()};
+  const audio = {status: 'runnable', callStack: new Stack()};
+  jvm.threads = [producer, audio];
+  jvm.currentThreadIndex = 0;
+  jvm._awtFrameProducerThread = producer;
+  let queued = 0.01;
+  const priority = {thread: audio, output: {queuedSeconds: () => queued},
+    until: jvm.clock.millis() + 1000};
+  jvm._audioPriority = priority;
+  t.equal(jvm._prepareSchedulerTick().thread, audio,
+    'the renderer cannot overwrite an urgent audio selection');
+  queued = 0.2;
+  t.equal(jvm._prepareSchedulerTick().thread, producer,
+    'rendering resumes once the audio queue is replenished');
+  t.equal(jvm._audioPriority, null, 'the fulfilled priority request is retired');
+  queued = 0.01;
+  priority.until = jvm.clock.millis() - 1;
+  jvm._audioPriority = priority;
+  t.equal(jvm._prepareSchedulerTick().thread, producer,
+    'an expired request cannot reserve further audio turns');
+  t.end();
+});
+
+test('renewed audio refill requests cannot indefinitely withhold the loader', async t => {
+  const jvm = new JVM({schedulerStarvationMs: 20});
+  const audio = {id: 1, status: 'runnable', callStack: new Stack()};
+  const loader = {id: 2, status: 'runnable', callStack: new Stack()};
+  jvm.threads = [audio, loader];
+  jvm.currentThreadIndex = 1;
+  const renew = () => { jvm._audioPriority = {thread: audio,
+    output: {queuedSeconds: () => 0}, until: jvm.clock.millis() + 50}; };
+  renew();
+  t.equal(jvm._prepareSchedulerTick().thread, audio, 'urgent audio initially takes priority');
+  jvm._advanceSchedulerThread();
+  await new Promise(resolve => setTimeout(resolve, 40));
+  renew();
+  t.equal(jvm._prepareSchedulerTick().thread, loader,
+    'a renewed deadline does not reset the loader starvation bound');
+  t.ok(jvm._schedulerReliefActive, 'the depleted queue enters bounded round-robin relief');
+  jvm._advanceSchedulerThread();
+  t.equal(jvm._prepareSchedulerTick().thread, audio, 'audio still runs during relief');
+  await jvm._yieldHostTurn();
+  jvm.currentThreadIndex = 1;
+  renew();
+  t.equal(jvm._prepareSchedulerTick().thread, audio, 'the next host turn restores audio priority');
+  await jvm._yieldHostTurn();
+  jvm.currentThreadIndex = 1;
+  renew();
+  t.equal(jvm._prepareSchedulerTick().thread, loader, 'continued starvation gets another relief turn');
+  t.end();
+});
+
 test('a withheld runnable thread ends the frame-producer priority after a bounded wait',
   async (t) => {
   const jvm = new JVM({ schedulerStarvationMs: 20 });
@@ -745,14 +799,20 @@ test('explicit preparation can limit Wasm to prepared oversized upgrades',
   const compiled = [];
   jvm.jit.wasmJit.compile = ({method}) => compiled.push(method);
 
+  const progress = [];
   const result = await jvm.precompileInitializedClasses({
     wasm: true, effectful: true, wasmPreparedUpgradesOnly: true,
+    onProgress: update => progress.push(update),
   });
   t.equal(result.methods, 2,
     'JavaScript preparation still covers every selected method');
   t.deepEqual(compiled, [oversized],
     'the Wasm pass compiles only a prepared oversized upgrade');
   t.equal(result.wasmMethods, 1,
-    'progress reports only the selected Wasm upgrade');
+    'the result counts only the selected Wasm upgrade');
+  t.deepEqual(progress.filter(update => update.tier === 'wasm'), [
+    {completed: 1, total: 2, compiled: 0, tier: 'wasm'},
+    {completed: 2, total: 2, compiled: 1, tier: 'wasm'},
+  ], 'Wasm progress reaches its total even when only some methods need compilation');
   t.end();
 });

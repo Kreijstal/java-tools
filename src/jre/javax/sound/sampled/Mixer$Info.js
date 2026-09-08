@@ -1,4 +1,4 @@
-const { readField } = require('../../../../core/objectModel');
+const { readField, writeField } = require('../../../../core/objectModel');
 module.exports = {
   super: 'java/lang/Object',
   fields: {
@@ -10,12 +10,12 @@ module.exports = {
   methods: {
     '<init>(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V': (jvm, obj, args) => {
       const [name, vendor, description, version] = args;
-      readField(obj.fields, 'javax/sound/sampled/Mixer$Info') = {
+      writeField(obj.fields, 'javax/sound/sampled/Mixer$Info', {
         name,
         vendor,
         description,
         version,
-      };
+      });
     },
     'getName()Ljava/lang/String;': (jvm, obj) => {
       return readField(obj.fields, 'javax/sound/sampled/Mixer$Info')['name'];

@@ -157,15 +157,9 @@ class BrowserJVMDebug {
     // continuations.
     this.debugController = new DebugController({
       rewindHistorySize: 50, classpath: ['.'],
-      // Host-turn quantum. The 8 ms default made a 170 ms game frame unwind
-      // and rebuild the whole Java stack about twenty times (each safe point
-      // materializes every frame, and every level then re-enters through the
-      // resume dispatcher and a baseline tail); measured at the Deko Bloko
-      // menu as ~1000 scheduler entries and ~190 baseline hand-offs per
-      // second. One frame of a 24 fps game is ~42 ms, so a 40 ms quantum
-      // keeps input latency within a frame while letting a frame render in
-      // one activation.
-      eventLoopYieldMs: 40,
+      // Use the core's short host-turn quantum. A video-frame-sized quantum
+      // delays worklet queue reports and PCM delivery beyond refill deadlines;
+      // continuation efficiency must not be bought by blocking host events.
       wasmHeap: true,
       wasmHeapMb: 128,
       wasmFields: true,

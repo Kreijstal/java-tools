@@ -284,8 +284,8 @@ function addFieldImport(reg, jvm, ins, isStaticOp, isGet, elementOf = null) {
   const [, className, [fieldName, descriptor]] = ins.arg;
   const t = descToWasm(descriptor[0]);
   if (isStaticOp) {
-    // Resolve eagerly at compile time — if the owning class is not loaded
-    // and initialized yet, reject rather than risking a skipped <clinit>.
+    // Declared storage can be linked during preparation, before <clinit>.
+    // Callers must emit initializationIdx's guard before guest side effects.
     let currentClassName = className;
     let container = null;
     let key = null;
@@ -295,6 +295,10 @@ function addFieldImport(reg, jvm, ins, isStaticOp, isGet, elementOf = null) {
         const fieldKey = `${fieldName}:${descriptor}`;
         if (cd.staticFields.has(fieldKey)) { container = cd.staticFields; key = fieldKey; break; }
         if (cd.staticFields.has(fieldName)) { container = cd.staticFields; key = fieldName; break; }
+        const declared = cd.ast?.classes?.[0]?.items?.some(item =>
+          item.type === 'field' && item.field?.name === fieldName &&
+          item.field?.descriptor === descriptor && item.field.flags?.includes('static'));
+        if (declared) { container = cd.staticFields; key = fieldKey; break; }
       }
       currentClassName = cd && cd.ast && cd.ast.classes[0] ? cd.ast.classes[0].superClassName : null;
     }
@@ -305,6 +309,14 @@ function addFieldImport(reg, jvm, ins, isStaticOp, isGet, elementOf = null) {
         `${className}.${fieldName}:${descriptor}`);
     }
     const name = `${isGet ? 'gs' : 'ps'}_${className}_${fieldName}`.replace(/[^\w]/g, '_');
+    let initializationIdx = null;
+    if (jvm.classInitializationState.get(currentClassName) !== 'INITIALIZED') {
+      const token = jvm.getClassInitializationToken(currentClassName);
+      initializationIdx = reg.addImport(
+        `static_ready_${currentClassName}`.replace(/[^\w]/g, '_'), [], [T.i32],
+        () => token.initialized ? 1 : 0);
+      (reg.staticInitializationGuards ||= new Set()).add(currentClassName);
+    }
     const getStatic = t === T.i32
       ? () => {
         const value = container.get(key);
@@ -315,6 +327,7 @@ function addFieldImport(reg, jvm, ins, isStaticOp, isGet, elementOf = null) {
     return {
       t,
       name,
+      initializationIdx,
       idx: isGet
         ? reg.addImport(name, [], [t], getStatic)
         : reg.addImport(name, [t], [], (v) => container.set(key, v)),
@@ -536,6 +549,30 @@ function addTimeImport(reg, jvm, ins) {
   return { params: [], partial: false, idx: reg.addImport(`sys_${name}`, [], [T.i64], fn) };
 }
 
+// A bulk native must not strand its compiled caller in an interpreter
+// continuation. Reuse the existing synchronous JRE operation (including its
+// exception behavior); this is one boundary per copy, not per array element.
+function addSystemImport(reg, jvm, ins) {
+  const [, owner, [name, descriptor]] = ins.arg;
+  if (owner !== 'java/lang/System' || name !== 'arraycopy' ||
+      descriptor !== '(Ljava/lang/Object;ILjava/lang/Object;II)V') {
+    return addTimeImport(reg, jvm, ins);
+  }
+  const native = jvm.jre[owner]?.staticMethods?.[name + descriptor];
+  if (typeof native !== 'function') throw new Unsupported('System.arraycopy native unavailable');
+  let initializationIdx = null;
+  if (jvm.classInitializationState.get(owner) !== 'INITIALIZED') {
+    const token = jvm.getClassInitializationToken(owner);
+    initializationIdx = reg.addImport('static_ready_java_lang_System', [], [T.i32],
+      () => token.initialized ? 1 : 0);
+    (reg.staticInitializationGuards ||= new Set()).add(owner);
+  }
+  const params = [T.ref, T.i32, T.ref, T.i32, T.i32];
+  return {params, partial:false, writes:null, initializationIdx,
+    idx:reg.addImport('sys_arraycopy', params, [], (src, srcPos, dst, dstPos, len) =>
+      native(jvm, null, [src, srcPos, dst, dstPos, len]))};
+}
+
 module.exports = {
   arrayTracer,
   addI32ArrayLoadImports,
@@ -546,6 +583,7 @@ module.exports = {
   addFieldImport,
   addMathImport,
   addTimeImport,
+  addSystemImport,
   addNewArrayImport,
   addANewArrayImport,
   addNewImport,

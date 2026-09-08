@@ -408,6 +408,13 @@ function enumerateFieldKeys(fields) {
 // The field map for a fresh instance: slab-backed when the class is eligible,
 // otherwise the plain defaulted map. Every allocation site calls this.
 function newFields(jvm, className) {
+  if (jvm.wasmFieldClasses?.has(className)) {
+    const selectedLayout = slabLayoutFor(jvm, className);
+    if (selectedLayout) {
+      const fields = makeSlabFields(jvm, selectedLayout);
+      if (fields) return fields;
+    }
+  }
   const denseLayout = denseLayoutFor(jvm, className);
   if (denseLayout) return makeDenseFields(denseLayout);
   const layout = slabLayoutFor(jvm, className);

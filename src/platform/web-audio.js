@@ -37,10 +37,14 @@ class JVMSourceDataLineProcessor extends AudioWorkletProcessor {
     this.chunks = [];
     this.chunkOffset = 0;
     this.queuedFrames = 0;
+    this.consumedFrames = 0;
     this.phase = 0;
-    this.current = null;
-    this.next = null;
+    this.current = new Float32Array(this.channels);
+    this.next = new Float32Array(this.channels);
     this.started = false;
+    this.hasPlayed = false;
+    // Lifetime output-domain counter. Flush resets playback, not diagnostics.
+    this.missingOutputFrames = 0;
     this.generation = 0;
     this.reportCountdown = 0;
     this.port.onmessage = event => {
@@ -53,62 +57,67 @@ class JVMSourceDataLineProcessor extends AudioWorkletProcessor {
         this.chunks.length = 0;
         this.chunkOffset = 0;
         this.queuedFrames = 0;
-        this.current = this.next = null;
+        this.consumedFrames = 0;
         this.started = false;
+        this.hasPlayed = false;
         this.phase = 0;
       }
     };
   }
-  readFrame() {
+  readFrame(frame) {
     while (this.chunks.length) {
       const chunk = this.chunks[0];
       if (this.chunkOffset + this.channels <= chunk.length) {
-        const frame = new Float32Array(this.channels);
         for (let channel = 0; channel < this.channels; channel++)
           frame[channel] = chunk[this.chunkOffset + channel];
         this.chunkOffset += this.channels;
         this.queuedFrames = Math.max(0, this.queuedFrames - 1);
+        this.consumedFrames++;
         if (this.chunkOffset >= chunk.length) {
           this.chunks.shift();
           this.chunkOffset = 0;
         }
-        return frame;
+        return true;
       }
       this.chunks.shift();
       this.chunkOffset = 0;
     }
-    return null;
+    return false;
   }
   process(inputs, outputs) {
     const output = outputs[0];
     if (!this.started && this.queuedFrames >= this.startFrames) {
-      this.current = this.readFrame();
-      this.next = this.readFrame();
-      this.started = Boolean(this.current && this.next);
+      this.started = this.readFrame(this.current) && this.readFrame(this.next);
+      if (this.started) this.hasPlayed = true;
     }
+    let renderedFrames = 0;
     for (let frame = 0; frame < output[0].length; frame++) {
-      if (!this.started || !this.current || !this.next) break;
+      if (!this.started) break;
       for (let channel = 0; channel < output.length; channel++) {
         const sourceChannel = Math.min(channel, this.channels - 1);
         output[channel][frame] = this.current[sourceChannel] +
           (this.next[sourceChannel] - this.current[sourceChannel]) * this.phase;
       }
       this.phase += this.ratio;
+      renderedFrames++;
       while (this.phase >= 1) {
         this.phase -= 1;
+        const previous = this.current;
         this.current = this.next;
-        this.next = this.readFrame();
-        if (!this.next) {
-          this.port.postMessage({type: "underrun"});
+        this.next = previous;
+        if (!this.readFrame(this.next)) {
+          this.port.postMessage({type: "underrun", generation: this.generation});
           this.started = false;
-          this.current = null;
           break;
         }
       }
     }
+    if (this.hasPlayed) this.missingOutputFrames += output[0].length - renderedFrames;
     if (--this.reportCountdown <= 0) {
       this.reportCountdown = 16;
-      this.port.postMessage({type: "queue", frames: this.queuedFrames});
+      this.port.postMessage({type: "queue", frames: this.queuedFrames,
+        missingOutputFrames: this.missingOutputFrames,
+        consumedFrames: this.consumedFrames, generation: this.generation});
     }
     return true;
   }
@@ -182,17 +191,14 @@ registerProcessor("jvm-source-data-line", JVMSourceDataLineProcessor);`;
       this.bufferSize = Math.max(1, Number(options.bufferSize) || 4096);
       this.bytesPerFrame = Math.max(1, options.channels || 1) *
         Math.max(1, (options.bitDepth || 16) / 8);
-      // Native SourceDataLine producers may fill a large device buffer on a
-      // dedicated Java thread. Browser JVM threads share the UI host thread,
-      // so advertising an empty 64 KiB line can make one producer decode and
-      // submit dozens of PCM regions before rendering runs again. Expose a
-      // bounded immediately-writable window while retaining the line's real
-      // occupancy and capacity underneath. Twenty-five milliseconds is enough
-      // to seed WebAudio without turning startup/catch-up into a long task;
-      // lines at or below 8 KiB preserve their exact negotiated behavior.
+      // Bound refill bursts while guest threads share the browser thread.
+      // Caveat: producers that derive occupancy from available() see this
+      // conservative window as queued data. Removing the window regresses
+      // frame pacing in the current runtime; it needs a coordinated mixer /
+      // scheduling fix, not an unconditional full-capacity advertisement.
       const bytesPerSecond = Math.max(1,
         Number(options.sampleRate) || 44100) * this.bytesPerFrame;
-      this.producerWindowBytes = this.bufferSize <= 8192
+      this.producerWindowBytes = options.cooperativeRefill === true || this.bufferSize <= 8192
         ? this.bufferSize
         : Math.min(this.bufferSize, Math.max(2048,
           Math.ceil(bytesPerSecond * 0.025)));
@@ -230,9 +236,12 @@ registerProcessor("jvm-source-data-line", JVMSourceDataLineProcessor);`;
       this.decodedFrames = 0;
       this.underruns = 0;
       this.underrunSeconds = 0;
+      this.workletMissingOutputFrames = 0;
       this.forceMono = options.forceMono === true || forceMonoByQuery;
       this.workletNode = null;
       this.workletQueuedFrames = 0;
+      this.workletSubmittedFrames = 0;
+      this.workletConsumedFrames = 0;
       this.workletGeneration = 0;
       // Long-lived music benefits from an ~80 ms cushion, but short-lived
       // effect lines often contain only one coalesced region. Requiring the
@@ -262,11 +271,35 @@ registerProcessor("jvm-source-data-line", JVMSourceDataLineProcessor);`;
               },
             });
           this.workletNode.port.onmessage = event => {
-            if (event.data && event.data.type === "queue") {
-              this.workletQueuedFrames = Math.max(0,
-                Number(event.data.frames) || 0);
+            const message = event.data;
+            if (!message) return;
+            if (message.type === "queue") {
+              // Lifetime gap accounting is independent of generation-local
+              // occupancy. A late pre-flush report still records real silence.
+              const missing = message.missingOutputFrames;
+              if (Number.isInteger(message.generation) && message.generation >= 0 &&
+                  message.generation <= this.workletGeneration &&
+                  Number.isSafeInteger(missing) && missing >= this.workletMissingOutputFrames) {
+                const gap = (missing - this.workletMissingOutputFrames) / this.context.sampleRate;
+                this.workletMissingOutputFrames = missing;
+                this.underrunSeconds += gap;
+                underrunSeconds += gap;
+              }
+              if (message.generation !== this.workletGeneration) return;
+              const consumed = Number(message.consumedFrames);
+              if (!Number.isSafeInteger(consumed) || consumed < this.workletConsumedFrames ||
+                  consumed > this.workletSubmittedFrames) return;
+              this.workletConsumedFrames = consumed;
+              // Reports were created on another thread, potentially before
+              // more PCM was submitted here. Never overwrite pending writes
+              // with that stale absolute queue length.
+              this.workletQueuedFrames = this.workletSubmittedFrames - consumed;
               this.maybeFlushDrainCallbacks();
-            } else if (event.data && event.data.type === "underrun") {
+            } else if (message.type === "underrun" &&
+                Number.isInteger(message.generation) && message.generation >= 0 &&
+                message.generation <= this.workletGeneration) {
+              // A late event still describes a real gap in a previous stream.
+              // Preserve lifetime diagnostics; only stale occupancy is ignored.
               this.underruns += 1;
               underrunCount += 1;
             }
@@ -311,7 +344,14 @@ registerProcessor("jvm-source-data-line", JVMSourceDataLineProcessor);`;
       this.stagedChunks.push(new Uint8Array(bytes));
       this.stagedByteLength += bytes.length;
       this.stagedFrames += frameCount;
-      if (this.stagedFrames >= this.coalesceFrames) {
+      const urgentFrames = Math.max(this.coalesceFrames,
+        (this.options.sampleRate || this.context.sampleRate || 44100) *
+          this.coalesceDelayMs / 1000);
+      if (this.stagedFrames >= this.coalesceFrames ||
+          this.workletNode && this.workletQueuedFrames <= urgentFrames) {
+        // The worklet already has a continuous resampler. Holding a partial
+        // region for the fallback's coalescing timer can starve it despite
+        // playable PCM already waiting on this thread.
         this.scheduleStaged();
       } else if (this.stageTimer === null && this.coalesceDelayMs > 0) {
         this.stageTimer = setTimeout(() => {
@@ -469,6 +509,7 @@ registerProcessor("jvm-source-data-line", JVMSourceDataLineProcessor);`;
         }
       }
       this.decodedFrames += frames;
+      this.workletSubmittedFrames += frames;
       this.workletQueuedFrames += frames;
       this.workletNode.port.postMessage({
         type: "pcm", generation: this.workletGeneration, frames,
@@ -641,6 +682,8 @@ registerProcessor("jvm-source-data-line", JVMSourceDataLineProcessor);`;
       if (this.workletNode) {
         this.workletGeneration += 1;
         this.workletQueuedFrames = 0;
+        this.workletSubmittedFrames = 0;
+        this.workletConsumedFrames = 0;
         this.workletNode.port.postMessage({
           type: "flush", generation: this.workletGeneration,
         });

@@ -1,4 +1,5 @@
 const Stack = require("./stack");
+const AudioRefillPolicy = require("./AudioRefillPolicy");
 const { StaticFieldStore } = require("./StaticFieldStore");
 const CallStack = require("./callStack");
 const { releaseFrameMonitor } = CallStack;
@@ -254,6 +255,16 @@ class JVM {
     // are superclass-first so compiled fieldrefs can embed one numeric slot.
     this.denseInstanceFields = options.denseInstanceFields === true ||
       env.JVM_DENSE_INSTANCE_FIELDS === '1';
+    if (options.wasmFieldClasses !== undefined &&
+        (!Array.isArray(options.wasmFieldClasses) ||
+          options.wasmFieldClasses.some(name => typeof name !== 'string' || !name))) {
+      throw new TypeError('wasmFieldClasses must be an array of class names');
+    }
+    // Incremental heap migration: selected classes prefer slab storage while
+    // other guest classes retain their existing dense/plain representation.
+    this.wasmFieldClasses = options.wasmFieldClasses === undefined
+      ? null : new Set(options.wasmFieldClasses);
+    this.audioRefillPolicy = options.audioRefillScheduling === true ? new AudioRefillPolicy() : null;
     this.clock = options.clock || createClock({
       fakeTime: options.fakeTime ?? env.JVM_FAKE_TIME,
       fakeTimeStep: options.fakeTimeStep ?? env.JVM_FAKE_TIME_STEP,
@@ -813,6 +824,13 @@ class JVM {
         effectful: true,
         wasm: true,
       });
+      if (this.jit?.singleSiteInlineExperiment) {
+        require('../jit/SingleSiteInlineExperiment').prepare(
+          this.jit, this.jit.singleSiteInlineExperiment);
+      }
+      if (this.jit?.checkedSpanExperiment) {
+        require('../jit/CheckedSpanExperiment').prepare(this.jit, this.jit.checkedSpanExperiment);
+      }
       // Nothing eligible is left to compile, so a later compile would be a
       // stall with no upside.
       //
@@ -838,6 +856,7 @@ class JVM {
     // invocation further down. Set it even when preparation was skipped --
     // opting out of preparation does not make later inline compilation free.
     this.guestStarted = true;
+    this.jit?.markMainStarted?.();
 
     // Initialize the main class before running main method or creating applet
     // This ensures static blocks execute before main method starts
@@ -872,11 +891,6 @@ class JVM {
       mainFrame.locals[0] = this.createStringArray(mainArgs);
       mainThread.callStack.push(mainFrame);
     }
-
-    // The Phase 1 boundary: everything above this point is preparation and
-    // costs nothing; any synchronous JIT compile from here on is a stall and
-    // is counted as postMainSyncCompile* by the JIT (docs/phase1-worker-audit.md).
-    this.jit?.markMainStarted?.();
 
     if (!this.debugManager.debugMode || !this.debugManager.isPaused) {
       await this.execute();
@@ -1461,6 +1475,7 @@ class JVM {
         await this.jit.compileWorker.whenIdle();
       }
       if (compileWasm && this.jit.wasmJit?.enabled) {
+        let wasmProcessed = 0;
         for (const {className, method} of methods) {
           const flags = method.flags || [];
           const preparedWasmUpgrade =
@@ -1473,7 +1488,9 @@ class JVM {
                 preparedWasmUpgrade) &&
               method.name !== "<init>" && method.name !== "<clinit>" &&
               !flags.includes("native") && !flags.includes("abstract") &&
-              !flags.includes("synchronized") && !this.jit.jitDenied(method)) {
+              (!flags.includes("synchronized") ||
+                this.jit.wasmJit.synchronizedInstanceLinksEnabled &&
+                  !flags.includes("static")) && !this.jit.jitDenied(method)) {
             const wasm = this.jit.wasmJit;
             const state = wasm.methodState({method});
             if (state.status === "cold") {
@@ -1482,7 +1499,8 @@ class JVM {
             wasmCompleted += 1;
           }
           if (typeof options.onProgress === "function") {
-            options.onProgress({completed: wasmCompleted, total: methods.length, tier: "wasm"});
+            options.onProgress({completed: ++wasmProcessed, total: methods.length,
+              compiled: wasmCompleted, tier: "wasm"});
           }
           await yieldToEventLoop(0, this.eventLoopYieldStrategy);
         }
@@ -1778,7 +1796,7 @@ class JVM {
 
   _prepareSchedulerTick() {
     // On each tick, check for threads that need to be woken up.
-    const audioPriority = this._audioPriority;
+    let audioPriority = this._audioPriority;
     const hasTimedThread = this.threads.some((t) =>
       (t.status === 'SLEEPING' && t.sleepUntil !== undefined) ||
       (t.status === 'WAITING' && t.waitDeadline !== undefined)) ||
@@ -1837,6 +1855,8 @@ class JVM {
 
     // console.error(`Tick. Current thread: ${this.currentThreadIndex}. Statuses: ${this.threads.map(t => `${t.id}:${t.status}`).join(', ')}`);
 
+    if (this.audioRefillPolicy) audioPriority = this.audioRefillPolicy.select(this.threads);
+    let servicingAudio = false;
     if (audioPriority && audioPriority.thread &&
         audioPriority.thread.status === "runnable" &&
         schedulerNow <= audioPriority.until &&
@@ -1844,7 +1864,14 @@ class JVM {
         typeof audioPriority.output.queuedSeconds === "function" &&
         audioPriority.output.queuedSeconds() < 0.12) {
       const priorityIndex = this.threads.indexOf(audioPriority.thread);
-      if (priorityIndex >= 0) this.currentThreadIndex = priorityIndex;
+      // Repeated writes can renew this deadline indefinitely while the queue
+      // stays depleted. Audio priority must obey the same bounded fairness
+      // as rendering, or a faster mixer can starve the game's loader.
+      if (priorityIndex >= 0 &&
+          !this._schedulerStarvationRelief(audioPriority.thread)) {
+        this.currentThreadIndex = priorityIndex;
+        servicingAudio = true;
+      }
     } else if (audioPriority) {
       this._audioPriority = null;
     }
@@ -1855,7 +1882,7 @@ class JVM {
     // still run while the animation thread sleeps between frames, matching
     // native JVM concurrency without assigning a workload-specific priority.
     const frameProducer = this._awtFrameProducerThread;
-    if (frameProducer && frameProducer.status === "runnable" &&
+    if (!servicingAudio && frameProducer && frameProducer.status === "runnable" &&
         !this._schedulerStarvationRelief(frameProducer)) {
       const producerIndex = this.threads.indexOf(frameProducer);
       if (producerIndex >= 0) this.currentThreadIndex = producerIndex;

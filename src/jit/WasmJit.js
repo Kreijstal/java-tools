@@ -67,7 +67,7 @@ const {
   denseSlotFor, readField, writeField,
 } = require('../core/objectModel');
 const {
-  addMathImport, addTimeImport, addNewArrayImport, addANewArrayImport,
+  addMathImport, addSystemImport, addNewArrayImport, addANewArrayImport,
   addNewImport, addTypedArrayStoreImports, arrayTracer,
   addI32ArrayLoadImports,
 } = require('./wasmRuntimeImports');
@@ -475,9 +475,10 @@ class MethodTranslator {
     const t = descToWasm(descriptor[0]);
     const jvm = this.jvm;
     if (isStaticOp) {
-      // Resolve eagerly at compile time — if the owning class is not loaded
-      // and initialized yet, the block is demoted rather than risking a
-      // skipped <clinit> at run time.
+      // Resolve the declared storage without running <clinit>. A cold class
+      // already has its store, but its keys are populated by initialization.
+      // The block-entry guard below keeps that lifecycle observable while
+      // allowing ahead-of-guest compilation to retain the static operations.
       let currentClassName = className;
       let container = null;
       let key = null;
@@ -487,6 +488,10 @@ class MethodTranslator {
           const fieldKey = `${fieldName}:${descriptor}`;
           if (cd.staticFields.has(fieldKey)) { container = cd.staticFields; key = fieldKey; break; }
           if (cd.staticFields.has(fieldName)) { container = cd.staticFields; key = fieldName; break; }
+          const declared = cd.ast?.classes?.[0]?.items?.some(item =>
+            item.type === 'field' && item.field?.name === fieldName &&
+            item.field?.descriptor === descriptor && item.field.flags?.includes('static'));
+          if (declared) { container = cd.staticFields; key = fieldKey; break; }
         }
         currentClassName = cd && cd.ast && cd.ast.classes[0] ? cd.ast.classes[0].superClassName : null;
       }
@@ -498,6 +503,14 @@ class MethodTranslator {
           `${className}.${fieldName}:${descriptor}`);
       }
       const name = `${isGet ? 'gs' : 'ps'}_${className}_${fieldName}`.replace(/[^\w]/g, '_');
+      let initializationIdx = null;
+      if (jvm.classInitializationState.get(currentClassName) !== 'INITIALIZED') {
+        const token = jvm.getClassInitializationToken(currentClassName);
+        initializationIdx = this.addImport(
+          `static_ready_${currentClassName}`.replace(/[^\w]/g, '_'), [], [T.i32],
+          () => token.initialized ? 1 : 0);
+        (this.staticInitializationGuards ||= new Set()).add(currentClassName);
+      }
       const getStatic = t === T.i32
         ? () => {
           const value = container.get(key);
@@ -508,6 +521,7 @@ class MethodTranslator {
       return {
         t,
         name,
+        initializationIdx,
         idx: isGet
           ? this.addImport(name, [], [t], getStatic)
           : this.addImport(name, [t], [], (v) => container.set(key, v)),
@@ -1904,6 +1918,27 @@ class MethodTranslator {
       pop(); pop(); push(T.i32);
     };
 
+    // Bail out before any effects in a block that needs a cold static owner.
+    // Its entry carry still contains every operand, so even a putstatic
+    // value produced in the previous block survives the initialization exit.
+    const initializationGuards = new Set();
+    for (let i = from; i < to; i++) {
+      const ins = this.items[i].instruction;
+      const op = getOp(ins);
+      if (op === 'invokestatic' && ins.arg?.[1] === 'java/lang/System') {
+        const {initializationIdx} = addSystemImport(this, this.jvm, ins);
+        if (initializationIdx != null) initializationGuards.add(initializationIdx);
+        continue;
+      }
+      if (op !== 'getstatic' && op !== 'putstatic') continue;
+      const {initializationIdx} = this.fieldImports(ins, true, op === 'getstatic');
+      if (initializationIdx != null) initializationGuards.add(initializationIdx);
+    }
+    for (const idx of initializationGuards) {
+      emit(OP.call, ...uleb(idx), OP.i32_eqz, OP.if, 0x40,
+        ...this.exitStub(b), OP.end);
+    }
+
     // Charge fuel per basic block. Carry locals already contain this block's
     // entry stack, so a fuel exit can materialize the interpreter frame before
     // the values are reloaded onto the wasm operand stack.
@@ -2099,7 +2134,8 @@ class MethodTranslator {
         } catch (err) {
           if (!(err instanceof Unsupported)) throw err;
           try {
-            bound = addTimeImport(this, this.jvm, ins);
+            bound = addSystemImport(this, this.jvm, ins);
+            if (bound.writes === null) writes = null;
           } catch (err2) {
             if (!(err2 instanceof Unsupported)) throw err2;
             const pcount = parseMethodDescriptor(ins.arg[2][1]).params.length;
@@ -2386,7 +2422,7 @@ class MethodTranslator {
       // instance-dispatch sites can deopt at runtime (dispatch-map miss or
       // partial target), so callers must give this module a real frame and
       // the NestedDeopt protocol even when it is fully compiled
-      deoptableCalls: this.instanceSites || 0,
+      deoptableCalls: (this.instanceSites || 0) + (this.staticInitializationGuards?.size || 0),
       directLinks: this.directLinks || 0,
       // Speculative monomorphic direct links bake the compile-time cone;
       // prepare()'s gate revalidates these on entry and re-arms specok.
@@ -2409,6 +2445,17 @@ class WasmJit {
   constructor(jvm, jit) {
     this.jvm = jvm;
     this.jit = jit;
+    this.activeThread = null;
+    this.synchronizedInstanceLinksEnabled =
+      jvm.jitOptions?.wasmSynchronizedInstanceLinks === true;
+    this.normalFlowPreparedUpgradesEnabled =
+      jvm.jitOptions?.wasmNormalFlowPreparedUpgrades === true;
+    const compileClasses = jvm.jitOptions?.wasmCompileClasses;
+    if (compileClasses !== undefined && (!Array.isArray(compileClasses) ||
+        compileClasses.some(name => typeof name !== 'string' || !name))) {
+      throw new TypeError('wasmCompileClasses must be an array of class names');
+    }
+    this.compileClassFilter = compileClasses === undefined ? null : new Set(compileClasses);
     const env = (typeof process !== 'undefined' && process.env) || {};
     const browserDefault = typeof window !== 'undefined' && typeof document !== 'undefined';
     // Embedders (the browser bundle has an empty process.env) switch the
@@ -2716,6 +2763,8 @@ class WasmJit {
   // shared gating/warmup/compile; returns {st, blk} when the frame can run now
   prepare(frame) {
     if (!this.enabled || !frame || !frame.method || !frame.instructions) return null;
+    if (this.compileClassFilter &&
+        !this.compileClassFilter.has(frame.className || frame.method.className)) return null;
     // Object construction and class initialization have observable all-or-
     // nothing ordering. A partial Wasm exit around new/invokespecial can leave
     // an allocated object visible without having run the rest of <init>.
@@ -3062,6 +3111,14 @@ class WasmJit {
   }
 
   compile(frame, st, options = {}) {
+    // Restrict an incremental migration without disabling the JS/interpreter
+    // tiers. Check direct/callee compilation as well as normal frame entry.
+    if (this.compileClassFilter &&
+        !this.compileClassFilter.has(frame.className || frame.method?.className)) {
+      st.status = 'failed';
+      st.failReason = st.lastCompileError = 'class-filter';
+      return;
+    }
     // Every entry path lands here, so this is where the post-main question is
     // answerable for all of them rather than for the one `prepare` guards.
     const entryPath = options.entryPath ||
@@ -3597,6 +3654,10 @@ class WasmJit {
   }
 
   execute(frame, thread, st, blk, nested = false, osr = false) {
+    if (frame.isSynchronizedMethod && !frame.monitorEntered &&
+        !this.jvm.enterFrameMonitorIfNeeded(frame, thread)) {
+      return {handled:true};
+    }
     const mod = osr && st.osr ? st.osr : st;
     const meta = mod.meta;
     // Diagnostic: a structured fuel/deopt exit writes back only the slots its
@@ -3648,6 +3709,8 @@ class WasmJit {
     st.runs += 1;
     this.runCount += 1;
     let status;
+    const previousThread = this.activeThread;
+    this.activeThread = thread;
     try {
       status = mod.run(...args);
     } catch (err) {
@@ -3668,6 +3731,8 @@ class WasmJit {
         return { handled: true, deopted: true };
       }
       throw err;
+    } finally {
+      this.activeThread = previousThread;
     }
 
     if (this.traceMethodPattern && st.key &&
@@ -4073,13 +4138,14 @@ class WasmJit {
   // recursion through one site already gets a throwaway frame under the
   // partial-callee protocol. The site still counts as deoptable, so callers
   // link this module under that same protocol.
-  selfLinkState(method, className, implClassName, name, descriptor) {
+  selfLinkState(method, className, implClassName, name, descriptor, allowSynchronized = false) {
     if (!method || implClassName !== className || method.name !== name ||
         method.descriptor !== descriptor) return null;
-    if ((method.flags || []).includes('synchronized')) return null;
+    if ((method.flags || []).includes('synchronized') && !allowSynchronized) return null;
     const st = this.state.get(method);
     if (!st || st.status !== 'compiling') return null;
     if (!st.method) st.method = method;
+    st.synchronized = (method.flags || []).includes('synchronized');
     st.targetClassName = className;
     return st;
   }
@@ -4088,7 +4154,7 @@ class WasmJit {
   // No <clinit> gate: an instance method only runs on an existing object,
   // whose class was initialized at instantiation, so linking cannot bypass
   // an observable class initializer.
-  findReadyInstance(className, name, descriptor) {
+  findReadyInstance(className, name, descriptor, allowSynchronized = false) {
     const cd = this.jvm.classes[className];
     const clsAst = cd && cd.ast && cd.ast.classes[0];
     if (!clsAst) return null;
@@ -4098,10 +4164,11 @@ class WasmJit {
     const flags = method.flags || [];
     if (flags.includes('static') || flags.includes('abstract') || flags.includes('native')) return null;
     // See findReadyStatic: a linked call has no frame, so it has no monitor.
-    if (flags.includes('synchronized')) return null;
+    if (flags.includes('synchronized') && !allowSynchronized) return null;
     let st = this.state.get(method);
     if (!st) st = this.methodState({ method });
     if (!st.method) st.method = method;
+    st.synchronized = flags.includes('synchronized');
     st.targetClassName = className;
     if (st.status === 'cold' && !this.noOnDemandCalleeCompile && this.calleeRetryAllowed(st)) {
       this.compile({ method, className }, st,
@@ -4159,7 +4226,8 @@ class WasmJit {
   // transitive field writes are covered by the cache kills already emitted
   // in the caller; otherwise retain the original deopt-before-side-effects
   // behavior. `null` means the caller already kills every field cache.
-  resolveLateInstanceTarget(owner, name, descriptor, runtimeClass, allowedWrites) {
+  resolveLateInstanceTarget(owner, name, descriptor, runtimeClass, allowedWrites,
+    allowSynchronized = false) {
     if (!this.lateInstanceTargetsEnabled) return null;
     this.lateInstanceTargetAttempts += 1;
     const resolved = this.hierarchy.resolveDispatch(owner, name, descriptor);
@@ -4174,7 +4242,7 @@ class WasmJit {
       this.lateInstanceTargetWriteRejects += 1;
       return null;
     }
-    const st = this.findReadyInstance(impl.className, name, descriptor);
+    const st = this.findReadyInstance(impl.className, name, descriptor, allowSynchronized);
     if (!st) {
       this.lateInstanceTargetNotReady += 1;
       return null;
@@ -4186,6 +4254,27 @@ class WasmJit {
     }
     this.lateInstanceTargetInstalls += 1;
     return st;
+  }
+
+  // A synchronized linked instance call owns a real frame even when its
+  // body is complete. Contention exits at entry with the original arguments;
+  // continuations retain the monitor until CallStack.pop retires the frame.
+  runSynchronizedInstance(mod, frame, wasmArgs, javaArgs, argPosBySlot) {
+    for (const [slot, pos] of argPosBySlot) frame.locals[slot] = javaArgs[pos];
+    const thread = this.activeThread;
+    if (!thread || !this.jvm.enterFrameMonitorIfNeeded(frame, thread)) return 0;
+    let status;
+    try {
+      status = mod.run(...wasmArgs);
+      return status;
+    } catch (error) {
+      // NestedDeopt transfers the live activation, including its lock, to
+      // the scheduler. An uncaught exception instead retires this activation.
+      if (!(error instanceof NestedDeopt)) this.jvm.exitFrameMonitor(frame);
+      throw error;
+    } finally {
+      if (status === -1) this.jvm.exitFrameMonitor(frame);
+    }
   }
 
   dumpStats() {

@@ -17,7 +17,7 @@ function field(name, descriptor) {
   };
 }
 
-function denseJvm() {
+function denseJvm(options = {}) {
   const jvm = new JVM({
     denseInstanceFields: true,
     // These cases compile synthetic methods that exist only in this test's AST,
@@ -25,6 +25,7 @@ function denseJvm() {
     // with no class file behind it, and getGeneratedFunction returns null once
     // the worker accepts a method, so codegen assertions must compile in-thread.
     jit: { warmupThreshold: 0, profileMethods: false, compileWorker: false },
+    ...options,
   });
   jvm.classes.DenseBase = {
     staticFields: new Map(),
@@ -71,6 +72,35 @@ test('interpreter getfield and putfield preserve dense inherited storage', (t) =
   frame.stack.push(object);
   objectHandlers.getfield(frame, instruction, jvm);
   t.equal(frame.stack.pop(), 37, 'getfield reads the same numeric slot');
+  t.end();
+});
+
+test('selected heap classes coexist with dense inherited objects', (t) => {
+  const jvm = denseJvm({ wasmHeap: true, wasmFields: true,
+    wasmFieldClasses: ['DenseChild'] });
+  const base = newFields(jvm, 'DenseBase');
+  const child = newFields(jvm, 'DenseChild');
+  t.ok(Array.isArray(base), 'unselected base keeps dense storage');
+  t.notOk(Array.isArray(child), 'selected child uses heap-backed storage');
+  const functions = [];
+  const registry = { importIndexByName: new Map(),
+    addImport(name, params, results, fn) {
+      functions.push(fn); return functions.length - 1;
+    } };
+  const instruction = { arg: ['Field', 'DenseBase', ['value', 'I']] };
+  const getter = addFieldImport(registry, jvm, instruction, false, true);
+  const setter = addFieldImport(registry, jvm, instruction, false, false);
+  for (const [name, fields] of [['DenseBase', base], ['DenseChild', child]]) {
+    const object = { type: name, _className: name, fields };
+    writeField(fields, 'DenseBase.value', 31);
+    t.equal(functions[getter.idx](object), 31, name + ' imported inherited read');
+    functions[setter.idx](object, 47);
+    t.equal(readField(fields, 'DenseBase.value'), 47, name + ' imported inherited write');
+  }
+  const fallback = denseJvm({ wasmHeap: false, wasmFields: true,
+    wasmFieldClasses: ['DenseChild'] });
+  t.ok(Array.isArray(newFields(fallback, 'DenseChild')), 'heap-disabled selection falls back');
+  t.throws(() => denseJvm({ wasmFieldClasses: 'DenseChild' }), /wasmFieldClasses/);
   t.end();
 });
 
