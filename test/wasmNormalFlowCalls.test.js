@@ -5,6 +5,7 @@ const {JVM}=require('../src/core/jvm');
 const Compiler=require('../src/jit/StructuredWasmCompiler');
 const Frame=require('../src/core/frame'),CallStack=require('../src/core/callStack');
 const {newFields,makeObjectRef,writeField,readField}=require('../src/core/objectModel');
+const {supportsWasmTryTable}=require('../src/jit/wasmShared');
 test('complete normal-flow selection retains canonical exception handling',async t=>{
  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'wasm-normal-flow-'));
  t.teardown(()=>fs.rmSync(dir,{recursive:true,force:true}));
@@ -28,6 +29,13 @@ test('complete normal-flow selection retains canonical exception handling',async
  const helperState=wasm.methodState({method:m});wasm.compile({className:owner,method:m},helperState);
  const protectedMethod=await j.findMethodInHierarchy(owner,'protectedMix','(LWasmNormalFlowCalls;[II)I');
  const state=wasm.methodState({method:protectedMethod});wasm.compile({className:owner,method:protectedMethod},state,{asCallee:true});
+ if(!supportsWasmTryTable()){
+   // Without try_table every block a handler covers demotes, and a body that
+   // is nothing but a try has no compiled block left: the exception-table
+   // half of this test needs the EH tier.
+   t.notEqual(state.status,'ready','an engine without try_table does not compile the protected caller');
+   t.end();return;
+ }
  t.equal(state.status,'ready',state.lastCompileError||'the protected caller compiles');
  if(!state.meta){t.end();return;}
  t.notOk(state.meta.fullyCompiled,'an exception table does not become full coverage');

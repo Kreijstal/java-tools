@@ -6,6 +6,7 @@ const {JVM}=require('../src/core/jvm');
 const Frame=require('../src/core/frame');
 const CallStack=require('../src/core/callStack');
 const {newFields,makeObjectRef}=require('../src/core/objectModel');
+const {supportsWasmTryTable}=require('../src/jit/wasmShared');
 
 test('compiled synchronized instance calls preserve monitor ownership',async t=>{
  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'wasm-sync-calls-'));
@@ -82,12 +83,18 @@ test('compiled synchronized instance calls preserve monitor ownership',async t=>
  t.equal(thrown?.type,'java/lang/NullPointerException','an uncaught exception propagates');
  t.equal(object.isLocked,false,'an uncaught exception releases the monitor');
 
- const catching=await compile('catching','(LWasmSynchronizedCalls;[I)I');
- const handled=invoke(catching,[object,null]);
- t.equal(handled.thread.callStack.peek().method.name,'caught','the handler retains the callee frame');
- t.equal(object.isLocked,true,'the monitor is retained through a caught exception');
- handled.thread.callStack.pop();
- t.equal(object.isLocked,false,'retiring the handler frame releases the monitor');
+ // A callee whose body is one try block needs the EH tier; without try_table
+ // every covered block demotes and nothing is left to compile.
+ if(supportsWasmTryTable()){
+   const catching=await compile('catching','(LWasmSynchronizedCalls;[I)I');
+   const handled=invoke(catching,[object,null]);
+   t.equal(handled.thread.callStack.peek().method.name,'caught','the handler retains the callee frame');
+   t.equal(object.isLocked,true,'the monitor is retained through a caught exception');
+   handled.thread.callStack.pop();
+   t.equal(object.isLocked,false,'retiring the handler frame releases the monitor');
+ }else{
+   t.comment('engine without try_table: the caught-exception callee is skipped');
+ }
 
  const parking=await compile('parking','(LWasmSynchronizedCalls;I)I');
  const saved=value;

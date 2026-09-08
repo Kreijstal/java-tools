@@ -43,7 +43,11 @@ test('Wasm field imports support direct-property JRE objects', (t) => {
 
 function assertEhTierOrFallback(t, state) {
   if (WASM_TRY_TABLE_SUPPORTED) return true;
-  t.notOk(state && state.meta,
+  // Without try_table the compiler still installs a module: the blocks a live
+  // handler range covers demote to exit stubs and the interpreter runs them.
+  // What must never happen is an EH body (try_table/catch_all) on an engine
+  // that cannot validate one.
+  t.notOk(state && state.meta && state.meta.usedEh,
     'engine without try_table support preserves semantics through fallback');
   return false;
 }

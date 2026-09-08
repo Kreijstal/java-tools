@@ -1790,6 +1790,34 @@ function updateDebugDisplay() {
                 editor.session.removeMarker(editor.__executionMarkerId);
                 editor.__executionMarkerId = null;
               }
+              editor.__executionMarkerRow =
+                currentExecutionLine === -1 ? null : currentExecutionLine;
+              if (!editor.__executionMarkerResizeHook) {
+                // A hidden panel (an inactive GoldenLayout tab, a collapsed
+                // workspace) has no height, so the scrollToLine below cannot
+                // bring the execution line into view. When the editor later
+                // gets its size back, scroll to the line it still marks.
+                // Ace signals "resize" before it has re-laid the viewport
+                // (its line height and visible rows are still the hidden
+                // layout's), so the scroll itself waits for the render that
+                // follows the resize.
+                editor.__executionMarkerResizeHook = true;
+                editor.renderer.on("resize", () => {
+                  if (editor.__executionMarkerRow != null) {
+                    editor.__executionMarkerScrollPending = true;
+                  }
+                });
+                editor.renderer.on("afterRender", () => {
+                  if (!editor.__executionMarkerScrollPending) return;
+                  editor.__executionMarkerScrollPending = false;
+                  const row = editor.__executionMarkerRow;
+                  if (row == null) return;
+                  if (row < editor.renderer.getFirstVisibleRow() ||
+                      row > editor.renderer.getLastVisibleRow()) {
+                    editor.renderer.scrollToLine(row, true, false);
+                  }
+                });
+              }
               if (currentExecutionLine !== -1) {
                 editor.session.setBreakpoint(
                   currentExecutionLine,

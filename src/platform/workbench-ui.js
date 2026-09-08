@@ -902,6 +902,25 @@
     }
   }
 
+  // The class files a decompiled document's source refers to by name, so the
+  // recompile can resolve sibling types the way javac's -cp would. The source
+  // replaces one class of a set (an outer class next to its member classes,
+  // a sample next to the classes it depends on), and that set lives in the
+  // directory the backing class was loaded from.
+  function siblingClasspath(document) {
+    const backing = logicalDocument(document);
+    const classPath = backing && backing.backingClassPath;
+    const provider = window.jvmDebug && window.jvmDebug.fileProvider;
+    if (!classPath || !provider || typeof provider.resolveVirtualPath !== "function") {
+      return [];
+    }
+    const resolved = provider.resolveVirtualPath(classPath);
+    if (!resolved) return [];
+    const normalized = `/${String(resolved).replace(/\\/g, "/").replace(/^\/+/, "")}`;
+    const slash = normalized.lastIndexOf("/");
+    return [slash > 0 ? normalized.slice(0, slash) : "/"];
+  }
+
   async function compileSource(options = {}) {
     captureActiveDocument();
     const sourceDocument = activeDocument();
@@ -923,6 +942,7 @@
           sourceRoot: "/src",
           outputDir: "/classes",
           sourceLevel: "8",
+          classpath: siblingClasspath(sourceDocument),
         },
       );
       workbenchState.compiledArtifacts = result.artifacts;

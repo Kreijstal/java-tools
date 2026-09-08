@@ -7,6 +7,7 @@ const {execFileSync} = require('child_process');
 const {JVM} = require('../src/core/jvm');
 const Frame = require('../src/core/frame');
 const Stack = require('../src/core/stack');
+const {supportsWasmTryTable} = require('../src/jit/wasmShared');
 
 for (const structured of [false, true]) {
  test(`bulk native stays in compiled execution (structured=${structured})`, async t => {
@@ -59,6 +60,13 @@ for (const structured of [false, true]) {
     const backward=invoke(method,state,[overlap,1,overlap,0,3]);
     t.equal(backward.result.returned,true,'reverse overlap stays compiled');
     t.deepEqual(Array.from(overlap),[1,2,3,3],'backward overlap is exact');
+  }
+  // The wrapper's handlers are an EH-tier feature: without try_table the
+  // guest exception leaves the compiled body as a host throw for the caller's
+  // dispatcher, and there is no in-module handler exit to drive here.
+  if (!supportsWasmTryTable()) {
+    t.comment('engine without try_table: the exception wrapper is skipped');
+    t.end();return;
   }
   const catches=await jvm.findMethodInHierarchy('WasmBulkCopy','caught','([I[II)I');
   const catchState=wasm.methodState({method:catches});
