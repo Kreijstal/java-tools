@@ -3233,7 +3233,12 @@ class JitCompiler {
   // wrong-value bug, which is how a dropped region call site produced the
   // void sentinel as an array index.
   static get transportOptionalKeys() {
-    return new Set(["jvmRestoringDirectPositionalInsertion"]);
+    // Keys a receiving JIT reads only while compiling a *caller*, where their
+    // absence means "do not insert this callee lexically" and the caller
+    // calls the transported body instead. Neither can cross as data: both
+    // close over the compile's own statement fragments.
+    return new Set(["jvmRestoringDirectPositionalInsertion",
+      "jvmCheckedLeafInlineBody"]);
   }
 
   static get transportableSiteTables() {

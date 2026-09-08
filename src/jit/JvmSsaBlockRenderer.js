@@ -12434,16 +12434,18 @@ class JvmSsaBlockRenderer {
       }
       return lines.join("\n");
     };
-    const fieldReadCacheDeclarations = [
-      ...(fieldReadCaches.size > 0
+    const fieldReadCacheDeclarationsFor = (caches) => [
+      ...(caches.length > 0
         ? [letDecl(named("ssaFieldCacheEpoch"), e`1`)] : []),
-      ...[...fieldReadCaches.values()].flatMap((cache) => [
+      ...caches.flatMap((cache) => [
         letDecl(cache.object, e`null`),
         letDecl(cache.value),
         letDecl(cache.valid, e`0`),
         ...(cache.isArray ? [letDecl(cache.data, e`null`)] : []),
       ]),
     ];
+    const fieldReadCacheDeclarations =
+      fieldReadCacheDeclarationsFor([...fieldReadCaches.values()]);
     const fieldCacheInvalidationHelperDeclarations =
       fieldCacheInvalidationHelperUsed ? [
         recordStatement(["function ssaInvalidateFieldCaches() {"],
@@ -12609,6 +12611,19 @@ class JvmSsaBlockRenderer {
           e`) `), CHECKED_LEAF_BAIL_VALUE),
       );
     }
+    // The initializations above bind every eager cache -- one whose receiver
+    // is an entry reference -- as a constant read once at entry. A cache
+    // whose receiver is a value the tree itself computes (the second read of
+    // `this.a.b`) keeps its epoch-stamped form in the rendered tree, so the
+    // checked-leaf bodies need the same declarations the scheduler-entry and
+    // restoring bodies carry for it. A checked leaf makes no call and
+    // performs no field write, so its epoch never advances: every such cache
+    // is simply cold at entry and fills on its first read.
+    const transactionalEagerFieldCacheSet =
+      new Set(transactionalEagerFieldCaches);
+    const transactionalFieldReadCacheDeclarations =
+      fieldReadCacheDeclarationsFor([...fieldReadCaches.values()]
+        .filter((cache) => !transactionalEagerFieldCacheSet.has(cache)));
     const guardedStaticBooleanConditions = (direct) => exprConcat(
       e`((`,
       direct.cellVariable
@@ -15320,9 +15335,11 @@ class JvmSsaBlockRenderer {
                 ...invariantPositionalCallDeclarations,
                 ...checkedLeafEntryArrayDeclarationsFor(inline),
                 ...persistentStaticArrayDataDeclarations,
-                ...(transactionalAcyclicShape ? [
-                  ...transactionalFieldReadCacheInitializations,
-                ] : []),
+                ...(transactionalAcyclicShape || transactionalAcyclicReadShape
+                  ? [
+                    ...transactionalFieldReadCacheDeclarations,
+                    ...transactionalFieldReadCacheInitializations,
+                  ] : []),
                 checkedLeafArrayDataGuardFor(inline),
                 ...checkedLeafTripDeclarations,
                 ...declarations,
@@ -15529,8 +15546,11 @@ class JvmSsaBlockRenderer {
                   ...checkedLeafEntryLocalDeclarations(),
                   ...checkedLeafEntryArrayDeclarationsFor(inline),
                   ...persistentStaticArrayDataDeclarations,
-                  ...(transactionalAcyclicShape
-                    ? transactionalFieldReadCacheInitializations : []),
+                  ...(transactionalAcyclicShape || transactionalAcyclicReadShape
+                    ? [
+                      ...transactionalFieldReadCacheDeclarations,
+                      ...transactionalFieldReadCacheInitializations,
+                    ] : []),
                   checkedLeafArrayDataGuardFor(inline),
                   ...checkedLeafTripDeclarations,
                   ...declarations,
