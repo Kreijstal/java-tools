@@ -5718,11 +5718,55 @@ function lowerExpressionToJavaIrValue(expression, context) {
       ? { kind: 'ConditionalValue', type: descriptor, condition, consequent, alternate }
       : null;
   }
-  if (expression && expression.kind === 'AssignmentExpression' && expression.operator === '='
-      && expression.left.kind === 'Identifier' && context.localByName.has(expression.left.name)) {
-    const local = context.localByName.get(expression.left.name);
-    const value = coerceValueToDescriptor(lowerExpressionToJavaIrValue(expression.right, context), local.descriptor);
-    return value ? { kind: 'AssignValue', type: local.descriptor, target: local.id, value } : null;
+  if (expression && expression.kind === 'AssignmentExpression') {
+    if (expression.operator === '='
+        && expression.left.kind === 'Identifier' && context.localByName.has(expression.left.name)) {
+      const local = context.localByName.get(expression.left.name);
+      const value = coerceValueToDescriptor(lowerExpressionToJavaIrValue(expression.right, context), local.descriptor);
+      return value ? { kind: 'AssignValue', type: local.descriptor, target: local.id, value } : null;
+    }
+    const target = lowerExpressionToJavaIrValue(expression.left, context);
+    if (target && (target.kind === 'StaticFieldValue' || target.kind === 'FieldValue' || target.kind === 'ArrayLoadValue')) {
+      const rawValue = expression.operator === '='
+        ? lowerExpressionToJavaIrValueAsDescriptor(expression.right, context, target.type)
+        : lowerExpressionToJavaIrValue({
+          kind: 'BinaryExpression',
+          operator: expression.operator.slice(0, -1),
+          left: expression.left,
+          right: expression.right,
+        }, context);
+      const value = coerceValueToDescriptor(rawValue, target.type);
+      if (value && value.type === target.type) {
+        if (target.kind === 'StaticFieldValue') {
+          return {
+            kind: 'AssignStaticFieldValue',
+            type: target.type,
+            owner: target.owner,
+            name: target.name,
+            descriptor: target.descriptor,
+            value,
+          };
+        }
+        if (target.kind === 'FieldValue') {
+          return {
+            kind: 'AssignFieldValue',
+            type: target.type,
+            owner: target.owner,
+            name: target.name,
+            descriptor: target.descriptor,
+            receiver: target.receiver,
+            value,
+          };
+        }
+        return {
+          kind: 'AssignArrayElementValue',
+          type: target.type,
+          array: target.array,
+          index: target.index,
+          value,
+        };
+      }
+    }
   }
   if (expression && expression.kind === 'UnaryExpression') {
     let value = lowerExpressionToJavaIrValue(expression.operand, context);
