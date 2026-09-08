@@ -914,6 +914,7 @@ test('AudioSystem preserves DataLine.Info format for no-arg open', (t) => {
     signed: 1,
     bigEndian: 0,
     bufferSize: 2048,
+    cooperativeRefill: false,
   }, 'no-arg open creates the concrete output with the negotiated format');
   t.ok(line.isOpen, 'the line is open after the inherited Java Sound sequence');
   t.end();
