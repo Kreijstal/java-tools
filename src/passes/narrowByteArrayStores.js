@@ -1,5 +1,7 @@
 'use strict';
 
+const { parameterDescriptorsOrEmpty: parseParameterDescriptors } = require('./parameterDescriptors');
+
 function runNarrowByteArrayStores(astRoot) {
   let rewrites = 0;
   for (const cls of astRoot.classes || []) {
@@ -136,26 +138,6 @@ function parameterLocals(method, descriptor) {
     local += (desc === 'J' || desc === 'D') ? 2 : 1;
   }
   return out;
-}
-
-function parseParameterDescriptors(descriptor) {
-  const close = descriptor.indexOf(')');
-  if (!descriptor.startsWith('(') || close < 0) return [];
-  const params = [];
-  for (let i = 1; i < close;) {
-    const start = i;
-    while (descriptor[i] === '[') i += 1;
-    if (descriptor[i] === 'L') {
-      const semi = descriptor.indexOf(';', i);
-      if (semi < 0 || semi > close) return params;
-      params.push(descriptor.slice(start, semi + 1));
-      i = semi + 1;
-    } else {
-      params.push(descriptor.slice(start, i + 1));
-      i += 1;
-    }
-  }
-  return params;
 }
 
 function op(item) {

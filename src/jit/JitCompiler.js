@@ -10,7 +10,8 @@ const {
 } = require("../instructions/object");
 const WasmJit = require("./WasmJit");
 const JvmSsaBlockRenderer = require("./JvmSsaBlockRenderer");
-const { unboundGeneratedSsaIdentifiers } = JvmSsaBlockRenderer;
+const { unboundGeneratedSsaIdentifiers } =
+  require("./generatedSourceVerifier");
 const HotCallGraphRegionCompiler = require("./HotCallGraphRegionCompiler");
 const monoArray = require("./monoArray");
 const { denseSlotFor, enumerateFieldKeys, hasField, makeObjectRef, newFields, readField, writeField } = require('../core/objectModel');
@@ -30,7 +31,8 @@ const debugConstructorOwners = new Set(
 const { buildSsa } = require("../analysis/opgraph/ssa");
 const { kindWidth } = require("../analysis/opgraph/ssaTypes");
 const { buildCfgFromCode } = require("../decompiler/structurer");
-const { capturesBooleanStatic, isNoOpExceptionHandler } = WasmJit._test;
+const { capturesBooleanStatic, isNoOpExceptionHandler } =
+  require("./wasmShared");
 
 const RETURN_VOID = Symbol("jit.return.void");
 

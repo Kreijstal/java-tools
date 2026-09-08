@@ -22,6 +22,7 @@
 // too large to inline, or the site never reaches the linking path.
 
 const test = require('tape');
+const { makeJavaFixtureCompiler } = require('./javaFixture');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -31,15 +32,7 @@ const Frame = require('../src/core/frame');
 const CallStack = require('../src/core/callStack');
 const WasmLinker = require('../src/jit/WasmLinker');
 
-function compileJavaFixture(t, className, source) {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wasm-link-table-'));
-  t.teardown(() => fs.rmSync(tempDir, { recursive: true, force: true }));
-  const sourcePath = path.join(tempDir, `${className}.java`);
-  fs.writeFileSync(sourcePath, source);
-  execFileSync('javac', ['-g', '-d', tempDir, sourcePath], { stdio: 'inherit' });
-  return tempDir;
-}
-
+const compileJavaFixture = makeJavaFixtureCompiler('wasm-link-table-');
 function withEnv(t, vars) {
   const saved = {};
   for (const [key, value] of Object.entries(vars)) {

@@ -11,7 +11,46 @@ const { arrayDataExpression } = require("./arrayDataExpression");
 const { inlineIntegerArgumentName } = require("./inlineIntegerNames");
 const { buildSsa } = require("../analysis/opgraph/ssa");
 const { kindWidth } = require("../analysis/opgraph/ssaTypes");
-const { parse: parseJavaScript } = require("acorn");
+const {
+  Expr,
+  renderParts,
+  AMBIENT_GENERATED_NAMES,
+  substituteLabelParts,
+  partsMentionLiteralName,
+  substituteParts,
+  PARTS_OPERAND_PLACEHOLDER,
+  partsSkeleton,
+  isPartsWordCharacter,
+  partsWriteImpureCall,
+  partsAmbientNames,
+  BODY_HELPER_NAME_PREFIXES,
+  partsBodyHelperNames,
+  skeletonCodeMask,
+  skeletonKeywordPositions,
+  partsCarriesNestedFunction,
+  RELOCATION_HOSTILE_KEYWORDS,
+  partsRelocationHostile,
+  partsAmbientWrites,
+  partsDeclaresAmbient,
+  partsContinuesBlock,
+  partsOpenCondition,
+  partsWriteThrowOrTry,
+  partsWriteDivision,
+  partsWriteIndex,
+  partsLoadEntryArrayElement,
+  partsReferences,
+} = require("./statementParts");
+const { createLoopRelations } = require("./loopRelations");
+const { createLineSpecialisations } =
+  require("./lineSpecialisations");
+const {
+  auditStatementIrLines,
+  reportStatementIrAudit,
+} = require("./statementIrAudit");
+const {
+  walkJavaScriptAst,
+  unboundGeneratedSsaIdentifiers,
+} = require("./generatedSourceVerifier");
 const {
   outlineLargeRegionLoops,
   partitionOversizedLinearBlocks,
@@ -44,160 +83,6 @@ function opcodeOf(instruction) {
 function isIrreducibleError(error) {
   return error instanceof IrreducibleError ||
     error?.name === "IrreducibleError" && Array.isArray(error.edges);
-}
-
-function walkJavaScriptAst(node, visit, parent = null) {
-  if (!node || typeof node !== "object") return;
-  const pending = [{node, parent}];
-  while (pending.length) {
-    const current = pending.pop();
-    visit(current.node, current.parent);
-    // The verifier's question is per-identifier and order independent. Avoid
-    // Object.entries(), flatMap(), and a host call frame per AST node for
-    // generated bodies containing hundreds of thousands of nodes.
-    for (const key in current.node) {
-      if (key === "start" || key === "end" || key === "loc" ||
-          key === "range") continue;
-      const child = current.node[key];
-      if (Array.isArray(child)) {
-        for (let index = 0; index < child.length; index += 1) {
-          const entry = child[index];
-          if (entry && typeof entry.type === "string") {
-            pending.push({node: entry, parent: current.node});
-          }
-        }
-      } else if (child && typeof child.type === "string") {
-        pending.push({node: child, parent: current.node});
-      }
-    }
-  }
-}
-
-function parseGeneratedStatements(source) {
-  // The verifier below parses a finished body; wrapping it in a generator
-  // keeps `yield` and top-level `return` legal for the parser.
-  return parseJavaScript(`function* __jvmSsaAstWrapper() {\n${source}\n}`, {
-    ecmaVersion: "latest",
-  });
-}
-
-// Opt-in verifier. The generated body must never reference an SSA name that
-// no enclosing scope declares; the emitters are responsible for that by
-// construction, and this parse only re-checks the result when
-// JVM_JIT_VERIFY_GENERATED=1 asks for it (or when a test calls it directly).
-// It is a check, never a transformation: nothing in the compiler reads back
-// the JavaScript it has emitted in order to decide what to emit.
-function unboundGeneratedSsaIdentifiers(source, candidates = null,
-  externallyBound = null) {
-  const program = parseGeneratedStatements(source);
-  const nodeScopes = new WeakMap();
-  const declarationIdentifiers = new WeakSet();
-  const createScope = (parent) => ({parent, bindings: new Set()});
-  const rootScope = createScope(null);
-  // Names the finished body does not declare because its caller supplies
-  // them: the generated function's own parameters and its captures.
-  if (externallyBound) for (const name of externallyBound) {
-    rootScope.bindings.add(name);
-  }
-  const isCandidate = (name) => typeof candidates === "function"
-    ? candidates(name)
-    : candidates ? candidates.has(name) : name.startsWith("ssaValue");
-  const visitChildren = (node, visit) => {
-    for (const key in node) {
-      if (key === "start" || key === "end" || key === "loc" ||
-          key === "range") continue;
-      const child = node[key];
-      if (Array.isArray(child)) {
-        for (let index = 0; index < child.length; index += 1) {
-          const entry = child[index];
-          if (entry && typeof entry.type === "string") visit(entry);
-        }
-      } else if (child && typeof child.type === "string") {
-        visit(child);
-      }
-    }
-  };
-  const declarePattern = (pattern, scope) => {
-    if (!pattern) return;
-    if (pattern.type === "Identifier") {
-      declarationIdentifiers.add(pattern);
-      if (isCandidate(pattern.name)) scope.bindings.add(pattern.name);
-      return;
-    }
-    if (pattern.type === "RestElement") {
-      declarePattern(pattern.argument, scope);
-    } else if (pattern.type === "AssignmentPattern") {
-      declarePattern(pattern.left, scope);
-    } else if (pattern.type === "ArrayPattern") {
-      for (const element of pattern.elements) declarePattern(element, scope);
-    } else if (pattern.type === "ObjectPattern") {
-      for (const property of pattern.properties) {
-        declarePattern(property.value || property.argument, scope);
-      }
-    }
-  };
-  const define = (node, scope) => {
-    if (!node || typeof node !== "object") return;
-    nodeScopes.set(node, scope);
-    if (node.type === "FunctionDeclaration" ||
-        node.type === "FunctionExpression" ||
-        node.type === "ArrowFunctionExpression") {
-      if (node.id) declarePattern(node.id, scope);
-      const functionScope = createScope(scope);
-      for (const parameter of node.params) {
-        declarePattern(parameter, functionScope);
-      }
-      define(node.body, functionScope);
-      return;
-    }
-    if (node.type === "BlockStatement") {
-      const blockScope = createScope(scope);
-      nodeScopes.set(node, blockScope);
-      for (const statement of node.body) define(statement, blockScope);
-      return;
-    }
-    if (node.type === "CatchClause") {
-      const catchScope = createScope(scope);
-      nodeScopes.set(node, catchScope);
-      declarePattern(node.param, catchScope);
-      define(node.body, catchScope);
-      return;
-    }
-    if (node.type === "ForStatement" || node.type === "ForInStatement" ||
-        node.type === "ForOfStatement" || node.type === "SwitchStatement") {
-      const controlScope = createScope(scope);
-      nodeScopes.set(node, controlScope);
-      visitChildren(node, (child) => define(child, controlScope));
-      return;
-    }
-    if (node.type === "VariableDeclaration") {
-      for (const declarator of node.declarations) {
-        declarePattern(declarator.id, scope);
-      }
-    }
-    visitChildren(node, (child) => define(child, scope));
-  };
-  define(program, rootScope);
-
-  const unbound = new Set();
-  walkJavaScriptAst(program, (node, parent) => {
-    if (node.type !== "Identifier" || !isCandidate(node.name) ||
-        declarationIdentifiers.has(node)) return;
-    if (parent?.type === "MemberExpression" && parent.property === node &&
-        !parent.computed) return;
-    if ((parent?.type === "Property" || parent?.type === "MethodDefinition") &&
-        parent.key === node && !parent.computed && !parent.shorthand) return;
-    if ((parent?.type === "LabeledStatement" ||
-        parent?.type === "BreakStatement" ||
-        parent?.type === "ContinueStatement") && parent.label === node) return;
-    let bound = false;
-    for (let scope = nodeScopes.get(node) || rootScope; scope && !bound;
-      scope = scope.parent) {
-      bound = scope.bindings.has(node.name);
-    }
-    if (!bound) unbound.add(node.name);
-  });
-  return [...unbound];
 }
 
 function normalizedArrayLoadExpression(raw, op, array, arrayKind = null) {
@@ -290,26 +175,6 @@ function bindCallStackArray(source) {
       "$1\nconst ssaCallStack = thread.callStack.items;\n");
 }
 
-class Expr {
-  constructor(parts) { this.parts = parts; }
-  toString() { return renderParts(this.parts); }
-}
-
-function renderParts(parts) {
-  let text = "";
-  for (let index = 0; index < parts.length; index += 1) {
-    const part = parts[index];
-    // A reference may render as something other than its name while a later
-    // stage still owns it: an array-range access token renders as
-    // `false /*token*/` until a proof replaces the whole reference by a guard.
-    // A label part renders as the label it names.
-    text += typeof part === "string" ? part
-      : part.label !== undefined ? part.label
-        : part.text !== undefined ? part.text : part.ref;
-  }
-  return text;
-}
-
 // The set of names the compile currently being rendered has minted. Only the
 // compiler's own names become operand references; anything else an emitter
 // interpolates is an opaque literal chunk. The renderer compiles one method at
@@ -318,12 +183,6 @@ let activeEmittedNames = null;
 // Names every generated tier declares in its outermost scope. They are never
 // operands of a statement: no pass renames, propagates or removes one, and an
 // outlined unit always receives them.
-const AMBIENT_GENERATED_NAMES = [
-  "helpers", "frame", "locals", "stack", "ssaRestoredFrame", "thread", "plan",
-  "restorationDepth", "safePointBudget", "nestedEntryGuarded",
-  "framelessEntry", "initialBytecodeChecks",
-];
-
 // Composite operands the simulator stages on the bytecode operand stack stay
 // strings, because the simulator compares and keys them by identity. Their
 // parts list is remembered here so an emitter that interpolates one keeps its
@@ -385,20 +244,6 @@ function exprConcat(...pieces) {
   return new Expr(parts);
 }
 
-function partsReferences(parts) {
-  const names = [];
-  for (let index = 0; index < parts.length; index += 1) {
-    const part = parts[index];
-    // A label part that names no value contributes no operand: it names a
-    // statement. A label the compile minted is also a name the generated
-    // scope carries, so it keeps its operand identity as well.
-    if (typeof part !== "string" && part.ref !== undefined) {
-      names.push(part.ref);
-    }
-  }
-  return names;
-}
-
 // A label a statement declares or jumps to, as a part of that statement. The
 // label is not recovered from the emitted characters by any consumer: the
 // emitter that wrote the label states it here, and a pass that has to rename
@@ -417,239 +262,41 @@ function labelExpr(name) {
 
 // Rename every label a parts list declares or jumps to. Labels are parts, so
 // this is a substitution over the compiler's own representation.
-function substituteLabelParts(parts, rename) {
-  const out = [];
-  let changed = false;
-  for (let index = 0; index < parts.length; index += 1) {
-    const part = parts[index];
-    if (typeof part === "string" || part.label === undefined) {
-      out.push(part);
-      continue;
-    }
-    const renamed = rename(part.label);
-    if (renamed === part.label) { out.push(part); continue; }
-    changed = true;
-    out.push(part.ref === undefined
-      ? {label: renamed} : {label: renamed, ref: renamed});
-  }
-  return changed ? out : parts;
-}
-
 // Whether one of a set of compiler-owned names appears in the *literal text*
 // an emitter wrote, rather than as a part of the statement. Operands and
 // labels are parts and stand for one placeholder character in the skeleton,
 // so what is left is the emitter's own text: a name found there is one no
 // pass can rename, and the caller declines rather than leave it behind. This
 // is the scan `partsAmbientNames` performs, for a different name set.
-function partsMentionLiteralName(parts, names) {
-  if (!names || names.size === 0) return false;
-  const skeleton = partsSkeleton(parts);
-  for (const name of names) {
-    let position = skeleton.indexOf(name);
-    while (position >= 0) {
-      if (!isPartsWordCharacter(skeleton[position - 1]) &&
-          !isPartsWordCharacter(skeleton[position + name.length])) return true;
-      position = skeleton.indexOf(name, position + 1);
-    }
-  }
-  return false;
-}
-
 // Replace operand references by parts lists. This is the only way a pass may
 // rewrite a statement.
-function substituteParts(parts, replacements) {
-  const out = [];
-  for (let index = 0; index < parts.length; index += 1) {
-    const part = parts[index];
-    // A label names a statement, not a value: no operand substitution
-    // replaces one.
-    if (typeof part === "string" || part.label !== undefined) {
-      out.push(part);
-      continue;
-    }
-    const replacement = replacements.get(part.ref);
-    if (replacement === undefined) { out.push(part); continue; }
-    const replacementParts = replacement instanceof Expr
-      ? replacement.parts : replacement;
-    for (let position = 0; position < replacementParts.length; position += 1) {
-      out.push(replacementParts[position]);
-    }
-  }
-  return out;
-}
-
 // The syntactic properties the checked-leaf passes ask a statement about.
 // Each is read off the parts list through its *skeleton*: the literal chunks
 // the emitter wrote, with every operand reference replaced by one placeholder
 // character. An operand is a name, so it can neither contribute an operator,
 // a bracket or a keyword nor split one; the skeleton therefore answers these
 // questions on the statement the compiler built, not on a rendered body.
-const PARTS_OPERAND_PLACEHOLDER = "\u0000";
-
-function partsSkeleton(parts) {
-  let text = "";
-  for (let index = 0; index < parts.length; index += 1) {
-    const part = parts[index];
-    text += typeof part === "string" ? part : PARTS_OPERAND_PLACEHOLDER;
-  }
-  return text;
-}
-
-function isPartsWordCharacter(character) {
-  return character !== undefined && character !== "" &&
-    (character >= "a" && character <= "z" ||
-      character >= "A" && character <= "Z" ||
-      character >= "0" && character <= "9" ||
-      character === "_" || character === "$");
-}
-
-function partsWriteImpureCall(parts, builtSkeleton = null) {
-  const skeleton = builtSkeleton === null ? partsSkeleton(parts) : builtSkeleton;
-  if (skeleton.includes("helpers.")) return true;
-  let position = skeleton.indexOf("new");
-  while (position >= 0) {
-    if (!isPartsWordCharacter(skeleton[position - 1]) &&
-        !isPartsWordCharacter(skeleton[position + 3])) return true;
-    position = skeleton.indexOf("new", position + 1);
-  }
-  return false;
-}
-
 // The ambient names a statement mentions. They are declared by the tier's
 // outermost scope rather than by any statement, so they are not operands; an
 // outlined unit still has to receive them.
-function partsAmbientNames(parts, builtSkeleton = null) {
-  const skeleton = builtSkeleton === null ? partsSkeleton(parts) : builtSkeleton;
-  const found = [];
-  for (let index = 0; index < AMBIENT_GENERATED_NAMES.length; index += 1) {
-    const name = AMBIENT_GENERATED_NAMES[index];
-    let position = skeleton.indexOf(name);
-    while (position >= 0) {
-      if (!isPartsWordCharacter(skeleton[position - 1]) &&
-          !isPartsWordCharacter(skeleton[position + name.length])) {
-        found.push(name);
-        break;
-      }
-      position = skeleton.indexOf(name, position + 1);
-    }
-  }
-  return found;
-}
-
 // Names a generated tier declares once in its own body prologue and then
 // calls from ordinary statements: the local spill helper and the frame
 // materialization helpers. Unlike an SSA value they are literal text in the
 // statement the emitter wrote rather than operands, so they never appear in
 // `reads` -- but a unit outlined out of the body still has to receive them.
-const BODY_HELPER_NAME_PREFIXES = ["ssaMaterialize"];
-
-function partsBodyHelperNames(parts) {
-  const skeleton = partsSkeleton(parts);
-  const found = [];
-  let position = skeleton.indexOf("spillLocals");
-  if (position >= 0 && !isPartsWordCharacter(skeleton[position - 1])) {
-    found.push("spillLocals");
-  }
-  for (const prefix of BODY_HELPER_NAME_PREFIXES) {
-    position = skeleton.indexOf(prefix);
-    while (position >= 0) {
-      if (!isPartsWordCharacter(skeleton[position - 1])) {
-        let end = position + prefix.length;
-        while (isPartsWordCharacter(skeleton[end])) end += 1;
-        const name = skeleton.slice(position, end);
-        if (name !== prefix && !found.includes(name)) found.push(name);
-      }
-      position = skeleton.indexOf(prefix, position + 1);
-    }
-  }
-  return found;
-}
-
 // Which characters of a skeleton are code rather than the contents of a
 // string literal or a comment the emitter wrote. Operands are already blanked
 // to one placeholder character, so what is left is the emitter's own literal
 // text: a `;` inside `'/ by zero'` or a keyword inside `/*__JVM_...__*/` must
 // not be read as syntax.
-function skeletonCodeMask(skeleton) {
-  const mask = new Array(skeleton.length).fill(true);
-  let index = 0;
-  while (index < skeleton.length) {
-    const character = skeleton[index];
-    if (character === "'" || character === "\"" || character === "`") {
-      mask[index] = false;
-      index += 1;
-      while (index < skeleton.length) {
-        mask[index] = false;
-        if (skeleton[index] === "\\") { index += 2; continue; }
-        if (skeleton[index] === character) { index += 1; break; }
-        index += 1;
-      }
-      continue;
-    }
-    if (character === "/" && skeleton[index + 1] === "/") {
-      while (index < skeleton.length) mask[index++] = false;
-      continue;
-    }
-    if (character === "/" && skeleton[index + 1] === "*") {
-      mask[index] = false;
-      mask[index + 1] = false;
-      index += 2;
-      while (index < skeleton.length) {
-        mask[index] = false;
-        if (skeleton[index] === "*" && skeleton[index + 1] === "/") {
-          mask[index + 1] = false;
-          index += 2;
-          break;
-        }
-        index += 1;
-      }
-      continue;
-    }
-    index += 1;
-  }
-  return mask;
-}
-
 // A keyword the emitter wrote, as opposed to the same characters inside an
 // operand, a string or a comment: operands are one placeholder character in
 // the skeleton, so a word-boundary test on the code positions answers about
 // the emitted statement.
-function skeletonKeywordPositions(skeleton, keyword, mask = null) {
-  const codeMask = mask || skeletonCodeMask(skeleton);
-  const positions = [];
-  let position = skeleton.indexOf(keyword);
-  while (position >= 0) {
-    if (codeMask[position] &&
-        !isPartsWordCharacter(skeleton[position - 1]) &&
-        !isPartsWordCharacter(skeleton[position + keyword.length])) {
-      positions.push(position);
-    }
-    position = skeleton.indexOf(keyword, position + 1);
-  }
-  return positions;
-}
-
 // Whether the statement carries a nested function. Moving such a statement
 // into a helper would rebind its captures to the helper's parameter copies,
 // so a consumer leaves it where it is.
-function partsCarriesNestedFunction(parts) {
-  const skeleton = partsSkeleton(parts);
-  return skeleton.includes("=>") ||
-    skeletonKeywordPositions(skeleton, "function").length > 0;
-}
-
 // Constructs whose meaning depends on the activation they were written in.
-const RELOCATION_HOSTILE_KEYWORDS = ["this", "super", "await", "arguments",
-  "eval", "var", "new.target"];
-
-function partsRelocationHostile(parts) {
-  const skeleton = partsSkeleton(parts);
-  for (const keyword of RELOCATION_HOSTILE_KEYWORDS) {
-    if (skeletonKeywordPositions(skeleton, keyword).length) return true;
-  }
-  return false;
-}
-
 // The ambient names a statement assigns.
 //
 // An ambient name is declared by the tier's outermost scope rather than by
@@ -659,266 +306,17 @@ function partsRelocationHostile(parts) {
 // compound assignment operator, or by `++`/`--` on either side, and the
 // destructuring target the frame materialization writes
 // (`[frame, locals, stack] = ...`).
-function partsAmbientWrites(parts) {
-  const skeleton = partsSkeleton(parts);
-  const mask = skeletonCodeMask(skeleton);
-  const found = [];
-  // The one destructuring target the emitters write: a bracketed list at the
-  // head of the statement, assigned as a whole.
-  let destructuringEnd = -1;
-  const head = skeleton.length - skeleton.trimStart().length;
-  if (skeleton[head] === "[" && mask[head]) {
-    let depth = 0;
-    for (let index = head; index < skeleton.length; index += 1) {
-      if (!mask[index]) continue;
-      if (skeleton[index] === "[") depth += 1;
-      else if (skeleton[index] === "]") {
-        depth -= 1;
-        if (depth === 0) {
-          let after = index + 1;
-          while (skeleton[after] === " ") after += 1;
-          if (skeleton[after] === "=" && skeleton[after + 1] !== "=") {
-            destructuringEnd = index;
-          }
-          break;
-        }
-      }
-    }
-  }
-  const assignsAt = (position, length) => {
-    if (destructuringEnd > 0 && position > head &&
-        position + length <= destructuringEnd) return true;
-    let before = position - 1;
-    while (skeleton[before] === " ") before -= 1;
-    if (before >= 1 && (skeleton[before] === "+" || skeleton[before] === "-") &&
-        skeleton[before - 1] === skeleton[before]) return true;
-    let after = position + length;
-    while (skeleton[after] === " ") after += 1;
-    if ((skeleton[after] === "+" || skeleton[after] === "-") &&
-        skeleton[after + 1] === skeleton[after]) return true;
-    let operators = 0;
-    while (operators < 3 &&
-      "+-*/%&|^<>".includes(skeleton[after + operators])) operators += 1;
-    return skeleton[after + operators] === "=" &&
-      skeleton[after + operators + 1] !== "=" &&
-      (operators > 0 || skeleton[after + 1] !== ">");
-  };
-  for (const name of AMBIENT_GENERATED_NAMES) {
-    for (const position of skeletonKeywordPositions(skeleton, name, mask)) {
-      if (!assignsAt(position, name.length)) continue;
-      found.push(name);
-      break;
-    }
-  }
-  return found;
-}
-
 // Whether the statement declares an ambient name in its own scope
 // (`let frame = null;`). Such a statement may not be relocated: the unit it
 // would move into already receives that name as a parameter, and a
 // declaration of a parameter's name is not even legal there.
-function partsDeclaresAmbient(parts) {
-  const skeleton = partsSkeleton(parts).trimStart();
-  for (const keyword of ["let ", "const ", "var "]) {
-    if (!skeleton.startsWith(keyword)) continue;
-    let start = keyword.length;
-    while (skeleton[start] === " ") start += 1;
-    let end = start;
-    while (isPartsWordCharacter(skeleton[end])) end += 1;
-    return AMBIENT_GENERATED_NAMES.includes(skeleton.slice(start, end));
-  }
-  return false;
-}
-
 // Whether the statement continues the block it closes (`} else {`,
 // `} catch (error) {`, `} finally {`). Its nesting delta is zero, but a
 // consumer must not treat it as an ordinary statement: it belongs to the
 // construct around it and can never be relocated on its own.
-function partsContinuesBlock(parts) {
-  const skeleton = partsSkeleton(parts).trim();
-  return skeleton.startsWith("}") && skeleton.endsWith("{");
-}
-
 // Whether the statement the emitter wrote is a conditional that opens a
 // block: `if (<condition>) {`.
-function partsOpenCondition(parts, builtSkeleton = null) {
-  const skeleton = builtSkeleton === null ? partsSkeleton(parts) : builtSkeleton;
-  return skeleton.trimStart().startsWith("if (") && skeleton.endsWith(") {");
-}
-
 // Whether the emitter opened a `try` or wrote a `throw` in this statement.
-function partsWriteThrowOrTry(parts, builtSkeleton = null) {
-  const skeleton = builtSkeleton === null ? partsSkeleton(parts) : builtSkeleton;
-  return skeleton.includes("throw ") || skeleton.includes("try {");
-}
-
-function partsWriteDivision(parts, builtSkeleton = null) {
-  const skeleton = builtSkeleton === null ? partsSkeleton(parts) : builtSkeleton;
-  return skeleton.includes(" / ") || skeleton.includes(" % ");
-}
-
-function partsWriteIndex(parts, builtSkeleton = null) {
-  const skeleton = builtSkeleton === null ? partsSkeleton(parts) : builtSkeleton;
-  let open = -1;
-  for (let index = 0; index < skeleton.length; index += 1) {
-    const character = skeleton[index];
-    if (character === "[") { open = index; continue; }
-    if (character !== "]" || open < 0) continue;
-    if (index > open + 1) return true;
-    open = -1;
-  }
-  return false;
-}
-
-function partsLoadEntryArrayElement(parts, entryArrayDataNames) {
-  for (let index = 0; index + 1 < parts.length; index += 1) {
-    const part = parts[index];
-    if (typeof part === "string" || !entryArrayDataNames.has(part.ref)) {
-      continue;
-    }
-    const next = parts[index + 1];
-    if (typeof next === "string" && next.startsWith("[")) return true;
-  }
-  return false;
-}
-
-// Opt-in audit of the statement IR (JVM_JIT_VERIFY_STATEMENT_IR=1). Like the
-// generated-scope verifier it only re-checks a finished body: it scans the
-// rendered text for names the compile minted and reports any line the emitters
-// did not record, or whose record disagrees with the operands actually
-// present. Nothing in the compiler decides what to emit from this scan; the
-// passes read the records, never the characters.
-const statementIrAuditIssues = new Map();
-function auditStatementIrLines(lines, records, names, label) {
-  const note = (issue, line) => {
-    const key = `${issue}: ${line}`;
-    statementIrAuditIssues.set(key,
-      (statementIrAuditIssues.get(key) || 0) + 1);
-  };
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (trimmed === "") continue;
-    const record = records.get(trimmed);
-    if (!record) { note(`${label} unrecorded`, trimmed); continue; }
-    if (record.foreign) continue;
-    const present = [];
-    for (const match of trimmed.matchAll(/[A-Za-z_$][\w$]*/g)) {
-      if (names.has(match[0])) present.push(match[0]);
-    }
-    const declared = partsReferences(record.parts).sort();
-    present.sort();
-    if (declared.length !== present.length ||
-        declared.some((name, index) => present[index] !== name)) {
-      note(`${label} operand mismatch [${declared.join(",")}] vs [` +
-        `${present.join(",")}]`, trimmed);
-    }
-  }
-  auditStatementIrControlFlow(lines, records, label, note);
-}
-
-// The second half of the audit: the control flow every statement *declared*,
-// cross-checked against what an acorn parse of the finished body actually
-// finds there. `returnStmt` states an exit, `jumpStmt` states a break or a
-// continue, a label emitter states the label it wrote and the emitters that
-// write `yield` say so; nothing in the compiler recovers any of it from the
-// text, so this is the check that an emitter which grows a new exit, jump,
-// label or yield form is noticed instead of silently escaping the routing.
-//
-// Like the operand check it is a test oracle: opt-in, never a compilation
-// step, and nothing the compiler emits depends on it.
-function auditStatementIrControlFlow(lines, records, label, note) {
-  // A body a caller inserts breaks out of a label the *caller* declares, so
-  // the parser needs those labels wrapped around it. Which labels those are
-  // is read off the records; a record that names the wrong one shows up as a
-  // parse failure.
-  const declared = new Set();
-  const targets = new Set();
-  for (const line of lines) {
-    const record = records.get(line.trim());
-    if (!record || record.foreign) continue;
-    if (record.declaresLabel && record.label) declared.add(record.label);
-    if (record.jump && record.jump.label) targets.add(record.jump.label);
-  }
-  const wrappers = [...targets].filter((name) => !declared.has(name));
-  const body = lines.join("\n");
-  const source = wrappers.length
-    ? `${wrappers.map((name) => `${name}: {`).join("\n")}\n${body}\n${
-      wrappers.map(() => "}").join("\n")}`
-    : body;
-  const offset = wrappers.length;
-  let program = null;
-  try {
-    program = parseJavaScript(`function* __jvmSsaAuditWrapper() {\n${
-      source}\n}`, {ecmaVersion: "latest", locations: true});
-  } catch (error) {
-    note(`${label} audit parse failed`, String(error.message));
-    return;
-  }
-  // Line 1 is the wrapper, then the label wrappers, then `lines[0]`.
-  const found = lines.map(() => ({
-    exit: 0, jump: null, jumps: 0, label: null, labels: 0, yields: 0,
-  }));
-  const at = (node) => {
-    const index = node.loc.start.line - 2 - offset;
-    return index >= 0 && index < found.length ? found[index] : null;
-  };
-  walkJavaScriptAst(program, (node) => {
-    const seen = at(node);
-    if (!seen) return;
-    if (node.type === "ReturnStatement") seen.exit += 1;
-    else if (node.type === "YieldExpression") seen.yields += 1;
-    else if (node.type === "BreakStatement" ||
-        node.type === "ContinueStatement") {
-      seen.jumps += 1;
-      seen.jump = {
-        kind: node.type === "BreakStatement" ? "break" : "continue",
-        label: node.label ? node.label.name : null,
-      };
-    } else if (node.type === "LabeledStatement") {
-      seen.labels += 1;
-      seen.label = node.label.name;
-    }
-  });
-  for (let index = 0; index < lines.length; index += 1) {
-    const trimmed = lines[index].trim();
-    if (trimmed === "") continue;
-    const record = records.get(trimmed);
-    if (!record || record.foreign) continue;
-    const seen = found[index];
-    const declaredExit = record.exit ? 1 : 0;
-    if (seen.exit !== declaredExit) {
-      note(`${label} exit declared ${declaredExit} found ${seen.exit}`,
-        trimmed);
-    }
-    const declaredYields = record.yields ? 1 : 0;
-    if ((seen.yields > 0 ? 1 : 0) !== declaredYields) {
-      note(`${label} yield declared ${declaredYields} found ${seen.yields}`,
-        trimmed);
-    }
-    const declaredJumps = record.jump ? 1 : 0;
-    if (seen.jumps !== declaredJumps) {
-      note(`${label} jump declared ${declaredJumps} found ${seen.jumps}`,
-        trimmed);
-    } else if (record.jump && (record.jump.kind !== seen.jump.kind ||
-        (record.jump.label || null) !== seen.jump.label)) {
-      note(`${label} jump ${record.jump.kind} ${record.jump.label} vs ` +
-        `${seen.jump.kind} ${seen.jump.label}`, trimmed);
-    }
-    const declaresLabel = record.declaresLabel && record.label ? 1 : 0;
-    if (seen.labels !== declaresLabel) {
-      note(`${label} label declared ${declaresLabel} found ${seen.labels}`,
-        trimmed);
-    } else if (declaresLabel && record.label !== seen.label) {
-      note(`${label} label ${record.label} vs ${seen.label}`, trimmed);
-    }
-  }
-}
-
-function reportStatementIrAudit() {
-  return [...statementIrAuditIssues.entries()]
-    .sort((left, right) => right[1] - left[1]);
-}
-
 // A checked leaf leaves its body through one compiler-owned statement. When
 // the body is inserted lexically into a caller, that statement is late-bound
 // to the caller-visible result slot and exit label of the inserted scope.
@@ -1741,6 +1139,37 @@ class JvmSsaBlockRenderer {
   }
 
   compileMethodBody(method) {
+    const stats = {
+      coalescedSsaCopyCount: 0,
+      deferredCallMaterializationCount: 0,
+      reusedLocalLoadCount: 0,
+      eliminatedLocalStoreCount: 0,
+      sentinelArrayLoadCount: 0,
+      blockArrayDataViewCount: 0,
+      fixedPointScalarizationCount: 0,
+      eliminatedArrayStoreCheckCount: 0,
+      specializedArrayRangeAccessCount: 0,
+      dominatedFieldReceiverCheckCount: 0,
+      dominatedEntryReferenceNullBranchCount: 0,
+      eliminatedTerminalStructuredBreakCount: 0,
+      eliminatedStructuredBlockCount: 0,
+      restoringRangeGuardDeoptCount: 0,
+      restoringCoarseLoopDeoptCount: 0,
+      versionedLoopCount: 0,
+      nestedVersionedLoopSuppressionCount: 0,
+      rangeDominatedArithmeticGuardCount: 0,
+      cfgDominatedArithmeticGuardCount: 0,
+      eliminatedDeadLocalStoreCount: 0,
+      coalescedArrayRangeGuardCount: 0,
+      loopInvariantDivisorGuardCount: 0,
+      fieldBackedArrayRangeCandidateCount: 0,
+      hoistedArrayRangeGuardCount: 0,
+      provenCheckedCallAdmissionCount: 0,
+      blockCoalescedArrayRangeAccessCount: 0,
+      methodInvokeCount: 0,
+      methodAllocationCount: 0,
+      resumeEntryConflictCount: 0,
+    };
     this.lastCompileError = null;
     this.lastRejectionReason = null;
     this.lastFailedSource = null;
@@ -3020,10 +2449,9 @@ class JvmSsaBlockRenderer {
     // out of the rendered text afterwards. Only names this compile allocated
     // qualify; block entry slots (`ssaStackN_M`) and locals are reassigned,
     // and an inserted child's names belong to another compile.
-    let coalescedSsaCopyCount = 0;
-    const stagedValue = (input, lines) => {
+        const stagedValue = (input, lines) => {
       if (ownSsaValueNames.has(input)) {
-        coalescedSsaCopyCount += 1;
+        stats.coalescedSsaCopyCount += 1;
         return input;
       }
       const out = value();
@@ -3106,14 +2534,7 @@ class JvmSsaBlockRenderer {
     };
     const materializeDepths = new Set();
     const materializeUnwindDepths = new Set();
-    let deferredCallMaterializationCount = 0;
-    let reusedLocalLoadCount = 0;
-    let eliminatedLocalStoreCount = 0;
-    let sentinelArrayLoadCount = 0;
-    let blockArrayDataViewCount = 0;
-    let fixedPointScalarizationCount = 0;
-    let eliminatedArrayStoreCheckCount = 0;
-    // Record only `aaload` sites whose SSA operand has a known nested
+                                // Record only `aaload` sites whose SSA operand has a known nested
     // primitive-array descriptor. Such a load merely selects a primitive row
     // for subsequent numeric access. Object/reference element loads retain
     // the virtual-Frame ABI because their values can cross arbitrary dynamic
@@ -3125,26 +2546,16 @@ class JvmSsaBlockRenderer {
     // feed checked field/call operations while retaining exact restoration.
     const verifiedResolvedStaticReferenceAaloads = new Set();
     const resolvedStaticReferenceArrayValues = new Set();
-    let specializedArrayRangeAccessCount = 0;
-    const specializedArrayRangeAccesses = new Set();
-    let dominatedFieldReceiverCheckCount = 0;
-    const dominatedFieldReceiverChecks = new Set();
-    let dominatedEntryReferenceNullBranchCount = 0;
-    const dominatedEntryReferenceNullBranches = new Set();
-    let eliminatedTerminalStructuredBreakCount = 0;
-    let eliminatedStructuredBlockCount = 0;
-    let restoringRangeGuardDeoptCount = 0;
-    let restoringCoarseLoopDeoptCount = 0;
-    // Two-arm loop versioning copies the rendered body into both arms, so a
+        const specializedArrayRangeAccesses = new Set();
+        const dominatedFieldReceiverChecks = new Set();
+        const dominatedEntryReferenceNullBranches = new Set();
+                    // Two-arm loop versioning copies the rendered body into both arms, so a
     // versioned loop nested inside another versioned loop doubles the emitted
     // code at every nesting level (Deko Bloko's va.d rendered 256 copies of
     // its innermost loops: a 7.3 MB restoring body for a 226 KB method).
     // Only the innermost versioned loops keep their fast arm; an enclosing
     // loop whose body already holds one stays a single polled loop.
-    let versionedLoopCount = 0;
-    let nestedVersionedLoopSuppressionCount = 0;
-    let rangeDominatedArithmeticGuardCount = 0;
-    const rangeDominatedArithmeticGuards = new Set();
+                const rangeDominatedArithmeticGuards = new Set();
     const lexicalVoidFastPathSites = new Set();
     const arrayRangeCheckCandidates = [];
     // Keep every primitive entry-array access available to whole-region
@@ -3155,16 +2566,23 @@ class JvmSsaBlockRenderer {
     let nextPrimitiveArrayAccessMarker = 0;
     const deferredStaticArrayAccesses = [];
     let nextDeferredStaticArrayAccessMarker = 0;
-    const localIndex = (instruction, op) => {
-      if (instruction && typeof instruction === "object" && instruction.arg !== undefined) {
-        return Number(instruction.arg);
-      }
-      const match = /_([0-3])$/.exec(op || "");
-      return match ? Number(match[1]) : NaN;
-    };
-    const opOf = (instruction) => !instruction ? null :
-      (typeof instruction === "string" ? instruction : instruction.op);
-    const hasReachableIntArrayStore = items.some((item, index) =>
+    const {
+      localIndex,
+      opOf,
+      constantInstructionValue,
+      affineLocalStep,
+      carriedCountedLocalRelation,
+      packedAppendRelation,
+      binaryLocalAssignment,
+      cyclicLocalRange,
+      nestedCyclicLocalRange,
+      loopPathExists,
+      loopAssignmentDominates,
+      scaledCountedLocalRelation,
+      quotientProductRecurrence,
+    } = createLoopRelations(
+      { cfg, items, labels, structured, directStaticSites });
+        const hasReachableIntArrayStore = items.some((item, index) =>
       normalReachableItems.has(index) && opOf(item?.instruction) === "iastore");
     const arrayIndexOutOfBounds = (index, length) =>
       this.unsignedArrayBoundsEnabled
@@ -4045,8 +3463,7 @@ class JvmSsaBlockRenderer {
     // predecessor-specific assumption can leak into a generated block.
     const dominatedNonZeroDivisionItems = new Set();
     const literalNonZeroDivisionItems = new Set();
-    let cfgDominatedArithmeticGuardCount = 0;
-    {
+        {
       const relationKey = (kind, left, right) =>
         kind === "ne" && left > right
           ? `${kind}:${right}:${left}` : `${kind}:${left}:${right}`;
@@ -4564,8 +3981,7 @@ class JvmSsaBlockRenderer {
         liveLocalsOutByBlock[blockId] = liveOut[blockId];
       }
     }
-    let eliminatedDeadLocalStoreCount = 0;
-    const boundedLocalDefinitionRangeMemo = new Map();
+        const boundedLocalDefinitionRangeMemo = new Map();
     const bytecodeIntegerConstant = (instruction) => {
       const op = opOf(instruction);
       if (op === "iconst_m1") return -1;
@@ -4764,7 +4180,7 @@ class JvmSsaBlockRenderer {
       const readLocal = (slot) => {
         const cached = localValues[slot];
         if (this.localValueNumberingEnabled && cached !== null) {
-          reusedLocalLoadCount += 1;
+          stats.reusedLocalLoadCount += 1;
           // Even when the current local value already has an SSA name, this
           // bytecode load establishes the symbolic local slot used by loop
           // recurrence and range analysis.
@@ -5180,10 +4596,10 @@ class JvmSsaBlockRenderer {
           if (input === null || !Number.isInteger(slot) || slot < 0 || slot >= localCount) valid = false;
           else {
             if (foldedEntryStoreIndexes.has(index)) {
-              eliminatedLocalStoreCount += 1;
+              stats.eliminatedLocalStoreCount += 1;
             }
             else if (this.localValueNumberingEnabled && localValues[slot] === input) {
-              eliminatedLocalStoreCount += 1;
+              stats.eliminatedLocalStoreCount += 1;
             }
             else lines.push(storeLocal(localName(slot), e`${input}`));
             const persistentArrayView =
@@ -5349,7 +4765,7 @@ class JvmSsaBlockRenderer {
               left: intToLongOrigins.get(left),
               right: intToLongOrigins.get(right),
             });
-            fixedPointScalarizationCount += 1;
+            stats.fixedPointScalarizationCount += 1;
             stack.push(out);
           } else {
             const out = value();
@@ -5498,9 +4914,9 @@ class JvmSsaBlockRenderer {
               ? Number(divisorInput) : 0;
             if (literalDivisor !== 0) {
               literalNonZeroDivisionItems.add(index);
-              cfgDominatedArithmeticGuardCount += 1;
+              stats.cfgDominatedArithmeticGuardCount += 1;
             } else if (dominatedNonZeroDivisionItems.has(index)) {
-              cfgDominatedArithmeticGuardCount += 1;
+              stats.cfgDominatedArithmeticGuardCount += 1;
             } else {
               lines.push(stmt(e`if (${divisor} === 0) {`,
                 {kind: "if", comparison: {input: divisor, cmp: "=== 0"}}),
@@ -5587,7 +5003,7 @@ class JvmSsaBlockRenderer {
               arrayViews.set(arrayInput, arrayData);
               arrayViews.set(array, arrayData);
               dynamicBlockArrayViews.add(arrayData);
-              blockArrayDataViewCount += 1;
+              stats.blockArrayDataViewCount += 1;
             }
             const primitiveSentinel = op !== "aaload" && arrayData;
             const arrayIndex = stagedValue(arrayIndexInput, lines);
@@ -5627,7 +5043,7 @@ class JvmSsaBlockRenderer {
                 blockEnd(""),
               );
               checkedPrimitiveArrayAccesses.add(`${arrayData}\0${arrayIndexInput}`);
-              sentinelArrayLoadCount += 1;
+              stats.sentinelArrayLoadCount += 1;
             } else {
               const raw = arrayData
                 ? exprConcat(
@@ -5728,7 +5144,7 @@ class JvmSsaBlockRenderer {
               arrayViews.set(arrayInput, arrayData);
               arrayViews.set(array, arrayData);
               dynamicBlockArrayViews.add(arrayData);
-              blockArrayDataViewCount += 1;
+              stats.blockArrayDataViewCount += 1;
             }
             const arrayIndex = stagedValue(arrayIndexInput, lines);
             const stored = stagedValue(storedInput, lines);
@@ -5750,7 +5166,7 @@ class JvmSsaBlockRenderer {
                 {kind: "arrayStore", storeTarget: arrayData,
                   storeIndex: e`${arrayIndex}`,
                   storeValue: e`${normalizedStore}`}));
-              eliminatedArrayStoreCheckCount += 1;
+              stats.eliminatedArrayStoreCheckCount += 1;
             } else if (op !== "aastore" && arrayData &&
                 guardedEntryArrayData.has(arrayData)) {
               const rangeMarker =
@@ -7125,7 +6541,7 @@ class JvmSsaBlockRenderer {
               st`    helpers.linkStructuredCallChild(frame, thread, ${
                 callStackDepth}, ${JSON.stringify(site.returnType)})) {`,
               st`${leftActiveChildMarker}`, blockEnd(""));
-            if (deferMaterialization) deferredCallMaterializationCount += 1;
+            if (deferMaterialization) stats.deferredCallMaterializationCount += 1;
             const coldAfterLines = materializeLines(stack, index + 1);
             if (!site.returnsVoid) stack.push(out);
             const yieldedCallMarker = named(
@@ -7470,7 +6886,7 @@ class JvmSsaBlockRenderer {
         .map((cache) => ({ kind: "static", cache })),
     ];
     const captureFieldBackedArrayState = (frame) => {
-      if (fieldBackedArrayRangeCandidateCount === 0) return null;
+      if (stats.fieldBackedArrayRangeCandidateCount === 0) return null;
       return fieldBackedArrayGuards.map((guard) => {
         if (guard.kind === "field") {
           const object = frame.locals[guard.cache.eagerLocal];
@@ -7480,7 +6896,7 @@ class JvmSsaBlockRenderer {
       });
     };
     const fieldBackedArrayStateMatches = (state) => {
-      if (fieldBackedArrayRangeCandidateCount === 0) return true;
+      if (stats.fieldBackedArrayRangeCandidateCount === 0) return true;
       if (!Array.isArray(state) ||
           state.length !== fieldBackedArrayGuards.length) return false;
       return fieldBackedArrayGuards.every((guard, index) => {
@@ -7558,23 +6974,7 @@ class JvmSsaBlockRenderer {
             : []),
         ];
       });
-    const constantInstructionValue = (instruction) => {
-      const op = opOf(instruction);
-      if (/^iconst_(?:m1|[0-5])$/.test(op)) {
-        return op === "iconst_m1" ? -1 : Number(op.slice(-1));
-      }
-      if (op === "bipush" || op === "sipush" ||
-          op === "ldc" || op === "ldc_w") {
-        const raw = instruction && typeof instruction === "object"
-          ? instruction.arg : undefined;
-        const resolved = raw && typeof raw === "object" &&
-          Object.prototype.hasOwnProperty.call(raw, "value") ? raw.value : raw;
-        const number = Number(resolved);
-        return Number.isInteger(number) ? number | 0 : null;
-      }
-      return null;
-    };
-    // A preheader value computed only from integer constants and entry
+        // A preheader value computed only from integer constants and entry
     // scalars that the method never writes holds the same value at method
     // entry as it does at the preheader, so an entry-emitted checked-leaf
     // guard may name it. The candidate run is simulated as a small stack
@@ -8523,11 +7923,9 @@ class JvmSsaBlockRenderer {
     const arrayRangeGuardByCondition = new Map();
     const tripBoundedArrayRangeGuards = new Set();
     const countedRangeTripValues = new Map();
-    let coalescedArrayRangeGuardCount = 0;
-    const loopInvariantDivisorGuards = new Map();
+        const loopInvariantDivisorGuards = new Map();
     const loopInvariantDivisorGuardNonZeroLocals = new Map();
-    let loopInvariantDivisorGuardCount = 0;
-    const sharedCountedTrips = (info, preamble) => {
+        const sharedCountedTrips = (info, preamble) => {
       let shared = countedRangeTripValues.get(info.header);
       if (!shared) {
         const remaining =
@@ -8610,14 +8008,12 @@ class JvmSsaBlockRenderer {
           ]), e`)`), {pure: true}),
       });
       loopInvariantDivisorGuardNonZeroLocals.set(variable, [...slots]);
-      loopInvariantDivisorGuardCount += slots.size;
+      stats.loopInvariantDivisorGuardCount += slots.size;
     }
     const quotientProductRangePreambles = new Map();
     const indirectArrayRangePreambles = new Map();
     const cyclicArrayRangeCandidates = new Set();
-    let fieldBackedArrayRangeCandidateCount = 0;
-    let hoistedArrayRangeGuardCount = 0;
-    const trustedHoistedRangeGuards = new Set();
+            const trustedHoistedRangeGuards = new Set();
     const entryDominatedRangeGuards = new Set();
     const rangeBailoutGuardsByHeader = new Map();
     const hasEffectBeforeLoopHeader = (header) => {
@@ -8633,290 +8029,7 @@ class JvmSsaBlockRenderer {
       }
       return false;
     };
-    const affineLocalStep = (info, slot) => {
-      let result = null;
-      let writes = 0;
-      for (const block of info.loopBlocks) {
-        const blockItems = cfg.blocks[block].insns;
-        for (let position = 0; position < blockItems.length; position += 1) {
-          const itemIndex = blockItems[position];
-          const instruction = items[itemIndex]?.instruction;
-          const op = opOf(instruction);
-          const writtenSlot = /^istore(?:_[0-3])?$/.test(op)
-            ? localIndex(instruction, op)
-            : op === "iinc" ? Number(instruction.varnum ?? instruction.arg)
-              : null;
-          if (writtenSlot !== slot) continue;
-          writes += 1;
-          if (op === "iinc") {
-            const increment = Number(instruction.incr ?? 0);
-            if (Number.isInteger(increment)) result = String(increment);
-            continue;
-          }
-          if (position < 3) continue;
-          const load = items[blockItems[position - 3]]?.instruction;
-          const stepLoad = items[blockItems[position - 2]]?.instruction;
-          const add = items[blockItems[position - 1]]?.instruction;
-          const loadOp = opOf(load);
-          if (!/^iload(?:_[0-3])?$/.test(loadOp) ||
-              localIndex(load, loadOp) !== slot ||
-              opOf(add) !== "iadd") continue;
-          const constantStep = constantInstructionValue(stepLoad);
-          if (Number.isInteger(constantStep)) {
-            result = String(constantStep);
-            continue;
-          }
-          if (opOf(stepLoad) === "getstatic") {
-            const direct = directStaticSites.get(blockItems[position - 2]);
-            if (direct?.entryReadCache?.value) {
-              result = direct.entryReadCache.value;
-            }
-          }
-        }
-      }
-      return writes === 1 ? result : null;
-    };
-    const carriedCountedLocalRelation = (info, candidate) => {
-      if (candidate.kind !== "affine-local" || info.initial !== 0 ||
-          info.increment <= 0 || candidate.slots.length !== 1) return null;
-      const slot = candidate.slots[0];
-      if (slot === info.slot || !Number.isInteger(info.boundSlot) ||
-          !Number.isInteger(info.preheader)) return null;
-      const preheaderItems = cfg.blocks[info.preheader]?.insns || [];
-      let initialized = false;
-      for (let position = 3; position < preheaderItems.length; position += 1) {
-        const load = items[preheaderItems[position - 3]]?.instruction;
-        const stride = items[preheaderItems[position - 2]]?.instruction;
-        const subtract = items[preheaderItems[position - 1]]?.instruction;
-        const store = items[preheaderItems[position]]?.instruction;
-        const loadOp = opOf(load), storeOp = opOf(store);
-        if (/^iload(?:_[0-3])?$/.test(loadOp) &&
-            localIndex(load, loadOp) === info.boundSlot &&
-            constantInstructionValue(stride) === info.increment &&
-            opOf(subtract) === "isub" &&
-            /^istore(?:_[0-3])?$/.test(storeOp) &&
-            localIndex(store, storeOp) === slot) initialized = true;
-      }
-      if (!initialized) return null;
-      let assignment = null;
-      let writes = 0;
-      for (const loopBlock of info.loopBlocks) {
-        const blockItems = cfg.blocks[loopBlock]?.insns || [];
-        for (let position = 1; position < blockItems.length; position += 1) {
-          const storeIndex = blockItems[position];
-          const store = items[storeIndex]?.instruction;
-          const storeOp = opOf(store);
-          if (!/^istore(?:_[0-3])?$/.test(storeOp) ||
-              localIndex(store, storeOp) !== slot) continue;
-          writes += 1;
-          const load = items[blockItems[position - 1]]?.instruction;
-          const loadOp = opOf(load);
-          if (/^iload(?:_[0-3])?$/.test(loadOp) &&
-              localIndex(load, loadOp) === info.slot) {
-            assignment = {block: loopBlock, itemIndex: storeIndex};
-          }
-        }
-      }
-      if (writes !== 1 || !assignment) return null;
-      const afterAccess = assignment.block === candidate.block
-        ? assignment.itemIndex > candidate.itemIndex
-        : loopPathExists(info, candidate.block, assignment.block);
-      if (!afterAccess || (info.backedges || []).some((backedge) =>
-        assignment.block !== backedge &&
-        loopPathExists(info, info.header, backedge, assignment.block))) {
-        return null;
-      }
-      return {slot, offset: candidate.indexAffine?.offset || 0};
-    };
-    const packedAppendRelation = (info, candidate) => {
-      if (candidate.kind !== "affine-local" || info.increment <= 0 ||
-          candidate.slots.length !== 1) return null;
-      const slot = candidate.slots[0];
-      if (slot === info.slot) return null;
-      if ([...structured.loopHeaders].some((header) =>
-        header !== info.header && info.loopBlocks.has(header))) return null;
-      let writeCount = 0;
-      const blockWeights = new Map();
-      for (const block of info.loopBlocks) {
-        let weight = 0;
-        for (const itemIndex of cfg.blocks[block]?.insns || []) {
-          const instruction = items[itemIndex]?.instruction;
-          const op = opOf(instruction);
-          const writtenSlot = op === "iinc"
-            ? Number(instruction.varnum ?? instruction.arg)
-            : /^istore(?:_[0-3])?$/.test(op)
-              ? localIndex(instruction, op) : null;
-          if (writtenSlot !== slot) continue;
-          writeCount += 1;
-          if (op !== "iinc" || Number(instruction.incr) !== 1) return null;
-          weight += 1;
-        }
-        blockWeights.set(block, weight);
-      }
-      if (!writeCount) return null;
-      const memo = new Map();
-      const visiting = new Set();
-      const maximumToBackedge = (block) => {
-        if (memo.has(block)) return memo.get(block);
-        if (visiting.has(block)) return null;
-        visiting.add(block);
-        let suffix = -Infinity;
-        for (const successor of cfg.succ[block] || []) {
-          if (successor === info.header) {
-            suffix = Math.max(suffix, 0);
-          } else if (info.loopBlocks.has(successor)) {
-            const candidateMaximum = maximumToBackedge(successor);
-            if (candidateMaximum === null) return null;
-            suffix = Math.max(suffix, candidateMaximum);
-          }
-        }
-        visiting.delete(block);
-        const maximum = suffix === -Infinity
-          ? -Infinity : (blockWeights.get(block) || 0) + suffix;
-        memo.set(block, maximum);
-        return maximum;
-      };
-      let incrementsPerTrip = -Infinity;
-      for (const successor of cfg.succ[info.header] || []) {
-        if (!info.loopBlocks.has(successor) || successor === info.header) continue;
-        const maximum = maximumToBackedge(successor);
-        if (maximum === null) return null;
-        incrementsPerTrip = Math.max(incrementsPerTrip, maximum);
-      }
-      if (!Number.isInteger(incrementsPerTrip) || incrementsPerTrip <= 0) {
-        return null;
-      }
-      const candidateItems = cfg.blocks[candidate.block]?.insns || [];
-      const candidatePosition = candidateItems.indexOf(candidate.itemIndex);
-      let postIncrement = false;
-      for (let position = candidatePosition - 1; position > 0; position -= 1) {
-        const instruction = items[candidateItems[position]]?.instruction;
-        const op = opOf(instruction);
-        if (op === "iinc" &&
-            Number(instruction.varnum ?? instruction.arg) === slot &&
-            Number(instruction.incr) === 1) {
-          postIncrement = candidateItems.slice(0, position).some((itemIndex) => {
-            const load = items[itemIndex]?.instruction;
-            const loadOp = opOf(load);
-            return /^iload(?:_[0-3])?$/.test(loadOp) &&
-              localIndex(load, loadOp) === slot;
-          });
-          break;
-        }
-      }
-      return {
-        slot,
-        offset: candidate.indexAffine?.offset || 0,
-        incrementsPerTrip,
-        postIncrement,
-      };
-    };
-    const binaryLocalAssignment = (info, targetSlot, binaryOp) => {
-      let result = null;
-      let writes = 0;
-      for (const block of info.loopBlocks) {
-        const blockItems = cfg.blocks[block].insns;
-        for (let position = 0; position < blockItems.length; position += 1) {
-          const itemIndex = blockItems[position];
-          const instruction = items[itemIndex]?.instruction;
-          const op = opOf(instruction);
-          const writtenSlot = /^istore(?:_[0-3])?$/.test(op)
-            ? localIndex(instruction, op)
-            : op === "iinc" ? Number(instruction.varnum ?? instruction.arg)
-              : null;
-          if (writtenSlot !== targetSlot) continue;
-          writes += 1;
-          if (position < 3 || op === "iinc") continue;
-          const left = items[blockItems[position - 3]]?.instruction;
-          const right = items[blockItems[position - 2]]?.instruction;
-          const binary = items[blockItems[position - 1]]?.instruction;
-          const leftOp = opOf(left);
-          const rightOp = opOf(right);
-          if (!/^iload(?:_[0-3])?$/.test(leftOp) ||
-              !/^iload(?:_[0-3])?$/.test(rightOp) ||
-              opOf(binary) !== binaryOp) continue;
-          result = {
-            left: localIndex(left, leftOp),
-            right: localIndex(right, rightOp),
-            block,
-            itemIndex,
-          };
-        }
-      }
-      return writes === 1 ? result : null;
-    };
-    const cyclicLocalRange = (info, candidate) => {
-      if (candidate.kind !== "affine-local" ||
-          candidate.slots.length !== 1) return null;
-      const indexSlot = candidate.slots[0];
-      const candidateIndex = candidate.itemIndex;
-      const sampledLoad = items[candidateIndex - 2]?.instruction;
-      const sampledIncrement = items[candidateIndex - 1]?.instruction;
-      const sampledLoadOp = opOf(sampledLoad);
-      if (!/^iload(?:_[0-3])?$/.test(sampledLoadOp) ||
-          localIndex(sampledLoad, sampledLoadOp) !== indexSlot ||
-          opOf(sampledIncrement) !== "iinc" ||
-          Number(sampledIncrement.varnum ?? sampledIncrement.arg) !== indexSlot ||
-          Number(sampledIncrement.incr) !== 1) return null;
-      const loopItems = [...info.loopBlocks]
-        .flatMap((block) => cfg.blocks[block].insns || []);
-      const loopItemSet = new Set(loopItems);
-      const writtenSlots = new Map();
-      for (const itemIndex of loopItems) {
-        const instruction = items[itemIndex]?.instruction;
-        const op = opOf(instruction);
-        const slot = /^istore(?:_[0-3])?$/.test(op)
-          ? localIndex(instruction, op)
-          : op === "iinc"
-            ? Number(instruction.varnum ?? instruction.arg) : null;
-        if (Number.isInteger(slot)) {
-          writtenSlots.set(slot, (writtenSlots.get(slot) || 0) + 1);
-        }
-      }
-      for (let position = 0; position + 9 < items.length; position += 1) {
-        const sequence = Array.from(
-          {length: 10}, (_unused, offset) =>
-            items[position + offset]?.instruction);
-        if (sequence.some((_instruction, offset) =>
-            !loopItemSet.has(position + offset))) continue;
-        const phaseIncrement = sequence[0];
-        if (opOf(phaseIncrement) !== "iinc" ||
-            Number(phaseIncrement.incr) !== 1) continue;
-        const phaseSlot =
-          Number(phaseIncrement.varnum ?? phaseIncrement.arg);
-        const phaseLoadOp = opOf(sequence[1]);
-        const modulusLoadOp = opOf(sequence[2]);
-        const indexLoadOp = opOf(sequence[4]);
-        const secondModulusLoadOp = opOf(sequence[5]);
-        const indexStoreOp = opOf(sequence[7]);
-        const phaseStoreOp = opOf(sequence[9]);
-        if (!/^iload(?:_[0-3])?$/.test(phaseLoadOp) ||
-            localIndex(sequence[1], phaseLoadOp) !== phaseSlot ||
-            !/^iload(?:_[0-3])?$/.test(modulusLoadOp) ||
-            !/^iload(?:_[0-3])?$/.test(indexLoadOp) ||
-            localIndex(sequence[4], indexLoadOp) !== indexSlot ||
-            !/^iload(?:_[0-3])?$/.test(secondModulusLoadOp) ||
-            opOf(sequence[3]) !== "if_icmpne" ||
-            opOf(sequence[6]) !== "isub" ||
-            !/^istore(?:_[0-3])?$/.test(indexStoreOp) ||
-            localIndex(sequence[7], indexStoreOp) !== indexSlot ||
-            opOf(sequence[8]) !== "iconst_0" ||
-            !/^istore(?:_[0-3])?$/.test(phaseStoreOp) ||
-            localIndex(sequence[9], phaseStoreOp) !== phaseSlot) continue;
-        const modulusSlot = localIndex(sequence[2], modulusLoadOp);
-        if (localIndex(sequence[5], secondModulusLoadOp) !== modulusSlot ||
-            info.writtenSlots.has(modulusSlot) ||
-            (writtenSlots.get(indexSlot) || 0) !== 2 ||
-            (writtenSlots.get(phaseSlot) || 0) !== 2) continue;
-        const branchTarget = sequence[3]?.arg;
-        const targetIndex = typeof branchTarget === "string"
-          ? labels.get(branchTarget.replace(/:$/, "")) : null;
-        if (targetIndex !== position + 10) continue;
-        return {indexSlot, phaseSlot, modulusSlot};
-      }
-      return null;
-    };
-    // Extend a verified one-dimensional cyclic access across an enclosing
+                        // Extend a verified one-dimensional cyclic access across an enclosing
     // counted row loop.  This is the bytecode form produced for a general
     // cyclic rectangle, but the proof is expressed entirely in terms of local
     // recurrences:
@@ -8929,140 +8042,7 @@ class JvmSsaBlockRenderer {
     // been verified, one entry predicate can cover the complete rectangular
     // backing store.  The generated fast loop then needs neither a per-row
     // source predicate nor a checked duplicate of its inner loop.
-    const nestedCyclicLocalRange = (info, candidate, cyclic, outer) => {
-      if (!outer || !outer.loopBlocks.has(info.header)) return null;
-      const innerItems = new Set([...info.loopBlocks]
-        .flatMap((block) => cfg.blocks[block]?.insns || []));
-      const outerOnlyItems = [...outer.loopBlocks]
-        .flatMap((block) => cfg.blocks[block]?.insns || [])
-        .filter((itemIndex) => !innerItems.has(itemIndex))
-        .sort((left, right) => left - right);
-      const outerOnlySet = new Set(outerOnlyItems);
-      const loadSlot = (instruction) => {
-        const op = opOf(instruction);
-        return /^iload(?:_[0-3])?$/.test(op)
-          ? localIndex(instruction, op) : null;
-      };
-      const storeSlot = (instruction) => {
-        const op = opOf(instruction);
-        return /^istore(?:_[0-3])?$/.test(op)
-          ? localIndex(instruction, op) : null;
-      };
-      const sequenceAt = (position, length) => {
-        const indexes = Array.from(
-          {length}, (_unused, offset) => position + offset);
-        return indexes.every((itemIndex) => outerOnlySet.has(itemIndex))
-          ? indexes.map((itemIndex) => items[itemIndex]?.instruction) : null;
-      };
-
-      let rowAdvance = null;
-      for (const position of outerOnlyItems) {
-        const sequence = sequenceAt(position, 10);
-        if (!sequence ||
-            loadSlot(sequence[0]) !== cyclic.indexSlot ||
-            loadSlot(sequence[1]) !== cyclic.phaseSlot ||
-            opOf(sequence[2]) !== "isub" ||
-            !Number.isInteger(loadSlot(sequence[3])) ||
-            opOf(sequence[4]) !== "iadd" ||
-            loadSlot(sequence[5]) !== cyclic.modulusSlot ||
-            opOf(sequence[6]) !== "iadd" ||
-            storeSlot(sequence[7]) !== cyclic.indexSlot ||
-            loadSlot(sequence[8]) !== loadSlot(sequence[3]) ||
-            storeSlot(sequence[9]) !== cyclic.phaseSlot) continue;
-        if (rowAdvance) return null;
-        rowAdvance = {
-          position,
-          entryPhaseSlot: loadSlot(sequence[3]),
-        };
-      }
-      if (!rowAdvance || outer.writtenSlots.has(rowAdvance.entryPhaseSlot)) {
-        return null;
-      }
-
-      let verticalWrap = null;
-      for (const position of outerOnlyItems) {
-        const sequence = sequenceAt(position, 10);
-        if (!sequence || opOf(sequence[0]) !== "iinc" ||
-            Number(sequence[0].incr) !== 1) continue;
-        const rowSlot = Number(sequence[0].varnum ?? sequence[0].arg);
-        const heightSlot = loadSlot(sequence[2]);
-        const cycleSlot = loadSlot(sequence[7]);
-        if (loadSlot(sequence[1]) !== rowSlot ||
-            !Number.isInteger(heightSlot) ||
-            opOf(sequence[3]) !== "if_icmpne" ||
-            opOf(sequence[4]) !== "iconst_0" ||
-            storeSlot(sequence[5]) !== rowSlot ||
-            loadSlot(sequence[6]) !== cyclic.indexSlot ||
-            !Number.isInteger(cycleSlot) ||
-            opOf(sequence[8]) !== "isub" ||
-            storeSlot(sequence[9]) !== cyclic.indexSlot) continue;
-        const branchTarget = sequence[3]?.arg;
-        const targetIndex = typeof branchTarget === "string"
-          ? labels.get(branchTarget.replace(/:$/, "")) : null;
-        if (targetIndex !== position + 10) continue;
-        if (verticalWrap) return null;
-        verticalWrap = {position, rowSlot, heightSlot, cycleSlot};
-      }
-      if (!verticalWrap ||
-          outer.writtenSlots.has(verticalWrap.heightSlot) ||
-          outer.writtenSlots.has(verticalWrap.cycleSlot) ||
-          outer.writtenSlots.has(cyclic.modulusSlot)) return null;
-
-      const firstOuterItem = Math.min(...[...outer.loopBlocks]
-        .flatMap((block) => cfg.blocks[block]?.insns || []));
-      let entryPhaseInitializationCount = 0;
-      let cycleInitializationCount = 0;
-      for (let position = 1; position < firstOuterItem; position += 1) {
-        const store = items[position]?.instruction;
-        if (storeSlot(store) === rowAdvance.entryPhaseSlot &&
-            loadSlot(items[position - 1]?.instruction) === cyclic.phaseSlot) {
-          entryPhaseInitializationCount += 1;
-        }
-        if (position >= 3 &&
-            storeSlot(store) === verticalWrap.cycleSlot &&
-            opOf(items[position - 1]?.instruction) === "imul") {
-          const left = loadSlot(items[position - 3]?.instruction);
-          const right = loadSlot(items[position - 2]?.instruction);
-          if ((left === verticalWrap.heightSlot &&
-               right === cyclic.modulusSlot) ||
-              (right === verticalWrap.heightSlot &&
-               left === cyclic.modulusSlot)) {
-            cycleInitializationCount += 1;
-          }
-        }
-      }
-      if (entryPhaseInitializationCount !== 1 ||
-          cycleInitializationCount !== 1) return null;
-
-      const writeCounts = new Map();
-      for (const itemIndex of [...outer.loopBlocks]
-        .flatMap((block) => cfg.blocks[block]?.insns || [])) {
-        const instruction = items[itemIndex]?.instruction;
-        const op = opOf(instruction);
-        const slot = op === "iinc"
-          ? Number(instruction.varnum ?? instruction.arg)
-          : storeSlot(instruction);
-        if (Number.isInteger(slot)) {
-          writeCounts.set(slot, (writeCounts.get(slot) || 0) + 1);
-        }
-      }
-      if (writeCounts.get(cyclic.indexSlot) !== 4 ||
-          writeCounts.get(cyclic.phaseSlot) !== 3 ||
-          writeCounts.get(verticalWrap.rowSlot) !== 2 ||
-          writeCounts.has(rowAdvance.entryPhaseSlot) ||
-          writeCounts.has(verticalWrap.heightSlot) ||
-          writeCounts.has(verticalWrap.cycleSlot) ||
-          writeCounts.has(cyclic.modulusSlot)) return null;
-
-      return {
-        outer,
-        entryPhaseSlot: rowAdvance.entryPhaseSlot,
-        rowSlot: verticalWrap.rowSlot,
-        heightSlot: verticalWrap.heightSlot,
-        cycleSlot: verticalWrap.cycleSlot,
-      };
-    };
-    // Recognize a general integer recurrence used by affine samplers:
+        // Recognize a general integer recurrence used by affine samplers:
     //
     //   recurrence += invariantStep
     //   quotient = recurrence / invariantDivisor
@@ -9075,34 +8055,7 @@ class JvmSsaBlockRenderer {
     // truncating division and multiplication are monotone over the finite
     // recurrence, so all intermediate indexes are in range as well. The
     // original checked loop remains the complete slow arm.
-    const loopPathExists = (info, start, target, blocked = null) => {
-      if (start === blocked) return false;
-      const pending = [start];
-      const visited = new Set();
-      while (pending.length) {
-        const block = pending.pop();
-        if (block === blocked || visited.has(block)) continue;
-        if (block === target) return true;
-        visited.add(block);
-        for (const successor of cfg.succ[block] || []) {
-          // Crossing the natural-loop backedge starts the next iteration and
-          // cannot establish ordering within the current one.
-          if (successor === info.header ||
-              !info.loopBlocks.has(successor)) continue;
-          pending.push(successor);
-        }
-      }
-      return false;
-    };
-    const loopAssignmentDominates = (info, assignment, candidate) => {
-      if (assignment.block === candidate.block) {
-        return assignment.itemIndex < candidate.itemIndex;
-      }
-      if (assignment.block === info.header) return true;
-      return !loopPathExists(
-        info, info.header, candidate.block, assignment.block);
-    };
-    // A polygon/edge walker and many table decoders carry the previous
+            // A polygon/edge walker and many table decoders carry the previous
     // induction value in a second local:
     //
     //   previous = bound - 1;
@@ -9114,118 +8067,7 @@ class JvmSsaBlockRenderer {
     // Verify the initialization, unique assignment, ordering, and every
     // backedge structurally. Both locals then share [0, bound - 1], allowing
     // one loop-entry range guard for scaled array indexes.
-    const scaledCountedLocalRelation = (info, candidate) => {
-      if (candidate.kind !== "scaled-local" || info.increment !== 1 ||
-          info.initial !== 0 || candidate.slots.length !== 1) return null;
-      const slot = candidate.slots[0];
-      if (slot === info.slot) return {kind: "induction"};
-      if (!Number.isInteger(info.boundSlot) ||
-          !Number.isInteger(info.preheader)) return null;
-      const preheaderItems = cfg.blocks[info.preheader]?.insns || [];
-      let initialized = false;
-      for (let position = 3; position < preheaderItems.length; position += 1) {
-        const load = items[preheaderItems[position - 3]]?.instruction;
-        const one = items[preheaderItems[position - 2]]?.instruction;
-        const subtract = items[preheaderItems[position - 1]]?.instruction;
-        const store = items[preheaderItems[position]]?.instruction;
-        const loadOp = opOf(load), storeOp = opOf(store);
-        if (/^iload(?:_[0-3])?$/.test(loadOp) &&
-            localIndex(load, loadOp) === info.boundSlot &&
-            constantInstructionValue(one) === 1 &&
-            opOf(subtract) === "isub" &&
-            /^istore(?:_[0-3])?$/.test(storeOp) &&
-            localIndex(store, storeOp) === slot) {
-          initialized = true;
-        }
-      }
-      if (!initialized) return null;
-
-      let assignment = null;
-      let writes = 0;
-      for (const loopBlock of info.loopBlocks) {
-        const blockItems = cfg.blocks[loopBlock]?.insns || [];
-        for (let position = 1; position < blockItems.length; position += 1) {
-          const storeIndex = blockItems[position];
-          const store = items[storeIndex]?.instruction;
-          const storeOp = opOf(store);
-          if (!/^istore(?:_[0-3])?$/.test(storeOp) ||
-              localIndex(store, storeOp) !== slot) continue;
-          writes += 1;
-          const load = items[blockItems[position - 1]]?.instruction;
-          const loadOp = opOf(load);
-          if (/^iload(?:_[0-3])?$/.test(loadOp) &&
-              localIndex(load, loadOp) === info.slot) {
-            assignment = {block: loopBlock, itemIndex: storeIndex};
-          }
-        }
-      }
-      if (writes !== 1 || !assignment) return null;
-      const afterAccess = assignment.block === candidate.block
-        ? assignment.itemIndex > candidate.itemIndex
-        : loopPathExists(info, candidate.block, assignment.block);
-      if (!afterAccess) return null;
-      if ((info.backedges || []).some((backedge) =>
-          assignment.block !== backedge &&
-          loopPathExists(info, info.header, backedge, assignment.block))) {
-        return null;
-      }
-      return {kind: "carried"};
-    };
-    const quotientProductRecurrence = (info, candidate) => {
-      const slots = candidate.slots;
-      for (let derivedIndex = 0; derivedIndex < slots.length;
-        derivedIndex += 1) {
-        const derivedSlot = slots[derivedIndex];
-        const offsetSlot = slots[1 - derivedIndex];
-        if (info.writtenSlots.has(offsetSlot)) continue;
-        const multiply = binaryLocalAssignment(info, derivedSlot, "imul");
-        if (!multiply) continue;
-        for (const [quotientSlot, multiplierSlot] of [
-          [multiply.left, multiply.right],
-          [multiply.right, multiply.left],
-        ]) {
-          if (info.writtenSlots.has(multiplierSlot)) continue;
-          const divide =
-            binaryLocalAssignment(info, quotientSlot, "idiv");
-          if (!divide || info.writtenSlots.has(divide.right)) continue;
-          const recurrenceSlot = divide.left;
-          const recurrence =
-            binaryLocalAssignment(info, recurrenceSlot, "iadd");
-          if (!recurrence) continue;
-          const stepSlot = recurrence.left === recurrenceSlot
-            ? recurrence.right
-            : recurrence.right === recurrenceSlot
-              ? recurrence.left : null;
-          if (!Number.isInteger(stepSlot) ||
-              info.writtenSlots.has(stepSlot)) continue;
-          if (!loopAssignmentDominates(info, divide, candidate) ||
-              !loopAssignmentDominates(info, multiply, candidate)) continue;
-          // The recurrence update must occur exactly once on every path to a
-          // backedge and after this access in the current iteration. This
-          // excludes conditionally updated or update-before-sample loops whose
-          // endpoint formula would require a different starting value.
-          if ((info.backedges || []).some((backedge) =>
-              recurrence.block !== backedge &&
-              loopPathExists(
-                info, info.header, backedge, recurrence.block))) continue;
-          const updatePrecedesCandidate =
-            recurrence.block === candidate.block
-              ? recurrence.itemIndex < candidate.itemIndex
-              : loopPathExists(
-                info, recurrence.block, candidate.block);
-          if (updatePrecedesCandidate) continue;
-          return {
-            recurrenceSlot,
-            stepSlot,
-            divisorSlot: divide.right,
-            multiplierSlot,
-            offsetSlot,
-          };
-        }
-      }
-      return null;
-    };
-    for (let candidateIndex = 0;
+            for (let candidateIndex = 0;
       candidateIndex < arrayRangeCheckCandidates.length;
       candidateIndex += 1) {
       const candidate = arrayRangeCheckCandidates[candidateIndex];
@@ -9790,7 +8632,7 @@ class JvmSsaBlockRenderer {
         // so its wrapper snapshots and verifies all contributing array
         // locations before resuming lexical state. This applies equally to
         // already-direct and first-use-linked static locations.
-        fieldBackedArrayRangeCandidateCount += 1;
+        stats.fieldBackedArrayRangeCandidateCount += 1;
       }
       if (!unconditionallyNonNullEntryArrayData.has(candidate.arrayData)) {
         condition = operand(
@@ -9820,7 +8662,7 @@ class JvmSsaBlockRenderer {
             new Map([[candidate.marker, [{ref: existingGuard}]]]));
         }
         if (coveredOffsets) candidate.coveredOffsets = coveredOffsets;
-        coalescedArrayRangeGuardCount += 1;
+        stats.coalescedArrayRangeGuardCount += 1;
         continue;
       }
       arrayRangeGuardByCondition.set(guardKey, variable);
@@ -9834,7 +8676,7 @@ class JvmSsaBlockRenderer {
         constDecl(variable, e`${condition}`, {pure: true}), [variable]));
       arrayRangeGuardDeclarations.set(declarationHeader, declarations);
       if (declarationHeader !== info.header) {
-        hoistedArrayRangeGuardCount += 1;
+        stats.hoistedArrayRangeGuardCount += 1;
       }
       // A guard emitted at its own first loop header is just as transactional
       // as one hoisted across nested loops when no guest effect precedes that
@@ -10168,8 +9010,7 @@ class JvmSsaBlockRenderer {
         break;
       }
     }
-    let provenCheckedCallAdmissionCount = 0;
-    let clippedAffineRegionAdmission = null;
+        let clippedAffineRegionAdmission = null;
     const checkedAdmissionOwnedCaptureRefreshes = new Set();
     let preflightedCheckedLeafVerifier = null;
     let preflightedCheckedLeafArgumentSlots = null;
@@ -10367,7 +9208,7 @@ class JvmSsaBlockRenderer {
             ordinary: candidateLines.slice(start + 1, end),
           });
           candidateLines.splice(start, end - start + 1, st`${marker}`);
-          provenCheckedCallAdmissionCount += 1;
+          stats.provenCheckedCallAdmissionCount += 1;
           clippedAffineRegionAdmission = {
             top,
             bottom,
@@ -10440,11 +9281,11 @@ class JvmSsaBlockRenderer {
             ordinary: candidateLines.slice(start + 1, end),
           });
           candidateLines.splice(start, end - start + 1, st`${marker}`);
-          provenCheckedCallAdmissionCount += 1;
+          stats.provenCheckedCallAdmissionCount += 1;
         } else if (!needsTighterTripGuard) {
           candidateLines.splice(
             start, end - start + 1, ...candidate.replacement);
-          provenCheckedCallAdmissionCount += 1;
+          stats.provenCheckedCallAdmissionCount += 1;
         } else {
           candidateLines.splice(end, 1);
           candidateLines.splice(start, 1);
@@ -10462,7 +9303,7 @@ class JvmSsaBlockRenderer {
     // This relies only on the verified capacity/compaction/callee contracts.
     if (clippedAffineRegionAdmission &&
         checkedCallAdmissionCandidates.length === callSites.size &&
-        provenCheckedCallAdmissionCount === callSites.size &&
+        stats.provenCheckedCallAdmissionCount === callSites.size &&
         packedArrayCapacityFacts.length === 1 &&
         compactingCursorFacts.length > 0 &&
         (code.code.exceptionTable || []).length === 0) {
@@ -10542,8 +9383,7 @@ class JvmSsaBlockRenderer {
     // failure retain normal JVM semantics.  Java array lengths are immutable;
     // requiring the cursor local to be unwritten between the accesses makes
     // the shared successful proof valid for the complete group.
-    let blockCoalescedArrayRangeAccessCount = 0;
-    const primitiveGroups = new Map();
+        const primitiveGroups = new Map();
     for (const access of primitiveArrayAccessCandidates) {
       if (access.structuralGuard ||
           !Number.isInteger(access.indexAffine?.slot) ||
@@ -10571,7 +9411,7 @@ class JvmSsaBlockRenderer {
         continue;
       }
       const variable = named(`ssaBlockArrayRangeGuard${
-        blockCoalescedArrayRangeAccessCount}`);
+        stats.blockCoalescedArrayRangeAccessCount}`);
       let applied = false;
       for (const candidatePlan of plans) {
         if (!candidatePlan?.lines) continue;
@@ -10595,7 +9435,7 @@ class JvmSsaBlockRenderer {
         applied = true;
       }
       if (applied) {
-        blockCoalescedArrayRangeAccessCount += group.length - 1;
+        stats.blockCoalescedArrayRangeAccessCount += group.length - 1;
       }
     }
     for (const candidate of primitiveArrayAccessCandidates) {
@@ -10647,16 +9487,14 @@ class JvmSsaBlockRenderer {
     // This only reads Date.now() at the resulting boundary; an actual
     // spill/yield still occurs solely when the ordinary scheduler deadline,
     // debugger, timer, or thread state says it is observable.
-    let methodInvokeCount = 0;
-    let methodAllocationCount = 0;
-    for (const item of items) {
+            for (const item of items) {
       const op = opOf(item?.instruction);
-      if (op?.startsWith("invoke")) methodInvokeCount += 1;
+      if (op?.startsWith("invoke")) stats.methodInvokeCount += 1;
       if (op === "new" || op === "newarray" || op === "anewarray" ||
-          op === "multianewarray") methodAllocationCount += 1;
+          op === "multianewarray") stats.methodAllocationCount += 1;
     }
     const methodLoopWorkEstimate = Math.max(1,
-      items.length + methodInvokeCount * 32 + methodAllocationCount * 16);
+      items.length + stats.methodInvokeCount * 32 + stats.methodAllocationCount * 16);
     const maxPollBudget = this.jit.structuredLoopSafePointMaxBudget;
     const methodPollBudget = hasAtomicUnsafeOperation
       ? Math.max(64, Math.min(maxPollBudget,
@@ -10795,7 +9633,7 @@ class JvmSsaBlockRenderer {
             const key = `${zeroGuardSlot}\0${trimmed}`;
             if (!rangeDominatedArithmeticGuards.has(key)) {
               rangeDominatedArithmeticGuards.add(key);
-              rangeDominatedArithmeticGuardCount += 1;
+              stats.rangeDominatedArithmeticGuardCount += 1;
             }
             index = close;
             continue;
@@ -10813,7 +9651,7 @@ class JvmSsaBlockRenderer {
             const key = `${nonNullReferenceSlot}\0${trimmed}`;
             if (!dominatedEntryReferenceNullBranches.has(key)) {
               dominatedEntryReferenceNullBranches.add(key);
-              dominatedEntryReferenceNullBranchCount += 1;
+              stats.dominatedEntryReferenceNullBranchCount += 1;
             }
             const nestedPrefix = `${indentPrefix}  `;
             const nonNullLines = lines.slice(index + 1, close).map(
@@ -10839,7 +9677,7 @@ class JvmSsaBlockRenderer {
             const key = `${referenceSlot}\0${trimmed}`;
             if (!dominatedEntryReferenceNullBranches.has(key)) {
               dominatedEntryReferenceNullBranches.add(key);
-              dominatedEntryReferenceNullBranchCount += 1;
+              stats.dominatedEntryReferenceNullBranchCount += 1;
             }
             const nestedPrefix = `${indentPrefix}  `;
             const nonNullLines = lines.slice(alternate + 1, close).map(
@@ -10868,7 +9706,7 @@ class JvmSsaBlockRenderer {
             const key = `${receiverArrayData}\0${trimmed}`;
             if (!dominatedFieldReceiverChecks.has(key)) {
               dominatedFieldReceiverChecks.add(key);
-              dominatedFieldReceiverCheckCount += 1;
+              stats.dominatedFieldReceiverCheckCount += 1;
             }
             index = close;
             continue;
@@ -10888,7 +9726,7 @@ class JvmSsaBlockRenderer {
         const specializationKey = trimmed;
         if (!specializedArrayRangeAccesses.has(specializationKey)) {
           specializedArrayRangeAccesses.add(specializationKey);
-          specializedArrayRangeAccessCount += 1;
+          stats.specializedArrayRangeAccessCount += 1;
         }
         // This version is reached only after the exact range predicate above
         // succeeded. Keep the emitted successful-store arm; the slow loop
@@ -10912,264 +9750,27 @@ class JvmSsaBlockRenderer {
     // counted-loop proof and the emitted header agree exactly. This is a
     // generated-source canonicalization: it is driven only by the verified
     // induction slot/bound and never by a guest owner, method, or descriptor.
-    const canonicalCountedLoop = (header, label, lines) => {
-      const info = countedLoopInfos.get(header);
-      if (!info || !Number.isInteger(info.slot) || !info.boundExpression ||
-          lines.length < 5) return null;
-      const first = recordOf(lines[0]);
-      if (first?.kind !== "const" || first.localSnapshot !== info.slot) {
-        return null;
-      }
-      const second = recordOf(lines[1]);
-      const secondIsBound = second?.kind === "const" &&
-        renderParts(second.exprParts) === String(info.boundExpression);
-      const headerComparison = (line, left, right) => {
-        const record = recordOf(line);
-        const comparison = record?.kind === "if" ? record.comparison : null;
-        if (!comparison) return null;
-        if (comparison.left !== undefined) {
-          return comparison.left === left && comparison.right === right
-            ? comparison.cmp : null;
-        }
-        // A bytecode `ifge`/`iflt` compares against zero directly, so its
-        // comparison carries one operand and the zero is part of the operator.
-        if (comparison.input !== left || right !== "0") return null;
-        return comparison.cmp === ">= 0" ? ">="
-          : comparison.cmp === "< 0" ? "<" : null;
-      };
-      const loopCondition = operand(
-        e`${localName(info.slot)} < ${info.boundExpression}`);
-      let conditionIndex;
-      let bodyOnThen = false;
-      const twoValueCmp = secondIsBound
-        ? headerComparison(lines[2], first.def, second.def) : null;
-      const boundCmp = headerComparison(
-        lines[1], first.def, String(info.boundExpression));
-      if (twoValueCmp === ">=") {
-        conditionIndex = 2;
-      } else if (twoValueCmp === "<") {
-        conditionIndex = 2;
-        bodyOnThen = true;
-      } else if (boundCmp === ">=") {
-        conditionIndex = 1;
-      } else if (boundCmp === "<") {
-        conditionIndex = 1;
-        bodyOnThen = true;
-      } else {
-        return null;
-      }
-      let alternate = -1;
-      let depth = 0;
-      for (let index = conditionIndex; index < lines.length; index += 1) {
-        const record = recordOf(lines[index]);
-        const closesToElse = record?.kind === "elseArm";
-        if (index > conditionIndex && depth === 1 && closesToElse) {
-          alternate = index;
-          break;
-        }
-        depth += record?.blockDelta || 0;
-      }
-      if (alternate < 0 ||
-          recordOf(lines[lines.length - 1])?.kind !== "blockEnd") return null;
-      const unindentOne = (line) => line.startsWith("  ")
-        ? line.slice(2) : line;
-      const thenLines = lines.slice(conditionIndex + 1, alternate).map(unindentOne);
-      const elseLines = lines.slice(alternate + 1, -1).map(unindentOne);
-      const exit = bodyOnThen ? elseLines : thenLines;
-      const body = bodyOnThen ? thenLines : elseLines;
-      const lastRecord = recordOf(body[body.length - 1] || "");
-      if (lastRecord?.kind === "continue" && lastRecord.label === label) {
-        body.pop();
-      }
-      return {
-        condition: loopCondition,
-        inductionLocal: localName(info.slot),
-        bound: String(info.boundExpression),
-        body,
-        exit,
-      };
-    };
-    // Javac lowers `while (remaining-- > 0)` to load/iinc/ifle at the loop
+        // Javac lowers `while (remaining-- > 0)` to load/iinc/ifle at the loop
     // header. It is not an increasing counted loop, but it is still a common
     // finite numeric-loop shape. Preserve the post-decrement value and move
     // the header test into JavaScript's while condition, eliminating the
     // infinite-loop/if/continue scaffold without assuming a trip bound.
-    const canonicalPostDecrementLoop = (label, lines) => {
-      if (lines.length < 8) return null;
-      const oldValue = recordOf(lines[0]);
-      if (oldValue?.kind !== "const" ||
-          !Number.isInteger(oldValue.localSnapshot)) return null;
-      const nextValue = recordOf(lines[1]);
-      if (nextValue?.kind !== "const" ||
-          nextValue.iincSource !== oldValue.def ||
-          nextValue.iincIncrement !== -1) return null;
-      const store = recordOf(lines[2]);
-      if (store?.kind !== "store" ||
-          store.write !== localName(oldValue.localSnapshot) ||
-          renderParts(store.exprParts) !== nextValue.def) return null;
-      const test = recordOf(lines[3]);
-      if (test?.kind !== "if" || test.comparison?.input !== oldValue.def ||
-          test.comparison?.cmp !== "<= 0") return null;
-      let alternate = -1;
-      let depth = 0;
-      for (let index = 3; index < lines.length; index += 1) {
-        const record = recordOf(lines[index]);
-        if (index > 3 && depth === 1 && record?.kind === "elseArm") {
-          alternate = index;
-          break;
-        }
-        depth += record?.blockDelta || 0;
-      }
-      if (alternate < 0 ||
-          recordOf(lines[lines.length - 1])?.kind !== "blockEnd") return null;
-      const unindentOne = (line) => line.startsWith("  ")
-        ? line.slice(2) : line;
-      const exit = lines.slice(4, alternate).map(unindentOne);
-      const body = [
-        ...lines.slice(0, 3),
-        ...lines.slice(alternate + 1, -1).map(unindentOne),
-      ];
-      const lastRecord = recordOf(body[body.length - 1] || "");
-      if (lastRecord?.kind === "continue" && lastRecord.label === label) {
-        body.pop();
-      }
-      return {
-        condition: operand(
-          e`${localName(oldValue.localSnapshot)} > 0`),
-        body,
-        exit,
-      };
-    };
-    let dominatedArithmeticGuardCount = cfgDominatedArithmeticGuardCount;
+        stats.dominatedArithmeticGuardCount = stats.cfgDominatedArithmeticGuardCount;
     const deferredStaticArrayAccessByMarker = new Map(
       deferredStaticArrayAccesses.map((access) => [access.marker, access]));
-    const specializeDeferredStaticArrayAccessLines = (lines, trusted) => {
-      const output = [];
-      for (let index = 0; index < lines.length; index += 1) {
-        const start = recordOf(lines[index]);
-        if (start?.kind !== "deferredStaticStart") {
-          output.push(lines[index]);
-          continue;
-        }
-        const access = deferredStaticArrayAccessByMarker.get(start.marker);
-        let close = index + 1;
-        while (close < lines.length) {
-          const record = recordOf(lines[close]);
-          if (record?.kind === "deferredStaticEnd" &&
-              record.marker === start.marker) break;
-          close += 1;
-        }
-        if (!access || close >= lines.length) {
-          output.push(lines[index]);
-          continue;
-        }
-        if (trusted && provenDeferredStaticArrayAccesses.has(start.marker)) {
-          output.push(...access.directLines);
-        } else {
-          output.push(...lines.slice(index + 1, close));
-        }
-        index = close;
-      }
-      return output;
-    };
-    const removeTerminalBreakTo = (node, label) => {
-      if (!node) return node;
-      if (node.t === "break" && node.label === label) {
-        eliminatedTerminalStructuredBreakCount += 1;
-        return {t: "seq", body: []};
-      }
-      if (node.t === "seq" && node.body.length) {
-        const body = [...node.body];
-        body[body.length - 1] = removeTerminalBreakTo(
-          body[body.length - 1], label);
-        return {...node, body};
-      }
-      if (node.t === "if") {
-        return {
-          ...node,
-          then: removeTerminalBreakTo(node.then, label),
-          els: removeTerminalBreakTo(node.els, label),
-        };
-      }
-      if (node.t === "switch") {
-        return {
-          ...node,
-          cases: node.cases.map((entry) => ({
-            ...entry,
-            body: removeTerminalBreakTo(entry.body, label),
-          })),
-          dflt: removeTerminalBreakTo(node.dflt, label),
-        };
-      }
-      if (node.t === "block") {
-        return {...node, body: removeTerminalBreakTo(node.body, label)};
-      }
-      // A break from within a loop changes that loop's control flow even when
-      // the loop node is terminal in the surrounding block.
-      return node;
-    };
-    const specializeNonZeroBranch = (plan, lines) => {
-      const comparison = plan.comparison;
-      if (!comparison || comparison.cmp !== "!== 0" ||
-          !ownSsaValueNames.has(comparison.input)) return lines;
-      const equivalent = new Set([comparison.input]);
-      // A copy of a value known non-zero is known non-zero. The record says
-      // what a statement defines or writes and what its right-hand side is,
-      // so the equivalence walk needs no line matching.
-      const learnAlias = (line) => {
-        const record = recordOf(line);
-        if (!record || record.kind !== "const" && record.kind !== "store") {
-          return false;
-        }
-        const target = record.def || record.write;
-        const source = record.exprParts?.length === 1 &&
-          typeof record.exprParts[0] !== "string"
-          ? record.exprParts[0].ref : null;
-        if (!target || !source || !equivalent.has(source)) return false;
-        const size = equivalent.size;
-        equivalent.add(target);
-        return equivalent.size !== size;
-      };
-      // The conditional plan commonly stores the tested stack value into a
-      // local immediately before branching; seed that equivalence before
-      // walking the selected successor.
-      let changed = true;
-      while (changed) {
-        changed = false;
-        for (const line of plan.lines || []) changed = learnAlias(line) || changed;
-      }
-      const output = [];
-      for (let index = 0; index < lines.length; index += 1) {
-        const line = lines[index];
-        learnAlias(line);
-        const record = recordOf(line);
-        const zeroCheck = record?.kind === "if" &&
-          record.comparison?.cmp === "=== 0" && !record.negated
-          ? record.comparison.input : null;
-        if (!zeroCheck || !equivalent.has(zeroCheck)) {
-          output.push(line);
-          continue;
-        }
-        let depth = 1;
-        let close = index + 1;
-        for (; close < lines.length && depth > 0; close += 1) {
-          const closeRecord = recordOf(lines[close]);
-          if (closeRecord?.kind === "elseArm") break;
-          depth += closeRecord?.blockDelta || 0;
-        }
-        if (depth !== 0) {
-          output.push(line);
-          continue;
-        }
-        // This is the renderer-owned idiv/irem exceptional arm. The branch
-        // edge proved the divisor nonzero, so retaining it only bloats and
-        // inhibits the surrounding numeric region.
-        dominatedArithmeticGuardCount += 1;
-        index = close - 1;
-      }
-      return output;
-    };
-    // Framed resume entry. A body that cannot yield leaves its frame at a
+    const {
+      canonicalCountedLoop,
+      canonicalPostDecrementLoop,
+      specializeDeferredStaticArrayAccessLines,
+      removeTerminalBreakTo,
+      specializeNonZeroBranch,
+      groupStraightScopes,
+      transactionalizeAcyclicLeafLines,
+    } = createLineSpecialisations({
+      blockEnd, blockStart, countedLoopInfos, deferredStaticArrayAccessByMarker, indent, indentationOf, leafBailStatement, localName, operand, ownSsaValueNames, provenDeferredStaticArrayAccesses, recordOf, stats,
+      e,
+    });
+                // Framed resume entry. A body that cannot yield leaves its frame at a
     // loop header (locals and the header's operand stack materialized) when
     // the scheduler quantum expires. The framed body re-enters at exactly
     // those headers: the prologue accepts the header pcs listed here, each
@@ -11327,82 +9928,12 @@ class JvmSsaBlockRenderer {
     const withdrawResumeConflicts = (lines) => {
       for (const pc of resumeDispatchConflicts(lines)) {
         activeResumePcs.delete(pc);
-        resumeEntryConflictCount += 1;
+        stats.resumeEntryConflictCount += 1;
       }
       return lines;
     };
-    let resumeEntryConflictCount = 0;
-    const resumeConflictNames = new Map();
-    const groupStraightScopes = (children, renderedChildren, isEntryChild) => {
-      const declaredIn = renderedChildren.map((lines) => {
-        const names = new Set();
-        let unsafe = false;
-        for (const line of lines) {
-          if (line.trim() === "") continue;
-          const record = recordOf(line);
-          if (!record) { unsafe = true; break; }
-          if (record.def) names.add(record.def);
-          if (record.opens === "function" ||
-              /HelperHeader$/.test(record.kind || "")) unsafe = true;
-        }
-        return {names, unsafe};
-      });
-      // References are found in the rendered text (a name a template wrote
-      // as literal text is a reference too), so a name mentioned anywhere in
-      // a later sibling keeps its declaring block open: conservative, and
-      // independent of how faithfully a statement recorded its operands.
-      const textOf = renderedChildren.map((lines) => lines.join("\n"));
-      const mentions = (later, names) => {
-        if (names.size === 0) return false;
-        const pattern = new RegExp(`\\b(?:${[...names].join("|")})\\b`);
-        return pattern.test(textOf[later]);
-      };
-      const output = [];
-      let index = 0;
-      while (index < children.length) {
-        if (children[index].t !== "straight" || declaredIn[index].unsafe ||
-            declaredIn[index].names.size === 0 || isEntryChild(index)) {
-          output.push(renderedChildren[index]);
-          index += 1;
-          continue;
-        }
-        let end = index;
-        const declared = new Set(declaredIn[index].names);
-        let ok = true;
-        for (;;) {
-          let conflict = -1;
-          for (let later = end + 1; later < children.length; later += 1) {
-            if (mentions(later, declared)) { conflict = later; break; }
-          }
-          if (conflict < 0) break;
-          // A loop keeps its own place: the passes that version a loop read
-          // the declarations before its header at the header's own depth.
-          for (let member = end + 1; member <= conflict; member += 1) {
-            if (isEntryChild(member) || declaredIn[member].unsafe ||
-                children[member].t === "loop") ok = false;
-          }
-          if (!ok) break;
-          for (let member = end + 1; member <= conflict; member += 1) {
-            for (const name of declaredIn[member].names) declared.add(name);
-          }
-          end = conflict;
-        }
-        if (!ok) {
-          output.push(renderedChildren[index]);
-          index += 1;
-          continue;
-        }
-        // Stay aligned with `children`: the group sits at its first
-        // child's index and the merged followers contribute nothing.
-        output.push([blockStart(""),
-          ...indent(renderedChildren.slice(index, end + 1).flat()),
-          blockEnd("")]);
-        for (let member = index + 1; member <= end; member += 1) output.push([]);
-        index = end + 1;
-      }
-      return output;
-    };
-    const render = (
+        const resumeConflictNames = new Map();
+        const render = (
       node, continuationMode = useContinuations, directPositional = false,
       loopSafePointBudget = safePointInitialBudget,
       checkedLeafOnly = false,
@@ -11783,12 +10314,12 @@ class JvmSsaBlockRenderer {
           ...rangeGuards,
           ...(invariantDivisorGuard ? [invariantDivisorGuard.variable] : []),
         ];
-        const versionedLoopsBeforeBody = versionedLoopCount;
+        const versionedLoopsBeforeBody = stats.versionedLoopCount;
         const loopBody = render(node.body, continuationMode, directPositional,
           currentLoopSafePointBudget, checkedLeafOnly, rangeBailout,
           loopSafePointBudgetOverrides);
         const bodyHoldsVersionedLoop =
-          versionedLoopCount !== versionedLoopsBeforeBody;
+          stats.versionedLoopCount !== versionedLoopsBeforeBody;
         // A loop resumed at a header inside its body is entered without
         // evaluating its own exit test, so it keeps the `while (true)` form
         // with the test in the body.
@@ -11891,7 +10422,7 @@ class JvmSsaBlockRenderer {
           countedLoop && countedLoopInfos.get(header)?.increment > 0 &&
           this.restoringRangeGuardDeoptEnabled);
         if (restoringCoarseLoopBailout && specializationGuards.length === 0) {
-          restoringCoarseLoopDeoptCount += 1;
+          stats.restoringCoarseLoopDeoptCount += 1;
           return [
             ...prefix,
             st`if (nestedEntryGuarded !== 2 && !${runtimeCoarse.variable}) {`,
@@ -11986,7 +10517,7 @@ class JvmSsaBlockRenderer {
           // published-metadata consumers.)
           if (coarse && directPositional && rangeBailout && !checkedLeafOnly &&
               this.restoringRangeGuardDeoptEnabled) {
-            restoringRangeGuardDeoptCount += 1;
+            stats.restoringRangeGuardDeoptCount += 1;
             return [
               ...prefix,
               st`if (!(${fastLoopCondition})) {`,
@@ -12017,10 +10548,10 @@ class JvmSsaBlockRenderer {
             ];
           }
           if (bodyHoldsVersionedLoop) {
-            nestedVersionedLoopSuppressionCount += 1;
+            stats.nestedVersionedLoopSuppressionCount += 1;
             return [...prefix, ...polledLoop];
           }
-          versionedLoopCount += 1;
+          stats.versionedLoopCount += 1;
           return [
             ...prefix,
             st`if (${fastLoopCondition}) {`,
@@ -12044,7 +10575,7 @@ class JvmSsaBlockRenderer {
           const record = statementRecords.get(line.trim());
           return record?.kind === "break" && record.label === node.label;
         })) {
-          eliminatedStructuredBlockCount += 1;
+          stats.eliminatedStructuredBlockCount += 1;
           return rendered;
         }
         return [
@@ -13602,49 +12133,7 @@ class JvmSsaBlockRenderer {
       }
       return lines;
     };
-    const transactionalizeAcyclicLeafLines = (sourceLines) => {
-      const lines = [...sourceLines];
-      const output = [];
-      for (let index = 0; index < lines.length; index += 1) {
-        const opening = recordOf(lines[index]);
-        if (opening?.conditional !== true) {
-          output.push(lines[index]);
-          continue;
-        }
-        let depth = 1;
-        let boundary = -1;
-        for (let cursor = index + 1; cursor < lines.length; cursor += 1) {
-          const record = recordOf(lines[cursor]);
-          if (depth === 1 && (record?.kind === "blockEnd" ||
-              record?.kind === "elseArm" || record?.kind === "elseIfArm")) {
-            boundary = cursor;
-            break;
-          }
-          depth += record?.blockDelta || 0;
-        }
-        if (boundary < 0) {
-          output.push(lines[index]);
-          continue;
-        }
-        // The arm is a cold reconstruct-and-throw arm: it opens with the
-        // frame reconstruction the emitter writes there, and it performs an
-        // operation whose only purpose is to raise the guest exception.
-        const first = recordOf(lines[index + 1] || "");
-        const opensReconstruction = first?.kind === "conditionalSpill" ||
-          first?.kind === "spill" || first?.kind === "materialize";
-        const raises = lines.slice(index + 1, boundary).some((line) =>
-          recordOf(line)?.deoptEffect === true);
-        if (!opensReconstruction || !raises) {
-          output.push(lines[index]);
-          continue;
-        }
-        output.push(lines[index],
-          leafBailStatement(`${indentationOf(lines[index])}  `));
-        index = boundary - 1;
-      }
-      return output;
-    };
-    // Collapse a reducible three-block crossing diamond into its direct
+        // Collapse a reducible three-block crossing diamond into its direct
     // boolean form. The matcher follows only label targets and comparison
     // topology. Invert the branch comparisons algebraically instead of
     // emitting `!(a > b)`: host optimizers consistently recognize the
@@ -14935,7 +13424,7 @@ class JvmSsaBlockRenderer {
         lexicalCheckedLeafWrapper = lexicalCheckedLeafWrapperShape;
         const allCheckedLeafCallsAdmitted = callSites.size > 0 &&
           checkedCallAdmissionCandidates.length === callSites.size &&
-          provenCheckedCallAdmissionCount === callSites.size &&
+          stats.provenCheckedCallAdmissionCount === callSites.size &&
           [...callSites.values()].every((site) =>
             site.returnsVoid && site.directCheckedLeaf?.noThrow === true &&
             Boolean(site.directCheckedLeaf.inlineBody));
@@ -15638,7 +14127,7 @@ class JvmSsaBlockRenderer {
           (direct) => ({
             targetId: direct.targetId, value: direct.guardedBooleanValue,
           })),
-        fieldBackedArrayGuards: fieldBackedArrayRangeCandidateCount === 0 ? []
+        fieldBackedArrayGuards: stats.fieldBackedArrayRangeCandidateCount === 0 ? []
           : fieldBackedArrayGuards.map((guard) => guard.kind === "field"
             ? {
               kind: "field",
@@ -15679,7 +14168,7 @@ class JvmSsaBlockRenderer {
         structured.loopHeaders.size === 0 ||
         (activeResumePcs.size > 0 &&
           structuralResumeHeaderCount === structured.loopHeaders.size &&
-          resumeEntryConflictCount === 0);
+          stats.resumeEntryConflictCount === 0);
       if (!ordinaryResumeCoverage &&
           (this.jit.compiledCallChainsEnabled ||
             this.jit.ordinaryAdaptiveFramelessPositionalEnabled)) {
@@ -15860,7 +14349,7 @@ class JvmSsaBlockRenderer {
       // Loop-header pcs the framed entry resumes at (see resumeEntryLines).
       generated.jvmStructuredResumePcs = resumeDispatchEmitted &&
         activeResumePcs.size > 0 ? new Set(activeResumePcs) : null;
-      generated.jvmStructuredResumeEntryConflicts = resumeEntryConflictCount;
+      generated.jvmStructuredResumeEntryConflicts = stats.resumeEntryConflictCount;
       generated.jvmStructuredResumeConflictNames = Object.fromEntries(resumeConflictNames);
       generated.jvmStructuredResumeCoverage = {
         structuralHeaders: structuralResumeHeaderCount,
@@ -16107,18 +14596,18 @@ class JvmSsaBlockRenderer {
       generated.jvmStructuredSplitBlocks = splitBlocks;
       generated.jvmStructuredDispatchIslands = dispatchIslands;
       generated.jvmStructuredDeferredCallMaterializationCount =
-        deferredCallMaterializationCount;
-      generated.jvmStructuredReusedLocalLoadCount = reusedLocalLoadCount;
-      generated.jvmStructuredEliminatedLocalStoreCount = eliminatedLocalStoreCount;
+        stats.deferredCallMaterializationCount;
+      generated.jvmStructuredReusedLocalLoadCount = stats.reusedLocalLoadCount;
+      generated.jvmStructuredEliminatedLocalStoreCount = stats.eliminatedLocalStoreCount;
       generated.jvmStructuredEliminatedDeadLocalStoreCount =
-        eliminatedDeadLocalStoreCount;
-      generated.jvmStructuredSentinelArrayLoadCount = sentinelArrayLoadCount;
+        stats.eliminatedDeadLocalStoreCount;
+      generated.jvmStructuredSentinelArrayLoadCount = stats.sentinelArrayLoadCount;
       generated.jvmStructuredBlockArrayDataViewCount =
-        blockArrayDataViewCount;
+        stats.blockArrayDataViewCount;
       generated.jvmStructuredFixedPointScalarizationCount =
-        fixedPointScalarizationCount;
+        stats.fixedPointScalarizationCount;
       generated.jvmStructuredEliminatedArrayStoreCheckCount =
-        eliminatedArrayStoreCheckCount;
+        stats.eliminatedArrayStoreCheckCount;
       generated.jvmStructuredArrayRangeGuardCount =
         arrayRangeCheckCandidates.length;
       generated.jvmStructuredEntryFieldArrayLocalViewCount =
@@ -16142,24 +14631,24 @@ class JvmSsaBlockRenderer {
       this.loopInvariantStaticArrayViewCompileCount +=
         generated.jvmStructuredLoopInvariantStaticArrayViewCount;
       generated.jvmStructuredFieldBackedArrayRangeCandidateCount =
-        fieldBackedArrayRangeCandidateCount;
+        stats.fieldBackedArrayRangeCandidateCount;
       generated.jvmStructuredIndirectArrayRangeCount =
         arrayRangeCheckCandidates.filter((candidate) =>
           candidate.kind === "indirect-entry-array" &&
           candidate.rangeGuardVariable).length;
       generated.jvmStructuredCoalescedArrayRangeGuardCount =
-        coalescedArrayRangeGuardCount;
+        stats.coalescedArrayRangeGuardCount;
       generated.jvmStructuredBlockCoalescedArrayRangeAccessCount =
-        blockCoalescedArrayRangeAccessCount;
+        stats.blockCoalescedArrayRangeAccessCount;
       generated.jvmStructuredHoistedArrayRangeGuardCount =
-        hoistedArrayRangeGuardCount;
+        stats.hoistedArrayRangeGuardCount;
       // Staging operations that reused an existing SSA value instead of
       // binding a second name to it. The copies are never emitted, so this
       // counts declarations avoided rather than declarations removed.
       generated.jvmStructuredCoalescedSsaCopyCount =
-        coalescedSsaCopyCount;
+        stats.coalescedSsaCopyCount;
       generated.jvmStructuredDominatedArithmeticGuardCount =
-        dominatedArithmeticGuardCount;
+        stats.dominatedArithmeticGuardCount;
       generated.jvmStructuredCapturedCheckedLeafCallCount =
         [...callSites.values()].filter((site) =>
           Array.isArray(site.directCheckedLeaf?.captures) &&
@@ -16221,26 +14710,26 @@ class JvmSsaBlockRenderer {
       generated.jvmStructuredCyclicRangeCount =
         cyclicArrayRangeCandidates.size;
       generated.jvmStructuredSpecializedArrayRangeAccessCount =
-        specializedArrayRangeAccessCount;
+        stats.specializedArrayRangeAccessCount;
       generated.jvmStructuredDominatedFieldReceiverCheckCount =
-        dominatedFieldReceiverCheckCount;
+        stats.dominatedFieldReceiverCheckCount;
       generated.jvmStructuredDominatedEntryReferenceNullBranchCount =
-        dominatedEntryReferenceNullBranchCount;
+        stats.dominatedEntryReferenceNullBranchCount;
       generated.jvmStructuredEliminatedTerminalBreakCount =
-        eliminatedTerminalStructuredBreakCount;
+        stats.eliminatedTerminalStructuredBreakCount;
       generated.jvmStructuredEliminatedBlockCount =
-        eliminatedStructuredBlockCount;
+        stats.eliminatedStructuredBlockCount;
       generated.jvmStructuredRestoringRangeGuardDeoptCount =
-        restoringRangeGuardDeoptCount;
+        stats.restoringRangeGuardDeoptCount;
       generated.jvmStructuredRestoringCoarseLoopDeoptCount =
-        restoringCoarseLoopDeoptCount;
-      generated.jvmStructuredVersionedLoopCount = versionedLoopCount;
+        stats.restoringCoarseLoopDeoptCount;
+      generated.jvmStructuredVersionedLoopCount = stats.versionedLoopCount;
       generated.jvmStructuredNestedVersionedLoopSuppressionCount =
-        nestedVersionedLoopSuppressionCount;
+        stats.nestedVersionedLoopSuppressionCount;
       generated.jvmStructuredRangeDominatedArithmeticGuardCount =
-        rangeDominatedArithmeticGuardCount;
+        stats.rangeDominatedArithmeticGuardCount;
       generated.jvmStructuredLoopInvariantDivisorGuardCount =
-        loopInvariantDivisorGuardCount;
+        stats.loopInvariantDivisorGuardCount;
       generated.jvmStructuredRestoringDirectFieldLayoutCount =
         restoringDirectFieldLayoutCaches.length;
       generated.jvmStructuredRestoringSpillCallCount =
@@ -16260,7 +14749,7 @@ class JvmSsaBlockRenderer {
       generated.jvmStructuredProvenDeferredStaticArrayAccessCount =
         provenDeferredStaticArrayAccesses.size;
       generated.jvmStructuredProvenCheckedCallAdmissionCount =
-        provenCheckedCallAdmissionCount;
+        stats.provenCheckedCallAdmissionCount;
       generated.jvmStructuredGuardedBooleanSiteCount = guardedStaticBooleanSites.size;
       generated.jvmStructuredPrunedBooleanCfgBranchCount =
         prunedBooleanCfgBranches;

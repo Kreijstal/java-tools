@@ -81,8 +81,18 @@ npm install
 - [Debugger API](DEBUG_API.md)
 - [Decompiler](docs/decompiler.md)
 - [Language server protocol](docs/lsp.md)
-- [Handwritten kernel retirement](docs/handwritten-kernel-retirement.md) —
-  generic compiler targets, differential oracles, and measurements
+- [Browser IDE](docs/ide.md) — the GoldenLayout IDE at `dist/index.html`
+- [Working on this repository](docs/workflow.md) — build, test, and benchmark
+  commands, what the suites do and do not cover, and the documentation index
+- [Runtime options](docs/runtime-options.md) — every `JVM_*` option read from
+  `src/`, its consumers, and the nine that cross module boundaries
+- [Repository map](docs/repository-map.md) — areas, ownership, verified
+  structural findings, and the migration backlog
+
+Plans and experiment records, kept as written rather than updated to match
+current behavior: [plan-linear-runtime.md](docs/plan-linear-runtime.md),
+[region-compiler-emission-plan.md](docs/region-compiler-emission-plan.md),
+[phase1-worker-audit.md](docs/phase1-worker-audit.md).
 
 ### Basic Usage
 

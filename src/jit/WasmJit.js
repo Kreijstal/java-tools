@@ -80,6 +80,7 @@ const {
   uleb, sleb, f32bytes, f64bytes,
   wasmProfilerName, wasmFunctionNameSection,
   getOp, descToWasm, toWasmValue, parseMethodDescriptor, sig,
+  capturesBooleanStatic,
   NPE, AIOOBE,
   BRANCH_COND, BRANCH_ZERO, ICONST, BIN_OPS, ARRAY_LOAD, ARRAY_STORE,
   arrayLoadImportName,
@@ -121,58 +122,6 @@ const DEFERRABLE_DEMOTE =
 const UNSERVICEABLE_DEMOTE = /callee not ready|unresolved static/;
 
 const EMPTY_WRITE_SET = new Set();
-const capturesBooleanStaticCache = new WeakMap();
-
-function capturesBooleanStatic(method) {
-  if (method && capturesBooleanStaticCache.has(method)) {
-    return capturesBooleanStaticCache.get(method);
-  }
-  const code = method && method.attributes &&
-    method.attributes.find((attribute) => attribute.type === 'code');
-  const items = code && code.code && code.code.codeItems;
-  const localIndex = (instruction, op, prefix) => {
-    if (op.length === prefix.length + 2 && op.startsWith(`${prefix}_`)) {
-      const compact = op.charCodeAt(op.length - 1) - 48;
-      if (compact >= 0 && compact <= 3) return compact;
-    }
-    if (op !== prefix) return null;
-    const value = instruction && typeof instruction === 'object'
-      ? instruction.varnum ?? instruction.arg
-      : null;
-    const numeric = Number(value);
-    return Number.isInteger(numeric) ? numeric : null;
-  };
-  const result = Boolean(items && items.some((item, index) => {
-    const instruction = item && item.instruction;
-    if (!(getOp(instruction) === 'getstatic' &&
-      Array.isArray(instruction.arg) &&
-      Array.isArray(instruction.arg[2]) &&
-      instruction.arg[2][1] === 'Z')) return false;
-    for (let next = index + 1; next < items.length; next += 1) {
-      const nextInstruction = items[next] && items[next].instruction;
-      const nextOp = getOp(nextInstruction);
-      if (!nextOp) continue;
-      const capturedLocal = localIndex(nextInstruction, nextOp, 'istore');
-      if (capturedLocal === null) return false;
-      let crossedCall = false;
-      for (let use = next + 1; use < items.length; use += 1) {
-        const useInstruction = items[use] && items[use].instruction;
-        const useOp = getOp(useInstruction);
-        if (!useOp) continue;
-        if (useOp && useOp.startsWith('invoke')) crossedCall = true;
-        if (localIndex(useInstruction, useOp, 'istore') === capturedLocal) return false;
-        if (localIndex(useInstruction, useOp, 'iload') === capturedLocal) {
-          return crossedCall;
-        }
-      }
-      return false;
-    }
-    return false;
-  }));
-  if (method) capturesBooleanStaticCache.set(method, result);
-  return result;
-}
-
 
 
 

@@ -6,6 +6,7 @@
 // caches, falling back to the aget/aset imports for null or non-heap arrays.
 
 const test = require('tape');
+const { makeJavaFixtureCompiler } = require('./javaFixture');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -14,17 +15,7 @@ const { JVM } = require('../src/core/jvm');
 const Frame = require('../src/core/frame');
 const Stack = require('../src/core/stack');
 
-function compileJavaFixture(t, className, source) {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'heap-arr-fixture-'));
-  t.teardown(() => {
-    fs.rmSync(tempDir, { recursive: true, force: true });
-  });
-  const sourcePath = path.join(tempDir, `${className}.java`);
-  fs.writeFileSync(sourcePath, source);
-  execFileSync('javac', ['-g', '-d', tempDir, sourcePath], { stdio: 'inherit' });
-  return tempDir;
-}
-
+const compileJavaFixture = makeJavaFixtureCompiler('heap-arr-fixture-');
 async function invoke(jvm, thread, className, methodName, descriptor, locals) {
   const method = await jvm.findMethodInHierarchy(className, methodName, descriptor);
   const frame = new Frame(method);

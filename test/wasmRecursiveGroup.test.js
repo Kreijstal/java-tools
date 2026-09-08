@@ -16,6 +16,7 @@
 // of reverting to the stub, which is what keeps the members' deopt paths dead.
 
 const test = require('tape');
+const { makeJavaFixtureCompiler } = require('./javaFixture');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -26,15 +27,7 @@ const { sealedNeverExits } = require('../src/jit/wasmShared');
 const Frame = require('../src/core/frame');
 const Stack = require('../src/core/stack');
 
-function compileJavaFixture(t, className, source) {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'recursive-group-'));
-  t.teardown(() => fs.rmSync(tempDir, { recursive: true, force: true }));
-  fs.writeFileSync(path.join(tempDir, `${className}.java`), source);
-  execFileSync('javac', ['-g', '-d', tempDir, path.join(tempDir, `${className}.java`)],
-    { stdio: 'inherit' });
-  return tempDir;
-}
-
+const compileJavaFixture = makeJavaFixtureCompiler('recursive-group-');
 function withEnv(t, vars) {
   const saved = {};
   for (const [key, value] of Object.entries(vars)) {

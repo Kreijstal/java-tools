@@ -1,4 +1,5 @@
 const test = require('tape');
+const { makeJavaFixtureCompiler } = require('./javaFixture');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -546,18 +547,7 @@ test('typed Wasm array-store imports preserve JVM narrowing and traps', (t) => {
   t.end();
 });
 
-function compileJavaFixture(t, className, source) {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'jit-fixture-'));
-  t.teardown(() => {
-    fs.rmSync(tempDir, { recursive: true, force: true });
-  });
-
-  const sourcePath = path.join(tempDir, `${className}.java`);
-  fs.writeFileSync(sourcePath, source);
-  execFileSync('javac', ['-g', '-d', tempDir, sourcePath], { stdio: 'inherit' });
-  return tempDir;
-}
-
+const compileJavaFixture = makeJavaFixtureCompiler('jit-fixture-');
 async function invoke(jvm, thread, className, methodName, descriptor, locals) {
   const method = await jvm.findMethodInHierarchy(className, methodName, descriptor);
   const frame = new Frame(method);

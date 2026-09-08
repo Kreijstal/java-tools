@@ -1,5 +1,14 @@
 'use strict';
 
+const {
+  trimLabel,
+  branchTargets,
+  referencedLabels,
+} = require('./labelReferences');
+
+const { parameterDescriptorsOrEmpty: parameterDescriptors } =
+  require('./parameterDescriptors');
+
 function runMaterializeTypedNullArgs(astRoot) {
   let rewrites = 0;
   for (const cls of astRoot.classes || []) {
@@ -106,26 +115,6 @@ function isSimpleArgumentProducer(item) {
     itemOp === 'getstatic' || itemOp === 'getfield';
 }
 
-function parameterDescriptors(descriptor) {
-  const close = descriptor.indexOf(')');
-  if (!descriptor.startsWith('(') || close < 0) return [];
-  const params = [];
-  for (let i = 1; i < close;) {
-    const start = i;
-    while (descriptor[i] === '[') i += 1;
-    if (descriptor[i] === 'L') {
-      const semi = descriptor.indexOf(';', i);
-      if (semi < 0 || semi > close) return params;
-      params.push(descriptor.slice(start, semi + 1));
-      i = semi + 1;
-    } else {
-      params.push(descriptor.slice(start, i + 1));
-      i += 1;
-    }
-  }
-  return params;
-}
-
 function isReferenceDescriptor(desc) {
   return typeof desc === 'string' && (desc.startsWith('L') || desc.startsWith('['));
 }
@@ -155,44 +144,9 @@ function isOneSlotSimpleArgumentProducer(item) {
     itemOp !== 'dconst_0' && itemOp !== 'dconst_1';
 }
 
-function referencedLabels(code) {
-  const out = new Set();
-  for (const item of code.codeItems || []) {
-    for (const label of branchTargets(item)) out.add(trimLabel(label));
-  }
-  for (const entry of code.exceptionTable || []) {
-    for (const label of [entry.startLbl, entry.endLbl, entry.handlerLbl]) out.add(trimLabel(label));
-  }
-  out.delete(null);
-  return out;
-}
-
-function branchTargets(item) {
-  const insn = item && item.instruction;
-  if (!insn || typeof insn !== 'object') return [];
-  if (insn.op === 'tableswitch' || insn.op === 'lookupswitch') {
-    const out = [];
-    const value = insn.arg;
-    if (Array.isArray(value)) {
-      for (const entry of value) {
-        if (Array.isArray(entry)) out.push(entry[entry.length - 1]);
-        else if (typeof entry === 'string') out.push(entry);
-      }
-    }
-    if (Array.isArray(insn.labels)) out.push(...insn.labels);
-    if (insn.defaultLbl) out.push(insn.defaultLbl);
-    return out;
-  }
-  return typeof insn.arg === 'string' ? [insn.arg] : [];
-}
-
 function isReferencedLabel(item, referenced) {
   const label = trimLabel(item && item.labelDef);
   return !!label && referenced.has(label);
-}
-
-function trimLabel(label) {
-  return typeof label === 'string' ? label.replace(/:$/, '') : null;
 }
 
 function referenceDescriptorFromClassName(target) {

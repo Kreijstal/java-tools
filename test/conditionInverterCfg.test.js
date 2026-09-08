@@ -1,7 +1,7 @@
 'use strict';
 
 const test = require('tape');
-const { invertConditionalGotos } = require('../src/conditionInverterCfg');
+const { invertConditionalGotos } = require('../src/passes/conditionInverterCfg');
 
 function block(id, successors = [], instruction = 'nop') {
   return {

@@ -1,4 +1,5 @@
 const test = require('tape');
+const { makeJavaFixtureCompiler } = require('./javaFixture');
 const { parse } = require('acorn');
 const fs = require('fs');
 const os = require('os');
@@ -11,17 +12,7 @@ const { JVM } = require('../src/core/jvm');
 // body by selecting fragments instead of re-parsing the generated JavaScript.
 // These assertions pin the contract that consumer depends on.
 
-function compileJavaFixture(t, className, source) {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fragment-fixture-'));
-  t.teardown(() => {
-    fs.rmSync(tempDir, { recursive: true, force: true });
-  });
-  const sourcePath = path.join(tempDir, `${className}.java`);
-  fs.writeFileSync(sourcePath, source);
-  execFileSync('javac', ['-g', '-d', tempDir, sourcePath], { stdio: 'inherit' });
-  return tempDir;
-}
-
+const compileJavaFixture = makeJavaFixtureCompiler('fragment-fixture-');
 const DIRECTIVE = "'use strict';\n";
 
 function bodyOf(source) {

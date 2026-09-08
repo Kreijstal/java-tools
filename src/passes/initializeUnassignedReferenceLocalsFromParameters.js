@@ -1,5 +1,7 @@
 'use strict';
 
+const { parameterDescriptors } = require('./parameterDescriptors');
+
 const {
   buildCfg,
   computeDominators,
@@ -151,26 +153,6 @@ function referenceParameterLocals(method) {
   for (const desc of parameterDescriptors(method.descriptor) || []) {
     if (isReferenceDescriptor(desc)) out.push({ local: String(slot), desc });
     slot += desc === 'J' || desc === 'D' ? 2 : 1;
-  }
-  return out;
-}
-
-function parameterDescriptors(desc) {
-  if (typeof desc !== 'string' || desc[0] !== '(') return null;
-  const out = [];
-  for (let i = 1; i < desc.length && desc[i] !== ')';) {
-    const start = i;
-    while (desc[i] === '[') i += 1;
-    if (desc[i] === 'L') {
-      const end = desc.indexOf(';', i);
-      if (end < 0) return null;
-      out.push(desc.slice(start, end + 1));
-      i = end + 1;
-    } else {
-      if (!desc[i]) return null;
-      out.push(desc.slice(start, i + 1));
-      i += 1;
-    }
   }
   return out;
 }

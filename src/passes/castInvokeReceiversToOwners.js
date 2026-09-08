@@ -1,5 +1,7 @@
 'use strict';
 
+const { parameterDescriptors } = require('./parameterDescriptors');
+
 function runCastInvokeReceiversToOwners(astRoot, options = {}) {
   let rewrites = 0;
   for (const cls of astRoot.classes || []) {
@@ -144,26 +146,6 @@ function applyStackEffect(stack, item, index) {
   }
   if (itemOp === 'goto' || itemOp === 'iinc' || itemOp === 'return') return true;
   return false;
-}
-
-function parameterDescriptors(desc) {
-  if (typeof desc !== 'string' || desc[0] !== '(') return null;
-  const out = [];
-  for (let i = 1; i < desc.length && desc[i] !== ')';) {
-    const start = i;
-    while (desc[i] === '[') i += 1;
-    if (desc[i] === 'L') {
-      const end = desc.indexOf(';', i);
-      if (end < 0) return null;
-      out.push(desc.slice(start, end + 1));
-      i = end + 1;
-    } else {
-      if (!desc[i]) return null;
-      out.push(desc.slice(start, i + 1));
-      i += 1;
-    }
-  }
-  return out;
 }
 
 function returnDescriptor(desc) {

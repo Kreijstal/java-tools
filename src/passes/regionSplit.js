@@ -1,5 +1,12 @@
 'use strict';
 
+const {
+  trimLabel,
+  getOp,
+  CONDITIONAL_JUMPS,
+  collectReferencedLabelsFromItems: collectReferencedLabels,
+} = require('./labelReferences');
+
 /**
  * regionSplit — controlled node splitting for irreducible loops.
  *
@@ -34,12 +41,6 @@
  * fast irreducibility oracle (and ultimately CFR) that a split actually helps.
  */
 
-const CONDITIONAL_JUMPS = new Set([
-  'ifeq', 'ifne', 'iflt', 'ifge', 'ifgt', 'ifle',
-  'if_icmpeq', 'if_icmpne', 'if_icmplt', 'if_icmpge', 'if_icmpgt', 'if_icmple',
-  'if_acmpeq', 'if_acmpne',
-  'ifnull', 'ifnonnull',
-]);
 const TERMINAL_OPCODES = new Set([
   'ret', 'return', 'ireturn', 'lreturn', 'freturn', 'dreturn', 'areturn', 'athrow',
 ]);
@@ -455,27 +456,6 @@ function collectProtectedLabels(exceptionTable) {
   return set;
 }
 
-function collectReferencedLabels(codeItems, protectedLabels) {
-  const set = new Set(protectedLabels);
-  for (const item of codeItems) {
-    if (!item || !item.instruction) continue;
-    const insn = item.instruction;
-    const op = getOp(insn);
-    if (op === 'goto' || op === 'jsr' || CONDITIONAL_JUMPS.has(op)) {
-      if (typeof insn.arg === 'string') set.add(trimLabel(insn.arg));
-    } else if (op === 'tableswitch') {
-      for (const l of (insn.labels || [])) set.add(trimLabel(l));
-      if (typeof insn.defaultLbl === 'string') set.add(trimLabel(insn.defaultLbl));
-    } else if (op === 'lookupswitch' && insn.arg && typeof insn.arg === 'object') {
-      for (const pair of (insn.arg.pairs || [])) {
-        if (Array.isArray(pair) && typeof pair[1] === 'string') set.add(trimLabel(pair[1]));
-      }
-      if (typeof insn.arg.defaultLabel === 'string') set.add(trimLabel(insn.arg.defaultLabel));
-    }
-  }
-  return set;
-}
-
 function findLabelIndex(codeItems, label) {
   const trimmed = trimLabel(label);
   for (let i = 0; i < codeItems.length; i++) {
@@ -525,17 +505,6 @@ function retargetJump(instruction, fromLabel, toLabel) {
 function deepCloneInstruction(instruction) {
   return JSON.parse(JSON.stringify(instruction, (_key, value) =>
     typeof value === 'bigint' ? value.toString() : value));
-}
-
-function getOp(instruction) {
-  if (!instruction) return null;
-  if (typeof instruction === 'string') return instruction;
-  return instruction.op || null;
-}
-
-function trimLabel(label) {
-  if (typeof label !== 'string') return label;
-  return label.endsWith(':') ? label.slice(0, -1) : label;
 }
 
 module.exports = { listRegionSplitCandidates, applyRegionSplit };

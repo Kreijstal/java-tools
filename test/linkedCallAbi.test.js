@@ -14,6 +14,7 @@
  */
 
 const tape = require('tape');
+const { makeJavaFixtureCompiler } = require('./javaFixture');
 
 // These are fail-first acceptance tests for work in progress: they describe
 // the target contract, not current behaviour, so they must not break the
@@ -29,15 +30,7 @@ const { JVM } = require('../src/core/jvm');
 const Frame = require('../src/core/frame');
 const Stack = require('../src/core/stack');
 
-function compileJavaFixture(t, className, source) {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'linked-call-abi-'));
-  t.teardown(() => fs.rmSync(tempDir, { recursive: true, force: true }));
-  const sourcePath = path.join(tempDir, `${className}.java`);
-  fs.writeFileSync(sourcePath, source);
-  execFileSync('javac', ['-g', '-d', tempDir, sourcePath], { stdio: 'inherit' });
-  return tempDir;
-}
-
+const compileJavaFixture = makeJavaFixtureCompiler('linked-call-abi-');
 function withEnv(t, vars) {
   const saved = {};
   for (const [key, value] of Object.entries(vars)) {

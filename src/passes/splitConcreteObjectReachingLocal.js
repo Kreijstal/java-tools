@@ -1,6 +1,12 @@
 'use strict';
 
 const {
+  trimLabel,
+  branchTargets,
+  collectReferencedLabelsFromCode: collectReferencedLabels,
+} = require('./labelReferences');
+
+const {
   buildCfg,
   computeDominators,
   instructionDominates,
@@ -108,23 +114,6 @@ function isBranchTarget(code, item) {
     if (candidate === label) return true;
   }
   return false;
-}
-
-function collectReferencedLabels(code) {
-  const out = new Set();
-  for (const item of code.codeItems || []) {
-    for (const target of branchTargets(item)) {
-      const label = trimLabel(target);
-      if (label) out.add(label);
-    }
-  }
-  for (const entry of code.exceptionTable || []) {
-    for (const value of [entry.startLbl, entry.endLbl, entry.handlerLbl]) {
-      const label = trimLabel(value);
-      if (label) out.add(label);
-    }
-  }
-  return out;
 }
 
 function hasUnrewrittenLoadBeforeNextStore(items, storeIndex, local, rewrittenLoads) {
@@ -675,25 +664,6 @@ function hasIncomingBranchFromOutside(items, refs, start, end) {
   return false;
 }
 
-function branchTargets(item) {
-  const insn = item && item.instruction;
-  if (!insn || typeof insn !== 'object') return [];
-  if (insn.op === 'tableswitch' || insn.op === 'lookupswitch') {
-    const out = [];
-    const value = insn.arg;
-    if (Array.isArray(value)) {
-      for (const entry of value) {
-        if (Array.isArray(entry)) out.push(entry[entry.length - 1]);
-        else if (typeof entry === 'string') out.push(entry);
-      }
-    }
-    if (Array.isArray(insn.labels)) out.push(...insn.labels);
-    if (insn.defaultLbl) out.push(insn.defaultLbl);
-    return out;
-  }
-  return typeof insn.arg === 'string' ? [insn.arg] : [];
-}
-
 /** Drops candidates that claim a store instruction another candidate already
  *  claimed. Ordered by descending storeIndex to match the rewrite loop, so the
  *  candidate that would have won the clobber is the one kept. */
@@ -1215,10 +1185,6 @@ function op(item) {
 function arg(item) {
   const insn = item && item.instruction;
   return insn && typeof insn === 'object' ? insn.arg : null;
-}
-
-function trimLabel(label) {
-  return typeof label === 'string' ? label.replace(/:$/, '') : null;
 }
 
 module.exports = {

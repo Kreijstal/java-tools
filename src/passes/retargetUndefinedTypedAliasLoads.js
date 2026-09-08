@@ -1,5 +1,7 @@
 'use strict';
 
+const { parameterDescriptors: argumentDescriptors } = require('./parameterDescriptors');
+
 const {
   buildCfg,
   computeDominators,
@@ -140,26 +142,6 @@ function entryDefinedLocals(method) {
   const locals = new Set(parameterLocals(method).map((param) => param.local));
   if (!(method.flags && method.flags.includes('static'))) locals.add('0');
   return locals;
-}
-
-function argumentDescriptors(desc) {
-  if (typeof desc !== 'string' || desc[0] !== '(') return null;
-  const out = [];
-  for (let i = 1; i < desc.length && desc[i] !== ')';) {
-    const start = i;
-    while (desc[i] === '[') i += 1;
-    if (desc[i] === 'L') {
-      const end = desc.indexOf(';', i);
-      if (end < 0) return null;
-      out.push(desc.slice(start, end + 1));
-      i = end + 1;
-    } else {
-      if (!desc[i]) return null;
-      out.push(desc.slice(start, i + 1));
-      i += 1;
-    }
-  }
-  return out;
 }
 
 function isSimpleStackProducer(item) {
