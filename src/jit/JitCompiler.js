@@ -2775,29 +2775,39 @@ class JitCompiler {
   // interned into the receiving JIT's own tables by internLinkRecords.
   describeLinkRecord(name, value) {
     let m;
+    // Every record descriptor also carries the sender's table index. Under
+    // the shared id space (siteIdWatermark) the receiver places the sender's
+    // table entries at exactly those indices before it binds any body, so
+    // the index names the ONE record every body of the result must share.
+    // Capture names carry the global id for the same reason on the sending
+    // side; without the id crossing, each body re-registered its own copy
+    // of the same bytecode site and the framed body's warm-up was invisible
+    // to the positional entry (see internLinkRecords).
     if ((m = /^ssaLinkStaticCell(\d+)$/.exec(name))) {
       const target = this.directStaticTargets[Number(m[1])];
-      return { kind: "staticCell", className: target?.siteClassName ?? null,
-        key: target?.key ?? null };
+      return { kind: "staticCell", id: Number(m[1]),
+        className: target?.siteClassName ?? null, key: target?.key ?? null };
     }
     if ((m = /^ssaLinkCallSite(\d+)$/.exec(name))) {
       const site = this.syncCallSites[Number(m[1])];
-      return { kind: "callSite", op: site?.op, className: site?.declaredClassName,
+      return { kind: "callSite", id: Number(m[1]), op: site?.op,
+        className: site?.declaredClassName,
         methodName: site?.methodName, descriptor: site?.descriptor,
         callerPc: site?.callerPc ?? null };
     }
     if ((m = /^ssaLinkFieldSite(\d+)$/.exec(name))) {
       const site = this.fieldSites[Number(m[1])];
-      return { kind: "fieldSite", className: site?.className,
+      return { kind: "fieldSite", id: Number(m[1]), className: site?.className,
         fieldName: site?.fieldName, descriptor: site?.descriptor };
     }
-    if (/^ssaLinkClassGuard\d+$/.test(name)) {
-      return { kind: "classGuard", owners: value?.owners || [] };
+    if ((m = /^ssaLinkClassGuard(\d+)$/.exec(name))) {
+      return { kind: "classGuard", id: Number(m[1]),
+        owners: value?.owners || [] };
     }
     if ((m = /^ssaLinkStaticTarget(\d+)$/.exec(name))) {
       const target = this.directStaticTargets[Number(m[1])];
-      return { kind: "staticTarget", className: target?.siteClassName ?? null,
-        key: target?.key ?? null };
+      return { kind: "staticTarget", id: Number(m[1]),
+        className: target?.siteClassName ?? null, key: target?.key ?? null };
     }
     if ((m = /^ssaLinkRestoringLayout(\d+)$/.exec(name))) {
       // Plain data - a list of local slot indices - so it crosses by value
@@ -2891,6 +2901,216 @@ class JitCompiler {
   // the method is compiled locally later, when the class is here. Throwing
   // instead killed the process, because the only caller on the worker path is
   // an async 'message' handler with nothing above it to catch.
+  // ---- record identity across the transport ----
+  // One bytecode call site is one record. Locally every body of a compile
+  // (framed, positional, resume) captures `this.jit.syncCallSites[id]` under
+  // a name that carries the id, so whichever body a call goes through, the
+  // link it learns is seen by the others. A transported result must keep
+  // that: the record a descriptor binds is, in order, the entry placed at
+  // the sender's index by placeSiteTables (which already aliases it onto the
+  // receiver's warmed site when one exists), else the receiver's existing
+  // record for the same caller, op, target and pc, else a fresh one.
+  // The receiver's record for a caller's bytecode site: the copy that has
+  // learned a link, else the most recent one, else null.
+  static siteHasLinkState(site) {
+    return Boolean(site && (site.fastPositional || site.fastDynamicTarget ||
+      site.fastStaticTarget || site.fastSpecialTarget ||
+      site.fastIntrinsic || site.fastJreTarget ||
+      (site.targets && site.targets.size) ||
+      (site.jreTargets && site.jreTargets.size)));
+  }
+
+  linkedSyncCallSite(callerMethod, key) {
+    const sites = callerMethod &&
+      this.syncCallSitesByCaller.get(callerMethod)?.get(key);
+    if (!sites || !sites.length) return null;
+    for (let index = sites.length - 1; index >= 0; index -= 1) {
+      if (JitCompiler.siteHasLinkState(sites[index])) return sites[index];
+    }
+    return sites[sites.length - 1];
+  }
+
+  syncCallSiteForDescriptor(d, callerMethod) {
+    const sameCall = (site) => site && site.op === d.op &&
+      site.declaredClassName === d.className &&
+      site.methodName === d.methodName && site.descriptor === d.descriptor;
+    if (Number.isInteger(d.id)) {
+      const placed = this.syncCallSites[d.id];
+      if (sameCall(placed) && (!callerMethod || !placed.callerMethod ||
+          placed.callerMethod === callerMethod)) {
+        return placed;
+      }
+    }
+    if (callerMethod) {
+      const existing = this.linkedSyncCallSite(callerMethod,
+        `${d.op}|${d.className}|${d.methodName}|${d.descriptor}|${
+          Number.isInteger(d.callerPc) ? d.callerPc : null}`);
+      if (sameCall(existing)) return existing;
+    }
+    const id = this.registerSyncCallSite(d.op,
+      { arg: ["Method", d.className, [d.methodName, d.descriptor]] },
+      callerMethod, d.callerPc);
+    return this.syncCallSites[id];
+  }
+
+  // A field site by descriptor: the placed entry at the sender's index when
+  // it denotes the same field, else a fresh registration. `fieldName` is
+  // null for a static-target descriptor, whose field is inside `key`.
+  fieldSiteForDescriptor(d, fieldName) {
+    const name = fieldName ?? String(d.key).split(":")[0];
+    const descriptor = fieldName ? d.descriptor : String(d.key).split(":")[1];
+    if (Number.isInteger(d.id) && fieldName !== null) {
+      const placed = this.fieldSites[d.id];
+      if (placed && placed.className === d.className &&
+          placed.fieldName === name && placed.descriptor === descriptor) {
+        return d.id;
+      }
+    }
+    return this.registerFieldSite(["Field", d.className, [name, descriptor]]);
+  }
+
+  placedDirectStaticTarget(d) {
+    if (!Number.isInteger(d.id)) return null;
+    const placed = this.directStaticTargets[d.id];
+    return placed && placed.siteClassName === d.className &&
+      placed.key === d.key ? placed : null;
+  }
+
+  // ---- warmth transport (Phase 1.2, link state) ----
+  // What the requesting JIT has LEARNED at each call site of `method` by
+  // running it: the receiver type its monomorphic link resolved to, every
+  // receiver type its inline cache holds and the method each resolved to,
+  // and whether a JRE shim answered the call. Plain data, no live object.
+  // A compile worker seeds this into its own sites (seedTransportedWarmth)
+  // so it plans against the same speculation the requester would, and the
+  // requester uses it again on arrival to pre-link the sites of the body it
+  // installs (placeSiteTables). Sites that learned nothing are omitted.
+  describeCallSiteWarmth(method) {
+    const byCaller = method && this.syncCallSitesByCaller.get(method);
+    if (!byCaller) return null;
+    const out = [];
+    for (const key of byCaller.keys()) {
+      const learned = this.describeLearnedLinkState(
+        this.linkedSyncCallSite(method, key));
+      if (learned) out.push(learned);
+    }
+    return out.length ? out : null;
+  }
+
+  describeLearnedLinkState(site) {
+    if (!site) return null;
+    const receivers = [];
+    for (const [type, target] of site.targets || []) {
+      const ref = target?.method
+        ? this.describeMethodReference(target.method) : null;
+      if (!ref) continue;
+      receivers.push({ type, lookupClass: target.lookupClass || type,
+        method: ref });
+    }
+    const jreReceivers = site.jreTargets ? [...site.jreTargets.keys()] : [];
+    const linked = site.fastPositional
+      ? { lookupClass: site.fastPositional.lookupClass || null,
+        receiverType: site.fastPositional.receiverType || null }
+      : null;
+    const monomorphicReceiver =
+      site.fastDynamicTarget?.targetClassName || null;
+    if (!linked && !receivers.length && !jreReceivers.length &&
+        !monomorphicReceiver) {
+      return null;
+    }
+    return { op: site.op, className: site.declaredClassName,
+      methodName: site.methodName, descriptor: site.descriptor,
+      callerPc: site.callerPc ?? null, linked, monomorphicReceiver,
+      receivers, jreReceivers };
+  }
+
+  static warmthKey(entry) {
+    return `${entry.op}|${entry.className}|${entry.methodName}|` +
+      `${entry.descriptor}|${Number.isInteger(entry.callerPc)
+        ? entry.callerPc : null}`;
+  }
+
+  // Compile-worker side. The sites this JIT registers while compiling
+  // `method` (JvmSsaBlockRenderer registers one per call bytecode, with the
+  // caller method and pc) are given the requester's learned state as they
+  // are created (registerSyncCallSite): the monomorphic receiver becomes a
+  // fastDynamicTarget whose method is resolved against THIS JVM's classes,
+  // which is what the hot call-graph planner reads (resolveMetadataEdge) to
+  // prove an edge runtime-monomorphic. Nothing runnable is attached; the
+  // receiving JIT re-derives every live link itself.
+  seedTransportedWarmth(method, sites) {
+    if (!method) return;
+    if (!this.transportedWarmth) this.transportedWarmth = new WeakMap();
+    if (!Array.isArray(sites) || !sites.length) {
+      this.transportedWarmth.delete(method);
+      return;
+    }
+    const hints = new Map();
+    for (const entry of sites) hints.set(JitCompiler.warmthKey(entry), entry);
+    this.transportedWarmth.set(method, hints);
+  }
+
+  applyTransportedWarmth(site, hint) {
+    site.transportedWarmth = hint;
+    if (site.op !== "invokevirtual" && site.op !== "invokeinterface") return;
+    const receiverType = hint.monomorphicReceiver ||
+      hint.linked?.receiverType || null;
+    if (!receiverType || site.fastDynamicTarget) return;
+    const receiver = hint.receivers.find((r) => r.type === receiverType);
+    const method = receiver ? this.resolveMethodReference(receiver.method)
+      : null;
+    if (!method) return;
+    site.fastDynamicTarget = { targetClassName: receiverType,
+      target: { method, lookupClass: receiver.lookupClass,
+        targetClassName: receiverType, transported: true },
+      positional: null };
+  }
+
+  // Receiving side, at placement: give a fresh site the links the first
+  // generic call through it would build, using only what this JIT already
+  // has (a cached callee body, a JRE shim). Receiver types come from the
+  // requester's own learned state; a static or special call has one target
+  // by bytecode. A site that already carries any link is left alone.
+  prewarmSyncCallSite(site, hint) {
+    if (!site || site.fastPositional || site.targets.size ||
+        site.jreTargets?.size) return false;
+    const { op } = site;
+    const wholeMethodCaller = site.callerMethod
+      ? this.prefersWholeMethodJs(site.callerMethod) : false;
+    const keepStaticForWasm = op === "invokestatic" &&
+      this.wasmJit.enabled && !wholeMethodCaller;
+    let linked = false;
+    if (op === "invokestatic" || op === "invokespecial") {
+      if (op === "invokestatic" && !site.initializationToken.initialized) {
+        return false;
+      }
+      if (hint?.jreReceivers?.length && !keepStaticForWasm) {
+        linked = Boolean(this.linkSynchronousJreTarget(
+          site, site.declaredClassName));
+      }
+      if (!linked) {
+        linked = Boolean(this.linkSyncCallTarget(
+          site, site.declaredClassName, wholeMethodCaller, true));
+      }
+    } else if (hint) {
+      for (const type of hint.jreReceivers || []) {
+        if (this.linkSynchronousJreTarget(site, type)) linked = true;
+      }
+      const types = [...new Set([hint.monomorphicReceiver,
+        hint.linked?.receiverType,
+        ...hint.receivers.map((r) => r.type)].filter(Boolean))];
+      for (const type of types) {
+        if (site.targets.has(type) || site.jreTargets?.has(type)) continue;
+        if (this.linkSyncCallTarget(site, type, wholeMethodCaller, true)) {
+          linked = true;
+        }
+      }
+    }
+    if (linked) this.prewarmedTransportedSites =
+      (this.prewarmedTransportedSites || 0) + 1;
+    return linked;
+  }
+
   internLinkRecords(descriptors, callerMethod = null) {
     const captures = {};
     const renames = {};
@@ -2901,52 +3121,54 @@ class JitCompiler {
     for (const [name, d] of Object.entries(descriptors)) {
       switch (d.kind) {
         case "staticCell": {
-          const [fieldName, descriptor] = String(d.key).split(":");
-          const fieldSiteId = this.registerFieldSite(
-            ["Field", d.className, [fieldName, descriptor]]);
-          const direct = this.registerDirectStaticTarget(fieldSiteId, false);
-          const cell = direct ? this.directStaticTargets[direct.targetId].cell : null;
+          const placed = this.placedDirectStaticTarget(d);
+          const direct = placed ? null : this.registerDirectStaticTarget(
+            this.fieldSiteForDescriptor(d, null), false);
+          const target = placed ||
+            (direct ? this.directStaticTargets[direct.targetId] : null);
+          const cell = target ? target.cell : null;
           if (!cell) {
             return refuse(`cannot intern static cell ${d.className}.${d.key}`);
           }
           captures[name] = cell;
-          renames[name] = `ssaLinkStaticCell${direct.targetId}`;
+          renames[name] = `ssaLinkStaticCell${
+            placed ? d.id : direct.targetId}`;
           break;
         }
         case "callSite": {
-          const id = this.registerSyncCallSite(d.op,
-            { arg: ["Method", d.className, [d.methodName, d.descriptor]] },
-            callerMethod, d.callerPc);
-          captures[name] = this.syncCallSites[id];
-          renames[name] = `ssaLinkCallSite${id}`;
+          const site = this.syncCallSiteForDescriptor(d, callerMethod);
+          captures[name] = site;
+          renames[name] = `ssaLinkCallSite${site.id}`;
           break;
         }
         case "fieldSite": {
-          const id = this.registerFieldSite(
-            ["Field", d.className, [d.fieldName, d.descriptor]]);
+          const id = this.fieldSiteForDescriptor(d, d.fieldName);
           captures[name] = this.fieldSites[id];
           renames[name] = `ssaLinkFieldSite${id}`;
           break;
         }
         case "classGuard": {
-          const id = this.structuredSsa.registerClassInitializationGuard(d.owners);
-          captures[name] = this.structuredSsa.classInitializationGuards[id];
+          const guards = this.structuredSsa.classInitializationGuards;
+          const placed = Number.isInteger(d.id) ? guards[d.id] : null;
+          const id = placed ? d.id
+            : this.structuredSsa.registerClassInitializationGuard(d.owners);
+          captures[name] = guards[id];
           renames[name] = `ssaLinkClassGuard${id}`;
           break;
         }
         case "staticTarget": {
-          const [fieldName, descriptor] = String(d.key).split(":");
-          const fieldSiteId = this.registerFieldSite(
-            ["Field", d.className, [fieldName, descriptor]]);
-          const direct = this.registerDirectStaticTarget(fieldSiteId, false);
-          const target = direct
-            ? this.directStaticTargets[direct.targetId] : null;
+          const placed = this.placedDirectStaticTarget(d);
+          const direct = placed ? null : this.registerDirectStaticTarget(
+            this.fieldSiteForDescriptor(d, null), false);
+          const target = placed ||
+            (direct ? this.directStaticTargets[direct.targetId] : null);
           if (!target) {
             return refuse(
               `cannot intern static target ${d.className}.${d.key}`);
           }
           captures[name] = target;
-          renames[name] = `ssaLinkStaticTarget${direct.targetId}`;
+          renames[name] = `ssaLinkStaticTarget${
+            placed ? d.id : direct.targetId}`;
           break;
         }
         case "restoringLayout": {
@@ -3318,8 +3540,12 @@ class JitCompiler {
   // sender's index. Returns null on success, else the reason it could not be
   // placed -- an occupied slot that denotes something else means the two
   // id spaces have diverged and the result must not be installed.
-  placeSiteTables(tables, callerMethod = null) {
+  placeSiteTables(tables, callerMethod = null, warmth = null) {
     if (!tables) return null;
+    const hints = new Map();
+    for (const entry of warmth || []) {
+      hints.set(JitCompiler.warmthKey(entry), entry);
+    }
     const grow = (array, index) => {
       while (array.length <= index) array.push(undefined);
     };
@@ -3334,8 +3560,8 @@ class JitCompiler {
     // So an arriving site is aliased to the warmed one whenever the identity
     // matches exactly. Identity includes the caller method, so two callers of
     // the same target never share a PIC.
-    const warmedCallSites = (callerMethod &&
-      this.syncCallSitesByCaller.get(callerMethod)) || new Map();
+    const warmedCallSite = (key) => callerMethod
+      ? this.linkedSyncCallSite(callerMethod, key) : null;
     for (const entry of tables.fieldSites || []) {
       const existing = this.fieldSites[entry.index];
       if (existing) {
@@ -3363,8 +3589,9 @@ class JitCompiler {
         }
         continue;
       }
-      const warmed = warmedCallSites.get(`${entry.op}|${entry.className}|` +
-        `${entry.methodName}|${entry.descriptor}|${entry.callerPc ?? null}`);
+      const key = `${entry.op}|${entry.className}|` +
+        `${entry.methodName}|${entry.descriptor}|${entry.callerPc ?? null}`;
+      const warmed = warmedCallSite(key);
       if (warmed) {
         grow(this.syncCallSites, entry.index);
         this.syncCallSites[entry.index] = warmed;
@@ -3375,6 +3602,10 @@ class JitCompiler {
         callerMethod, entry.callerPc);
       grow(this.syncCallSites, entry.index);
       this.syncCallSites[entry.index] = this.syncCallSites[id];
+      // No warmed counterpart here, so the receiver's own cache is the only
+      // source of a link. Sites the requester never ran through a compiled
+      // caller still get pre-linked when their callee already has a body.
+      this.prewarmSyncCallSite(this.syncCallSites[id], hints.get(key) || null);
     }
     for (const entry of tables.directStaticTargets || []) {
       if (this.directStaticTargets[entry.index]) continue;
@@ -3507,7 +3738,8 @@ class JitCompiler {
     if (timings) timings.validationMs += mark() - phaseStart;
     if (payload.siteTables) {
       phaseStart = mark();
-      const conflict = this.placeSiteTables(payload.siteTables, method);
+      const conflict = this.placeSiteTables(payload.siteTables, method,
+        options.warmth || payload.warmth || null);
       if (timings) timings.descriptorBindingMs += mark() - phaseStart;
       if (conflict) {
         this.staleTransportedResults = (this.staleTransportedResults || 0) + 1;
@@ -4728,6 +4960,11 @@ class JitCompiler {
     if (!entries) return;
     for (const { target, site } of entries) {
       const invoke = target.positionalInvoker;
+      // Already withdrawn by an earlier publication of this method (a Wasm
+      // recompile republishes): an undefined invoker matched every site
+      // slot that had nothing, and the delete below threw on a site that
+      // never had per-class targets, failing the whole recompile.
+      if (invoke === undefined) continue;
       target.positionalInvoker = undefined;
       if (site.fastPositional?.invoke === invoke) site.fastPositional = null;
       if (target.targetClassName && site.fastPositionalTargets?.[
@@ -8019,8 +8256,19 @@ class JitCompiler {
         byCaller = new Map();
         this.syncCallSitesByCaller.set(callerMethod, byCaller);
       }
-      byCaller.set(`${op}|${declaredClassName}|${methodName}|` +
-        `${descriptor}|${site.callerPc}`, site);
+      const key = `${op}|${declaredClassName}|${methodName}|` +
+        `${descriptor}|${site.callerPc}`;
+      // One bytecode site is registered more than once locally too (the
+      // framed compile and the positional compile each register it), and
+      // only some of those copies ever run. Keep them all: the consumers
+      // want the one that learned something, not the one made last.
+      const sites = byCaller.get(key);
+      if (sites) sites.push(site); else byCaller.set(key, [site]);
+      // A compile worker compiling on behalf of a requester: the requester's
+      // learned link state for this exact site, if it sent any.
+      const hint = this.transportedWarmth &&
+        this.transportedWarmth.get(callerMethod)?.get(key);
+      if (hint) this.applyTransportedWarmth(site, hint);
     }
     return id;
   }
@@ -9094,11 +9342,11 @@ class JitCompiler {
     if (op === "invokevirtual" || op === "invokeinterface") {
       targetClassName = receiver.type || declaredClassName;
     }
+    const wholeMethodCaller = this.prefersWholeMethodJs(frame.method);
     // When Wasm is the preferred tier, leave static shims available to its
     // linker; consuming a Math call in a JS fallback can otherwise prevent a
     // numeric caller from reaching Wasm. Whole-method JavaScript mode instead
     // keeps both static and instance JRE leaves inside the generated region.
-    const wholeMethodCaller = this.prefersWholeMethodJs(frame.method);
     const keepStaticForWasm = op === "invokestatic" &&
       this.wasmJit.enabled && !wholeMethodCaller;
     const cachedJreTarget = !keepStaticForWasm &&
@@ -9109,220 +9357,256 @@ class JitCompiler {
         site, cachedJreTarget, frame, thread);
     }
     const synchronousJre = keepStaticForWasm ? null
-      : this.resolveSynchronousJreMethod(
-        targetClassName, declaredClassName, methodName, descriptor);
+      : this.linkSynchronousJreTarget(site, targetClassName);
     if (synchronousJre) {
-      const target = { targetClassName, method: synchronousJre };
-      if (!site.jreTargets) site.jreTargets = new Map();
-      site.jreTargets.set(targetClassName, target);
-      site.fastJreTarget = target;
-      const positional = this.getPositionalJreInvoker(site, target);
-      if (positional && !site.fastPositional) {
-        site.fastPositional = {
-          invoke: positional,
-          lookupClass: targetClassName,
-          receiverType: op === "invokestatic" ? null : targetClassName,
-          debugGuarded: positional.jvmDebugGuarded === true,
-        };
-      }
-      return this.tryInvokeSynchronousJre(site, target, frame, thread);
+      return this.tryInvokeSynchronousJre(site, synchronousJre, frame, thread);
     }
     let target = site.targets.get(targetClassName);
     if (!target) {
-      let classData = this.jvm.classes[targetClassName];
-      if (!classData) return ASYNC_INVOKE;
-      let method = this.jvm.findMethod(classData, methodName, descriptor);
-      let lookupClass = targetClassName;
-      while (!method && (op === "invokevirtual" || op === "invokeinterface") &&
-        classData && classData.ast.classes[0].superClassName) {
-        lookupClass = classData.ast.classes[0].superClassName;
-        classData = this.jvm.classes[lookupClass];
-        if (!classData) return ASYNC_INVOKE;
-        method = this.jvm.findMethod(classData, methodName, descriptor);
-      }
-      if (!method) return ASYNC_INVOKE;
-      // The Firefox whole-method tier deliberately accepts a wider verified
-      // opcode/control-flow set than the legacy runner. Keep nested calls in
-      // that same tier: otherwise a generated caller yields to the scheduler,
-      // only for the child to be admitted by tryRunFrame on the next turn.
-      // This is a structural capability check; no class or method identity is
-      // involved.
-      const normallySupported = this.isSupported(method) ||
-        this.isShortSupportedHelper(method) ||
-        (wholeMethodCaller && this.isCodegenSupported(method));
-      // A semantic intrinsic can cover a method whose raw bytecodes are too
-      // large/irregular for the ordinary method tier.  Probe it before the
-      // generic support rejection.  For the polygon family the final span
-      // owner may still be cold; retain only the cheap dependency list and
-      // perform the complete fingerprint proof once that owner loads.
-      const structuralIntrinsic = op === "invokestatic"
-        ? this.getSynchronousIntrinsic(method, descriptor)
-        : null;
-      // A method the JavaScript tiers reject can still be owned by a ready
-      // Wasm module: the scheduler runs it there, but without a target this
-      // site never reached the resolved-target dispatcher, and every call
-      // from a synchronous caller was a deopt. Give it a target with no
-      // JavaScript body; the dispatcher enters the module in place.
-      const wasmOwned = !normallySupported && !structuralIntrinsic &&
-        this.hasReadyWasmModuleForSynchronousCall(method);
-      if (!normallySupported && !structuralIntrinsic && !wasmOwned) {
-        return ASYNC_INVOKE;
-      }
-      target = {
-        method,
-        lookupClass,
-        targetClassName,
-        intrinsic: structuralIntrinsic,
-        // Declared here so the hot generic-call path never transitions this
-        // object's shape when it starts counting JavaScript child runs.
-        readyWasmJsChildRuns: 0,
-        inlineIntegerRegion: normallySupported &&
-          (op === "invokestatic" || op === "invokevirtual" || op === "invokeinterface")
-          ? this.getInlineIntegerRegion(method, params, returnType)
-          : null,
+      target = this.linkSyncCallTarget(site, targetClassName,
+        wholeMethodCaller, false);
+      if (!target) return ASYNC_INVOKE;
+    }
+
+    return this.tryInvokeResolvedTarget(site, target, frame, thread);
+  }
+
+  // Resolve a synchronous JRE shim for `targetClassName` at this site and
+  // publish it as the site's fast JRE target. Returns the target, or null
+  // when the JRE has no synchronous method for the call.
+  linkSynchronousJreTarget(site, targetClassName) {
+    const { op, declaredClassName, methodName, descriptor } = site;
+    const synchronousJre = this.resolveSynchronousJreMethod(
+      targetClassName, declaredClassName, methodName, descriptor);
+    if (!synchronousJre) return null;
+    const target = { targetClassName, method: synchronousJre };
+    if (!site.jreTargets) site.jreTargets = new Map();
+    site.jreTargets.set(targetClassName, target);
+    site.fastJreTarget = target;
+    const positional = this.getPositionalJreInvoker(site, target);
+    if (positional && !site.fastPositional) {
+      site.fastPositional = {
+        invoke: positional,
+        lookupClass: targetClassName,
+        receiverType: op === "invokestatic" ? null : targetClassName,
+        debugGuarded: positional.jvmDebugGuarded === true,
       };
-      if (normallySupported && op !== "invokestatic") {
-        const instanceIntrinsic = this.getSynchronousIntrinsic(method, descriptor);
-        if (instanceIntrinsic?.jvmReceiverSlots === 1) {
-          target.intrinsic = instanceIntrinsic;
-        }
+    }
+    return target;
+  }
+
+  // Resolve the guest method a call at `site` reaches for `targetClassName`,
+  // build its target record and publish the site's fast links for it. This
+  // is the linking half of generic dispatch, and it is also what a
+  // transported body's fresh call site is given on arrival (`prewarm`): the
+  // same record the first generic call would have built, except that a
+  // prewarm never compiles -- a callee with no cached body links nothing and
+  // leaves the site for the ordinary path -- and never triggers hot
+  // call-graph feedback, which belongs to an actual call. Returns the target,
+  // or null when the call cannot be made synchronously here.
+  linkSyncCallTarget(site, targetClassName, wholeMethodCaller, prewarm) {
+    const { op, methodName, descriptor, params, returnType } = site;
+    let classData = this.jvm.classes[targetClassName];
+    if (!classData) return null;
+    let method = this.jvm.findMethod(classData, methodName, descriptor);
+    let lookupClass = targetClassName;
+    while (!method && (op === "invokevirtual" || op === "invokeinterface") &&
+      classData && classData.ast.classes[0].superClassName) {
+      lookupClass = classData.ast.classes[0].superClassName;
+      classData = this.jvm.classes[lookupClass];
+      if (!classData) return null;
+      method = this.jvm.findMethod(classData, methodName, descriptor);
+    }
+    if (!method) return null;
+    // The Firefox whole-method tier deliberately accepts a wider verified
+    // opcode/control-flow set than the legacy runner. Keep nested calls in
+    // that same tier: otherwise a generated caller yields to the scheduler,
+    // only for the child to be admitted by tryRunFrame on the next turn.
+    // This is a structural capability check; no class or method identity is
+    // involved.
+    const normallySupported = this.isSupported(method) ||
+      this.isShortSupportedHelper(method) ||
+      (wholeMethodCaller && this.isCodegenSupported(method));
+    // A semantic intrinsic can cover a method whose raw bytecodes are too
+    // large/irregular for the ordinary method tier.  Probe it before the
+    // generic support rejection.  For the polygon family the final span
+    // owner may still be cold; retain only the cheap dependency list and
+    // perform the complete fingerprint proof once that owner loads.
+    const structuralIntrinsic = op === "invokestatic"
+      ? this.getSynchronousIntrinsic(method, descriptor)
+      : null;
+    // A method the JavaScript tiers reject can still be owned by a ready
+    // Wasm module: the scheduler runs it there, but without a target this
+    // site never reached the resolved-target dispatcher, and every call
+    // from a synchronous caller was a deopt. Give it a target with no
+    // JavaScript body; the dispatcher enters the module in place.
+    const wasmOwned = !normallySupported && !structuralIntrinsic &&
+      this.hasReadyWasmModuleForSynchronousCall(method);
+    if (!normallySupported && !structuralIntrinsic && !wasmOwned) {
+      return null;
+    }
+    const target = {
+      method,
+      lookupClass,
+      targetClassName,
+      intrinsic: structuralIntrinsic,
+      // Declared here so the hot generic-call path never transitions this
+      // object's shape when it starts counting JavaScript child runs.
+      readyWasmJsChildRuns: 0,
+      inlineIntegerRegion: normallySupported &&
+        (op === "invokestatic" || op === "invokevirtual" || op === "invokeinterface")
+        ? this.getInlineIntegerRegion(method, params, returnType)
+        : null,
+    };
+    if (normallySupported && op !== "invokestatic") {
+      const instanceIntrinsic = this.getSynchronousIntrinsic(method, descriptor);
+      if (instanceIntrinsic?.jvmReceiverSlots === 1) {
+        target.intrinsic = instanceIntrinsic;
       }
-      if (normallySupported && op === "invokestatic" &&
-          !target.intrinsic && !target.inlineIntegerRegion) {
-        target.memoizedIntegralLeaf =
-          this.getMemoizedIntegralLeaf(method, params, returnType);
-      }
-      if (normallySupported && !target.intrinsic && !target.inlineIntegerRegion) {
+    }
+    if (normallySupported && op === "invokestatic" &&
+        !target.intrinsic && !target.inlineIntegerRegion) {
+      target.memoizedIntegralLeaf =
+        this.getMemoizedIntegralLeaf(method, params, returnType);
+    }
+    if (normallySupported && !target.intrinsic && !target.inlineIntegerRegion) {
+      if (prewarm) {
+        // Arrival is not the time to compile a callee. Without a body there
+        // is nothing to link, and registering a bodiless target would
+        // silently turn the site's first real call into a frame handoff.
+        const cached = this.codegenCache.get(method);
+        if (!cached) return null;
+        target.generated = cached;
+      } else {
         target.generated = this.getGeneratedFunction(method);
-        this.trackGeneratedTarget(method, target, site);
-      } else if (wasmOwned) {
-        // A Wasm-owned target has no JavaScript body yet. Track it anyway so a
-        // later adaptive compile of the callee publishes its synchronous body
-        // here; otherwise the site returns the asynchronous handoff on every
-        // call once the module stops being ready.
-        this.trackGeneratedTarget(method, target, site);
       }
-      site.targets.set(targetClassName, target);
-      if (op === "invokestatic" && target.intrinsic) {
-        site.fastIntrinsic = {
-          intrinsic: target.intrinsic,
+      this.trackGeneratedTarget(method, target, site);
+    } else if (wasmOwned) {
+      // A Wasm-owned target has no JavaScript body yet. Track it anyway so a
+      // later adaptive compile of the callee publishes its synchronous body
+      // here; otherwise the site returns the asynchronous handoff on every
+      // call once the module stops being ready.
+      this.trackGeneratedTarget(method, target, site);
+    }
+    site.targets.set(targetClassName, target);
+    if (op === "invokestatic" && target.intrinsic) {
+      site.fastIntrinsic = {
+        intrinsic: target.intrinsic,
+        lookupClass,
+        methodKey: `${lookupClass}.${method.name}${descriptor}`,
+      };
+    } else if (op === "invokestatic") {
+      site.fastStaticTarget = target;
+      const positional = this.getPositionalGeneratedInvoker(site, target);
+      if (positional && !site.fastPositional) {
+        site.fastPositional = {
+          invoke: positional,
+          rawInvoke: positional.jvmRawInvoke || null,
           lookupClass,
-          methodKey: `${lookupClass}.${method.name}${descriptor}`,
+          receiverType: null,
+          debugGuarded: positional.jvmDebugGuarded === true,
         };
-      } else if (op === "invokestatic") {
-        site.fastStaticTarget = target;
-        const positional = this.getPositionalGeneratedInvoker(site, target);
-        if (positional && !site.fastPositional) {
-          site.fastPositional = {
-            invoke: positional,
-            rawInvoke: positional.jvmRawInvoke || null,
-            lookupClass,
-            receiverType: null,
-            debugGuarded: positional.jvmDebugGuarded === true,
-          };
-          const tracePattern = typeof process !== "undefined" && process.env
-            ? process.env.JVM_TRACE_POSITIONAL_GENERATED || "" : "";
-          const traceKey = `${lookupClass}.${method.name}${descriptor}`;
-          if (tracePattern && traceKey.includes(tracePattern)) {
-            console.error("[positional-published]", JSON.stringify({
-              method: traceKey,
-              debugGuarded: site.fastPositional.debugGuarded,
-            }));
-          }
+        const tracePattern = typeof process !== "undefined" && process.env
+          ? process.env.JVM_TRACE_POSITIONAL_GENERATED || "" : "";
+        const traceKey = `${lookupClass}.${method.name}${descriptor}`;
+        if (tracePattern && traceKey.includes(tracePattern)) {
+          console.error("[positional-published]", JSON.stringify({
+            method: traceKey,
+            debugGuarded: site.fastPositional.debugGuarded,
+          }));
         }
-      } else if (op === "invokespecial") {
-        // Private/super helpers are monomorphic by bytecode semantics. Cache
-        // them independently from virtual receiver types and publish the same
-        // fixed-arity positional entry used by other generated callees.
-        // Constructors never reach this branch because method admission keeps
-        // <init> outside generated execution.
-        site.fastSpecialTarget = target;
-        const positional = this.getPositionalGeneratedInvoker(site, target);
-        if (positional && !site.fastPositional) {
-          site.fastPositional = {
-            invoke: positional,
-            rawInvoke: positional.jvmRawInvoke || null,
+      }
+    } else if (op === "invokespecial") {
+      // Private/super helpers are monomorphic by bytecode semantics. Cache
+      // them independently from virtual receiver types and publish the same
+      // fixed-arity positional entry used by other generated callees.
+      // Constructors never reach this branch because method admission keeps
+      // <init> outside generated execution.
+      site.fastSpecialTarget = target;
+      const positional = this.getPositionalGeneratedInvoker(site, target);
+      if (positional && !site.fastPositional) {
+        site.fastPositional = {
+          invoke: positional,
+          rawInvoke: positional.jvmRawInvoke || null,
+          lookupClass,
+          receiverType: null,
+          debugGuarded: positional.jvmDebugGuarded === true,
+        };
+      }
+    } else if (op === "invokevirtual" || op === "invokeinterface") {
+      // A virtual bytecode site may be polymorphic. Each resolved receiver
+      // target still deserves its own positional adapter; limiting adapter
+      // creation to the first monomorphic fast slot forced every secondary
+      // receiver through a child Frame on every invocation.
+      const positional = this.getPositionalGeneratedInvoker(site, target);
+      const intrinsicPositional = typeof target.intrinsic?.jvmPositional ===
+        "function" ? target.intrinsic.jvmPositional : null;
+      const direct = intrinsicPositional || positional;
+      if (direct) {
+        if (!site.fastPositionalTargets) {
+          site.fastPositionalTargets = Object.create(null);
+        }
+        site.fastPositionalTargets[targetClassName] = {
+          invoke: direct,
+          rawInvoke: direct.jvmRawInvoke || null,
+          lookupClass,
+          receiverType: targetClassName,
+          debugGuarded: direct.jvmDebugGuarded === true,
+        };
+      }
+      // The monomorphic slot below only ever holds the first receiver type.
+      // Keep every resolved receiver in a by-type map as well, so a
+      // polymorphic site does not walk the whole generic resolution path on
+      // each call for its second and subsequent types. The stored value is
+      // the same target object that site.targets holds, so an in-place
+      // generated-code upgrade is visible through both.
+      const registryVersion = this.jvm.jni ? this.jvm.jni.registryVersion : 0;
+      if (!site.fastDynamicTargets ||
+          site.fastDynamicTargetsVersion !== registryVersion) {
+        site.fastDynamicTargets = Object.create(null);
+        site.fastDynamicTargetsVersion = registryVersion;
+      }
+      site.fastDynamicTargets[targetClassName] = target;
+      if (!site.fastDynamicTarget) {
+        site.fastDynamicTarget = { targetClassName, target, positional };
+        if (target.intrinsic) {
+          site.fastDynamicIntrinsic = {
+            targetClassName,
+            intrinsic: target.intrinsic,
+            positional: typeof target.intrinsic.jvmPositional === "function"
+              ? target.intrinsic.jvmPositional : null,
             lookupClass,
-            receiverType: null,
-            debugGuarded: positional.jvmDebugGuarded === true,
+            methodKey: `${lookupClass}.${method.name}${descriptor}`,
           };
         }
-      } else if (op === "invokevirtual" || op === "invokeinterface") {
-        // A virtual bytecode site may be polymorphic. Each resolved receiver
-        // target still deserves its own positional adapter; limiting adapter
-        // creation to the first monomorphic fast slot forced every secondary
-        // receiver through a child Frame on every invocation.
-        const positional = this.getPositionalGeneratedInvoker(site, target);
-        const intrinsicPositional = typeof target.intrinsic?.jvmPositional ===
-          "function" ? target.intrinsic.jvmPositional : null;
-        const direct = intrinsicPositional || positional;
-        if (direct) {
-          if (!site.fastPositionalTargets) {
-            site.fastPositionalTargets = Object.create(null);
-          }
-          site.fastPositionalTargets[targetClassName] = {
-            invoke: direct,
-            rawInvoke: direct.jvmRawInvoke || null,
+        const monomorphicDirect =
+          site.fastDynamicIntrinsic?.positional || positional;
+        if (monomorphicDirect && !site.fastPositional) {
+          site.fastPositional = {
+            invoke: monomorphicDirect,
+            rawInvoke: monomorphicDirect.jvmRawInvoke || null,
             lookupClass,
             receiverType: targetClassName,
-            debugGuarded: direct.jvmDebugGuarded === true,
+            debugGuarded: monomorphicDirect.jvmDebugGuarded === true,
           };
         }
-        // The monomorphic slot below only ever holds the first receiver type.
-        // Keep every resolved receiver in a by-type map as well, so a
-        // polymorphic site does not walk the whole generic resolution path on
-        // each call for its second and subsequent types. The stored value is
-        // the same target object that site.targets holds, so an in-place
-        // generated-code upgrade is visible through both.
-        const registryVersion = this.jvm.jni ? this.jvm.jni.registryVersion : 0;
-        if (!site.fastDynamicTargets ||
-            site.fastDynamicTargetsVersion !== registryVersion) {
-          site.fastDynamicTargets = Object.create(null);
-          site.fastDynamicTargetsVersion = registryVersion;
-        }
-        site.fastDynamicTargets[targetClassName] = target;
-        if (!site.fastDynamicTarget) {
-          site.fastDynamicTarget = { targetClassName, target, positional };
-          if (target.intrinsic) {
-            site.fastDynamicIntrinsic = {
-              targetClassName,
-              intrinsic: target.intrinsic,
-              positional: typeof target.intrinsic.jvmPositional === "function"
-                ? target.intrinsic.jvmPositional : null,
-              lookupClass,
-              methodKey: `${lookupClass}.${method.name}${descriptor}`,
-            };
-          }
-          const monomorphicDirect =
-            site.fastDynamicIntrinsic?.positional || positional;
-          if (monomorphicDirect && !site.fastPositional) {
-            site.fastPositional = {
-              invoke: monomorphicDirect,
-              rawInvoke: monomorphicDirect.jvmRawInvoke || null,
-              lookupClass,
-              receiverType: targetClassName,
-              debugGuarded: monomorphicDirect.jvmDebugGuarded === true,
-            };
-          }
-          // Runtime receiver feedback closes this exact caller/bytecode edge.
-          if (site.callerMethod &&
-              this.shouldCompileHotCallGraphRegion(site.callerMethod)) {
-            const callerGenerated = this.codegenCache.get(site.callerMethod);
-            const callerPlan = callerGenerated?.jvmHotCallGraphRegionPlan;
-            this.hotCallGraphRegions.markCallSiteFeedback(site);
-            // Establish the first usable plan immediately. Later target/type
-            // discoveries are batched by the region entry, but without an
-            // initial plan a positional root has no shared entry at which it
-            // could consume pending feedback.
-            if (!callerPlan || !callerPlan.backendEligible) {
-              this.compileHotCallGraphRegion(site.callerMethod);
-            }
+        // Runtime receiver feedback closes this exact caller/bytecode edge.
+        if (!prewarm && site.callerMethod &&
+            this.shouldCompileHotCallGraphRegion(site.callerMethod)) {
+          const callerGenerated = this.codegenCache.get(site.callerMethod);
+          const callerPlan = callerGenerated?.jvmHotCallGraphRegionPlan;
+          this.hotCallGraphRegions.markCallSiteFeedback(site);
+          // Establish the first usable plan immediately. Later target/type
+          // discoveries are batched by the region entry, but without an
+          // initial plan a positional root has no shared entry at which it
+          // could consume pending feedback.
+          if (!callerPlan || !callerPlan.backendEligible) {
+            this.compileHotCallGraphRegion(site.callerMethod);
           }
         }
       }
     }
-
-    return this.tryInvokeResolvedTarget(site, target, frame, thread);
+    return target;
   }
 
   resolveSynchronousJreMethod(targetClassName, declaredClassName, methodName, descriptor) {

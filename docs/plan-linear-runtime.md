@@ -637,6 +637,127 @@ synchronous `getGeneratedFunction` contract. The `prepareBeforeMain` path is
 similarly thin. Both are gaps worth an equivalence test (same program, same
 output, preparation on and off) before Phase 2.
 
+### 1.6 runtime linker — landed (2026-09-08)
+
+`src/jit/WasmLinker.js`: a late-bound static call site is a funcref table
+slot (`call_indirect` through `env.ltab`), initially holding the JS
+trampoline wrapped as a wasm function; when the callee publishes and meets
+the direct-link contract the linker writes its `runv` export into the slot
+(wasm->wasm, no caller recompile), and `WasmJit.withdrawModule` puts the stub
+back on every reset. Acceptance: `test/wasmLinkTable.test.js` (42). Details
+and open items in dekobloko-work `docs/phase1-linked-call-abi.md` 9.
+This is the "link the whole module later" half of 1.6; module construction
+and the import closures still live on the main thread.
+
+### 1.6 recursive groups — landed (2026-09-08)
+
+The "recursive group" row of the linked-call ABI (dekobloko-work
+`docs/phase1-linked-call-abi.md` 6): two methods in two classes that call
+each other. They ran, and agreed with the interpreter, but the group never
+converged to wasm->wasm. Each arm's only exit was the late-bound site naming
+the other, that site can deopt for as long as its slot may hold the stub, so
+each arm counted one deoptable call, so neither met the never-exits contract
+the other needed. Measured on the two-class fixture: both arms fully
+compiled, linker `bound 0`, every call crossing into JS through the
+trampoline for the life of the process — and every later caller of either
+arm bridged in through a deoptable `pcall_` as well.
+
+Fix, `src/jit/WasmLinker.js` `sealGroups` (called from `bind` on every
+publication): take the verdict over the group. Candidates are modules whose
+every deoptable site is a slot site (`meta.slotSites`, counted by the
+structured compiler; `deoptableCalls === slotSites`) and that otherwise meet
+the export contract. A greatest fixpoint drops any candidate with a slot
+naming neither a never-exits export nor another candidate; the survivors
+have every slot bound in one step and are marked `groupSealed`.
+`sealedNeverExits(meta)` (`wasmShared.js`) then makes them never-exits for
+every direct-link decision — the `dcall_` gate, the pinned-pair fallback,
+`WasmLinker.directLinkable`. Two consequences the acceptance test pins:
+
+- A sealed edge never goes back to the stub. `withdrawModule` PINS it
+  (`slotState` reports `pinned`; the withdrawn export is still a correct
+  compilation of that bytecode, and a stub would put a deopt path back into
+  a module others already enter directly). A republished callee that meets
+  the contract takes the edge over again. This is the same "correct,
+  possibly stale" pin a `dcall_` import keeps, and it now also applies to a
+  single caller whose one slot holds a never-exits export (a sealed
+  singleton) — `test/wasmLinkTable.test.js` step 3 changed accordingly.
+- A ready callee that is a not-yet-sealed group member is lowered through
+  a SLOT, not a deoptable JS bridge (`staticCallImport`, `groupPending`):
+  bridging it would have made the caller unsealable for good.
+
+Evidence: `test/wasmRecursiveGroup.test.js` (44): both arms sealed on the
+first activation, `stubCalls` frozen afterwards, a caller compiled after the
+seal links the arm with a plain `dcall_` and has no deoptable site, a
+withdrawn arm is pinned and the group still agrees with the interpreter, a
+recompiled arm rebinds the edge. Also fixed on the way: a second Wasm
+publication of a method whose JS-tier generated targets were already
+withdrawn threw inside `publishWasmTargetReady` (delete on an undefined
+per-class map) and failed the recompile.
+
+### 1.2 warmth transport — landed (2026-09-08)
+
+Closes the "lost call-site warmth" cluster recorded under *Correction: the
+21 shadow-mode failures are not a <clinit> problem*. Its cause was not the
+one written there. A transported result's bodies (framed, positional, resume)
+each re-registered their OWN copy of every bytecode call site on arrival
+(`internLinkRecords` called `registerSyncCallSite` per capture), so the link
+the framed body learned on the resolving call was invisible to the positional
+entry the next call took — the JS-tier equivalent of the local compile, where
+every body captures `syncCallSites[id]` under a name carrying the id. The
+stack trace said it plainly: generic dispatch ran inside the *callee's*
+`ssa-direct-restoring-positional` body, at a site the framed body had already
+warmed.
+
+Three pieces, all in `src/jit/JitCompiler.js` unless noted:
+
+1. **Record identity crosses.** `describeLinkRecord` now carries the
+   sender's table `id` for call sites, field sites, static targets/cells and
+   class guards. On arrival `syncCallSiteForDescriptor` binds, in order: the
+   entry `placeSiteTables` put at that index (the shared id space of 1.2
+   guarantees it is this result's), else the receiver's existing record for
+   the same caller/op/target/pc, else a fresh one. `syncCallSitesByCaller`
+   now keeps EVERY registration of a key (a method's framed and positional
+   compiles each register the site locally too; only some copies ever run)
+   and `linkedSyncCallSite` picks the copy that has learned a link. Payloads
+   without ids (older senders) still bind.
+2. **The request carries learned link state.** `describeCallSiteWarmth
+   (method)` → per warm site: op/target/pc, the monomorphic receiver type,
+   the inline-cache receiver types with the method each resolved to
+   (symbolic), JRE receivers. Sent as `warmth` by `ShadowCompiler` and
+   `CompileWorkerClient`; the worker (`compileWorkerThread`, shadow) calls
+   `seedTransportedWarmth(method, sites)` and `registerSyncCallSite` gives
+   each site it creates for that caller a `fastDynamicTarget` resolved
+   against the worker's own classes — what `resolveMetadataEdge` reads to
+   prove an edge runtime-monomorphic — plus the hint. Nothing runnable is
+   attached.
+3. **Arrival pre-links fresh sites.** `placeSiteTables(tables, method,
+   warmth)`: a site with no warm counterpart is given the links its first
+   generic call would build, from the receiver's cache only (`prewarmSync
+   CallSite` → `linkSyncCallTarget(..., prewarm=true)`, the linking half of
+   `tryInvokeSyncSite` factored out; a prewarm never compiles and never
+   raises hot-graph feedback). Receiver types come from the requester's
+   warmth; a static/special call has one target by bytecode. Counted in
+   `prewarmedTransportedSites`.
+
+Also fixed on the way: the worker served a body it already had in its
+`codegenCache` for a re-request (a replacement, or a method first compiled
+as a side effect of another request). That body carried bare site ids of an
+earlier grant — never placed here if that result was refused — and none of
+this request's link state. Both worker and shadow now drop the cached body
+and compile into the current grant.
+
+Evidence: `JVM_JIT_SHADOW_COMPILE=1 node test/jitCompiler.test.js`
+2364/2364 (was 2349 pass / 12 fail on this tree; 20 in the original note);
+`test/jitWarmthTransport.test.js` (55: identity, request state, worker
+seeding, arrival pre-link, id-less payloads, and a real `worker_threads`
+round trip whose replacement request carries the state and whose first call
+through the installed body takes no generic dispatch); shadow census on the
+compiler suite 161 of 199 requests transported. Still failing under shadow
+mode, unchanged by this and pre-existing: `hotCallGraphRegion.test.js` 5
+(region-plan transport: `jvmHotCallGraphHasContinuation`,
+`jvmHotCallGraphRegionSource` do not cross) — the third cluster of the
+original note, not warmth.
+
 ### The compile worker was a net loss during preparation (2026-09-06)
 
 `producerConsumer` failed on its 2000 ms bound from the moment the worker went

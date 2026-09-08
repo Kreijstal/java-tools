@@ -74,6 +74,7 @@ const {
 const { ClassHierarchy } = require('../analysis/closedWorld/classHierarchy');
 const { revalidateSpeculations } = require('./wasmInline');
 const Frame = require('../core/frame');
+const WasmLinker = require('./WasmLinker');
 const {
   T, CAT2, OP, TRUNC_SAT,
   uleb, sleb, f32bytes, f64bytes,
@@ -2545,6 +2546,13 @@ class WasmJit {
     // resolves by compiling the callee itself.
     this.noOnDemandCalleeCompile = wasmOptions.noOnDemandCalleeCompile ??
       (env.JVM_WASM_NO_ONDEMAND_CALLEE === '1');
+    // Runtime linker (docs/refactor.md 1.6): late-bound static calls go
+    // through a funcref table the linker owns, and binding a callee is a
+    // table write rather than a caller recompile. JVM_WASM_LINK_TABLE=0 (or
+    // jit.wasm.linkTable:false) keeps the permanent JS trampoline instead.
+    const linkTable = wasmOptions.linkTable ?? (env.JVM_WASM_LINK_TABLE !== '0');
+    this.linker = linkTable && typeof WebAssembly !== 'undefined' &&
+      typeof WebAssembly.Table === 'function' ? new WasmLinker(this) : null;
     // Direct wasm->wasm instance links: a monomorphic-in-practice site calls
     // its single ready fully-compiled target through runv behind an in-wasm
     // null check (invokespecial) or a one-import receiver-class guard
@@ -2635,6 +2643,9 @@ class WasmJit {
     // and the rebuild it should have triggered would never fire. See
     // blockerSignature.
     this.keyReadyEpoch = new Map();
+    // `Class.name(desc)` -> state, for the linker's group seal (which needs
+    // a callee's state from a slot's key without compiling anything).
+    this.stateByKey = new Map();
     this.writeSummaries = new Map(); // `cls.name(desc)` -> {keys: Set|null, epoch}
     this.lateInstanceTargetAttempts = 0;
     this.lateInstanceTargetInstalls = 0;
@@ -2725,6 +2736,20 @@ class WasmJit {
       return this.blockerSignature(st.blockers) !== st.blockerSig;
     }
     return st.depWorld !== this.depWorldVersion();
+  }
+
+  // Withdraw a method's published module(s). Every path that resets a state
+  // back to cold goes through here so the runtime linker can stop callers
+  // entering the withdrawn module directly on their next call.
+  withdrawModule(st) {
+    st.status = 'cold';
+    st.entries = 0;
+    st.retryAfter = 1;
+    st.meta = null;
+    st.run = null;
+    st.osr = null;
+    st.callee = null;
+    if (this.linker && st.key) this.linker.unbind(st.key);
   }
 
   methodState(frame) {
@@ -2893,13 +2918,7 @@ class WasmJit {
       st.blockerSig = this.blockerSignature(st.blockers);
       if ((st.depRecompiles || 0) < this.depRecompileLimit) {
         st.depRecompiles = (st.depRecompiles || 0) + 1;
-        st.status = 'cold';
-        st.entries = 0;
-        st.retryAfter = 1;
-        st.meta = null;
-        st.run = null;
-        st.osr = null;
-        st.callee = null;
+        this.withdrawModule(st);
         if (this.census) this._censusNote(frame, 'dependency-world-grew');
         return null;
       }
@@ -2920,13 +2939,7 @@ class WasmJit {
         m.specEpoch = this.jvm.classEpoch || 0;
         if (m.specok) m.specok.value = 1;
       } else {
-        st.status = 'cold';
-        st.entries = 0;
-        st.retryAfter = 1;
-        st.meta = null;
-        st.run = null;
-        st.osr = null;
-        st.callee = null;
+        this.withdrawModule(st);
         if (this.census) this._censusNote(frame, 'speculation-invalidated');
         return null;
       }
@@ -3183,6 +3196,7 @@ class WasmJit {
     const isRecompile = st.status === 'ready';
     const className = frame.className || (frame.method.className) || '?';
     st.key = `${className}.${frame.method.name}${frame.method.descriptor}`;
+    this.stateByKey.set(st.key, st);
     // The world this compile is about to read. Callee compiles it triggers
     // will advance the epoch, so the blocker signature is stamped against
     // this value rather than the one at the end. See blockerSignature.
@@ -3192,6 +3206,8 @@ class WasmJit {
     st.status = 'compiling';
     let validatingBytes = null; // last bytes handed to WebAssembly.Module, for reject dumps
     let primaryMeta = null; // census-only: the meta a partial-module reject saw
+    let installedSlots = null; // linker slots the surviving module names
+    let installed = false;
     try {
       let structuredMeta = null;
       let structuredDeferred = false;
@@ -3251,8 +3267,10 @@ class WasmJit {
           structuredMeta.uncoveredItems > meta.uncoveredItems &&
           (linkable(meta) || !linkable(structuredMeta))) {
         st.wasmCandidateCoverage.structuredDiscarded = true;
+        if (this.linker) this.linker.release(structuredMeta.linkSlots);
         structuredMeta = null;
       }
+      installedSlots = structuredMeta ? structuredMeta.linkSlots : null;
       // A partial module can leave and later resume with locals captured
       // before its first compiled block. Until boolean-static values have a
       // verifier-backed spill proof across every unsupported edge, keep that
@@ -3433,8 +3451,12 @@ class WasmJit {
         : m.fullyCompiled ? 2 : m.normalFlowFullyCompiled ? 1 : 0);
       st.callee = st.osr && rank(st.osr.meta) > rank(st.meta) ? st.osr : null;
       st.status = 'ready';
+      installed = true;
       this.registerPendingLinks(st, primary);
       this.resolvePendingLinks(st);
+      // Every publication, first or recompile: the table slots naming this
+      // method follow the module that is current now.
+      if (this.linker) this.linker.bind(st);
       this.jit.publishWasmTargetReady?.(frame.method);
       // Stamped before this compile's own epoch bump, so "ready at epoch E"
       // always compares strictly less than any later compile's start epoch.
@@ -3504,6 +3526,8 @@ class WasmJit {
           (primary.demoteReasons.size ? ` (exits: ${[...primary.demoteReasons.values()].join('; ')})` : ''));
       }
     } catch (err) {
+      // The surviving translation's slots die with it.
+      if (!installed && this.linker && installedSlots) this.linker.release(installedSlots);
       if (process.env.JVM_WASM_DUMP_REJECT && validatingBytes &&
           /WebAssembly/.test(err.message)) {
         const file = `${process.env.JVM_WASM_DUMP_REJECT}/${st.key.replace(/[^\w.]/g, '_')}.wasm`;
@@ -3511,6 +3535,7 @@ class WasmJit {
         if (this.debug) console.error(`[wasmjit] dumped rejected module to ${file}`);
       }
       st.lastCompileError = err && err.message ? String(err.message).slice(0, 80) : String(err);
+      if (process.env.JVM_WASM_TRACE_COMPILE_ERRORS === '1') console.error('[wasmjit] compile error', st.key, err && err.stack);
       if (isRecompile) {
         // keep the previous working module
         st.status = 'ready';
@@ -4209,13 +4234,7 @@ class WasmJit {
       if (meta.specok) meta.specok.value = 1;
       return true;
     }
-    st.status = 'cold';
-    st.entries = 0;
-    st.retryAfter = 1;
-    st.meta = null;
-    st.run = null;
-    st.osr = null;
-    st.callee = null;
+    this.withdrawModule(st);
     return false;
   }
 

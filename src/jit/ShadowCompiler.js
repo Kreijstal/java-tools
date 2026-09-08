@@ -216,6 +216,10 @@ class ShadowCompiler {
         // uses, so the result's table entries can be placed at exactly the
         // indices its generated text names.
         siteIdWatermark: this.jit.siteIdWatermark(),
+        // The link state the requester has learned at this method's call
+        // sites by running it. The shadow plans against it; the requester
+        // pre-links the arriving body's sites from it.
+        warmth: this.jit.describeCallSiteWarmth(method),
       };
       const shadowMethod = this.findShadowMethod(
         request.className, request.name, request.descriptor);
@@ -224,12 +228,19 @@ class ShadowCompiler {
           "shadowRejected");
       }
       const grantedBase = shadow.jit.reserveSiteIdSpace(request.siteIdWatermark);
+      // A request is for a fresh body: a shadow body left from an earlier
+      // request carries that request's site ids and none of this one's link
+      // state (see compileWorkerThread.compile).
+      shadow.jit.codegenCache.delete(shadowMethod);
+      shadow.jit.seedTransportedWarmth(shadowMethod, request.warmth);
       let generated;
       try {
         generated = shadow.jit.getGeneratedFunction(shadowMethod,
           request.preparedWholeMethod ? { allowEffectfulCalls: true } : {});
       } catch (error) {
         return this.fail(`shadow compile threw: ${error.message}`, "errors");
+      } finally {
+        shadow.jit.seedTransportedWarmth(shadowMethod, null);
       }
       if (!generated) {
         return this.fail(`${className}.${method.name} refused by the shadow`,
@@ -258,7 +269,8 @@ class ShadowCompiler {
         globalStats.payloadBytes += text.length;
         payload = JSON.parse(text);
       }
-      const materialized = this.jit.materializeGeneratedResult(payload, method);
+      const materialized = this.jit.materializeGeneratedResult(payload, method,
+        { warmth: request.warmth });
       if (!materialized) {
         this.stats.stale += 1;
         globalStats.stale += 1;

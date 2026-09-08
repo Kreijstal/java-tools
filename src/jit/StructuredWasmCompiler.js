@@ -33,8 +33,9 @@ const {
   arrayLoadImportName,
   Unsupported, blockedNames, NestedDeopt, isGuestThrow, sig, assembleModule,
   liveExceptionRanges,
-  maxImpls, NPE, AIOOBE,
+  maxImpls, NPE, AIOOBE, sealedNeverExits,
 } = require('./wasmShared');
+const WasmLinker = require('./WasmLinker');
 const monoArray = require('./monoArray');
 const {
   addRuntimeImports, pushImportFor, addArrayImports, addFieldImport, addMathImport,
@@ -149,6 +150,16 @@ class StructuredWasmCompiler {
     this.linkBindings = [];
     this.importDecls = [];
     this.importIndexByName = new Map();
+    // Signatures used by call_indirect through the runtime linker's table
+    // (WasmLinker). Interned before the imports by assembleModule, so an
+    // index here is the module's type index.
+    this.sigTypes = [];
+    this.sigTypeIndex = new Map();
+    this.usedLinkTable = false;
+    this.linkSlots = []; // table slots this translation reserved
+    // call-site node -> slot, so the dry-run and the real lowering of one
+    // block share a slot the way imports share an index
+    this.linkSlotByNode = new Map();
     this.box = {
       frame: null, ret: undefined,
       // EH protocol: the wrapper below records what an import threw so the
@@ -162,6 +173,26 @@ class StructuredWasmCompiler {
       // the wasm code checks the flag right after every deoptable call.
       deoptFlag: 0, pendingFrames: null,
     };
+  }
+
+  // Table slots reserved by a translation that will not be installed go
+  // back to the linker; the module that named them never instantiates.
+  releaseLinkSlots() {
+    if (this.linkSlots.length && this.wasmJit.linker) {
+      this.wasmJit.linker.release(this.linkSlots);
+    }
+    this.linkSlots = [];
+  }
+
+  internSig(params, results) {
+    const key = `${params.join(',')}|${results.join(',')}`;
+    let idx = this.sigTypeIndex.get(key);
+    if (idx === undefined) {
+      idx = this.sigTypes.length;
+      this.sigTypes.push({ params: params.slice(), results: results.slice() });
+      this.sigTypeIndex.set(key, idx);
+    }
+    return idx;
   }
 
   addImport(name, params, results, fn) {
@@ -201,11 +232,17 @@ class StructuredWasmCompiler {
     try {
       return this.translateWith(inlineEnabled);
     } catch (err) {
+      this.releaseLinkSlots();
       // Inlining can create blocks with no interpreter resume pc; if one of
       // those ends up needing an exit stub, redo the method without inlining.
       if (!(err instanceof Unsupported) || !this.didInline) throw err;
-      return new StructuredWasmCompiler(this.jvm, this.method, this.className, this.wasmJit)
-        .translateWith(false);
+      const plain = new StructuredWasmCompiler(this.jvm, this.method, this.className, this.wasmJit);
+      try {
+        return plain.translateWith(false);
+      } catch (retryErr) {
+        plain.releaseLinkSlots();
+        throw retryErr;
+      }
     }
   }
 
@@ -291,6 +328,11 @@ class StructuredWasmCompiler {
     // or late-bound callees). Keyed by item index: the demotion dry-run
     // emits each block twice, so a plain counter would double-count.
     this.deoptableSites = new Set();
+    // The subset of deoptableSites that are late-bound calls through the
+    // runtime linker's table. A module whose deoptable sites are ALL of this
+    // kind can be sealed into a never-exits recursive group once every slot
+    // holds a never-exits export (WasmLinker.sealGroups).
+    this.linkSlotSites = new Set();
 
     // Guard-miss deopt stubs from inlined instance calls: blocks that exit to
     // the interpreter at the ORIGINAL call site with [recv, args...] rebuilt
@@ -472,6 +514,8 @@ class StructuredWasmCompiler {
         ? null : descToWasm(parseMethodDescriptor(this.method.descriptor).ret),
       runvWrapper: true,
       specokGlobal: !!this.usesSpecok,
+      importTable: this.usedLinkTable,
+      sigTypes: this.sigTypes,
     });
 
     const blockOfItem = new Map();
@@ -491,6 +535,7 @@ class StructuredWasmCompiler {
     const env = {};
     this.importDecls.forEach((d, i) => { env[d.name] = this.importFns[i]; });
     if (this.usedHeap) env.mem = this.heap.memory;
+    if (this.usedLinkTable) env.ltab = this.wasmJit.linker.table;
     // Deopt stubs exit mid-method needing a real frame, so modules that have
     // them must take the partial-callee protocol (and are never pinned).
     const normalFlowFullyCompiled = this.demoted.size === 0 && this.deoptBlocks.size === 0;
@@ -518,14 +563,19 @@ class StructuredWasmCompiler {
         ('L['.includes(parseMethodDescriptor(this.method.descriptor).ret) ||
          preferCompleteSynchronized || preferCompleteNormalFlow)) {
       let plain = null;
+      const plainCompiler = new StructuredWasmCompiler(this.jvm, this.method, this.className, this.wasmJit);
       try {
-        plain = new StructuredWasmCompiler(this.jvm, this.method, this.className, this.wasmJit)
-          .translateWith(false);
+        plain = plainCompiler.translateWith(false);
       } catch (err) {
+        plainCompiler.releaseLinkSlots();
         if (!(err instanceof Unsupported)) throw err;
       }
       if (plain && (plain.fullyCompiled ||
-          preferCompleteNormalFlow && plain.normalFlowFullyCompiled)) return plain;
+          preferCompleteNormalFlow && plain.normalFlowFullyCompiled)) {
+        this.releaseLinkSlots();
+        return plain;
+      }
+      if (plain && this.wasmJit.linker) this.wasmJit.linker.release(plain.linkSlots);
     }
     return {
       bytes,
@@ -546,6 +596,7 @@ class StructuredWasmCompiler {
       // matching field in WasmJit's meta.
       artifactId: this.artifactIdentity(),
       linkBindings: this.linkBindings,
+      linkSlots: this.linkSlots,
       blockCount: cfg.n,
       fullyCompiled: normalFlowFullyCompiled && table.length === 0,
       normalFlowFullyCompiled,
@@ -558,6 +609,7 @@ class StructuredWasmCompiler {
       // callers must nest this module with a real scratch frame, never the
       // junk sink (same contract as the dispatcher tier's deoptable calls).
       deoptableCalls: this.deoptableSites.size + (this.staticInitializationGuards?.size || 0),
+      slotSites: this.linkSlotSites.size,
       directLinks: this.directLinks || 0,
       // Normal-flow coverage gap for compile()'s tier preference:
       // instruction-bearing items in DEMOTED tree blocks (counted like the
@@ -1420,7 +1472,17 @@ class StructuredWasmCompiler {
         if (node.kind !== 'V') out.push(...this.cacheKillsFor(node.id));
         return;
       }
-      out.push(OP.call, ...uleb(call.idx));
+      if (call.indirect) {
+        this.linkSlotSites.add(node.itemIdx);
+        // Late-bound static call through the runtime linker's table. Both
+        // occupants of the slot return the runv shape [status, value]: the
+        // stub reports -1 and signals deopt through the box flag checked
+        // below, the callee's runv export upholds the never-exits invariant.
+        out.push(OP.i32_const, ...sleb(call.indirect.slot),
+          OP.call_indirect, ...uleb(call.indirect.typeIdx), 0x00);
+      } else {
+        out.push(OP.call, ...uleb(call.idx));
+      }
       if (call.direct) {
         // runv returned [status, value]: bank the value, verify the
         // never-exits invariant in wasm.
@@ -1862,6 +1924,15 @@ class StructuredWasmCompiler {
     const calleeSt = this.wasmJit &&
       this.wasmJit.findReadyStatic(className, name, descriptor, true);
     const linked = calleeSt && (calleeSt.callee || calleeSt);
+    // A ready callee whose only exits are its own late-bound slot sites is a
+    // member of a recursive group the linker has not sealed yet (it may be
+    // waiting on the method being compiled right now). Bridging it with a
+    // deoptable JS import would make THIS module unsealable for good; a
+    // table slot keeps the edge sealable and costs nothing the stub does not
+    // already cost until the group closes (WasmLinker.sealGroups).
+    const linker = this.wasmJit && this.wasmJit.linker;
+    const groupPending = !!(linked && linker && linker.enabled && !this.ehMethod &&
+      WasmLinker.sealable(calleeSt));
     // java arg slot -> position in the wasm arg list
     const argPosBySlot = new Map();
     let slot = 0;
@@ -1906,7 +1977,7 @@ class StructuredWasmCompiler {
     //
     // This is NOT the same as a callee that provably cannot satisfy the
     // contract -- that stays a refusal below, because waiting cannot fix it.
-    if (!linked) {
+    if (!linked || groupPending) {
       const pendingFrames = new Map();
       const pendingDummy = dummyRet(ret);
       binding.lateBound = true;
@@ -1923,7 +1994,11 @@ class StructuredWasmCompiler {
       const fn = (...args) => {
         // allowOnDemand: we are executing in the owning runtime now, so the
         // callee may be compiled here even when codegen was forbidden to.
-        if (bound === null || boundEpoch !== this.wasmJit.compileEpoch) {
+        // ...and on a withdrawn module: the state object survives a reset
+        // with its meta gone and no epoch bump, so an epoch-only cache would
+        // deopt on every call until some unrelated compile moved the epoch.
+        if (bound === null || boundEpoch !== this.wasmJit.compileEpoch ||
+            !(bound.callee || bound).meta) {
           bound = this.wasmJit.findReadyStatic(className, name, descriptor, true, true);
           boundEpoch = this.wasmJit.compileEpoch;
           // The binding is the linker's record of this dependency; keeping it
@@ -1944,6 +2019,32 @@ class StructuredWasmCompiler {
           st, className, args, argPosBySlot, pendingFrames, pendingDummy,
         );
       };
+      // Through the runtime linker when there is one: the site calls
+      // through a table slot the linker owns, so once the callee is ready
+      // the linker can point the slot at the callee's runv export and the
+      // call becomes wasm->wasm with no recompile. The trampoline above is
+      // the slot's initial occupant and its fallback. EH callers keep the JS
+      // import: their import wrapper records what a call threw for catch_all
+      // classification, which a raw funcref call would bypass (the same
+      // reason dcall_ is excluded for them below).
+      if (linker && linker.enabled && !this.ehMethod) {
+        let slot = this.linkSlotByNode.get(node);
+        if (slot === undefined) {
+          slot = linker.allocate({ key, className, name, descriptor, trampoline: fn });
+          this.linkSlotByNode.set(node, slot);
+          this.linkSlots.push(slot);
+        }
+        binding.slot = slot;
+        this.usedLinkTable = true;
+        const slotResults = ret === 'V' ? [T.i32] : [T.i32, descToWasm(ret)];
+        return {
+          idx: -1,
+          indirect: { slot, typeIdx: this.internSig(wParams, slotResults) },
+          direct: true,
+          writes,
+          deoptable: true,
+        };
+      }
       return {
         idx: this.addImport(`lcall_${key}`.replace(/[^\w]/g, '_'), wParams, results, fn),
         writes,
@@ -1956,8 +2057,8 @@ class StructuredWasmCompiler {
     // mappings keep the bridge (the JS closure reorders/pads arguments).
     if (this.wasmJit.directStaticLinkEnabled && !this.ehMethod &&
         linked.meta.fullyCompiled && !linked.meta.boxedCount &&
-        !linked.meta.deoptableCalls && !linked.meta.usedEh &&
-        linked.meta.runv) {
+        (!linked.meta.deoptableCalls || sealedNeverExits(linked.meta)) &&
+        !linked.meta.usedEh && linked.meta.runv) {
       const identity = linked.meta.paramSlots.length === params.length &&
         linked.meta.paramSlots.every((p, i) => {
           let at = 0;
@@ -1975,7 +2076,8 @@ class StructuredWasmCompiler {
       }
     }
     if (linked.meta.fullyCompiled && !linked.meta.boxedCount &&
-        !linked.meta.deoptableCalls && !linked.meta.usedEh) {
+        (!linked.meta.deoptableCalls || sealedNeverExits(linked.meta)) &&
+        !linked.meta.usedEh) {
       // Never-exits fast path: no scratch frame, no flag check. A later
       // recompile may repoint the state to a module with deoptable sites;
       // pin the link-time pair as the safe fallback. usedEh matters here:
@@ -1985,8 +2087,10 @@ class StructuredWasmCompiler {
       const junk = { locals: [] }; // spill sink; a fully-compiled callee never exits
       const fn = (...args) => {
         const current = calleeSt.callee || calleeSt; // recompiles may repoint it
-        const mod = (current.meta.fullyCompiled && !current.meta.boxedCount &&
-          !current.meta.deoptableCalls && !current.meta.usedEh) ? current : pinned;
+        const mod = (current.meta && current.meta.fullyCompiled &&
+          !current.meta.boxedCount &&
+          (!current.meta.deoptableCalls || sealedNeverExits(current.meta)) &&
+          !current.meta.usedEh) ? current : pinned;
         const meta = mod.meta;
         const full = new Array(meta.paramSlots.length + 2);
         for (let i = 0; i < meta.paramSlots.length; i++) {

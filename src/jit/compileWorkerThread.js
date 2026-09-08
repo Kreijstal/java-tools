@@ -158,12 +158,25 @@ function compile(request) {
     request.descriptor);
   if (!method) return { refused: "method not mirrored in the worker" };
   const base = jvm.jit.reserveSiteIdSpace(request.grant);
+  // A request is always for a fresh body. This worker may already hold one
+  // for the method -- compiled as a side effect of an earlier request, or
+  // for an earlier request of the same method that is now being replaced --
+  // and serving it would be wrong twice over: its bare site ids belong to
+  // that earlier grant (whose entries were described with THAT result, and
+  // never placed at all if it was refused), and it was planned without the
+  // link state this request carries. Compile again, into this grant.
+  jvm.jit.codegenCache.delete(method);
+  // The requester's learned link state for this method's call sites, so
+  // the worker plans against the same speculation the requester would.
+  jvm.jit.seedTransportedWarmth(method, request.warmth);
   let generated;
   try {
     generated = jvm.jit.getGeneratedFunction(method,
       request.preparedWholeMethod ? { allowEffectfulCalls: true } : {});
   } catch (error) {
     return { refused: `compile threw: ${error.message}` };
+  } finally {
+    jvm.jit.seedTransportedWarmth(method, null);
   }
   if (!generated) return { refused: "the worker's own compiler refused it" };
   const untransportable = jvm.jit.untransportableTableGrowth(base);

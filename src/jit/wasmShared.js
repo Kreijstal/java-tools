@@ -14,6 +14,7 @@ const OP = {
   // enclosing label instead of embedding a legacy catch body.
   try_table: 0x1f, catch_all_clause: 0x02, end: 0x0b,
   br: 0x0c, br_if: 0x0d, br_table: 0x0e, return: 0x0f, call: 0x10,
+  call_indirect: 0x11,
   drop: 0x1a, select: 0x1b,
   local_get: 0x20, local_set: 0x21, local_tee: 0x22,
   global_get: 0x23, global_set: 0x24,
@@ -325,6 +326,17 @@ class Unsupported extends Error {
 
 // The names a refusal waits on, as a list — blockedOn may be one or several,
 // and is absent on permanent refusals.
+// A module whose only exit paths are late-bound linker slot sites, every one
+// of which the runtime linker has sealed to a never-exits export
+// (docs/phase1-linked-call-abi.md 6, "recursive group"): the deopt checks
+// behind those sites can no longer fire, so for every linking decision it is
+// a module that never exits. `slotSites` is counted by the structured
+// compiler, `groupSealed` is written by WasmLinker.sealGroups.
+function sealedNeverExits(meta) {
+  return !!(meta && meta.groupSealed && meta.slotSites > 0 &&
+    meta.deoptableCalls === meta.slotSites);
+}
+
 function blockedNames(err) {
   if (!err || !err.blockedOn) return [];
   return Array.isArray(err.blockedOn) ? err.blockedOn : [err.blockedOn];
@@ -409,7 +421,7 @@ function specokGlobalEntry() {
 }
 
 function assembleModule({ importDecls, mainParams, mainResults, declared, body, profilerName,
-  importMemory, retvType, runvWrapper, specokGlobal }) {
+  importMemory, retvType, runvWrapper, specokGlobal, importTable, sigTypes }) {
   const typeKey = (p, r) => `${p.join(',')}|${r.join(',')}`;
   const types = [];
   const typeIndex = new Map();
@@ -421,12 +433,24 @@ function assembleModule({ importDecls, mainParams, mainResults, declared, body, 
     }
     return typeIndex.get(key);
   };
+  // Signatures the body already encoded by index (call_indirect through the
+  // linker table). They are interned FIRST so their indices are exactly
+  // their positions in `sigTypes`, which is what the emitter assumed when it
+  // wrote the body; a later import with the same shape simply reuses them.
+  for (const sig of sigTypes || []) internType(sig.params, sig.results);
 
   const importEntries = [];
   if (importMemory) {
     // (import "env" "mem" (memory 1)) — memories index separately from
     // functions, so this does not shift any call target
     importEntries.push([3, 0x65, 0x6e, 0x76, 3, 0x6d, 0x65, 0x6d, 0x02, 0x00, ...uleb(1)]);
+  }
+  if (importTable) {
+    // (import "env" "ltab" (table 0 funcref)) — the runtime linker's slot
+    // table (WasmLinker). Tables index separately from functions too. The
+    // zero minimum lets the shared table grow without invalidating this
+    // instance.
+    importEntries.push([3, 0x65, 0x6e, 0x76, 4, 0x6c, 0x74, 0x61, 0x62, 0x01, 0x70, 0x00, 0x00]);
   }
   for (const d of importDecls) {
     const ti = internType(d.params, d.results);
@@ -577,6 +601,7 @@ module.exports = {
   mathIntrinsicFunction,
   Unsupported,
   blockedNames,
+  sealedNeverExits,
   NestedDeopt,
   maxImpls,
   isGuestThrow,

@@ -318,6 +318,7 @@ class CompileWorkerClient {
         limit[table] = grant[table] + this.grantStride;
       }
       const classes = this.pendingClasses();
+      entry.warmth = this.jit.describeCallSiteWarmth(entry.method);
       this.inFlight.set(entry.method, { id, entry });
       try {
         this.ensureWorker().postMessage({
@@ -329,6 +330,10 @@ class CompileWorkerClient {
           provenance: this.jit.captureResultProvenance(),
           grant, limit,
           classes,
+          // What this thread has learned at the method's call sites. The
+          // worker plans against it; the copy kept on the in-flight record
+          // pre-links the body's sites when it lands.
+          warmth: entry.warmth,
         });
         // Only a send that returned has promised anything. Reserving the id
         // range on this side after it -- nothing else runs in between --
@@ -403,7 +408,8 @@ class CompileWorkerClient {
       const timings = { validationMs: 0, descriptorBindingMs: 0,
         newFunctionMs: 0, wasmInstantiationMs: 0 };
       const generated = this.jit.materializeGeneratedResult(
-        message.payload, found, { timings });
+        message.payload, found,
+        { timings, warmth: foundRecord?.entry?.warmth || null });
       const materializeMs = this.jit.monotonicNow() - installStart;
       if (!generated) {
         this.stats.stale += 1;
