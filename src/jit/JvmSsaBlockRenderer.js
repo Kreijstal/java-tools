@@ -2478,7 +2478,18 @@ class JvmSsaBlockRenderer {
     // identity and `indentationOf` recovers the prefix to re-apply.
     const indentationOf = (line) =>
       line.slice(0, line.length - line.trimStart().length);
-    const recordOf = (line) => statementRecords.get(line.trim());
+    // Look up a rendered line's statement record. Records are keyed by their
+    // trimmed text, but passes hold the indented line and look the same line up
+    // repeatedly, so trim + rehash on every call was the dominant allocation in
+    // the JS-preparation profile. Cache by the raw line: the first lookup trims
+    // and hashes once, later ones are a cached-string-hash Map hit.
+    const recordOfCache = new Map();
+    const recordOf = (line) => {
+      if (recordOfCache.has(line)) return recordOfCache.get(line);
+      const record = statementRecords.get(line.trim());
+      recordOfCache.set(line, record);
+      return record;
+    };
     // The JVM slot a name denotes, or null when the name is not a local.
     const localSlotOfName = (name) => {
       const slot = localNameSlots.get(name);

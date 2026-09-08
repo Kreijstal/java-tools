@@ -1596,6 +1596,17 @@ function createValidateClassFileModelPass(options = {}) {
 function compileJavaFile(inputPath, options = {}) {
   const fileSystem = fileSystemFor(options);
   const pathModule = pathModuleFor(options);
+  const resolved = pathModule.resolve(inputPath);
+  // A batch compile hands over the document it already parsed during its scan
+  // pass, so a file is parsed exactly once instead of once per pipeline stage.
+  const parsed = options.parsedDocuments && options.parsedDocuments.get(resolved);
+  if (parsed) {
+    return compileJavaAst(parsed, {
+      ...options,
+      sourcePath: inputPath,
+      sourceFileName: options.sourceFileName || pathModule.basename(inputPath),
+    });
+  }
   const source = fileSystem.readFileSync(inputPath, 'utf8');
   return compileJavaSource(source, {
     ...options,
@@ -1667,12 +1678,17 @@ function duplicateOutputIndexes(inputPaths, outputDir, options = {}, report = ()
     }
     try {
       if (!declaredNames) {
-        const source = fileSystem.readFileSync(inputPath, 'utf8');
-        const document = parseJava(source, {
+        const resolved = pathModule.resolve(inputPath);
+        const parsed = options.parsedDocuments && options.parsedDocuments.get(resolved);
+        const document = parsed || parseJava(fileSystem.readFileSync(inputPath, 'utf8'), {
           ...options,
           sourcePath: inputPath,
           sourceFileName: pathModule.basename(inputPath),
         });
+        // Keep the parsed document for the compile and prelude stages so a
+        // batch parses each source once, not three times (scan, prelude,
+        // compile).
+        if (options.parsedDocuments && !parsed) options.parsedDocuments.set(resolved, document);
         declaredNames = collectDeclaredInternalNames(document);
       }
     } catch (error) {
@@ -1765,10 +1781,15 @@ function compileJavaFiles(inputPaths, options = {}) {
   // caller named one.
   const cache = createBuildCache(options, pathModule.resolve(options.sourceRoot || sourceRoot));
   const declaredNamesByInput = new Map();
+  // Parsed documents shared by the scan pass, the source prelude and the
+  // per-file compile, so a batch parses each input once instead of three times
+  // (scan, prelude, compile).
+  const parsedDocuments = new Map();
+  const scanOptions = { ...options, parsedDocuments };
   const duplicateIndexes = duplicateOutputIndexes(
     inputPaths,
     options.outputDir,
-    options,
+    scanOptions,
     report,
     cache,
     declaredNamesByInput,
@@ -1793,6 +1814,7 @@ function compileJavaFiles(inputPaths, options = {}) {
       outputDir,
       sourcePath: inputPath,
       sourceFileName: pathModule.basename(inputPath),
+      parsedDocuments,
     };
     const reusable = cache && cache.read(inputPath);
     if (reusable) {

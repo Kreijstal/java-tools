@@ -1943,6 +1943,7 @@ class JitCompiler {
         !cached.jvmRestoringDirectPositionalBody &&
         !cached.jvmDirectPositionalBody);
       if (options.allowEffectfulCalls === true &&
+          !this.preparedCodegenMethods.has(method) &&
           (cached?.jvmStructuredGuardedBooleanSiteCount > 0 ||
             lifecycleSensitiveStructuredBody || plainCachedBody)) {
         // This method may have warmed before the explicit preparation phase,

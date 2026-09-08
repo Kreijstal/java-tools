@@ -443,12 +443,13 @@ function addClassPreludeName(map, name, internalName) {
 }
 
 function cloneNestedMap(map) {
-  const out = new Map();
-  for (const [key, value] of map || []) {
-    if (value instanceof Map) out.set(key, new Map(value));
-    else out.set(key, value);
-  }
-  return out;
+  // Shallow copy: the outer map is per-file, but the inner Maps are immutable
+  // once built. lowerAstToJavaIr only ever REPLACES an outer entry for the
+  // class it is currently lowering (context.classMethodsByInternalName.set(
+  // owner, freshMap)); it never mutates an existing inner Map in place. Deep-
+  // copying the inner Maps was therefore pure O(files × total-members) waste
+  // and dominated the GeoBlox sourceRoot compile.
+  return new Map(map || []);
 }
 
 function formalParameterDescriptor(parameter, context) {
@@ -481,10 +482,28 @@ function sourceDirectoryMetadata(sourcePath, sourcePathIsDirectory = false, opti
   };
   let files = [];
   function collectJavaFiles(current, out = []) {
-    for (const entry of fileSystem.readdirSync(current, { withFileTypes: true })) {
+    let entries;
+    try {
+      entries = fileSystem.readdirSync(current, { withFileTypes: true });
+    } catch (_) {
+      return out;
+    }
+    for (const entry of entries) {
       const full = pathModule.join(current, entry.name);
-      if (entry.isDirectory()) collectJavaFiles(full, out);
-      else if (entry.isFile() && entry.name.endsWith('.java')) out.push(full);
+      if (entry.isDirectory()) {
+        // This prelude exists to resolve sibling references, not to index the
+        // whole checkout. Recursing into hidden directories (.git, .work,
+        // .claude, ...) or node_modules turns a one-file compile in a large
+        // repo into parsing tens of thousands of generated/third-party .java
+        // files — a multi-minute, multi-gigabyte OOM (observed on
+        // dekobloko-work, whose .work/ holds ~55k decompiled sources).
+        if (entry.name.startsWith('.') || entry.name === 'node_modules') {
+          continue;
+        }
+        collectJavaFiles(full, out);
+      } else if (entry.isFile() && entry.name.endsWith('.java')) {
+        out.push(full);
+      }
     }
     return out;
   }
@@ -497,7 +516,8 @@ function sourceDirectoryMetadata(sourcePath, sourcePathIsDirectory = false, opti
   const documents = [];
   for (const file of files) {
     try {
-      documents.push(parseJava(fileSystem.readFileSync(file, 'utf8'), {
+      const parsed = options.parsedDocuments && options.parsedDocuments.get(pathModule.resolve(file));
+      documents.push(parsed || parseJava(fileSystem.readFileSync(file, 'utf8'), {
         sourceFileName: pathModule.basename(file),
       }));
     } catch (_) {
@@ -711,8 +731,17 @@ function classpathMetadata(classpath, options = {}) {
     }
     for (const entry of entries) {
       const full = pathModule.join(current, entry.name);
-      if (entry.isDirectory()) collectClassFiles(full, out);
-      else if (entry.isFile() && entry.name.endsWith('.class')) out.push(full);
+      if (entry.isDirectory()) {
+        // Same rule as sourceDirectoryMetadata: skip hidden directories and
+        // node_modules, otherwise a classpath pointing at a big repo root
+        // scans .git/.work and thousands of unrelated .class files.
+        if (entry.name.startsWith('.') || entry.name === 'node_modules') {
+          continue;
+        }
+        collectClassFiles(full, out);
+      } else if (entry.isFile() && entry.name.endsWith('.class')) {
+        out.push(full);
+      }
     }
     return out;
   };
@@ -5146,6 +5175,13 @@ function lowerKnownStaticMethodCall(expression, context) {
   if (!expression || expression.kind !== 'MethodInvocationExpression' || !expression.target) return null;
   const targetParts = chainParts(expression.target);
   const owner = resolveClassInternalNameFromParts(targetParts, context);
+  // This helper only resolves JRE intrinsics. A non-JRE owner can never match,
+  // so bail out BEFORE lowering the arguments: lowering them eagerly here and
+  // then AGAIN in lowerStaticUserMethodCall made a nested user static call
+  // (f.a(1, f.a(1, f.a(...)))) exponential in argument depth -- the exact
+  // shape of the obfuscated GeoBlox kernels (ge.c, qc.java) that dominated
+  // compile time.
+  if (!jreClassInfo(owner)) return null;
   const args = (expression.arguments || []).map((argument) => lowerExpressionToJavaIrValue(argument, context));
   if (!args.every(Boolean)) return null;
   const jreMethod = selectJreMethodDescriptor(owner, expression.name, args, true);
@@ -5641,22 +5677,30 @@ function lowerExpressionToJavaIrValue(expression, context) {
   if (expression && expression.kind === 'MethodInvocationExpression' && expression.target
       && !['ThisExpression', 'SuperExpression'].includes(expression.target.kind)) {
     const receiver = lowerExpressionToJavaIrValue(expression.target, context);
-    const args = (expression.arguments || []).map((argument) => lowerExpressionToJavaIrValue(argument, context));
-    const owner = receiver && instanceCallOwner(receiver.type, expression.name, args);
-    if (receiver && owner && args.every(Boolean)) {
-      const method = methodDescriptorForInstanceCall(owner, expression.name, args, context);
-      const callArgs = prepareMethodArguments(method, args);
-      if (method && callArgs) {
-        return {
-          kind: 'MethodCallValue',
-          type: method.returnDescriptor,
-          owner,
-          name: expression.name,
-          descriptor: method.descriptor,
-          invokeKind: method.invokeKind || 'virtual',
-          receiver,
-          args: callArgs,
-        };
+    // Do not lower the arguments before knowing there is a receiver: a static
+    // call (ClassName.method) has no receiver and is handled by the static
+    // helpers below. Lowering the args here and then again there made nested
+    // static calls exponential (see lowerKnownStaticMethodCall).
+    if (!receiver) {
+      // fall through to the static-call handling later in this function
+    } else {
+      const args = (expression.arguments || []).map((argument) => lowerExpressionToJavaIrValue(argument, context));
+      const owner = instanceCallOwner(receiver.type, expression.name, args);
+      if (owner && args.every(Boolean)) {
+        const method = methodDescriptorForInstanceCall(owner, expression.name, args, context);
+        const callArgs = prepareMethodArguments(method, args);
+        if (method && callArgs) {
+          return {
+            kind: 'MethodCallValue',
+            type: method.returnDescriptor,
+            owner,
+            name: expression.name,
+            descriptor: method.descriptor,
+            invokeKind: method.invokeKind || 'virtual',
+            receiver,
+            args: callArgs,
+          };
+        }
       }
     }
   }
