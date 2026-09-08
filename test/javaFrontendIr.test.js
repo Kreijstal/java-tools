@@ -3369,3 +3369,46 @@ test('a label on a for loop carries its continue target, not just its break targ
     'the labelled continue reaches the loop update, not the end of a block');
   t.end();
 });
+
+test('a field assignment used as an expression stores and yields the value', async (t) => {
+  const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'java-frontend-assign-value-'));
+  try {
+    const result = frontend.compileJavaSource(`
+      public class AssignExprSmoke {
+        static int number;
+        int instance;
+        int[] values = new int[1];
+        static int storeInherited(boolean choose, int value) {
+          return number = choose ? value : value + 1;
+        }
+        int storeInstance(int value) {
+          return this.instance = value * 2;
+        }
+        int storeElement(int value) {
+          return values[0] = value - 1;
+        }
+        public static void main(String[] args) {
+          System.out.println(storeInherited(true, 7));
+          System.out.println(number);
+          AssignExprSmoke self = new AssignExprSmoke();
+          System.out.println(self.storeInstance(9));
+          System.out.println(self.instance);
+          System.out.println(self.storeElement(5));
+          System.out.println(self.values[0]);
+        }
+      }
+    `, { sourceFileName: 'AssignExprSmoke.java', outputDir });
+
+    t.equal(result.bytecodeIr.status, 'complete', 'the assignment expressions lower completely');
+    t.deepEqual(result.bytecodeIr.unsupported || [], [], 'nothing is reported unsupported');
+
+    const jvm = new JVM({ classpath: outputDir });
+    const getOutput = setupIntegerPrintCapture(jvm);
+    await jvm.run('AssignExprSmoke', { args: [] });
+    t.equal(getOutput().trim(), '7\n7\n18\n18\n4\n4',
+      'every store yields the stored value to its enclosing expression');
+  } finally {
+    fs.rmSync(outputDir, { recursive: true, force: true });
+  }
+  t.end();
+});

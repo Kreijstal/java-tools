@@ -562,6 +562,36 @@ function emitValue(value, state) {
     state.maxStack = Math.max(state.maxStack, emitted.stack, stack);
     return { descriptor: local.descriptor, stack };
   }
+  if (value.kind === 'AssignStaticFieldValue') {
+    const emitted = emitValue(value.value, state);
+    if (!emitted || emitted.descriptor !== value.descriptor) return null;
+    const stack = slotWidthFromDescriptor(value.descriptor);
+    state.instructions.push(createJvmInstruction(stack === 2 ? 'dup2' : 'dup'));
+    state.instructions.push(createJvmInstruction('putstatic', ['Field', value.owner, value.name, value.descriptor]));
+    state.maxStack = Math.max(state.maxStack, emitted.stack + stack);
+    return { descriptor: value.descriptor, stack };
+  }
+  if (value.kind === 'AssignFieldValue') {
+    const receiver = emitValue(value.receiver, state);
+    const emitted = emitValue(value.value, state);
+    if (!receiver || !emitted || emitted.descriptor !== value.descriptor) return null;
+    const stack = slotWidthFromDescriptor(value.descriptor);
+    state.instructions.push(createJvmInstruction(stack === 2 ? 'dup2_x1' : 'dup_x1'));
+    state.instructions.push(createJvmInstruction('putfield', ['Field', value.owner, value.name, value.descriptor]));
+    state.maxStack = Math.max(state.maxStack, receiver.stack + emitted.stack + stack);
+    return { descriptor: value.descriptor, stack };
+  }
+  if (value.kind === 'AssignArrayElementValue') {
+    const array = emitValue(value.array, state);
+    const index = emitValue(value.index, state);
+    const emitted = emitValue(value.value, state);
+    if (!array || !index || !array.descriptor.startsWith('[') || index.descriptor !== 'I' || !emitted || emitted.descriptor !== value.type) return null;
+    const stack = slotWidthFromDescriptor(value.type);
+    state.instructions.push(createJvmInstruction(stack === 2 ? 'dup2_x2' : 'dup_x2'));
+    state.instructions.push(createJvmInstruction(arrayStoreOpcodeForDescriptor(value.type)));
+    state.maxStack = Math.max(state.maxStack, array.stack + index.stack + emitted.stack + stack);
+    return { descriptor: value.type, stack };
+  }
   if (value.kind === 'PostUpdateValue') {
     const local = state.locals.get(value.target);
     if (!local || local.descriptor !== 'I' || typeof local.slotHint !== 'number') return null;
