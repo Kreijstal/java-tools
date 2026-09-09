@@ -37,6 +37,7 @@
 // table say for this callee right now".
 const {
   T, OP, uleb, sleb, descToWasm, parseMethodDescriptor, sealedNeverExits,
+  hasUncheckedSpeculation,
 } = require('./wasmShared');
 
 const OP_CALL_INDIRECT = 0x11;
@@ -165,7 +166,7 @@ class WasmLinker {
     const meta = mod && mod.meta;
     if (!meta || !meta.runv) return null;
     if (!meta.fullyCompiled || meta.boxedCount || meta.usedEh) return null;
-    if (meta.speculations || (meta.specSites && meta.specSites.length)) return null;
+    if (hasUncheckedSpeculation(meta)) return null;
     if (st.synchronized || st.linkVetoed) return null;
     return meta;
   }

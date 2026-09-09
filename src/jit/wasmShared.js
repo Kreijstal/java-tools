@@ -337,6 +337,92 @@ function sealedNeverExits(meta) {
     meta.deoptableCalls === meta.slotSites);
 }
 
+// A module's baked speculations come in two kinds, and only one of them
+// makes the module unsafe to reach through a captured link. Inline-elided
+// CHA sites (the `specSites` wasmInline records for a guard-elided `this`
+// call) are checked nowhere inside the module: prepare()'s entry gate is the
+// only thing between a grown class world and a wrong inlined body, so a link
+// that outlives that gate must be refused. A speculative monomorphic direct
+// link carries its own check instead -- the exported `specok` global, which
+// onClassEpochBump zeroes synchronously on every class registration -- so a
+// stale module drops to its generic dispatch import by itself and stays
+// linkable. Metas built before the split carry no `inlineSpecSites` and are
+// treated as entirely unchecked.
+function hasUncheckedSpeculation(meta) {
+  if (!meta) return false;
+  if (meta.speculations) return true;
+  if (!(meta.specSites && meta.specSites.length)) return false;
+  const inline = meta.inlineSpecSites;
+  if (inline === undefined || inline.length) return true;
+  // Link sites without the flag they are supposed to be gated by: the
+  // module cannot self-check, so treat it like an inlined one.
+  return !meta.specok;
+}
+
+// The callee half of the direct wasm->wasm instance-link contract, shared by
+// both backends so the two cannot state it differently. A raw `runv` call
+// carries no frame, no deopt protocol and no monitor, so the callee must be
+// unable to need any of them: fully compiled (no block can exit), no boxed
+// slots, no deoptable call of its own, no exception table, not synchronized
+// (a linked call has no frame, so it has no monitor), not vetoed, and it
+// must actually export runv. A speculative callee is admitted only where the
+// caller re-checks the class world at link time AND keeps a receiver guard
+// that later-loaded classes fail -- which invokespecial, whose only guard is
+// non-null, cannot offer.
+function directInstanceLinkCalleeEligible(st, isSpecial, revalidate) {
+  const meta = st && (st.callee || st).meta;
+  if (!meta) return false;
+  if (!meta.fullyCompiled || !meta.runv) return false;
+  if (meta.boxedCount || meta.deoptableCalls || meta.usedEh) return false;
+  if (st.synchronized || st.linkVetoed) return false;
+  if (!(meta.specSites && meta.specSites.length)) return true;
+  return !isSpecial && !!revalidate && revalidate(st);
+}
+
+// The argument half: the callee's typed slots must be exactly the receiver
+// followed by the descriptor's parameters at their natural slots, because
+// the direct sequence hands them over positionally with no JS closure to
+// reorder or pad them.
+function identityInstanceParams(meta, params) {
+  const expected = [{ slot: 0, t: T.ref }];
+  let slot = 1;
+  for (const p of params) {
+    expected.push({ slot, t: descToWasm(p) });
+    slot += (p === 'J' || p === 'D') ? 2 : 1;
+  }
+  return meta.paramSlots.length === expected.length &&
+    meta.paramSlots.every((p, i) => p.slot === expected[i].slot &&
+      p.t === expected[i].t);
+}
+
+// Every wasm bridge reaches its callee the same way: build a dense
+// `[...paramSlots, resumeBlock, fuel]` array and hand it to the module's
+// exported `run`. Spreading that array (`run(...args)`) is a variadic call,
+// and V8 charges about 15 ns for one -- measurably more than the ~4 ns wasm
+// crossing it wraps. The argument count is whatever the callee's signature
+// says, so it is fixed for the life of a module even though it is not a
+// literal here; dispatching on `args.length` recovers a fixed-arity call at
+// each site. Arities past the table stay on the spread: a method may take
+// many parameters and must keep working, it is just rare.
+function callWasmRun(run, args) {
+  switch (args.length) {
+    case 2: return run(args[0], args[1]);
+    case 3: return run(args[0], args[1], args[2]);
+    case 4: return run(args[0], args[1], args[2], args[3]);
+    case 5: return run(args[0], args[1], args[2], args[3], args[4]);
+    case 6: return run(args[0], args[1], args[2], args[3], args[4], args[5]);
+    case 7: return run(args[0], args[1], args[2], args[3], args[4], args[5],
+      args[6]);
+    case 8: return run(args[0], args[1], args[2], args[3], args[4], args[5],
+      args[6], args[7]);
+    case 9: return run(args[0], args[1], args[2], args[3], args[4], args[5],
+      args[6], args[7], args[8]);
+    case 10: return run(args[0], args[1], args[2], args[3], args[4], args[5],
+      args[6], args[7], args[8], args[9]);
+    default: return run(...args);
+  }
+}
+
 function blockedNames(err) {
   if (!err || !err.blockedOn) return [];
   return Array.isArray(err.blockedOn) ? err.blockedOn : [err.blockedOn];
@@ -657,7 +743,11 @@ module.exports = {
   mathIntrinsicFunction,
   Unsupported,
   blockedNames,
+  callWasmRun,
   sealedNeverExits,
+  hasUncheckedSpeculation,
+  directInstanceLinkCalleeEligible,
+  identityInstanceParams,
   NestedDeopt,
   maxImpls,
   isGuestThrow,

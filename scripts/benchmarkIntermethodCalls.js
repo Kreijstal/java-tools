@@ -15,9 +15,21 @@ const iterations = positiveInteger('INTERMETHOD_ITERATIONS', 50000);
 const rounds = positiveInteger('INTERMETHOD_ROUNDS', 5);
 const warmups = positiveInteger('INTERMETHOD_WARMUPS', 3);
 const profileJit = process.env.INTERMETHOD_PROFILE_JIT === '1';
+// Wasm work counts: how many sites emitted a direct wasm->wasm link, and how
+// many calls still crossed into the generic JS dispatch bridge during the
+// measured rounds. Opt-in, because counting bridge entries adds a JS
+// increment to every bridge call -- a cost the arm that avoids the bridge
+// does not pay, which would bias exactly the comparison it is there to
+// explain. A run with counters on reports `wasmCounters: true` and is a
+// diagnostic run, never acceptance timing.
+const wasmCounters = process.env.INTERMETHOD_WASM_COUNTERS === '1';
+// Java-level calls each iteration of a shape performs, from the fixture:
+// runStatic calls the eight steps; runVirtual/runInterface call apply, which
+// calls chain, which calls the eight steps.
+const CALLS_PER_ITERATION = { monolith: 0, static: 8, virtual: 10, interface: 10 };
 const className = 'IntermethodCallBenchmark';
 const workerType = 'IntermethodCallBenchmark$Worker';
-const shapes = [
+const allShapes = [
   { name: 'monolith', method: 'runMonolith', descriptor: '(II)I', object: false },
   { name: 'static', method: 'runStatic', descriptor: '(II)I', object: false },
   { name: 'virtual', method: 'runVirtual',
@@ -25,6 +37,17 @@ const shapes = [
   { name: 'interface', method: 'runInterface',
     descriptor: '(LIntermethodCallBenchmark$InterfaceWorker;II)I', object: true },
 ];
+// INTERMETHOD_SHAPES selects and orders the shapes, so one shape can be
+// measured alone and shape ordering effects can be tested without editing
+// this file.
+const shapes = (process.env.INTERMETHOD_SHAPES || '')
+  .split(',').map((entry) => entry.trim()).filter(Boolean)
+  .map((name) => {
+    const shape = allShapes.find((entry) => entry.name === name);
+    if (!shape) throw new Error(`unknown shape ${name}`);
+    return shape;
+  });
+if (!shapes.length) shapes.push(...allShapes);
 
 function positiveInteger(name, fallback) {
   const value = Number(process.env[name] || fallback);
@@ -53,7 +76,7 @@ function nativeResults(directory) {
   const checksums = new Map();
   for (const line of output.split(/\r?\n/)) {
     const match = /^RESULT (\w+) (\d+) (\d+) (-?\d+)$/.exec(line);
-    if (!match) continue;
+    if (!match || !byName.has(match[1])) continue;
     byName.get(match[1]).push(Number(match[3]));
     checksums.set(match[1], Number(match[4]));
   }
@@ -77,6 +100,9 @@ async function createRuntime(directory, tier) {
   } });
   if (previousWasm === undefined) delete process.env.JVM_WASM_JIT;
   else process.env.JVM_WASM_JIT = previousWasm;
+  // The generic instance-dispatch bridge reads this map when a site is
+  // emitted, so it has to exist before anything compiles.
+  if (tier === 'wasm' && wasmCounters) jvm.jit.wasmJit.siteStats = new Map();
   for (const name of [className, `${className}$VirtualWorker`,
     `${className}$InterfaceWorker`, workerType]) {
     const classData = await jvm.loadClassByName(name);
@@ -173,6 +199,39 @@ function compiledMethodKinds(runtime) {
   }, {});
 }
 
+// Sites that emitted a direct wasm->wasm link, over every module built for
+// this run -- the caller's own instance sites and its callees' alike.
+function directLinkTotal(runtime) {
+  let total = 0;
+  for (const state of runtime.jvm.jit.wasmJit.compiled) {
+    total += (state.meta && state.meta.directLinks) || 0;
+  }
+  return total;
+}
+
+// Entries into the generic JS dispatch bridge, summed over every instance
+// site. Zero without INTERMETHOD_WASM_COUNTERS, which is what allocates the
+// map the bridge counts into.
+function bridgeCallTotal(runtime) {
+  const stats = runtime.jvm.jit.wasmJit.siteStats;
+  if (!stats) return 0;
+  let total = 0;
+  for (const entry of stats.values()) total += entry.calls;
+  return total;
+}
+
+// Static sites lowered to a direct wasm->wasm link. Counted separately from
+// directLinks: a static site has no per-call fallback arm, so its emission
+// count IS its crossing count, while an instance site keeps the generic
+// dispatch import for every receiver its guard refuses.
+function directStaticLinkTotal(runtime) {
+  let total = 0;
+  for (const state of runtime.jvm.jit.wasmJit.compiled) {
+    total += (state.meta && state.meta.directStaticLinks) || 0;
+  }
+  return total;
+}
+
 function directInlineSiteCount(runtime) {
   const classData = runtime.jvm.classes[className];
   return classData.ast.classes[0].items
@@ -182,8 +241,17 @@ function directInlineSiteCount(runtime) {
     .reduce((total, generated) => total + (generated.jvmDirectInlineCount || 0), 0);
 }
 
+let effectiveLinkFlags = null;
+
 async function tierResults(directory, tier) {
   const runtime = await createRuntime(directory, tier);
+  if (!effectiveLinkFlags) {
+    const wasmJit = runtime.jvm.jit.wasmJit;
+    effectiveLinkFlags = {
+      directInstanceLink: !!wasmJit.directInstanceLinkEnabled,
+      directStaticLink: !!wasmJit.directStaticLinkEnabled,
+    };
+  }
   const results = [];
   for (const shape of shapes) {
     let last;
@@ -192,6 +260,10 @@ async function tierResults(directory, tier) {
     }
     const generatedRunsBefore = runtime.jvm.jit.syncGeneratedRunCount;
     const inlinedCallsBefore = runtime.jvm.jit.syncInlinedCallCount;
+    const runnerRunsBefore = runtime.jvm.jit.runnerRunCount;
+    const safePointsBefore = runtime.jvm.jit.structuredSsa.safePointCount;
+    const structuredRunsBefore = runtime.jvm.jit.structuredSsa.totalRunCount;
+    const bridgeCallsBefore = bridgeCallTotal(runtime);
     const elapsed = [];
     for (let round = 0; round < rounds; round++) {
       const started = process.hrtime.bigint();
@@ -205,6 +277,14 @@ async function tierResults(directory, tier) {
         summary.generatedRuns = runtime.jvm.jit.generatedMethodRunCounts.get(key) || 0;
         summary.measuredInlinedCalls = runtime.jvm.jit.syncInlinedCallCount - inlinedCallsBefore;
         summary.measuredGeneratedCalls = runtime.jvm.jit.syncGeneratedRunCount - generatedRunsBefore;
+        // How much of the measured region ran in the bytecode interpreter
+        // rather than in the generated body, and how often the structured
+        // body suspended: a tier that is compiled is not a tier that runs.
+        summary.measuredRunnerRuns = runtime.jvm.jit.runnerRunCount - runnerRunsBefore;
+        summary.measuredSafePoints =
+          runtime.jvm.jit.structuredSsa.safePointCount - safePointsBefore;
+        summary.measuredStructuredRuns =
+          runtime.jvm.jit.structuredSsa.totalRunCount - structuredRunsBefore;
       }
       summary.callSiteTargets = callSiteTargetKinds(runtime.jvm.jit);
       summary.compiledMethods = compiledMethodKinds(runtime);
@@ -219,7 +299,18 @@ async function tierResults(directory, tier) {
         reason: state.failReason || null,
         supportedBlocks: state.meta?.supportedBlocks?.size || 0,
         blocks: state.meta?.blockCount || 0,
+        // Direct wasm->wasm links across every module this shape reaches:
+        // the caller's own sites plus its callees'. A link is emitted, not
+        // executed -- measuredBridgeCalls below is what says which path ran.
+        directLinks: directLinkTotal(runtime),
+        directStaticLinks: directStaticLinkTotal(runtime),
       } : null;
+      summary.callsPerIteration = CALLS_PER_ITERATION[shape.name] ?? null;
+      if (wasmCounters && summary.wasm) {
+        const bridged = bridgeCallTotal(runtime) - bridgeCallsBefore;
+        summary.wasm.measuredBridgeCalls = bridged;
+        summary.wasm.bridgeCallsPerIteration = bridged / (iterations * rounds);
+      }
     }
     results.push(summary);
   }
@@ -232,27 +323,39 @@ function javaVersion() {
   return (result.stderr || result.stdout || '').split(/\r?\n/, 1)[0];
 }
 
+// INTERMETHOD_TIERS narrows the run to the tiers under investigation, so a
+// profile of one tier is not dominated by the other arms (the native arm is a
+// `java` subprocess). Dropping `native` drops the checksum oracle with it, so
+// the report says so.
+const tiers = (process.env.INTERMETHOD_TIERS || 'native,javascript,wasm')
+  .split(',').map((entry) => entry.trim()).filter(Boolean);
+
 (async () => {
   const directory = compileFixture();
   try {
-    const native = nativeResults(directory);
-    const javascript = await tierResults(directory, 'javascript');
-    const wasm = await tierResults(directory, 'wasm');
+    const native = tiers.includes('native') ? nativeResults(directory) : [];
+    const javascript = tiers.includes('javascript')
+      ? await tierResults(directory, 'javascript') : [];
+    const wasm = tiers.includes('wasm') ? await tierResults(directory, 'wasm') : [];
     const nativeByName = new Map(native.map((row) => [row.name, row]));
     for (const rows of [javascript, wasm]) {
       for (const row of rows) {
-        const expected = nativeByName.get(row.name).checksum;
-        if (row.checksum !== expected) {
-          throw new Error(`${row.name} checksum mismatch: ${row.checksum} !== ${expected}`);
+        const reference = nativeByName.get(row.name);
+        if (!reference) continue;
+        if (row.checksum !== reference.checksum) {
+          throw new Error(`${row.name} checksum mismatch: ${row.checksum} !== ${reference.checksum}`);
         }
         row.slowdownVsNative = row.nanosecondsPerIteration /
-          nativeByName.get(row.name).nanosecondsPerIteration;
+          reference.nanosecondsPerIteration;
       }
     }
     process.stdout.write(`${JSON.stringify({
       node: process.version,
       java: javaVersion(),
-      iterations, rounds, warmups, profileJit,
+      iterations, rounds, warmups, profileJit, tiers,
+      checksumOracle: tiers.includes('native'),
+      wasmCounters,
+      ...(effectiveLinkFlags || {}),
       native, javascript, wasm,
     }, null, 2)}\n`);
   } finally {

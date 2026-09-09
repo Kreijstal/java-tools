@@ -86,12 +86,15 @@ const {
   arrayLoadImportName,
   Unsupported,
   blockedNames,
+  callWasmRun,
   NestedDeopt,
   isGuestThrow,
   FUEL,
   isNoOpExceptionHandler, liveExceptionRanges, supportsWasmTryTable,
   retvGlobalEntry, runvWrapperBody, specokGlobalEntry,
   maxImpls,
+  hasUncheckedSpeculation, directInstanceLinkCalleeEligible,
+  identityInstanceParams,
 } = require('./wasmShared');
 const monoArray = require('./monoArray');
 const {
@@ -663,9 +666,10 @@ class MethodTranslator {
         const wResults = ret === 'V' ? [T.i32] : [T.i32, descToWasm(ret)];
         this.linkBindings.push({
           kind: 'static-direct', className, name, descriptor, importName,
-          site: itemIndex, partial: false,
+          site: itemIndex, partial: false, direct: true,
           params: wParams.slice(), results: wResults.slice(),
         });
+        this.directStaticLinks = (this.directStaticLinks || 0) + 1;
         return {
           argTypes: wParams,
           underTypes: [],
@@ -747,7 +751,7 @@ class MethodTranslator {
       meta.box.ret = undefined;
       let status;
       try {
-        status = calleeMod.run(...full);
+        status = callWasmRun(calleeMod.run, full);
       } catch (err) {
         if (partial && err instanceof NestedDeopt) {
           // the deeper site set frame.pc through its own callerBox
@@ -1017,7 +1021,7 @@ class MethodTranslator {
       meta.box.ret = undefined;
       let status;
       try {
-        status = calleeMod.run(...full);
+        status = callWasmRun(calleeMod.run, full);
       } catch (err) {
         if (partial && err instanceof NestedDeopt) {
           if (stats) stats.deopts += 1;
@@ -1092,31 +1096,15 @@ class MethodTranslator {
       const st = targets.length === 1 ? targets[0] : null;
       const calleeMod = st && (st.callee || st);
       const calleeMeta = calleeMod && calleeMod.meta;
-      // A guard-elided speculative callee can be raw-linked only through the
-      // class-set guard: directClasses is a closed set verified against the
-      // callee's baked picks at link time (revalidate now), and any class
-      // loaded later misses the guard into the generic path. invokespecial's
-      // bare null check admits future receiver classes, so it keeps the
-      // bridge for speculative callees.
-      const speculative = calleeMeta &&
-        calleeMeta.specSites && calleeMeta.specSites.length > 0;
-      const eligible = calleeMeta && calleeMeta.fullyCompiled &&
-        !calleeMeta.usedEh && !(calleeMeta.deoptableCalls > 0) &&
-        calleeMeta.runv && !st.linkVetoed &&
-        (!speculative ||
-          (!direct && this.wasmJit.revalidateNestedCallee(st)));
-      let identity = false;
-      if (eligible) {
-        const expected = [{slot: 0, t: T.ref}];
-        let expectedSlot = 1;
-        for (const p of params) {
-          expected.push({slot: expectedSlot, t: descToWasm(p)});
-          expectedSlot += (p === 'J' || p === 'D') ? 2 : 1;
-        }
-        identity = calleeMeta.paramSlots.length === expected.length &&
-          calleeMeta.paramSlots.every((p, i) => p.slot === expected[i].slot &&
-            p.t === expected[i].t);
-      }
+      // One contract, stated once in wasmShared: a raw runv call carries no
+      // frame, no deopt protocol and no monitor, and a guard-elided
+      // speculative callee is admitted only where the caller re-checks the
+      // class world at link time and keeps a receiver guard later-loaded
+      // classes fail -- which invokespecial, whose only guard is non-null,
+      // cannot offer.
+      const eligible = directInstanceLinkCalleeEligible(
+        st, !!direct, (target) => this.wasmJit.revalidateNestedCallee(target));
+      const identity = eligible && identityInstanceParams(calleeMeta, params);
       if (identity) {
         const directIdx = this.addImport(
           `dcall_${key}_${itemIndex}`.replace(/[^\w]/g, '_'),
@@ -2374,9 +2362,13 @@ class MethodTranslator {
       // the NestedDeopt protocol even when it is fully compiled
       deoptableCalls: (this.instanceSites || 0) + (this.staticInitializationGuards?.size || 0),
       directLinks: this.directLinks || 0,
+      directStaticLinks: this.directStaticLinks || 0,
       // Speculative monomorphic direct links bake the compile-time cone;
       // prepare()'s gate revalidates these on entry and re-arms specok.
       specSites: this.specSites || [],
+      // This backend never inlines, so every recorded site is a direct-link
+      // speculation the module's own specok flag gates.
+      inlineSpecSites: [],
       speculations: 0,
       specEpoch: this.jvm.classEpoch || 0,
       boxedCount: this.boxedSlots.size,
@@ -2487,7 +2479,20 @@ class WasmJit {
     this.instanceLinkEnabled = env.JVM_WASM_DEVIRT !== '0';
     // Direct wasm->wasm static links: eligible fully-compiled callees are
     // called through their runv export with no JS bridge on the path.
-    this.directStaticLinkEnabled = wasmOptions.directStaticLink ?? (env.JVM_WASM_DIRECT_STATIC_LINK === '1');
+    //
+    // On by default, like the instance link. Eligibility is decided upstream
+    // by findReadyStatic (static, not synchronized, ready, no boxed values,
+    // no unchecked speculation, and -- when the callee still has to be
+    // compiled -- its class already initialized), so what this flag selects
+    // is only whether an ALREADY eligible callee is entered through its runv
+    // export or through the JS never-exits bridge. Both pin the callee module
+    // they linked against, so the flag does not change which staleness a
+    // caller can observe; it changes what stands between the two modules.
+    // The browser bundle has run with it set since browser-entry.js was
+    // written. Set JVM_WASM_DIRECT_STATIC_LINK=0, or
+    // jit.wasm.directStaticLink:false, to keep every static call on the
+    // bridge; the linker reads the same flag and keeps its slots stubbed.
+    this.directStaticLinkEnabled = wasmOptions.directStaticLink ?? (env.JVM_WASM_DIRECT_STATIC_LINK !== '0');
     // Worker mode: lower a caller without being allowed to compile its callees
     // on demand. This is the state a compile worker is actually in -- it holds
     // bytecode, not the owning runtime's tier state -- and it is what makes
@@ -2505,9 +2510,18 @@ class WasmJit {
     // Direct wasm->wasm instance links: a monomorphic-in-practice site calls
     // its single ready fully-compiled target through runv behind an in-wasm
     // null check (invokespecial) or a one-import receiver-class guard
-    // (invokevirtual/invokeinterface); every other receiver falls back to
-    // the generic dispatch import.
-    this.directInstanceLinkEnabled = wasmOptions.directInstanceLink ?? (env.JVM_WASM_DIRECT_INSTANCE_LINK === '1');
+    // (invokevirtual/invokeinterface); every other receiver -- null, a class
+    // the guard does not admit, a late target, a deopt -- falls back to the
+    // generic dispatch import, which stays in the module as the complete
+    // slow path. The callee contract is directInstanceLinkCalleeEligible.
+    //
+    // On by default. It was landed opt-in with the rest of the direct-link
+    // work and never revisited, not held back for a known defect; enabling
+    // it exposed exactly one, since fixed (a direct link made its own module
+    // unlinkable as a static callee -- see hasUncheckedSpeculation). Set
+    // JVM_WASM_DIRECT_INSTANCE_LINK=0, or jit.wasm.directInstanceLink:false,
+    // to keep every instance call on the bridge.
+    this.directInstanceLinkEnabled = wasmOptions.directInstanceLink ?? (env.JVM_WASM_DIRECT_INSTANCE_LINK !== '0');
     // Closed polymorphic sites can classify the externref once, then call the
     // selected raw Wasm export directly. This removes the JS nested-call
     // wrapper while retaining the generic import for null, late, partial, and
@@ -2603,11 +2617,23 @@ class WasmJit {
     // Exported "specok" globals of live modules with speculative monomorphic
     // links; zeroed synchronously on every class registration so mid-run
     // receivers of new classes fall to the generic path.
-    this.specokGlobals = [];
+    this.specokGlobals = new Set();
   }
 
   onClassEpochBump() {
     for (const g of this.specokGlobals) g.value = 0;
+  }
+
+  // The specok flags of the modules a state holds right now. Every class
+  // registration walks this set, so a module that is no longer reachable has
+  // to leave it: withdrawal drops one, and a recompile drops the module it
+  // replaces. A flag outliving its module is not unsound -- nothing reads it
+  // any more, and zeroing it is harmless -- but it makes every later class
+  // load fractionally more expensive, without bound, for the whole process.
+  releaseSpecokGlobals(st) {
+    for (const m of [st.meta, st.osr && st.osr.meta]) {
+      if (m && m.specok) this.specokGlobals.delete(m.specok);
+    }
   }
 
   // The world a deferrable demotion depends on: which classes exist
@@ -2691,6 +2717,7 @@ class WasmJit {
   // back to cold goes through here so the runtime linker can stop callers
   // entering the withdrawn module directly on their next call.
   withdrawModule(st) {
+    this.releaseSpecokGlobals(st);
     st.status = 'cold';
     st.entries = 0;
     st.retryAfter = 1;
@@ -3362,12 +3389,15 @@ class WasmJit {
       validatingBytes = primary.bytes;
       const module = new WebAssembly.Module(primary.bytes);
       const instance = new WebAssembly.Instance(module, primary.importObject);
+      // The modules this state is about to stop holding leave the
+      // class-load walk with it.
+      this.releaseSpecokGlobals(st);
       st.meta = primary;
       st.run = instance.exports.run;
       primary.retv = instance.exports.retv || null;
       primary.runv = instance.exports.runv || null;
       primary.specok = instance.exports.specok || null;
-      if (primary.specok) this.specokGlobals.push(primary.specok);
+      if (primary.specok) this.specokGlobals.add(primary.specok);
       if (structuredMeta && meta) {
         validatingBytes = meta.bytes;
         const osrModule = new WebAssembly.Module(meta.bytes);
@@ -3375,7 +3405,7 @@ class WasmJit {
         meta.retv = osrInstance.exports.retv || null;
         meta.runv = osrInstance.exports.runv || null;
         meta.specok = osrInstance.exports.specok || null;
-        if (meta.specok) this.specokGlobals.push(meta.specok);
+        if (meta.specok) this.specokGlobals.add(meta.specok);
         // JVM_WASM_NO_OSR=1: keep the structured module but refuse the
         // dispatcher OSR companion, so a fuel exit resumes ONLY in the
         // interpreter. Separates "the spill wrote the wrong locals" from
@@ -3686,7 +3716,7 @@ class WasmJit {
     const previousThread = this.activeThread;
     this.activeThread = thread;
     try {
-      status = mod.run(...args);
+      status = callWasmRun(mod.run, args);
     } catch (err) {
       if (err instanceof NestedDeopt) {
         // A linked partial callee hit a demoted block. The import closures
@@ -3983,7 +4013,7 @@ class WasmJit {
     const cm = (st.callee || st).meta;
     if (!cm) return 'unknown';
     if (cm.boxedCount) return 'incompatible';
-    if (cm.speculations || (cm.specSites && cm.specSites.length)) return 'incompatible';
+    if (hasUncheckedSpeculation(cm)) return 'incompatible';
     if (cm.fullyCompiled || cm.normalFlowFullyCompiled) return 'compatible';
     // An artifact exists but covers too little to be entered as a callee.
     // That is a property of what was produced, not of when it was asked for,
@@ -4090,10 +4120,13 @@ class WasmJit {
     if (!st || st.status !== 'ready') return null;
     const cm = (st.callee || st).meta;
     if (cm.boxedCount) return null;
-    // speculative modules are entered only through prepare(), whose epoch
-    // check invalidates them; a captured link would outlive that check
-    // (guard-elided `this` sites are speculative with speculations === 0)
-    if (cm.speculations || (cm.specSites && cm.specSites.length)) return null;
+    // Inline-baked speculative modules are entered only through prepare(),
+    // whose epoch check invalidates them; a captured link would outlive that
+    // check (guard-elided `this` sites are speculative with
+    // speculations === 0). A speculative monomorphic direct link is not in
+    // that class: its in-wasm specok flag is zeroed on every class
+    // registration, so the module self-checks. See hasUncheckedSpeculation.
+    if (hasUncheckedSpeculation(cm)) return null;
     if (cm.fullyCompiled || cm.normalFlowFullyCompiled) return st;
     // partial callees deopt on demoted blocks; the entry block at least must
     // run in wasm or every call would deopt immediately
@@ -4233,7 +4266,7 @@ class WasmJit {
     if (!thread || !this.jvm.enterFrameMonitorIfNeeded(frame, thread)) return 0;
     let status;
     try {
-      status = mod.run(...wasmArgs);
+      status = callWasmRun(mod.run, wasmArgs);
       return status;
     } catch (error) {
       // NestedDeopt transfers the live activation, including its lock, to

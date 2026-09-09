@@ -238,12 +238,16 @@ test('a two-class recursive group seals into wasm->wasm edges and stays sealed',
   t.end();
 });
 
+// Direct static links are on by default, so "off" is the explicit opt-out
+// and not an unset variable: leaving JVM_WASM_DIRECT_STATIC_LINK out of the
+// environment now selects the enabled path. This test owns the opt-out, so
+// it states it.
 test('the seal is off with direct static links off, and the group still runs right', async (t) => {
   withEnv(t, {
     JVM_WASM_JIT: '1',
     JVM_WASM_STRUCTURED: '1',
     JVM_WASM_JIT_WARMUP: '1',
-    JVM_WASM_DIRECT_STATIC_LINK: undefined,
+    JVM_WASM_DIRECT_STATIC_LINK: '0',
   });
   const classpath = compileJavaFixture(t, 'GroupDrive', SOURCE);
   const interpreter = await bootJvm(classpath, { jit: { enabled: false } });

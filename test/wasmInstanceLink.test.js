@@ -49,6 +49,13 @@ async function makeHarness(t, className, source, extraEnv = {}) {
     JVM_WASM_JIT: '1',
     JVM_WASM_CHECKCAST: '1',
     JVM_DISABLE_WASM_LATE_INSTANCE_TARGETS: '0',
+    // Most of this file is about the generic dispatch import's own recovery
+    // protocol -- late-target installation, the write-summary guard, and the
+    // pre-side-effect deopt -- which only runs when the site keeps that
+    // import on the fast path. Pin the configuration those assertions
+    // describe; the tests that are about the direct link pass '1' below, and
+    // wasmDirectInstanceLinkContract covers the enabled path's own recovery.
+    JVM_WASM_DIRECT_INSTANCE_LINK: '0',
     ...extraEnv,
   });
   const classpath = compileJavaFixture(t, className, source);

@@ -33,7 +33,8 @@ const {
   arrayLoadImportName,
   Unsupported, blockedNames, NestedDeopt, isGuestThrow, sig, assembleModule,
   liveExceptionRanges,
-  maxImpls, NPE, AIOOBE, sealedNeverExits,
+  maxImpls, NPE, AIOOBE, sealedNeverExits, callWasmRun,
+  directInstanceLinkCalleeEligible, identityInstanceParams,
 } = require('./wasmShared');
 const WasmLinker = require('./WasmLinker');
 const monoArray = require('./monoArray');
@@ -611,6 +612,7 @@ class StructuredWasmCompiler {
       deoptableCalls: this.deoptableSites.size + (this.staticInitializationGuards?.size || 0),
       slotSites: this.linkSlotSites.size,
       directLinks: this.directLinks || 0,
+      directStaticLinks: this.directStaticLinks || 0,
       // Normal-flow coverage gap for compile()'s tier preference:
       // instruction-bearing items in DEMOTED tree blocks (counted like the
       // dispatcher's uncoveredItems). Inline guard-miss deopt stubs are
@@ -631,6 +633,10 @@ class StructuredWasmCompiler {
       // grew, and recompiles only when a speculated cone actually changed.
       speculations,
       specSites: [...(specSites || []), ...(this.linkSpecSites || [])],
+      // The inline-derived half alone: unlike the direct-link half it has no
+      // in-wasm flag, so it is what keeps a module out of the static link
+      // paths. See hasUncheckedSpeculation.
+      inlineSpecSites: specSites || [],
       specEpoch: this.jvm.classEpoch || 0,
       deoptStubCount: this.deoptBlocks.size,
       arrayCacheCount: this.arrayCaches.size,
@@ -2066,6 +2072,13 @@ class StructuredWasmCompiler {
           return p.slot === at && p.t === descToWasm(params[i]);
         });
       if (identity) {
+        // Which of the two non-late shapes this site got is otherwise
+        // invisible: a bridged never-exits call records the same binding,
+        // with the same classification and the same lateBound:false. A test
+        // (or census) that cannot tell them apart cannot tell that a direct
+        // link happened at all, so state it on the binding.
+        binding.direct = true;
+        this.directStaticLinks = (this.directStaticLinks || 0) + 1;
         return {
           idx: this.addImport(`dcall_${key}`.replace(/[^\w]/g, '_'), wParams,
             ret === 'V' ? [T.i32] : [T.i32, descToWasm(ret)],
@@ -2106,7 +2119,7 @@ class StructuredWasmCompiler {
         meta.box.ret = undefined;
         let status;
         try {
-          status = mod.run(...full);
+          status = callWasmRun(mod.run, full);
         } finally {
           meta.box.frame = savedFrame;
         }
@@ -2328,32 +2341,15 @@ class StructuredWasmCompiler {
       const st = targets.length === 1 ? targets[0] : null;
       const calleeMod = st && (st.callee || st);
       const calleeMeta = calleeMod && calleeMod.meta;
-      // A guard-elided speculative callee can be raw-linked only through the
-      // class-set guard: directClasses is a closed set verified against the
-      // callee's baked picks at link time (revalidate now), and any class
-      // loaded later misses the guard into the generic path. invokespecial's
-      // bare null check admits future receiver classes, so it keeps the
-      // bridge for speculative callees.
-      const speculative = calleeMeta &&
-        calleeMeta.specSites && calleeMeta.specSites.length > 0;
-      const eligible = calleeMeta && calleeMeta.fullyCompiled &&
-        !st.synchronized &&
-        !calleeMeta.boxedCount && !calleeMeta.deoptableCalls &&
-        !calleeMeta.usedEh && calleeMeta.runv && !st.linkVetoed &&
-        (!speculative ||
-          (!direct && this.wasmJit.revalidateNestedCallee(st)));
-      let identity = false;
-      if (eligible) {
-        identity = calleeMeta.paramSlots.length === params.length + 1 &&
-          calleeMeta.paramSlots.every((p, i) => {
-            if (i === 0) return p.slot === 0 && p.t === T.ref;
-            let at = 1;
-            for (let k = 0; k < i - 1; k++) {
-              at += (params[k] === 'J' || params[k] === 'D') ? 2 : 1;
-            }
-            return p.slot === at && p.t === descToWasm(params[i - 1]);
-          });
-      }
+      // One contract, stated once in wasmShared, so the two backends cannot
+      // drift: see directInstanceLinkCalleeEligible. A guard-elided
+      // speculative callee is raw-linked only behind the class-set guard
+      // below -- directClasses is closed and verified at link time, and any
+      // class loaded later misses it into the generic path -- so
+      // invokespecial, whose only guard is non-null, keeps the bridge.
+      const eligible = directInstanceLinkCalleeEligible(
+        st, !!direct, (target) => this.wasmJit.revalidateNestedCallee(target));
+      const identity = eligible && identityInstanceParams(calleeMeta, params);
       if (identity) {
         const directIdx = this.addImport(
           `dcall_${key}`.replace(/[^\w]/g, '_'), wParams,
@@ -2472,7 +2468,7 @@ class StructuredWasmCompiler {
       status = calleeSt.synchronized
         ? this.wasmJit.runSynchronizedInstance(calleeMod, frame, full,
           javaArgs, argPosBySlot)
-        : calleeMod.run(...full);
+        : callWasmRun(calleeMod.run, full);
     } catch (err) {
       if (partial && err instanceof NestedDeopt) {
         if (this.wasmJit.debug) {
