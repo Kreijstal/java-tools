@@ -1,0 +1,14 @@
+{
+  "sourceCommit": "00d399b875f305b61b4045562c4c8db959c6789e",
+  "command": "npm run build:bundle",
+  "files": {
+    "106.jvm-debug.js": "e2ccca52f08f646ab9a94510c1cdf7bbc7a4c9462f1e80aa15e6ef8858bf34ae",
+    "106.jvm-debug.js.LICENSE.txt": "25a11bc271386fe61dc10ff6938918ea8b2388747230ca6173bd6087c176881e",
+    "868.jvm-debug.js": "f899a0f56ec09819f0a33e57f446115e00f9a91833e3bc59a3fae592162bc0e8",
+    "jvm-compile-worker.js": "6f7d39c8c0e41ada3d99fe8e550f822f066e91b5c73e3235c94b9e0b6de9f7c1",
+    "jvm-compile-worker.js.LICENSE.txt": "662701bf402cc0db75299d925f17e3d3b4101f2d99c95b7b5605584c0e821c3c",
+    "jvm-debug.js": "7d506e27526848d56f73565648733fcf44f1cf41443229fb397e5cf79c54f70a",
+    "jvm-debug.js.LICENSE.txt": "662701bf402cc0db75299d925f17e3d3b4101f2d99c95b7b5605584c0e821c3c",
+    "jvm-debug.js.map": "96c3e5ff7a697a75ea79603e8640e79ca9d8498fd89a2f0d31f3648bfd883107"
+  }
+}
