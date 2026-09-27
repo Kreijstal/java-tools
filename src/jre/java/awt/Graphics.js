@@ -656,8 +656,12 @@ module.exports = {
             if (!(target._pixels instanceof Int32Array) || target._pixels.length !== count) {
               target._pixels = new Int32Array(count);
             }
-            if (pixels.length === count && typeof target._pixels.set === 'function') {
+            if (pixels.length === count) {
               target._pixels.set(pixels);
+            } else if (pixels instanceof Int32Array || pixels instanceof Uint32Array) {
+              // Raster storage may include padding or a trailing sentinel.
+              // Copy only visible pixels while retaining an independent frame.
+              target._pixels.set(pixels.subarray(0, count));
             } else {
               for (let index = 0; index < count; index += 1) {
                 target._pixels[index] = pixels[index] | 0;
