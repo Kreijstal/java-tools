@@ -258,3 +258,11 @@ in tests, and nothing outside this repository is expected to set them.
 | `JVM_WASM_TRACE_ARRAYS_TO` | jit/wasmRuntimeImports.js | yes |
 | `JVM_WASM_TRACE_COMPILE_ERRORS` | jit/WasmJit.js | no |
 | `JVM_WASM_TRACE_RESUME` | jit/WasmJit.js | yes |
+
+`jit.wasm.refusePostMainCompiles` is an optional boolean (default false, or
+`JVM_JIT_REFUSE_POST_MAIN_WASM=1` when omitted). After guest startup it refuses
+all Wasm compilation entry paths, including callee links and recompilation.
+Prepared modules remain usable; missing modules use existing execution fallbacks.
+Preparation must supply the working set before enabling this policy: refusal alone
+does not guarantee frame performance. The Wasm census reports `executionOnly`
+only when this enforcement is enabled, not for a warmup-only freeze.

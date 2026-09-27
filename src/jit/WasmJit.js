@@ -2428,8 +2428,12 @@ class WasmJit {
     // is to preserve working tiers through the migration. This exists so the
     // contract can be tested, and so the cost of honouring it is measurable
     // before it is made the default.
-    this.refusePostMainCompiles =
-      env.JVM_JIT_REFUSE_POST_MAIN_WASM === '1';
+    if (wasmOptions.refusePostMainCompiles !== undefined &&
+        typeof wasmOptions.refusePostMainCompiles !== 'boolean') {
+      throw new TypeError('wasm.refusePostMainCompiles must be a boolean');
+    }
+    this.refusePostMainCompiles = wasmOptions.refusePostMainCompiles ??
+      (env.JVM_JIT_REFUSE_POST_MAIN_WASM === '1');
     this.debug = env.JVM_DEBUG_WASMJIT === '1';
     this.traceMethodPattern = env.JVM_TRACE_WASM_METHOD || '';
     this.traceExitsOnly = env.JVM_TRACE_WASM_EXITS_ONLY === '1';
@@ -2744,10 +2748,8 @@ class WasmJit {
     return {
       enforcing: this.refusePostMainCompiles,
       frozen: this.compilationFrozen,
-      // Whether the freeze is the mode in force, so a census that reports no
-      // post-main Wasm compilation says which of the two reasons applies:
-      // nothing asked, or the tier was switched off after preparation.
-      executionOnly: this.compilationFrozen && !this.executionOnlyDeclined,
+      // A warmup freeze alone still permits synchronous callee compilation.
+      executionOnly: this.refusePostMainCompiles && !this.executionOnlyDeclined,
       compiled: Object.fromEntries(this.postMainCompilesByEntry),
       refused: Object.fromEntries(this.postMainRefusedByEntry),
     };
