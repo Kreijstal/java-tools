@@ -68,7 +68,7 @@ const {
   denseSlotFor, readField, writeField,
 } = require('../core/objectModel');
 const {
-  addMathImport, addSystemImport, addArrayFillImport, addNewArrayImport, addANewArrayImport,
+  addMathImport, addSystemImport, addArraysImport, addNewArrayImport, addANewArrayImport,
   addNewImport, addTypedArrayStoreImports, arrayTracer,
   addI32ArrayLoadImports, addStringConstantImport, addStringCallImport,
 } = require('./wasmRuntimeImports');
@@ -1910,7 +1910,7 @@ class MethodTranslator {
         continue;
       }
       if (op === 'invokestatic') {
-        const call = addArrayFillImport(this, this.jvm, ins);
+        const call = addArraysImport(this, this.jvm, ins);
         if (call?.initializationIdx != null) initializationGuards.add(call.initializationIdx);
       }
       if (op !== 'getstatic' && op !== 'putstatic') continue;
@@ -2119,7 +2119,7 @@ class MethodTranslator {
         } catch (err) {
           if (!(err instanceof Unsupported)) throw err;
           try {
-            bound = addArrayFillImport(this, this.jvm, ins) || addSystemImport(this, this.jvm, ins);
+            bound = addArraysImport(this, this.jvm, ins) || addSystemImport(this, this.jvm, ins);
             if (bound.writes === null) writes = null;
           } catch (err2) {
             if (!(err2 instanceof Unsupported)) throw err2;

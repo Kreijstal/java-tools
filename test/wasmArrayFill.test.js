@@ -88,12 +88,12 @@ for (const structured of [false, true]) {
   });
 }
 
-test('range-fill bridge admits only the tested static signature', t => {
-  const {addArrayFillImport} = require('../src/jit/wasmRuntimeImports');
+test('Arrays bridge rejects untested static signatures', t => {
+  const {addArraysImport} = require('../src/jit/wasmRuntimeImports');
   const registry = {addImport() {throw new Error('unexpected import');}};
   for (const [owner, name, descriptor] of [['GuestArrays', 'fill', '([IIII)V'],
     ['java/util/Arrays', 'fill', '([II)V'], ['java/util/Arrays', 'sort', '([I)V']]) {
-    t.equal(addArrayFillImport(registry, {}, {arg: ['Method', owner, [name, descriptor]]}), null);
+    t.equal(addArraysImport(registry, {}, {arg: ['Method', owner, [name, descriptor]]}), null);
   }
   t.end();
 });

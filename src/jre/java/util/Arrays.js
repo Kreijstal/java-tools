@@ -7,9 +7,44 @@ function javaString(value) {
   return String(value);
 }
 
+// Compare byte contents without copying or retaining backing buffers. Aligned
+// typed views admit four-byte comparisons; ordinary or unaligned arrays keep
+// the byte path. Equality is independent of the host byte order.
+function byteArraysEqual(a, b) {
+  if (a === b) return 1;
+  if (a == null || b == null || a.length !== b.length) return 0;
+  let i = 0;
+  if (ArrayBuffer.isView(a) && ArrayBuffer.isView(b) &&
+      a.BYTES_PER_ELEMENT === 1 && b.BYTES_PER_ELEMENT === 1 &&
+      (a.byteOffset & 3) === 0 && (b.byteOffset & 3) === 0) {
+    const count = Math.floor(a.length / 4);
+    const left = new Uint32Array(a.buffer, a.byteOffset, count);
+    const right = new Uint32Array(b.buffer, b.byteOffset, count);
+    for (let word = 0; word < count; word++) {
+      if (left[word] !== right[word]) return 0;
+    }
+    i = count * 4;
+  }
+  for (; i < a.length; i++) {
+    if ((a[i] & 255) !== (b[i] & 255)) return 0;
+  }
+  return 1;
+}
+
+function intArraysEqual(a, b) {
+  if (a === b) return 1;
+  if (a == null || b == null || a.length !== b.length) return 0;
+  for (let i = 0; i < a.length; i++) {
+    if ((a[i] | 0) !== (b[i] | 0)) return 0;
+  }
+  return 1;
+}
+
 module.exports = {
   methods: {},
   staticMethods: {
+    'equals([I[I)Z': (jvm, obj, args) => intArraysEqual(args[0], args[1]),
+    'equals([B[B)Z': (jvm, obj, args) => byteArraysEqual(args[0], args[1]),
     'sort([I)V': (jvm, obj, args) => {
       const array = args[0];
       if (array && typeof array.sort === 'function') {

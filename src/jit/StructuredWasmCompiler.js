@@ -40,7 +40,7 @@ const WasmLinker = require('./WasmLinker');
 const monoArray = require('./monoArray');
 const {
   addStringConstantImport, addStringCallImport, addRuntimeImports, pushImportFor, addArrayImports, addFieldImport, addMathImport,
-  addSystemImport, addArrayFillImport, addNewArrayImport, addANewArrayImport, addNewImport,
+  addSystemImport, addArraysImport, addNewArrayImport, addANewArrayImport, addNewImport,
 } = require('./wasmRuntimeImports');
 const { inlineCalls, GUARD_OWNER } = require('./wasmInline');
 const { runtimeClassName } = require('../instructions/object');
@@ -1196,7 +1196,7 @@ class StructuredWasmCompiler {
         continue;
       }
       if (node.op === 'invokestatic') {
-        const call = addArrayFillImport(this, this.jvm, {arg: node.imm});
+        const call = addArraysImport(this, this.jvm, {arg: node.imm});
         if (call?.initializationIdx != null) initializationGuards.add(call.initializationIdx);
       }
       if (node.op !== 'getstatic' && node.op !== 'putstatic') continue;
@@ -2078,7 +2078,7 @@ class StructuredWasmCompiler {
     const [, className, [name, descriptor]] = node.imm;
     if (className === 'java/lang/Math') return addMathImport(this, { arg: node.imm });
     if (className === 'java/lang/System') return addSystemImport(this, this.jvm, { arg: node.imm });
-    const fill = addArrayFillImport(this, this.jvm, {arg: node.imm});
+    const fill = addArraysImport(this, this.jvm, {arg: node.imm});
     if (fill) return fill;
     const writes = this.wasmJit
       ? this.wasmJit.staticWriteSummary(className, name, descriptor)

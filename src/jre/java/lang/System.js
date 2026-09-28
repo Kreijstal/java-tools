@@ -64,29 +64,7 @@ module.exports = {
     },
     'gc()V': () => {},
     'runFinalization()V': () => {},
-    'arraycopy(Ljava/lang/Object;ILjava/lang/Object;II)V': withThrows((jvm, _, args) => {
-      const [src, srcPos, dest, destPos, length] = args;
-      if (src === null || dest === null) {
-        throw {
-          type: 'java/lang/NullPointerException'
-        };
-      }
-      if (srcPos < 0 || destPos < 0 || length < 0 || srcPos + length > src.length || destPos + length > dest.length) {
-        throw {
-          type: 'java/lang/ArrayIndexOutOfBoundsException'
-        };
-      }
-      if (src === dest) {
-        const srcCopy = [...src];
-        for (let i = 0; i < length; i++) {
-          dest[destPos + i] = srcCopy[srcPos + i];
-        }
-      } else {
-        for (let i = 0; i < length; i++) {
-          dest[destPos + i] = src[srcPos + i];
-        }
-      }
-    }, ['java/lang/NullPointerException', 'java/lang/ArrayIndexOutOfBoundsException']),
+    'arraycopy(Ljava/lang/Object;ILjava/lang/Object;II)V': require('../../arrayCopy'),
     'getProperty(Ljava/lang/String;)Ljava/lang/String;': (jvm, obj, args) => {
       const key = javaString(args[0]);
       const value = module.exports.staticFields.get('props').get(key);

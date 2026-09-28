@@ -591,8 +591,8 @@ function addSystemImport(reg, jvm, ins) {
   const initializationIdx = addNativeInitializationGuard(reg, jvm, owner);
   const params = [T.ref, T.i32, T.ref, T.i32, T.i32];
   return {params, partial:false, writes:null, initializationIdx,
-    idx:reg.addImport('sys_arraycopy', params, [], (src, srcPos, dst, dstPos, len) =>
-      native(jvm, null, [src, srcPos, dst, dstPos, len]))};
+    idx:reg.addImport('sys_arraycopy', params, [], native.jvmPositionalBody ||
+      ((src, srcPos, dst, dstPos, len) => native(jvm, null, [src, srcPos, dst, dstPos, len])))};
 }
 
 // Shared by the explicitly admitted synchronous bulk natives. Checking at
@@ -609,10 +609,21 @@ function addNativeInitializationGuard(reg, jvm, owner) {
 
 // Range fill mutates array elements, never guest fields or array identity.
 // Keep the JRE's validation order and all-or-nothing invalid-range behavior.
+// Primitive equality reads only array contents and returns a primitive boolean.
 // Other overloads retain ordinary linking until their native contract is tested.
-function addArrayFillImport(reg, jvm, ins) {
+function addArraysImport(reg, jvm, ins) {
   const [, owner, [name, descriptor]] = ins.arg;
-  if (owner !== 'java/util/Arrays' || name !== 'fill' || descriptor !== '([IIII)V') return null;
+  if (owner !== 'java/util/Arrays') return null;
+  if (name === 'equals' && (descriptor === '([B[B)Z' || descriptor === '([I[I)Z')) {
+    const native = jvm.jre[owner]?.staticMethods?.[name + descriptor];
+    if (typeof native !== 'function') throw new Unsupported('Arrays.equals native unavailable');
+    const params = [T.ref, T.ref];
+    return {params, partial: false, writes: new Set(),
+      initializationIdx: addNativeInitializationGuard(reg, jvm, owner),
+      idx: reg.addImport(descriptor === '([B[B)Z' ? 'arrays_equals_byte' : 'arrays_equals_int', params, [T.i32], (left, right) =>
+        native(jvm, null, [left, right]))};
+  }
+  if (name !== 'fill' || descriptor !== '([IIII)V') return null;
   const native = jvm.jre[owner]?.staticMethods?.[name + descriptor];
   if (typeof native !== 'function') throw new Unsupported('Arrays.fill native unavailable');
   const params = [T.ref, T.i32, T.i32, T.i32];
@@ -664,7 +675,7 @@ function addStringConstantImport(reg, jvm, literal, op) {
 module.exports = {
   addStringConstantImport,
   addStringCallImport,
-  addArrayFillImport,
+  addArraysImport,
   arrayTracer,
   addI32ArrayLoadImports,
   addRuntimeImports,
