@@ -436,3 +436,46 @@ Prepared modules remain usable; missing modules use existing execution fallbacks
 Preparation must supply the working set before enabling this policy: refusal alone
 does not guarantee frame performance. The Wasm census reports `executionOnly`
 only when this enforcement is enabled, not for a warmup-only freeze.
+
+
+`jit.structuredExplicitFrameSpills` defaults to `false` (experimental). Framed
+continuation and adaptive bodies pass local values and a captured slot layout
+to shared materialization helpers instead of creating nested spill functions
+on every entry. Cold call suspension retains the existing completion protocol.
+This option preserves frame locals, operands and resume PCs and is disabled
+when hot call graph regions are enabled. It does not eliminate unrelated
+closures or change restoring-body selection. Validate generated-code size,
+allocation cost and sustained playback before enabling it for a workload.
+
+`jit.structuredSharedFieldAccess` defaults to `false` (experimental). For
+instance fields with known dense slots, generated reads and writes call shared
+storage helpers instead of repeating dense/named/fallback branches. Receiver
+guards, exception materialization, cache invalidation, and compile-time layout
+constants are preserved. This reduces generated code but adds helper calls;
+validate both code size and constrained gameplay before enabling it.
+
+`jit.structuredSharedFieldAccessMinCodeItems` optionally restricts that experiment
+to methods with at least this many code items. Nonnegative safe integers are
+accepted; omitted or invalid values use zero (all sizes). The threshold includes
+its boundary and has no effect unless shared field access is enabled.
+
+`jit.fuseStructuredResumeDispatch` defaults to `false` (experimental). Canonical
+ordinary adaptive methods with a baseline resume companion combine fresh-entry
+selection into one dispatcher. Stored continuations still use the original
+validation and completion wrapper. Worker installation rebuilds the same
+dispatcher; `profileResumeDispatch` retains the diagnostic routing and counters.
+This changes dispatch overhead only and requires constrained performance testing.
+
+`jit.structuredSharedFramedMaterializer` defaults to `false` (experimental).
+Framed continuation/adaptive entries with multiple materialization arities share
+one helper closure. The spill callback and all frame locals, operand order and
+resume PCs are preserved. A rest-operand array is allocated only when the helper
+is called. Direct/restoring expansion is unchanged. Validate allocation churn
+and constrained gameplay before enabling this option.
+
+`jit.wasm.reuseNestedArguments` defaults to `false` (experimental). Structured
+Wasm-to-JavaScript trampolines reuse one argument buffer per live callee module.
+Recursive entries use temporary buffers; every exit clears all argument slots.
+Module metadata keys are weak, so obsolete modules are not retained by the pool.
+This does not reuse live or suspended guest frames. Measure allocation churn
+and gameplay before enabling it.

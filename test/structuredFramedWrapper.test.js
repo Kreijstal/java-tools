@@ -3,7 +3,7 @@ const test = require('tape');
 const {structuredWrappers: {wrapFramedStructuredBody}} = require('../src/jit/JvmSsaBlockRenderer');
 const {STRUCTURED_CONTINUATION: key} = require('../src/core/constants');
 
-test('canonical framed entry preserves adaptive arguments and continuation ownership', t => {
+for (const fused of [false, true]) test('canonical framed entry preserves adaptive arguments and continuation ownership (fused=' + fused + ')', t => {
   const frame = {pc: 0, stack: {itemCount: 2}}, thread = {callStack: {peek: () => frame, pop: () => { pops++; }}};
   let pops = 0, adaptiveCalls = 0, nextCalls = 0, returns = 0;
   const helpers = {needsBytecodeChecks: () => false, skipJitOnce: () => { skipped++; },
@@ -11,10 +11,21 @@ test('canonical framed entry preserves adaptive arguments and continuation owner
   let skipped = 0;
   const value = {}, state = {guardedStaticBooleanStateMatches: () => true,
     fieldBackedArrayStateMatches: () => true, captureFieldBackedArrayState: () => null};
-  const body = wrapFramedStructuredBody(() => { throw new Error('unexpected new generator'); }, state, {
+  let body = wrapFramedStructuredBody(() => { throw new Error('unexpected new generator'); }, state, {
     itemCount: 20, ordinaryAdaptiveCanonical: true,
     adaptivePositionalBody: (...args) => { adaptiveCalls++; t.deepEqual(args, [frame, thread, helpers, false, false], 'adaptive argument protocol'); return value; },
   });
+  if (fused) {
+    const {JVM} = require('../src/core/jvm');
+    const {attachStructuredContinuationHelpers} = require('../src/jit/JvmSsaBlockRenderer').structuredWrappers;
+    const adaptive = (...args) => { adaptiveCalls++; t.deepEqual(args, [frame, thread, helpers, false, false], 'fused adaptive argument protocol'); return value; };
+    body.jvmAdaptivePositionalBody = adaptive;
+    body.jvmStructuredWrapperShape = {useContinuations:true, ordinaryAdaptive:true, ordinaryAdaptiveCanonical:true};
+    attachStructuredContinuationHelpers(body, function* () {});
+    body = new JVM({jit:{compileWorker:false,fuseStructuredResumeDispatch:true}}).jit.buildResumeDispatcher(
+      body, () => {throw new Error('unexpected baseline entry');}, {});
+    t.ok(body.jvmFusedStructuredResumeDispatch, 'combined dispatcher selected');
+  }
   t.equal(body(frame, thread, helpers, false), value, 'fresh entry returns adaptive result unchanged');
   const iterator = {next: () => { nextCalls++; return {done: false, value: {structuredResumePc: 3}}; }, return: () => { returns++; }};
   frame.pc = 3; frame[key] = {iterator, pc: 3, framelessEntry: true};

@@ -48,3 +48,22 @@ test('bulk-copy Wasm bridge preserves JRE overrides and shared-buffer boundaries
  t.deepEqual([...buffer],expected,'shared-buffer bulk copy leaves all surrounding bytes intact');
  t.end();
 });
+
+test('reference self-copies preserve exact values for every overlap direction',t=>{
+ const refs=[{},{}];let cases=0;
+ for(const from of [0,1,4,7,8])for(const to of [0,1,4,7,8])for(const length of [0,1,2,4,8]) {
+  const values=[refs[0],null,refs[1],undefined,-0,NaN,3,refs[0]],snapshot=values.slice(),expected=values.slice();
+  const valid=from+length<=values.length&&to+length<=values.length;
+  if(valid)for(let i=0;i<length;i++)expected[to+i]=snapshot[from+i];
+  let error;try{copy({},null,[values,from,values,to,length]);}catch(e){error=e;}
+  if(valid)t.equal(error,undefined,'valid copy completes');
+  else t.equal(error?.type,'java/lang/ArrayIndexOutOfBoundsException','invalid copy fails before writes');
+  t.ok(values.every((v,i)=>Object.is(v,expected[i])),'snapshot values, NaN, signed zero and identities preserved');
+  cases++;
+ }
+ t.equal(cases,125,'all overlap and bounds cases covered');
+ const source=new Int32Array([7,11,19]),target=new Int32Array([1,2,3,4,5]);
+ copy({},null,[source,0,target,1,3]);
+ t.deepEqual([...target],[1,7,11,19,5],'whole typed source preserves destination prefix and tail');
+ t.end();
+});

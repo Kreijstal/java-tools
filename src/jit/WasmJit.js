@@ -2452,6 +2452,8 @@ class WasmJit {
     // directStaticLink, directInstanceLink, checkcast }. An option that is
     // set wins over its environment variable.
     const wasmOptions = (jvm && jvm.jitOptions && jvm.jitOptions.wasm) || {};
+    this.nestedArgumentBuffers = wasmOptions.reuseNestedArguments === true
+      ? new (require('./NestedArgumentBuffers'))() : null;
     const heapVersionBytes = wasmOptions.parameterHeapSpecializationMaxBytes ?? 0;
     if (!Number.isSafeInteger(heapVersionBytes) || heapVersionBytes < 0) {
       throw new TypeError('wasm.parameterHeapSpecializationMaxBytes must be a nonnegative safe integer');

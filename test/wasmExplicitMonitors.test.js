@@ -15,7 +15,7 @@ public class ExplicitMonitors {
   }
   static int caller(Object lock, int[] values) { return 9 + read(lock, values); }
 }`);
-  const j = new JVM({classpath, jit: {compileWorker: false, wasmStructured: true}});
+  const j = new JVM({classpath, jit: {compileWorker: false, wasmStructured: true, wasm: {reuseNestedArguments:true}}});
   await j.preloadClasspathClasses();
   j.classes.ExplicitMonitors.staticFields.set('calls:I', 0);
   j._setClassInitializationState('ExplicitMonitors', 'INITIALIZED');
@@ -95,7 +95,7 @@ public class ExplicitMonitors {
 });
 
 test('explicit monitor continuation preserves operands beneath the lock', async t => {
-  const j = new JVM({jit: {compileWorker: false, wasmStructured: true}}), w = j.jit.wasmJit;
+  const j = new JVM({jit: {compileWorker: false, wasmStructured: true, wasm: {reuseNestedArguments:true}}}), w = j.jit.wasmJit;
   const method = {name: 'under', descriptor: '(Ljava/lang/Object;)I', flags: ['static'],
     attributes: [{type: 'code', code: {localsSize: 1, stackSize: 2, exceptionTable: [],
       codeItems: ['iconst_5', 'aload_0', 'monitorenter', 'aload_0', 'monitorexit', 'ireturn']

@@ -796,6 +796,7 @@ class JitCompiler {
     // Diagnostic: per-method tally of fast-tier versus resume-body entries.
     this.resumeDispatchStats = options.profileResumeDispatch === true
       ? new Map() : null;
+    this.fuseStructuredResumeDispatch = options.fuseStructuredResumeDispatch === true;
     this.asyncCallCensus = options.asyncCallCensus === true ||
       Boolean(typeof process !== "undefined" && process.env &&
         process.env.JVM_JIT_ASYNC_CALL_CENSUS === "1") ? new Map() : null;
@@ -6089,6 +6090,9 @@ class JitCompiler {
     const statsKey = stats
       ? `${method?.className || this.jvm.findClassNameForMethod?.(method) ||
         "unknown"}.${method?.name || "?"}${method?.descriptor || ""}` : null;
+    const fused = !stats && this.fuseStructuredResumeDispatch
+      ? require("./JvmSsaBlockRenderer").structuredWrappers
+        .buildOrdinaryAdaptiveResumeDispatcher(fast, resume) : null;
     const dispatcher = stats ? function (
       frame, thread, helpers, initialBytecodeChecks, framelessEntry,
     ) {
@@ -6115,7 +6119,7 @@ class JitCompiler {
         : outcome && outcome.returned ? "returned" : "value";
       row.outcomes[key] = (row.outcomes[key] || 0) + 1;
       return outcome;
-    } : function (
+    } : fused || function (
       frame, thread, helpers, initialBytecodeChecks, framelessEntry,
     ) {
       return frame.pc === 0 || fast.jvmHasStructuredContinuation?.(frame) ||
@@ -6124,6 +6128,7 @@ class JitCompiler {
         : resume(frame, thread, helpers, initialBytecodeChecks);
     };
     for (const key of Object.keys(fast)) dispatcher[key] = fast[key];
+    dispatcher.jvmFusedStructuredResumeDispatch = Boolean(fused);
     dispatcher.jvmSynchronous = true;
     dispatcher.jvmResumeBody = true;
     dispatcher.jvmScalarResumeBody = resume.jvmScalarLoop === true;

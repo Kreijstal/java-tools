@@ -611,6 +611,13 @@ class JvmSsaBlockRenderer {
     this.compactColdCallSiteCount = 0;
     this.guardVoidCallCompletion = options.structuredGuardVoidCallCompletion === true;
     this.compactRestoringVoidCalls = options.structuredCompactRestoringVoidCalls === true;
+    this.explicitFrameSpills = options.structuredExplicitFrameSpills === true;
+    this.sharedFramedMaterializer = options.structuredSharedFramedMaterializer === true;
+    this.sharedFieldAccess = options.structuredSharedFieldAccess === true;
+    this.sharedFieldAccessMinCodeItems =
+      Number.isSafeInteger(options.structuredSharedFieldAccessMinCodeItems) &&
+      options.structuredSharedFieldAccessMinCodeItems >= 0
+        ? options.structuredSharedFieldAccessMinCodeItems : 0;
     this.compactRestoringValueCalls = options.structuredCompactRestoringValueCalls !== false;
     this.wideCaptureFreeRestoring = options.structuredWideCaptureFreeRestoring === true;
     this.normalPathArrayOptionality = options.normalPathArrayOptionality === true;
@@ -837,6 +844,48 @@ class JvmSsaBlockRenderer {
       entry.every((slot, index) => slot === wanted[index]));
     if (existing !== -1) return existing;
     return this.restoringFrameLayouts.push(wanted) - 1;
+  }
+
+  // Shared framed materialization keeps mutable locals out of per-entry
+  // closures. Values are captured only when an actual spill is required.
+  // The generated receiver guard still owns null-failure materialization.
+  // Pass the compile-time layout explicitly, as the inline emitter does.
+  readDenseOrNamedField(helpers, site, object, slot, key) {
+    return Array.isArray(object.fields) ? object.fields[slot]
+      : object.fields && object.fields[key] !== undefined ? object.fields[key]
+      : helpers.getFieldAtSite(site, object);
+  }
+
+  writeDenseOrNamedField(helpers, site, object, slot, key, value) {
+    if (Array.isArray(object.fields)) object.fields[slot] = value;
+    else if (object.fields) object.fields[key] = value;
+    else helpers.putFieldAtSite(site, object, value);
+  }
+
+  spillFramedSlots(locals, slots, values) {
+    if (!Array.isArray(slots) || !Array.isArray(values) || slots.length !== values.length) {
+      throw new Error("invalid structured SSA framed spill layout");
+    }
+    for (let index = 0; index < slots.length; index += 1) locals[slots[index]] = values[index];
+  }
+
+  materializeFramedSlots(frame, locals, stack, slots, values, pc, operands) {
+    this.spillFramedSlots(locals, slots, values);
+    for (let index = 0; index < operands.length; index += 1) stack[index] = operands[index];
+    stack.length = operands.length;
+    this.jit.materialize(frame, locals, stack, pc);
+  }
+
+  coldCallOrdinarySlots(frame, thread, out, depth, siteId, returnType,
+    resumePc, returnsVoid, operands, belowCount, locals, slots, values) {
+    return this.coldCallOrdinary(frame, thread, out, depth, siteId, returnType,
+      resumePc, returnsVoid, () => this.spillFramedSlots(locals, slots, values), operands, belowCount);
+  }
+
+  coldCallContinuationSlots(frame, thread, out, depth, siteId, returnType,
+    resumePc, returnsVoid, operands, belowCount, locals, slots, values) {
+    return this.coldCallContinuation(frame, thread, out, depth, siteId, returnType,
+      resumePc, returnsVoid, () => this.spillFramedSlots(locals, slots, values), operands, belowCount);
   }
 
   // The id form indexes the table of the JIT that compiled the body, which is
@@ -2937,6 +2986,8 @@ class JvmSsaBlockRenderer {
     const localLoads = new Map();
     const invariantPositionalReceiverSlots = new Map();
     const cacheFieldReads = items.length <= this.fieldReadCacheMaxCodeItems;
+    const shareFieldAccess = this.sharedFieldAccess &&
+      items.length >= this.sharedFieldAccessMinCodeItems;
     for (let index = 0; cacheFieldReads && index < items.length; index += 1) {
       const instruction = items[index]?.instruction;
       if (opOf(instruction) !== "getfield" ||
@@ -5524,7 +5575,9 @@ class JvmSsaBlockRenderer {
             const fieldPlan = this.jit.fieldSites[site];
             const directKey = fieldPlan?.directInstanceKey || null;
             const denseSlot = fieldPlan?.denseSlot;
-            const directRead = Number.isInteger(denseSlot)
+            const directRead = shareFieldAccess && Number.isInteger(denseSlot)
+              ? e`helpers.structuredSsa.readDenseOrNamedField(helpers, ${capturedFieldSite(site)}, ${object}, ${denseSlot}, ${JSON.stringify(directKey)})`
+              : Number.isInteger(denseSlot)
               ? exprConcat(
                 e`(Array.isArray(${object}.fields) ? `,
                 e`${object}.fields[${denseSlot}] : `,
@@ -5611,7 +5664,9 @@ class JvmSsaBlockRenderer {
               {kind: "nullCheck", value: object}),
               ...materializeLines([...stack, object, stored], index, true).map((line) => `  ${line}`),
               st`  helpers.putFieldAtSite(${capturedFieldSite(site)}, ${object}, ${stored});`, blockEnd(""),
-              ...(Number.isInteger(denseSlot) ? [
+              ...(shareFieldAccess && Number.isInteger(denseSlot) ? [
+                st`helpers.structuredSsa.writeDenseOrNamedField(helpers, ${capturedFieldSite(site)}, ${object}, ${denseSlot}, ${JSON.stringify(directKey)}, ${stored});`,
+              ] : Number.isInteger(denseSlot) ? [
                 st`if (Array.isArray(${object}.fields)) {`,
                 st`  ${object}.fields[${denseSlot}] = ${stored};`,
                 stmt(e`} else if (${object}.fields) {`,
@@ -6776,7 +6831,7 @@ class JvmSsaBlockRenderer {
                 stmt(coldCondition),
                 `  ${constDecl(coldState, exprConcat(
                   e`helpers.structuredSsa.coldCallContinuation(`,
-                  helperArguments, e`)`))}`,
+                  helperArguments, e`)`), {frameColdCall: 'coldCallContinuationSlots'})}`,
                 `  ${letDecl(coldStep, e`${coldState}.next()`)}`,
                 st`  while (!${coldStep}.done) {`,
                 stmt(e`    yield ${coldStep}.value;`, {yields: true}),
@@ -6794,7 +6849,7 @@ class JvmSsaBlockRenderer {
                 stmt(coldCondition),
                 `  ${constDecl(coldState, exprConcat(
                   e`helpers.structuredSsa.coldCallOrdinary(`,
-                  helperArguments, e`)`))}`,
+                  helperArguments, e`)`), {frameColdCall: 'coldCallOrdinarySlots'})}`,
                 st`  if (${coldState} !== helpers.structuredSsa.coldContinue) {`,
                 returnStmt("    ", e`${coldState}`),
                 blockEnd("  "),
@@ -11799,7 +11854,28 @@ class JvmSsaBlockRenderer {
     // Unwind markers behave identically to plain materializations in every
     // spill-based output; only the capture-free restoring expansion treats
     // them specially. The release marker is a no-op outside that expansion.
-    const materializeHelperDeclarations = () => [
+    const materializeHelperDeclarations = () => {
+      const sharedNames = [...materializeDepths].map(depth => `ssaMaterialize${depth}`)
+        .concat([...materializeUnwindDepths].map(depth => `ssaMaterializeUnwind${depth}`));
+      if (this.sharedFramedMaterializer && sharedNames.length > 1) {
+        // Framed unwind and ordinary materialization have identical semantics.
+        // Share one closure per entry; its operand array is allocated only on
+        // materialization, rather than allocating one closure for every arity.
+        return [
+          recordStatement(["function ssaMaterializeShared(pc, ...operands) {"],
+            {kind: "materializeHelperHeader", opens: "function", declares: ["pc", "operands"]}),
+          `  ${spillStatement()}`,
+          recordStatement(["  for (let i = 0; i < operands.length; i++) stack[i] = operands[i];"], null),
+          recordStatement(["  stack.length = operands.length;"], null),
+          recordStatement(["  helpers.materialize(frame, locals, stack, pc);"], null),
+          blockEnd(),
+          ...sharedNames.map(name => recordStatement([
+            `const ${name} = ssaMaterializeShared;`], {kind: "materializeHelperHeader"})),
+          ...(materializeUnwindDepths.size ? [recordStatement([
+            "function ssaMaterializeUnwindRelease() {}"], {kind: "materializeHelperHeader"})] : []),
+        ];
+      }
+      return [
       ...[...materializeDepths, ...materializeUnwindDepths]
         .filter((depth, position, all) => all.indexOf(depth) === position)
         .sort((left, right) => left - right)
@@ -11831,7 +11907,8 @@ class JvmSsaBlockRenderer {
       ...(materializeUnwindDepths.size
         ? [recordStatement(["function ssaMaterializeUnwindRelease() {}"],
           {kind: "materializeHelperHeader"})] : []),
-    ];
+      ];
+    };
     const inlineMaterializeCalls = (lines) =>
       lines.flatMap((line) => {
         const record = recordOf(line);
@@ -12389,6 +12466,49 @@ class JvmSsaBlockRenderer {
     // them in its outermost scope -- but each line is still a recorded
     // statement, so a structural pass sees the whole body and not only the
     // part below the prologue.
+    const explicitFrameSpills = this.explicitFrameSpills && !this.jit.hotCallGraphRegions.enabled;
+    const framedSpillLayoutId = explicitFrameSpills
+      ? this.restoringFrameLayouts.push([...spillSlots]) - 1 : -1;
+    const framedSpillLayout = explicitFrameSpills ? capturedLinkRecord(
+      `ssaLinkRestoringLayout${framedSpillLayoutId}`, this.restoringFrameLayouts[framedSpillLayoutId]) : null;
+    const framedSpillArguments = () => exprConcat(e`locals, ${framedSpillLayout}, [`,
+      argumentListExpression(spillSlots.map(slot => immutableEntryLocals.has(slot)
+        ? entryLocalInitialValues.get(slot) : localName(slot))), e`]`);
+    const explicitFrameTree = lines => !explicitFrameSpills ? lines : lines.flatMap(line => {
+      const record = recordOf(line), prefix = indentationOf(line);
+      if (record?.kind === 'materializeRelease') return [];
+      if (record?.kind === 'materialize') return [prefix + stmt(exprConcat(
+        e`helpers.structuredSsa.materializeFramedSlots(frame, locals, stack, ${framedSpillLayout}, [`,
+        argumentListExpression(spillSlots.map(slot => immutableEntryLocals.has(slot)
+          ? entryLocalInitialValues.get(slot) : localName(slot))), e`], ${record.pc}, [`,
+        argumentListExpression(record.operands), e`]);`))];
+      if (record?.kind === 'spill' || record?.kind === 'conditionalSpill') return [prefix + stmt(exprConcat(
+        record.kind === 'conditionalSpill' ? e`if (frame === null) ` : e``,
+        e`helpers.structuredSsa.spillFramedSlots(`, framedSpillArguments(), e`);`))];
+      if (record?.frameColdCall) {
+        // Use the current expression parts, including any SSA substitutions.
+        // A parallel argument expression in metadata would retain stale names
+        // after propagation. Rewrite only our own fixed helper-call literals.
+        let callbacks = 0, callees = 0;
+        const oldCallee = record.frameColdCall.replace(/Slots$/, '');
+        const parts = record.exprParts.map(part => {
+          if (typeof part !== 'string') return part;
+          if (part.includes('spillLocals, ')) { callbacks++; part = part.replace('spillLocals, ', ''); }
+          if (part.includes(`helpers.structuredSsa.${oldCallee}(`)) {
+            callees++; part = part.replace(`helpers.structuredSsa.${oldCallee}(`,
+              `helpers.structuredSsa.${record.frameColdCall}(`);
+          }
+          return part;
+        });
+        if (callbacks !== 1 || callees !== 1 || parts[parts.length - 1] !== ')') {
+          throw new Error('unexpected framed cold-call expression');
+        }
+        parts.pop();
+        return [prefix + constDecl(record.def, exprConcat(new Expr(parts),
+          e`, `, framedSpillArguments(), e`)`))];
+      }
+      return [line];
+    });
     const buildBody = (
       tree, entrySafePointBudget = safePointInitialBudget,
     ) => [sourceDirective(),
@@ -12484,7 +12604,7 @@ class JvmSsaBlockRenderer {
       // The spill helper is one statement carrying a nested function: it is
       // recorded like any other, and a consumer never relocates it because
       // its parts carry an arrow.
-      recordStatement([
+      ...(explicitFrameSpills ? [] : [recordStatement([
         "const spillLocals = () => {",
         ...spillSlots.flatMap((i) => [
           ` locals[${i}] = `,
@@ -12495,8 +12615,8 @@ class JvmSsaBlockRenderer {
         ]),
         " };",
       ], {kind: "spillHelperDeclaration"}),
-      ...materializeHelperDeclarations(),
-      ...declarations, ...tree];
+      ...materializeHelperDeclarations()]),
+      ...declarations, ...explicitFrameTree(tree)];
     // An optional prologue fragment that was not emitted joins as a blank
     // line, so it is recorded as one rather than dropped: the fragment list
     // is a partition of the published source, blank lines included.
@@ -14969,6 +15089,7 @@ class JvmSsaBlockRenderer {
         restoringSpillInlineCost;
       generated.jvmStructuredInlinedRestoringSpills =
         inlinedRestoringSpills;
+      generated.jvmStructuredExplicitFrameSpills = explicitFrameSpills;
       generated.jvmStructuredCaptureFreeRestoringSpills =
         captureFreeRestoringSpills;
       generated.jvmStructuredOutlinedCaptureFreeRestoringSpills =
@@ -15318,12 +15439,34 @@ function attachStructuredContinuationHelpers(generated, generatedBody) {
   generated.toString = () => generatedBody.toString();
 }
 
+// A canonical adaptive entry already knows how to execute an ordinary frame.
+// Combine its fresh-entry selection with the baseline resume dispatcher. Old
+// iterators still enter the original wrapper, which owns their validation and
+// completion protocol (including iterators from a superseded compiled body).
+function buildOrdinaryAdaptiveResumeDispatcher(fast, resume) {
+  const shape = fast.jvmStructuredWrapperShape;
+  if (!shape?.useContinuations || !shape.ordinaryAdaptiveCanonical ||
+      !shape.ordinaryAdaptive || typeof fast.jvmAdaptivePositionalBody !== "function") {
+    return null;
+  }
+  const adaptive = fast.jvmAdaptivePositionalBody;
+  return function structuredAdaptiveResumeDispatch(frame, thread, helpers, initialBytecodeChecks) {
+    if (frame[STRUCTURED_CONTINUATION]) {
+      return fast(frame, thread, helpers, initialBytecodeChecks);
+    }
+    return frame.pc === 0 || fast.jvmStructuredResumePcs?.has(frame.pc) === true
+      ? adaptive(frame, thread, helpers, initialBytecodeChecks, false)
+      : resume(frame, thread, helpers, initialBytecodeChecks);
+  };
+}
+
 module.exports = JvmSsaBlockRenderer;
 module.exports.structuredWrappers = {
   createStructuredSpeculationState,
   wrapAdaptiveStructuredBody,
   wrapFramedStructuredBody,
   attachStructuredContinuationHelpers,
+  buildOrdinaryAdaptiveResumeDispatcher,
 };
 module.exports.unboundGeneratedSsaIdentifiers =
   unboundGeneratedSsaIdentifiers;

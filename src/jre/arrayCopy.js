@@ -37,13 +37,17 @@ function copyRange(src, srcPos, dest, destPos, length) {
       const from = src.byteOffset + srcPos * width;
       const to = dest.byteOffset + destPos * width;
       bytes.copyWithin(to, from, from + length * width);
+    } else if (srcPos === 0 && length === src.length) {
+      dest.set(src, destPos);
     } else dest.set(src.subarray(srcPos, srcPos + length), destPos);
     return;
   }
-  if (src === dest) {
-    const srcCopy = [...src];
-    for (let i = 0; i < length; i++) {
-      dest[destPos + i] = srcCopy[srcPos + i];
+  // Copy overlapping reference-array ranges backwards when the destination
+  // starts inside the source range. This preserves snapshot semantics without
+  // allocating a snapshot of the entire array for a small shift.
+  if (src === dest && destPos > srcPos && destPos < srcPos + length) {
+    for (let i = length - 1; i >= 0; i--) {
+      dest[destPos + i] = src[srcPos + i];
     }
   } else {
     for (let i = 0; i < length; i++) {

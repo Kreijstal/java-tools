@@ -23,7 +23,7 @@ for (const structured of [false, true]) {
         return x.length + y.length;
       }
     }`);
-    const jvm = new JVM({ classpath, jit: { compileWorker: false, wasmStructured: structured } });
+    const jvm = new JVM({ classpath, jit: { compileWorker: false, wasmStructured: structured, wasm: {reuseNestedArguments:true} } });
     await jvm.preloadClasspathClasses();
     jvm.classInitializationState.set('ReferenceReturn', 'INITIALIZED');
     const wasm = jvm.jit.wasmJit;

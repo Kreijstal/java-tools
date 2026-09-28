@@ -6,7 +6,7 @@ const Frame = require('../src/core/frame');
 const Stack = require('../src/core/stack');
 const compileFixture = makeJavaFixtureCompiler('adaptive-partition-');
 
-test('partitioned adaptive entries preserve execution and worker transport', async t => {
+for (const [explicitFrameSpills, sharedMaterializer] of [[false,false],[true,false],[false,true]]) test(`partitioned adaptive entries preserve execution and worker transport (explicit spills ${explicitFrameSpills}, shared materializer ${sharedMaterializer})`, async t => {
   const operations = Array.from({length: 80}, (_, k) =>
     `s = (s * 31) ^ a[(i + ${k}) & 7];`).join('\n');
   const classpath = compileFixture(t, 'AdaptivePartition', `
@@ -16,7 +16,7 @@ public class AdaptivePartition {
     return s;
   }
 }`);
-  const jvm = new JVM({classpath, jit: {compileWorker: false, structuredSsa: true,
+  const jvm = new JVM({classpath, jit: {compileWorker: false, structuredSsa: true, structuredExplicitFrameSpills: explicitFrameSpills, structuredSharedFramedMaterializer: sharedMaterializer,
     ordinaryAdaptiveFramelessPositional: true, structuredLinearPartition: true,
     structuredLinearPartitionUnitBytes: 16384,
     structuredLinearPartitionSegmentBytes: 4096,
@@ -28,10 +28,13 @@ public class AdaptivePartition {
   t.ok(generated, `compiled: ${jvm.jit.structuredSsa.lastRejectionReason}`);
   if (!generated) {t.end();return;}
   t.ok(generated.jvmAdaptivePositionalOrdinary, 'ordinary adaptive entry is selected');
+  if (sharedMaterializer) t.ok(generated.toString().includes('ssaMaterializeShared'), 'shared materializer is emitted');
   t.ok(generated.jvmAdaptivePartitionedSegmentCount > 0, 'the adaptive entry is actually split');
   const rebound = jvm.jit.materializeGeneratedResult(jvm.jit.serializeGeneratedResult(generated), method);
   t.ok(rebound, 'split helpers survive worker transport');
   jvm.jit.structuredSsa.linearPartitionEnabled = false;
+  jvm.jit.structuredSsa.explicitFrameSpills = false;
+  jvm.jit.structuredSsa.sharedFramedMaterializer = false;
   const control = jvm.jit.structuredSsa.compile(method);
   t.equal(control.jvmAdaptivePartitionedSegmentCount, 0, 'control uses the unsplit entry');
   for (const body of [generated, rebound]) {
@@ -74,7 +77,7 @@ public class AdaptivePartition {
   t.end();
 });
 
-test('adaptive partitions preserve the per-call fast-path guard binding', async t => {
+for (const [explicitFrameSpills, sharedMaterializer] of [[false,false],[true,false],[false,true]]) test(`adaptive partitions preserve the per-call fast-path guard binding (explicit spills ${explicitFrameSpills}, shared materializer ${sharedMaterializer})`, async t => {
   const calls = Array.from({length: 40}, (_, i) => `s = child(s) + ${i};`).join('\n');
   const classpath = compileFixture(t, 'PartitionCalls', `
 public class PartitionCalls {
@@ -82,7 +85,7 @@ public class PartitionCalls {
   public static int child(int v) { seen++; return v + 1; }
   public static int run(int n, int s) { for (int i=0; i<n; i++) { ${calls} } return s; }
 }`);
-  const jvm = new JVM({classpath, jit: {compileWorker: false, structuredSsa: true,
+  const jvm = new JVM({classpath, jit: {compileWorker: false, structuredSsa: true, structuredExplicitFrameSpills: explicitFrameSpills, structuredSharedFramedMaterializer: sharedMaterializer,
     ordinaryAdaptiveFramelessPositional: true, compiledCallChains: true,
     ordinaryAdaptiveCallChainSafePointBudget: 10000, structuredLinearPartition: true,
     structuredLinearPartitionUnitBytes: 16384,

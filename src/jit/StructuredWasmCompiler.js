@@ -2606,95 +2606,102 @@ class StructuredWasmCompiler {
     // dispatches inside it below.
     const partial = !meta.fullyCompiled || meta.boxedCount > 0 ||
       meta.deoptableCalls > 0 || meta.usedEh || calleeSt.synchronized;
-    const full = new Array(meta.paramSlots.length + 2);
-    for (let i = 0; i < meta.paramSlots.length; i += 1) {
-      const p = meta.paramSlots[i];
-      const pos = argPosBySlot.get(p.slot);
-      if (pos !== undefined) full[i] = javaArgs[pos];
-      else full[i] = p.t === T.i64 ? 0n : (p.t === T.ref ? null : 0);
-    }
-    full[meta.paramSlots.length] = 0;
-    full[meta.paramSlots.length + 1] = 100_000_000;
-    const savedFrame = meta.box.frame;
-    let frame;
-    if (partial) {
-      calleeSt.nestedCalls = (calleeSt.nestedCalls || 0) + 1;
-      const scratch = scratchFrames.get(calleeSt);
-      if (scratch && !scratch.inUse) {
-        frame = scratch;
-        frame.pc = 0;
-      } else {
-        frame = new Frame(calleeSt.method);
-        frame.className = frameClassName;
-        if (!scratch) scratchFrames.set(calleeSt, frame);
-      }
-      frame.inUse = true;
-    } else {
-      frame = { locals: [] }; // junk sink; this callee never exits
-    }
-    meta.box.frame = frame;
-    meta.box.ret = undefined;
-    let status;
+    const buffers = this.wasmJit.nestedArgumentBuffers;
+    const argumentBuffer = buffers ? buffers.acquire(meta, meta.paramSlots.length + 2) : null;
     try {
-      status = calleeSt.synchronized
-        ? this.wasmJit.runSynchronizedInstance(calleeMod, frame, full,
-          javaArgs, argPosBySlot)
-        : callWasmRun(calleeMod.run, full);
-    } catch (err) {
-      if (partial && err instanceof NestedDeopt) {
-        recordNestedDeopt(calleeSt);
-        if (this.wasmJit.debug) {
-          console.error(`[wasmjit] nested callee ${calleeSt.key} unwound through a nested deopt`
-            + ` (${err.frames.map((f) => `${f.className || '?'}.${f.method && f.method.name}@${f.pc}`).join(' <- ') || 'no frames'})`);
+      const full = argumentBuffer ? argumentBuffer.values
+        : new Array(meta.paramSlots.length + 2);
+      for (let i = 0; i < meta.paramSlots.length; i += 1) {
+        const p = meta.paramSlots[i];
+        const pos = argPosBySlot.get(p.slot);
+        if (pos !== undefined) full[i] = javaArgs[pos];
+        else full[i] = p.t === T.i64 ? 0n : (p.t === T.ref ? null : 0);
+      }
+      full[meta.paramSlots.length] = 0;
+      full[meta.paramSlots.length + 1] = 100_000_000;
+      const savedFrame = meta.box.frame;
+      let frame;
+      if (partial) {
+        calleeSt.nestedCalls = (calleeSt.nestedCalls || 0) + 1;
+        const scratch = scratchFrames.get(calleeSt);
+        if (scratch && !scratch.inUse) {
+          frame = scratch;
+          frame.pc = 0;
+        } else {
+          frame = new Frame(calleeSt.method);
+          frame.className = frameClassName;
+          if (!scratch) scratchFrames.set(calleeSt, frame);
         }
-        err.frames.push(frame);
-        if (frame === scratchFrames.get(calleeSt)) scratchFrames.delete(calleeSt);
-        box.pendingFrames = err.frames;
-        box.deoptFlag = 2;
-        return dummy;
+        frame.inUse = true;
+      } else {
+        frame = { locals: [] }; // junk sink; this callee never exits
       }
-      throw err;
-    } finally {
-      if (partial) frame.inUse = false;
-      meta.box.frame = savedFrame;
-    }
-    if (status === -3) {
-      // The callee caught a guest exception in wasm: its spill import
-      // already wrote the throw-point locals into `frame` (its scratch).
-      // Dispatch inside the callee's own table; a handler match parks the
-      // frame positioned at the handler, no match propagates the exception
-      // to this module's wrap (EH catch or plain unwind).
-      const exn = meta.box.pendingException;
-      meta.box.pendingException = null;
-      if (this.jvm.dispatchExceptionInFrame(frame, exn, meta.box.throwPc)) {
-        if (frame === scratchFrames.get(calleeSt)) scratchFrames.delete(calleeSt);
-        box.pendingFrames = [frame];
-        box.deoptFlag = 2;
-        return dummy;
+      meta.box.frame = frame;
+      meta.box.ret = undefined;
+      let status;
+      try {
+        status = calleeSt.synchronized
+          ? this.wasmJit.runSynchronizedInstance(calleeMod, frame, full,
+            javaArgs, argPosBySlot)
+          : callWasmRun(calleeMod.run, full);
+      } catch (err) {
+        if (partial && err instanceof NestedDeopt) {
+          recordNestedDeopt(calleeSt);
+          if (this.wasmJit.debug) {
+            console.error(`[wasmjit] nested callee ${calleeSt.key} unwound through a nested deopt`
+              + ` (${err.frames.map((f) => `${f.className || '?'}.${f.method && f.method.name}@${f.pc}`).join(' <- ') || 'no frames'})`);
+          }
+          err.frames.push(frame);
+          if (frame === scratchFrames.get(calleeSt)) scratchFrames.delete(calleeSt);
+          box.pendingFrames = err.frames;
+          box.deoptFlag = 2;
+          return dummy;
+        }
+        throw err;
+      } finally {
+        if (partial) frame.inUse = false;
+        meta.box.frame = savedFrame;
       }
-      if (calleeSt.synchronized) this.jvm.exitFrameMonitor(frame);
-      throw exn;
-    }
-    if (status !== -1) {
-      if (!partial) throw new Error(`wasmjit: nested callee exited at ${status}`);
-      if (this.wasmJit.debug) {
+      if (status === -3) {
+        // The callee caught a guest exception in wasm: its spill import
+        // already wrote the throw-point locals into `frame` (its scratch).
+        // Dispatch inside the callee's own table; a handler match parks the
+        // frame positioned at the handler, no match propagates the exception
+        // to this module's wrap (EH catch or plain unwind).
+        const exn = meta.box.pendingException;
+        meta.box.pendingException = null;
+        if (this.jvm.dispatchExceptionInFrame(frame, exn, meta.box.throwPc)) {
+          if (frame === scratchFrames.get(calleeSt)) scratchFrames.delete(calleeSt);
+          box.pendingFrames = [frame];
+          box.deoptFlag = 2;
+          return dummy;
+        }
+        if (calleeSt.synchronized) this.jvm.exitFrameMonitor(frame);
+        throw exn;
+      }
+      if (status !== -1) {
+        if (!partial) throw new Error(`wasmjit: nested callee exited at ${status}`);
+        if (this.wasmJit.debug) {
+          const deeper = meta.box.pendingFrames;
+          console.error(`[wasmjit] nested callee ${calleeSt.key} exited at pc ${status}`
+            + ` (${(meta.demoteReasons && meta.demoteReasons.get(meta.blockOfItem
+              ? meta.blockOfItem.get(status) : undefined)) || 'no demote reason'}`
+            + `${deeper ? `; parked ${deeper.map((f) => `${f.className || '?'}.${f.method && f.method.name}@${f.pc}`).join(' <- ')}` : ''})`);
+        }
+        frame.pc = status;
+        if (frame === scratchFrames.get(calleeSt)) scratchFrames.delete(calleeSt);
+        // the callee's own call-site deopt may have parked deeper frames
         const deeper = meta.box.pendingFrames;
-        console.error(`[wasmjit] nested callee ${calleeSt.key} exited at pc ${status}`
-          + ` (${(meta.demoteReasons && meta.demoteReasons.get(meta.blockOfItem
-            ? meta.blockOfItem.get(status) : undefined)) || 'no demote reason'}`
-          + `${deeper ? `; parked ${deeper.map((f) => `${f.className || '?'}.${f.method && f.method.name}@${f.pc}`).join(' <- ')}` : ''})`);
+        meta.box.pendingFrames = null;
+        box.pendingFrames = deeper ? [...deeper, frame] : [frame];
+        box.deoptFlag = 2;
+        recordNestedDeopt(calleeSt);
+        return dummy;
       }
-      frame.pc = status;
-      if (frame === scratchFrames.get(calleeSt)) scratchFrames.delete(calleeSt);
-      // the callee's own call-site deopt may have parked deeper frames
-      const deeper = meta.box.pendingFrames;
-      meta.box.pendingFrames = null;
-      box.pendingFrames = deeper ? [...deeper, frame] : [frame];
-      box.deoptFlag = 2;
-      recordNestedDeopt(calleeSt);
-      return dummy;
+      return takeWasmReturnValue(meta);
+    } finally {
+      if (argumentBuffer) buffers.release(argumentBuffer);
     }
-    return takeWasmReturnValue(meta);
   }
 
   // Wasm-side check right after a deoptable call: read-and-clear the box

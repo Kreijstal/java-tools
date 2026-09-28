@@ -30,10 +30,13 @@ public class NestedRetirement {
     return sum;
   }
 }`);
-    const j = new JVM({classpath, jit: {compileWorker: false, wasm: {structured}}});
+    const j = new JVM({classpath, jit: {compileWorker: false, wasm: {structured, reuseNestedArguments:true}}});
     await j.preloadClasspathClasses();
     j._setClassInitializationState('NestedRetirement', 'INITIALIZED');
     const w = j.jit.wasmJit;
+    let acquired = 0;
+    const acquire = w.nestedArgumentBuffers.acquire;
+    w.nestedArgumentBuffers.acquire = function (...args) { acquired++; return acquire.apply(this,args); };
     const states = {};
     for (const name of ['step', 'hop', 'drive']) {
       const descriptor = name === 'drive' ? '(LNestedRetirement;[I)I' : '([IIJD)I';
@@ -73,6 +76,7 @@ public class NestedRetirement {
       t.ok(nested.nestedCalls > 0 && nested.nestedCalls <= 257,
         `${name} stops entering its compiled body after retirement (${nested.nestedCalls})`);
     }
+    if (structured) t.ok(acquired > 0, 'real nested exits exercise reusable argument storage');
     t.end();
   });
 }

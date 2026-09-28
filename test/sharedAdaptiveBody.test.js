@@ -12,7 +12,7 @@ test('ordinary adaptive canonical entries build and transport only one execution
     static int sum(int[] values, int n) { int s=0; for(int i=0;i<n;i++) s+=values[i]; return s; }
   }`);
   const jvm = new JVM({ classpath, jit: { compileWorker: false, structuredSsa: true,
-    ordinaryAdaptiveFramelessPositional: true } });
+    fuseStructuredResumeDispatch: true, ordinaryAdaptiveFramelessPositional: true } });
   await jvm.loadClassByName('SharedAdaptive');
   jvm.classInitializationState.set('SharedAdaptive', 'INITIALIZED');
   const method = await jvm.findMethodInHierarchy('SharedAdaptive', 'sum', '([II)I');
@@ -40,7 +40,12 @@ test('ordinary adaptive canonical entries build and transport only one execution
   const retransmitted = jvm.jit.serializeGeneratedResult(rebound);
   t.equal(retransmitted.bodies.framed, null, 'retransport does not duplicate the shared body');
   t.ok(retransmitted.bodies.adaptive, 'retransport retains the executable body');
-  for (const entry of [body, rebound]) {
+  const dispatched = jvm.jit.withResumeBody(body, method);
+  t.ok(dispatched.jvmFusedStructuredResumeDispatch, 'local compile combines resume dispatch');
+  const dispatchedRebound = jvm.jit.materializeGeneratedResult(
+    structuredClone(jvm.jit.serializeGeneratedResult(dispatched)), method);
+  t.ok(dispatchedRebound?.jvmFusedStructuredResumeDispatch, 'worker transport rebuilds combined dispatch');
+  for (const entry of [body, rebound, dispatched, dispatchedRebound]) {
     const frame = new Frame(method); frame.className = 'SharedAdaptive';
     frame.locals.splice(0,2,[3,5,-2],3);
     const thread = {status:'runnable',callStack:new Stack()}; thread.callStack.push(frame);
@@ -67,7 +72,7 @@ test('ordinary adaptive canonical entries build and transport only one execution
   t.end();
 });
 
-test('a replacement adaptive canonical body resumes an older generator iterator', t => {
+for (const fused of [false,true]) test('replacement adaptive body resumes an older iterator (fused=' + fused + ')', t => {
   const state = { guardedStaticBooleanStateMatches: () => true,
     fieldBackedArrayStateMatches: () => true, captureFieldBackedArrayState: () => null };
   const frame = {pc:0,stack:{itemCount:0}}, thread = {callStack:new Stack()}; thread.callStack.push(frame);
@@ -79,8 +84,16 @@ test('a replacement adaptive canonical body resumes an older generator iterator'
   const helpers = { needsBytecodeChecks:()=>false };
   old(frame,thread,helpers,false); frame.pc=7;
   const adaptive = () => { adaptiveCalls++; return {returned:true,value:99}; };
-  const replacement = structuredWrappers.wrapFramedStructuredBody(adaptive,state,
+  let replacement = structuredWrappers.wrapFramedStructuredBody(adaptive,state,
     {itemCount:20,ordinaryAdaptiveCanonical:true,adaptivePositionalBody:adaptive});
+  if (fused) {
+    replacement.jvmStructuredWrapperShape={useContinuations:true,ordinaryAdaptive:true,ordinaryAdaptiveCanonical:true};
+    replacement.jvmAdaptivePositionalBody=adaptive;
+    structuredWrappers.attachStructuredContinuationHelpers(replacement,adaptive);
+    replacement=new JVM({jit:{compileWorker:false,fuseStructuredResumeDispatch:true}}).jit.buildResumeDispatcher(
+      replacement,()=>{throw new Error('unexpected baseline entry');},{});
+    t.ok(replacement.jvmFusedStructuredResumeDispatch,'replacement selects combined dispatch');
+  }
   t.equal(replacement(frame,thread,helpers,false).value,41,'stored iterator completes instead of restarting the method');
   t.equal(resumed,1,'old iterator resumes exactly once');
   t.equal(adaptiveCalls,0,'replacement body did not replay guest work');
@@ -92,7 +105,7 @@ test('a real compile worker installs a shared adaptive execution body', async t 
     public static int sum(int[] values, int n) { int s=0; for(int i=0;i<n;i++) s+=values[i]; return s; }
   }`);
   const jvm = new JVM({classpath, prepareBeforeMain:false, jit:{compileWorker:true,
-    structuredSsa:true, warmupThreshold:0, ordinaryAdaptiveFramelessPositional:true}});
+    structuredSsa:true, warmupThreshold:0, fuseStructuredResumeDispatch:true, ordinaryAdaptiveFramelessPositional:true}});
   const jit = jvm.jit;
   t.teardown(() => jit.compileWorker.dispose());
   await jvm.loadClassByName('SharedAdaptiveWorker');
@@ -104,6 +117,7 @@ test('a real compile worker installs a shared adaptive execution body', async t 
   await jit.compileWorker.whenIdle();
   t.ok(jit.compileWorker.installedMethods.has(method), 'worker installs the method');
   const installed = jit.codegenCache.get(method);
+  t.ok(installed?.jvmFusedStructuredResumeDispatch, 'real worker installation combines dispatch');
   const body = installed?.jvmFastBody || installed;
   t.ok(body?.jvmStructuredWrapperShape?.framedUsesAdaptive, 'worker uses the shared-body protocol');
   t.equal(body?.jvmStructuredFramedBody, body?.jvmAdaptiveGeneratedBody, 'installed entry roles share one function');

@@ -11,6 +11,7 @@ test('block-local receiver proofs preserve null failures and changed references'
     int x, y;
     static void touch(FieldReceiverChecks a) { a.y++; }
     static int aroundCall(FieldReceiverChecks a) { int x=a.x; touch(a); return x+a.y; }
+    static int write(FieldReceiverChecks a) { a.x=17; return a.x; }
     static int read(FieldReceiverChecks a) { return a.x + a.y + a.x; }
     static int replace(FieldReceiverChecks a, FieldReceiverChecks b) { int x=a.x; a=b; return x+a.y; }
     static int branch(FieldReceiverChecks a, FieldReceiverChecks b, boolean first) {
@@ -18,10 +19,12 @@ test('block-local receiver proofs preserve null failures and changed references'
     }
   }`);
   const observations = [];
-  for (const cacheLimit of [undefined,0,8,9]) for (const enabled of [false,true]) {
-    const j = new JVM({classpath,jit:{compileWorker:false,structuredSsa:true,
+  for (const denseInstanceFields of [false,true]) for (const [sharedFieldAccess, sharedMinimum] of [[false,0],[true,0],[true,1000]]) for (const cacheLimit of [undefined,0,8,9]) for (const enabled of [false,true]) {
+    const j = new JVM({classpath,denseInstanceFields,jit:{compileWorker:false,structuredSsa:true,
       preferWholeMethodJs:true,retainCompilerDiagnostics:true,
       structuredDominatedFieldReceiverChecks:enabled,
+      structuredSharedFieldAccess:sharedFieldAccess,
+      structuredSharedFieldAccessMinCodeItems:sharedMinimum,
       structuredFieldReadCacheMaxCodeItems:cacheLimit}});
     await j.loadClassByName('FieldReceiverChecks');
     j.classInitializationState.set('FieldReceiverChecks','INITIALIZED');
@@ -34,12 +37,17 @@ test('block-local receiver proofs preserve null failures and changed references'
     const rows=[];
     for (const [name,descriptor,cases] of [
       ['read','(LFieldReceiverChecks;)I', [['a'],[null]]],
+      ['write','(LFieldReceiverChecks;)I', [['a'],[null]]],
       ['replace','(LFieldReceiverChecks;LFieldReceiverChecks;)I', [['a','b'],['a',null]]],
       ['branch','(LFieldReceiverChecks;LFieldReceiverChecks;Z)I', [['a','b',1],[null,'b',0],['a',null,1]]],
     ]) {
       const method=await j.findMethodInHierarchy('FieldReceiverChecks',name,descriptor);
       const body=j.jit.getGeneratedFunction(method,{allowEffectfulCalls:true,compileLocally:true});
       t.ok(body?.jvmStructuredSsa,name+' uses structured code');
+      if (denseInstanceFields && sharedFieldAccess && sharedMinimum===0 && ((name==='read' && cacheLimit===0) || name==='write')) {
+        t.ok(body.toString().includes(name==='read' ? 'readDenseOrNamedField' : 'writeDenseOrNamedField'), 'selected shared field helper is emitted');
+      }
+      if (sharedMinimum===1000) t.notOk(/(?:read|write)DenseOrNamedField/.test(body.toString()), 'small methods retain inline storage access');
       if(name==='read') {
         t.equal(body.jvmStructuredDominatedFieldReceiverCheckCount,enabled?2:0,
           'only subsequent checks of the same immutable reference are removed');
@@ -69,7 +77,7 @@ test('block-local receiver proofs preserve null failures and changed references'
           t.equal(error?.type,'java/lang/NullPointerException','null failure remains observable');
         else {
           t.ok(result?.returned,'valid receiver completes');
-          t.equal(result.value,name==='read'?11:name==='replace'?18:8,'exact field arithmetic is preserved');
+          t.equal(result.value,name==='read'?11:name==='write'?17:name==='replace'?18:8,'exact field arithmetic is preserved');
         }
       }
     }

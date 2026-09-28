@@ -29,3 +29,37 @@ test('resume dispatch preserves tier routing and call contracts', t => {
   catch (error) { t.equal(error,failure,'guest exception identity survives the dispatcher'); }
   t.end();
 });
+
+test('combined canonical dispatch preserves live routing and diagnostic counting', t => {
+  const {structuredWrappers: wrappers} = require('../src/jit/JvmSsaBlockRenderer');
+  for (const enabled of [false,true]) for (const diagnostics of [false,true]) {
+    const jit = new JVM({jit:{compileWorker:false,fuseStructuredResumeDispatch:enabled,
+      profileResumeDispatch:diagnostics}}).jit;
+    const calls=[], value={}, baseline={};
+    const adaptive = (...args) => {calls.push(['adaptive',args]); return value;};
+    const fast=wrappers.wrapFramedStructuredBody(null,{}, {
+      ordinaryAdaptiveCanonical:true,adaptivePositionalBody:adaptive});
+    fast.jvmStructuredWrapperShape={useContinuations:true,ordinaryAdaptive:true,ordinaryAdaptiveCanonical:true};
+    fast.jvmAdaptivePositionalBody=adaptive;
+    fast.jvmStructuredResumePcs=new Set([7]);
+    wrappers.attachStructuredContinuationHelpers(fast,function* () {});
+    const resume=(...args)=>{calls.push(['baseline',args]);return baseline;};
+    const method={className:'DispatchProbe',name:'run',descriptor:'()V'};
+    const dispatch=jit.buildResumeDispatcher(fast,resume,method);
+    t.equal(dispatch.jvmFusedStructuredResumeDispatch,enabled&&!diagnostics,'profiling keeps diagnostic dispatcher');
+    for (const pc of [0,7,3]) for (const checks of [undefined,false,true]) {
+      const frame={pc},thread={},helpers={};
+      const expected=pc===3?'baseline':'adaptive';
+      t.equal(dispatch(frame,thread,helpers,checks,true),pc===3?baseline:value,'exact result identity');
+      t.deepEqual(calls.pop(),[expected,pc===3?[frame,thread,helpers,checks]:[frame,thread,helpers,checks,false]],
+        'canonical entry remains framed and forwards bytecode checks');
+    }
+    fast.jvmStructuredResumePcs=new Set([3]);
+    t.equal(dispatch({pc:3},{},{},false),value,'replaced resume set is consulted live');
+    if(diagnostics) {
+      const row=jit.resumeDispatchStats.get('DispatchProbe.run()V');
+      t.equal(row.fast,7,'fast entries counted');t.equal(row.resume,3,'baseline entries counted');
+    }
+  }
+  t.end();
+});
