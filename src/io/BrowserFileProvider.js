@@ -231,6 +231,29 @@ class BrowserFileProvider extends FileProvider {
    * @param {string} dirPath - Directory path to list (optional)
    * @returns {Promise<string[]>} - Array of file names
    */
+  // Every class the provider can serve for a classpath entry, as class
+  // names. The JVM's before-main preparation preloads the whole classpath
+  // through this: the browser has no directory listing, so without it only
+  // the classes reachable from main()'s constant pools were prepared and a
+  // class reached by reflection alone stayed unprepared for good.
+  async listClassNames(classpathEntry = '.') {
+    const entry = this.normalizePath(String(classpathEntry || ''))
+      .replace(/^\.?\/+/, '').replace(/^\.$/, '').replace(/\/+$/, '');
+    const roots = [entry, ...this.classpathRoots.map((root) =>
+      entry ? `${root}/${entry}` : root)].map((root) => root.replace(/^\/+/, ''));
+    const names = new Set();
+    for (const path of this.virtualFS.keys()) {
+      if (!/\.class$/i.test(path)) continue;
+      for (const root of roots) {
+        const prefix = root ? `${root}/` : '';
+        if (!path.startsWith(prefix)) continue;
+        names.add(path.slice(prefix.length, -6));
+        break;
+      }
+    }
+    return [...names];
+  }
+
   async listFiles(dirPath = '') {
     const files = [];
     for (const path of this.virtualFS.keys()) {

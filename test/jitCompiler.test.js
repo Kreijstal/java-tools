@@ -12136,7 +12136,7 @@ public class WasmLinkedHelperHarness {
   t.end();
 });
 
-test('Wasm JIT links helpers whose only unsupported blocks are exception reporters', async (t) => {
+test('Wasm JIT preserves helpers with exception reporters', async (t) => {
   const classpath = compileJavaFixture(t, 'WasmLinkedReporterHelperHarness', `
 public class WasmLinkedReporterHelperHarness {
   private static int mix(int value) {
@@ -12181,8 +12181,8 @@ public class WasmLinkedReporterHelperHarness {
   const compiled = new Map(jvm.jit.wasmJit.compiled.map((entry) => [entry.key, entry]));
   t.ok(compiled.has('WasmLinkedReporterHelperHarness.mix(I)I'),
     'normal-flow-complete helper links despite handler-only blocks');
-  t.equal(compiled.get('WasmLinkedReporterHelperHarness.compute([I)V').exits, 0,
-    'linked reporter helper does not force caller exits');
+  t.ok(compiled.get('WasmLinkedReporterHelperHarness.mix(I)I').meta.usedEh,
+    'reporter helper retains exception dispatch even when its caller uses fallback');
   t.end();
 });
 
@@ -12257,7 +12257,7 @@ public class WasmReporterHarness {
   t.end();
 });
 
-test('Wasm JIT reporter scan skips unreachable throws before a forward join', (t) => {
+test('Wasm JIT retains reporting handlers with forward joins', (t) => {
   const codeItems = [
     { instruction: { op: 'astore', varnum: 1 } },
     { instruction: { op: 'aload', varnum: 2 } },
@@ -12273,8 +12273,8 @@ test('Wasm JIT reporter scan skips unreachable throws before a forward join', (t
   ];
   const labels = new Map([['Lnull', 6], ['Ljoin', 8]]);
 
-  t.ok(wasmJitTest.isNoOpExceptionHandler(codeItems, 0, labels),
-    'an unreachable trap before the pending join is not mistaken for handler recovery');
+  t.notOk(wasmJitTest.isNoOpExceptionHandler(codeItems, 0, labels),
+    'reporting calls require exception dispatch even when their paths rethrow');
   t.end();
 });
 

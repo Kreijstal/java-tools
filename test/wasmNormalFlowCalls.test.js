@@ -6,13 +6,14 @@ const Compiler=require('../src/jit/StructuredWasmCompiler');
 const Frame=require('../src/core/frame'),CallStack=require('../src/core/callStack');
 const {newFields,makeObjectRef,writeField,readField}=require('../src/core/objectModel');
 const {supportsWasmTryTable}=require('../src/jit/wasmShared');
-test('complete normal-flow selection retains canonical exception handling',async t=>{
+for (const retainCompilerDiagnostics of [true, false]) {
+test(`complete normal-flow selection retains canonical exception handling (diagnostics=${retainCompilerDiagnostics})`,async t=>{
  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'wasm-normal-flow-'));
  t.teardown(()=>fs.rmSync(dir,{recursive:true,force:true}));
  execFileSync('javac',['-g','-d',dir,path.resolve(__dirname,'../sources/WasmNormalFlowCalls.java')]);
  const owner='WasmNormalFlowCalls';
  const j=new JVM({classpath:dir,wasmHeap:true,jit:{compileWorker:false,
-   wasmStructured:true,wasmSynchronizedInstanceLinks:true,wasmNormalFlowPreparedUpgrades:true}});
+   retainCompilerDiagnostics,wasmStructured:true,wasmSynchronizedInstanceLinks:true,wasmNormalFlowPreparedUpgrades:true}});
  await j.preloadClasspathClasses();
  j.classInitializationState.set(owner,'INITIALIZED');
  const m=await j.findMethodInHierarchy(owner,'mix','(LWasmNormalFlowCalls;[II)I');
@@ -21,7 +22,10 @@ test('complete normal-flow selection retains canonical exception handling',async
  const speculative=new Compiler(j,m,owner,wasm).translateWith(true);
  wasm.normalFlowPreparedUpgradesEnabled=true;
  const plain=new Compiler(j,m,owner,wasm).translateWith(false);
- const selected=new Compiler(j,m,owner,wasm).translateWith(true);
+ const compiler=new Compiler(j,m,owner,wasm);
+ const selected=compiler.translateWith(true);
+ t.equal(Boolean(compiler.fn),retainCompilerDiagnostics,'SSA retention follows the diagnostics option');
+ t.equal(Boolean(compiler.localOf),retainCompilerDiagnostics,'SSA local allocation map is released with the graph');
  t.notOk(speculative.normalFlowFullyCompiled,'the control exercises a guard-only inline exit');
  t.ok(plain.normalFlowFullyCompiled,'the non-inlined normal path is complete');
  t.ok(selected.normalFlowFullyCompiled,'speculative inline exits cannot displace complete normal flow');
@@ -98,3 +102,5 @@ test('complete normal-flow selection retains canonical exception handling',async
  t.throws(()=>new JVM({jit:{wasmCompileClasses:'bad'}}),/wasmCompileClasses/);
  t.end();
 });
+
+}

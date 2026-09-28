@@ -291,15 +291,19 @@ function mathIntrinsicFunction(name, descriptor) {
   }
   const jsFn = Math[name];
   if (typeof jsFn !== 'function') return null;
-  return ret === 'F'
-    ? (...args) => Math.fround(jsFn(...args))
-    : (...args) => jsFn(...args);
+  // Native Math bindings can be imported directly. A rest/spread trampoline
+  // adds a JS call at every Wasm boundary and hides the native target from
+  // the engine. Float results alone need Java's explicit float32 rounding.
+  if (ret !== 'F') return jsFn;
+  if (params.length === 1) return value => Math.fround(jsFn(value));
+  if (params.length === 2) return (left, right) => Math.fround(jsFn(left, right));
+  return (...args) => Math.fround(jsFn(...args));
 }
 
 // Control-flow exception (per-block demotion, callee-link deferral, whole-
-// method rejection) thrown thousands of times per boot: V8's stack capture in
-// the Error constructor was ~1s of a profiled run, so skip it — nothing ever
-// reads .stack, only .message.
+// method rejection) thrown thousands of times per boot. Keep Error's prototype
+// contract without invoking native stack capture or changing stackTraceLimit
+// globally. These internal signals carry a message and blockers, not a stack.
 class Unsupported extends Error {
   // `blockedOn` names what has to change before this refusal could go away:
   // a guest CLASS (absent, or merely uninitialized), or a callee METHOD that
@@ -316,11 +320,14 @@ class Unsupported extends Error {
   // account of what this module lost, so an unnamed recoverable loss becomes
   // invisible rather than merely imprecise.
   constructor(message, blockedOn = null) {
-    const limit = Error.stackTraceLimit;
-    Error.stackTraceLimit = 0;
-    super(message);
-    Error.stackTraceLimit = limit;
-    this.blockedOn = blockedOn;
+    const signal = Object.create(new.target.prototype);
+    if (message !== undefined) {
+      Object.defineProperty(signal, 'message', {
+        value: String(message), writable: true, configurable: true,
+      });
+    }
+    signal.blockedOn = blockedOn;
+    return signal;
   }
 }
 
@@ -368,12 +375,23 @@ function hasUncheckedSpeculation(meta) {
 // must actually export runv. A speculative callee is admitted only where the
 // caller re-checks the class world at link time AND keeps a receiver guard
 // that later-loaded classes fail -- which invokespecial, whose only guard is
-// non-null, cannot offer.
-function directInstanceLinkCalleeEligible(st, isSpecial, revalidate) {
+// non-null, cannot offer. A backend may separately guard live initialization
+// tokens for a leaf whose only exits are initialization checks. That opt-in
+// MUST emit the guard at every call; the ordinary contract stays unchanged.
+function hasOnlyLeafInitializationExits(meta) {
+  return meta?.initializationGuardLeaf === true &&
+    meta.initializationGuardTokens?.length > 0 &&
+    meta.deoptableCalls === meta.initializationGuardTokens.length;
+}
+
+function directInstanceLinkCalleeEligible(st, isSpecial, revalidate,
+  guardInitialization = false) {
   const meta = st && (st.callee || st).meta;
   if (!meta) return false;
   if (!meta.fullyCompiled || !meta.runv) return false;
-  if (meta.boxedCount || meta.deoptableCalls || meta.usedEh) return false;
+  if (meta.boxedCount || meta.usedEh) return false;
+  if (meta.deoptableCalls &&
+      !(guardInitialization && hasOnlyLeafInitializationExits(meta))) return false;
   if (st.synchronized || st.linkVetoed) return false;
   if (!(meta.specSites && meta.specSites.length)) return true;
   return !isSpecial && !!revalidate && revalidate(st);
@@ -437,8 +455,18 @@ const FUEL = Number(process.env.JVM_WASM_FUEL || 5_000_000);
 // Largest dispatch cone an instance call site will compile a map for. Read per
 // call rather than captured, so a test or a boot experiment can move it with
 // JVM_WASM_MAX_IMPLS without reloading the module graph.
-function maxImpls() {
-  return Number(process.env.JVM_WASM_MAX_IMPLS) || 4;
+function maxImpls(configured) {
+  return configured ?? (Number(process.env.JVM_WASM_MAX_IMPLS) || 4);
+}
+
+// Retire repeatedly unproductive nested links after enough observations.
+// Both compilers use the same threshold, including exits propagated through
+// another partial callee; bytecode coverage alone does not prove progress.
+function recordNestedDeopt(state) {
+  state.nestedDeopts = (state.nestedDeopts || 0) + 1;
+  if (state.nestedDeopts > 256 && state.nestedDeopts * 4 > state.nestedCalls) {
+    state.linkVetoed = true;
+  }
 }
 
 // Guest exceptions are plain objects with a string `type` (never Error
@@ -482,6 +510,18 @@ function retvGlobalEntry(t) {
   return [t, 0x01, ...zero, 0x0b];
 }
 
+// Numeric results keep the cheap JS import ABI. Reference results cross
+// through the exported global only, and are consumed rather than retained.
+function takeWasmReturnValue(meta) {
+  if (meta.retChar === 'L' || meta.retChar === '[') {
+    const value = meta.retv.value;
+    meta.retv.value = null;
+    meta.box.ret = undefined;
+    return value;
+  }
+  return meta.box.ret;
+}
+
 // Body of the direct-link wrapper: forward the java params, supply entry
 // block 0 and the nested-call fuel budget, run the main function, then push
 // the retv global so a wasm->wasm caller receives [status, value] without
@@ -493,6 +533,9 @@ function runvWrapperBody(paramCount, mainIdx, retvType) {
   out.push(OP.i32_const, ...sleb(100_000_000));
   out.push(OP.call, ...uleb(mainIdx));
   if (retvType) out.push(OP.global_get, ...uleb(0));
+  // The returned externref is already on the operand stack. A long-lived
+  // module must not keep a second owning reference in its result scratch.
+  if (retvType === T.ref) out.push(OP.ref_null, T.ref, OP.global_set, ...uleb(0));
   out.push(OP.end);
   return out;
 }
@@ -600,42 +643,31 @@ function assembleModule({ importDecls, mainParams, mainResults, declared, body, 
   ]);
 }
 
-// Ops that may appear in a wrap-and-rethrow reporter handler before its
-// terminating athrow. Forward branches are handled separately: obfuscator
-// reporters commonly select "null" versus "{...}" while formatting args.
-const REPORTER_OPS = /^(astore|aload|iload|lload|fload|dload|ldc|ldc_w|ldc2_w|bipush|sipush|iconst|lconst|fconst|dconst|aconst_null|new|dup|checkcast|getstatic|invokespecial|invokevirtual|invokestatic|invokedynamic|i2l|i2c|l2i)/;
-
-function isNoOpExceptionHandler(codeItems, handlerIndex, labelIndex) {
-  let furthestForwardTarget = handlerIndex;
-  // Large game methods can have reporters that append dozens of arguments.
-  // Keep discovery bounded, but do not confuse their size with recovery.
-  const end = Math.min(codeItems.length, handlerIndex + 512);
-  for (let i = handlerIndex; i < end; i++) {
-    const instruction = codeItems[i] && codeItems[i].instruction;
+// Only a proof that the original throwable is rethrown permits omitting a
+// handler. Formatting/reporting calls and replacement exceptions are guest
+// behavior, even when every path ends in athrow.
+function isNoOpExceptionHandler(codeItems, handlerIndex, _labelIndex) {
+  const instructions = [];
+  for (let i = handlerIndex; i < codeItems.length && i < handlerIndex + 16; i++) {
+    const instruction = codeItems[i]?.instruction;
     const op = getOp(instruction);
-    if (!op) continue;
-    if (op === 'athrow') {
-      // Obfuscators commonly leave an unreachable throw on one side of a
-      // forward null-selection branch. It is not the handler terminator when
-      // another branch target still has to be visited.
-      if (i >= furthestForwardTarget) return true;
-      continue;
-    }
-    if (op === 'goto' || op.startsWith('if')) {
-      const target = instruction && typeof instruction === 'object'
-        ? labelIndex.get(instruction.arg) : undefined;
-      // Backedges can run arbitrary recovery logic; unresolved targets are
-      // not a proof either.
-      if (target === undefined || target <= i) return false;
-      furthestForwardTarget = Math.max(furthestForwardTarget, target);
-      continue;
-    }
-    if (/^(return|[a-z]return|putfield|putstatic|[a-z]astore|monitorenter|monitorexit)$/.test(op)) {
-      return false;
-    }
-    if (!REPORTER_OPS.test(op)) return false;
+    if (!op || op === 'nop') continue;
+    instructions.push(instruction);
+    if (instructions.length === 1 && op === 'athrow') return true;
+    if (instructions.length === 3) break;
   }
-  return false;
+  if (instructions.length !== 3 || getOp(instructions[2]) !== 'athrow') return false;
+  const local = (instruction, prefix) => {
+    const op = getOp(instruction);
+    const suffix = new RegExp(`^${prefix}_([0-3])$`).exec(op);
+    const raw = suffix ? suffix[1] : op === prefix
+      ? instruction.varnum ?? instruction.arg : undefined;
+    if (!['string', 'number'].includes(typeof raw) || !/^\d+$/.test(String(raw))) return -1;
+    const slot = Number(raw);
+    return Number.isInteger(slot) && slot <= 65535 ? slot : -1;
+  };
+  const stored = local(instructions[0], 'astore');
+  return stored >= 0 && local(instructions[1], 'aload') === stored;
 }
 
 function catchesOnlyCheckedExceptions(jvm, catchType) {
@@ -655,8 +687,8 @@ function catchesOnlyCheckedExceptions(jvm, catchType) {
 }
 
 // Returns the item-index ranges [start, end) protected by LIVE (non-no-op)
-// handlers. Blocks intersecting these ranges must stay interpreted. No-op
-// handler entries (bare rethrow, wrap-and-rethrow reporter) contribute none.
+// handlers. Backends must protect these ranges or retain interpreter fallback.
+// Only proven unchanged rethrows contribute no protected range.
 function liveExceptionRanges(jvm, code, labelIndex) {
   const table = code.exceptionTable || [];
   const ranges = [];
@@ -743,13 +775,13 @@ module.exports = {
   mathIntrinsicFunction,
   Unsupported,
   blockedNames,
-  callWasmRun,
+  callWasmRun, takeWasmReturnValue,
   sealedNeverExits,
   hasUncheckedSpeculation,
-  directInstanceLinkCalleeEligible,
+  directInstanceLinkCalleeEligible, hasOnlyLeafInitializationExits,
   identityInstanceParams,
   NestedDeopt,
-  maxImpls,
+  maxImpls, recordNestedDeopt,
   isGuestThrow,
   specokGlobalEntry,
   FUEL,

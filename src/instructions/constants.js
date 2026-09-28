@@ -1,25 +1,40 @@
-module.exports = {
-  ldc: async (frame, instruction, jvm) => {
-    if (Array.isArray(instruction.arg) && instruction.arg[0] === "Class") {
-      const className = instruction.arg[1];
-      const classObj = await jvm.getClassObject(className);
-      frame.stack.push(classObj);
-    } else {
-      const constant = instruction.arg;
-      if (typeof constant === "string" || constant instanceof String) {
-        frame.stack.push(jvm.internString(constant));
-      } else if (
-        typeof constant === "object" &&
-        constant !== null &&
-        constant.hasOwnProperty("value")
-      ) {
-        // Handle typed constants from convert_tree.js (e.g., {value: 3.14, type: "Float"})
-        frame.stack.push(constant.value);
-      } else {
-        frame.stack.push(constant);
-      }
+const SYNC_FALLBACK = require('./syncFallback');
+
+function wideConstant(frame, instruction) {
+  let constant = instruction.arg;
+  // Converted operands are normally values; retain the legacy pool-index form.
+  if (typeof constant === 'string' && /^\d+$/.test(constant) && frame.method.constantPool) {
+    const index = parseInt(constant, 10);
+    if (index >= 1 && index < frame.method.constantPool.length) {
+      constant = frame.method.constantPool[index];
     }
-  },
+  }
+  return constant;
+}
+
+function pushConstantSync(frame, constant, jvm) {
+  if (Array.isArray(constant) && constant[0] === 'Class') {
+    const mirror = jvm.getClassObjectSync?.(constant[1]);
+    if (!mirror) return SYNC_FALLBACK;
+    frame.stack.push(mirror);
+  } else if (typeof constant === 'string' || constant instanceof String) {
+    frame.stack.push(jvm.internString(constant));
+  } else if (constant !== null && typeof constant === 'object' &&
+      Object.prototype.hasOwnProperty.call(constant, 'value')) {
+    frame.stack.push(constant.value);
+  } else {
+    frame.stack.push(constant);
+  }
+}
+
+async function loadConstant(frame, constant, jvm) {
+  if (pushConstantSync(frame, constant, jvm) === SYNC_FALLBACK) {
+    frame.stack.push(await jvm.getClassObject(constant[1]));
+  }
+}
+
+module.exports = {
+  ldc: (frame, instruction, jvm) => loadConstant(frame, instruction.arg, jvm),
   bipush: (frame, instruction) => {
     const value = parseInt(instruction.arg, 10);
     frame.stack.push(value);
@@ -99,34 +114,10 @@ module.exports = {
       frame.stack.push(parseFloat(value));
     }
   },
-    ldc_w: async (frame, instruction, jvm) => {
-      let constant = instruction.arg;
-
-      // jvm_parser/convertJson resolves many ldc_w operands to their constant
-      // value already (for example strings).  Some callers may still supply a
-      // raw constant-pool index, so keep supporting that representation too.
-      if (typeof constant === 'string' && /^\d+$/.test(constant) && frame.method.constantPool) {
-        const index = parseInt(constant, 10); // 16-bit constant pool index
-        const constantPool = frame.method.constantPool;
-        if (index < constantPool.length && index >= 1) {
-          constant = constantPool[index];
-        }
-      }
-
-      if (Array.isArray(constant) && constant[0] === "Class") {
-        const className = constant[1];
-        const classObj = await jvm.getClassObject(className);
-        frame.stack.push(classObj);
-      } else if (typeof constant === "string" || constant instanceof String) {
-        frame.stack.push(jvm.internString(constant));
-      } else if (
-        typeof constant === "object" &&
-        constant !== null &&
-        constant.hasOwnProperty("value")
-      ) {
-        frame.stack.push(constant.value);
-      } else {
-        frame.stack.push(constant);
-      }
-    },
+  ldc_w: (frame, instruction, jvm) => loadConstant(frame, wideConstant(frame, instruction), jvm),
 };
+
+module.exports.ldcSync = (frame, instruction, jvm) =>
+  pushConstantSync(frame, instruction.arg, jvm);
+module.exports.ldcWideSync = (frame, instruction, jvm) =>
+  pushConstantSync(frame, wideConstant(frame, instruction), jvm);

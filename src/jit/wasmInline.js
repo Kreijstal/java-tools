@@ -56,6 +56,7 @@ const {
   getOp, parseMethodDescriptor, liveExceptionRanges, MATH_INTRINSICS,
 } = require('./wasmShared');
 const { collectRefdLabels } = require('../decompiler/structurer');
+const { getStackEffect } = require('../analysis/opgraph/stackEffects');
 
 const SHORT_LOCAL = /^([ilfda])(load|store)_([0-3])$/;
 const LONG_LOCAL = /^([ilfda])(load|store)$/;
@@ -239,14 +240,33 @@ function planStaticInline(ctx, ins, base, maxItems) {
 // stubs are elided when the dispatch pick is decidable from the caller
 // class, keeping the module fully compiled — the site still records a
 // specSite so entry revalidation catches later-loaded overriders.
+// Trace the receiver backwards through straight-line argument evaluation.
+// Slot counts include category-2 values. A join, call, or stack shuffle makes
+// the origin ambiguous, so keep the ordinary guard in those cases.
+function receiverIsThis(items, index, targeted) {
+  const call = items[index];
+  const isTargeted = item => item.labelDef && targeted.has(item.labelDef.slice(0, -1));
+  if (isTargeted(call)) return false;
+  const {params} = parseMethodDescriptor(call.instruction.arg[2][1]);
+  let above = paramSlotsOf(params, 0).end;
+  for (let i = index - 1; i >= 0; i--) {
+    const item = items[i], ins = item.instruction, op = getOp(ins);
+    if (above === 0 && (op === 'aload_0' ||
+        op === 'aload' && String(ins.arg) === '0')) return true;
+    if (!op || isTargeted(item) || BRANCH_OP.test(op) ||
+        /^(invoke|.*switch$|.*return$|athrow$|jsr|ret$)/.test(op)) return false;
+    const effect = getStackEffect(op, ins);
+    if (!effect || effect.special || effect.pushSlots > above) return false;
+    above += effect.popSlots - effect.pushSlots;
+  }
+  return false;
+}
+
 function planInstanceSite(ctx, ins, op, callerClassName, alloc, depth, recvIsThis) {
   if (!Array.isArray(ins.arg)) return null;
   const [, owner, [name, descriptor]] = ins.arg;
   if (name === '<init>' || name === '<clinit>') return null;
   const { params } = parseMethodDescriptor(descriptor);
-  // With arguments on the stack the aload_0 before the invoke is the last
-  // argument, not the receiver.
-  if (params.length) recvIsThis = false;
   let impls;
   let guards = null; // instanceof classes aligned with impls; null = ifnonnull only
   let elide = false;
@@ -421,8 +441,8 @@ function buildCalleeBody(ctx, impl, alloc, retLabel, depth) {
 
   // Interior receiver-is-this detection mirrors inlineCalls: the callee is an
   // instance method, so its slot 0 holds its own `this` unless something
-  // stores over it. A zero-arg interior invoke directly following aload_0 at
-  // an untargeted item then has this body's receiver as its receiver — and
+  // stores over it. A straight-line argument sequence traced back to aload_0
+  // then proves this body's receiver is the call's receiver — and
   // the branch guard (or outer elision) already bounds that receiver's
   // runtime class by `className`, so planInstanceSite can elide its guard.
   const calleeThisStable = !items.some((it) => {
@@ -447,11 +467,8 @@ function buildCalleeBody(ctx, impl, alloc, retLabel, depth) {
     const op = getOp(item.instruction);
     const lbl = item.labelDef ? prefix + item.labelDef : undefined;
     if (reachable.has(idx) && INSTANCE_INVOKE.test(op)) {
-      const prevOp = idx > 0 ? getOp(items[idx - 1].instruction) : null;
       const interiorRecvIsThis = calleeThisStable &&
-        !(item.labelDef && targeted.has(item.labelDef.slice(0, -1))) &&
-        (prevOp === 'aload_0' ||
-          (prevOp === 'aload' && String(items[idx - 1].instruction.arg) === '0'));
+        receiverIsThis(items, idx, targeted);
       const site = planInstanceSite(ctx, item.instruction, op, className, alloc,
         depth + 1, interiorRecvIsThis);
       if (!site) return null;
@@ -511,8 +528,6 @@ function inlineCalls(jvm, codeAttr, options = {}) {
       if (typeof l === 'string') targetedLabels.add(l.endsWith(':') ? l.slice(0, -1) : l);
     }
   }
-  const isTargeted = (it) => !!it.labelDef &&
-    targetedLabels.has(it.labelDef.slice(0, -1));
   let budget = options.budget || 512;
   const labelIndex = new Map();
   items.forEach((it, i) => { if (it.labelDef) labelIndex.set(it.labelDef.slice(0, -1), i); });
@@ -528,12 +543,14 @@ function inlineCalls(jvm, codeAttr, options = {}) {
     const op = getOp(item.instruction);
     if (op === 'invokestatic' && budget > 0 && !inRange(i)) {
       const plan = planStaticInline(ctx, item.instruction, alloc.next, ctx.maxCalleeItems);
-      if (plan && plan.stores.length + plan.body.length + 1 <= budget) {
+      const entryMarker = plan && !plan.stores.length && item.labelDef;
+      const planCost = plan && plan.stores.length + plan.body.length + 1 + (entryMarker ? 1 : 0);
+      if (plan && planCost <= budget) {
         plan.stores.forEach((s, si) => {
           out.push(si === 0 && item.labelDef ? { ...s, labelDef: item.labelDef } : s);
           origIdx.push(si === 0 ? i : -1);
         });
-        if (!plan.stores.length && item.labelDef) {
+        if (entryMarker) {
           // keep branch targets pointing at the (zero-arg) call site valid
           out.push({ labelDef: item.labelDef, instruction: 'nop' });
           origIdx.push(i);
@@ -542,21 +559,18 @@ function inlineCalls(jvm, codeAttr, options = {}) {
         out.push({ labelDef: `${plan.prefix}RET:`, instruction: 'nop' });
         origIdx.push(i + 1 < items.length ? i + 1 : -1);
         alloc.next += plan.localsSize;
-        budget -= plan.stores.length + plan.body.length + 1;
+        budget -= planCost;
         inlined += 1;
         continue;
       }
     } else if (ctx.hierarchy && INSTANCE_INVOKE.test(op) && budget > 0 && !inRange(i)) {
-      // Receiver is provably `this` when the invoke (not itself a branch
-      // target — a jump landing here could bring a different stack) directly
-      // follows aload_0. Zero-arg is enforced inside planInstanceSite.
-      const prevOp = i > 0 ? getOp(items[i - 1].instruction) : null;
-      const recvIsThis = thisSlotStable && !isTargeted(item) &&
-        (prevOp === 'aload_0' ||
-          (prevOp === 'aload' && String(items[i - 1].instruction.arg) === '0'));
+      const recvIsThis = thisSlotStable &&
+        receiverIsThis(items, i, targetedLabels);
       const site = planInstanceSite(
         ctx, item.instruction, op, options.callerClassName, alloc, 0, recvIsThis);
-      if (site && site.items.length + 1 <= budget) {
+      const siteCost = site && site.items.length + 1 +
+        (site.deadReceiverSlot !== undefined ? 2 : 0);
+      if (site && siteCost <= budget) {
         site.items.forEach((s, si) => {
           out.push(si === 0 && item.labelDef ? { ...s, labelDef: item.labelDef } : s);
           origIdx.push(si === 0 ? i : -1);

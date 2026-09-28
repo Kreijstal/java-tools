@@ -1,3 +1,4 @@
+const { invokeNative } = require("../core/nativeInvocation");
 const { parseDescriptor } = require("../parsing/typeParser");
 const Frame = require("../core/frame");
 const Stack = require("../core/stack");
@@ -147,7 +148,7 @@ function invokeNativeSync(frame, thread, target, state, receiver, kind, jvm) {
     }
     return undefined;
   };
-  const result = target.native(jvm,
+  const result = invokeNative(target.native, jvm,
     kind === 'static' ? null : receiver, args, thread);
   return result && typeof result.then === 'function' ? result.then(finish) : finish(result);
 }
@@ -362,7 +363,7 @@ async function invokevirtual(frame, instruction, jvm, thread) {
       descriptor,
     );
     if (jreMethod) {
-      let result = jreMethod(jvm, boxedObj, args, thread);
+      let result = invokeNative(jreMethod, jvm, boxedObj, args, thread);
       if (result && typeof result.then === "function") {
         result = await result;
       }
@@ -385,7 +386,7 @@ async function invokevirtual(frame, instruction, jvm, thread) {
       jreMethod = jvm._jreFindMethod(currentClassName, methodName, descriptor);
     }
     if (jreMethod) {
-      let result = jreMethod(jvm, boxedObj, args, thread);
+      let result = invokeNative(jreMethod, jvm, boxedObj, args, thread);
 
       // Check if the result is a Promise and await it
       if (result && typeof result.then === "function") {
@@ -486,7 +487,7 @@ async function invokestatic(frame, instruction, jvm, thread) {
       args.unshift(frame.stack.pop());
     }
 
-    let result = await jreMethod(jvm, null, args, thread);
+    let result = await invokeNative(jreMethod, jvm, null, args, thread);
     const { returnType } = parseDescriptor(descriptor);
     if (returnType !== "V" && returnType !== "void" && result !== undefined) {
       if (typeof result === "boolean") {
@@ -597,7 +598,7 @@ async function invokespecial(frame, instruction, jvm, thread) {
   }
 
   if (jreMethod) {
-    let result = await jreMethod(jvm, obj, args, thread);
+    let result = await invokeNative(jreMethod, jvm, obj, args, thread);
     if (result !== ASYNC_METHOD_SENTINEL) {
       const { returnType } = parseDescriptor(descriptor);
       if (returnType !== "V" && returnType !== "void" && result !== undefined) {
@@ -960,7 +961,7 @@ async function invokeinterface(frame, instruction, jvm, thread) {
       jreMethod = jvm._jreFindMethod(currentClassName, methodName, descriptor);
     }
     if (jreMethod) {
-      let result = jreMethod(jvm, boxedObj, args, thread);
+      let result = invokeNative(jreMethod, jvm, boxedObj, args, thread);
       if (result && typeof result.then === 'function') {
         result = await result;
       }

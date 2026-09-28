@@ -1,5 +1,6 @@
 const Frame = require('../core/frame');
 const Stack = require('../core/stack');
+const {javaKeyCode} = require('./awt-key-code');
 
 const LISTENER_METHODS = {
   mousePressed: '(Ljava/awt/event/MouseEvent;)V',
@@ -101,7 +102,7 @@ function keyChar(event) {
 function keyEvent(source, id, event) {
   return {
     ...baseInputEvent('java/awt/event/KeyEvent', source, id, event),
-    keyCode: event.keyCode || event.which || 0,
+    keyCode: id === 400 ? 0 : javaKeyCode(event),
     keyChar: keyChar(event),
     keyLocation: event.location || 0,
   };

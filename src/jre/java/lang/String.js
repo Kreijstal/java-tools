@@ -400,6 +400,7 @@ module.exports = {
       return stringValue(obj).indexOf(char);
     },
     "equalsIgnoreCase(Ljava/lang/String;)Z": (jvm, obj, args) => (
+      args[0] !== null && args[0] !== undefined &&
       stringValue(obj).toLowerCase() === stringValue(args[0]).toLowerCase() ? 1 : 0
     ),
     "indexOf(II)I": (jvm, obj, args) => {

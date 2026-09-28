@@ -107,6 +107,56 @@ test('a parked guest resumes on the presentation, and on a bounded timer',
     }, 1);
   });
 
+test('presentation waits release timers and unlink timed-out callbacks', async (t) => {
+  const jvm = new JVM({ eventLoopYieldMs: 16 });
+  const originalTimeout = global.setTimeout;
+  const originalClear = global.clearTimeout;
+  const timers = new Map();
+  let nextTimer = 0;
+  const completed = [];
+  try {
+    global.setTimeout = callback => {
+      const id = ++nextTimer;
+      timers.set(id, callback);
+      return id;
+    };
+    global.clearTimeout = id => timers.delete(id);
+    const first = jvm._awaitPresentation();
+    const second = jvm._awaitPresentation();
+    const staleTimeout = timers.get(1);
+    staleTimeout();
+    t.equal(jvm._awtPresentationWaiters.length, 1,
+      'timing out one waiter preserves the other pending waiter');
+    t.equal(timers.size, 1, 'only the pending waiter owns a timer');
+    // Match the presenter: detach before invoking, allowing a fresh queue.
+    const detached = jvm._awtPresentationWaiters;
+    jvm._awtPresentationWaiters = [];
+    const third = jvm._awaitPresentation();
+    detached.forEach(resume => resume());
+    t.equal(timers.size, 1, 'presentation cancels its safety timer');
+    t.equal(jvm._awtPresentationWaiters.length, 1,
+      'presentation preserves a waiter in the new queue');
+    staleTimeout();
+    t.equal(jvm._awtPresentationWaiters.length, 1,
+      'a late duplicate timeout cannot remove a new waiter');
+    timers.get(3)();
+    completed.push(first, second, third);
+    for (let i = 0; i < 1000; i++) {
+      completed.push(jvm._awaitPresentation());
+      timers.get(nextTimer)();
+    }
+    t.equal(jvm._awtPresentationWaiters.length, 0,
+      'repeated timeouts without painting retain no callbacks');
+    t.equal(timers.size, 0, 'completed waits retain no timers');
+  } finally {
+    global.setTimeout = originalTimeout;
+    global.clearTimeout = originalClear;
+  }
+  await Promise.all(completed);
+  t.pass('all completed waits resolve');
+  t.end();
+});
+
 test('a rendering host resumes a timer yield from a real timer task', (t) => {
   const { yieldToEventLoop } = require('../src/core/jvm');
   const previousRaf = global.requestAnimationFrame;
@@ -133,11 +183,13 @@ test('a rendering host resumes a timer yield from a real timer task', (t) => {
     else global.document = previousDocument;
   };
   yieldToEventLoop(0, 'timer')
-    .then(() => yieldToEventLoop(0, 'message-channel'))
+    .then(() => require('../src/jit/JitCompiler').prototype.cooperativeYield.call({
+      jvm: {eventLoopYieldStrategy: 'timer'},
+    }))
     .then(() => {
       restore();
-      t.deepEqual(used, ['timeout:0', 'immediate'],
-        'only the timer strategy leaves the continuously runnable task queue');
+      t.deepEqual(used, ['timeout:0', 'timeout:0'],
+        'interpreter and generated-code timer requests bypass the immediate polyfill');
       t.end();
     })
     .catch((error) => { restore(); t.fail(error); t.end(); });
@@ -216,6 +268,66 @@ test('a depleted audio queue receives its refill turn ahead of rendering', (t) =
   t.end();
 });
 
+test('the audio refill override survives the producer\'s own refill sleep', (t) => {
+  const jvm = new JVM();
+  const producer = { id: 1, status: 'runnable', callStack: new Stack() };
+  const audio = { id: 2, status: 'SLEEPING', sleepUntil: jvm.clock.millis() + 10000,
+    callStack: new Stack() };
+  jvm.threads = [producer, audio];
+  jvm.currentThreadIndex = 0;
+  jvm._awtFrameProducerThread = producer;
+  let queued = 0.02;
+  const output = { queuedSeconds: () => queued };
+  jvm._audioPriority = { thread: audio, output, until: jvm.clock.millis() + 50000 };
+
+  t.equal(jvm._prepareSchedulerTick().thread, producer,
+    'a sleeping refill thread cannot be selected');
+  t.ok(jvm._audioPriority, 'a tick inside the refill sleep keeps the override');
+  audio.status = 'runnable';
+  audio.sleepUntil = undefined;
+  jvm.currentThreadIndex = 0;
+  t.equal(jvm._prepareSchedulerTick().thread, audio,
+    'the woken refill thread runs ahead of the producer while its queue is depleted');
+  queued = 0.2;
+  jvm.currentThreadIndex = 0;
+  t.equal(jvm._prepareSchedulerTick().thread, producer,
+    'a healthy queue returns the turn to the producer');
+  t.equal(jvm._audioPriority, null, 'and retires the override');
+  t.end();
+});
+
+test('service under the audio override keeps the starvation clock running', async (t) => {
+  const jvm = new JVM({ schedulerStarvationMs: 20 });
+  const producer = { id: 1, status: 'runnable', callStack: new Stack() };
+  const audio = { id: 2, status: 'runnable', callStack: new Stack() };
+  jvm.threads = [producer, audio];
+  jvm.currentThreadIndex = 0;
+  jvm._awtFrameProducerThread = producer;
+
+  t.equal(jvm._prepareSchedulerTick().thread, producer,
+    'the producer keeps its turn while the mixer has waited only briefly');
+  t.ok(audio._withheldSince !== undefined, 'the withheld mixer starts its clock');
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  let queued = 0.02;
+  jvm._audioPriority = { thread: audio, output: { queuedSeconds: () => queued },
+    until: jvm.clock.millis() + 50000 };
+  jvm._schedulerReliefActive = false;
+  jvm._schedulerReliefCooldown = true;
+  jvm.currentThreadIndex = 0;
+  t.equal(jvm._prepareSchedulerTick().thread, audio,
+    'a depleted queue is served through the override, not through relief');
+  t.notOk(jvm._schedulerReliefActive, 'the override is not a relief turn');
+  t.ok(audio._withheldSince !== undefined,
+    'override service does not count as the producer yielding on its own');
+  queued = 0.2;
+  jvm._schedulerReliefCooldown = false;
+  jvm.currentThreadIndex = 0;
+  t.equal(jvm._prepareSchedulerTick().thread, audio,
+    'once the override lapses the accumulated wait grants relief at once');
+  t.ok(jvm._schedulerReliefActive, 'the refill continues under relief');
+  t.end();
+});
+
 test('renewed audio refill requests cannot indefinitely withhold the loader', async t => {
   const jvm = new JVM({schedulerStarvationMs: 20});
   const audio = {id: 1, status: 'runnable', callStack: new Stack()};
@@ -261,9 +373,17 @@ test('a withheld runnable thread ends the frame-producer priority after a bounde
   t.equal(jvm._prepareSchedulerTick().thread, worker,
     'a worker withheld past the bound is scheduled instead of the producer');
   jvm._advanceSchedulerThread();
-  t.equal(jvm._prepareSchedulerTick().thread, producer,
-    'relief is round-robin, so the producer still runs inside the relief turn');
+  t.equal(jvm._prepareSchedulerTick().thread, worker,
+    'inside the relief turn the producer stands aside while the worker can run');
   t.ok(jvm._schedulerReliefActive, 'relief lasts for the rest of the host turn');
+  worker.status = 'SLEEPING';
+  jvm._advanceSchedulerThread();
+  t.equal(jvm._prepareSchedulerTick().thread, producer,
+    'the producer runs inside the relief turn once no other thread is runnable');
+  worker.status = 'runnable';
+  jvm.currentThreadIndex = 0;
+  t.equal(jvm._prepareSchedulerTick().thread, worker,
+    'a runnable worker takes the relief turn even when the rotation lands on the producer');
 
   await jvm._yieldHostTurn();
   t.notOk(jvm._schedulerReliefActive, 'a new host turn ends the relief');

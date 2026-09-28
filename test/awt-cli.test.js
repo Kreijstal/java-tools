@@ -119,6 +119,14 @@ test('browser AWT input bridge translates DOM input for guest listeners', (t) =>
     t.equal(calls[2].method, 'keyPressed', 'focused key input selects keyPressed');
     t.equal(calls[2].event.keyCode, 38, 'browser arrow code is retained as the AWT code');
     t.equal(calls.length, 3, 'non-character arrows do not manufacture keyTyped');
+    handlers.get('keydown')(domEvent({key: 'Enter', keyCode: 13, buttons: 0}));
+    handlers.get('keyup')(domEvent({key: 'Enter', keyCode: 13, buttons: 0}));
+    t.deepEqual(calls.slice(3).map(call => [call.method, call.event.keyCode, call.event.keyChar]),
+        [['keyPressed', 10, 10], ['keyTyped', 0, 10], ['keyReleased', 10, 10]],
+        'Enter uses AWT VK_ENTER and typed events use VK_UNDEFINED');
+    handlers.get('keydown')(domEvent({key: 'Enter', keyCode: 13, location: 3, buttons: 0}));
+    t.equal(calls[6].event.keyCode, 10, 'numeric-keypad Enter has the same AWT code');
+    t.equal(calls[6].event.keyLocation, 3, 'numeric-keypad location is preserved');
     t.end();
 });
 

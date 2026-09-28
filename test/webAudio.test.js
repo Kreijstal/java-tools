@@ -58,6 +58,7 @@ test("WebAudio unlocks before a delayed SourceDataLine open", async (t) => {
     }
   }
   const audioPlatform = {
+    pcmDiagnostics: true,
     setAudioOutputFactory(value) { factory = value; },
   };
   const fakeWindow = {
@@ -236,11 +237,11 @@ test("WebAudio unlocks before a delayed SourceDataLine open", async (t) => {
     coalesceFrames: 1,
     coalesceDelayMs: 0,
   });
-  t.equal(oversized.available(), 2205,
-    "large lines retain the bounded refill window pending a coordinated scheduler fix");
+  t.equal(oversized.available(), 65536,
+    "large lines report their real free space: a capped window made a Java Sound producer see a 97% full line and refill two chunks per pass");
   oversized.write(new Uint8Array(1024));
-  t.equal(oversized.available(), 2205,
-    "the producer window stays bounded while physical capacity remains larger");
+  t.ok(oversized.available() >= 64508 && oversized.available() <= 64512,
+    "available() subtracts the queued PCM with at most one conservative rounding frame");
   oversized.end();
   const coordinated = factory({channels:2,bitDepth:16,sampleRate:22050,
     bufferSize:65536,coalesceFrames:1,coalesceDelayMs:0,cooperativeRefill:true});

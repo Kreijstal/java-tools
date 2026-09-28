@@ -198,8 +198,10 @@ class JNI {
       });
 
     this.registerNativeMethod('java/lang/Object', 'getClass', '()Ljava/lang/Class;',
-      async (jniEnv, thisObj) => {
-        return await jniEnv.jvm.getClassObject(thisObj._className || thisObj.type);
+      (jniEnv, thisObj) => {
+        const className = thisObj._className || thisObj.type;
+        return jniEnv.jvm.getClassObjectSync(className) ||
+          jniEnv.jvm.getClassObject(className);
       });
 
     // Thread native methods

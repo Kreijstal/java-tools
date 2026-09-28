@@ -56,6 +56,398 @@ Accounting contract:
   `getStructuredRegionCandidate` still swallows the compiler error into
   `codegenCompileErrors` and returns null.
 
+### Exclusive phase accounting inside one compile
+
+The counters above answer *how long* the guest's thread was held, not *by what*.
+`JVM_JIT_COMPILE_PHASE_TIMING=1` (or `jit: {compilePhaseTiming: true}`, or
+setting `jit.compilePhaseTiming = true` from a page, which is how a browser turns
+it on) adds a second layer that splits one compile into named phases:
+
+- `jit.compilePhase(name, fn)` / `beginCompilePhase` / `endCompilePhase` time a
+  phase **exclusively**: entering a child charges the parent for everything up to
+  that moment and suspends it, so a phase is never charged for the phases nested
+  inside it. `inclusiveMs` is also reported, and is the wall interval the phase
+  spanned.
+- A compile triggered from inside another compile is itself a phase
+  (`compile.calleeRecursive`, against the outer `compile.total`), so recursive
+  callee compilation leaves the caller's phases instead of being counted twice.
+- `jit.countCompileWork(name, amount)` records counted (not timed) quantities —
+  emitted statements, indentation passes, characters copied — for paths that run
+  once per generated line and must not carry a clock read.
+- `jit.compileTimeline` holds one row per outermost post-main compile with its
+  own `startMs` and `ms`. A running total cannot say how much compilation fell
+  before a transition's first frame; a timeline can.
+- `jit.compilePhaseCensus()` returns the phase table and the counters as plain
+  data; `jit.resetCompilePhaseStats()` clears both.
+
+The facility is off by default and costs one property read per call site when
+off. It exists because a stall has to be attributed before it can be reduced:
+the Deko Bloko Start Game census reported ~8 s of post-main synchronous
+compilation inside a transition whose click-to-first-frame freeze was ~4-5 s.
+The counter could not be double-counting (it is outermost-only), and the
+timeline showed the rest directly: compilation continues well past the first
+frame, inside the same stage.
+
+### What one large structured-SSA compile is made of
+
+Measured with the above on the two Deko Bloko methods the Start Game transition
+enters for the first time, `qc.a(ZIIZZ)V` (4121 bytecodes, 2.18 MB of generated
+JavaScript, 20391 lines) and `qc.b(IZ)Z` (3463 bytecodes, 1.82 MB):
+
+- The compiler is **linear** in method size for these two. Across every method
+  of the gamepack the tier accepts, the median is 0.13-0.20 ms per bytecode in
+  every size bucket from 40 to 8000 bytecodes, and these two sit on the median.
+  They are expensive because they are large, not because they are pathological.
+  (Two other methods are genuinely superlinear — `ml.a(Lji;B)V` at 1.37 ms/bc
+  and `sh.a(ZLji;)V` at 0.57 — and neither is in this transition.)
+- Leading whitespace is 55.7% / 59.3% of the emitted bytes, at an average
+  nesting depth of 30 and a maximum of 57. It is produced by re-prefixing every
+  line at every nesting level, so `qc.a`'s 20391 lines cost 645855 line
+  rebuilds and 54.5 MB of characters — a 25x amplification.
+- **That amplification costs very different amounts in different engines.**
+  Removing the indentation entirely took the compile from 604 ms to 486 ms in
+  Node/V8 (-19%) but from 1587 ms to 697 ms in Firefox/SpiderMonkey (-56%): V8's
+  cons strings make the repeated prefixing nearly free, SpiderMonkey's do not.
+  A V8-only profile therefore understates this by a factor of three, which is
+  why it reads as a 2% line in a Node profile and as the dominant cost in the
+  browser (`render` is 64-70% of these compiles there, 25% in Node).
+
+### Where the Start Game compiles come from: a launcher with preparation off
+
+The Deko Bloko transition above was re-traced on one clock (browser
+mousedown, AWT enqueue and dispatch, every scheduler tick with its thread and
+top-of-stack method, every presented frame classified from its pixels, every
+outermost compile with its own start). Cut at the first Stage 1 briefing frame
+— not at the first *presentation* after the click, which is a menu repaint
+6-110 ms in — the interval is 5.5-6.8 s, of which 71-74% is synchronous
+compilation (76-79 outermost compiles, 3.9-5.0 s), 23-24% is the guest
+running (mostly freshly generated code and the interpreter for the islands of
+partial Wasm modules), and 3-5% is the main thread outside a guest tick. The
+earlier "0 of 84 compiles start before the first frame" was true of the menu
+repaint and false of the briefing.
+
+Every one of those compiles is a **first** compile (the session's per-method
+codegen counts are all 1), because the page hosts the JVM through
+`DebugController`, whose constructor sets `prepareBeforeMain: false` for
+debugging fidelity. Nothing is compiled ahead of `main()` in that launcher:
+its boot runs 1004 synchronous post-main compiles (32.9 s) and the Start Game
+click runs the 77 that the gameplay path touches next. Node, whose launcher
+prepares by default, compiles 2335 methods before `main()` and reaches the
+menu without any of this.
+
+Turning preparation on in the browser (`prepareBeforeMain: true` passed
+through the controller's options, `prepareWasmPreparedUpgradesOnly: true` so
+the Wasm half is the prepared oversized-loop upgrades only, as
+`apps/launcher/browser-runtime.js` asks for) first crashed the guest at
+"Unpacking graphics" with `NullPointerException: Attempted to store into null
+array` from a prepared body of `mf.a(...)`. The mechanism, found by trapping
+writes to `jvm.classes.um` with JS stacks: the page registers a targeted JRE
+override for the *game* class `um` (`natives: {applicationFallback: true}`),
+so `um` exists as a JRE stub from JVM construction; the preparation pass
+compiles against that stub and prepared bodies resolve their static-field
+targets to the stub's `StaticFieldStore` (and keep its value cells). When the
+real class is loaded over the stub at first use, `loadClassByName` used to
+register a class with a fresh store, so a prepared `putstatic um.c` wrote into
+the stub's dead store and the next `getstatic um.c` read null from the live
+one. `loadClassByName` now makes the real class adopt the stub's store
+(`test/applicationFallbackStubStore.test.js`); the store object is the
+identity those cells rely on. Node never saw this because only the browser
+page carries that override.
+
+With that fixed, preparation on: click to Stage 1 briefing 5495 -> 1637 ms
+(one 19 ms compile in the interval instead of 76 compiles / 3.85 s), nothing
+compiled after the briefing (0 instead of 10 compiles / 3.5 s), longest rAF gap
+after the briefing 1591 -> 69 ms, SPACE to the board 594 -> 507 ms with 0
+compiles. The cost is the boot: first frame 67 -> 117 s, menu 104 -> 183 s
+(2530 pre-main compiles, 83 s in Firefox). What remains of the transition is
+1.5 s of guest execution that is now mostly *interpreted* (1255 ms of
+interpreter ticks, `mm.a(Ljava/lang/String;II)V` 298 ms, `qc.a(ZIIZZ)V` 254
+ms), i.e. prepared bodies deopting back to the interpreter — the next thing to
+account for. `JVM.run()`'s preparation pass takes `prepareWasm`,
+`prepareEffectful` and `prepareLoopsOnly` for the same reason the phases above
+exist: each half can be measured on its own.
+
+### Complete preparation: a fixed point before main(), and what it exposed
+
+The `?prepare=1` experiment above left three things unfinished, and the
+follow-up made preparation the browser page's default only after fixing
+them rather than routing around them.
+
+**The class-record identity invariant.** Adopting the stub's static store was
+one field of a general problem: prepared code holds the class record, its
+store and value cells, its Class object, its initialization token and its
+method objects by reference, and an `applicationFallback` stub is all of
+those before the class file is read. `JVM.upgradeStubClassInPlace` (called
+from `loadClassByName`) now fills the existing record in place — stub-only
+members go, the real class's members arrive, the stub's store is kept with
+the real class's declared statics merged in, the method index keyed on the
+record is dropped — so `jvm.classes[name]` never changes identity.
+`preloadReferencedClasses` treats such a stub as not loaded, so the
+preparation pass compiles against the real class in the first place.
+`test/preparationStableIdentity.test.js` prepares a body against the stub by
+hand (statics, static call, virtual call, an overridden method, `instanceof`,
+a class literal), runs the program, and checks that the *same* body still
+computes the right result through the *same* record, store, cells, Class
+object and token, with `<clinit>` run once at its Java-visible point.
+
+**Prepared callees were treated as asynchronous.** `linkSyncCallTarget`
+decided whether a callee is synchronous with the adaptive (non-effectful)
+admission, which rejects any method that constructs an object with a
+non-trivial constructor. Preparation compiles exactly those methods (it uses
+the effectful admission), so a prepared caller reaching a prepared callee
+found "no target", returned the async sentinel, and the caller deopted to
+the interpreter: on Deko Bloko's first Start Game that was ~74,000 deopts
+of prepared bodies per stage ("asynchronous structured SSA callee",
+"structured resume handoff", "asynchronous callee from synchronous
+invoke*"), the callees being ordinary draw/text helpers such as
+`mm.a(Ljava/lang/String;II)V` with a body already in the cache. A callee
+with a published synchronous body is now a synchronous callee
+(`hasPublishedSynchronousBody`), and the resolved-target adoption path uses
+the prepared admission for prepared methods. `jit.asyncCallCensus` (jit
+option `asyncCallCensus`, or `JVM_JIT_ASYNC_CALL_CENSUS=1`) records every
+remaining handoff with its reason, so the pass is judged on data.
+
+**Fixed point.** `_precompileInitializedClasses` now repeats compile rounds
+until a round prepares nothing new (bounded, exit on no progress), re-running
+the referenced-class preload between rounds; then links every synchronous
+call site of every prepared body (`prelinkPreparedCallSites`: static and
+special sites to their one target, virtual sites to each concrete loaded
+receiver in the declared class's cone, bounded per site; nothing compiles —
+a callee without a body is left to the ordinary path); then compiles the
+Wasm modules preparation is asked for and settles them against their
+dependencies (`settlePreparedWasmModules`: rebuild while a module's blockers
+moved, up to the runtime's own per-module bound) before the tier is frozen.
+`jvm.preparationReport` says what happened: rounds, bodies, the unprepared
+list, linked sites, Wasm modules settled, and the tier each prepared
+oversized method ends on (`wasmFull` when its module covers it end to end,
+`jsOwned` otherwise — a partial module is never an entry tier for a prepared
+method; that selection was already in `tryRunFrame`, the report makes it
+visible). `test/preparationFixedPoint.test.js` covers rounds, termination on
+no progress, the unprepared report, and a prepared caller reaching a
+prepared-only callee with the single asynchronous handoff Java requires (the
+first-use `<clinit>`).
+
+**What pre-linking exposed.** A static JRE shim may depend on its class's
+`<clinit>` shim (`Runtime.getRuntime()` reads the static the initializer
+stores). The fast JRE path in `tryInvokeSyncAtSite` had no initialization
+check because the generic path, until now its only publisher, checked
+before every static call. A site linked ahead of main called the shim
+before the initializer, got `undefined`, pushed nothing, and the next call
+underflowed its operands (`si.b(I)V` on Deko Bloko, caught by the Node
+launcher). The check is on the fast path now, and the fixed-point test has
+a case for it.
+
+**Measured (Deko Bloko, Firefox, 2026-09-12, previous candidate with
+`?prepare=1` vs completed preparation by default, two back-to-back pairs).**
+Prepared-body deopts over the Start Game stage 72458/75023 -> 2884/3206;
+click to Stage 1 briefing 1584/2062 -> 1241/1538 ms; briefing to 30 more
+frames 2392/3184 -> 1691/2085 ms; interpreter samples before the briefing
+188 -> 150 ms, runtime helpers under generated code 980 -> 804 ms; no
+synchronous compile in either arm but one 20 ms Wasm callee link; pre-main
+compiles 2530 -> 2556 (84-88 s of a 173-183 s boot). The remaining 1318
+handoffs per stage are all methods with no synchronous tier at all: 161
+constructors that call methods and 100 of their callers (constructor
+admission), two oversized `client` methods with irreducible control flow
+(the structured renderer's CFG structuring), and one long-arithmetic body.
+The gamepack oracle (`.work/start-stall/compile-oracle.js`) is byte-identical
+to the previous candidate on all 3022 methods (502 compiled, 2520 rejected):
+the changes alter which methods preparation compiles, not what a compile
+generates. Node's launcher reaches the menu with the same code in 97-123 s.
+
+**Eager parsing.** Generated bodies are returned from their `new Function`
+factory as a parenthesised function expression, which SpiderMonkey and V8
+compile eagerly (the "possibly immediately invoked" heuristic) instead of
+syntax-parsing and delazifying on the first call; preparation creates them
+before main, where the parse is free.
+
+### Compiler coverage after preparation: constructors, irreducible bodies, `pop2`
+
+With preparation complete, every remaining Start Game handoff was a method
+with no synchronous tier, so the follow-up ranked those by wall time and
+then removed the compiler gaps in that order.
+
+**Handoff wall time.** A handoff count says nothing about cost: one
+interpreted long-arithmetic body can cost more than three hundred
+interpreted constructor calls. `asyncCallCensus` now also attributes
+elapsed time. When a synchronous call site hands a call back
+(`recordAsyncCall`), the caller's frame remembers the site and the
+`performance.now()` stamp (`frame.jitHandoffPending`); `CallStack.push`
+matches the next pushed frame against it by member name and descriptor (a
+structured caller does not materialise a pc, so the pc is not usable as the
+key) and opens a record; `CallStack.pop`, the universal frame retire point,
+closes it. Nested handoffs subtract their own elapsed time from the parent's
+record, so `jit.asyncCallCensusTime` (per site+callee: count, exclusive ms,
+longest single interruption) is exclusive of nested execution and sums
+without double counting. On Deko Bloko's Start Game stage the ranking was
+`dn.a(I)J -> dn.c(I)J` 458 ms in 107 calls (a `pop2` the tiers did not
+emit), the constructor callers `ia.a -> ei.b` 122 ms and `bd.b -> fh.a`
+50 ms, and `in.<init>` 29 ms in one call, out of 703 ms; the two
+irreducible `client` methods were missing from the first ranking because
+of the pc-keyed match above, which is how that bug was found.
+
+**Constructor admission on the resolved call graph.** `isJitSafeConstructor`
+rejected any constructor that calls a method, and every caller that
+allocates such an object with it. A constructor is now admitted when it is
+an ordinary instance constructor (not `synchronized`) and every invoke in it
+resolves to a published synchronous entry: a synchronous JRE shim, a bytecode
+method with a published synchronous body, a static intrinsic, or an abstract
+target whose loaded concrete implementors (the declared class's cone, at
+most eight, each checked recursively) all have one
+(`isSynchronouslyResolvedConstructor`, notes in
+`jit.constructorAdmissionNotes`). Class initialization, exception
+propagation and the partially initialized `this` need nothing new: the
+admitted body is the same effectful structured/baseline body every prepared
+method runs, its `<clinit>` and `athrow` paths are the existing ones, and
+`this` is only ever the receiver the bytecode passes. Because admission
+depends on callee bodies that later rounds prepare, the fixed-point loop
+clears the admission cache between rounds, so a constructor rejected in
+round 1 for a callee without a body is admitted once the callee is
+prepared, and its callers after it (Deko Bloko needs 8 rounds). A
+constructor that reaches a genuinely asynchronous host operation (a
+`RandomAccessFile.read`, `Class.forName`, a `Thread.sleep`) stays rejected
+with the reason recorded. `JVM_DISABLE_PREPARED_CONSTRUCTORS=1` restores the
+old rule. `test/preparedConstructors.test.js` covers a constructor calling a
+synchronous instance method, a static method, superclass chaining, a throwing
+constructor, a constructor calling an asynchronous callee (rejected, note
+names the callee, its caller still hands off), and the census showing no
+handoff at the admitted sites.
+
+**Nested irreducible regions.** `dispatchIrreducibleCfg` (the dispatch-island
+transform that turns a multi-entry loop into a block dispatcher inside an
+otherwise structured body) looked for a multi-entry strongly connected
+component among the method's top-level SCCs. `client.i(B)V` and
+`client.a(IIZIZIB)V` have a single-entry outer loop whose *body* contains
+the multi-entry region, so the search found nothing and the method fell to
+`IrreducibleError`. The candidate search now peels a single-entry component
+by its entry and searches inside it recursively; the island itself is
+unchanged. `test/structuredNestedIrreducible.test.js` builds a nested
+two-entry loop by hand and checks values against a JS reference.
+
+**Counted-loop canonicalisation.** Compiling `client.i` then failed with an
+undefined label: `canonicalCountedLoop` in `lineSpecialisations.js` split the
+loop body at the first `else` after the header test, which is the wrong arm
+when a merge block follows the header's own `if`/`else`, and it did not
+account for a negated header test (`if (!(i >= n))`). The rewrite now finds
+the header's own arms (`ifArms`) and requires the loop to end with them; a
+negated test flips which arm is the body. The gamepack oracle shows three
+methods that previously failed with "Undefined label" compiling as a result.
+
+**`pop2`.** `dn.c(I)J` discards a `long` with `pop2`, which neither tier
+emitted. Because a `long` and a `double` are one slot in this JVM (a BigInt
+or a Number), `pop2` pops one value of width 2 or two values of width 1; the
+stack-width analysis (`computeStackDepths`, `ssaOperandCategories`) is run
+for any method containing `pop2`, and both the baseline emitter and the
+structured lowering pop by the verified width. `test/pop2Codegen.test.js`
+covers long, double and two-int operands on both tiers.
+
+**Offline preparation census (Deko Bloko gamepack).** Unprepared methods
+296 -> 129 (constructor admission) -> 74 (baseline framed entry allowed for
+structured bodies that need it) -> 40 (cone resolution of interface
+targets); every method on the Start Game handoff ranking is prepared. The
+remaining 40 are: 29 bodies with `monitorenter`/`monitorexit`
+(`synchronized` blocks), which the effectful admission keeps off unless
+`effectfulMonitorCodegen` / `JVM_ENABLE_EFFECTFUL_MONITOR_CODEGEN=1` is set
+(`ia.a(IIIIII)V`, the caller of `ei.b`, is one of them and is now the only
+method on the Start Game top-of-stack list without a synchronous tier);
+three constructors that reach an asynchronous JRE shim (`hf.<init>`:
+`RandomAccessFile.read`; `fd.<init>`: `Class.forName`; `le.<init>`: `im.a`,
+a monitor body), one constructor calling `hf.<init>` (`nh.<init>`), and
+seven callers of those (five "calls a non-safe constructor", two whose
+constructor target is a class never loaded, `Socket`/`Proxy`). The gamepack
+oracle against the previous candidate:
+487 methods byte-identical, 9 newly compiled, 0 lost, 15 whose only change
+is call-site numbering (identical after digit normalisation).
+
+**Admitted but never emitted.** The first browser run of that candidate
+stalled after the logo: the client thread sat in the loading state machine
+(`client.n(I)Z`, the stage that builds the music tracks and fonts) for eight
+minutes and more, the Firefox content process grew past 28 GB, and the Node
+launcher never reproduced it. The census that found it
+(`jit.deoptedMethods` with `lastMethodDeoptReasons`, page snapshot every
+15 s) showed 13 prepared bodies deoptimised for good: eleven with
+"unsupported generated opcode multianewarray" (`client.n(I)Z`, three
+`pl.a(...)Lud;` sprite loaders, `bi.<init>`/`bi.a`, `kj.a(Lwl;)V`,
+`va.b([B)V`, `je.<init>`, `hj.<init>`, `ja.<init>`) and two with
+"unsupported opcode lconst_0 in en.<init>" (`en.<init>`, `hn.start`).
+`multianewarray` was on both opcode admission lists but the baseline
+emitter had no case for it, so a body with `new int[a][b]` was admitted,
+compiled, and deoptimised at its first allocation; `lconst_0` (and every
+long load/store/arithmetic opcode, `pop2`, `dup_x2`, `dup2_x2`, `i2c`,
+`i2s`, `instanceof`, both switches) was missing from the JIT runner
+(`runFrame`), the interpreter a JIT-owned frame resumes in after a
+transient deopt. A non-transient deopt sets `frame.jitJsDisabled`, the
+frame is interpreted from then on, and every call boundary in it ends the
+scheduler quantum: the sampled scheduler rows put `client.n(I)Z` and
+`di.<clinit>()V` (a 92-bytecode table builder) on the awaited slow path at
+about a millisecond per bytecode, which is the stall. The current bundle
+carried five of the same deopts but not the loading loop's. Now:
+`allocMultiArray` (src/instructions/object.js) is the one allocator for the
+interpreter, the baseline emitter (`helpers.newMultiArrayFrom`), the
+structured renderer (`helpers.newMultiArrayCounts`, plus the missing
+stack-effect rule) and the runner; the runner has the listed opcodes, using
+the same verified operand widths as the generated tier for the category-2
+shuffles. `test/multianewarrayCodegen.test.js` (every tier, `long[n][n][]`
+partial dimensions, `NegativeArraySizeException`, a javac fixture that must
+keep its synchronous body and record no "unsupported" deopt) and
+`test/runnerOrdinaryOpcodes.test.js`. With the rebuilt bundle the same
+page reaches the menu (first frame 159 s, menu 215 s) and the Start Game
+click runs with no synchronous compile.
+
+**The preload the browser never had.** With the stall gone, the census
+arm's top handoff by wall time was one site, 488 calls and 1.2 s of a
+1.9 s click: `bd.b(ZI)V@51 invokevirtual hm.a(I)I`, whose receiver is
+`ag`, the mouse-wheel listener, and whose target `ag.a(I)I` is a
+20-bytecode `synchronized` getter. Offline the same preparation prepared
+it; in the page none of `ag`'s five methods were prepared, and the getter
+fails the post-main worth gate, so it never got a body. The game loads
+`ag` with `Class.forName` (the 1.3-era mouse-wheel dance), so it is in no
+constant pool; `preloadClasspathClasses` would have found it in the jar,
+except that in the browser the classpath is `.` on a virtual file system
+with no directory to read -- the walk failed silently and only
+`preloadReferencedClasses` ran. `BrowserFileProvider.listClassNames`
+enumerates the classes it can serve and the preload asks a provider that
+has it before walking a directory
+(`test/preparationPreloadsProviderClasses.test.js`: a reflection-only
+class with a synchronized getter is prepared before main).
+
+**Measured** (2026-09-12, same fast host, Firefox, page defaults, arms back
+to back: the current bundle, then the candidate twice, then the candidate
+with the census on; the machine carried a load average of 12-18 from other
+work throughout, so only the pairing is evidence):
+
+| | current bundle | candidate | candidate, repeat |
+| --- | --- | --- | --- |
+| menu (boot, free) | 193.6 s | 187.2 s | 187.3 s |
+| click -> first transition frame | 621 ms | 605 ms | 317 ms |
+| click -> Stage 1 briefing | 1197 ms | 1148 ms | 1188 ms |
+| briefing -> 30 more frames | 1502 ms | 1406 ms | 1359 ms |
+| SPACE -> board frame | 468 ms | 345 ms | 466 ms |
+| longest rAF gap after the click | 107 ms | 61 ms | 62 ms |
+| synchronous compile in the stage | 20 ms / 1 | 0 | 0 |
+| prepared-body deopts, stage total | 2951 | 1583 | 1583 |
+| click -> briefing partition: interpreter | 656 ms | 34 ms | 31 ms |
+| click -> briefing partition: generated | 374 ms | 966 ms | 1042 ms |
+| click -> briefing partition: slow async | 73 ms | 48 ms | 14 ms |
+| preparation | 2 rounds, 2335/5156 bodies, 293 unprepared | 8 rounds, 2608/5174, 38 unprepared | same |
+
+Census arm (candidate, `?asyncCensus=1`): 2 handoffs at synchronous call
+sites in the whole stage (was 1318 before this work, 490 before the
+preload fix), 6 ms of handoff wall time, both singletons
+(`pn.a(ZZZ)V@58 -> nn.a(ILui;Z)V`, a monitor body; `wg.mousePressed ->
+SwingUtilities.isRightMouseButton`, class not initialized). No constructor
+handoff, no irreducible-CFG handoff. The remaining 1583 stage deopts are
+structured-tier continuations and resume handoffs (895 + 567), safe points
+(143) and thread yields (56) -- scheduler quanta, not coverage. The 38
+unprepared are the 29 monitor bodies and the 9 asynchronous-shim
+constructors and their callers listed above. Gameplay: the click reaches
+Stage 1, SPACE reaches the board, input is accepted (the drive presses the
+keys and sees the frames). Full suite 12493 tests, all passing; the
+gamepack oracle against the morning's candidate: 2998 byte-identical,
+4 newly compiled (all `multianewarray` bodies now accepted by the
+structured tier), 0 lost, 20 with a changed hash, every one a method
+without `multianewarray` in the two classes (`ja`, `ke`) that gained a
+compiled sibling, i.e. call-site numbering.
+
 `jit.syncCompileCensus()` returns all of the above plus `mainStarted` as plain
 data; `jit.compileWorker.census()` returns worker + install + sync-compile
 census together for the benchmark.

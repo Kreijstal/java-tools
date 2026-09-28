@@ -1,4 +1,5 @@
 'use strict';
+const {bindStaticFieldAccessors} = require('./staticFieldAccessors');
 
 // Wasm↔JS boundary import builders shared by the wasm backends. A registry is
 // any object with addImport(name, params, results, fn) -> importIndex and an
@@ -165,6 +166,30 @@ function addTypedArrayStoreImports(reg, methodName, traceKey = methodName) {
   checkedStore('sastore', T.i32, (_a, v) => (v << 16) >> 16);
 }
 
+function makeTypedI32ArrayLoad(op) {
+  // Separate keyed reads keep each backing class monomorphic.
+  switch (op) {
+    case 'iaload': return (a, i) => {
+      if (!(a instanceof Int32Array) || a.type !== '[I') return NOT_MINE;
+      return i < a.length ? a[i] : monoArray.OOB;
+    };
+    case 'baload': return (a, i) => {
+      if (!(a instanceof Int8Array) || a.type !== '[B' ||
+          a.elementType === 'boolean') return NOT_MINE;
+      return i < a.length ? a[i] : monoArray.OOB;
+    };
+    case 'caload': return (a, i) => {
+      if (!(a instanceof Uint16Array) || a.type !== '[C') return NOT_MINE;
+      return i < a.length ? a[i] : monoArray.OOB;
+    };
+    case 'saload': return (a, i) => {
+      if (!(a instanceof Int16Array) || a.type !== '[S') return NOT_MINE;
+      return i < a.length ? a[i] : monoArray.OOB;
+    };
+  }
+  throw new Unsupported(`array load ${op}`);
+}
+
 // The four i32-backed array loads all shared one generic `aget_i` import, and
 // that import re-derived the element kind from the array descriptor on EVERY
 // element: normalizeArrayLoad compares `arrayRef.type` against up to six
@@ -195,6 +220,10 @@ function makeI32ArrayLoad(op, methodName, trace) {
       : op === 'saload'
         ? (v, a) => (a.type === '[S' ? (Number(v) << 16) >> 16 : NOT_MINE)
         : (v, a) => (a.type === '[I' ? Number(v) | 0 : NOT_MINE);
+  // Matching typed storage already enforces Java's element width. Each
+  // opcode gets a separate keyed read; ordinary Arrays keep the original
+  // fast path below, without another wrapper call on every element.
+  const typedLoad = makeTypedI32ArrayLoad(op);
   return (a, i) => {
     if (trace) trace(name, a, i);
     if (a === null || a === undefined) {
@@ -206,6 +235,11 @@ function makeI32ArrayLoad(op, methodName, trace) {
       const v = a[u];
       const narrowed = narrow(v, a);
       return narrowed === NOT_MINE ? normalizeArrayLoad(v, null, a) : narrowed;
+    }
+    const typedValue = typedLoad(a, i >>> 0);
+    if (typedValue !== NOT_MINE) {
+      if (typedValue === monoArray.OOB) throw AIOOBE(i, a.length);
+      return typedValue;
     }
     const value = monoArray.load(a, i);
     if (value === monoArray.OOB) throw AIOOBE(i, monoArray.len(a));
@@ -314,23 +348,17 @@ function addFieldImport(reg, jvm, ins, isStaticOp, isGet, elementOf = null) {
       const token = jvm.getClassInitializationToken(currentClassName);
       initializationIdx = reg.addImport(
         `static_ready_${currentClassName}`.replace(/[^\w]/g, '_'), [], [T.i32],
-        () => token.initialized ? 1 : 0);
+        token.wasmReadinessGuard?.() || (() => token.initialized ? 1 : 0));
       (reg.staticInitializationGuards ||= new Set()).add(currentClassName);
     }
-    const getStatic = t === T.i32
-      ? () => {
-        const value = container.get(key);
-        return typeof value === 'boolean' ? (value ? 1 : 0) : value;
-      }
-      : t === T.ref ? () => container.get(key)
-        : () => toWasmValue(t, container.get(key));
+    const access = bindStaticFieldAccessors(container, key, t);
     return {
       t,
       name,
       initializationIdx,
       idx: isGet
-        ? reg.addImport(name, [], [t], getStatic)
-        : reg.addImport(name, [t], [], (v) => container.set(key, v)),
+        ? reg.addImport(name, [], [t], access.get)
+        : reg.addImport(name, [t], [], access.set),
     };
   }
   const name = `${isGet ? 'gf' : 'pf'}${elementOf ? 'at' : ''}_${className}_${fieldName}`
@@ -560,20 +588,83 @@ function addSystemImport(reg, jvm, ins) {
   }
   const native = jvm.jre[owner]?.staticMethods?.[name + descriptor];
   if (typeof native !== 'function') throw new Unsupported('System.arraycopy native unavailable');
-  let initializationIdx = null;
-  if (jvm.classInitializationState.get(owner) !== 'INITIALIZED') {
-    const token = jvm.getClassInitializationToken(owner);
-    initializationIdx = reg.addImport('static_ready_java_lang_System', [], [T.i32],
-      () => token.initialized ? 1 : 0);
-    (reg.staticInitializationGuards ||= new Set()).add(owner);
-  }
+  const initializationIdx = addNativeInitializationGuard(reg, jvm, owner);
   const params = [T.ref, T.i32, T.ref, T.i32, T.i32];
   return {params, partial:false, writes:null, initializationIdx,
     idx:reg.addImport('sys_arraycopy', params, [], (src, srcPos, dst, dstPos, len) =>
       native(jvm, null, [src, srcPos, dst, dstPos, len]))};
 }
 
+// Shared by the explicitly admitted synchronous bulk natives. Checking at
+// block entry preserves operands and effects when class initialization needs
+// to run through the scheduler first.
+function addNativeInitializationGuard(reg, jvm, owner) {
+  if (jvm.classInitializationState.get(owner) === 'INITIALIZED') return null;
+  const token = jvm.getClassInitializationToken(owner);
+  const idx = reg.addImport(`static_ready_${owner.replace(/\//g, '_')}`, [], [T.i32],
+    token.wasmReadinessGuard?.() || (() => token.initialized ? 1 : 0));
+  (reg.staticInitializationGuards ||= new Set()).add(owner);
+  return idx;
+}
+
+// Range fill mutates array elements, never guest fields or array identity.
+// Keep the JRE's validation order and all-or-nothing invalid-range behavior.
+// Other overloads retain ordinary linking until their native contract is tested.
+function addArrayFillImport(reg, jvm, ins) {
+  const [, owner, [name, descriptor]] = ins.arg;
+  if (owner !== 'java/util/Arrays' || name !== 'fill' || descriptor !== '([IIII)V') return null;
+  const native = jvm.jre[owner]?.staticMethods?.[name + descriptor];
+  if (typeof native !== 'function') throw new Unsupported('Arrays.fill native unavailable');
+  const params = [T.ref, T.i32, T.i32, T.i32];
+  return {params, partial: false, writes: new Set(),
+    initializationIdx: addNativeInitializationGuard(reg, jvm, owner),
+    idx: reg.addImport('arrays_fill_int_range', params, [], (array, from, to, value) =>
+      native(jvm, null, [array, from, to, value]))};
+}
+
+// String is final and this exact native operation cannot suspend or mutate
+// guest fields. Other owners/signatures keep normal linked-call resolution.
+function addStringCallImport(reg, jvm, instruction, op) {
+  const [, owner, [name, descriptor]] = instruction.arg;
+  if (op !== 'invokevirtual' || owner !== 'java/lang/String' ||
+      name !== 'equalsIgnoreCase' || descriptor !== '(Ljava/lang/String;)Z') return null;
+  const native = require('../jre/java/lang/String').methods[name + descriptor];
+  return {
+    idx: reg.addImport('string_equalsIgnoreCase', [T.ref, T.ref], [T.i32], (receiver, other) => {
+      if (receiver === null || receiver === undefined) throw NPE();
+      return native(jvm, receiver, [other]);
+    }),
+    argTypes: [T.ref, T.ref], underTypes: [], writes: new Set(), deoptable: false,
+  };
+}
+
+// Resolve literals at execution, using the same pool as ldc in the interpreter.
+// Numeric import names avoid embedding large literals or malformed UTF-16 in
+// Wasm's UTF-8 import-name section. The map is compilation-only; callbacks
+// retain just the JVM and literal, not the compiler or its analyses.
+function addStringConstantImport(reg, jvm, literal, op) {
+  // The interpreter also accepts legacy ldc_w pool-index operands. SSA has
+  // not resolved their type/value; retain fallback instead of treating the
+  // index text as a literal string.
+  const pool = reg.method?.constantPool;
+  if (op === 'ldc_w' && pool && /^\d+$/.test(literal)) {
+    const index = Number(literal);
+    if (index >= 1 && index < pool.length) {
+      throw new Unsupported('ldc_w unresolved constant-pool index');
+    }
+  }
+  const imports = reg.stringConstantImports ||= new Map();
+  if (imports.has(literal)) return imports.get(literal);
+  const index = reg.addImport(`string_constant_${imports.size}`, [], [T.ref],
+    () => jvm.internString(literal));
+  imports.set(literal, index);
+  return index;
+}
+
 module.exports = {
+  addStringConstantImport,
+  addStringCallImport,
+  addArrayFillImport,
   arrayTracer,
   addI32ArrayLoadImports,
   addRuntimeImports,

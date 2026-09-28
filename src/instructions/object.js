@@ -43,7 +43,7 @@ function resolveInstanceFieldKey(jvm, objRef, className, fieldName) {
 // check keeps synthetic/JRE objects with unusual layouts on the full resolver.
 const resolvedInstanceFieldKey = Symbol('resolvedInstanceFieldKey');
 const resolvedStaticFieldSite = Symbol('resolvedStaticFieldSite');
-const SYNC_STATIC_FALLBACK = Symbol('syncStaticFallback');
+const SYNC_STATIC_FALLBACK = require('./syncFallback');
 function resolveInstanceFieldKeyAtSite(jvm, objRef, instruction, className, fieldName) {
   if (instruction && typeof instruction === 'object') {
     const cached = instruction[resolvedInstanceFieldKey];
@@ -67,8 +67,10 @@ function resolveInstanceFieldKeyAtSite(jvm, objRef, instruction, className, fiel
 }
 
 function resolveStaticFieldSite(jvm, instruction, className, fieldName, descriptor) {
-  if (instruction && typeof instruction === 'object' && instruction[resolvedStaticFieldSite]) {
-    return instruction[resolvedStaticFieldSite];
+  const cached = instruction && typeof instruction === 'object'
+    ? instruction[resolvedStaticFieldSite] : null;
+  if (cached && cached.epoch === jvm.classEpoch) {
+    return cached;
   }
   const fieldKey = `${fieldName}:${descriptor}`;
   let currentClassName = className;
@@ -107,6 +109,7 @@ function resolveStaticFieldSite(jvm, instruction, className, fieldName, descript
     if (key !== undefined) site = { kind: 'jre', owner: className, key };
   }
   if (site && instruction && typeof instruction === 'object') {
+    site.epoch = jvm.classEpoch;
     try {
       Object.defineProperty(instruction, resolvedStaticFieldSite, {
         configurable: true, writable: true, value: site,
@@ -138,6 +141,30 @@ function getstaticSync(frame, instruction, jvm, thread) {
   const site = resolveStaticFieldSite(jvm, instruction, className, fieldName, descriptor);
   if (!site) throw new Error(`Unresolved static field: ${className}.${fieldName}`);
   frame.stack.push(readStaticFieldSite(jvm, site));
+  return undefined;
+}
+
+function putstaticSync(frame, instruction, jvm, thread) {
+  const [_, className, [fieldName, descriptor]] = instruction.arg;
+  const state = classInitializationTokenFor(jvm, instruction, className).state;
+  if (state !== 'INITIALIZED' &&
+      !(state === 'INITIALIZING' &&
+        jvm.classInitializationOwners.get(className) === thread.id)) {
+    return SYNC_STATIC_FALLBACK;
+  }
+  const site = resolveStaticFieldSite(jvm, instruction, className, fieldName, descriptor);
+  // Keep missing fields and JRE compatibility writes on the canonical path.
+  // No operand is consumed until the initialized declaring storage is known.
+  if (!site || site.kind !== 'class' || site.key !== `${fieldName}:${descriptor}`) {
+    return SYNC_STATIC_FALLBACK;
+  }
+  if (frame.stack.isEmpty()) {
+    const m = frame.method || {};
+    throw new Error(`Stack underflow at putstatic ${className}.${fieldName}:${descriptor} in ${frame.className}.${m.name}${m.descriptor} pc=${frame.pc}`);
+  }
+  const fields = jvm.classes[site.owner].staticFields;
+  fields.set(site.key, frame.stack.pop());
+  jvm.jit?.markStaticLocationChanged(fields, site.key);
   return undefined;
 }
 
@@ -182,6 +209,68 @@ function allocReferenceArray(jvm, elementType, count) {
   array.elementType = elementType;
   array.hashCode = jvm.nextHashCode++;
   return array;
+}
+
+// One allocator for multianewarray in every tier (interpreter, generated
+// bodies, the JIT runner): outer dimensions are reference arrays of the
+// nested array class, the leaf dimension is a primitive array (a linear-heap
+// view when the heap is on) or a reference array, every level tagged with
+// its own runtime class so rows of an [[I pass checkcast [I. A negative
+// count anywhere throws NegativeArraySizeException before anything is built.
+function allocMultiArray(jvm, className, counts) {
+  for (const count of counts) {
+    if (count < 0) {
+      throw { type: 'java/lang/NegativeArraySizeException', message: String(count) };
+    }
+  }
+  const baseType = className.replace(/^\[+/, '');
+  const leafDefault = (() => {
+    if (baseType.startsWith('L')) return null;
+    switch (baseType) {
+      case 'Z':
+      case 'B':
+      case 'S':
+      case 'I':
+      case 'C':
+        return 0;
+      case 'J':
+        return BigInt(0);
+      case 'F':
+      case 'D':
+        return 0.0;
+      default:
+        return null;
+    }
+  })();
+  // `new long[n][n][]` allocates two of three dimensions: the innermost
+  // allocated level is then a reference array of nulls, not the leaf.
+  const totalDimensions = className.length - baseType.length;
+  const createMultiArray = (dims, depth = 0) => {
+    const count = dims[0];
+    const remaining = dims.slice(1);
+    let arr;
+    if (remaining.length === 0 && depth < totalDimensions - 1) {
+      arr = new Array(count).fill(null);
+    } else if (remaining.length === 0) {
+      arr = (jvm.wasmHeap && !baseType.startsWith('L') &&
+        jvm.wasmHeap.alloc(`[${baseType}`, count)) ||
+        new Array(count).fill(leafDefault);
+    } else {
+      arr = new Array(count).fill(null);
+      for (let i = 0; i < count; i++) {
+        arr[i] = createMultiArray(remaining, depth + 1);
+      }
+    }
+    // Each nested Java array has its own runtime class. For example, rows of
+    // an [[I are [I instances and must pass checkcast [I. Without this tag,
+    // runtimeClassName returned undefined for rows produced by
+    // multianewarray even though newarray/anewarray were already tagged.
+    arr.type = className.slice(depth);
+    arr.elementType = arr.type.slice(1);
+    arr.hashCode = jvm.nextHashCode++;
+    return arr;
+  };
+  return createMultiArray(counts);
 }
 
 module.exports = {
@@ -446,53 +535,7 @@ module.exports = {
     for (let i = 0; i < dimensions; i++) {
       counts.unshift(frame.stack.pop());
     }
-
-    const baseType = className.replace(/^\[+/, '');
-    const leafDefault = (() => {
-      if (baseType.startsWith('L')) return null;
-      switch (baseType) {
-        case 'Z':
-        case 'B':
-        case 'S':
-        case 'I':
-        case 'C':
-          return 0;
-        case 'J':
-          return BigInt(0);
-        case 'F':
-        case 'D':
-          return 0.0;
-        default:
-          return null;
-      }
-    })();
-
-    const createMultiArray = (dims, depth = 0) => {
-      const count = dims[0];
-      const remaining = dims.slice(1);
-      let arr;
-      if (remaining.length === 0) {
-        arr = (jvm.wasmHeap && !baseType.startsWith('L') &&
-          jvm.wasmHeap.alloc(`[${baseType}`, count)) ||
-          new Array(count).fill(leafDefault);
-      } else {
-        arr = new Array(count).fill(null);
-        for (let i = 0; i < count; i++) {
-          arr[i] = createMultiArray(remaining, depth + 1);
-        }
-      }
-      // Each nested Java array has its own runtime class. For example, rows of
-      // an [[I are [I instances and must pass checkcast [I. Without this tag,
-      // runtimeClassName returned undefined for rows produced by
-      // multianewarray even though newarray/anewarray were already tagged.
-      arr.type = className.slice(depth);
-      arr.elementType = arr.type.slice(1);
-      arr.hashCode = jvm.nextHashCode++;
-      return arr;
-    };
-
-    const newArray = createMultiArray(counts);
-    frame.stack.push(newArray);
+    frame.stack.push(allocMultiArray(jvm, className, counts));
   },
 
   checkcast: async (frame, instruction, jvm) => {
@@ -535,5 +578,7 @@ module.exports.resolveInstanceFieldKey = resolveInstanceFieldKey;
 module.exports.runtimeClassName = runtimeClassName;
 module.exports.allocPrimitiveArray = allocPrimitiveArray;
 module.exports.allocReferenceArray = allocReferenceArray;
+module.exports.allocMultiArray = allocMultiArray;
 module.exports.getstaticSync = getstaticSync;
+module.exports.putstaticSync = putstaticSync;
 module.exports.SYNC_STATIC_FALLBACK = SYNC_STATIC_FALLBACK;

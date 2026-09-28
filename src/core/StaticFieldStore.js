@@ -12,6 +12,8 @@
 // consults the cell first, so a Map reader observes exactly what the last
 // writer stored whichever side wrote it. The Map keeps owning key existence
 // (`has`, `keys`, `size`) and the value of keys that no cell has claimed.
+// `present` mirrors that membership so resolved writers can avoid a keyed
+// lookup while still restoring a key after deletion or a cold first write.
 class StaticFieldStore extends Map {
   constructor(entries) {
     super();
@@ -24,8 +26,11 @@ class StaticFieldStore extends Map {
   cell(key) {
     let cell = this.cells.get(key);
     if (!cell) {
-      cell = { value: super.get(key) };
+      cell = { value: super.get(key), present: super.has(key) };
       this.cells.set(key, cell);
+      // Once the cell owns the value, the Map only tracks membership. Keeping
+      // its original value would retain replaced arrays/objects indefinitely.
+      if (cell.present) super.set(key, undefined);
     }
     return cell;
   }
@@ -39,7 +44,8 @@ class StaticFieldStore extends Map {
     const cell = this.cells.get(key);
     if (cell !== undefined) {
       cell.value = value;
-      if (!super.has(key)) super.set(key, value);
+      if (!super.has(key)) super.set(key, undefined);
+      cell.present = true;
     } else {
       super.set(key, value);
     }
@@ -49,13 +55,19 @@ class StaticFieldStore extends Map {
   delete(key) {
     const removed = super.delete(key);
     const cell = this.cells.get(key);
-    if (cell) cell.value = undefined;
+    if (cell) {
+      cell.value = undefined;
+      cell.present = false;
+    }
     return removed;
   }
 
   clear() {
     super.clear();
-    for (const cell of this.cells.values()) cell.value = undefined;
+    for (const cell of this.cells.values()) {
+      cell.value = undefined;
+      cell.present = false;
+    }
   }
 
   *entries() {

@@ -13,6 +13,9 @@
 const { JVM } = require("../core/jvm");
 const { StaticFieldStore } = require("../core/StaticFieldStore");
 const JitCompiler = require("./JitCompiler");
+const { ClassMirrorDecoder } = require("./ClassMirrorTransport");
+const { ClassDataStrings } = require("../core/ClassDataStrings");
+const classDataStrings = new ClassDataStrings();
 
 // The same conversation over two different ports. `worker_threads` gives this
 // file its configuration up front in `workerData`; a browser Worker has no
@@ -36,10 +39,6 @@ const port = parentPort || (typeof self !== "undefined" ? {
 let jvm = null;
 let preloaded = null;
 
-// Classes this worker has been given, so the main thread only sends each one
-// once and later requests carry only what changed.
-const known = new Set();
-
 // The worker boots from the same classpath as the main thread, so it does not
 // have to wait to be told what a class is: it can load one itself. Before
 // this, a class missing from the pushed mirror -- for any reason, including a
@@ -52,15 +51,18 @@ const known = new Set();
 // the first was promised. Loading a class is asynchronous, so the handler
 // below is a chain rather than a bare listener.
 let pending = null;
+let classMirror = null;
 
 function start(config) {
   if (jvm) return;
   jvm = new JVM({
     classpath: config?.classpath,
+    // Generated field accesses must use the execution JVM's storage layout.
+    denseInstanceFields: config?.denseInstanceFields === true,
     // The worker compiles and nothing else: no hotness sampling (the main
     // thread owns the queue order), no shadow compiler, and above all no
     // compile worker of its own.
-    jit: { ...(config?.jitOptions || {}), compileWorker: false,
+    jit: { ...(config?.jitOptions || {}), compileWorker: false, producesTransport: true,
       shadowCompile: false, hotness: false, warmupThreshold: 0 },
   });
   preloaded = (async () => {
@@ -90,18 +92,28 @@ async function mirrorClass(className) {
 function installClasses(classes) {
   for (const entry of classes || []) {
     if (!entry?.className) continue;
-    if (!known.has(entry.className)) {
-      known.add(entry.className);
-      if (entry.ast) {
-        jvm.classes[entry.className] = {
-          ast: entry.ast,
-          constantPool: entry.constantPool,
-          staticFields: new StaticFieldStore(),
-        };
-      }
+    // The sender includes an AST only when its class data is new or replaced.
+    // Remembering only the name here would hide methods added by stub upgrades.
+    if (entry.ast) {
+      classDataStrings.share(entry.ast);
+      classDataStrings.share(entry.constantPool);
+      jvm.classes[entry.className] = {
+        ast: entry.ast,
+        constantPool: entry.constantPool,
+        staticFields: new StaticFieldStore(),
+      };
+      jvm.bumpClassEpoch();
     }
     if (entry.initialized) {
       declareStaticKeys(jvm.classes[entry.className]);
+      const fields = jvm.classes[entry.className]?.staticFields;
+      for (const [key, value] of entry.staticBooleans || []) {
+        if (fields?.has(key) && key.endsWith(':Z') &&
+            (value === 0 || value === 1)) {
+          fields.set(key, value);
+          jvm.jit.markStaticLocationChanged(fields, key);
+        }
+      }
       jvm.classInitializationState.set(entry.className, "INITIALIZED");
     }
   }
@@ -111,7 +123,8 @@ function installClasses(classes) {
 // static keys declared at their descriptor defaults. Without the keys
 // resolveStaticFieldSite finds nothing and every static read in the compiled
 // body degrades to the slow path. The VALUES are not the main thread's; every
-// value-dependent speculation is re-guarded on arrival.
+// value-dependent speculation is re-guarded on arrival. Boolean values receive
+// a fresh request snapshot above so their guards are useful, not always false.
 function declareStaticKeys(classData) {
   const items = classData?.ast?.classes?.[0]?.items || [];
   for (const item of items) {
@@ -178,7 +191,11 @@ function compile(request) {
   } finally {
     jvm.jit.seedTransportedWarmth(method, null);
   }
-  if (!generated) return { refused: "the worker's own compiler refused it" };
+  if (!generated) {
+    const error = jvm.jit.codegenCompileErrors.get(method);
+    return { refused: error ? `compile threw: ${error.message}` :
+      "the worker's own compiler refused it" };
+  }
   const untransportable = jvm.jit.untransportableTableGrowth(base);
   if (untransportable.length) {
     return { refused: `uses untransportable tables [${
@@ -186,7 +203,13 @@ function compile(request) {
   }
   const overflowed = exceedsGrant(request.limit);
   if (overflowed) {
-    return { refused: `outgrew its ${overflowed} id grant` };
+    const watermark = jvm.jit.siteIdWatermark();
+    const required = {};
+    for (const table of JitCompiler.transportableSiteTables) {
+      required[table] = watermark[table] - base[table];
+    }
+    return { refused: `outgrew its ${overflowed} id grant`,
+      grantRetry: { watermark, required } };
   }
   const payload = jvm.jit.serializeGeneratedResult(generated,
     { provenance: request.provenance, siteTablesSince: base });
@@ -201,6 +224,14 @@ async function handle(message) {
     return compile(message);
   } catch (error) {
     return { refused: `worker threw: ${error.message}` };
+  } finally {
+    // Serialization owns its plain-data result. The worker never executes
+    // this body; keep no cache root to its closures after any outcome.
+    const method = findMethod(message.className, message.name, message.descriptor);
+    if (method) {
+      jvm.jit.codegenCache.delete(method);
+      jvm.jit.codegenCompileErrors.delete(method);
+    }
   }
 }
 
@@ -208,6 +239,34 @@ if (port) {
   port.on("message", (message) => {
     if (message?.type === "init") {
       start(message);
+      return;
+    }
+    if (message?.type === "class-mirror-abort" && jvm) {
+      pending = pending.then(() => {
+        if (classMirror?.id === message.id) classMirror = null;
+      });
+      return;
+    }
+    if (message?.type === "class-mirror" && jvm) {
+      pending = pending.then(() => {
+        try {
+          if (classMirror?.id !== message.id) {
+            if (message.sequence !== 0) throw new Error("missing first class mirror packet");
+            classMirror = { id: message.id, sequence: 0, decoder: new ClassMirrorDecoder() };
+          }
+          if (message.sequence !== classMirror.sequence++) throw new Error("class mirror packet out of order");
+          const entry = classMirror.decoder.accept(message.packet);
+          if (message.packet.done) {
+            classMirror = null;
+            installClasses([entry]);
+          }
+          port.postMessage({ type: "class-mirrored", id: message.id, sequence: message.sequence });
+        } catch (error) {
+          classMirror = null;
+          port.postMessage({ type: "class-mirrored", id: message.id,
+            sequence: message.sequence, error: error.message });
+        }
+      });
       return;
     }
     if (message?.type !== "compile") return;

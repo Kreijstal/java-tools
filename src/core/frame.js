@@ -58,6 +58,11 @@ class Frame {
     this.jitStableGeneratedEntry = undefined;
     this.jvmResumeHandoffs = undefined;
     this.jitFrameHandoffTrace = undefined;
+    // Handoff census (diagnostic, see CallStack): the handoff this frame's
+    // next child frame will be charged to, and the record charged to this
+    // frame while it is such a child.
+    this.jitHandoffPending = undefined;
+    this.jitHandoffRecord = undefined;
     this.initializingClassName = undefined;
     this.inUse = false;
     this.resumedAt = undefined;

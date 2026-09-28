@@ -1,3 +1,5 @@
+const { withThrows } = require('../../helpers');
+
 function javaString(value) {
   if (value === null || value === undefined) return 'null';
   if (value && value.type === 'java/lang/String') return String(value);
@@ -63,6 +65,23 @@ module.exports = {
         }
       }
     },
+    'fill([IIII)V': withThrows((jvm, obj, args) => {
+      const [array, from, to, value] = args;
+      // Java checks the array reference before range ordering, then the low
+      // and high bounds. Validate everything before the first write: native
+      // fill clamps indices, whereas Arrays.fill must throw for invalid ones.
+      if (array === null || array === undefined) {
+        throw { type: 'java/lang/NullPointerException' };
+      }
+      if (from > to) {
+        throw { type: 'java/lang/IllegalArgumentException' };
+      }
+      if (from < 0 || to > array.length) {
+        throw { type: 'java/lang/ArrayIndexOutOfBoundsException' };
+      }
+      array.fill(value | 0, from, to);
+    }, ['java/lang/NullPointerException', 'java/lang/IllegalArgumentException',
+      'java/lang/ArrayIndexOutOfBoundsException']),
     'fill([Ljava/lang/Object;Ljava/lang/Object;)V': (jvm, obj, args) => {
       const array = args[0];
       const val = args[1];

@@ -257,6 +257,8 @@ test('a method the worker refuses is compiled on the main thread instead',
       JSON.stringify(client.stats)}, last: ${client.lastRefusal})`);
   t.ok(client.declined.has(method),
     'the refused method is retired, not re-queued');
+  t.equal(client.refusalReasons.get(method), 'method-not-mirrored',
+    'the compact refusal reason is associated with the method');
   // The fallback is the ordinary path, not a second mechanism: the next time
   // anything asks for the body, the main thread compiles it itself. Before
   // the fix `enqueue` kept claiming the method and it stayed interpreted for
@@ -387,6 +389,8 @@ test('a stale result is retried once before the method is retired',
   t.ok(client.declined.has(method), 'now the method is retired');
   t.ok(client.declinedByRefusal.has(method),
     'as a refusal, so after main() it keeps its tier instead of stalling');
+  t.equal(client.refusalReasons.get(method), 'rejected-on-arrival',
+    'diagnostics can attribute the retired method without retaining its payload');
   t.equal(sent.length, 2, 'nothing further was sent');
   t.end();
 });
@@ -504,5 +508,69 @@ test('a browser with no worker script configured falls back cleanly',
   // every method to a worker that cannot be built.
   t.equal(client.createBrowserWorkerHost(), null,
     'no script URL means no browser host');
+  t.end();
+});
+
+test('worker grant overflow retries once with bounded disjoint per-table space', t => {
+  const {jvm, client, sent} = stubbedWorkerClient(t, 'jit-worker-grant-retry-');
+  const method = {className: 'GrantProbe', name: 'add', descriptor: '(II)I',
+    flags: ['static'], attributes: [{type: 'code', code: {
+      codeItems: ['iload_0', 'iload_1', 'iadd', 'ireturn'].map(
+        (instruction, index) => ({labelDef: `L${index}:`, instruction})),
+      localsSize: '2', stackSize: '2', exceptionTable: []}}]};
+  jvm.classes.GrantProbe = {staticFields: new Map(), ast: {classes: [{
+    className: 'GrantProbe', superClassName: 'java/lang/Object',
+    items: [{type: 'method', method}]}]}};
+  client.enqueue(method, {});
+  const first = sent[0], required = {}, watermark = {};
+  for (const table of jvm.jit.constructor.transportableSiteTables) {
+    required[table] = table === 'syncCallSites' ? 900 : 2;
+    watermark[table] = first.grant[table] + required[table];
+  }
+  const reply = id => ({type: 'result', id,
+    refused: 'outgrew its syncCallSites id grant', grantRetry: {required, watermark}});
+  client.maxQueued = 1;
+  client.queue.push({method: {...method, name: 'waiting'}});
+  client.receive(reply(first.id));
+  t.equal(sent.length, 2, 'overflow is retried off-thread');
+  t.equal(client.queue.length, 1, 'a full waiting queue stays bounded during retry');
+  t.equal(client.inFlight.size, 1, 'retry reuses the single in-flight slot');
+  client.queue.length = 0;
+  t.equal(client.stats.grantRetried, 1, 'retry is observable');
+  t.notOk(client.declined.has(method), 'first overflow does not strand the method');
+  const second = sent[1];
+  t.ok(second.grant.syncCallSites >= watermark.syncCallSites,
+    'retry starts above the worker overflow allocation');
+  t.equal(second.limit.syncCallSites - second.grant.syncCallSites, 900,
+    'only the required table receives a larger grant');
+  t.equal(second.limit.fieldSites - second.grant.fieldSites, client.grantStride,
+    'other tables retain the small default grant');
+  client.receive(reply(second.id));
+  t.equal(sent.length, 2, 'second overflow is not retried');
+  t.ok(client.declinedByRefusal.has(method), 'fallback remains supported after retry exhaustion');
+  for (const invalid of [4097, NaN, -1]) {
+    const next = {...method, name: 'bad' + String(invalid)};
+    client.enqueue(next, {});
+    const request = sent[sent.length - 1], count = sent.length;
+    const bad = reply(request.id);
+    bad.grantRetry = {required: {...required, syncCallSites: invalid}, watermark};
+    client.receive(bad);
+    t.equal(sent.length, count, `invalid requirement ${invalid} cannot reserve memory`);
+    t.ok(client.declined.has(next), 'invalid retry retains the refusal fallback');
+  }
+  t.end();
+});
+
+test('default grants scale with method size without enlarging explicit grants', t => {
+  const {jvm, client} = stubbedWorkerClient(t, 'jit-worker-grant-size-');
+  const original = jvm.jit.getCodeItems;
+  jvm.jit.getCodeItems = method => ({length: method.instructions});
+  t.equal(client.initialGrantFor({instructions: 4}), 64, 'small default grant avoids mostly empty tables');
+  t.equal(client.initialGrantFor({instructions: 257}), 128, 'medium methods have more initial space');
+  t.equal(client.initialGrantFor({instructions: 1025}), 512, 'large methods retain the previous grant');
+  t.equal(client.initialGrantFor({instructions: 100000}), 512, 'initial space stays bounded');
+  client.adaptiveGrants = false;
+  t.equal(client.initialGrantFor({instructions: 100000}), 64, 'fixed grants remain fixed');
+  jvm.jit.getCodeItems = original;
   t.end();
 });

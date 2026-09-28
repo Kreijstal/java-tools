@@ -1,12 +1,22 @@
+const { methodIdentitySet } = require('./PreparationPolicy');
+const { yieldToEventLoop } = require("../core/hostYield");
+const normalInstructionReachability = require("./normalInstructionReachability");
+const switchTargetLabels = require("./switchTargetLabels");
+const { invokeNative } = require("../core/nativeInvocation");
 const { arrayDataExpression } = require("./arrayDataExpression");
+const directJreInitializationGuard = require('./directJreInitializationGuard');
+const {fieldSiteMatches, callSiteMatches, preflightTransportSites} =
+  require("./transportSiteValidation");
 const { inlineIntegerArgumentName } = require("./inlineIntegerNames");
 const Frame = require("../core/frame");
+const { setHandoffCensus, handoffNow } = require("../core/callStack");
 const { ShadowCompiler } = require("./ShadowCompiler");
 const { CompileWorkerClient } = require("./CompileWorkerClient");
 const { ASYNC_METHOD_SENTINEL } = require("../core/constants");
 const { parseDescriptor } = require("../parsing/typeParser");
 const {
   resolveInstanceFieldKey, allocPrimitiveArray, allocReferenceArray,
+  allocMultiArray,
 } = require("../instructions/object");
 const WasmJit = require("./WasmJit");
 const JvmSsaBlockRenderer = require("./JvmSsaBlockRenderer");
@@ -177,6 +187,9 @@ class JitCompiler {
     this.labelCache = new WeakMap();
     this.runningFrames = new WeakSet();
     this.deoptedMethods = new WeakSet();
+    // Verified operand widths per method, for the runner's category-2
+    // stack shuffles (pop2, dup_x2, dup2_x2); null when analysis rejected.
+    this.runnerStackWidths = new WeakMap();
     this.invocationCounts = new WeakMap();
     this.backwardBranchCache = new WeakMap();
     this.controlFlowBackedgeCache = new WeakMap();
@@ -206,6 +219,9 @@ class JitCompiler {
     // The real compile worker (JVM_JIT_COMPILE_WORKER=1). When it is on, a
     // method the main thread would have compiled is queued instead and runs
     // interpreted until its body arrives; the queue is ordered by hotness.
+    this.retainCompilerDiagnostics = options.retainCompilerDiagnostics !== false;
+    this.producesTransport = options.producesTransport === true;
+    this.installedSourceRetention = new (require("./InstalledSourceRetention"))(options);
     this.compileWorker = new CompileWorkerClient(this, options);
     this.hotnessEnabled = options.hotness ??
       (typeof process !== "undefined" && process.env &&
@@ -259,10 +275,88 @@ class JitCompiler {
     // overlap in time; the aggregate stall-time counter must count only the
     // outermost interval once, so this tracks the nesting depth.
     this.syncCompileDepth = 0;
+    // How long one compile may hold the thread the guest runs on before the
+    // compilers stop ENLARGING that turn. It is not a deadline: work already
+    // started always finishes, and no method is ever left without a body.
+    // What it governs is whether more work joins the same turn -- today, the
+    // Wasm tier's on-demand callee recursion (WasmJit.compile arms it,
+    // onDemandCalleeBudgetAvailable reads it). 0 removes the bound. Before
+    // the guest starts there is nothing to keep responsive, so it is off.
+    //
+    // Why it exists: clicking Stamina Mode in Deko Bloko froze Firefox for
+    // 9.7-10.0 s, of which 13.2-13.4 s (compiles nest, so the sum exceeds the
+    // freeze) was post-main synchronous compilation in ~607 compiles. Two
+    // gameplay methods, 4121 and 3463 bytecodes, were entered for the first
+    // time and each dragged a recursive cascade of ~40 cold callees into its
+    // own compile: 3066 ms and 2692 ms respectively, of which one callee
+    // subtree alone was 2307 ms.
+    //
+    // Why 120 ms. Measured back to back in Firefox on one host, first click
+    // after the menu / boot to the menu:
+    //     no bound   9.7-10.0 s freeze   228-247 s to the menu
+    //     120 ms     4.3-4.8 s           109-114 s
+    //     40 ms      4.7 s               1226 s
+    //     15 ms      6.7 s               299 s
+    // Tightening it is not free: a turn that keeps running out leaves modules
+    // partial, and rebuilding them costs more than the cascade did.
+    //
+    // `&&` yields false, not undefined, where there is no process at all, and
+    // `??` does not catch false -- reading the environment inline here would
+    // have set the budget to Number(false) === 0 in every browser bundle and
+    // silently disabled the bound exactly where it is needed.
+    const environmentValue = (name) => {
+      const environment = (typeof process !== "undefined" && process.env)
+        ? process.env : null;
+      const value = environment ? environment[name] : undefined;
+      return value === undefined || value === "" ? undefined : value;
+    };
+    const budgetSetting = options.postMainCompileBudgetMs ??
+      environmentValue("JVM_JIT_POST_MAIN_COMPILE_BUDGET_MS");
+    const budget = budgetSetting === undefined || budgetSetting === null ||
+      budgetSetting === "" || typeof budgetSetting === "boolean"
+      ? 120 : Number(budgetSetting);
+    // An explicit 0 disables the bound; anything unreadable is not an
+    // instruction to disable it.
+    this.postMainCompileBudgetMs =
+      Number.isFinite(budget) && budget >= 0 ? budget : 120;
     // tier -> {count, inclusiveMs} for post-main compiles only. `inclusiveMs`
     // includes nested compiles, so its per-tier sums are inclusive and are
     // NOT comparable to postMainSyncCompileMs, which is outermost-only.
     this.postMainSyncCompileByTier = new Map();
+    // Exclusive phase accounting for one compile (diagnostic-only; off unless
+    // asked for, because the whole point is to measure the compiler and an
+    // always-on clock in the compiler measures itself).
+    //
+    // Why it exists: the Start Game census reported ~8 s of post-main
+    // synchronous compilation inside a transition whose click-to-first-frame
+    // freeze was only ~4.2-4.9 s, and there were two candidate explanations --
+    // the counter double-counting nested compiles, or compilation continuing
+    // after the first frame. postMainSyncCompileMs is already outermost-only,
+    // so it cannot double count; this facility settles the rest by splitting
+    // one compile into named phases whose times are disjoint, and by recording
+    // when each outermost compile ran so a transition can be cut at its first
+    // frame.
+    //
+    // Exclusivity: phases nest on a stack. Entering a child charges the parent
+    // for everything up to that moment and suspends it; leaving resumes the
+    // parent. A recursively triggered callee compile is itself a phase, so its
+    // time is subtracted from whatever phase of the caller triggered it and
+    // never appears twice.
+    // code items -> operand-category SSA analysis; see ssaOperandCategories.
+    this.ssaOperandCategoryCache = new WeakMap();
+    this.compilePhaseTiming = options.compilePhaseTiming === true ||
+      (options.compilePhaseTiming !== false &&
+        environmentValue("JVM_JIT_COMPILE_PHASE_TIMING") === "1");
+    this.compilePhaseStack = [];
+    // name -> {exclusiveMs, inclusiveMs, count}
+    this.compilePhaseStats = new Map();
+    // name -> number. Counted, not timed: a counter in a path called once per
+    // emitted line must not carry a clock read.
+    this.compilePhaseCounters = new Map();
+    // One entry per outermost post-main compile: {method, tier, startMs, ms}.
+    // Bounded, because a long session must not accumulate a transcript.
+    this.compileTimeline = [];
+    this.compileTimelineLimit = 4096;
     // Phase 1 observability (docs/phase1-worker-audit.md, task 2): main-thread
     // work after a worker result arrives, split into phases. Attempts include
     // rejected and superseded results (their materialization still occupied
@@ -303,7 +397,15 @@ class JitCompiler {
     this.singleSiteInlineExperiment = options.singleSiteInlineExperiment || null;
     this.checkedSpanExperiment = options.checkedSpanExperiment || null;
     this.preparedCodegenDeopts = new Map();
+    // Plain counter of the same events, cheap enough to sample on a timer.
+    this.preparedDeoptCount = 0;
     this.effectfulPreparationActive = false;
+    // Constructors admitted on their resolved call graph by the preparation
+    // pass (isSynchronouslyResolvedConstructor); the notes say why one was not.
+    this.preparedConstructorsEnabled = options.preparedConstructors !== false &&
+      !(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DISABLE_PREPARED_CONSTRUCTORS === "1");
+    this.constructorAdmissionNotes = new Map();
     // Explicit preparation is intended to remain valid across later lifecycle
     // transitions. Do not let those methods retain a compiled body whose CFG
     // was pruned from the current value of a mutable static boolean: once the
@@ -416,6 +518,7 @@ class JitCompiler {
     // argument slicing, and generic call dispatch.
     this.directJreIntrinsics = [];
     this.directJreInitializationTokens = [];
+    this.directJreDescriptors = new Map();
     this.directStaticJreIntrinsicsEnabled =
       options.directStaticJreIntrinsics !== false &&
       !(typeof process !== "undefined" && process.env &&
@@ -693,6 +796,30 @@ class JitCompiler {
     // Diagnostic: per-method tally of fast-tier versus resume-body entries.
     this.resumeDispatchStats = options.profileResumeDispatch === true
       ? new Map() : null;
+    this.asyncCallCensus = options.asyncCallCensus === true ||
+      Boolean(typeof process !== "undefined" && process.env &&
+        process.env.JVM_JIT_ASYNC_CALL_CENSUS === "1") ? new Map() : null;
+    // Wall time each handoff cost (same keys), exclusive of nested handoffs:
+    // {n, ms, max}. Charged by CallStack when the scheduler-run callee pops.
+    this.asyncCallCensusTime = null;
+    this.asyncCallCensusTimeMs = 0;
+    if (this.asyncCallCensus) {
+      this.asyncCallCensusTime = new Map();
+      const jit = this;
+      setHandoffCensus({
+        record(key, exclusiveMs, elapsedMs) {
+          let entry = jit.asyncCallCensusTime.get(key);
+          if (!entry) {
+            entry = { n: 0, ms: 0, max: 0 };
+            jit.asyncCallCensusTime.set(key, entry);
+          }
+          entry.n += 1;
+          entry.ms += exclusiveMs;
+          if (elapsedMs > entry.max) entry.max = elapsedMs;
+          jit.asyncCallCensusTimeMs += exclusiveMs;
+        },
+      });
+    }
     this.scalarGuestBodiesEnabled = this.rendererPipelineEnabled || options.scalarGuestBodies === true ||
       Boolean(typeof process !== "undefined" && process.env &&
         process.env.JVM_ENABLE_SCALAR_GUEST_BODIES === "1");
@@ -703,6 +830,11 @@ class JitCompiler {
     this.prepareColdIntegerInlines = options.prepareColdIntegerInlines === true;
     this.preparedLoopLeafWasm = options.preparedLoopLeafWasm === true;
     this.preparedCompleteWasm = options.preparedCompleteWasm === true;
+    this.preparedPartialWasmMethodKeys = methodIdentitySet(options.preparedPartialWasmMethods, "preparedPartialWasmMethods");
+    this.preparedWasmMethodKeys = methodIdentitySet(options.preparedWasmMethods, "preparedWasmMethods");
+    for (const key of this.preparedPartialWasmMethodKeys) this.preparedWasmMethodKeys.add(key);
+    this.preparedWasmMethodMatches = new WeakMap();
+    this.preparedPartialWasmMethodMatches = new WeakMap();
     this.rawRestoringCalls = options.rawRestoringCalls === true;
     this.caughtRuntimeCalls = options.caughtRuntimeCalls === true;
     this.caughtCallMarker = Symbol('jit.caught.call');
@@ -1216,7 +1348,8 @@ class JitCompiler {
   }
 
   hasPreparedFullWasmUpgrade(method) {
-    return this.hasPreparedLoopLeafWasmUpgrade(method) || this.hasPreparedNormalFlowWasmUpgrade(method) ||
+    return this.hasPreparedPartialWasmUpgrade(method) ||
+      this.hasPreparedLoopLeafWasmUpgrade(method) || this.hasPreparedNormalFlowWasmUpgrade(method) ||
       this.preparedCodegenMethods.has(method) &&
       (this.isOversizedLoopMethod(method) ||
         this.wasmJit.synchronizedInstanceLinksEnabled &&
@@ -1227,14 +1360,40 @@ class JitCompiler {
   }
 
   hasPreparedLoopLeafWasmUpgrade(method) {
-    if (!(this.preparedLoopLeafWasm || this.preparedCompleteWasm) || !this.preparedCodegenMethods.has(method) ||
+    const selected = this.isPreparedWasmMethodSelected(method);
+    if (!(this.preparedLoopLeafWasm || this.preparedCompleteWasm || selected) || !this.preparedCodegenMethods.has(method) ||
         !this.hasBackwardBranch(method)) return false;
     if (normalFlowContainsInvoke(this.getCodeItems(method)) &&
-        !(this.preparedCompleteWasm && this.wasmJit.methodState({method}).meta?.fullyCompiled === true)) return false;
+        !((this.preparedCompleteWasm || selected) && this.wasmJit.methodState({method}).meta?.fullyCompiled === true)) return false;
     // Full, call-free bodies avoid the per-child cross-backend handoff cost.
     // Preparation supplies executable code; this only selects an existing
     // module and retains ordinary fuel/exception exits and exit-storm guards.
     return this.hasReadyFullWasmModule(method) && !this.hasWasmExitStorm(method);
+  }
+
+  // Explicit measured selections may have cold exits. Keep the executable
+  // entry and exit-storm gates; selection never changes coverage/link metadata.
+  hasPreparedPartialWasmUpgrade(method) {
+    return this.matchesPreparedMethod(method, this.preparedPartialWasmMethodKeys,
+      this.preparedPartialWasmMethodMatches) &&
+      this.preparedCodegenMethods.has(method) && this.hasBackwardBranch(method) &&
+      this.hasReadyWasmModuleForSynchronousCall(method);
+  }
+
+  isPreparedWasmMethodSelected(method) {
+    return this.matchesPreparedMethod(method, this.preparedWasmMethodKeys,
+      this.preparedWasmMethodMatches);
+  }
+
+  matchesPreparedMethod(method, keys, matches) {
+    if (!method || !keys?.size) return false;
+    if (matches.has(method)) return matches.get(method);
+    const owner = this.jvm.findClassNameForMethod?.(method) || method.className;
+    // Registration can occur after a first lookup. Cache only resolved identities.
+    if (!owner) return false;
+    const selected = keys.has(`${owner}.${method.name}${method.descriptor}`);
+    matches.set(method, selected);
+    return selected;
   }
 
   hasPreparedNormalFlowWasmUpgrade(method) {
@@ -1823,6 +1982,7 @@ class JitCompiler {
         const key = `${preparedMethodKey}: ${reason}`;
         this.preparedCodegenDeopts.set(
           key, (this.preparedCodegenDeopts.get(key) || 0) + 1);
+        this.preparedDeoptCount += 1;
       }
       this.lastMethodDeoptReasons.set(
         frame.method, result.reason || "unspecified");
@@ -2042,7 +2202,8 @@ class JitCompiler {
       // saw, leaves no one else to build the body, and stranding it would be a
       // permanent tier loss rather than the deferral 0.2 describes.
       if (this.jvm && this.jvm.guestStarted &&
-          this.compileWorker.declinedByRefusal.has(method)) {
+          (this.compileWorker.declinedByRefusal.has(method) ||
+            this.compileWorker.queue.length >= this.compileWorker.maxQueued)) {
         this.workerUnservedPostMainCount += 1;
         if (!this.workerUnservedPostMainMethods.has(method)) {
           this.workerUnservedPostMainMethods.add(method);
@@ -2057,6 +2218,8 @@ class JitCompiler {
       const generated = this.compileMethod(method, {
         preparedWholeMethod: options.allowEffectfulCalls === true,
       });
+      if (options.onGeneratedResult) options.onGeneratedResult(generated);
+      if (!this.producesTransport) this.installedSourceRetention.apply(generated);
       this.codegenCache.set(method, generated);
       if (generated && process.env.JVM_JIT_RESULT_CENSUS) {
         this.recordResultCensus(method, generated);
@@ -2474,6 +2637,134 @@ class JitCompiler {
     throw error;
   }
 
+  // The budget in force right now: zero (no bound) unless the guest is
+  // running, since a compile before main() competes with nothing.
+  guestCompileBudgetMs() {
+    if (!(this.postMainCompileBudgetMs > 0)) return 0;
+    if (!this.jvm || !this.jvm.guestStarted) return 0;
+    return this.postMainCompileBudgetMs;
+  }
+
+  // The operand-category SSA analysis for one method's code, built at most
+  // once. Three callers need it -- two stack-depth computations (for dup_x2,
+  // dup2 and dup2_x2) and the structured-SSA renderer (which also needs it for
+  // dup_x1) -- and their trigger conditions overlap, so a method carrying a
+  // dup2 had the same analysis built twice on the same compile. Measured on
+  // Deko Bloko's qc.b(IZ)Z: 85 ms of a 732 ms compile, rebuilt from the same
+  // code items for the same answer.
+  //
+  // Keyed by the code-item array, and only reused for the same method: one of
+  // the stack-depth computations is reached with `method` null (it verifies a
+  // body it was handed rather than a method), and a null method means no
+  // exception table and no method context, so the analysis is a different one.
+  // Serving it to a later caller that did pass the method changed the
+  // generated code of 20 methods in the Deko Bloko gamepack -- three of them
+  // from compiled to "operand-stack verification failed" -- which is why the
+  // method is part of the key and not an afterthought.
+  ssaOperandCategories(codeItems, method) {
+    const cached = this.ssaOperandCategoryCache.get(codeItems);
+    if (cached && cached.method === method) return cached.analysis;
+    const code = method?.attributes?.find((attribute) =>
+      attribute.type === "code");
+    const fullAnalysis = this.compilePhase("analysis.ssaOperandCategories",
+      () => buildSsa({
+        codeItems,
+        exceptionTable: code?.code?.exceptionTable || [],
+        method,
+      })) ?? null;
+    // Callers need verification kinds and failure diagnostics, not the SSA
+    // blocks, values, uses, and predecessor graph produced while deriving them.
+    const analysis = !fullAnalysis || this.retainCompilerDiagnostics
+      ? fullAnalysis : {
+        rejected: fullAnalysis.rejected,
+        reason: fullAnalysis.reason,
+        stackKindsBefore: fullAnalysis.stackKindsBefore,
+      };
+    // One entry per code-item array: the callers that share an analysis share
+    // the method too, so a second method for the same array is a replacement
+    // rather than a second live entry.
+    this.ssaOperandCategoryCache.set(codeItems, { method, analysis });
+    return analysis;
+  }
+
+  // Enter a named compile phase. Returns the entry to hand back to
+  // endCompilePhase, or null when the facility is off (the caller then pays
+  // one property read and no clock read).
+  beginCompilePhase(name) {
+    if (!this.compilePhaseTiming) return null;
+    const now = this.monotonicNow();
+    const stack = this.compilePhaseStack;
+    const parent = stack.length ? stack[stack.length - 1] : null;
+    // The parent owns everything up to this instant; from here the child does.
+    if (parent) parent.exclusive += now - parent.resumed;
+    const entry = { name, start: now, resumed: now, exclusive: 0 };
+    stack.push(entry);
+    return entry;
+  }
+
+  endCompilePhase(entry) {
+    if (!entry) return;
+    const now = this.monotonicNow();
+    const stack = this.compilePhaseStack;
+    // Defensive: an emitter that threw past its own endCompilePhase would
+    // leave the stack deeper than this entry. Unwind to it rather than
+    // charging its children's time to whatever runs next.
+    while (stack.length && stack[stack.length - 1] !== entry) stack.pop();
+    if (stack.length) stack.pop();
+    entry.exclusive += now - entry.resumed;
+    const row = this.compilePhaseStats.get(entry.name) ||
+      { exclusiveMs: 0, inclusiveMs: 0, count: 0 };
+    row.exclusiveMs += entry.exclusive;
+    row.inclusiveMs += now - entry.start;
+    row.count += 1;
+    this.compilePhaseStats.set(entry.name, row);
+    const parent = stack.length ? stack[stack.length - 1] : null;
+    if (parent) parent.resumed = now;
+  }
+
+  // Time `fn` as one phase. The phase is closed even if `fn` throws, so a
+  // rejected compile does not leave the stack suspended in it.
+  compilePhase(name, fn) {
+    if (!this.compilePhaseTiming) return fn();
+    const entry = this.beginCompilePhase(name);
+    try {
+      return fn();
+    } finally {
+      this.endCompilePhase(entry);
+    }
+  }
+
+  // A counted (not timed) quantity of compiler work: emitted statements,
+  // indentation passes, characters copied. Called from paths that run once per
+  // generated line, so it must stay a property read and an add.
+  countCompileWork(name, amount = 1) {
+    if (!this.compilePhaseTiming) return;
+    this.compilePhaseCounters.set(name,
+      (this.compilePhaseCounters.get(name) || 0) + amount);
+  }
+
+  // The phase table plus the counters, as plain data. `exclusiveMs` values are
+  // disjoint and sum to the compiler's own time; `inclusiveMs` is the wall
+  // interval the phase spanned and does overlap its children.
+  compilePhaseCensus() {
+    return {
+      phases: Object.fromEntries([...this.compilePhaseStats.entries()]
+        .map(([name, row]) => [name, {
+          exclusiveMs: Math.round(row.exclusiveMs * 1000) / 1000,
+          inclusiveMs: Math.round(row.inclusiveMs * 1000) / 1000,
+          count: row.count,
+        }])),
+      counters: Object.fromEntries(this.compilePhaseCounters.entries()),
+    };
+  }
+
+  resetCompilePhaseStats() {
+    this.compilePhaseStats = new Map();
+    this.compilePhaseCounters = new Map();
+    this.compilePhaseStack = [];
+    this.compileTimeline = [];
+  }
+
   // Begin one synchronous compile interval. The assertion runs first (before
   // any state or compiler work); the returned token's finish() finalizes the
   // accounting and never throws. Nesting is tracked so the aggregate
@@ -2482,16 +2773,33 @@ class JitCompiler {
     this.assertNoPostMainSyncCompile(method, entryPath);
     const outermost = this.syncCompileDepth === 0;
     this.syncCompileDepth += 1;
+    // A compile triggered from inside another compile is its own phase, so its
+    // time leaves the caller's phase instead of being charged to it twice.
+    const phase = this.beginCompilePhase(
+      outermost ? "compile.total" : "compile.calleeRecursive");
     const start = this.monotonicNow();
     return {
       finish: (tier) => this.finishSynchronousCompile(method, tier,
-        entryPath, start, outermost),
+        entryPath, start, outermost, phase),
     };
   }
 
-  finishSynchronousCompile(method, tier, entryPath, start, outermost) {
+  finishSynchronousCompile(method, tier, entryPath, start, outermost, phase) {
     const ms = this.monotonicNow() - start;
+    this.endCompilePhase(phase);
     this.syncCompileDepth -= 1;
+    if (this.compilePhaseTiming && outermost && this.mainStarted &&
+        this.compileTimeline.length < this.compileTimelineLimit) {
+      // When, not just how long: a transition's compile total can only be cut
+      // at its first frame if each compile carries its own start.
+      this.compileTimeline.push({
+        method: this.methodIdentity(method),
+        descriptor: method?.descriptor ?? null,
+        tier, entryPath,
+        startMs: Math.round(start * 1000) / 1000,
+        ms: Math.round(ms * 1000) / 1000,
+      });
+    }
     if (this.mainStarted) {
       this.postMainSyncCompileCount += 1;
       if (outermost) this.postMainSyncCompileMs += ms;
@@ -2528,6 +2836,9 @@ class JitCompiler {
       postMainSyncCompileMs: this.postMainSyncCompileMs,
       workerUnservedPostMainCount: this.workerUnservedPostMainCount,
       workerUnservedPostMainMethodCount: this.workerUnservedPostMainMethodCount,
+      postMainCompileBudgetMs: this.postMainCompileBudgetMs,
+      calleeCompileBudgetExhaustedCount:
+        (this.wasmJit && this.wasmJit.calleeCompileBudgetExhaustedCount) || 0,
       postMainSyncCompileByTier: Object.fromEntries(
         [...this.postMainSyncCompileByTier.entries()].map(([tier, row]) =>
           [tier, { count: row.count, inclusiveMs: row.inclusiveMs }])),
@@ -2677,9 +2988,11 @@ class JitCompiler {
   createGeneratedFunction(method, tier, parameters, source,
     ownerOverride = null, asynchronous = false, generator = false,
     captures = null, hoistedSource = null) {
+    const phase = (name, fn) => this.compilePhase(name, fn);
     if (this.generatorVarDeclarationsEnabled &&
         (generator || tier.startsWith("hot-call-graph"))) {
-      const hoisted = hoistGeneratorDeclarations(source, generator);
+      const hoisted = phase("assemble.hoistDeclarations",
+        () => hoistGeneratorDeclarations(source, generator));
       if (hoisted.shadowed) {
         this.generatorVarDeclarationShadowedBodies += 1;
       } else {
@@ -2687,7 +3000,8 @@ class JitCompiler {
         this.generatorVarDeclarationRewrites += hoisted.rewritten;
       }
       if (hoistedSource) {
-        const hoistedHelpers = hoistGeneratorDeclarations(hoistedSource, false);
+        const hoistedHelpers = phase("assemble.hoistDeclarations",
+          () => hoistGeneratorDeclarations(hoistedSource, false));
         if (hoistedHelpers.shadowed) {
           this.generatorVarDeclarationShadowedBodies += 1;
         } else {
@@ -2696,7 +3010,10 @@ class JitCompiler {
         }
       }
     }
-    const labeled = this.generatedSource(method, tier, source, ownerOverride);
+    const labeled = phase("assemble.label",
+      () => this.generatedSource(method, tier, source, ownerOverride));
+    this.countCompileWork("generated.chars", (labeled.source || "").length);
+    this.countCompileWork("generated.bodies", 1);
     // Reading a miscompile means reading the code that was generated. The
     // sourceURL only names it inside a debugger, so JVM_DUMP_GENERATED_DIR
     // writes each body to disk; JVM_DUMP_GENERATED_METHODS=ck.a,p.a narrows
@@ -2708,21 +3025,45 @@ class JitCompiler {
     }
     if (typeof process !== "undefined" && process.env &&
         process.env.JVM_JIT_VERIFY_FREE_NAMES) {
-      this.verifyGeneratedFreeNames(labeled, method, tier, ownerOverride,
-        parameters, captures ? Object.keys(captures) : [], hoistedSource);
+      phase("verify", () => this.verifyGeneratedFreeNames(labeled, method,
+        tier, ownerOverride, parameters,
+        captures ? Object.keys(captures) : [], hoistedSource));
     }
     // Function constructors themselves remain anonymous in Gecko profiles.
     // Return a named literal so stack sampling exposes the guest identity.
+    //
+    // The literal is parenthesised. Both SpiderMonkey and V8 syntax-parse an
+    // inner function lazily and compile it on its first call ("script
+    // delazify" in a Gecko profile: ~130 ms of a prepared Deko Bloko Start
+    // Game transition was that, one delazification per generated body), but
+    // a function expression immediately inside `(` is treated as possibly
+    // immediately invoked and compiled eagerly at creation. Preparation
+    // creates these bodies before main(), where the parse is free.
     const prefix = generator ? "function* " : asynchronous ? "async function " : "function ";
     const captureNames = captures ? Object.keys(captures) : [];
     // Hoisted declarations evaluate once in the factory scope; the sourceURL
     // pragma inside the returned function's body names the whole script, so
     // profilers attribute the hoisted helpers to the same generated URL.
-    const factory = new Function(...captureNames, `"use strict"; ${
-      hoistedSource ? `\n${hoistedSource}\n` : ""}return ${prefix}` +
-      `${labeled.functionName}(${parameters.join(",")}) {\n` +
-      `${labeled.source}\n}`);
-    const generated = factory(...captureNames.map((name) => captures[name]));
+    const factory = this.producesTransport ? null : phase("newFunction", () =>
+      new Function(...captureNames, `"use strict"; ${
+        hoistedSource ? `\n${hoistedSource}\n` : ""}return (${prefix}` +
+        `${labeled.functionName}(${parameters.join(",")}) {\n` +
+        `${labeled.source}\n});`));
+    // A compile worker never executes guest bodies. Keep a distinct metadata
+    // carrier instead of eagerly parsing/compiling the same JavaScript that
+    // the receiver will construct. Accidental worker execution must fail.
+    const generated = this.producesTransport
+      ? function transportOnlyBody() {
+        throw new Error("Transport-only generated body cannot execute");
+      }
+      : phase("install.instantiate",
+        () => factory(...captureNames.map((name) => captures[name])));
+    if (this.producesTransport) {
+      Object.defineProperties(generated, {
+        name: { value: labeled.functionName, configurable: true },
+        length: { value: parameters.length, configurable: true },
+      });
+    }
     generated.jvmSourceUrl = labeled.url;
     // What a compile worker would send back instead of the live function
     // (docs/plan-linear-runtime.md, Phase 1.2): the text plus a symbolic
@@ -2734,7 +3075,8 @@ class JitCompiler {
     generated.jvmAsynchronous = asynchronous;
     generated.jvmHoistedSource = hoistedSource;
     generated.jvmCaptureDescriptors = captures
-      ? this.describeLinkRecords(captures) : null;
+      ? phase("install.describeLinks", () => this.describeLinkRecords(captures))
+      : null;
     // The text that was compiled, after the generator declaration hoisting;
     // `jvmStructuredSource` keeps the emitter's own output.
     generated.jvmGeneratedSource = labeled.source;
@@ -3114,6 +3456,90 @@ class JitCompiler {
     return linked;
   }
 
+  // Preparation's link pass (see JVM._precompileInitializedClasses): give
+  // every synchronous call site of the prepared bodies the link state its
+  // first generic call would build, using only bodies that already exist.
+  // Static and special sites have one target by bytecode. Virtual and
+  // interface sites get a target per loaded receiver class in the declared
+  // class's cone, bounded per site so a wide interface does not turn into
+  // thousands of adapters nobody calls; the runtime links the rest on
+  // demand exactly as before. Initialization is not consulted: the site
+  // checks its class-initialization token on every call, as it always has.
+  async prelinkPreparedCallSites(methods, yieldFn = null,
+    maxReceiversPerSite = 8) {
+    const result = { sites: 0, receivers: 0 };
+    if (!this.syncCallSitesByCaller) return result;
+    // The loaded world's subclass cone, once.
+    const children = new Map();
+    for (const [name, classData] of Object.entries(this.jvm.classes)) {
+      const header = classData?.ast?.classes?.[0];
+      if (!header || classData.isJreStub) continue;
+      const parents = [header.superClassName, ...(header.interfaces || [])];
+      for (const parent of parents) {
+        if (typeof parent !== "string") continue;
+        let list = children.get(parent);
+        if (!list) { list = []; children.set(parent, list); }
+        list.push(name);
+      }
+    }
+    const cone = (root) => {
+      const out = [root];
+      const seen = new Set(out);
+      for (let index = 0; index < out.length; index += 1) {
+        for (const child of children.get(out[index]) || []) {
+          if (!seen.has(child)) { seen.add(child); out.push(child); }
+        }
+      }
+      return out;
+    };
+    let steps = 0;
+    for (const method of methods) {
+      const byKey = this.syncCallSitesByCaller.get(method);
+      if (!byKey) continue;
+      for (const sites of byKey.values()) {
+        for (const site of sites) {
+          if (site.fastPositional || site.targets.size ||
+              site.jreTargets?.size) continue;
+          const wholeMethodCaller = this.prefersWholeMethodJs(method);
+          const keepStaticForWasm = site.op === "invokestatic" &&
+            this.wasmJit.enabled && !wholeMethodCaller;
+          let linked = 0;
+          if (site.op === "invokestatic" || site.op === "invokespecial") {
+            if (!keepStaticForWasm &&
+                this.linkSynchronousJreTarget(site, site.declaredClassName)) {
+              linked += 1;
+            } else if (this.linkSyncCallTarget(
+              site, site.declaredClassName, wholeMethodCaller, true)) {
+              linked += 1;
+            }
+          } else {
+            const receivers = cone(site.declaredClassName);
+            if (receivers.length > maxReceiversPerSite) continue;
+            for (const type of receivers) {
+              const classData = this.jvm.classes[type];
+              const header = classData?.ast?.classes?.[0];
+              // Only concrete receivers can be `receiver.type` at run time.
+              if (!header || (header.flags || []).includes("abstract") ||
+                  (header.flags || []).includes("interface")) continue;
+              if (this.linkSynchronousJreTarget(site, type) ||
+                  this.linkSyncCallTarget(site, type, wholeMethodCaller, true)) {
+                linked += 1;
+              }
+            }
+          }
+          if (linked) {
+            result.sites += 1;
+            result.receivers += linked;
+          }
+        }
+      }
+      steps += 1;
+      if (yieldFn && (steps & 63) === 0) await yieldFn();
+    }
+    this.prelinkedPreparedSites = result.sites;
+    return result;
+  }
+
   internLinkRecords(descriptors, callerMethod = null) {
     const captures = {};
     const renames = {};
@@ -3243,10 +3669,25 @@ class JitCompiler {
     const names = Object.keys(captures);
     const prefix = spec.generator ? "function* "
       : spec.asynchronous ? "async function " : "function ";
-    const factory = new Function(...names, `"use strict"; ${
-      spec.hoistedSource ? `\n${spec.hoistedSource}\n` : ""}return ${prefix}` +
-      `${spec.name || "rebound"}(${(spec.parameters || []).join(",")}) {\n` +
-      `${spec.source}\n}`);
+    // Preparation deliberately asks the host to parse every body eagerly.
+    // Runtime transport also carries alternative entries that may never run;
+    // avoid the parenthesized-function eager-parse hint for those installs.
+    const eager = !this.jvm.guestStarted;
+    let factory;
+    try {
+      factory = new Function(...names, `"use strict"; ${
+        spec.hoistedSource ? `\n${spec.hoistedSource}\n` : ""}return ${eager ? '(' : ''}${prefix}` +
+        `${spec.name || "rebound"}(${(spec.parameters || []).join(",")}) {\n` +
+        `${spec.source}\n}${eager ? ')' : ''};`);
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+      // Source-only workers defer host syntax validation to installation.
+      // Refuse the result without publishing a partial body or stranding
+      // the worker queue in an uncaught message-handler exception.
+      this.lastTransportRefusal = `invalid generated source: ${error.message}`;
+      if (timings) timings.newFunctionMs += this.monotonicNow() - t1;
+      return null;
+    }
     const fn = factory(...names.map((name) => captures[name]));
     if (timings) timings.newFunctionMs += this.monotonicNow() - t1;
     fn.jvmParameters = spec.parameters;
@@ -3339,6 +3780,14 @@ class JitCompiler {
   // its own bookkeeping and mean nothing on the requesting thread.
   serializeGeneratedResult(generated, options = {}) {
     if (typeof generated !== "function") return null;
+    if (generated.jvmDirectIntrinsicKind) {
+      // Intrinsics are runtime closures, not generated JavaScript. The
+      // receiver revalidates the bytecode and rebuilds its own closure.
+      return { kind: "direct-intrinsic", intrinsicKind: generated.jvmDirectIntrinsicKind,
+        provenance: this.stampResultProvenance(options.provenance),
+        siteTables: options.siteTablesSince
+          ? this.describeSiteTablesSince(options.siteTablesSince) : null };
+    }
     if (generated.jvmResumeBody === true &&
         typeof generated.jvmFastBody === "function" &&
         typeof generated.jvmResumeBodyFn === "function") {
@@ -3362,14 +3811,19 @@ class JitCompiler {
       siteTables: options.siteTablesSince
         ? this.describeSiteTablesSince(options.siteTablesSince) : null };
     if (generated.jvmStructuredSsa === true) {
-      const framed = this.serializeTextBody(
+      const shape = generated.jvmStructuredWrapperShape;
+      const shared = shape?.useContinuations === true &&
+        shape.ordinaryAdaptive === true && shape.ordinaryAdaptiveCanonical === true &&
+        generated.jvmStructuredFramedBody === generated.jvmAdaptiveGeneratedBody;
+      const framed = shared ? null : this.serializeTextBody(
         generated.jvmStructuredFramedBody || generated);
-      if (!framed) return null;
+      if (!shared && !framed) return null;
       payload.kind = "structured";
       payload.bodies.framed = framed;
       payload.bodies.adaptive =
         this.serializeTextBody(generated.jvmAdaptiveGeneratedBody);
-      payload.shape = generated.jvmStructuredWrapperShape || null;
+      if (shared && !payload.bodies.adaptive) return null;
+      payload.shape = shape ? {...shape, framedUsesAdaptive: shared} : null;
       payload.speculation = generated.jvmStructuredSpeculation || null;
       if (!payload.shape || !payload.speculation) return null;
     } else {
@@ -3381,8 +3835,24 @@ class JitCompiler {
     payload.linkRecordCaptures = generated.jvmStructuredLinkRecordCaptures
       ? this.describeLinkRecords(generated.jvmStructuredLinkRecordCaptures)
       : null;
+    const rebuiltKeys = JitCompiler.transportRebuiltKeys;
     for (const key of Object.keys(generated)) {
-      if (JitCompiler.transportRebuiltKeys.has(key)) continue;
+      if (rebuiltKeys.has(key)) continue;
+      // Structured wrappers carry these once in the protocol's dedicated
+      // fields. The receiver restores both after constructing its closures.
+      // Plain bodies still retain any metadata with these names in data.
+      if (payload.kind === "structured" &&
+          (key === "jvmStructuredWrapperShape" ||
+            key === "jvmStructuredSpeculation")) continue;
+      // Executable source is already represented in bodies. Do not copy
+      // diagnostic source properties which publication will immediately strip.
+      if (!this.installedSourceRetention.retain &&
+          this.installedSourceRetention.constructor.sourceKeys.includes(key)) continue;
+      // Already carried by serializeTextBody; copying these into data doubles
+      // source and descriptor transport for the same function.
+      if (["jvmGeneratedSource", "jvmHoistedSource", "jvmCaptureDescriptors",
+        "jvmParameters", "jvmTier", "jvmGenerator", "jvmAsynchronous",
+        "jvmSourceUrl"].includes(key)) continue;
       const value = generated[key];
       if (typeof value === "function") {
         const spec = this.serializeTextBody(value);
@@ -3407,8 +3877,8 @@ class JitCompiler {
     // sentinel, and the sentinel is then used as an array index. Refuse the
     // whole result instead; the caller already treats null as "cannot
     // transport" and compiles on the main thread.
-    const fatalDrops = payload.dropped.filter(
-      (key) => !JitCompiler.transportOptionalKeys.has(key));
+    const optionalKeys = JitCompiler.transportOptionalKeys;
+    const fatalDrops = payload.dropped.filter((key) => !optionalKeys.has(key));
     if (fatalDrops.length > 0) {
       this.lastTransportRefusal =
         `dropped metadata: ${fatalDrops.join(", ")}`;
@@ -3435,13 +3905,12 @@ class JitCompiler {
       classInitializationGuards:
         this.structuredSsa.classInitializationGuards.length,
       restoringFrameLayouts: this.structuredSsa.restoringFrameLayouts.length,
-      // Tables the generated text also indexes by bare id, but which the
-      // protocol cannot rebuild yet. They are watermarked so a compile that
-      // allocated into one can be refused instead of transported: a body that
-      // reaches `helpers.directJreIntrinsics[3]` on the receiving JIT would
-      // find someone else's entry, or nothing.
+      // Static native intrinsics and their initialization guards travel as
+      // paired symbolic entries and must reserve the same index space.
       directJreIntrinsics: this.directJreIntrinsics.length,
       directJreInitializationTokens: this.directJreInitializationTokens.length,
+      // Unsupported local tables remain watermarked so transport refuses
+      // generated text that would address missing receiver entries.
       checkedLeafCaptureCaches: this.checkedLeafCaptureCaches.length,
       inlineLoopRegions: this.inlineLoopRegions.length,
     };
@@ -3468,7 +3937,8 @@ class JitCompiler {
 
   static get transportableSiteTables() {
     return ["fieldSites", "syncCallSites", "directStaticTargets",
-      "classInitializationGuards", "restoringFrameLayouts"];
+      "classInitializationGuards", "restoringFrameLayouts",
+      "directJreIntrinsics", "directJreInitializationTokens"];
   }
 
   // Names the tables a compile allocated into that cannot cross, or [] when
@@ -3496,13 +3966,24 @@ class JitCompiler {
       watermark.classInitializationGuards);
     grow(this.structuredSsa.restoringFrameLayouts,
       watermark.restoringFrameLayouts);
+    grow(this.directJreIntrinsics, watermark.directJreIntrinsics);
+    grow(this.directJreInitializationTokens, watermark.directJreInitializationTokens);
     return this.siteIdWatermark();
   }
 
   // Every table entry allocated at or after `from`, as plain data.
   describeSiteTablesSince(from) {
     const tables = { fieldSites: [], syncCallSites: [], directStaticTargets: [],
-      classInitializationGuards: [], restoringFrameLayouts: [] };
+      classInitializationGuards: [], restoringFrameLayouts: [],
+      directJreIntrinsics: [] };
+    for (let id = from.directJreIntrinsics ?? 0; id < this.directJreIntrinsics.length; id++) {
+      if (!this.directJreIntrinsics[id]) continue;
+      const descriptor = this.directJreDescriptors.get(id);
+      if (!descriptor?.isStatic) {
+        throw new Error('direct JRE intrinsic has no supported transport descriptor');
+      }
+      tables.directJreIntrinsics.push({index: id, ...descriptor});
+    }
     for (let id = from.fieldSites; id < this.fieldSites.length; id += 1) {
       const site = this.fieldSites[id];
       if (!site) continue;
@@ -3545,6 +4026,33 @@ class JitCompiler {
   // id spaces have diverged and the result must not be installed.
   placeSiteTables(tables, callerMethod = null, warmth = null) {
     if (!tables) return null;
+    const conflict = preflightTransportSites(this, tables, callerMethod);
+    if (conflict) return conflict;
+    for (const entry of tables.directJreIntrinsics || []) {
+      const {className, methodName, descriptor, index} = entry;
+      const native = this.resolveSynchronousJreMethod(className, className, methodName, descriptor);
+      if (!entry.isStatic || native?.jvmDirectFinal !== true ||
+          typeof native.jvmDirectIntrinsic !== 'function' ||
+          this.declaredJreMethod(className, methodName, descriptor) !== native ||
+          JSON.stringify(native.jvmDirectFieldWriteKeys ?? null) !==
+            JSON.stringify(entry.fieldWriteKeys ?? null)) {
+        return `direct JRE intrinsic ${className}.${methodName}${descriptor} does not resolve here`;
+      }
+      const existing = this.directJreDescriptors.get(index);
+      if (this.directJreIntrinsics[index] && (!existing ||
+          existing.className !== className || existing.methodName !== methodName ||
+          existing.descriptor !== descriptor)) {
+        return `direct JRE intrinsic ${index} is already occupied`;
+      }
+      const intrinsic = native.jvmDirectIntrinsic;
+      this.directJreIntrinsics[index] = intrinsic;
+      this.directJreDescriptors.set(index, {className, methodName, descriptor, isStatic: true,
+        fieldWriteKeys: Array.isArray(entry.fieldWriteKeys) ? [...entry.fieldWriteKeys] : null});
+      // Reuse the emitted initialization fallback for a replaced native binding.
+      // The canonical invocation then observes the override at the same PC.
+      this.directJreInitializationTokens[index] =
+        directJreInitializationGuard(this.jvm, entry, native, intrinsic);
+    }
     const hints = new Map();
     for (const entry of warmth || []) {
       hints.set(JitCompiler.warmthKey(entry), entry);
@@ -3568,25 +4076,19 @@ class JitCompiler {
     for (const entry of tables.fieldSites || []) {
       const existing = this.fieldSites[entry.index];
       if (existing) {
-        if (existing.className !== entry.className ||
-            existing.fieldName !== entry.fieldName ||
-            existing.descriptor !== entry.descriptor) {
+        if (!fieldSiteMatches(existing, entry)) {
           return `field site ${entry.index} is already ${existing.className}.` +
             `${existing.fieldName}`;
         }
         continue;
       }
-      const id = this.registerFieldSite(
-        ["Field", entry.className, [entry.fieldName, entry.descriptor]]);
-      grow(this.fieldSites, entry.index);
-      this.fieldSites[entry.index] = this.fieldSites[id];
+      this.registerFieldSite(
+        ["Field", entry.className, [entry.fieldName, entry.descriptor]], entry.index);
     }
     for (const entry of tables.syncCallSites || []) {
       const existing = this.syncCallSites[entry.index];
       if (existing) {
-        if (existing.declaredClassName !== entry.className ||
-            existing.methodName !== entry.methodName ||
-            existing.descriptor !== entry.descriptor) {
+        if (!callSiteMatches(existing, entry, callerMethod)) {
           return `call site ${entry.index} is already ` +
             `${existing.declaredClassName}.${existing.methodName}`;
         }
@@ -3602,9 +4104,7 @@ class JitCompiler {
       }
       const id = this.registerSyncCallSite(entry.op,
         { arg: ["Method", entry.className, [entry.methodName, entry.descriptor]] },
-        callerMethod, entry.callerPc);
-      grow(this.syncCallSites, entry.index);
-      this.syncCallSites[entry.index] = this.syncCallSites[id];
+        callerMethod, entry.callerPc, entry.index);
       // No warmed counterpart here, so the receiver's own cache is the only
       // source of a link. Sites the requester never ran through a compiled
       // caller still get pre-linked when their callee already has a body.
@@ -3616,21 +4116,15 @@ class JitCompiler {
         return `direct static target ${entry.index} has no field site`;
       }
       const direct = this.registerDirectStaticTarget(
-        entry.fieldSiteId, entry.forWrite);
+        entry.fieldSiteId, entry.forWrite, entry.index);
       if (!direct) {
         return `direct static target ${entry.index} does not resolve here`;
       }
-      grow(this.directStaticTargets, entry.index);
-      this.directStaticTargets[entry.index] =
-        this.directStaticTargets[direct.targetId];
     }
     const guards = this.structuredSsa.classInitializationGuards;
     for (const entry of tables.classInitializationGuards || []) {
       if (guards[entry.index]) continue;
-      const id = this.structuredSsa.registerClassInitializationGuard(
-        entry.owners);
-      grow(guards, entry.index);
-      guards[entry.index] = guards[id];
+      this.structuredSsa.registerClassInitializationGuard(entry.owners, entry.index);
     }
     const layouts = this.structuredSsa.restoringFrameLayouts;
     for (const entry of tables.restoringFrameLayouts || []) {
@@ -3660,12 +4154,14 @@ class JitCompiler {
   // baked an epoch-sensitive link, so it stamps that itself.
   stampResultProvenance(requested) {
     const provenance = requested || this.captureResultProvenance();
-    return { ...provenance, epochSensitive: provenance.epochSensitive === true ||
+    return { ...provenance, denseInstanceFields: this.jvm.denseInstanceFields,
+      epochSensitive: provenance.epochSensitive === true ||
       this.resultIsEpochSensitive() };
   }
 
   captureResultProvenance() {
     return {
+      denseInstanceFields: this.jvm.denseInstanceFields,
       epochSensitive: this.resultIsEpochSensitive(),
       classEpoch: this.jvm.classEpoch,
       classInitializationEpoch: this.jvm.classInitializationEpoch,
@@ -3680,6 +4176,10 @@ class JitCompiler {
   resultStalenessReason(payload) {
     const provenance = payload?.provenance;
     if (!provenance) return "result carries no provenance";
+    if (provenance.denseInstanceFields !== undefined &&
+        provenance.denseInstanceFields !== this.jvm.denseInstanceFields) {
+      return "instance field layout differs from compiler";
+    }
     // Classes the compile treated as initialized must still be initialized
     // here. Initialization is monotone within one JVM, so the failing case in
     // practice is a shadow JVM that reported more than the main thread has.
@@ -3750,6 +4250,16 @@ class JitCompiler {
         return null;
       }
     }
+    if (payload.kind === "direct-intrinsic") {
+      phaseStart = mark();
+      const intrinsic = this.compileDirectIntrinsicFrameEntry(method);
+      if (timings) timings.descriptorBindingMs += mark() - phaseStart;
+      if (!intrinsic || intrinsic.jvmDirectIntrinsicKind !== payload.intrinsicKind) {
+        this.lastTransportRefusal = "intrinsic does not match receiving method";
+        return null;
+      }
+      return intrinsic;
+    }
     if (payload.kind === "resume-dispatcher") {
       const fast = this.materializeGeneratedResult(
         payload.fast, method, { checkStaleness: false, timings });
@@ -3762,14 +4272,27 @@ class JitCompiler {
     let generated;
     let framedBody = null;
     let adaptivePositionalBody = null;
+    let adaptiveGeneratedBody = null;
     if (payload.kind === "structured") {
-      framedBody = this.materializeTextBody(payload.bodies.framed, method, timings);
-      if (!framedBody) return null;
+      const shared = payload.shape?.framedUsesAdaptive === true;
+      if (shared && (payload.shape.useContinuations !== true ||
+          payload.shape.ordinaryAdaptive !== true ||
+          payload.shape.ordinaryAdaptiveCanonical !== true ||
+          !payload.bodies.adaptive || payload.bodies.adaptive.generator ||
+          payload.bodies.adaptive.asynchronous || payload.bodies.framed)) {
+        this.lastTransportRefusal = "invalid shared adaptive body";
+        return null;
+      }
+      if (!shared) {
+        framedBody = this.materializeTextBody(payload.bodies.framed, method, timings);
+        if (!framedBody) return null;
+      }
       const state = wrappers.createStructuredSpeculationState(
         this, payload.speculation);
-      const adaptiveGeneratedBody = payload.bodies.adaptive
+      adaptiveGeneratedBody = payload.bodies.adaptive
         ? this.materializeTextBody(payload.bodies.adaptive, method, timings) : null;
       if (payload.bodies.adaptive && !adaptiveGeneratedBody) return null;
+      if (shared) framedBody = adaptiveGeneratedBody;
       if (adaptiveGeneratedBody) {
         adaptivePositionalBody = payload.shape.ordinaryAdaptive
           ? adaptiveGeneratedBody
@@ -3818,6 +4341,7 @@ class JitCompiler {
     }
     if (payload.kind === "structured") {
       generated.jvmStructuredFramedBody = framedBody;
+      generated.jvmAdaptiveGeneratedBody = adaptiveGeneratedBody;
       generated.jvmAdaptivePositionalBody = adaptivePositionalBody;
       generated.jvmStructuredWrapperShape = payload.shape;
       generated.jvmStructuredSpeculation = payload.speculation;
@@ -3966,7 +4490,7 @@ class JitCompiler {
       "ior", "irem", "ireturn", "ishl", "istore_1", "istore_2", "istore_3", "ineg", "ishr", "iushr", "isub", "ixor", "l2i", "lcmp", "ldc", "ldc_w", "ldc2_w", "ldiv", "lmul", "lreturn", "lshr", "lxor",
       ...(this.postIncrementHelpersEnabled ? ["dup_x1"] : []),
       ...EXTENDED_TIER_OPCODES,
-      "monitorenter", "monitorexit", "multianewarray", "new", "newarray", "nop", "pop", "putfield", "putstatic", "return", "saload", "sastore",
+      "monitorenter", "monitorexit", "multianewarray", "new", "newarray", "nop", "pop", "pop2", "putfield", "putstatic", "return", "saload", "sastore",
       "sipush"
     ]);
 
@@ -3987,9 +4511,24 @@ class JitCompiler {
     }
     const supportCache = allowEffectfulCalls
       ? this.adaptiveCodegenSupportCache : this.codegenSupportCache;
-    if (supportCache.has(method)) {
-      return supportCache.get(method);
+    const cachedSupport = supportCache.get(method);
+    if (cachedSupport === true) return true;
+    const preparedBody = allowEffectfulCalls &&
+      this.preparedCodegenMethods.has(method) && this.codegenCache.get(method);
+    if (this.structuredUnsafeConstructorCallersEnabled && this.structuredSsa.enabled &&
+        preparedBody?.jvmStructuredSsa &&
+        !preparedBody.jvmStructuredRequiresBaselineFramedEntry) {
+      // A verified, published entry is stronger evidence than an earlier
+      // admission rejection or dependency wait. Its precise continuations
+      // remain valid when a constructor dependency is not yet synchronous.
+      // Keep replacement compilation restricted to that same safe tier.
+      this.structuredOnlyCodegenMethods.add(method);
+      supportCache.set(method, true);
+      this.adaptiveCodegenDependencyPending.delete(method);
+      this.adaptiveCodegenDependencyEpoch.delete(method);
+      return true;
     }
+    if (cachedSupport === false) return false;
     if (allowEffectfulCalls &&
         this.adaptiveCodegenDependencyPending.has(method) &&
         this.adaptiveCodegenDependencyEpoch.get(method) ===
@@ -4010,7 +4549,13 @@ class JitCompiler {
     // restriction here costs the boot >70 s.
     const safeConstructor = this.hotLoopConstructorsEnabled &&
       this.isJitSafeConstructor(method, codeItems);
-    if ((method.name === "<init>" && !safeConstructor) ||
+    // Preparation admits a constructor on its resolved call graph (see
+    // isSynchronouslyResolvedConstructor); the run-time admission keeps the
+    // syntactic proof, since a compile there is a stall.
+    const resolvedConstructor = !safeConstructor && allowEffectfulCalls &&
+      method.name === "<init>" && this.preparedConstructorsEnabled &&
+      this.isSynchronouslyResolvedConstructor(method, codeItems);
+    if ((method.name === "<init>" && !safeConstructor && !resolvedConstructor) ||
         method.name === "<clinit>" ||
         !safeConstructor && !allowEffectfulCalls &&
         !this.experimentalControlFlow &&
@@ -4023,6 +4568,14 @@ class JitCompiler {
     }
     const safeInitializationCalls = !safeConstructor && allowEffectfulCalls
       ? this.hasOnlyJitSafeInitializationCalls(codeItems) : true;
+    if (allowEffectfulCalls && safeInitializationCalls === true &&
+        this.structuredOnlyCodegenMethods.has(method)) {
+      // A later preparation round may publish the constructor's body. The
+      // caller no longer needs the structured-only restriction, and a failed
+      // earlier attempt must not prevent trying the now-safe fallback tiers.
+      this.structuredOnlyCodegenMethods.delete(method);
+      if (this.codegenCache.get(method) === null) this.codegenCache.delete(method);
+    }
     if (safeInitializationCalls !== true) {
       // Adaptive compilation can start after an arbitrary number of
       // interpreter invocations.  Only omit a constructor boundary when its
@@ -4037,12 +4590,16 @@ class JitCompiler {
       const structuredOnly = safeInitializationCalls === false &&
         this.structuredUnsafeConstructorCallersEnabled &&
         this.structuredSsa.enabled &&
-        this.hasConstructorBeforeOrInsideBackwardLoop(method, codeItems) &&
-        codeItems.some((item) =>
-          PRIMITIVE_ARRAY_ACCESS_OPCODES.has(getOp(item?.instruction)));
+        (this.effectfulPreparationActive ||
+          this.structuredOnlyCodegenMethods.has(method) ||
+          this.hasConstructorBeforeOrInsideBackwardLoop(method, codeItems) &&
+          codeItems.some((item) =>
+            PRIMITIVE_ARRAY_ACCESS_OPCODES.has(getOp(item?.instruction))));
       if (structuredOnly) {
-        // This only admits the method to the adaptive heat counter. The full
-        // CFG/stack/exception proof still happens in compileMethod, which is
+        // Preparation can also verify callers whose allocating branch is
+        // cold: requiring a hot array loop would strand their ordinary path
+        // in the interpreter. Runtime admission retains its shape filter.
+        // The full CFG/stack/exception proof happens in compileMethod, which is
         // barred above from falling through to the baseline generator.
         this.structuredOnlyCodegenMethods.add(method);
         if (typeof process !== "undefined" && process.env &&
@@ -4099,7 +4656,7 @@ class JitCompiler {
       "ifnull", "iload", "iload_0", "iload_1", "iload_2", "iload_3",
       "iand", "imul", "ineg", "iinc", "invokeinterface", "invokespecial", "invokestatic", "invokevirtual",
       "i2l", "ior", "irem", "ireturn", "ishl", "ishr", "iushr", "istore", "istore_0", "istore_1", "istore_2",
-      "istore_3", "isub", "ixor", "l2i", "lcmp", "ldc", "ldc_w", "ldc2_w", "ldiv", "lmul", "lreturn", "lshr", "lxor", "multianewarray", "new", "newarray", "pop", "putfield", "putstatic", "return",
+      "istore_3", "isub", "ixor", "l2i", "lcmp", "ldc", "ldc_w", "ldc2_w", "ldiv", "lmul", "lreturn", "lshr", "lxor", "multianewarray", "new", "newarray", "pop", "pop2", "putfield", "putstatic", "return",
       "lookupswitch", "nop", "tableswitch",
       ...(this.postIncrementHelpersEnabled ? ["dup_x1"] : []),
       ...EXTENDED_TIER_OPCODES,
@@ -4140,7 +4697,16 @@ class JitCompiler {
         || (op === "newarray" && (item.instruction.arg === "double" || item.instruction.arg === "float"))
       );
     });
-    const supported = (safeConstructor || hasNumericHotPath ||
+    // The shape predicates below say whether a body is WORTH compiling at
+    // run time, where a compile is a stall; they are not safety proofs. The
+    // ahead-of-main preparation pass pays nothing the guest can observe, and
+    // a method it leaves without a body is one every prepared caller hands
+    // back to the scheduler on every call (Deko Bloko: a six-bytecode
+    // getter, `mi.c()Lol;`, was 1200 handoffs per Start Game stage). So
+    // during that pass any method whose every opcode the tier supports is
+    // worth a body; the run-time admission is unchanged.
+    const preparing = allowEffectfulCalls && this.effectfulPreparationActive;
+    const supported = (preparing || safeConstructor || hasNumericHotPath ||
       this.hasReferenceFieldHelperShape(method) ||
       this.hasBackwardBranch(method) ||
       this.hasCallDenseComputeShape(method, codeItems) ||
@@ -4171,9 +4737,141 @@ class JitCompiler {
       const constructor = classData &&
         this.jvm.findMethod(classData, "<init>", descriptor);
       if (!classData || !constructor) return null;
+      // A constructor that preparation already gave a synchronous body is as
+      // safe to call in place as a syntactically proven one; this is how a
+      // caller of such a constructor becomes preparable in the next round.
+      if (this.hasPublishedSynchronousBody(constructor)) continue;
       if (!this.isJitSafeConstructor(constructor)) return false;
     }
     return true;
+  }
+
+  // Preparation-time constructor admission. `isJitSafeConstructor` is a
+  // syntactic proof -- no call and no branch after the super() call -- from
+  // the time the only generated tier was the baseline runner. The structured
+  // renderer suspends and resumes a body at any call exactly as it does for an
+  // ordinary method, and a constructor keeps its canonical Frame (its
+  // positional entries are refused), so the property that has to hold is
+  // semantic: every call the body can make completes synchronously in place.
+  // That is decided on the resolved call graph -- a JRE shim with a
+  // synchronous form, an intrinsic, or a bytecode target that already has a
+  // published synchronous body -- and the preparation fixed point answers it
+  // round by round: a constructor whose callee gets a body in round N is
+  // admitted in round N+1. Initialization calls (super/this/nested new) are
+  // proven separately by hasOnlyJitSafeInitializationCalls. A native, an
+  // asynchronous shim, an abstract or unresolvable target, or a callee still
+  // without a body leaves the constructor interpreted, and the reason is
+  // kept for the preparation census.
+  isSynchronouslyResolvedConstructor(method, codeItems = this.getCodeItems(method)) {
+    if (!method || method.name !== "<init>" ||
+        (method.flags || []).includes("static") ||
+        isSynchronizedMethod(method)) return false;
+    if (!method.attributes.some((attribute) => attribute.type === "code")) {
+      return false;
+    }
+    for (const item of codeItems || []) {
+      const instruction = item && item.instruction;
+      const op = getOp(instruction);
+      if (!op || !op.startsWith("invoke")) continue;
+      if (op === "invokedynamic" || !Array.isArray(instruction.arg) ||
+          !Array.isArray(instruction.arg[2])) {
+        this.constructorAdmissionNotes.set(method, op);
+        return false;
+      }
+      const [, className, [methodName, descriptor]] = instruction.arg;
+      if (methodName === "<init>") continue;
+      const why = this.describeUnresolvedSynchronousEntry(
+        op, className, methodName, descriptor);
+      if (why) {
+        this.constructorAdmissionNotes.set(method,
+          `${op} ${className}.${methodName}${descriptor}: ${why}`);
+        return false;
+      }
+    }
+    this.constructorAdmissionNotes.delete(method);
+    return true;
+  }
+
+  // null when a call to this member completes synchronously through a
+  // published entry; otherwise why it does not. Resolution follows the
+  // superclass chain like the interpreter's resolver (JVMS 5.4.3.3).
+  describeUnresolvedSynchronousEntry(op, className, methodName, descriptor) {
+    if (this.resolveSynchronousJreMethod(
+      className, className, methodName, descriptor)) return null;
+    let classData = this.jvm.classes[className];
+    if (!classData) return "class not loaded";
+    let method = this.jvm.findMethod(classData, methodName, descriptor);
+    while (!method && classData?.ast?.classes?.[0]?.superClassName) {
+      const superName = classData.ast.classes[0].superClassName;
+      if (this.resolveSynchronousJreMethod(
+        superName, superName, methodName, descriptor)) return null;
+      classData = this.jvm.classes[superName];
+      if (!classData) return "superclass not loaded";
+      method = this.jvm.findMethod(classData, methodName, descriptor);
+    }
+    if (!method) {
+      return classData.isJreStub ? "JRE stub without synchronous form"
+        : this.jvm._jreFindMethod(className, methodName, descriptor)
+          ? "asynchronous JRE shim" : "no bytecode method";
+    }
+    const flags = method.flags || [];
+    if (flags.includes("native")) return "native";
+    if (flags.includes("abstract")) {
+      // What such a call may execute is what the loaded world implements:
+      // every concrete class in the declared class's cone, bounded like the
+      // preparation prelinker bounds a virtual site's receivers.
+      if (op !== "invokevirtual" && op !== "invokeinterface") return "abstract";
+      const implementors = this.loadedConcreteClassesInCone(className);
+      if (implementors.length === 0) return "abstract, no loaded implementor";
+      if (implementors.length > 8) {
+        return `abstract, ${implementors.length} loaded implementors`;
+      }
+      for (const type of implementors) {
+        const why = this.describeUnresolvedSynchronousEntry(
+          "invokevirtual", type, methodName, descriptor);
+        if (why) return `abstract, implementor ${type}: ${why}`;
+      }
+      return null;
+    }
+    if (this.hasPublishedSynchronousBody(method)) return null;
+    if (op === "invokestatic" &&
+        this.getSynchronousIntrinsic(method, descriptor)) return null;
+    return "callee has no synchronous body";
+  }
+
+  // Concrete loaded classes that extend or implement `root` (root included
+  // when concrete). The cone is rebuilt when the set of loaded classes grows.
+  loadedConcreteClassesInCone(root) {
+    const classNames = Object.keys(this.jvm.classes);
+    if (!this.loadedClassCone ||
+        this.loadedClassCone.count !== classNames.length) {
+      const children = new Map();
+      for (const name of classNames) {
+        const header = this.jvm.classes[name]?.ast?.classes?.[0];
+        if (!header || this.jvm.classes[name].isJreStub) continue;
+        for (const parent of [header.superClassName, ...(header.interfaces || [])]) {
+          if (typeof parent !== "string") continue;
+          let list = children.get(parent);
+          if (!list) { list = []; children.set(parent, list); }
+          list.push(name);
+        }
+      }
+      this.loadedClassCone = { count: classNames.length, children };
+    }
+    const { children } = this.loadedClassCone;
+    const out = [root];
+    const seen = new Set(out);
+    for (let index = 0; index < out.length; index += 1) {
+      for (const child of children.get(out[index]) || []) {
+        if (!seen.has(child)) { seen.add(child); out.push(child); }
+      }
+    }
+    return out.filter((name) => {
+      const header = this.jvm.classes[name]?.ast?.classes?.[0];
+      const flags = header?.flags || [];
+      return header && !flags.includes("abstract") &&
+        !flags.includes("interface");
+    });
   }
 
   isJitSafeConstructor(method, codeItems = this.getCodeItems(method)) {
@@ -5365,7 +6063,7 @@ class JitCompiler {
       // dispatch after a cooperative scheduler safe point.
       resume = fast.jvmStructuredSsa && this.scalarLoopsEnabled
         ? this.compileScalarIntegerLoop(method) : null;
-      if (!resume) resume = this.compileBaselineMethod(method);
+      if (!resume) resume = this.compileBaselineMethod(method, null, {coldHandlers: true});
     } catch (_) { resume = null; }
     if (!resume || resume.jvmSynchronous !== true) return fast;
     return this.buildResumeDispatcher(fast, resume, method);
@@ -5763,19 +6461,24 @@ class JitCompiler {
           if (value === undefined) valid = false;
           else {
             const castValue = temp();
-            const source = temp();
-            const cast = temp();
-            const caught = temp();
-            const target = JSON.stringify(instruction.arg);
-            body.push(`const ${castValue} = ${value}; if (${castValue} !== null && ${castValue} !== undefined) {`);
-            body.push(`const ${source} = ${generatedRuntimeClassNameExpression(castValue)}; if (${source} !== ${target}) {`);
-            body.push(`let ${cast}; try { ${cast} = helpers.tryCheckCastSourceSync(${source}, ${target}); } catch (${caught}) {`);
-            body.push(...materialize(expressions, index));
-            body.push(`throw ${caught};`, "}");
-            body.push(`if (${cast} === helpers.asyncInvokeSentinel()) {`);
-            body.push(...materialize(expressions, index));
-            body.push("helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'cold scalar checkcast' };", "}");
-            body.push("}", "}");
+            body.push(`const ${castValue} = ${value};`);
+            if (instruction.arg === "java/lang/Object") {
+              expressions[expressions.length - 1] = castValue;
+            } else {
+              const source = temp();
+              const cast = temp();
+              const caught = temp();
+              const target = JSON.stringify(instruction.arg);
+              body.push(`if (${castValue} !== null && ${castValue} !== undefined) {`);
+              body.push(`const ${source} = ${generatedRuntimeClassNameExpression(castValue)}; if (${source} !== ${target}) {`);
+              body.push(`let ${cast}; try { ${cast} = helpers.tryCheckCastSourceSync(${source}, ${target}); } catch (${caught}) {`);
+              body.push(...materialize(expressions, index));
+              body.push(`throw ${caught};`, "}");
+              body.push(`if (${cast} === helpers.asyncInvokeSentinel()) {`);
+              body.push(...materialize(expressions, index));
+              body.push("helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'cold scalar checkcast' };", "}");
+              body.push("}", "}");
+            }
           }
         } else if (op === "arraylength") {
           const arrayExpression = pop();
@@ -6082,7 +6785,7 @@ class JitCompiler {
     }
   }
 
-  compileBaselineMethod(method, inlineLoopRegions = null) {
+  compileBaselineMethod(method, inlineLoopRegions = null, {coldHandlers = false} = {}) {
     const synchronous = this.canCompileSynchronously(method);
     const GeneratedFunction = synchronous ? Function : getAsyncFunctionConstructor();
     if (!GeneratedFunction) {
@@ -6092,6 +6795,8 @@ class JitCompiler {
 
     const code = method.attributes.find((attr) => attr.type === "code");
     const codeItems = this.getCodeItems(method);
+    const normalReachable = coldHandlers && code.code.exceptionTable?.length
+      ? normalInstructionReachability(codeItems) : null;
     const loopRegions = inlineLoopRegions ||
       this.compileInlinePrimitiveLoopRegions(method);
     const loopRegionsByHeader = new Map(
@@ -6099,13 +6804,10 @@ class JitCompiler {
     let stackWidthsBefore = null;
     if (codeItems.some((item) => {
       const op = getOp(item && item.instruction);
-      return op === "dup_x2" || op === "dup2" || op === "dup2_x2";
+      return op === "dup_x2" || op === "dup2" || op === "dup2_x2" ||
+        op === "pop2";
     })) {
-      const analysis = buildSsa({
-        codeItems,
-        exceptionTable: code && code.code && code.code.exceptionTable || [],
-        method,
-      });
+      const analysis = this.ssaOperandCategories(codeItems, method);
       if (analysis && !analysis.rejected && analysis.stackKindsBefore) {
         stackWidthsBefore = new Map();
         for (const [index, kinds] of analysis.stackKindsBefore) {
@@ -6180,6 +6882,15 @@ class JitCompiler {
     try {
       codeItems.forEach((item, index) => {
         body.push(`case ${index}:`);
+        if (normalReachable && !normalReachable.has(index)) {
+          // A cold handler keeps the canonical frame and exception operand.
+          // Interpret the remainder of this activation instead of retaining a
+          // second generated copy of diagnostic/catch-only control flow.
+          if (index + 1 === codeItems.length || normalReachable.has(index + 1)) {
+            body.push("helpers.materializeCached(frame, locals, stack, sp, pc); frame.jitJsDisabled = true; return { deopt: true, transient: true, reason: 'cold exception handler' };");
+          }
+          return;
+        }
         if (synchronous && backEdgeTargets.has(index)) {
           body.push(
             // The per-frame cap bounds a fast body that keeps declining the
@@ -6306,15 +7017,9 @@ class JitCompiler {
     let stackWidthsBefore = null;
     if (codeItems.some((item) => {
       const op = getOp(item && item.instruction);
-      return op === "dup2" || op === "dup2_x2";
+      return op === "dup2" || op === "dup2_x2" || op === "pop2";
     })) {
-      const code = method?.attributes?.find((attribute) =>
-        attribute.type === "code");
-      const analysis = buildSsa({
-        codeItems,
-        exceptionTable: code?.code?.exceptionTable || [],
-        method,
-      });
+      const analysis = this.ssaOperandCategories(codeItems, method);
       if (!analysis || analysis.rejected || !analysis.stackKindsBefore) {
         return rejectDepths("category analysis failed", -1, null,
           analysis?.reason || null);
@@ -6550,6 +7255,16 @@ class JitCompiler {
         return `{ const value1 = stack[--sp]; const value2 = stack[--sp]; const value3 = stack[--sp]; const value4 = stack[--sp]; stack[sp++] = value2; stack[sp++] = value1; stack[sp++] = value4; stack[sp++] = value3; stack[sp++] = value2; stack[sp++] = value1; } ${goNext}`;
       }
       case "pop": return `sp -= 1; ${goNext}`;
+      case "pop2": {
+        // Statically verified widths decide between one category-2 slot and
+        // two category-1 slots; the interpreter's runtime check is the same
+        // decision made from the same analysis.
+        if (!stackWidthsBefore || stackWidthsBefore.length < 1) {
+          throw new Error("pop2 without verified operand widths");
+        }
+        const topIsCategory2 = stackWidthsBefore[stackWidthsBefore.length - 1] === 2;
+        return `sp -= ${topIsCategory2 ? 1 : 2}; ${goNext}`;
+      }
       case "iadd": return `{ const b = stack[--sp]; stack[sp - 1] = (stack[sp - 1] + b) | 0; } ${goNext}`;
       case "isub": return `{ const b = stack[--sp]; stack[sp - 1] = (stack[sp - 1] - b) | 0; } ${goNext}`;
       case "imul": return `{ const b = stack[--sp]; stack[sp - 1] = Math.imul(stack[sp - 1], b); } ${goNext}`;
@@ -6616,6 +7331,7 @@ class JitCompiler {
       case "anewarray": return `stack[sp - 1] = helpers.newReferenceArray(stack[sp - 1], ${JSON.stringify(instruction.arg)}); ${goNext}`;
       case "arraylength": return `stack[sp - 1] = helpers.arrayLength(stack[sp - 1], frame); ${goNext}`;
       case "checkcast":
+        if (instruction.arg === "java/lang/Object") return goNext;
         if (this.compileSynchronous) {
           return `{ const value = stack[sp - 1]; if (value !== null && value !== undefined) { const source = ${generatedRuntimeClassNameExpression("value")}; if (source !== ${JSON.stringify(instruction.arg)}) { const cast = helpers.tryCheckCastSourceSync(source, ${JSON.stringify(instruction.arg)}); if (cast === helpers.asyncInvokeSentinel()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "cold synchronous checkcast" }; } } } } ${goNext}`;
         }
@@ -6799,7 +7515,7 @@ class JitCompiler {
           const traceCall = this.compileTraceSyncCalls
             ? `helpers.traceSyncCallAt(${callSiteId}, frame, thread, value, sp);`
             : "";
-          return `{ helpers.materializeCached(frame, locals, stack, sp, ${next}); const value = helpers.tryInvokeSyncAt(${callSiteId}, frame, thread); ${traceCall} if (value === helpers.asyncInvokeSentinel()) { const activeChild = thread.callStack.items[thread.callStack.items.length - 1]; if (activeChild !== frame && activeChild && activeChild.jitGeneratedReturnParent === frame) { return { deopt: true, transient: true, reason: "asynchronous ${op} left active child" }; } helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "asynchronous callee from synchronous ${op}" }; } if (value && value.deopt) return value; sp = stack.length; if (thread.callStack.items[thread.callStack.items.length - 1] !== frame) { return { deopt: true, transient: true, reason: "synchronous ${op} left active child" }; } if (value !== helpers.returnVoid()) stack[sp++] = value; if (thread.status !== "runnable") return { deopt: true, transient: true, reason: "thread yielded in synchronous ${op}" }; } ${goNext}`;
+          return `{ helpers.materializeCached(frame, locals, stack, sp, ${next}); const value = helpers.tryInvokeSyncAt(${callSiteId}, frame, thread); ${traceCall} if (value === helpers.asyncInvokeSentinel()) return helpers.handleGeneratedAsyncInvoke(frame, thread, locals, stack, sp, ${index}, ${JSON.stringify(op)}); if (value && value.deopt) return value; sp = stack.length; if (thread.callStack.items[thread.callStack.items.length - 1] !== frame) { return { deopt: true, transient: true, reason: "synchronous ${op} left active child" }; } if (value !== helpers.returnVoid()) stack[sp++] = value; if (thread.status !== "runnable") return { deopt: true, transient: true, reason: "thread yielded in synchronous ${op}" }; } ${goNext}`;
         }
         {
           // Async-capable generated bodies still execute the overwhelming
@@ -6855,6 +7571,14 @@ class JitCompiler {
       case "freturn":
       case "dreturn":
         return `{ if (thread.callStack.items[thread.callStack.items.length - 1] !== frame) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "generated return with active child" }; } const ret = stack[--sp]; helpers.materializeCached(frame, locals, stack, sp, ${next}); thread.callStack.pop(); return { returned: true, value: ret }; }`;
+      case "multianewarray": {
+        // Admitted by both opcode gates but never emitted: a prepared body
+        // with a `new int[a][b]` deopted for good at its first allocation
+        // ("unsupported generated opcode multianewarray") and ran
+        // interpreted from then on.
+        const dimensions = Number(instruction.arg[1]) | 0;
+        return `{ sp -= ${dimensions}; stack[sp] = helpers.newMultiArrayFrom(${JSON.stringify(instruction.arg)}, stack, sp); sp += 1; } ${goNext}`;
+      }
       default:
         return `helpers.materializeCached(frame, locals, stack, sp, ${index}); return { deopt: true, reason: "unsupported generated opcode ${op}" };`;
     }
@@ -6981,11 +7705,11 @@ class JitCompiler {
       }));
     }
     if (result.returned) {
-      // `module` is the meta execute() actually ran (companion when
-      // prep.osr) — its box holds the return value, not the primary's.
+      // execute() carries the actual module's result (the companion on OSR)
+      // after releasing reference-valued return scratch.
       return {
         returned: true,
-        value: module.meta.retChar === "V" ? RETURN_VOID : module.meta.box.ret,
+        value: module.meta.retChar === "V" ? RETURN_VOID : result.value,
       };
     }
     if (result.deopted || !thread.callStack.isEmpty() &&
@@ -6993,6 +7717,22 @@ class JitCompiler {
       return { deopted: true, resumePc: frame.pc };
     }
     return { resumePc: frame.pc };
+  }
+
+  runnerStackWidthsBefore(frame, index) {
+    let widths = this.runnerStackWidths.get(frame.method);
+    if (widths === undefined) {
+      const analysis = this.ssaOperandCategories(this.getCodeItems(frame.method), frame.method);
+      widths = null;
+      if (analysis && !analysis.rejected && analysis.stackKindsBefore) {
+        widths = new Map();
+        for (const [at, kinds] of analysis.stackKindsBefore) {
+          widths.set(at, kinds.map(kindWidth));
+        }
+      }
+      this.runnerStackWidths.set(frame.method, widths);
+    }
+    return widths ? widths.get(index) || null : null;
   }
 
   async runFrame(frame, thread) {
@@ -7004,14 +7744,17 @@ class JitCompiler {
     const stack = frame.stack.items;
     const instructions = frame.instructions;
     let pc = frame.pc;
-    let bytecodesUntilYield = 100000;
+    // Awaiting a nested runner only drains microtasks. Check the shared host
+    // deadline at entry as well as within long bodies so repeated short calls
+    // cannot starve worker deliveries and browser rendering.
+    let bytecodesUntilYieldCheck = 0;
     // Prime stride so successive probes land on different pcs of a loop body —
     // a fixed multiple of the body length would hit the same (possibly
     // non-leader, non-empty-stack) offset forever.
     let bytecodesUntilOsrProbe = 10007;
 
     while (pc < instructions.length) {
-      bytecodesUntilYield -= 1;
+      bytecodesUntilYieldCheck -= 1;
       bytecodesUntilOsrProbe -= 1;
       if (bytecodesUntilOsrProbe === 0) {
         bytecodesUntilOsrProbe = 10007;
@@ -7028,10 +7771,20 @@ class JitCompiler {
           pc = osr.resumePc; // transient exit: resume interpreting there
         }
       }
-      if (bytecodesUntilYield === 0) {
-        this.materialize(frame, locals, stack, pc);
-        await yieldToEventLoop();
-        bytecodesUntilYield = 100000;
+      if (bytecodesUntilYieldCheck <= 0) {
+        bytecodesUntilYieldCheck = 256;
+        if (Date.now() >= this.jvm._nextEventLoopYieldAt) {
+          this.materialize(frame, locals, stack, pc);
+          await this.cooperativeYield();
+          this.jvm._nextEventLoopYieldAt = Date.now() + this.jvm.eventLoopYieldMs;
+          // A scheduler entry owns the entire nested call chain. Unwind to
+          // it after the host turn so another Java thread can run, and so a
+          // newly installed body can resume this materialized activation.
+          // Standalone runner callers still receive their completed result.
+          if (thread.callStack.items.some(active => this.runningFrames.has(active))) {
+            return {deopt: true, transient: true, reason: 'baseline scheduler quantum'};
+          }
+        }
       }
       if (this.shouldDeopt(frame, pc)) {
         this.materialize(frame, locals, stack, pc);
@@ -7183,8 +7936,83 @@ class JitCompiler {
         case "fcmpl": stack.push(compareDouble(stack.pop(), stack.pop(), -1)); break;
         case "newarray": stack.push(this.newPrimitiveArray(stack.pop(), instruction.arg)); break;
         case "anewarray": stack.push(this.newReferenceArray(stack.pop(), instruction.arg)); break;
-        case "multianewarray": stack.push(this.newMultiArray(instruction.arg, stack)); break;
         case "arraylength": stack.push(this.arrayLength(stack.pop(), frame)); break;
+        // Ordinary opcodes the generated tier has always had but this runner
+        // lacked; a frame that landed here (resumed after a transient deopt)
+        // deopted for good at the first of them ("unsupported opcode lconst_0
+        // in en.<init>") and the method ran interpreted from then on.
+        case "lconst_0": stack.push(0n); break;
+        case "lconst_1": stack.push(1n); break;
+        case "lload": stack.push(locals[Number(instruction.arg)]); break;
+        case "lload_0": stack.push(locals[0]); break;
+        case "lload_1": stack.push(locals[1]); break;
+        case "lload_2": stack.push(locals[2]); break;
+        case "lload_3": stack.push(locals[3]); break;
+        case "lstore": locals[Number(instruction.arg)] = stack.pop(); break;
+        case "lstore_0": locals[0] = stack.pop(); break;
+        case "lstore_1": locals[1] = stack.pop(); break;
+        case "lstore_2": locals[2] = stack.pop(); break;
+        case "lstore_3": locals[3] = stack.pop(); break;
+        case "ladd": { const b = stack.pop(); const a = stack.pop(); stack.push(BigInt.asIntN(64, BigInt(a) + BigInt(b))); break; }
+        case "lsub": { const b = stack.pop(); const a = stack.pop(); stack.push(BigInt.asIntN(64, BigInt(a) - BigInt(b))); break; }
+        case "land": { const b = stack.pop(); const a = stack.pop(); stack.push(BigInt.asIntN(64, BigInt(a) & BigInt(b))); break; }
+        case "lor": { const b = stack.pop(); const a = stack.pop(); stack.push(BigInt.asIntN(64, BigInt(a) | BigInt(b))); break; }
+        case "lneg": stack.push(BigInt.asIntN(64, -BigInt(stack.pop()))); break;
+        case "lshl": { const shift = stack.pop(); const value = stack.pop(); stack.push(BigInt.asIntN(64, BigInt(value) << (BigInt(shift) & 63n))); break; }
+        case "lushr": { const shift = stack.pop(); const value = stack.pop(); stack.push(BigInt.asIntN(64, BigInt.asUintN(64, BigInt(value)) >> (BigInt(shift) & 63n))); break; }
+        case "lrem": { const b = BigInt(stack.pop()); const a = BigInt(stack.pop()); if (b === 0n) throw { type: "java/lang/ArithmeticException", message: "/ by zero" }; stack.push(BigInt.asIntN(64, a % b)); break; }
+        case "laload": stack.push(this.arrayLoad(stack.pop(), stack.pop(), frame, op)); break;
+        case "lastore": this.arrayStore(stack.pop(), stack.pop(), stack.pop(), frame, op); break;
+        case "i2c": stack.push(stack.pop() & 0xffff); break;
+        case "i2s": stack.push((stack.pop() << 16) >> 16); break;
+        case "instanceof": stack.push(await this.instanceOf(stack.pop(), instruction.arg)); break;
+        case "multianewarray": stack.push(this.newMultiArray(instruction.arg, stack)); break;
+        case "dup_x1": { const value1 = stack.pop(); const value2 = stack.pop(); stack.push(value1, value2, value1); break; }
+        case "pop2":
+        case "dup_x2":
+        case "dup2_x2": {
+          // The same verified widths the generated tier uses decide between
+          // one category-2 slot and two category-1 slots.
+          const widths = this.runnerStackWidthsBefore(frame, pc - 1);
+          if (!widths || widths.length < (op === "pop2" ? 1 : 2)) {
+            this.materialize(frame, locals, stack, pc - 1);
+            return { deopt: true, reason: `unverified ${op} stack widths in ${frame.className || ""}.${frame.method.name}` };
+          }
+          const top = widths.length - 1;
+          if (op === "pop2") {
+            stack.length -= widths[top] === 2 ? 1 : 2;
+          } else if (op === "dup_x2") {
+            const value1 = stack.pop(); const value2 = stack.pop();
+            if (widths[top - 1] === 2) stack.push(value1, value2, value1);
+            else { const value3 = stack.pop(); stack.push(value1, value3, value2, value1); }
+          } else if (widths[top] === 2) {
+            const value1 = stack.pop(); const value2 = stack.pop();
+            if (widths[top - 1] === 2) stack.push(value1, value2, value1);
+            else { const value3 = stack.pop(); stack.push(value1, value3, value2, value1); }
+          } else {
+            const value1 = stack.pop(); const value2 = stack.pop(); const value3 = stack.pop();
+            if (widths[top - 2] === 2) stack.push(value2, value1, value3, value2, value1);
+            else { const value4 = stack.pop(); stack.push(value2, value1, value4, value3, value2, value1); }
+          }
+          break;
+        }
+        case "tableswitch": {
+          const selector = stack.pop() | 0;
+          const low = Number(instruction.low) | 0;
+          const labels = instruction.labels || [];
+          const offset = selector - low;
+          pc = this.target(frame, offset >= 0 && offset < labels.length ? labels[offset] : instruction.defaultLbl);
+          break;
+        }
+        case "lookupswitch": {
+          const selector = stack.pop() | 0;
+          let label = instruction.arg?.defaultLabel;
+          for (const pair of instruction.arg?.pairs || []) {
+            if (Array.isArray(pair) && (Number(pair[0]) | 0) === selector) { label = pair[1]; break; }
+          }
+          pc = this.target(frame, label);
+          break;
+        }
         case "checkcast": {
           const value = stack[stack.length - 1];
           if (value !== null && !await this.jvm.isInstanceOfAsync(runtimeClassName(value), instruction.arg)) {
@@ -7212,7 +8040,8 @@ class JitCompiler {
         case "getfield": stack.push(this.getField(stack.pop(), instruction.arg)); break;
         case "putfield": { const value = stack.pop(); const obj = stack.pop(); this.putField(obj, instruction.arg, value); break; }
         case "getstatic": {
-          const value = await this.getStatic(instruction.arg, thread);
+          let value = this.getStatic(instruction.arg, thread);
+          if (value && typeof value.then === "function") value = await value;
           if (value === STATIC_DEOPT) {
             this.materialize(frame, locals, stack, pc - 1);
             return { deopt: true, transient: true, reason: "class initialization at getstatic" };
@@ -7221,7 +8050,8 @@ class JitCompiler {
           break;
         }
         case "putstatic": {
-          const changed = await this.putStatic(instruction.arg, stack[stack.length - 1], thread);
+          let changed = this.putStatic(instruction.arg, stack[stack.length - 1], thread);
+          if (changed && typeof changed.then === "function") changed = await changed;
           if (changed === STATIC_DEOPT) {
             this.materialize(frame, locals, stack, pc - 1);
             return { deopt: true, transient: true, reason: "class initialization at putstatic" };
@@ -7315,7 +8145,7 @@ class JitCompiler {
   }
 
   cooperativeYield() {
-    return yieldToEventLoop();
+    return yieldToEventLoop(0, this.jvm.eventLoopYieldStrategy);
   }
 
   compareDouble(value2, value1, nanValue) {
@@ -7361,21 +8191,21 @@ class JitCompiler {
     for (let i = 0; i < dimensions; i += 1) {
       counts.unshift(stack.pop());
     }
-    const baseType = className.replace(/^\[+/, "");
-    const leafDefault = baseType.startsWith("L") ? null : 0;
-    const make = (depth) => {
-      const count = counts[depth];
-      const arr = new Array(count);
-      arr.type = className.slice(depth);
-      arr.hashCode = this.jvm.nextHashCode++;
-      if (depth === counts.length - 1) {
-        arr.fill(leafDefault);
-      } else {
-        for (let i = 0; i < count; i += 1) arr[i] = make(depth + 1);
-      }
-      return arr;
-    };
-    return make(0);
+    return allocMultiArray(this.jvm, className, counts);
+  }
+
+  // Structured bodies pass the staged dimension counts directly.
+  newMultiArrayCounts(arg, counts) {
+    return allocMultiArray(this.jvm, arg[0], counts);
+  }
+
+  // Generated bodies keep their operand stack in an array with an explicit
+  // stack pointer: the dimension counts are stack[base .. base + n).
+  newMultiArrayFrom(arg, stack, base) {
+    const [className, dimensions] = arg;
+    const counts = new Array(Number(dimensions) | 0);
+    for (let i = 0; i < counts.length; i += 1) counts[i] = stack[base + i];
+    return allocMultiArray(this.jvm, className, counts);
   }
 
   arrayLength(arrayRef, frame) {
@@ -7683,7 +8513,7 @@ class JitCompiler {
     }
   }
 
-  registerFieldSite(arg) {
+  registerFieldSite(arg, placementIndex = null) {
     const [, className, [fieldName, descriptor]] = arg;
     // A fieldref resolves to one declaring-class slot regardless of the
     // receiver's runtime subclass. Bind that verified slot once from loaded
@@ -7711,7 +8541,11 @@ class JitCompiler {
     const denseSlot = directInstanceKey
       ? denseSlotFor(this.jvm, declaringClassName, fieldName, descriptor)
       : null;
-    const id = this.nextFieldSiteId++;
+    // Transport installs into a reserved slot rather than appending a
+    // temporary alias beyond the reservation. Ordinary allocation still
+    // advances monotonically and can never reuse the installed slot.
+    const id = placementIndex ?? this.nextFieldSiteId;
+    this.nextFieldSiteId = Math.max(this.nextFieldSiteId, id + 1);
     this.fieldSites[id] = {
       arg,
       className,
@@ -7865,7 +8699,7 @@ class JitCompiler {
     return null;
   }
 
-  registerDirectStaticTarget(id, forWrite = false) {
+  registerDirectStaticTarget(id, forWrite = false, placementIndex = null) {
     const site = this.fieldSites[id];
     if (!site) return null;
     let target = site.staticTarget;
@@ -7892,8 +8726,8 @@ class JitCompiler {
     // copying an object that points into this JVM's static store.
     target.siteFieldSiteId = id;
     target.siteForWrite = forWrite === true;
-    const targetId = this.directStaticTargets.length;
-    this.directStaticTargets.push(target);
+    const targetId = placementIndex ?? this.directStaticTargets.length;
+    this.directStaticTargets[targetId] = target;
     return { targetId, kind: target.kind, key: target.key,
       cell: Boolean(target.cell), className: site.className };
   }
@@ -8216,14 +9050,57 @@ class JitCompiler {
     return makeObjectRef(this.jvm, className, newFields(this.jvm, className));
   }
 
+  // Keep cold asynchronous recovery out of every emitted synchronous call
+  // site. An owned child already holds the consumed operands and return PC;
+  // otherwise restore the invoke itself for canonical interpreter execution.
+  handleGeneratedAsyncInvoke(frame, thread, locals, stack, sp, pc, op) {
+    const activeChild = thread.callStack.items[thread.callStack.items.length - 1];
+    if (activeChild !== frame && activeChild &&
+        activeChild.jitGeneratedReturnParent === frame) {
+      return {deopt: true, transient: true,
+        reason: `asynchronous ${op} left active child`};
+    }
+    this.materializeCached(frame, locals, stack, sp, pc);
+    this.skipJitOnce(frame);
+    return {deopt: true, transient: true,
+      reason: `asynchronous callee from synchronous ${op}`};
+  }
+
   asyncInvokeSentinel() {
     return ASYNC_INVOKE;
   }
 
+  hasPublishedSynchronousBody(method) {
+    const cached = method ? this.codegenCache.get(method) : null;
+    return Boolean(cached && cached.jvmSynchronous === true);
+  }
+
+  // Diagnostic (jit option asyncCallCensus, or JVM_JIT_ASYNC_CALL_CENSUS=1):
+  // every synchronous call site that hands a call back to the scheduler,
+  // keyed by caller, pc, callee and the reason the call could not complete
+  // in place. Answers "which callees lack a synchronous entry, and why"
+  // without reading generated code; the preparation pass is judged on it.
+  recordAsyncCall(site, frame, why) {
+    const census = this.asyncCallCensus;
+    if (!census || !site) return;
+    const caller = frame && frame.method
+      ? `${this.getFrameClassName(frame)}.${frame.method.name}` +
+        `${frame.method.descriptor}@${frame.pc}` : "?";
+    const key = `${caller} ${site.op} ${site.declaredClassName}.` +
+      `${site.methodName}${site.descriptor}: ${why}`;
+    census.set(key, (census.get(key) || 0) + 1);
+    // Charge the child frame the scheduler is about to push for this call.
+    if (frame && this.asyncCallCensusTime) {
+      frame.jitHandoffPending = { key, at: handoffNow(),
+        methodName: site.methodName, descriptor: site.descriptor };
+    }
+  }
+
   registerSyncCallSite(op, instruction, callerMethod = null,
-    callerPc = null) {
+    callerPc = null, placementIndex = null) {
     const [, declaredClassName, [methodName, descriptor]] = instruction.arg;
-    const id = this.nextSyncCallSiteId++;
+    const id = placementIndex ?? this.nextSyncCallSiteId;
+    this.nextSyncCallSiteId = Math.max(this.nextSyncCallSiteId, id + 1);
     const site = {
       id,
       op,
@@ -8457,6 +9334,8 @@ class JitCompiler {
   }
 
   getCompileTimeDirectJre(op, instruction) {
+    // Workers transport declared static intrinsics symbolically. Instance and
+    // inherited bindings still use ordinary linked calls there.
     if (this.profileMethods ||
         !instruction || !Array.isArray(instruction.arg) ||
         !Array.isArray(instruction.arg[2])) return null;
@@ -8468,11 +9347,18 @@ class JitCompiler {
       declaredClassName, declaredClassName, methodName, descriptor);
     if (typeof method?.jvmDirectIntrinsic !== "function" ||
         method.jvmDirectFinal !== true) return null;
+    if (this.producesTransport && (op !== 'invokestatic' ||
+        this.declaredJreMethod(declaredClassName, methodName, descriptor) !== method)) return null;
     let parsed;
     try { parsed = parseDescriptor(descriptor); } catch (_) { return null; }
     const id = this.directJreIntrinsics.length;
     this.directJreIntrinsics.push(method.jvmDirectIntrinsic);
     const isStatic = op === "invokestatic";
+    this.directJreDescriptors.set(id, {
+      className: declaredClassName, methodName, descriptor, isStatic,
+      fieldWriteKeys: Array.isArray(method.jvmDirectFieldWriteKeys)
+        ? [...method.jvmDirectFieldWriteKeys] : null,
+    });
     this.directJreInitializationTokens.push(isStatic
       ? this.jvm.getClassInitializationToken(declaredClassName) : null);
     return {
@@ -8483,6 +9369,12 @@ class JitCompiler {
       fieldWriteKeys: Array.isArray(method.jvmDirectFieldWriteKeys)
         ? [...method.jvmDirectFieldWriteKeys] : null,
     };
+  }
+
+  declaredJreMethod(className, methodName, descriptor) {
+    const owner = this.jvm.jre[className];
+    const signature = methodName + descriptor;
+    return owner?.methods?.[signature] || owner?.staticMethods?.[signature];
   }
 
   // The bare id form indexes the compiling JIT's table. A transported body
@@ -8583,6 +9475,19 @@ class JitCompiler {
     }
     const jre = site.fastJreTarget;
     if (jre) {
+      // A static JRE shim may read state its class's <clinit> shim creates
+      // (Runtime.getRuntime reads the currentRuntime static the initializer
+      // stores). The generic path that used to be the only publisher of this
+      // fast target checks initialization before every static call, and a
+      // target linked ahead of main by the preparation pass exists before
+      // that first generic call ever happens -- so the check lives here, on
+      // the fast path, not on whoever published it. Without it the shim ran
+      // uninitialized, returned undefined, the caller pushed nothing, and
+      // the next call underflowed its operands (Deko Bloko si.b(I)V).
+      if (site.op === "invokestatic" && !site.initializationToken.initialized) {
+        if (this.asyncCallCensus) this.recordAsyncCall(site, frame, "class not initialized");
+        return ASYNC_INVOKE;
+      }
       const receiver = site.op === "invokestatic" ? null
         : frame.stack.items[frame.stack.items.length - site.params.length - 1];
       if (site.op === "invokestatic" ||
@@ -8613,6 +9518,7 @@ class JitCompiler {
     const target = site.fastStaticTarget;
     if (target) {
       if (!site.initializationToken.initialized) {
+        if (this.asyncCallCensus) this.recordAsyncCall(site, frame, "class not initialized");
         return ASYNC_INVOKE;
       }
       return this.tryInvokeResolvedTarget(site, target, frame, thread);
@@ -9078,7 +9984,7 @@ class JitCompiler {
       // which restores the child and lets the scheduler block on it.
       "  if (child.isSynchronizedMethod && !child.monitorEntered &&",
       "      !jit.jvm.enterFrameMonitorIfNeeded(child, thread)) {",
-      "    result = { deopt: true, reason: 'synchronized monitor contended' };",
+      "    result = { deopt: true, transient: true, cooperativeSuspension: true, reason: 'synchronized monitor contended' };",
       "  } else {",
       "  if (plan.referenceFrameless) jit.referenceFramelessPositionalRunCount += 1;",
       "  if (plan.compiledCallChain) jit.compiledCallChainRunCount += 1;",
@@ -9118,7 +10024,7 @@ class JitCompiler {
       // the interpreter re-enters the already-pushed child once it is free.
       "  if (child.isSynchronizedMethod && !child.monitorEntered &&",
       "      !jit.jvm.enterFrameMonitorIfNeeded(child, thread)) {",
-      "    result = { deopt: true, reason: 'synchronized monitor contended' };",
+      "    result = { deopt: true, transient: true, cooperativeSuspension: true, reason: 'synchronized monitor contended' };",
       "  } else {",
       "  result = jit.runGeneratedFrame(plan.canonicalGeneratedBody, child, thread, false);",
       "  if (result && typeof result.then === 'function') {",
@@ -9271,8 +10177,8 @@ class JitCompiler {
       ? target.method.jvmDirectIntrinsic : null;
     const invocation = direct
       ? `plan.direct(${argumentsList.join(", ")})`
-      : `plan.method(plan.jvm, ${receiver}, [${
-        callArguments.join(", ")}], thread)`;
+      : `plan.invokeNative(plan.method, plan.jvm, ${receiver}, [${
+        callArguments.join(", ")}], thread, true)`;
     const staticGuard = site.op === "invokestatic"
       ? `if (!plan.staticInitialization.initialized) return plan.asyncInvoke;`
       : "";
@@ -9311,6 +10217,7 @@ class JitCompiler {
       const plan = {
         jvm: this.jvm,
         method: target.method,
+        invokeNative,
         direct,
         staticOwner: site.declaredClassName,
         staticInitialization: site.initializationToken,
@@ -9330,6 +10237,7 @@ class JitCompiler {
     const { op, declaredClassName, methodName, descriptor, params, returnType } = site;
     if (op === "invokestatic" &&
         !site.initializationToken.initialized) {
+      if (this.asyncCallCensus) this.recordAsyncCall(site, frame, "class not initialized");
       return ASYNC_INVOKE;
     }
 
@@ -9368,10 +10276,49 @@ class JitCompiler {
     if (!target) {
       target = this.linkSyncCallTarget(site, targetClassName,
         wholeMethodCaller, false);
-      if (!target) return ASYNC_INVOKE;
+      if (!target) {
+        if (this.asyncCallCensus) {
+          this.recordAsyncCall(site, frame, this.describeUnlinkedCallee(
+            site, targetClassName, wholeMethodCaller));
+        }
+        return ASYNC_INVOKE;
+      }
     }
 
     return this.tryInvokeResolvedTarget(site, target, frame, thread);
+  }
+
+  // Census detail for a call the linker declined: what the callee is and
+  // which admission it failed. Diagnostic only; never on a hot path.
+  describeUnlinkedCallee(site, targetClassName, wholeMethodCaller) {
+    const { op, methodName, descriptor } = site;
+    let classData = this.jvm.classes[targetClassName];
+    if (!classData) return `no class ${targetClassName}`;
+    let method = this.jvm.findMethod(classData, methodName, descriptor);
+    while (!method && (op === "invokevirtual" || op === "invokeinterface" ||
+        op === "invokespecial" && methodName !== "<init>") &&
+      classData && classData.ast.classes[0].superClassName) {
+      classData = this.jvm.classes[classData.ast.classes[0].superClassName];
+      if (!classData) break;
+      method = this.jvm.findMethod(classData, methodName, descriptor);
+    }
+    if (!method) {
+      return classData && classData.isJreStub ? "no bytecode (JRE stub)"
+        : this.jvm._jreFindMethod(targetClassName, methodName, descriptor)
+          ? "JRE shim without synchronous form" : "no bytecode method";
+    }
+    if (method.name === "<init>") return "constructor";
+    const flags = method.flags || [];
+    if (flags.includes("native")) return "native";
+    if (flags.includes("abstract")) return "abstract";
+    const cached = this.codegenCache.get(method);
+    if (cached && !cached.jvmSynchronous) return "cached body not synchronous";
+    if (!cached) {
+      return `no body (supported=${this.isSupported(method)} codegen=${
+        this.isCodegenSupported(method)} prepared=${
+        this.preparedCodegenMethods.has(method)} wholeCaller=${wholeMethodCaller})`;
+    }
+    return "linker declined";
   }
 
   // Resolve a synchronous JRE shim for `targetClassName` at this site and
@@ -9413,7 +10360,12 @@ class JitCompiler {
     if (!classData) return null;
     let method = this.jvm.findMethod(classData, methodName, descriptor);
     let lookupClass = targetClassName;
-    while (!method && (op === "invokevirtual" || op === "invokeinterface") &&
+    // Method resolution walks the superclass chain for every kind of call
+    // except a constructor (JVMS 5.4.3.3; the interpreter's resolver does the
+    // same). An invokespecial of an inherited private/super method used to
+    // stop at the named class and hand every call back to the scheduler.
+    while (!method && (op === "invokevirtual" || op === "invokeinterface" ||
+        op === "invokespecial" && methodName !== "<init>") &&
       classData && classData.ast.classes[0].superClassName) {
       lookupClass = classData.ast.classes[0].superClassName;
       classData = this.jvm.classes[lookupClass];
@@ -9427,9 +10379,18 @@ class JitCompiler {
     // only for the child to be admitted by tryRunFrame on the next turn.
     // This is a structural capability check; no class or method identity is
     // involved.
+    // A callee that already has a published synchronous body needs no
+    // admission argument: the body exists, calling it compiles nothing. This
+    // is what an ahead-of-main preparation pass leaves behind for methods
+    // the adaptive (non-effectful) admission rejects -- constructor-calling
+    // draw/text helpers, say -- and without it every call from a prepared
+    // caller into such a callee was an "asynchronous callee" deopt (measured
+    // on Deko Bloko's Start Game: tens of thousands per stage).
     const normallySupported = this.isSupported(method) ||
       this.isShortSupportedHelper(method) ||
-      (wholeMethodCaller && this.isCodegenSupported(method));
+      this.hasPublishedSynchronousBody(method) ||
+      (wholeMethodCaller && this.isCodegenSupported(method,
+        this.preparedCodegenMethods.has(method)));
     // A semantic intrinsic can cover a method whose raw bytecodes are too
     // large/irregular for the ordinary method tier.  Probe it before the
     // generic support rejection.  For the polygon family the final span
@@ -9613,8 +10574,10 @@ class JitCompiler {
   }
 
   resolveSynchronousJreMethod(targetClassName, declaredClassName, methodName, descriptor) {
-    const method = this.jvm._jreFindMethod(targetClassName, methodName, descriptor) ||
-      this.jvm._jreFindMethod(declaredClassName, methodName, descriptor);
+    // A declared platform owner must not bypass the receiver's guest override.
+    const owner = typeof targetClassName === "string" && targetClassName.startsWith("[")
+      ? "java/lang/Object" : targetClassName || declaredClassName;
+    const method = this.jvm._jreFindMethod(owner, methodName, descriptor);
     if (typeof method !== "function") return null;
     const constructorName = method.constructor && method.constructor.name;
     if (constructorName === "AsyncFunction") return null;
@@ -9636,13 +10599,14 @@ class JitCompiler {
       throw { type: "java/lang/NullPointerException", message: null };
     }
     const args = frame.stack.items.slice(base + receiverSlots);
-    const result = target.method(this.jvm, receiver, args, thread);
+    const result = invokeNative(target.method, this.jvm, receiver, args, thread, true);
     // Classification above rejects declared async functions. Be conservative
-    // if a plain shim unexpectedly returns an asynchronous handoff: leave the
-    // operands untouched, disable this fast target, and use the canonical path.
+    // if a plain shim unexpectedly returns an asynchronous handoff: preserve
+    // its result, leave the operands untouched, and use the canonical path.
     if (result === ASYNC_METHOD_SENTINEL ||
         result && typeof result.then === "function") {
       site.fastJreTarget = null;
+      if (this.asyncCallCensus) this.recordAsyncCall(site, frame, "JRE shim returned asynchronously");
       return ASYNC_INVOKE;
     }
     frame.stack.items.length = base;
@@ -9751,7 +10715,14 @@ class JitCompiler {
       // Adopt an already cached synchronous body instead of handing every
       // call back to the scheduler; this never compiles anything here.
       const cached = !generated && !intrinsic && !inlineIntegerRegion &&
-        this.isCodegenSupported(method) ? this.codegenCache.get(method) : null;
+        this.isCodegenSupported(method, this.preparedCodegenMethods.has(method))
+        ? this.codegenCache.get(method) : null;
+      if (this.asyncCallCensus && !(cached && cached.jvmSynchronous)) {
+        this.recordAsyncCall(site, frame, generated
+          ? "target body not synchronous" : intrinsic || inlineIntegerRegion
+            ? "intrinsic/region declined" : cached ? "cached body not synchronous"
+              : "target has no body");
+      }
       if (cached && cached.jvmSynchronous) {
         this.publishGeneratedTargetUpgrade(method, cached, { regionEntryOnly: true });
         if (target.generated !== cached) {
@@ -9861,6 +10832,8 @@ class JitCompiler {
       child.jitGeneratedReturnType = returnType;
       return {
         deopt: true,
+        transient: true,
+        cooperativeSuspension: true,
         reason: "synchronized monitor contended",
         jvmPositionalChild: child,
       };
@@ -10805,7 +11778,7 @@ class JitCompiler {
 
     const jreMethod = await this.findJreMethod(targetClassName, declaredClassName, methodName, descriptor);
     if (jreMethod) {
-      let result = jreMethod(this.jvm, receiver, args, thread);
+      let result = invokeNative(jreMethod, this.jvm, receiver, args, thread);
       if (result && typeof result.then === "function") result = await result;
       if (result === ASYNC_METHOD_SENTINEL) {
         // Some JRE shims (notably Method.invoke) install a Java child frame
@@ -10830,7 +11803,7 @@ class JitCompiler {
     // Code attribute; treating such an empty Frame as a successful call
     // silently skips required work. Match the interpreter and fail explicitly
     // when no shim exists.
-    if (this.jvm.jre[targetClassName] || this.jvm.jre[declaredClassName]) {
+    if (this.jvm.jre[targetClassName]) {
       frame.stack.items = stackSnapshot;
       frame.pc = invokePc;
       throw new Error(
@@ -10879,8 +11852,9 @@ class JitCompiler {
     thread.callStack.push(child);
     if (child.isSynchronizedMethod && !child.monitorEntered &&
         !this.jvm.enterFrameMonitorIfNeeded(child, thread)) {
-      // Contended: leave the child pushed and let the scheduler resume it.
-      return { deopt: true, reason: "synchronized monitor contended" };
+      // Contention is a scheduler suspension, not a failed code assumption.
+      // Leave the child pushed and keep compiled callers eligible on resume.
+      return { deopt: true, transient: true, cooperativeSuspension: true, reason: "synchronized monitor contended" };
     }
     // A JS-supported child whose loops touch imported primitive arrays must
     // keep the same JavaScript locality it gets as a scheduler entry
@@ -10910,10 +11884,12 @@ class JitCompiler {
         if (returnType === "V" || wasmResult.isVoid) return RETURN_VOID;
         return wasmResult.value;
       }
-      if (wasmResult.exited && (wasmResult.deopted || !jsChildSupported)) {
-        // The child remains on the Java call stack at its materialized exit
-        // PC (a deopt may also have materialized deeper callee frames above
-        // it). Yield the generated parent transiently; executeTick will resume
+      if (wasmResult.exited) {
+        // Every partial exit transfers continuation ownership to the scheduler,
+        // just as in synchronous dispatch. The deopt flag does not describe
+        // every pending descendant; running this child's fallback immediately
+        // can execute below another live frame and pop the wrong return target.
+        // Yield the generated parent transiently; executeTick will resume
         // the top frame through the normal scheduler and then continue the
         // parent at the already-materialized post-invoke PC.
         return {
@@ -10946,31 +11922,28 @@ class JitCompiler {
   }
 
   async findJreMethod(targetClassName, declaredClassName, methodName, descriptor) {
-    const direct = this.jvm._jreFindMethod(targetClassName, methodName, descriptor)
-      || this.jvm._jreFindMethod(declaredClassName, methodName, descriptor);
-    if (direct) return direct;
-
-    // Arrays implement Object's virtual methods even though they do not have
-    // ordinary class metadata to walk. Keep generated invokevirtual behavior
-    // aligned with the interpreter (notably for array clone()).
+    // The runtime class chooses virtual dispatch. Falling back immediately to
+    // the declared JRE class bypasses a guest override, and walking past a
+    // guest constructor silently calls Object.<init> instead of initializing
+    // the object. _jreFindMethod already respects loaded guest declarations;
+    // this asynchronous path only needs to load missing hierarchy records.
     if (typeof targetClassName === "string" && targetClassName.startsWith("[")) {
-      const objectMethod = this.jvm._jreFindMethod(
-        "java/lang/Object", methodName, descriptor,
-      );
-      if (objectMethod) return objectMethod;
+      return this.jvm._jreFindMethod("java/lang/Object", methodName, descriptor);
     }
-
-    let currentClassName = targetClassName;
+    let currentClassName = targetClassName || declaredClassName;
     while (currentClassName) {
-      const classData = this.jvm.classes[currentClassName] || await this.jvm.loadClassByName(currentClassName);
-      if (!classData || !classData.ast || !classData.ast.classes[0]) break;
+      const classData = this.jvm.classes[currentClassName] ||
+        await this.jvm.loadClassByName(currentClassName);
+      const native = this.jvm._jreFindMethod(currentClassName, methodName, descriptor);
+      if (native) return native;
+      if (!classData?.ast?.classes?.[0]) return null;
+      if (this.jvm.findMethod(classData, methodName, descriptor) || methodName === "<init>") {
+        return null;
+      }
       currentClassName = classData.ast.classes[0].superClassName;
-      const method = this.jvm._jreFindMethod(currentClassName, methodName, descriptor);
-      if (method) return method;
     }
     return null;
   }
-
 }
 
 function isClassConstant(arg) {
@@ -11031,13 +12004,6 @@ function unsignedIntegralMemoValue(value, width) {
   return integer >>> 0;
 }
 
-function yieldToEventLoop() {
-  return new Promise((resolve) => {
-    if (typeof setImmediate === "function") setImmediate(resolve);
-    else setTimeout(resolve, 0);
-  });
-}
-
 
 function getOp(instruction) {
   if (!instruction) return null;
@@ -11080,9 +12046,20 @@ function stackEffect(instruction, stackWidthsBefore = null) {
     if (!stackWidthsBefore || stackWidthsBefore.length < 1) return null;
     return stackWidthsBefore[stackWidthsBefore.length - 1] === 2 ? 1 : 2;
   }
+  if (op === "pop2") {
+    // One category-2 value (a BigInt long or a double in one slot) or two
+    // category-1 values; only the verified widths can tell them apart.
+    if (!stackWidthsBefore || stackWidthsBefore.length < 1) return null;
+    return stackWidthsBefore[stackWidthsBefore.length - 1] === 2 ? -1 : -2;
+  }
   if (op === "dup2_x2") {
     if (!stackWidthsBefore || stackWidthsBefore.length < 2) return null;
     return stackWidthsBefore[stackWidthsBefore.length - 1] === 2 ? 1 : 2;
+  }
+  if (op === "multianewarray") {
+    // Pops one count per allocated dimension, pushes the array.
+    const dimensions = Number(instruction && instruction.arg && instruction.arg[1]);
+    return Number.isInteger(dimensions) && dimensions >= 1 ? 1 - dimensions : null;
   }
   if (op === "putfield") return -2;
   if (op.endsWith("aload") || [
@@ -11183,17 +12160,13 @@ function reachableInstructionIndexes(codeItems, exceptionTable) {
       if (Number.isInteger(target)) queue.push(target);
       queue.push(index + 1);
     } else if (op === "tableswitch" || op === "lookupswitch") {
-      const arg = instruction.arg;
-      if (arg && typeof arg === "object") {
-        if (typeof arg.defaultLabel === "string") {
-          const t = labels.get(arg.defaultLabel);
-          if (Number.isInteger(t)) queue.push(t);
-        }
-        for (const c of arg.cases || []) {
-          if (c && typeof c.label === "string") {
-            const t = labels.get(c.label);
-            if (Number.isInteger(t)) queue.push(t);
-          }
+      for (const label of switchTargetLabels(instruction)) {
+        const target = labels.get(label);
+        if (Number.isInteger(target)) queue.push(target);
+        else {
+          // A malformed edge cannot justify a safety/admission proof.
+          for (let pc = 0; pc < codeItems.length; pc += 1) queue.push(pc);
+          break;
         }
       }
     } else if (op === "return" || op === "ireturn" || op === "lreturn" ||
@@ -11255,49 +12228,12 @@ function normalFlowContainsInvoke(codeItems) {
 }
 
 function normalFlowContains(codeItems, predicate) {
-  const labels = buildLabelMap(codeItems);
-  const pending = [0];
-  const visited = new Set();
-
-  while (pending.length) {
-    const index = pending.pop();
-    if (index < 0 || index >= codeItems.length || visited.has(index)) continue;
-    visited.add(index);
-
-    const instruction = codeItems[index] && codeItems[index].instruction;
-    const op = getOp(instruction);
-    if (predicate(instruction, op)) return true;
-
-    if (op === "athrow" || op === "return" || op === "areturn" ||
-      op === "dreturn" || op === "freturn" || op === "ireturn" || op === "lreturn") {
-      continue;
-    }
-    if (op === "goto" || op === "goto_w") {
-      const target = branchTargetIndex(instruction, labels);
-      if (target === undefined) {
-        return codeItems.some((item) => {
-          const candidate = item && item.instruction;
-          return predicate(candidate, getOp(candidate));
-        });
-      }
-      pending.push(target);
-      continue;
-    }
-    if (op && op.startsWith("if")) {
-      const target = branchTargetIndex(instruction, labels);
-      if (target === undefined) {
-        return codeItems.some((item) => {
-          const candidate = item && item.instruction;
-          return predicate(candidate, getOp(candidate));
-        });
-      }
-      pending.push(target);
-    }
-    // Label-only entries and ordinary instructions both fall through.
-    pending.push(index + 1);
-  }
-
-  return false;
+  const reachable = normalInstructionReachability(codeItems);
+  return codeItems.some((item, index) => {
+    if (reachable && !reachable.has(index)) return false;
+    const instruction = item && item.instruction;
+    return predicate(instruction, getOp(instruction));
+  });
 }
 
 function branchTargetIndex(instruction, labels) {

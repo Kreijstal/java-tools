@@ -44,7 +44,10 @@ const syncInstructions = Object.fromEntries(Object.entries(instructions)
     func.constructor.name !== 'AsyncFunction'));
 // getstatic is asynchronous only while class initialization/loading is cold.
 // Its warm initialized-field path is safe inside the synchronous quantum.
+syncInstructions.ldc = constants.ldcSync;
+syncInstructions.ldc_w = constants.ldcWideSync;
 syncInstructions.getstatic = object.getstaticSync;
+syncInstructions.putstatic = object.putstaticSync;
 syncInstructions.invokevirtual = invoke.invokevirtualSync;
 syncInstructions.invokestatic = invoke.invokestaticSync;
 syncInstructions.invokespecial = invoke.invokespecialSync;
@@ -177,7 +180,8 @@ function dispatch(frame, instruction, jvm, thread) {
 // one through an async dispatcher creates two Promises per instruction even
 // though no suspension is possible. Invoke/getstatic sites add guarded warm
 // handlers and return a fallback sentinel for cold loading/initialization;
-// allocation, casts, class literals, and actual Promises remain asynchronous.
+// allocation, casts, unresolved class literals, and actual Promises remain
+// asynchronous. Numeric/string constants and loaded class mirrors stay warm.
 function dispatchSync(frame, instruction, jvm, thread) {
   if (jvm.verbose) return false;
   const op = typeof instruction === 'string' ? instruction : instruction.op;
@@ -186,6 +190,9 @@ function dispatchSync(frame, instruction, jvm, thread) {
   const func = expandedOp && syncInstructions[expandedOp];
   if (!func) return false;
   const result = func(frame, expanded, jvm, thread);
+  if (result === object.SYNC_STATIC_FALLBACK || result === invoke.SYNC_INVOKE_FALLBACK) {
+    return false;
+  }
   if (result && typeof result.then === 'function') {
     throw new Error(`Synchronous instruction handler returned a Promise: ${expandedOp}`);
   }
