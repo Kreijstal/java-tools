@@ -479,3 +479,12 @@ Recursive entries use temporary buffers; every exit clears all argument slots.
 Module metadata keys are weak, so obsolete modules are not retained by the pool.
 This does not reuse live or suspended guest frames. Measure allocation churn
 and gameplay before enabling it.
+
+`jit.wasm.preferCompleteInstanceCallees` defaults to `false` (experimental).
+Instance bridges can prefer a complete structured body with guard-elided inline
+calls over a partial dispatcher. Existing per-call class-world revalidation
+remains mandatory; guarded-inline bodies are still refused, static callee
+selection is unchanged, and synchronized calls retain their monitor protocol.
+This can remove interpreter exits but expand nested execution and increase frame
+latency. The GeoBlox audio experiment failed constrained gameplay, so keep the
+option disabled in release profiles until frame performance passes.

@@ -2593,6 +2593,10 @@ class WasmJit {
     // JVM_WASM_DIRECT_INSTANCE_LINK=0, or jit.wasm.directInstanceLink:false,
     // to keep every instance call on the bridge.
     this.directInstanceLinkEnabled = wasmOptions.directInstanceLink ?? (env.JVM_WASM_DIRECT_INSTANCE_LINK !== '0');
+    // Complete guard-elided instance bodies are safe under bridge
+    // revalidation, but expanding a nested chain can worsen frame latency.
+    // Keep the alternative ranking opt-in until constrained gameplay passes.
+    this.preferCompleteInstanceCallees = wasmOptions.preferCompleteInstanceCallees === true;
     // Closed polymorphic sites can classify the externref once, then call the
     // selected raw Wasm export directly. This removes the JS nested-call
     // wrapper while retaining the generic import for null, late, partial, and
@@ -3529,8 +3533,13 @@ class WasmJit {
       // scheduler's speculation gate. Rank actual entry eligibility before
       // coverage; otherwise a partial speculative primary ties with a usable
       // dispatcher and hides the only body static callers can safely enter.
+      // Instance bridges revalidate guard-elided inline assumptions before
+      // every call. Static links lack that entry gate; retain their stricter
+      // refusal. Guarded inline modules remain ineligible for both paths.
+      const revalidatedInstance = this.preferCompleteInstanceCallees &&
+        !(frame.method.flags || []).includes('static');
       const rank = (m) => (m.boxedCount || !m.externalEntry.has(0) ||
-          hasUncheckedSpeculation(m) ? -1
+          (revalidatedInstance ? m.speculations : hasUncheckedSpeculation(m)) ? -1
         : m.fullyCompiled ? 2 : m.normalFlowFullyCompiled ? 1 : 0);
       st.callee = st.osr && rank(st.osr.meta) > rank(st.meta) ? st.osr : null;
       st.status = 'ready';
