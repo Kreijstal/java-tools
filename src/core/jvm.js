@@ -2294,8 +2294,10 @@ class JVM {
       // points. Continue through the same Java thread's newly exposed child or
       // parent Frame without a full all-thread scan, but retain a bounded
       // scheduling and browser-event deadline.
-      if ((completedFrames & 7) === 7 &&
-          Date.now() >= this._nextEventLoopYieldAt) {
+      // A generated frame can run an entire nested call chain. Checking only
+      // every eight frames let several expensive chains overrun the host
+      // deadline before rendering or another Java thread could run.
+      if (Date.now() >= this._nextEventLoopYieldAt) {
         completedFrames += 1;
         break;
       }

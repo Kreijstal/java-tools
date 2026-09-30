@@ -789,7 +789,7 @@ test('the scheduler batches bounded same-thread generated frames', (t) => {
       ],
     } }],
   };
-  const jvm = new JVM({ generatedSchedulerBurst: 8,
+  const jvm = new JVM({ generatedSchedulerBurst: 8, eventLoopYieldMs: 1000,
     jit: { warmupThreshold: 0 } });
   const thread = { id: 0, status: 'runnable', callStack: new Stack() };
   const parent = new Frame(method);
@@ -936,3 +936,41 @@ test('explicit preparation can limit Wasm to prepared oversized upgrades',
   ], 'Wasm progress reaches its total even when only some methods need compilation');
   t.end();
 });
+
+for (const frameCostMs of [5, 12]) {
+  test(`generated chains hand off after the host deadline (${frameCostMs}ms frames)`, t => {
+    const realNow = Date.now;
+    let now = 1000;
+    Date.now = () => now;
+    t.teardown(() => { Date.now = realNow; });
+    const jvm = new JVM({generatedSchedulerBurst:64, eventLoopYieldMs:8});
+    const method = {name:'work', descriptor:'()V', flags:['static'],
+      attributes:[{type:'code', code:{localsSize:'0', exceptionTable:[],
+        codeItems:[{instruction:'return'}]}}]};
+    const thread = {id:0, status:'runnable', callStack:new Stack()};
+    const frames = [new Frame(method), new Frame(method), new Frame(method)];
+    frames.forEach(frame => thread.callStack.push(frame));
+    const other = {id:1, status:'runnable', callStack:new Stack()};
+    other.callStack.push(new Frame(method));
+    jvm.threads = [thread, other];
+    let completed = 0;
+    jvm.jit.tryRunFrame = (frame, selected) => {
+      t.equal(selected, thread, 'the current activation belongs to the selected Java thread');
+      t.equal(frame, frames[2-completed], 'parent activation order is preserved');
+      now += frameCostMs; completed++;
+      selected.callStack.pop();
+      return {handled:true};
+    };
+    const result = jvm._tryExecuteSynchronousJitTick(jvm._prepareSchedulerTick());
+    const expected = frameCostMs === 5 ? 2 : 1;
+    t.equal(completed, expected, 'no further generated frame starts after the host deadline');
+    t.equal(thread.callStack.size(), 3-expected, 'unexecuted parent frames stay available');
+    t.equal(jvm.currentThreadIndex, 1, 'another Java thread receives the next scheduling turn');
+    t.equal(jvm.generatedSchedulerBurstFrames, expected, 'completed-frame accounting is exact');
+    t.equal(jvm.generatedSchedulerBurstBatches, 1, 'the completed chain remains one batch');
+    t.notOk(result.slow, 'the handoff needs no interpreter fallback');
+    t.notOk(result.completed, 'live threads are not reported as terminated');
+    t.equal(thread.status, 'runnable', 'the suspended chain remains runnable');
+    t.end();
+  });
+}
