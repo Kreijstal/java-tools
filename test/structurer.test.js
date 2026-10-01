@@ -96,6 +96,30 @@ test('exception region exit inside a loop exits the loop', () => {
   assert.match(src, /break L0;/);
 });
 
+test('an ordinary empty if arm inside a loop does not infer a loop exit', () => {
+  const tree = { t: 'loop', label: 'L0', body: { t: 'seq', body: [
+    { t: 'if', block: 0, then: { t: 'seq', body: [] }, els: { t: 'straight', block: 1 } },
+    { t: 'straight', block: 2 }, { t: 'continue', label: 'L0' },
+  ] } };
+  const src = printTree(tree);
+  assert.doesNotMatch(src, /break L0;/);
+  assert.match(src, /stmt_2\(\);\n\s*continue L0;/);
+});
+
+test('printing a control tree repeatedly does not mutate its exits', () => {
+  const tree = structure(cfgFrom([
+    { term: { kind: 'fall', target: 1 } },
+    { term: { kind: 'cond', taken: 2, fall: 3 } },
+    { term: { kind: 'goto', target: 3 } },
+    { term: { kind: 'cond', taken: 1, fall: 4 } },
+    { term: { kind: 'return' } },
+  ])).tree;
+  const original = JSON.stringify(tree);
+  const once = printTree(tree);
+  assert.equal(JSON.stringify(tree), original);
+  assert.equal(printTree(tree), once);
+});
+
 test('simple while loop uses continue to the header', () => {
   // 0: fall 1 ; 1(header): if taken 1 (back) else 2 ; 2: return
   const cfg = cfgFrom([

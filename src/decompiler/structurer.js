@@ -468,31 +468,26 @@ function dropTailBreaks(node, tailLabels) {
       return tailLabels.has(node.label) ? { t: 'seq', body: [] } : node;
     case 'block': {
       const inner = new Set([...tailLabels, node.label]);
-      node.body = dropTailBreaks(node.body, inner);
-      return node;
+      return { ...node, body: dropTailBreaks(node.body, inner) };
     }
     case 'seq': {
       const body = node.body || [];
-      node.body = body.map((child, index) => dropTailBreaks(
-        child, index === body.length - 1 ? tailLabels : new Set()));
-      return node;
+      return { ...node, body: body.map((child, index) => dropTailBreaks(
+        child, index === body.length - 1 ? tailLabels : new Set())) };
     }
     case 'if':
-      node.then = dropTailBreaks(node.then, tailLabels);
-      node.els = dropTailBreaks(node.els, tailLabels);
-      return node;
+      return { ...node, then: dropTailBreaks(node.then, tailLabels),
+        els: dropTailBreaks(node.els, tailLabels) };
     case 'loop':
-      node.body = dropTailBreaks(node.body, new Set());
-      return node;
+      return { ...node, body: dropTailBreaks(node.body, new Set()) };
     case 'switch':
-      node.cases = (node.cases || []).map((item) => ({ ...item, body: dropTailBreaks(item.body, new Set()) }));
-      node.dflt = dropTailBreaks(node.dflt, new Set());
-      return node;
+      return { ...node,
+        cases: (node.cases || []).map((item) => ({ ...item, body: dropTailBreaks(item.body, new Set()) })),
+        dflt: dropTailBreaks(node.dflt, new Set()) };
     case 'synchronized':
     case 'try':
-      node.body = dropTailBreaks(node.body, new Set());
-      node.catches = (node.catches || []).map((item) => ({ ...item, body: dropTailBreaks(item.body, new Set()) }));
-      return node;
+      return { ...node, body: dropTailBreaks(node.body, new Set()),
+        catches: (node.catches || []).map((item) => ({ ...item, body: dropTailBreaks(item.body, new Set()) })) };
     default:
       return node;
   }
@@ -558,36 +553,30 @@ function repairEmptyLoopExits(node, loopLabels) {
     return { t: node.mode === 'continue' ? 'continue' : 'break', label };
   }
   if (node.t === 'loop') {
-    node.body = repairEmptyLoopExits(node.body, [...loopLabels, node.label]);
-    return node;
+    return { ...node, body: repairEmptyLoopExits(node.body, [...loopLabels, node.label]) };
   }
   if (node.t === 'if') {
-    const label = loopLabels[loopLabels.length - 1];
-    if (label && isEmptyTree(node.then) && !isEmptyTree(node.els)) node.then = { t: 'break', label };
-    node.then = repairEmptyLoopExits(node.then, loopLabels);
-    node.els = repairEmptyLoopExits(node.els, loopLabels);
-    return node;
+    // An empty arm can mean an ordinary no-op, not an exit from the nearest
+    // loop. Region exits already carry an explicit transfer; never infer one.
+    return { ...node, then: repairEmptyLoopExits(node.then, loopLabels),
+      els: repairEmptyLoopExits(node.els, loopLabels) };
   }
   if (node.t === 'seq') {
     const body = node.body || [];
-    node.body = body.map((child) => repairEmptyLoopExits(child, loopLabels));
+    return { ...node, body: body.map((child) => repairEmptyLoopExits(child, loopLabels)) };
   }
-  else if (node.t === 'block') node.body = repairEmptyLoopExits(node.body, loopLabels);
+  else if (node.t === 'block') return { ...node, body: repairEmptyLoopExits(node.body, loopLabels) };
   else if (node.t === 'switch') {
-    for (const item of node.cases || []) item.body = repairEmptyLoopExits(item.body, loopLabels);
-    node.dflt = repairEmptyLoopExits(node.dflt, loopLabels);
+    return { ...node,
+      cases: (node.cases || []).map(item => ({ ...item, body: repairEmptyLoopExits(item.body, loopLabels) })),
+      dflt: repairEmptyLoopExits(node.dflt, loopLabels) };
   } else if (node.t === 'try') {
-    node.body = repairEmptyLoopExits(node.body, loopLabels);
-    for (const item of node.catches || []) item.body = repairEmptyLoopExits(item.body, loopLabels);
+    return { ...node, body: repairEmptyLoopExits(node.body, loopLabels),
+      catches: (node.catches || []).map(item => ({ ...item, body: repairEmptyLoopExits(item.body, loopLabels) })) };
   } else if (node.t === 'synchronized') {
-    node.body = repairEmptyLoopExits(node.body, loopLabels);
+    return { ...node, body: repairEmptyLoopExits(node.body, loopLabels) };
   }
   return node;
-}
-
-function isEmptyTree(node) {
-  if (!node) return true;
-  return node.t === 'seq' && (node.body || []).every(isEmptyTree);
 }
 
 // ---------------------------------------------------------------------------

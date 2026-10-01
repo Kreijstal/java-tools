@@ -362,3 +362,66 @@ The four new differential tests, 11 dispatcher-readability checks, and existing
 36 fixture, 26 structured-feature, 77 additional-feature and 38 stack-ordering
 assertions pass. All 303 GeoBlox sources compile. This proves the focused latch
 fixtures and export compilation, not complete game runtime equivalence.
+
+## Explicit exception-region exits
+
+Exception-region composition now records an exit contract for each collapsed
+region. Every external sink retains its original working-CFG target ID and the
+owning region ID. Its transfer is an explicit `break` to a labeled region
+block, including when the sink itself has no statements. These IDs survive
+block remapping, substitution and label uniquification. Before printing, the
+contract verifier requires every enumerated target to be present and every
+transfer to resolve to the matching region block, never an unrelated loop.
+This checks exit identity and lexical ownership; it is not a proof of complete
+expression reconstruction or whole-program equivalence.
+
+Two unsafe shortcuts are removed or refused:
+
+- An empty ordinary `if` arm is a no-op. The printer no longer turns it into a
+  break from the nearest loop. Printer cleanup returns fresh composite nodes,
+  so printing a tree twice cannot turn a previously removed fall-through break
+  into a newly inferred loop exit.
+- A catch continuation into the middle of a try body, or a normal jump into a
+  handler component, cannot be mapped to the collapsed region entry. That would
+  rerun setup or enter the wrong component. Such reentry now declines structured
+  recovery and retains the CFG fallback. A retry at the actual try entry can
+  still be represented by the enclosing loop.
+
+The invariant-loop fanout safeguard permits protected methods to remain
+structured only when their composed exit contracts verify. Other safeguards
+and Java source-flow checks remain active. The compatibility printer node
+`regionExit` still exists for explicit legacy trees; the exception-region layer
+uses labeled transfers with contracts, not that nearest-loop shorthand.
+
+Focused validation:
+
+```sh
+node test/structurer.test.js                 # 10 checks
+node test/exceptionStructurer.test.js        # 16 checks
+node test/cfrInvariantFanout.test.js          # 10 JVM/regression tests
+node --test test/structurer.test.js test/exceptionStructurer.test.js test/cfrStateMachineReadability.test.js test/cfrFixtures.test.js test/cfrStructuredFeatures.test.js test/cfrAdditionalFeatures.test.js test/cfrStackOrdering.test.js test/cfrCatchSemanticsRegressions.test.js
+```
+
+The ten JVM/regression tests include eight fanout variants (unprotected,
+combined protection, separate catches with different continuations, and
+multiple protected exits around an unprotected return, with both latch
+polarities). Each compares 48 inputs against original verified bytecode and
+both structured and forced-dispatcher output: 768 differential comparisons.
+An executable no-op-arm test checks all loop iterations continue. Another
+executes a catch that resumes after setup: the refused structured shape uses
+its exact CFG and setup runs once, matching the original JVM. The grouped
+regression command passes all eight files. As before, installed dependencies
+and the temporary regular-file subprocess adapter were used in the restricted
+environment; fixture sources use the repository-native compiler.
+
+A fresh export of the unchanged 303 GeoBlox transformed classes emits zero
+hard failures; all generated sources compile against the frozen stubs. Original
+fallback methods fall from 16 to four and dispatcher cases from 1,131 to 877.
+Generated methods containing dispatchers fall from 33 to 21. In particular,
+`c.h(B)V` (`GameScreen.updateScreen`) is structured with its RuntimeException
+catch intact. Two original methods still contain at least 50 dispatcher cases:
+`kc.b(I)V` (60) and partitioned `wi.a(BLrh;)V` (756 across 18 helpers).
+The other two fallbacks, `gh.f(I)V` (27) and `n.a(IIIIBIIII)[Ldm;` (34), retain
+multi-value operand-stack safeguards. Nested-cycle splitting and bounded
+structured helpers remain separate future work. These results validate the
+focused fixtures and export integrity, not whole-game or browser performance.

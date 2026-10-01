@@ -3738,10 +3738,11 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
   // returns to the header or falls through to the same exit. Nesting several
   // such latches inside an exception region gives the Java structurer two
   // source-identical exits from different loops; folding those exits can join
-  // the continuation of one loop to the body of another. Preserve the exact
-  // CFG with the state-machine renderer when exception regions are present.
-  // Handler-free methods use the base structurer without region collapse:
-  // its labeled loop exits retain the two latches and their continuation.
+  // the continuation of one loop to the body of another. Exception regions
+  // now keep explicit exit-target and owner contracts through composition.
+  // Only a verified contract permits this latch shape to remain structured;
+  // otherwise preserve the exact CFG with the state-machine renderer.
+  // Handler-free methods use the base structurer without region collapse.
   // The test is entirely
   // structural: a unary int-local condition, the same local in its successor,
   // a lexical backedge, and no assignment to that local inside the loop.
@@ -3803,7 +3804,7 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     stateMachineReason = 'multi-value operand stack carried across a CFG backedge';
   }
   if (!useStateMachine && hasInvariantConditionalBackedgeFanout &&
-      exceptionTable.length > 0 && !syncHandlers.size) {
+      exceptionTable.length > 0 && !structured.regionExitsVerified && !syncHandlers.size) {
     useStateMachine = true;
     stateMachineReason =
       'invariant conditional fanout carried across a CFG backedge';

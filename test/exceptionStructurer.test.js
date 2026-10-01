@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { structureMethod } = require('../src/decompiler/exceptionStructurer');
+const { structureMethod, verifyRegionExitContracts } = require('../src/decompiler/exceptionStructurer');
 const { printTree } = require('../src/decompiler/structurer');
 
 // Render a method (codeItems + exception table) and return { ok, src, r }.
@@ -15,6 +15,42 @@ function run(codeItems, exceptionTable) {
 function assertGotoFree(src) {
   assert.ok(!/\bgoto\b/.test(src), `expected no goto in:\n${src}`);
 }
+
+test('region exit contracts preserve distinct targets through nested loops', () => {
+  const exit = target => ({ t: 'break', label: 'Region', regionExitOwner: 7, regionExitTarget: target });
+  const tree = { t: 'block', label: 'Region', regionExitOwner: 7, body: {
+    t: 'loop', label: 'Loop', body: { t: 'if', block: 0, then: exit(4), els: exit(5) },
+  } };
+  assert.equal(verifyRegionExitContracts(tree, [{ owner: 7, targets: [4, 5] }]), true);
+  tree.body.body.then.label = 'Loop';
+  assert.equal(verifyRegionExitContracts(tree, [{ owner: 7, targets: [4, 5] }]), false);
+});
+
+test('region exit contracts refuse missing or unknown continuations', () => {
+  const tree = { t: 'block', label: 'Region', regionExitOwner: 7, body: {
+    t: 'break', label: 'Region', regionExitOwner: 7, regionExitTarget: 4,
+  } };
+  assert.equal(verifyRegionExitContracts(tree, [{ owner: 7, targets: [4, 5] }]), false);
+  assert.equal(verifyRegionExitContracts(tree, [{ owner: 7, targets: [5] }]), false);
+});
+
+test('a catch retry into the middle of a try body must not restart its setup', () => {
+  const invoke = (pc, name) => ({ labelDef: `L${pc}:`, pc,
+    instruction: { op: 'invokestatic', arg: ['Method', 'X', [name, '()V']] } });
+  const code = [
+    invoke(0, 'setup'),
+    { pc: 3, instruction: { op: 'goto', arg: 'L4' } },
+    invoke(4, 'step'),
+    { labelDef: 'L7:', pc: 7, instruction: { op: 'goto', arg: 'L15' } },
+    { labelDef: 'L10:', pc: 10, instruction: 'astore_0' },
+    { pc: 11, instruction: { op: 'goto', arg: 'L4' } },
+    { labelDef: 'L15:', pc: 15, instruction: 'return' },
+  ];
+  const result = structureMethod(code,
+    [{ start_pc: 0, end_pc: 7, handler_pc: 10, catch_type: 'java/lang/RuntimeException' }]);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /continuation reenters a different component/);
+});
 
 // ---------------------------------------------------------------------------
 // (a) A single try/catch with straight-line bodies.

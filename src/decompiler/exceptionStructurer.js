@@ -499,7 +499,7 @@ function remapTreeBlocks(node, f) {
   switch (node.t) {
     case 'seq': return { t: 'seq', body: node.body.map((c) => remapTreeBlocks(c, f)) };
     case 'straight': return { t: 'straight', block: f(node.block) };
-    case 'block': return { t: 'block', label: node.label, body: remapTreeBlocks(node.body, f) };
+    case 'block': return { ...node, body: remapTreeBlocks(node.body, f) };
     case 'loop': return { t: 'loop', label: node.label, body: remapTreeBlocks(node.body, f) };
     case 'if': return { t: 'if', block: f(node.block), then: remapTreeBlocks(node.then, f), els: node.els ? remapTreeBlocks(node.els, f) : null };
     case 'switch': return {
@@ -682,7 +682,7 @@ function substituteSupers(node, overrides) {
   }
   switch (node.t) {
     case 'seq': return { t: 'seq', body: node.body.map((c) => substituteSupers(c, overrides)) };
-    case 'block': return { t: 'block', label: node.label, body: substituteSupers(node.body, overrides) };
+    case 'block': return { ...node, body: substituteSupers(node.body, overrides) };
     case 'loop': return { t: 'loop', label: node.label, body: substituteSupers(node.body, overrides) };
     case 'if': return { t: 'if', block: node.block, then: substituteSupers(node.then, overrides), els: node.els ? substituteSupers(node.els, overrides) : null };
     case 'switch': return {
@@ -724,6 +724,11 @@ function structureMethod(codeItems, exceptionTable, opts = {}) {
     try {
       uniquifyLabels(res.tree);
       uniquifyCatchParameters(res.tree);
+      if (res.regionExitContracts) {
+        if (!verifyRegionExitContracts(res.tree, res.regionExitContracts))
+          return { ok: false, reason: 'exception-region exit contract failed after tree composition' };
+        res.regionExitsVerified = true;
+      }
     } catch (err) {
       // A tree carrying a break whose target block is not an ancestor is not
       // expressible as Java. Decline it so the caller falls back, per this
@@ -830,6 +835,7 @@ function structureWithExceptions(codeItems, exceptionTable, methodCfg, render, o
   const synthetic = new Map();
   render.synthetic = synthetic; // exposed for the exceptionStructurer's own printTree
   const selectorDecls = [];
+  const regionExitContracts = [];
   let nextSelector = 0;
   const allocSelector = () => {
     const name = `decompiledRegionSelector${nextSelector++}`;
@@ -866,7 +872,7 @@ function structureWithExceptions(codeItems, exceptionTable, methodCfg, render, o
   for (const g of ordered) {
     const bail = processGroup(work, g, {
       overrides, allocId, emptyId, isNoThrowBlock, allHandlerPcs,
-      synthetic, allocSelector,
+      synthetic, allocSelector, regionExitContracts,
       syncHandlers: opts.syncHandlers || null,
       isCatchAssignable: opts.isCatchAssignable || null,
     }, (w) => { work = w; });
@@ -883,7 +889,7 @@ function structureWithExceptions(codeItems, exceptionTable, methodCfg, render, o
   // Names carried in `work.ids` are original/synthetic ids already.
   let tree = remapTreeBlocks(res.tree, (localId) => work.ids[localId]);
   tree = substituteSupers(tree, overrides);
-  return { ok: true, tree, render, synthetic, selectorDecls };
+  return { ok: true, tree, render, synthetic, selectorDecls, regionExitContracts };
 }
 
 /** Carve and collapse one try group in `work`. On success calls `commit(work')`
@@ -1045,12 +1051,11 @@ function processGroup(work, group, ctx, commit) {
   }
 
   // Whole region and the exits of each independently structured component.
-  // A catch can continue back to the try entry (or a try arm can enter a shared
-  // handler continuation): that target is internal to the union, but external
-  // to the catch/try sub-CFG currently being carved. Include such cross-component
-  // edges so structureRegion can terminate at a sink; collapseRegion maps a
-  // target inside `region` back to the synthetic super-block, preserving the
-  // resulting loop.
+  // A catch can continue back to the try entry: that target is internal to the
+  // union, but external to the catch sub-CFG currently being carved. Include
+  // cross-component edges so structureRegion can terminate at a sink. Only
+  // reentry at the actual try entry may map to the collapsed super-block;
+  // other internal continuations are refused below.
   const region = new Set([...tryset, ...inSomeHandler]);
   const externals = new Set();
   for (const component of [tryset, ...handlerSets]) {
@@ -1061,6 +1066,12 @@ function processGroup(work, group, ctx, commit) {
     }
   }
   const externalsList = [...externals];
+  // Collapsing an internal continuation maps it to the super-block's entry.
+  // That is valid only for a retry at the actual try entry, never a jump into
+  // a handler or the middle of its continuation. Refuse such reentry until a
+  // representation with distinct component entry points is available.
+  if (externalsList.some((target) => region.has(target) && target !== tryEntry))
+    return new Bail('exception region continuation reenters a different component');
 
   // Only the try entry may be targeted from outside the region.
   for (let b = 0; b < n; b++) {
@@ -1075,6 +1086,7 @@ function processGroup(work, group, ctx, commit) {
   // selector variable; each sink assigns `selector = <index>` and the collapsed
   // super-block dispatches on it.
   const superId = ctx.allocId();
+  const exitTargets = new Map();
   const externalToRenderId = new Map();
   let exits;
   if (externalsList.length <= 1) {
@@ -1082,6 +1094,7 @@ function processGroup(work, group, ctx, commit) {
       const rid = ctx.allocId();
       ctx.overrides.set(rid, { t: 'seq', body: [] });
       externalToRenderId.set(ext, rid);
+      exitTargets.set(rid, work.ids[ext]);
     }
     exits = externalsList.map((ext) => ({ external: ext, index: 0 }));
   } else {
@@ -1090,6 +1103,7 @@ function processGroup(work, group, ctx, commit) {
       const rid = ctx.allocId();
       ctx.synthetic.set(rid, { straight: [`${selectorName} = ${i};`] });
       externalToRenderId.set(ext, rid);
+      exitTargets.set(rid, work.ids[ext]);
     });
     exits = externalsList.map((ext, i) => ({ external: ext, index: i }));
     exits.selectorName = selectorName;
@@ -1111,7 +1125,8 @@ function processGroup(work, group, ctx, commit) {
         case 'straight':
           if (!sinkRids.has(node.block)) return node;
           used = true;
-          return { t: 'seq', body: [node, { t: 'break', label: REGION_EXIT_LABEL }] };
+          return { t: 'seq', body: [node, { t: 'break', label: REGION_EXIT_LABEL,
+            regionExitOwner: superId, regionExitTarget: exitTargets.get(node.block) }] };
         case 'seq': return { t: 'seq', body: node.body.map(walk) };
         case 'block': return { ...node, body: walk(node.body) };
         case 'loop': return { ...node, body: walk(node.body) };
@@ -1125,7 +1140,7 @@ function processGroup(work, group, ctx, commit) {
       }
     };
     const body = walk(tree);
-    return used ? { t: 'block', label: REGION_EXIT_LABEL, body } : body;
+    return used ? { t: 'block', label: REGION_EXIT_LABEL, regionExitOwner: superId, body } : body;
   };
 
   let tryTree = structureRegion(work, tryset, tryEntry, externalToRenderId, ctx);
@@ -1177,13 +1192,47 @@ function processGroup(work, group, ctx, commit) {
     }
   }
   ctx.overrides.set(superId, tryNode);
+  ctx.regionExitContracts.push({ owner: superId, targets: [...exitTargets.values()] });
   commit(collapseRegion(work, region, superId, group.start_pc, exits, ctx));
   return undefined;
+}
+
+// Check the composed tree after label uniquification, before printer cleanup.
+// Each exit keeps both its exact original target and its own region frame;
+// lexical proximity to an unrelated loop is not evidence of an exit target.
+function verifyRegionExitContracts(tree, contracts) {
+  const expected = new Map(contracts.map(({ owner, targets }) => [owner, new Set(targets)]));
+  if (expected.size !== contracts.length) return false;
+  const seen = new Map(contracts.map(({ owner }) => [owner, new Set()]));
+  let valid = true;
+  const walk = (node, frames) => {
+    if (!node) return;
+    if (node.regionExitOwner != null && node.t === 'break') {
+      const frame = [...frames].reverse().find(item => item.label === node.label);
+      if (!frame || frame.t !== 'block' || frame.regionExitOwner !== node.regionExitOwner ||
+          !expected.get(node.regionExitOwner)?.has(node.regionExitTarget)) valid = false;
+      else seen.get(node.regionExitOwner).add(node.regionExitTarget);
+    }
+    if (node.t === 'block' || node.t === 'loop') walk(node.body, [...frames, node]);
+    else if (node.t === 'seq') for (const child of node.body || []) walk(child, frames);
+    else if (node.t === 'if') { walk(node.then, frames); walk(node.els, frames); }
+    else if (node.t === 'switch') {
+      for (const item of node.cases || []) walk(item.body, frames);
+      walk(node.dflt, frames);
+    } else if (node.t === 'try' || node.t === 'synchronized') {
+      walk(node.body, frames);
+      for (const item of node.catches || []) walk(item.body, frames);
+    }
+  };
+  walk(tree, []);
+  return valid && contracts.every(({ owner }) =>
+    [...expected.get(owner)].every(target => seen.get(owner).has(target)));
 }
 
 module.exports = {
   structureMethod,
   splitIrreducibleTerms,
+  verifyRegionExitContracts,
   // exposed for tests
   normalizeTable,
   renderCatchType,
