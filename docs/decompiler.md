@@ -556,3 +556,22 @@ The existing shared JVM SSA splitting test also passes all 14 assertions when
 selected alone with a temporary tape filter; the generated JRE index was rebuilt
 first. All 303 regenerated sources compile. These checks establish focused
 splitting behavior and export integrity, not whole-game runtime equivalence.
+
+## String builders crossing exception and branch joins
+
+Concatenation recovery requires the complete append history of a freshly
+constructed builder. An existing builder parameter, local alias or operand-stack
+carrier can already contain text. Appending to such a receiver preserves the
+actual `append(...).toString()` calls instead of treating its new suffix as the
+whole string. This also preserves mutation of the existing builder and the
+original invoked overload, including `append(char)` in exception contexts.
+
+```sh
+node test/cfrStringBuilderJoins.test.js
+```
+
+Both verified native fixtures compare seven outputs against original bytecode,
+using structured and forced-dispatcher reconstruction. They cover prefixes
+carried over branch joins, the same pattern in a runtime catch, and repeated
+mutations of a caller-owned builder. Known complete inline chains still become
+concatenations and are checked by `test/cfrAdditionalFeatures.test.js`.

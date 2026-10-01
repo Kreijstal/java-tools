@@ -5629,10 +5629,13 @@ function stringBuilderAppendExpression(receiver, value, targetType) {
   // expression is narrowed explicitly. That changes visible strings (for
   // example, appending 'L' as the decimal text "76").
   const renderedValue = coerceExpressionForType(value, targetType || value.type);
-  const pieces = receiver.stringBuilderPieces ? receiver.stringBuilderPieces.slice() : [];
-  pieces.push(renderedValue);
+  // Only a freshly constructed, completely tracked chain may become a concat.
+  // A parameter, local alias or stack carrier can contain an unknown prefix;
+  // keep its append/toString calls, including their mutations and exceptions.
+  const pieces = receiver.stringBuilderPieces
+    ? [...receiver.stringBuilderPieces, renderedValue] : null;
   return expr(`${wrap(receiver, 100)}.append(${renderedValue.code})`, 'StringBuilder', 100, {
-    stringBuilderPieces: pieces,
+    ...(pieces ? {stringBuilderPieces: pieces} : {}),
   });
 }
 
