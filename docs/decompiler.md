@@ -425,3 +425,54 @@ The other two fallbacks, `gh.f(I)V` (27) and `n.a(IIIIBIIII)[Ldm;` (34), retain
 multi-value operand-stack safeguards. Nested-cycle splitting and bounded
 structured helpers remain separate future work. These results validate the
 focused fixtures and export integrity, not whole-game or browser performance.
+
+## Splitting nested exception cycles
+
+A maximal SCC can have one dominating entry while a cycle inside it has several
+entries. The previous induced-region splitter saw only maximal SCCs, returned
+no change, then tried one target-block copy. On `kc.b(I)V`, that extra block left
+three non-dominating retreating edges. Retrying the same splitter did not help.
+
+The splitter now traverses nested SCCs. For a component with one entry, it checks
+that the entry dominates every member, removes that header from the induced
+search graph and examines the child cycles. A component with several entries is
+copied for one secondary entry: internal edges point to matching copies, external
+exits retain their targets, and only external predecessors of that entry are
+redirected. Every copy retains its original block identity. The search uses
+reachable predecessors and stable numeric ordering; unreachable edges cannot
+manufacture entries. Both SCC traversal and nested search use explicit work
+stacks rather than JavaScript recursion.
+
+Splitting is bounded to 64 copies of regions and, by default, at most
+`min(8192, max(originalTerms * 4, originalTerms + 64))` terms. Callers can provide
+`maxTerms` and `maxRounds`. An exhausted budget returns no partial result; the
+exception layer retains its CFG fallback. The former unbudgeted one-block
+retry is removed. The shared JVM SSA consumer retains its own smaller block cap.
+
+The recorded board-entity subgraph becomes reducible after three region copies,
+adding 18 blocks to its 119 original blocks. A fresh 303-class export changes
+only `kc.java`. `kc.b(I)V` now uses loops and labeled blocks with its original
+runtime catch. Fallbacks drop from four to three, and numeric dispatcher cases
+from 877 to 817. The oversized initializer is the only remaining original
+method with at least 50 cases. Other stack and method-size safeguards remain.
+
+```sh
+node test/exceptionRegionSplitting.test.js # 4 checks, including 512 routed traces
+node test/cfrNestedLoopSplitting.test.js   # 3 verified JVM fixtures, 840 comparisons
+```
+
+The graph checks cover nested-cycle recovery, deterministic origin mapping,
+input immutability, exact budget refusal, switch defaults and duplicate targets,
+unreachable predecessors and a 5,000-node reducible cycle. The JVM fixtures cover
+both branch polarities and a switch with repeated targets. They compare 140
+flag/loop-limit/throw-point inputs per fixture against original version-49
+verified bytecode and both structured and forced-dispatcher output. Side effects
+encode their order, and thrown exceptions retain the catch result. All three
+structured outputs must retain their catch and contain no dispatcher.
+
+The nine existing decompiler regression files, including the ten invariant-loop
+JVM tests, pass with the same restricted-environment stdio adapter used above.
+The existing shared JVM SSA splitting test also passes all 14 assertions when
+selected alone with a temporary tape filter; the generated JRE index was rebuilt
+first. All 303 regenerated sources compile. These checks establish focused
+splitting behavior and export integrity, not whole-game runtime equivalence.

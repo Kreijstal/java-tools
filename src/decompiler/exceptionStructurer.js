@@ -360,23 +360,10 @@ function structureRegion(work, memberSet, entryLocal, externalToRenderId, ctx) {
   } catch (err) {
     if (err instanceof IrreducibleError) {
       const split = splitIrreducibleTerms(structuredTerms, subOf.get(entryLocal));
-      if (!split) {
-        const [from, to] = String((err.edges || [])[0] || '').split('->').map(Number);
-        if (!Number.isInteger(from) || !Number.isInteger(to) || !structuredTerms[to]) {
-          return new Bail(`region sub-CFG is irreducible: ${err.message}`);
-        }
-        // Tail-duplicate the retreating edge's target for this predecessor. The
-        // clone executes the identical block and retains its original outgoing
-        // edges, but the awkward join is no longer a retreating edge.
-        const clone = structuredTerms.length;
-        structuredTerms.push(remapTermTargets(structuredTerms[to], (target) => target));
-        origins.push(origins[to]);
-        structuredTerms[from] = remapTermTargets(structuredTerms[from], (target) =>
-          target === to ? clone : target);
-      } else {
-        structuredTerms = split.terms;
-        origins = split.origins;
-      }
+      if (!split)
+        return new Bail(`region sub-CFG exceeds controlled-splitting limits: ${err.message}`);
+      structuredTerms = split.terms;
+      origins = split.origins;
       try {
         res = structure(makeCfg());
       } catch (retryError) {
@@ -397,53 +384,95 @@ function structureRegion(work, memberSet, entryLocal, externalToRenderId, ctx) {
   return remapTreeBlocks(res.tree, toOrig);
 }
 
-// Controlled node splitting for an induced exception sub-CFG. The whole method
-// has already been normalized, but carving handler edges can expose a
-// multi-entry SCC inside a try body. Clone the SCC once per secondary entry and
-// redirect only predecessors outside the SCC; cloned nodes render the same
-// bytecode blocks as their originals.
+// Controlled node splitting for an induced exception sub-CFG. A single-entry
+// outer SCC can hide multi-entry nested cycles. Remove each sole, dominating
+// header while searching its children; clone only the first multi-entry region
+// found, retaining all original block identities and external destinations.
 function splitIrreducibleTerms(inputTerms, entry, options = {}) {
   const maxTerms = Number.isSafeInteger(options.maxTerms) && options.maxTerms > 0
-    ? options.maxTerms : Number.POSITIVE_INFINITY;
-  let terms = inputTerms.map((term) => ({ ...term }));
-  let origins = [...Array(terms.length).keys()];
-  for (let round = 0; round < 64; round++) {
+    ? options.maxTerms : Math.min(8192, Math.max(inputTerms.length * 4, inputTerms.length + 64));
+  const maxRounds = Number.isSafeInteger(options.maxRounds) && options.maxRounds > 0
+    ? options.maxRounds : 64;
+  if (!inputTerms.length || !Number.isSafeInteger(entry) || entry < 0 || entry >= inputTerms.length)
+    return null;
+  let terms = inputTerms.map((term) => remapTermTargets(term, target => target));
+  const origins = terms.map((_, index) => index);
+  for (let round = 0; round <= maxRounds; round++) {
     const succ = succFromTerms(terms);
-    const n = terms.length;
-    const index = new Array(n).fill(-1), low = new Array(n).fill(0);
-    const stack = [], onStack = new Array(n).fill(false), components = [];
-    let nextIndex = 0;
-    const visit = (v) => {
-      index[v] = low[v] = nextIndex++;
-      stack.push(v); onStack[v] = true;
-      for (const w of succ[v]) {
-        if (index[w] < 0) { visit(w); low[v] = Math.min(low[v], low[w]); }
-        else if (onStack[w]) low[v] = Math.min(low[v], index[w]);
+    const { rpo, rpoIndex } = reversePostorder(succ, entry);
+    const { idom, preds } = computeDominators(succ, entry, rpo, rpoIndex);
+    const live = new Set(rpo);
+
+    // Tarjan on an induced graph. Explicit traversal frames also handle deeply
+    // nested loops without consuming the JavaScript call stack.
+    const componentsOf = (nodes) => {
+      const allowed = new Set(nodes);
+      const index = new Map(), low = new Map(), active = new Set();
+      const stack = [], components = [];
+      let nextIndex = 0;
+      for (const root of nodes) {
+        if (index.has(root)) continue;
+        const frames = [[root, 0]];
+        while (frames.length) {
+          const frame = frames[frames.length - 1], v = frame[0];
+          if (!index.has(v)) {
+            index.set(v, nextIndex); low.set(v, nextIndex++);
+            stack.push(v); active.add(v);
+          }
+          let descend = false;
+          while (frame[1] < succ[v].length) {
+            const w = succ[v][frame[1]++];
+            if (!allowed.has(w)) continue;
+            if (!index.has(w)) { frames.push([w, 0]); descend = true; break; }
+            if (active.has(w)) low.set(v, Math.min(low.get(v), index.get(w)));
+          }
+          if (descend) continue;
+          if (low.get(v) === index.get(v)) {
+            const component = [];
+            for (;;) {
+              const w = stack.pop(); active.delete(w); component.push(w);
+              if (w === v) break;
+            }
+            components.push(component.sort((a, b) => a - b));
+          }
+          frames.pop();
+          if (frames.length) {
+            const parent = frames[frames.length - 1][0];
+            low.set(parent, Math.min(low.get(parent), low.get(v)));
+          }
+        }
       }
-      if (low[v] === index[v]) {
-        const component = [];
-        for (;;) { const w = stack.pop(); onStack[w] = false; component.push(w); if (w === v) break; }
-        components.push(component);
-      }
+      return components.sort((a, b) => a[0] - b[0]);
     };
-    for (let v = 0; v < n; v++) if (index[v] < 0) visit(v);
 
     let candidate = null;
-    for (const component of components) {
-      if (component.length === 1 && !succ[component[0]].includes(component[0])) continue;
-      const inside = new Set(component), entries = [];
-      for (const node of component) {
-        let externalPreds = node === entry ? 1 : 0;
-        for (let pred = 0; pred < n; pred++) if (!inside.has(pred) && succ[pred].includes(node)) externalPreds++;
-        if (externalPreds) entries.push({ node, externalPreds });
+    const pending = [rpo.slice().sort((a, b) => a - b)];
+    while (pending.length && !candidate) {
+      const children = [];
+      for (const component of componentsOf(pending.pop())) {
+        if (component.length === 1 && !succ[component[0]].includes(component[0])) continue;
+        const inside = new Set(component), entries = [];
+        for (const node of component) {
+          const externalPreds = preds[node].filter(pred => live.has(pred) && !inside.has(pred)).length
+            + (node === entry ? 1 : 0);
+          if (externalPreds) entries.push({ node, externalPreds });
+        }
+        if (entries.length > 1) { candidate = { component, inside, entries }; break; }
+        if (entries.length === 1) {
+          const header = entries[0].node;
+          if (!component.every(node => dominates(idom, header, node))) return null;
+          children.push(component.filter(node => node !== header));
+        }
       }
-      if (entries.length > 1) { candidate = { component, inside, entries }; break; }
+      // Stable node order gives reproducible primary entries and clone IDs.
+      pending.push(...children.reverse());
     }
     if (!candidate) return round ? { terms, origins } : null;
+    if (round === maxRounds || terms.length + candidate.component.length > maxTerms) return null;
     const primary = candidate.entries.find((item) => item.node === entry)
-      || candidate.entries.slice().sort((a, b) => b.externalPreds - a.externalPreds)[0];
+      || candidate.entries.slice().sort((a, b) => b.externalPreds - a.externalPreds || a.node - b.node)[0];
     const secondary = candidate.entries.find((item) => item !== primary);
-    if (terms.length + candidate.component.length > maxTerms) return null;
+    const n = terms.length;
     const cloneOf = new Map();
     for (const node of candidate.component) {
       cloneOf.set(node, terms.length);
@@ -460,7 +489,7 @@ function splitIrreducibleTerms(inputTerms, entry, options = {}) {
         target === secondary.node ? cloneOf.get(target) : target);
     }
   }
-  return { terms, origins };
+  return null;
 }
 
 /** Apply a target remapper to a terminator, returning a fresh terminator with
