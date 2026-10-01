@@ -81,7 +81,7 @@ test('straight-line diamond (if/else join) emits the merge once, unlabeled', () 
   assertNoLabeledBlock(src);
 });
 
-test('exception region exit inside a loop exits the loop', () => {
+test('exception region loop exits require an explicit target and transfer mode', () => {
   const src = printTree({
     t: 'loop',
     label: 'L0',
@@ -89,11 +89,24 @@ test('exception region exit inside a loop exits the loop', () => {
       t: 'seq',
       body: [
         { t: 'straight', block: 0 },
-        { t: 'regionExit' },
+        { t: 'regionExit', label: 'L0', mode: 'break' },
       ],
     },
   });
   assert.match(src, /break L0;/);
+  for (const exit of [{t: 'regionExit'}, {t: 'regionExit', mode: 'normal'},
+    {t: 'regionExit', label: 'missing', mode: 'break'},
+    {t: 'regionExit', label: 'L0', mode: 'return'}]) {
+    assert.throws(() => printTree({t: 'loop', label: 'L0', body: exit}),
+      /requires an explicit enclosing loop and transfer mode/);
+  }
+  for (const mode of ['break', 'continue']) {
+    const nested = printTree({t: 'loop', label: 'Outer', body: {
+      t: 'loop', label: 'Inner', body: {t: 'regionExit', label: 'Outer', mode},
+    }});
+    assert.match(nested, new RegExp(`${mode} Outer;`));
+    assert.doesNotMatch(nested, new RegExp(`${mode} Inner;`));
+  }
 });
 
 test('an ordinary empty if arm inside a loop does not infer a loop exit', () => {

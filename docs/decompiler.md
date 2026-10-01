@@ -223,6 +223,40 @@ coverage. The targeted throwing-tail bail keeps all the harmless-tail coverage a
 converts only the genuinely-wrong methods to honest bails. Lifting these into
 real output is deferred future work ("exception-boundary block split").
 
+### Exception-region loop exits must keep their destination
+
+Each reconstructed region exit carries its original CFG destination and the
+identity of the labeled region block it leaves. After nested trees are composed
+and their labels renamed, the contract verifier checks that every exit still
+resolves to that block. A `continue`, a missing destination or owner, and an
+unidentified transfer into a region frame all fail the contract. Legacy
+`regionExit` printer nodes likewise require an explicit enclosing loop label and
+`break`/`continue` mode; lexical proximity to a loop is insufficient evidence.
+An ordinary empty conditional arm remains a no-op.
+
+When exception-region reconstruction or Java source-flow validation fails, the
+CFG dispatcher retains the exception table. Three former large-method shortcuts
+could instead reconstruct only normal edges or remove handlers from the
+dispatcher. Method size cannot justify either transformation. A native JVM
+regression demonstrated the loss: a caught exception that should retry the body
+without repeating setup returned `1,1` in the original, but the decompiled large
+method returned `NullPointerException,1`, both with automatic and forced
+dispatch. Adding 1,100 no-ops must not change catch behavior. Those shortcuts are
+removed; oversized supported methods use bounded helpers, while unsupported
+shapes must fail visibly rather than discard exception semantics.
+
+Focused validation (run with `NODE_PATH` pointing at installed dependencies):
+
+```sh
+node --test test/structurer.test.js test/exceptionStructurer.test.js test/cfrInvariantFanout.test.js test/cfrNestedLoopSplitting.test.js
+```
+
+All four files pass, including verified original-bytecode versus rebuilt-Java
+execution for small and large catch retries, protected loop fanouts, and nested
+exception cycles. This is a targeted control-flow regression gate, not proof of
+whole-game behavioral equivalence. A fresh fixed-input GeoBlox export still has
+303 Java files, zero hard failures, and three original-method CFG fallbacks.
+
 ## Guarantees, verification, and what is *not* claimed
 
 - **Guaranteed:** reducible CFG ⇒ goto-free structured tree (structurer);

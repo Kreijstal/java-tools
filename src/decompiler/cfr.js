@@ -3531,10 +3531,9 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     isCatchAssignable: (subtype, supertype) => isAssignableExceptionType(
       subtype, supertype, options.exceptionModel),
   });
-  if ((!structured || !structured.ok) && codeItems.length > 1000 && !syncHandlers.size) {
-    const normalOnly = structureMethod(codeItems, []);
-    if (normalOnly && normalOnly.ok) structured = normalOnly;
-  }
+  // A failed exception-region reconstruction must retain the original handlers
+  // in the CFG fallback. Structuring only normal edges can look valid Java while
+  // dropping catch retries, recovery effects and exception priority entirely.
   if ((!structured || !structured.ok) && process.env.CFR_JS_DEBUG_STRUCTURER === '1') {
     console.error(`${cls.className}.${method.name}${method.descriptor}: ${structured && structured.reason ? structured.reason : 'structurer returned no result'}`);
   }
@@ -4051,16 +4050,10 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     if (!useStateMachine && structured && structured.tree) {
       normalizeStructuredCatchNodes(structured.tree, cfg, codeItems, options.exceptionModel);
     }
-    // Large obfuscated initializers can protect thousands of individual basic
-    // blocks with the same wrapper handler. Emitting one Java try/catch per
-    // block overflows javac's exception table before it can write the method.
-    // Keep the normal CFG state machine, but omit those synthetic wrappers for
-    // very large fallbacks. Handler states still need a value for their seeded
-    // exception-stack slot even though normal control flow cannot enter them.
-    const stateMachineExceptionTable = codeItems.length > 1000
-      && !partitionOversizedStateMachine
-      ? []
-      : exceptionTable;
+    // Size alone cannot prove handlers redundant. Keep the exact exception
+    // table when falling back; oversized supported methods are partitioned
+    // below instead of silently removing their protected transfers.
+    const stateMachineExceptionTable = exceptionTable;
     if (!stateMachineExceptionTable.length && handlerEntries.size) {
       declarations.push('Throwable caughtException = null;');
     }
@@ -4090,42 +4083,30 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     // prunes unreachable states) instead of shipping invalid Java.
     if (!useStateMachine && (source.includes('unsupported condition') || source.includes('= e;')
       || hasInvalidJavaSwitch(source) || hasInvalidJavaFlow(source) || hasUnreachableStatement(statements))) {
-      const normalOnly = codeItems.length > 1000 && !syncHandlers.size ? structureMethod(codeItems, []) : null;
-      if (normalOnly && normalOnly.ok) {
-        cache.clear();
-        evaluating.clear();
-        forwardedStackIns.clear();
-        edgeStackInSources.clear();
-        statements = structuredStatements(normalOnly.tree, render);
-        source = emitStatements(statements);
+      if (syncHandlers.size) {
+        // Never route a lowered synchronized method through the state
+        // machine — it would emit unsynchronized code. Fall back loudly.
+        return null;
       }
-      if (source.includes('unsupported condition') || source.includes('= e;')
-        || hasInvalidJavaSwitch(source) || hasInvalidJavaFlow(source) || hasUnreachableStatement(statements)) {
-        if (syncHandlers.size) {
-          // Never route a lowered synchronized method through the state
-          // machine — it would emit unsynchronized code. Fall back loudly.
-          return null;
-        }
-        useStateMachine = true;
-        stateMachineReason = 'structured output failed Java source-flow validation';
-        cache.clear();
-        evaluating.clear();
-        forwardedStackIns.clear();
-        edgeStackInSources.clear();
-        // The operand-stack carriers were declared for the structured (nested
-        // loop) rendering, where control flow guarantees each is assigned before
-        // use, so only the return/branch carriers received a default initializer
-        // (line ~3774). The state machine dispatches blocks through a switch, so
-        // javac can no longer prove definite assignment for the rest. Give every
-        // uninitialized carrier its Java default now — harmless for live paths
-        // (the real value overwrites it) and required for the method to compile.
-        for (let d = 0; d < declarations.length; d += 1) {
-          const carrier = /^(.+?)\s+(stackIn_\d+_\d+|stackOut_\d+_\d+);$/.exec(declarations[d]);
-          if (carrier) declarations[d] = `${carrier[1]} ${carrier[2]} = ${defaultValueForType(carrier[1])};`;
-        }
-        source = printCfgStateMachine(cfg, render, evaluate, codeItems, stateMachineExceptionTable, declarations,
-          methodReturnType(method), stateMachineConfiguration);
+      useStateMachine = true;
+      stateMachineReason = 'structured output failed Java source-flow validation';
+      cache.clear();
+      evaluating.clear();
+      forwardedStackIns.clear();
+      edgeStackInSources.clear();
+      // The operand-stack carriers were declared for the structured (nested
+      // loop) rendering, where control flow guarantees each is assigned before
+      // use, so only the return/branch carriers received a default initializer
+      // (line ~3774). The state machine dispatches blocks through a switch, so
+      // javac can no longer prove definite assignment for the rest. Give every
+      // uninitialized carrier its Java default now — harmless for live paths
+      // (the real value overwrites it) and required for the method to compile.
+      for (let d = 0; d < declarations.length; d += 1) {
+        const carrier = /^(.+?)\s+(stackIn_\d+_\d+|stackOut_\d+_\d+);$/.exec(declarations[d]);
+        if (carrier) declarations[d] = `${carrier[1]} ${carrier[2]} = ${defaultValueForType(carrier[1])};`;
       }
+      source = printCfgStateMachine(cfg, render, evaluate, codeItems, stateMachineExceptionTable, declarations,
+        methodReturnType(method), stateMachineConfiguration);
     }
     declarations.push(...localState.liftAllDeclarations(initializeLiftedLocals));
     const redundantStackInAliases = new Map();

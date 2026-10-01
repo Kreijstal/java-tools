@@ -1236,11 +1236,19 @@ function verifyRegionExitContracts(tree, contracts) {
   let valid = true;
   const walk = (node, frames) => {
     if (!node) return;
-    if (node.regionExitOwner != null && node.t === 'break') {
+    if (node.regionExitOwner != null || node.regionExitTarget != null) {
+      if (node.t !== 'block' && node.t !== 'break') valid = false;
+      if (node.t === 'block' && (!expected.has(node.regionExitOwner) || node.regionExitTarget != null))
+        valid = false;
+    }
+    if (node.t === 'break' || node.t === 'continue') {
       const frame = [...frames].reverse().find(item => item.label === node.label);
-      if (!frame || frame.t !== 'block' || frame.regionExitOwner !== node.regionExitOwner ||
-          !expected.get(node.regionExitOwner)?.has(node.regionExitTarget)) valid = false;
-      else seen.get(node.regionExitOwner).add(node.regionExitTarget);
+      if (node.regionExitOwner != null || node.regionExitTarget != null || frame?.regionExitOwner != null) {
+        if (node.t !== 'break' || !frame || frame.t !== 'block' ||
+            frame.regionExitOwner !== node.regionExitOwner ||
+            !expected.get(node.regionExitOwner)?.has(node.regionExitTarget)) valid = false;
+        else seen.get(node.regionExitOwner).add(node.regionExitTarget);
+      }
     }
     if (node.t === 'block' || node.t === 'loop') walk(node.body, [...frames, node]);
     else if (node.t === 'seq') for (const child of node.body || []) walk(child, frames);

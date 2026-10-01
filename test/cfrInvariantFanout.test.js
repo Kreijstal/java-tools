@@ -26,11 +26,13 @@ function run(command, args, directory) {
   } finally { fds.forEach(fd => fs.closeSync(fd)); }
 }
 
-test('a catch resuming inside a try uses the exact CFG without repeating setup', () => {
+for (const padding of [0, 1100]) for (const forced of [false, true]) {
+test(`a catch resuming inside a try preserves setup: padding=${padding}, forced=${forced}`, () => {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-catch-reentry-'));
   const previous = process.env.CFR_JS_FORCE_STATE_MACHINE;
   try {
-    delete process.env.CFR_JS_FORCE_STATE_MACHINE;
+    if (forced) process.env.CFR_JS_FORCE_STATE_MACHINE = '1';
+    else delete process.env.CFR_JS_FORCE_STATE_MACHINE;
     const native = path.join(temporary, 'native');
     fs.mkdirSync(native);
     const classFile = path.join(native, 'CatchReentry.class');
@@ -49,6 +51,7 @@ Lsetup:
     iadd
     putstatic Field CatchReentry COUNT I
 Lstep:
+    ${'nop\n    '.repeat(padding)}
     iload_0
     ifne Ldone
     aconst_null
@@ -66,8 +69,13 @@ Ldone:
   .end code
 .end method
 .end class`, classFile);
-    const driver = `class ReentryRunner { public static void main(String[] args) {
-      System.out.print(CatchReentry.compute(0)+","+CatchReentry.compute(1));
+    const driver = `class ReentryRunner {
+      static String compute(int input) {
+        try { return "" + CatchReentry.compute(input); }
+        catch (Throwable error) { return error.getClass().getSimpleName(); }
+      }
+      public static void main(String[] args) {
+      System.out.print(compute(0)+","+compute(1));
     } }`;
     fs.writeFileSync(path.join(native, 'ReentryRunner.java'), driver);
     run('javac', ['--release', '8', '-cp', native, '-d', native,
@@ -78,8 +86,6 @@ Ldone:
     const source = decompileClassFile(classFile,
       {diagnostics, preserveFieldNames: new Set(['COUNT'])});
     assertNoFallback(source);
-    assert.match(source, /switch \(statePc\)/);
-    assert.match(JSON.stringify(diagnostics), /continuation reenters a different component/);
     const rebuilt = path.join(temporary, 'rebuilt');
     fs.mkdirSync(rebuilt);
     const javaFile = path.join(rebuilt, 'CatchReentry.java');
@@ -88,12 +94,18 @@ Ldone:
     run('javac', ['--release', '8', '-d', rebuilt, javaFile,
       path.join(rebuilt, 'ReentryRunner.java')], rebuilt);
     assert.equal(run('java', ['-cp', rebuilt, 'ReentryRunner'], rebuilt), expected);
+    assert.match(source, /switch \(statePc\)/);
+    assert.match(source, /catch \(/);
+    assert.match(JSON.stringify(diagnostics), forced
+      ? /forced by CFR_JS_FORCE_STATE_MACHINE/
+      : /continuation reenters a different component/);
   } finally {
     if (previous === undefined) delete process.env.CFR_JS_FORCE_STATE_MACHINE;
     else process.env.CFR_JS_FORCE_STATE_MACHINE = previous;
     fs.rmSync(temporary, {recursive: true, force: true});
   }
 });
+}
 
 test('an empty conditional arm remains a no-op on every loop iteration', () => {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-empty-loop-arm-'));

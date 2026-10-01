@@ -548,9 +548,14 @@ function dropUnusedBlockLabels(node) {
 function repairEmptyLoopExits(node, loopLabels) {
   if (!node) return node;
   if (node.t === 'regionExit') {
-    const label = loopLabels[loopLabels.length - 1];
-    if (!label || node.mode === 'normal') return { t: 'seq', body: [] };
-    return { t: node.mode === 'continue' ? 'continue' : 'break', label };
+    // Legacy region nodes must identify their loop explicitly. The nearest
+    // lexical loop need not be the original CFG edge's destination, and a
+    // missing destination must never become an inferred break or a no-op.
+    if (!node.label || !loopLabels.includes(node.label) ||
+        !['break', 'continue'].includes(node.mode)) {
+      throw new Error('exception-region loop exit requires an explicit enclosing loop and transfer mode');
+    }
+    return { t: node.mode, label: node.label };
   }
   if (node.t === 'loop') {
     return { ...node, body: repairEmptyLoopExits(node.body, [...loopLabels, node.label]) };

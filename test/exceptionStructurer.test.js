@@ -34,6 +34,22 @@ test('region exit contracts refuse missing or unknown continuations', () => {
   assert.equal(verifyRegionExitContracts(tree, [{ owner: 7, targets: [5] }]), false);
 });
 
+test('region exit contracts reject lost identity and changed transfer kinds', () => {
+  for (const transfer of [
+    {t: 'continue', label: 'Region', regionExitOwner: 7, regionExitTarget: 4},
+    {t: 'break', label: 'Region', regionExitTarget: 4},
+    {t: 'break', label: 'Region', regionExitOwner: 7},
+    {t: 'break', label: 'Region'},
+  ]) {
+    // A valid sibling must not conceal a malformed exit to the same target.
+    const tree = {t: 'block', label: 'Region', regionExitOwner: 7, body: {
+      t: 'if', block: 0, then: transfer,
+      els: {t: 'break', label: 'Region', regionExitOwner: 7, regionExitTarget: 4},
+    }};
+    assert.equal(verifyRegionExitContracts(tree, [{owner: 7, targets: [4]}]), false);
+  }
+});
+
 test('a catch retry into the middle of a try body must not restart its setup', () => {
   const invoke = (pc, name) => ({ labelDef: `L${pc}:`, pc,
     instruction: { op: 'invokestatic', arg: ['Method', 'X', [name, '()V']] } });
