@@ -482,8 +482,8 @@ test('invariant conditional loop fanouts retain their exact CFG edges', (t) => {
     const source = decompileFixture(tempDir,
       'InvariantConditionalBackedgeFanout',
       INVARIANT_CONDITIONAL_BACKEDGE_FANOUT);
-    t.match(source, /while \(true\) \{\s*switch \(statePc\)/,
-      'two-stage invariant latches use the exact CFG state machine');
+    t.notOk(source.includes('statePc'),
+      'handler-free two-stage invariant latches retain labeled loops');
 
     fs.writeFileSync(path.join(tempDir,
       'InvariantConditionalBackedgeFanout.java'), source);

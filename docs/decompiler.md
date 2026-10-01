@@ -319,3 +319,46 @@ unchanged. Building the fixture inputs with host javac instead produced seven
 existing shape-test failures, also present with coalescing disabled. The native
 fixture build resolved them. `cfrObfuscationGuards.test.js` was skipped because
 its external Krakatau binary was absent; it is not recorded as validated.
+
+## Invariant loop fanouts without exception regions
+
+The invariant-condition safeguard described in `cfr.js` protects exception
+region collapse: two loop exits can become one continuation when separately
+structured regions are combined. It previously applied to every method with
+this latch shape, including handler-free methods. Those methods use the base
+CFG structurer directly and can retain the original paths as labeled loops.
+The safeguard now requires a nonempty effective exception table. The multi-value
+operand-stack safeguard, synchronized-region rules, and source-flow validation
+are unchanged; a failed structured rendering still falls back.
+
+`node test/cfrInvariantFanout.test.js` runs four fixture variants against their
+original, verified JVM bytecode and forced-dispatcher output. The variants
+combine reversed latch conditions with absent/present exception protection.
+Each variant checks 48 input combinations: four flag values, four loop sizes,
+and null/full/short copy arrays. Protected variants must retain the safeguard;
+handler-free variants must avoid dispatchers. Outputs and exception types agree
+across the original and both reconstructed versions (384 differential checks).
+The version-49 assembly fixture executes with verification enabled; this avoids
+requiring StackMapTable frames from the fixture assembler.
+
+On the same GeoBlox transformed classes, gameplay update, gameplay rendering
+and scene transition now use labeled loops instead of dispatchers. Update
+shrinks from roughly 2,000 to 770 source lines, and rendering from 941 to 426.
+Total emitted dispatcher cases fall from 1,330 to 1,131; original fallback
+methods fall from 19 to 16. Three original methods retain at least 50 cases:
+`c.h(B)V` (58), `kc.b(I)V` (60) and partitioned `wi.a(BLrh;)V` (756).
+
+The first remains behind the exception-region safeguard. The second's induced
+exception subgraph still has three non-dominating retreating edges after the
+current controlled split. Repeating that splitter makes no change: it handles
+secondary entries of maximal strongly connected components, while this shape
+requires examining nested cycles. A future fix needs dominance-aware nested
+region splitting and exception/differential tests, rather than more identical
+retries. The third has 9,499 normalized code items and triggers the generic
+oversized static-void partitioner; removing that size gate does not prove its
+Java output fits the 64 KiB method limit.
+
+The four new differential tests, 11 dispatcher-readability checks, and existing
+36 fixture, 26 structured-feature, 77 additional-feature and 38 stack-ordering
+assertions pass. All 303 GeoBlox sources compile. This proves the focused latch
+fixtures and export compilation, not complete game runtime equivalence.
