@@ -10,6 +10,7 @@ const {
   buildCfgFromCode, printTree, structuredStatements, emitStatements, hasUnreachableStatement,
 } = require('./structurer');
 const { structureMethod } = require('./exceptionStructurer');
+const { partitionStructuredVoidBody } = require('./structuredMethodPartition');
 const { listRegionSplitCandidates, applyRegionSplit } = require('../passes/regionSplit');
 const { jreClassInfo, jreMethodCandidates } = require('../java-frontend/jreMetadata');
 const { JavaParser } = require('../java-frontend/parser');
@@ -1242,7 +1243,7 @@ function formatMethod(cls, method, options = {}) {
     console.error('[cfr-body-before-locals]', JSON.stringify(body));
   }
   const hasPartitionedState = body.some((line) =>
-    String(line).trim() === 'class $CfrPartitionedState {');
+    ['class $CfrPartitionedState {', 'class $CfrPartitionedBody {'].includes(String(line).trim()));
   if (!hasPartitionedState) {
     removeImpossibleCheckedCatchBlocks(body, options.exceptionModel, code);
     ensureCheckedCatchReachability(body, code, options.exceptionModel);
@@ -3547,21 +3548,22 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
   // Java source has to materialize operand-stack joins as locals.  On hostile
   // methods with thousands of blocks that can make otherwise valid structured
   // output exceed the classfile's hard 64 KiB Code_attribute limit.  Use the
-  // same typed CFG representation, but partition its state dispatcher into
-  // bounded local-class methods.  This is deliberately selected by bytecode
+  // structured representation in bounded local-class helpers first, and retain
+  // a typed CFG dispatcher when statement boundaries cannot be safely outlined.
+  // This is deliberately selected by bytecode
   // size and source-representable method shape, never by owner/method names.
   //
   // Constructors, instance methods and value-returning methods remain on the
   // ordinary structurer until their receiver/return carriers are supported by
   // the partitioner.  The corpus case which exposed the limit is static void.
-  const partitionOversizedStateMachine = codeItems.length > 5000
+  const partitionOversizedMethod = codeItems.length > 5000
     && (method.flags || []).includes('static')
     && methodReturnType(method) === 'void'
     && !(method.flags || []).includes('synchronized')
     && !syncHandlers.size;
   let stateMachineReason = process.env.CFR_JS_FORCE_STATE_MACHINE === '1'
     ? 'forced by CFR_JS_FORCE_STATE_MACHINE'
-    : (partitionOversizedStateMachine
+    : (partitionOversizedMethod && options.structureOversizedMethods === false
       ? 'partitioned oversized CFG'
       : (normalBranchIntoHandler
       ? 'normal control-flow edge enters an exception handler'
@@ -4161,7 +4163,7 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
       source = source.replace(new RegExp(`\\b${escaped}\\b`, 'g'), replacement);
     }
     source = source.replace(/^\s*(stackIn_\d+_\d+)\s*=\s*\1;\s*$/gm, '');
-    const lines = source ? source.split('\n') : [];
+    let lines = source ? source.split('\n') : [];
     if (declarations.length) {
       const eliminatedStackIns = new Set([
         ...forwardedStackIns, ...redundantStackInAliases.keys(),
@@ -4172,6 +4174,37 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
       lines.unshift(...uniqueDeclarations);
     }
     if (lines[lines.length - 1] === 'return;') lines.pop();
+    if (partitionOversizedMethod && !useStateMachine) {
+      const descriptor = parseDescriptor(method.descriptor || '()V');
+      const partitioned = partitionStructuredVoidBody(lines, {
+        parameters: descriptor.params.map((type, index) => ({type: simplifyType(type), name: localState.paramNames[index]})),
+        throwsTypes: methodThrowsTypes(method),
+        parseDeclarations: localDeclarationsFromStatement,
+        stripDeclarationType,
+        typeFromAst: sourceTypeFromAst,
+        sourceBudget: options.structuredPartitionSourceBudget,
+        onFailure: process.env.CFR_JS_DEBUG_STRUCTURER === '1' ? reason =>
+          console.error(`${cls.className}.${method.name}${method.descriptor}: structured partition declined: ${reason}`) : undefined,
+      });
+      if (partitioned) {
+        if (Array.isArray(options.diagnostics)) options.diagnostics.push({
+          kind: 'structuredMethodPartition', className: cls.className,
+          methodName: method.name, descriptor: method.descriptor,
+          helpers: partitioned.helpers, sharedLocals: partitioned.sharedLocals,
+        });
+        return partitioned.lines;
+      }
+      // A helper boundary must not strand a labeled transfer or a local scope.
+      // Retain the typed CFG representation when closed statement extraction
+      // cannot keep every helper bounded. Rebuild with all original carriers;
+      // structured-only alias elimination above must not affect this fallback.
+      useStateMachine = true;
+      stateMachineReason = 'oversized structured body cannot be safely partitioned';
+      cache.clear(); evaluating.clear(); forwardedStackIns.clear(); edgeStackInSources.clear();
+      source = printCfgStateMachine(cfg, render, evaluate, codeItems, exceptionTable, declarations,
+        methodReturnType(method), stateMachineConfiguration);
+      lines = [...new Set(declarations), ...source.split('\n')];
+    }
     if (useStateMachine && Array.isArray(options.diagnostics)) {
       options.diagnostics.push({
         kind: 'stateMachineFallback',
@@ -4183,7 +4216,7 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
         dispatchStatesAfter: stateMachineStats.statesAfter,
       });
     }
-    if (partitionOversizedStateMachine) {
+    if (partitionOversizedMethod) {
       return partitionVoidStateMachine(lines, method, localState);
     }
     return coalesceDefaultConstructorBody(sinkForInitDeclarations(rewriteWhileLoopsAsFor(lines)), method);
@@ -4215,6 +4248,8 @@ function partitionVoidStateMachine(lines, method, localState) {
 
   const declarations = lines.slice(0, loopIndex);
   const fieldLines = [];
+  const fieldTypes = new Map();
+  const initializers = [];
   let entryState = 0;
   for (const raw of declarations) {
     const line = String(raw).trim();
@@ -4222,6 +4257,8 @@ function partitionVoidStateMachine(lines, method, localState) {
     if (!match) return lines;
     const [, type, name, initializer] = match;
     fieldLines.push(`${type} ${name};`);
+    fieldTypes.set(name, type);
+    if (initializer != null) initializers.push(`this.${name} = ${initializer};`);
     if (name === 'statePc' && initializer != null) {
       const parsed = Number(initializer);
       if (Number.isFinite(parsed)) entryState = parsed;
@@ -4243,6 +4280,28 @@ function partitionVoidStateMachine(lines, method, localState) {
     cases.push({ state: Number(start[1]), lines: body });
   }
   if (!cases.length) return lines;
+
+  // Block evaluation binds locals lazily, before liftAllDeclarations discovers
+  // them. Their first stores can therefore still spell declarations inside a
+  // case. Once lifted to carrier fields, these stores must assign those fields;
+  // leaving the declarations would shadow them and later helpers read defaults.
+  // Match parsed declarations, not identifier text in expressions or strings.
+  for (const item of cases) {
+    item.lines = item.lines.flatMap((line) => {
+      const locals = localDeclarationsFromStatement(line);
+      const promoted = locals.filter((local) => fieldTypes.has(local.name));
+      if (!promoted.length) return [line];
+      if (locals.length !== 1 || promoted[0].inCatch || promoted[0].inResource ||
+          promoted[0].type !== fieldTypes.get(promoted[0].name)) {
+        throw new Error('partitioned local cannot safely become a carrier field');
+      }
+      const local = promoted[0];
+      if (!local.initialized) return [];
+      const assignment = stripDeclarationType(line, local.name, local.inFor);
+      if (assignment === line) throw new Error('partitioned local store could not be promoted');
+      return [assignment];
+    });
+  }
 
   // Keep helper bytecode comfortably below 64 KiB even when one source block
   // carries many stack-join stores.  Group by rendered source weight rather
@@ -4269,7 +4328,7 @@ function partitionVoidStateMachine(lines, method, localState) {
   const out = [`class ${className} {`];
   for (const field of fieldLines) out.push(`    ${field}`);
   for (let index = 0; index < parameterTypes.length; index += 1) {
-    out.push(`    final ${parameterTypes[index]} ${parameterNames[index]};`);
+    out.push(`    ${parameterTypes[index]} ${parameterNames[index]};`);
   }
   out.push('    boolean finished;');
 
@@ -4279,7 +4338,10 @@ function partitionVoidStateMachine(lines, method, localState) {
   for (let index = 0; index < parameterTypes.length; index += 1) {
     out.push(`        this.${parameterNames[index]} = initialParam${index};`);
   }
-  out.push(`        this.statePc = ${entryState};`, '    }');
+  for (const initializer of initializers) out.push(`        ${initializer}`);
+  if (!initializers.some((line) => line.startsWith('this.statePc = ')))
+    out.push(`        this.statePc = ${entryState};`);
+  out.push('    }');
 
   const renderCaseLine = (line) => {
     if (line.trim() === 'return;') {

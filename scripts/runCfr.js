@@ -87,11 +87,15 @@ function parseArgs(argv) {
 function collectDiagnostics(outputs) {
   const files = [];
   const obfuscationGuards = [];
+  const structuredPartitions = [];
   const totals = { stackUnderflow: 0, rawControlFlow: 0, placeholders: 0, stateMachineFallback: 0 };
   for (const { name, source, diagnostics = [] } of outputs) {
     const stateMachineFallbacks = diagnostics.filter((item) => item && item.kind === 'stateMachineFallback');
     for (const guard of diagnostics.filter((item) => item && item.kind === 'obfuscationGuard')) {
       obfuscationGuards.push({ name, ...guard });
+    }
+    for (const partition of diagnostics.filter((item) => item && item.kind === 'structuredMethodPartition')) {
+      structuredPartitions.push({name, ...partition});
     }
     const counts = {
       stackUnderflow: (source.match(/stack-underflow/g) || []).length,
@@ -116,6 +120,7 @@ function collectDiagnostics(outputs) {
     totals,
     files,
     obfuscationGuards,
+    structuredPartitions,
   };
 }
 

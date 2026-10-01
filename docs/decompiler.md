@@ -257,6 +257,52 @@ exception cycles. This is a targeted control-flow regression gate, not proof of
 whole-game behavioral equivalence. A fresh fixed-input GeoBlox export still has
 303 Java files, zero hard failures, and three original-method CFG fallbacks.
 
+## Bounded structured helpers for oversized static-void methods
+
+The owned renderer now attempts `structuredMethodPartition.js` before choosing
+an oversized CFG dispatcher. It outlines complete structured statements into
+methods of a local `$CfrPartitionedBody` carrier. Original statement source bytes
+are retained, with indentation adjusted to the helper scope. Shared JVM locals
+and mutable parameters become fields; first stores become assignments rather
+than declarations that shadow those fields. Original initializers run in source
+order after parameters are copied. Void returns in helpers set `finished`, and
+call sites propagate that return before executing subsequent statements.
+
+Calls remain in their original protected scopes. Helpers declare the enclosing
+catch alternatives and the original method's declared exceptions, preserving
+checked-catch reachability. Transfers must resolve to labels/loops/switches
+inside a complete outlined statement. Small transfers to an enclosing frame
+stay at their original site between outlined runs. Catch-local scopes are not extracted
+independently. Resource/finally scopes, unpromoted locals, unclosed transfers,
+oversized individual statements and exhausted budgets decline extraction and
+retain the typed, exception-preserving CFG fallback. There is no game or method
+name gate. Constructors, instance methods, value returns and synchronized
+regions retain the existing restrictions.
+
+Library options are `structureOversizedMethods` (default enabled; `false`
+selects the previous dispatcher representation) and
+`structuredPartitionSourceBudget` (default 24,000 source characters, clamped at
+that maximum). The budget is a conservative source-weight limit, not a formal
+bytecode-size proof; native compilation remains the classfile-limit gate.
+`runCfr.js` records `structuredMethodPartition` entries separately from fallback
+diagnostics, including original method identity, helper count and shared locals.
+
+`node test/cfrPartitionedLocals.test.js` compares verified original bytecode with
+rebuilt Java across six native fixtures and 270 result/effect/exception comparisons: both dispatcher
+coalescing modes, structured returns/shared arrays/mutable parameters, checked
+catches across helpers, budget refusal and a nonlocal loop break retained at its
+original scope. Every generated carrier method in
+these fixtures is checked below 32 KiB of actual Code bytes. The initial red
+test exposed carrier shadowing: all 45 executions in each dispatcher mode threw
+`NullPointerException` before their first effect. The fixed representations
+match the original result, effect count and exception outcome.
+
+For fixed-input GeoBlox, `wi.a(BLrh;)V` now uses three structured helpers instead
+of 18 dispatcher helpers and 756 cases. Native compilation measured their Code
+sizes as 7,764, 7,925 and 6,671 bytes. The outer run method is 240 bytes and keeps
+the runtime catch and post-load guard behavior. The unchanged original
+transformed bytecode is not replaced by this source publication.
+
 ## Guarantees, verification, and what is *not* claimed
 
 - **Guaranteed:** reducible CFG ⇒ goto-free structured tree (structurer);
