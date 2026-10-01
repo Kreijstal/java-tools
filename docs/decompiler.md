@@ -248,3 +248,74 @@ real output is deferred future work ("exception-boundary block split").
 - `test/exceptionStructurer.test.js` — single/multi/nested try, catch-all,
   loop-in-try, multi-exit bail, no-table passthrough, mid-block throwing-tail
   bail.
+
+## Readable regions inside CFG dispatchers
+
+When full structuring refuses a method, the fallback keeps its typed operand
+carriers and explicit dispatcher. Its renderer now reduces dispatch scaffolding
+without changing the bytecode, evaluating operations differently, or weakening
+`assertNoFallback`.
+
+It combines straight-line `goto`/fallthrough states only when the successor has
+one normal predecessor and is neither a method entry nor an exception-handler
+entry. The ordered handler types and resolved handler targets must agree. Each
+original block retains a separate Java scope, allowing repeated temporary names.
+
+It then nests forward, single-entry branch regions inside ordinary `if` and
+`switch` bodies. Incoming **edges** are counted, so repeated switch targets are
+shared entries rather than duplicate inline bodies. Shared joins, backedges,
+handler entries and differing handler regions keep explicit dispatcher states.
+Nesting stops at four levels or a conservative 12,000-unit source-weight budget;
+this leaves bounded cases for the existing oversized-method partitioner.
+
+Nesting also needs a scope proof. The owned Java statement parser examines the
+parent block. Local declarations, formal parameters, local classes, unsupported
+nodes or parse failures prevent branch nesting. Otherwise moving a child under
+a parent could silently bind its field access to a parent's local variable.
+Generated block comments record original CFG block IDs for traceability.
+
+The default is enabled. For comparison, use
+`CFR_JS_COALESCE_STATE_MACHINE_CHAINS=0`, or pass
+`coalesceStateMachineChains: false` to `decompileClassFile`. This gate controls
+both straight-line coalescing and branch nesting. Fallback diagnostics include
+`dispatchStatesBefore` and `dispatchStatesAfter`, including methods subsequently
+split into local-class helpers.
+
+### GeoBlox result and limits
+
+Re-decompiling the same 303 verified transformed classes reduces emitted
+numeric `switch (statePc)` cases from **3,051 to 1,330**. The 19 original fallback
+methods remain; partitioning their largest method produces 18 helpers instead of
+23. Gameplay update drops from 252 to 107 cases, gameplay rendering from 115 to
+65, and board-entity reconciliation from 120 to 60. All 303 generated files
+compile with `javac --release 8 -proc:none` and the frozen FunOrb stubs.
+
+Straight-line coalescing alone reduced the total by only 59 cases. Single-entry
+branch nesting produced the larger improvement. This is a source readability
+change; it does not establish complete game equivalence or improve browser FPS.
+Shared joins and loops still require dispatcher recovery in a future pass.
+
+`node test/cfrStateMachineReadability.test.js` checks enabled and disabled
+renderings against expected JVM results, and a native-compiled original against
+both forced fallback variants. Its 11 checks cover duplicate local scopes,
+shared joins, loops and effect order, switch arms and duplicate targets, field
+shadowing refusals, handler boundaries/entries, bounded case weight, exception
+and finally behavior, and oversized-method diagnostic retention.
+
+Existing fixture suites require their repository-native inputs:
+
+```sh
+node scripts/compileJava.js sources/TryWithResourcesTest.java sources/PyramidApplet.java --out sources --no-progress
+node test/cfrFixtures.test.js
+node test/cfrStructuredFeatures.test.js
+node test/cfrAdditionalFeatures.test.js
+node test/cfrStackOrdering.test.js
+```
+
+The recorded results are respectively 36, 26, 77 and 38 passing assertions.
+In the restricted verification environment, the last suite's child processes
+used a temporary regular-file stdio adapter; its test and compiler code were
+unchanged. Building the fixture inputs with host javac instead produced seven
+existing shape-test failures, also present with coalescing disabled. The native
+fixture build resolved them. `cfrObfuscationGuards.test.js` was skipped because
+its external Krakatau binary was absent; it is not recorded as validated.

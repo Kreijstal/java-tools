@@ -4066,10 +4066,16 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     // Keep the folded Java statement AST alongside the rendered text: reachability
     // analysis must inspect the AST (dead if-branches already dropped by constant
     // folding), which is what javac sees — not the raw structurer tree.
+    const stateMachineStats = {};
+    const stateMachineConfiguration = {
+      coalesceLinearStates: options.coalesceStateMachineChains
+        ?? (process.env.CFR_JS_COALESCE_STATE_MACHINE_CHAINS !== '0'),
+      stats: stateMachineStats,
+    };
     let statements = useStateMachine ? null : structuredStatements(structured.tree, render);
     let source = useStateMachine
       ? printCfgStateMachine(cfg, render, evaluate, codeItems, stateMachineExceptionTable, declarations,
-        methodReturnType(method))
+        methodReturnType(method), stateMachineConfiguration)
       : emitStatements(statements);
     const hasInvalidJavaSwitch = (text) => /switch\s*\(\s*null\s*\)/.test(text)
       || /^\s*case\s+(?!-?\d+\s*:|'(?:\\.|[^'])+'\s*:)/m.test(text);
@@ -4114,7 +4120,7 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
           if (carrier) declarations[d] = `${carrier[1]} ${carrier[2]} = ${defaultValueForType(carrier[1])};`;
         }
         source = printCfgStateMachine(cfg, render, evaluate, codeItems, stateMachineExceptionTable, declarations,
-          methodReturnType(method));
+          methodReturnType(method), stateMachineConfiguration);
       }
     }
     declarations.push(...localState.liftAllDeclarations(initializeLiftedLocals));
@@ -4181,9 +4187,6 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
       lines.unshift(...uniqueDeclarations);
     }
     if (lines[lines.length - 1] === 'return;') lines.pop();
-    if (partitionOversizedStateMachine) {
-      return partitionVoidStateMachine(lines, method, localState);
-    }
     if (useStateMachine && Array.isArray(options.diagnostics)) {
       options.diagnostics.push({
         kind: 'stateMachineFallback',
@@ -4191,7 +4194,12 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
         methodName: method.name,
         descriptor: method.descriptor,
         reason: stateMachineReason || 'state-machine fallback selected',
+        dispatchStatesBefore: stateMachineStats.statesBefore,
+        dispatchStatesAfter: stateMachineStats.statesAfter,
       });
+    }
+    if (partitionOversizedStateMachine) {
+      return partitionVoidStateMachine(lines, method, localState);
     }
     return coalesceDefaultConstructorBody(sinkForInitDeclarations(rewriteWhileLoopsAsFor(lines)), method);
   } catch (err) {
@@ -4435,7 +4443,7 @@ function isAssignableExceptionType(thrownType, catchType, model) {
   return false;
 }
 
-function printCfgStateMachine(cfg, render, evaluate, codeItems, exceptionTable, declarations, returnType) {
+function printCfgStateMachine(cfg, render, evaluate, codeItems, exceptionTable, declarations, returnType, configuration = {}) {
   const blockByPc = new Map();
   for (const block of cfg.blocks) {
     const first = codeItems[block.insns[0]];
@@ -4495,7 +4503,12 @@ function printCfgStateMachine(cfg, render, evaluate, codeItems, exceptionTable, 
     return current;
   };
 
-  const dispatch = (blockId) => {
+  const stateLeaders = new Map();
+  const stateTarget = (target) => {
+    const resolved = resolve(target);
+    return stateLeaders.get(resolved) ?? resolved;
+  };
+  const dispatch = (blockId, inlineTarget = () => null) => {
     const term = cfg.term[blockId];
     if (!term || term.kind === 'return') return [];
     if (term.kind === 'goto' || term.kind === 'fall') {
@@ -4504,11 +4517,19 @@ function printCfgStateMachine(cfg, render, evaluate, codeItems, exceptionTable, 
           ? ['return;']
           : ['throw new IllegalStateException("control fell off non-void method");'];
       }
-      return [`statePc = ${resolve(term.target)};`, 'continue stateLoop;'];
+      return [`statePc = ${stateTarget(term.target)};`, 'continue stateLoop;'];
     }
     if (term.kind === 'cond') {
-      const taken = term.taken == null ? -1 : resolve(term.taken);
-      const fall = term.fall == null ? -1 : resolve(term.fall);
+      const taken = term.taken == null ? -1 : stateTarget(term.taken);
+      const fall = term.fall == null ? -1 : stateTarget(term.fall);
+      const takenBody = inlineTarget(term.taken);
+      const fallBody = inlineTarget(term.fall);
+      if (takenBody || fallBody) {
+        return [`if (${render.cond(blockId)}) {`,
+          ...(takenBody || [`statePc = ${taken};`, 'continue stateLoop;']).map((line) => `    ${line}`),
+          '} else {',
+          ...(fallBody || [`statePc = ${fall};`, 'continue stateLoop;']).map((line) => `    ${line}`), '}'];
+      }
       return [
         `if (${render.cond(blockId)}) {`,
         `    statePc = ${taken};`,
@@ -4519,11 +4540,25 @@ function printCfgStateMachine(cfg, render, evaluate, codeItems, exceptionTable, 
       ];
     }
     if (term.kind === 'switch') {
+      const inlineCases = term.cases.map((item) => inlineTarget(item.target));
+      const inlineDefault = inlineTarget(term.default);
+      if (inlineDefault || inlineCases.some(Boolean)) {
+        const lines = [`switch (${render.switchValue(blockId)}) {`];
+        term.cases.forEach((item, index) => {
+          lines.push(`    case ${item.key}: {`,
+            ...(inlineCases[index] || [`statePc = ${item.target == null ? -1 : stateTarget(item.target)};`,
+              'continue stateLoop;']).map((line) => `        ${line}`), '    }');
+        });
+        lines.push('    default: {',
+          ...(inlineDefault || [`statePc = ${term.default == null ? -1 : stateTarget(term.default)};`,
+            'continue stateLoop;']).map((line) => `        ${line}`), '    }', '}');
+        return lines;
+      }
       const lines = [`switch (${render.switchValue(blockId)}) {`];
       for (const item of term.cases) {
-        lines.push(`    case ${item.key}: statePc = ${item.target == null ? -1 : resolve(item.target)}; break;`);
+        lines.push(`    case ${item.key}: statePc = ${item.target == null ? -1 : stateTarget(item.target)}; break;`);
       }
-      lines.push(`    default: statePc = ${term.default == null ? -1 : resolve(term.default)}; break;`);
+      lines.push(`    default: statePc = ${term.default == null ? -1 : stateTarget(term.default)}; break;`);
       lines.push('}', 'continue stateLoop;');
       return lines;
     }
@@ -4550,12 +4585,138 @@ function printCfgStateMachine(cfg, render, evaluate, codeItems, exceptionTable, 
     for (const t of targets) worklist.push(resolve(t));
   }
 
-  const renderedBlocks = cfg.blocks
-    .filter((block) => reachable.has(block.id))
-    .map((block) => {
-      const info = evaluated.get(block.id);
-      return { block, body: [...info.lines, ...dispatch(block.id)], handlers: info.handlers };
+  // Coalesce straight-line states only when their normal and exceptional
+  // entries prove that no alternate path can start inside the chain. Preserve
+  // handler order/targets exactly, and keep each original block's Java scope.
+  // This changes dispatch scaffolding, not operand-stack stores or operations.
+  const activeBlocks = cfg.blocks.filter((block) => reachable.has(block.id));
+  const activeById = new Map(activeBlocks.map((block) => [block.id, block]));
+  const predecessors = new Map(activeBlocks.map((block) => [block.id, new Set()]));
+  const incomingEdges = new Map(activeBlocks.map((block) => [block.id, 0]));
+  const handlerEntries = new Set();
+  for (const block of activeBlocks) {
+    const term = cfg.term[block.id];
+    const targets = [];
+    if (term?.kind === 'goto' || term?.kind === 'fall') targets.push(term.target);
+    else if (term?.kind === 'cond') targets.push(term.taken, term.fall);
+    else if (term?.kind === 'switch') {
+      targets.push(...term.cases.map((item) => item.target), term.default);
+    }
+    for (const target of targets) {
+      const id = resolve(target);
+      predecessors.get(id)?.add(block.id);
+      if (incomingEdges.has(id)) incomingEdges.set(id, incomingEdges.get(id) + 1);
+    }
+    for (const handler of evaluated.get(block.id).handlers) handlerEntries.add(resolve(handler.target));
+  }
+  const handlerIdentity = (id) => JSON.stringify(evaluated.get(id).handlers.map(
+    (handler) => [handler.catchType, resolve(handler.target)]));
+  // Bound a combined case so partitioning oversized void methods still has
+  // sufficiently small units to keep each generated helper below 64 KiB.
+  const sourceWeight = (id) => evaluated.get(id).lines.reduce(
+    (sum, line) => sum + line.length + 32, 80);
+  const chains = [];
+  for (const block of activeBlocks) {
+    if (stateLeaders.has(block.id)) continue;
+    const chain = [];
+    const handlers = handlerIdentity(block.id);
+    let current = block;
+    let weight = 0;
+    while (current) {
+      chain.push(current);
+      stateLeaders.set(current.id, block.id);
+      weight += sourceWeight(current.id);
+      if (configuration.coalesceLinearStates === false) break;
+      const term = cfg.term[current.id];
+      if (term?.kind !== 'goto' && term?.kind !== 'fall') break;
+      const next = resolve(term.target);
+      const incoming = predecessors.get(next);
+      if (!activeById.has(next) || stateLeaders.has(next) || next === entryState
+        || handlerEntries.has(next) || incoming.size !== 1 || !incoming.has(current.id)
+        || handlerIdentity(next) !== handlers || weight + sourceWeight(next) > 12000) break;
+      current = activeById.get(next);
+    }
+    chains.push(chain);
+  }
+  // Inline single-entry branch regions as ordinary if/switch bodies. A case-
+  // local declaration in the parent could shadow a child's original field or
+  // local binding after nesting, so prove its absence using the owned Java AST.
+  // Unknown syntax is a refusal, never a reason to guess about local scope.
+  const unsafeParentScopes = new Map();
+  const unsafeParentScope = (id) => {
+    if (!unsafeParentScopes.has(id)) {
+      const unsafe = (node) => {
+        if (!node || typeof node !== 'object') return false;
+        if (node.kind === 'LocalVariableDeclarationStatement' || node.kind === 'FormalParameter'
+          || node.kind === 'ClassDeclaration' || String(node.kind).startsWith('Unsupported')) return true;
+        return Object.values(node).some((value) => Array.isArray(value)
+          ? value.some(unsafe) : unsafe(value));
+      };
+      try {
+        unsafeParentScopes.set(id, unsafe(javaStatementParser.parseStatement(
+          '{\n' + evaluated.get(id).lines.join('\n') + '\n}')));
+      } catch (_error) { unsafeParentScopes.set(id, true); }
+    }
+    return unsafeParentScopes.get(id);
+  };
+  const chainById = new Map(chains.map((chain) => [chain[0].id, chain]));
+  const absorbedBranches = new Set();
+  const inlineChildren = new Map();
+  const regionRoots = [];
+  for (const chain of chains) {
+    if (absorbedBranches.has(chain[0].id)) continue;
+    regionRoots.push(chain);
+    if (configuration.coalesceLinearStates === false) continue;
+    let weight = chain.reduce((sum, block) => sum + sourceWeight(block.id), 512);
+    const visit = (parent, depth) => {
+      const tail = parent[parent.length - 1];
+      const term = cfg.term[tail.id];
+      if (depth >= 4 || unsafeParentScope(tail.id)) return;
+      const targets = term?.kind === 'cond' ? [term.taken, term.fall]
+        : term?.kind === 'switch' ? [...term.cases.map((item) => item.target), term.default] : [];
+      for (const target of targets) {
+        const id = resolve(target);
+        const child = chainById.get(stateTarget(id));
+        if (!child || child[0].id <= parent[0].id || id === entryState
+          || handlerEntries.has(id) || incomingEdges.get(id) !== 1
+          || absorbedBranches.has(child[0].id) || handlerIdentity(id) !== handlerIdentity(tail.id)) continue;
+        const childWeight = child.reduce((sum, block) => sum + sourceWeight(block.id), 512);
+        if (weight + childWeight > 12000) continue;
+        weight += childWeight;
+        absorbedBranches.add(child[0].id);
+        if (!inlineChildren.has(tail.id)) inlineChildren.set(tail.id, new Set());
+        inlineChildren.get(tail.id).add(child[0].id);
+        visit(child, depth + 1);
+      }
+    };
+    visit(chain, 0);
+  }
+  const renderChain = (chain) => {
+    const tail = chain[chain.length - 1];
+    const terminal = dispatch(tail.id, (target) => {
+      const child = chainById.get(stateTarget(target));
+      if (!child || !inlineChildren.get(tail.id)?.has(child[0].id)) return null;
+      return [`/* Inlined CFG state: ${child[0].id}. */`, '{',
+        ...renderChain(child).map((line) => `    ${line}`), '}'];
     });
+    if (chain.length === 1) return [...evaluated.get(tail.id).lines, ...terminal];
+    const body = [`/* Sequential CFG blocks: ${chain.map((item) => item.id).join(', ')}. */`];
+    for (let index = 0; index < chain.length; index += 1) {
+      const statements = [...evaluated.get(chain[index].id).lines];
+      if (index === chain.length - 1) statements.push(...terminal);
+      body.push('{', ...statements.map((line) => `    ${line}`), '}');
+    }
+    return body;
+  };
+  const renderedBlocks = regionRoots.map((chain) => {
+    const block = chain[0];
+    const handlers = evaluated.get(block.id).handlers;
+    return { block, body: renderChain(chain), handlers };
+  });
+  if (configuration.stats) {
+    configuration.stats.statesBefore = activeBlocks.length;
+    configuration.stats.statesAfter = renderedBlocks.length;
+  }
   declarations.push('int statePc = ' + entryState + ';');
   if (renderedBlocks.some((item) => item.handlers.length)) declarations.push('Throwable caughtException = null;');
 
@@ -4569,8 +4730,8 @@ function printCfgStateMachine(cfg, render, evaluate, codeItems, exceptionTable, 
       const caught = `stateCaught_${block.id}`;
       lines.push(`            } catch (Throwable ${caught}) {`);
       const dispatchExpression = handlers.slice(0, -1).reduceRight((fallback, handler) =>
-        `(${caught} instanceof ${handler.catchType} ? ${resolve(handler.target)} : ${fallback})`,
-      String(resolve(handlers[handlers.length - 1].target)));
+        `(${caught} instanceof ${handler.catchType} ? ${stateTarget(handler.target)} : ${fallback})`,
+      String(stateTarget(handlers[handlers.length - 1].target)));
       lines.push(`                caughtException = ${caught};`);
       lines.push(`                statePc = ${dispatchExpression};`);
       lines.push('                continue stateLoop;');
@@ -9844,5 +10005,6 @@ module.exports = {
     javaTypeFromInternalName,
     normalizeLegacyClassFile,
     rewriteDuplicateLocalDeclarations,
+    printCfgStateMachine,
   },
 };
