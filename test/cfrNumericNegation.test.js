@@ -156,10 +156,193 @@ test('shift normalization refuses inferred values, nonliteral computations and w
         value('(int) distance()'),value('2147483648'),value('010'),value('-1L','long'),value('-1.0f','float')])
         assert.equal(ir.binaryExpr(value('x',type),symbol,right,type).code,`x ${symbol} ${right.code}`);
     }
-    assert.equal(ir.binaryExpr(value('x'),'+',value('-449443480'),'int').code,'x + -449443480');
+    assert.equal(ir.binaryExpr(value('x'),'*',value('-449443480'),'int').code,'x * -449443480');
   } finally {
     if(previous===undefined)delete process.env.PIPELINE_EXPERIMENTAL_INTERCLASS_DCE;
     else process.env.PIPELINE_EXPERIMENTAL_INTERCLASS_DCE=previous;
+  }
+});
+
+test('integral signed terms retain width, casts, literal boundaries and floating operations',()=>{
+  const value=(code,type='int',precedence=100)=>({code,type,precedence});
+  for(const type of ['int','long']) {
+    const left=value('left()',type),right=value('right()',type);
+    const minus=ir.negateNumericExpression(right,type);
+    assert.equal(ir.binaryExpr(left,'+',minus,type).code,'left() - right()');
+    assert.equal(ir.binaryExpr(left,'-',minus,type).code,'left() + right()');
+    const twice=ir.negateNumericExpression(minus,type);
+    assert.equal(ir.binaryExpr(left,'+',twice,type).code,'left() + right()');
+    assert.equal(ir.binaryExpr(left,'-',twice,type).code,'left() - right()');
+    const literal=value(type==='long'?'-7L':'-7',type);
+    assert.equal(ir.binaryExpr(left,'+',literal,type).code,`left() - ${type==='long'?'7L':'7'}`);
+    assert.equal(ir.binaryExpr(left,'-',literal,type).code,`left() + ${type==='long'?'7L':'7'}`);
+    const minimum=value(type==='long'?'-9223372036854775808L':'-2147483648',type);
+    assert.equal(ir.binaryExpr(left,'+',minimum,type).code,`left() + ${minimum.code}`);
+    const cast=value(`(${type}) -right()`,type,90);
+    assert.equal(ir.binaryExpr(left,'+',cast,type).code,`left() + (${type}) -right()`);
+    const wrong=ir.negateNumericExpression(value('wide()','long'),'long');
+    if(type==='int')assert.equal(ir.binaryExpr(left,'-',wrong,type).code,'left() - -wide()');
+  }
+  for(const type of ['float','double']) {
+    const right=ir.negateNumericExpression(value('right()',type),type);
+    assert.equal(ir.binaryExpr(value('left()',type),'+',right,type).code,'left() + -right()');
+    assert.equal(ir.binaryExpr(value('left()',type),'-',right,type).code,'left() - -right()');
+  }
+  assert.equal(ir.binaryExpr(value('text','String'),'+',value('-7'),'String').code,'text + -7');
+  const narrowed=value('(byte) -right()','byte',90);
+  assert.equal(ir.binaryExpr(value('left()'),'-',narrowed,'int').code,'left() - (byte) -right()');
+  const compound=ir.negateNumericExpression(value('a - b','int',70),'int');
+  assert.equal(ir.binaryExpr(value('x'),'+',compound,'int').code,'x - (a - b)');
+});
+
+test('attributed source audit accepts integral signs and rejects changes outside that scope',()=>{
+  const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'cfr-term-source-audit-'));
+  try {
+    const helper=path.join(temporary,'helper');fs.mkdirSync(helper);
+    run('javac',['-d',helper,path.join(__dirname,'helpers/IntegralTermAudit.java')],helper);
+    const before=path.join(temporary,'before'),after=path.join(temporary,'after');
+    fs.mkdirSync(before);fs.mkdirSync(after);
+    const cases=[
+      ['int','x + -(y - 7)','x - (y - 7)',true],
+      ['long','x - -(-y)','x - y',true],
+      ['int','x - -(-2147483648)','x + -2147483648',true],
+      ['float','x + -y','x - y',false],
+      ['long','x + -(int)y','x - (int)y',false],
+      ['int','x + (byte)-y','x - (byte)y',false],
+      ['int','x + -y','-y + x',false],
+      ['int','x - -7','x + 8',false],
+    ];
+    for(const [type,oldExpression,newExpression,equal] of cases) {
+      for(const [directory,expression] of [[before,oldExpression],[after,newExpression]])
+        fs.writeFileSync(path.join(directory,'MathShapes.java'),`class MathShapes { static ${type} compute(${type} x,${type} y){return ${expression};} }`);
+      const audit=()=>run('java',['-cp',helper,'IntegralTermAudit',before,after,helper],helper);
+      if(equal)assert.match(audit(),/Matched all 1 attributed Java trees/);
+      else assert.throws(audit,/Source changes exceed integral sign normalization/);
+    }
+  } finally {fs.rmSync(temporary,{recursive:true,force:true});}
+});
+
+test('signed-term reconstruction matches native modular arithmetic and evaluation failures',()=>{
+  const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'cfr-signed-terms-'));
+  const previous=process.env.CFR_JS_FORCE_STATE_MACHINE;
+  try {
+    const native=path.join(temporary,'native');fs.mkdirSync(native);
+    let assembly='.version 49 0\n.class public super SignedTerms\n.super java/lang/Object\n';
+    for(const [type,descriptor,prefix,slots] of [['int','I','i',1],['long','J','l',2]]) {
+      for(const symbol of ['add','sub'])for(let negations=0;negations<=4;negations++) {
+        assembly+=`.method public static ${type}${symbol}${negations} : (${descriptor}${descriptor})${descriptor}
+          .code stack ${slots*2} locals ${slots*2}
+            ${prefix}load_0
+            ${prefix}load ${slots}
+            ${Array(negations).fill(prefix+'neg').join('\n')}
+            ${prefix}${symbol}
+            ${prefix}return
+          .end code
+        .end method
+        .method public static effects${type}${symbol}${negations} : (${descriptor}${descriptor})${descriptor}
+          .code stack ${slots*2} locals ${slots*2}
+            ${prefix}load_0
+            invokestatic Method SignedEffects left${prefix} (${descriptor})${descriptor}
+            ${prefix}load ${slots}
+            invokestatic Method SignedEffects right${prefix} (${descriptor})${descriptor}
+            ${Array(negations).fill(prefix+'neg').join('\n')}
+            ${prefix}${symbol}
+            ${prefix}return
+          .end code
+        .end method\n`;
+      }
+      for(const symbol of ['add','sub'])for(const [index,constant] of
+          (type==='int'?['-1','-7','-2147483648']:['-1L','-7L','-9223372036854775808L']).entries()) {
+        assembly+=`.method public static literal${type}${symbol}${index} : (${descriptor}${descriptor})${descriptor}
+          .code stack ${slots*2} locals ${slots*2}
+            ${prefix}load_0
+            ${type==='int'?'ldc_w':'ldc2_w'} ${constant}
+            ${prefix}${symbol}
+            ${prefix}return
+          .end code
+        .end method\n`;
+      }
+    }
+    for(const conversion of ['i2b','i2s'])assembly+=`.method public static narrowed${conversion} : (II)I
+      .code stack 2 locals 2
+        iload_0
+        iload_1
+        ineg
+        ${conversion}
+        isub
+        ireturn
+      .end code
+    .end method\n`;
+    assembly+=`.method public static narrowedLong : (JJ)J
+      .code stack 4 locals 4
+        lload_0
+        lload_2
+        lneg
+        l2i
+        i2l
+        lsub
+        lreturn
+      .end code
+    .end method\n`;
+    assembly+='\n.end class';
+    const classFile=path.join(native,'SignedTerms.class'),ast=parseJasminSource(assembly);
+    for(const item of ast.classes[0].items)for(const attribute of item.method?.attributes||[])
+      for(const instruction of attribute.code?.codeItems||[]) {
+        if(instruction.op==='ldc_w')instruction.arg=Number(instruction.arg);
+        if(instruction.op==='ldc2_w')instruction.arg=BigInt(instruction.arg.replace(/L$/,''));
+      }
+    writeClassAstToClassFile(ast,classFile);
+    const effects=`class SignedEffects {
+      static String log="";static int failure;
+      static void record(String label,int stage){log+=label;if(failure==stage)throw new IllegalArgumentException(label);}
+      static int lefti(int x){record("L",1);return x;}
+      static int righti(int x){record("R",2);return x;}
+      static long leftl(long x){record("L",1);return x;}
+      static long rightl(long x){record("R",2);return x;}
+    }`;
+    const driver=`class SignedRunner {
+      public static void main(String[] args)throws Exception {
+        java.lang.reflect.Method[] methods=SignedTerms.class.getDeclaredMethods();
+        java.util.Arrays.sort(methods,java.util.Comparator.comparing(java.lang.reflect.Method::getName));
+        long[] ints={Integer.MIN_VALUE,Integer.MIN_VALUE+1,-129,-7,-1,0,1,7,129,Integer.MAX_VALUE-1,Integer.MAX_VALUE};
+        long[] longs={Long.MIN_VALUE,Long.MIN_VALUE+1,-129,-7,-1,0,1,7,129,Long.MAX_VALUE-1,Long.MAX_VALUE};
+        int count=0;
+        for(java.lang.reflect.Method method:methods) {
+          boolean wide=method.getReturnType()==long.class,effect=method.getName().startsWith("effects");
+          long[] values=wide?longs:ints;
+          for(long a:values)for(long b:values)for(int failure=0;failure<(effect?3:1);failure++) {
+            if(method.getName().startsWith("literal")&&b!=values[0])continue;
+            Object left,right;if(wide){left=Long.valueOf(a);right=Long.valueOf(b);}else{left=Integer.valueOf((int)a);right=Integer.valueOf((int)b);}
+            SignedEffects.log="";SignedEffects.failure=failure;String outcome;
+            try{outcome=String.valueOf(method.invoke(null,left,right));}
+            catch(java.lang.reflect.InvocationTargetException error){outcome=error.getCause().getClass().getSimpleName()+":"+error.getCause().getMessage();}
+            if(!SignedEffects.log.equals(effect?(failure==1?"L":"LR"):""))throw new AssertionError("operand order/count");
+            System.out.println(method.getName()+":"+a+":"+b+":"+failure+":"+outcome+":"+SignedEffects.log);count++;
+          }
+        }
+        if(count!=10175)throw new AssertionError("count "+count);
+        System.out.println("complete:"+count);
+      }
+    }`;
+    for(const [name,text] of Object.entries({SignedEffects:effects,SignedRunner:driver}))fs.writeFileSync(path.join(native,name+'.java'),text);
+    run('javac',['--release','8','-classpath',native,'-d',native,path.join(native,'SignedEffects.java'),path.join(native,'SignedRunner.java')],native);
+    const expected=run('java',['-cp',native,'SignedRunner'],native);assert.match(expected,/complete:10175\n$/);
+    for(const forced of [false,true]) {
+      if(forced)process.env.CFR_JS_FORCE_STATE_MACHINE='1';else delete process.env.CFR_JS_FORCE_STATE_MACHINE;
+      const source=decompileClassFile(classFile);assertNoFallback(source);
+      for(const type of ['int','long'])for(const original of ['add','sub'])for(let count=0;count<=4;count++) {
+        const body=source.match(new RegExp(`\\b${type}${original}${count}\\([^)]*\\) \\{([\\s\\S]*?)\\n    \\}`))?.[1];
+        const symbol=(original==='add')!==(count%2===1)?'+':'-';
+        assert.ok(body?.includes(`param0 ${symbol} param1;`),body);
+      }
+      const rebuilt=path.join(temporary,forced?'forced':'structured');fs.mkdirSync(rebuilt);
+      for(const [name,text] of Object.entries({SignedTerms:source,SignedEffects:effects,SignedRunner:driver}))fs.writeFileSync(path.join(rebuilt,name+'.java'),text);
+      run('javac',['--release','8','-d',rebuilt,...['SignedTerms','SignedEffects','SignedRunner'].map(name=>path.join(rebuilt,name+'.java'))],rebuilt);
+      assert.equal(run('java',['-cp',rebuilt,'SignedRunner'],rebuilt),expected);
+    }
+  } finally {
+    if(previous===undefined)delete process.env.CFR_JS_FORCE_STATE_MACHINE;else process.env.CFR_JS_FORCE_STATE_MACHINE=previous;
+    fs.rmSync(temporary,{recursive:true,force:true});
   }
 });
 

@@ -5014,11 +5014,7 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
 
     if (NEGATE_OPS.has(op)) {
       const value = pop(stack);
-      const operand = wrap(value, 90);
-      // Java's lexer reads adjacent '-' tokens as pre-decrement, even when
-      // the JVM only negates a value twice. Negative literals have atomic
-      // precedence too, so guarding precedence alone does not prevent '--7'.
-      stack.push(expr(`-${operand.trimStart().startsWith('-') ? `(${operand})` : operand}`, value.type, 90));
+      stack.push(negateNumericExpression(value, primitiveTypeFromOpcode(op)));
       continue;
     }
 
@@ -9635,7 +9631,33 @@ function constantExpression(value, op) {
   return expr(String(value), 'Object');
 }
 
+function negateNumericExpression(value, type) {
+  const operand = wrap(value, 90);
+  // Adjacent '-' tokens are pre-decrement in Java, not two JVM negations.
+  // Retain the opcode width separately from inferred field/local types so an
+  // enclosing integral add/subtract can safely expose the original operand.
+  return expr(`-${operand.trimStart().startsWith('-') ? `(${operand})` : operand}`,
+    value.type, 90, {numericNegation: {operand: value, type}});
+}
+
 function binaryExpr(left, symbol, right, type) {
+  if ((type === 'int' || type === 'long') && (symbol === '+' || symbol === '-')) {
+    // Modular JVM arithmetic has x + (-y) == x - y, even at MIN_VALUE.
+    // Only unwrap a tracked negation at the same width; casts discard this
+    // metadata. Never commute the operands or apply this to floating point.
+    while (right.numericNegation?.type === type && integralComplementOperand(right, type) &&
+        integralComplementOperand(right.numericNegation.operand, type)) {
+      right = right.numericNegation.operand;
+      symbol = symbol === '+' ? '-' : '+';
+    }
+    const constant = integralLiteralValue(right, type);
+    const minimum = type === 'long' ? -(1n << 63n) : -2147483648;
+    if (constant !== null && constant < 0 && constant !== minimum) {
+      const positive = -constant;
+      right = expr(type === 'long' ? `${positive}L` : String(positive), type);
+      symbol = symbol === '+' ? '-' : '+';
+    }
+  }
   // JVM shift distances use five bits for int and six for long. Normalize only
   // a literal int operand: rewriting an inferred value could discard effects
   // or a throwing computation, and the result width comes from the opcode.
@@ -10225,6 +10247,7 @@ module.exports = {
   buildExceptionModel,
   _internals: {
     binaryExpr,
+    negateNumericExpression,
     coerceExpressionForType,
     negateBooleanExpression,
     isBracketBalanced,
