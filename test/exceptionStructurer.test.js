@@ -25,9 +25,45 @@ function multiExitResult() {
     {labelDef: 'L7:', pc: 7, instruction: 'astore_1'},
     {pc: 8, instruction: {op: 'goto', arg: 'L12'}},
     {labelDef: 'L12:', pc: 12, instruction: 'return'},
-    {labelDef: 'L16:', pc: 16, instruction: 'return'},
+    // This continuation can throw and must retain its external sink. Pure
+    // forward returns now belong to the try component instead.
+    {labelDef: 'L16:', pc: 16, instruction: 'athrow'},
   ], [{start_pc: 0, end_pc: 7, handler_pc: 7, catch_type: 'java/lang/Exception'}]);
 }
+
+test('pure forward returns retain their original paths inside the try component', () => {
+  for (const opcode of ['ireturn','lreturn','freturn','dreturn','areturn','return']) {
+    const code = [
+      {labelDef:'L0:',pc:0,instruction:{op:'invokestatic',arg:['Method','X',['work','()V']]}},
+      {pc:3,instruction:'iload_0'},
+      {pc:4,instruction:{op:'ifeq',arg:'L20'}},
+      {labelDef:'L7:',pc:7,instruction:{op:'goto',arg:'L24'}},
+      {labelDef:'L10:',pc:10,instruction:'astore_1'},
+      {pc:11,instruction:'athrow'},
+      {labelDef:'L20:',pc:20,instruction:opcode},
+      {labelDef:'L24:',pc:24,instruction:opcode},
+    ];
+    const result=structureMethod(code,[{start_pc:0,end_pc:10,handler_pc:10,catch_type:'java/lang/RuntimeException'}]);
+    assert.equal(result.ok,true,result.reason);
+    assert.deepEqual(result.selectorDecls,[]);
+    assert.deepEqual(result.regionExitContracts[0].exits,[]);
+    assert.equal(result.regionExitsVerified,true);
+    let component;
+    visitTree(result.tree,node=>{if(node.regionFlowComponent===0)component=node;});
+    let returns=0;visitTree(component,node=>{
+      if(node.t==='straight'&&result.render.straight(node.block).includes(opcode+';'))returns++;
+    });
+    assert.equal(returns,2,'both original return blocks belong to the protected component');
+    const damaged=JSON.parse(JSON.stringify(result.tree));
+    let deleted=false;visitTree(damaged,node=>{
+      if(!deleted&&node.t==='straight'&&result.render.straight(node.block).includes(opcode+';')) {
+        node.block=-1;deleted=true;
+      }
+    });
+    assert.equal(verifyRegionFlowContracts(damaged,result.regionExitContracts),false,
+      'deleting an absorbed return must not pass the original-flow contract');
+  }
+});
 
 function visitTree(node, visit) {
   if (!node) return;
@@ -694,7 +730,7 @@ test('nested try/catch', () => {
 // try/handler set a synthetic selector local at each exit and an if/else chain
 // after the try dispatches to the right join. (No goto, valid Java.)
 // ---------------------------------------------------------------------------
-test('multi-exit try structures via a selector dispatch', () => {
+test('multi-exit try keeps selector routing for throwing continuations', () => {
   const code = [
     { labelDef: 'L0:', pc: 0, instruction: 'iload_0' },
     { pc: 1, instruction: { op: 'ifeq', arg: 'L12' } },  // exit target #1
@@ -702,8 +738,7 @@ test('multi-exit try structures via a selector dispatch', () => {
     { labelDef: 'L7:', pc: 7, instruction: 'astore_1' },
     { pc: 8, instruction: { op: 'goto', arg: 'L12' } },
     { labelDef: 'L12:', pc: 12, instruction: 'return' },
-    { labelDef: 'L16:', pc: 16, instruction: 'iconst_0' },
-    { pc: 17, instruction: 'return' },
+    { labelDef: 'L16:', pc: 16, instruction: 'athrow' },
   ];
   const et = [{ start_pc: 0, end_pc: 7, handler_pc: 7, catch_type: 'java/lang/Exception' }];
   const r = structureMethod(code, et);

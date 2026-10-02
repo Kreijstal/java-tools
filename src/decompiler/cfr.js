@@ -1639,7 +1639,7 @@ function statementSegments(statement) {
 
 // True when a rendered Java block (a brace-balanced line list) provably completes
 // abruptly on every path — control can never fall off its end. Recurses through
-// if/else, try/catch/finally, and infinite loops so a synthesized trailing
+// if/else, try/catch/finally, synchronized bodies, and infinite loops so a synthesized trailing
 // `return` is only added where the body can actually fall through.
 function bodyCompletesAbruptly(lines) {
   const statements = splitTopLevelStatements(lines);
@@ -1664,6 +1664,12 @@ function statementCompletesAbruptly(statement) {
     const last = segments[segments.length - 1];
     if (last && /^\}?\s*finally\s*\{$/.test(last.header) && bodyCompletesAbruptly(last.body)) return true;
     return segments.every((segment) => bodyCompletesAbruptly(segment.body));
+  }
+  if (/^synchronized\s*\(/.test(head)) {
+    // Lock acquisition/release does not add a normal completion path to an
+    // all-paths-return body. Appending a default return here is unreachable.
+    const segments = statementSegments(statement);
+    return segments.length === 1 && bodyCompletesAbruptly(segments[0].body);
   }
   if (/^(?:while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\))\s*\{/.test(head)) {
     const segments = statementSegments(statement);

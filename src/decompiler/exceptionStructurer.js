@@ -1100,6 +1100,11 @@ function processGroup(work, group, ctx, commit) {
   // spurious second external exit. A block that cannot throw, is entered only
   // from the try body, and merely transfers control (goto/fall terminator)
   // behaves identically inside or outside the protected range — pull it in.
+  // The same holds for a nonthrowing terminal return. Keeping each such return
+  // outside manufactures selector sinks and a post-try return ladder. Retain
+  // all original blocks and their flow contracts while placing the return at
+  // its original path. Synchronized regions keep their separate lock-exit
+  // boundary; do not extend those over a return here.
   {
     const preds = Array.from({ length: n }, () => []);
     for (let b = 0; b < n; b++) {
@@ -1120,7 +1125,9 @@ function processGroup(work, group, ctx, commit) {
         // current synchronized body (the first iteration then locks null).
         if (preds[b].some((p) => work.startPc[b] <= work.startPc[p])) continue;
         const k = work.term[b].kind;
-        if (k !== 'goto' && k !== 'fall') continue;
+        const terminalReturn = k === 'return' && !isSynchronizedGroup
+          && !ctx.allHandlerPcs.has(work.startPc[b]);
+        if (k !== 'goto' && k !== 'fall' && !terminalReturn) continue;
         if (!ctx.isNoThrowBlock(work, b)) continue;
         tryset.add(b);
         changed = true;

@@ -23,6 +23,196 @@ function run(command, args, directory) {
   } finally { fds.forEach(fd => fs.closeSync(fd)); }
 }
 
+test('nonthrowing return tails preserve values, effects, shared joins, lock exits and outside failures', () => {
+  const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'cfr-region-return-tails-'));
+  const previous=process.env.CFR_JS_FORCE_STATE_MACHINE;
+  try {
+    const native=path.join(temporary,'native');fs.mkdirSync(native);
+    let assembly='.version 49 0\n.class public super ReturnTails\n.super java/lang/Object\n';
+    for(const name of ['choose','outside','shared']) {
+      const tail=()=>name==='outside'?`iload_2\n invokestatic Method ReturnEffects tail (II)I\n ireturn`:'ireturn';
+      assembly+=`.method public static ${name} : (III)I
+        .code stack 2 locals 4
+        .catch java/lang/RuntimeException from Ltry to Lhandler using Lhandler
+      Ltry:
+        iload_1
+        invokestatic Method ReturnEffects work (I)V
+        iload_0
+        ifeq Lzero
+        iload_0
+        iconst_1
+        if_icmpeq Lone
+        bipush 30
+        goto LotherReturn
+      Lzero:
+        bipush 10
+        goto LzeroReturn
+      Lone:
+        bipush 20
+        goto LoneReturn
+      Lhandler:
+        astore_3
+        aload_3
+        invokestatic Method ReturnEffects caught (Ljava/lang/Throwable;)V
+        iconst_m1
+        ${name==='shared'?'goto LzeroReturn':'ireturn'}
+      LotherReturn:
+        ${tail()}
+      LzeroReturn:
+        ${tail()}
+      LoneReturn:
+        ${tail()}
+        .end code
+      .end method\n`;
+    }
+    for(const [name,descriptor,prefix,slots,zero] of [
+      ['integer','I','i',1,'iconst_0'],['wide','J','l',2,'lconst_0'],
+      ['single','F','f',1,'fconst_0'],['real','D','d',2,'dconst_0'],
+      ['reference','Ljava/lang/Object;','a',1,'aconst_null'],
+    ])assembly+=`.method public static ${name} : (${descriptor}I)${descriptor}
+      .code stack 2 locals ${slots+2}
+      .catch java/lang/RuntimeException from Ltry to Lhandler using Lhandler
+    Ltry:
+      iload ${slots}
+      invokestatic Method ReturnEffects work (I)V
+      ${prefix}load_0
+      goto Lreturn
+    Lhandler:
+      astore ${slots+1}
+      aload ${slots+1}
+      invokestatic Method ReturnEffects caught (Ljava/lang/Throwable;)V
+      ${zero}
+      ${prefix}return
+    Lreturn:
+      ${prefix}return
+      .end code
+    .end method\n`;
+    assembly+=`.method public static empty : (I)V
+      .code stack 1 locals 2
+      .catch java/lang/RuntimeException from Ltry to Lhandler using Lhandler
+    Ltry:
+      iload_0
+      invokestatic Method ReturnEffects work (I)V
+      goto Lreturn
+    Lhandler:
+      astore_1
+      aload_1
+      invokestatic Method ReturnEffects caught (Ljava/lang/Throwable;)V
+      return
+    Lreturn:
+      return
+      .end code
+    .end method
+    .end class`;
+    const classFile=path.join(native,'ReturnTails.class');assembleJasminSource(assembly,classFile);
+    const effects=`class ReturnEffects {
+      static String trace;static Throwable last;
+      @SuppressWarnings("unchecked") static <T extends Throwable> RuntimeException raise(Throwable error)throws T {throw (T)error;}
+      static void fail(int kind) {
+        if(kind==0)return;
+        last=kind==1?new IllegalArgumentException():kind==2?new IllegalStateException():kind==3?new AssertionError():new java.io.IOException();
+        throw ReturnEffects.<RuntimeException>raise(last);
+      }
+      static void work(int kind){trace+="W"+kind;fail(kind);}
+      static void caught(Throwable error){if(error!=last)throw new AssertionError("throwable identity");trace+="C";}
+      static int tail(int value,int kind){trace+="T"+value+":"+kind;fail(kind);return value;}
+      static void lockedWork(int kind){if(!Thread.holdsLock(ReturnLocks.lock()))throw new AssertionError("work lock");work(kind);}
+      static int unlockedTail(int value,int kind){if(Thread.holdsLock(ReturnLocks.lock()))throw new AssertionError("tail lock");return tail(value,kind);}
+    }`;
+    const locks=`public class ReturnLocks {
+      static final Object LOCK=new Object();
+      static Object lock(){return LOCK;}
+      public static int inside(int failure) {
+        synchronized(LOCK) {
+          try {ReturnEffects.lockedWork(failure);return 10;}
+          catch(RuntimeException error){if(!Thread.holdsLock(LOCK))throw new AssertionError("catch lock");ReturnEffects.caught(error);return -1;}
+        }
+      }
+      public static int outside(int failure) {
+        try {synchronized(LOCK){ReturnEffects.lockedWork(failure);return 11;}}
+        catch(RuntimeException error){if(Thread.holdsLock(LOCK))throw new AssertionError("catch release");ReturnEffects.caught(error);return -1;}
+      }
+      public static int after(int failure) {
+        synchronized(LOCK){ReturnEffects.lockedWork(0);}
+        return ReturnEffects.unlockedTail(12,failure);
+      }
+    }`;
+    const driver=`class ReturnTailRunner {
+      static int count;
+      static String value(Object result) {
+        if(result instanceof Float)return "f:"+Integer.toHexString(Float.floatToRawIntBits((Float)result));
+        if(result instanceof Double)return "d:"+Long.toHexString(Double.doubleToRawLongBits((Double)result));
+        return String.valueOf(result);
+      }
+      static void invoke(String name,Class<?>[] types,Object[] arguments)throws Exception {
+        ReturnEffects.trace="";ReturnEffects.last=null;String outcome;
+        try{
+          Object result=ReturnTails.class.getDeclaredMethod(name,types).invoke(null,arguments);
+          if(name.equals("reference")&&(Integer)arguments[1]==0&&result!=arguments[0])throw new AssertionError("return reference identity");
+          outcome=value(result);
+        }
+        catch(java.lang.reflect.InvocationTargetException error) {
+          Throwable cause=error.getCause();if(cause!=ReturnEffects.last)throw new AssertionError("escaping throwable identity");
+          outcome=cause.getClass().getSimpleName();
+        }
+        System.out.println(name+":"+outcome+":"+ReturnEffects.trace);count++;
+      }
+      public static void main(String[] args)throws Exception {
+        int[] ints={Integer.MIN_VALUE,-7,-1,0,1,2,7,Integer.MAX_VALUE};
+        for(String name:new String[]{"choose","outside","shared"})for(int mode:ints)for(int work=0;work<5;work++)for(int tail=0;tail<5;tail++)
+          invoke(name,new Class<?>[]{int.class,int.class,int.class},new Object[]{mode,work,tail});
+        long[] longs={Long.MIN_VALUE,-7,-1,0,1,2,7,Long.MAX_VALUE};
+        int[] floats={0x80000000,0,0xbf800000,0x3f800000,0xff800000,0x7f800000,0x7fc12345,0xffc54321};
+        long[] doubles={0x8000000000000000L,0,0xbff0000000000000L,0x3ff0000000000000L,0xfff0000000000000L,0x7ff0000000000000L,0x7ff8123456789abcL,0xfff8abcdef012345L};
+        for(int work=0;work<5;work++) {
+          for(int x:ints)invoke("integer",new Class<?>[]{int.class,int.class},new Object[]{x,work});
+          for(long x:longs)invoke("wide",new Class<?>[]{long.class,int.class},new Object[]{x,work});
+          for(int x:floats)invoke("single",new Class<?>[]{float.class,int.class},new Object[]{Float.intBitsToFloat(x),work});
+          for(long x:doubles)invoke("real",new Class<?>[]{double.class,int.class},new Object[]{Double.longBitsToDouble(x),work});
+          for(Object x:new Object[]{null,"","identity"})invoke("reference",new Class<?>[]{Object.class,int.class},new Object[]{x,work});
+          invoke("empty",new Class<?>[]{int.class},new Object[]{work});
+        }
+        for(String name:new String[]{"inside","outside","after"})for(int failure=0;failure<5;failure++) {
+          ReturnEffects.trace="";ReturnEffects.last=null;String outcome;
+          try{outcome=""+ReturnLocks.class.getDeclaredMethod(name,int.class).invoke(null,failure);}
+          catch(java.lang.reflect.InvocationTargetException error){if(error.getCause()!=ReturnEffects.last)throw new AssertionError("lock throwable identity");outcome=error.getCause().getClass().getSimpleName();}
+          if(Thread.holdsLock(ReturnLocks.lock()))throw new AssertionError("lock not released");
+          System.out.println("lock:"+name+":"+failure+":"+outcome+":"+ReturnEffects.trace);count++;
+        }
+        if(count!=795)throw new AssertionError("coverage "+count);System.out.println("complete:"+count);
+      }
+    }`;
+    for(const [name,text] of Object.entries({ReturnEffects:effects,ReturnLocks:locks,ReturnTailRunner:driver}))fs.writeFileSync(path.join(native,name+'.java'),text);
+    run('javac',['--release','8','-classpath',native,'-d',native,...['ReturnEffects','ReturnLocks','ReturnTailRunner'].map(name=>path.join(native,name+'.java'))],native);
+    const expected=run('java',['-cp',native,'ReturnTailRunner'],native);assert.match(expected,/complete:795\n$/);
+    for(const forced of [false,true]) {
+      if(forced)process.env.CFR_JS_FORCE_STATE_MACHINE='1';else delete process.env.CFR_JS_FORCE_STATE_MACHINE;
+      const source=decompileClassFile(classFile);assertNoFallback(source);
+      if(!forced) {
+        const body=name=>source.match(new RegExp('public static [^\\n]+ '+name+'\\([^)]*\\) \\{([\\s\\S]*?)(?=\\n    public static|\\n})'))?.[1];
+        assert.ok(body('choose')&&!body('choose').includes('decompiledRegionSelector'),'pure returns do not allocate a selector');
+        assert.ok(body('outside')?.includes('decompiledRegionSelector'),'throwing tails retain explicit external routing');
+        assert.match(body('shared'),/\n        return /,'shared try/catch return stays outside the catch scope');
+      }
+      const rebuilt=path.join(temporary,forced?'forced':'structured');fs.mkdirSync(rebuilt);
+      // The forced dispatcher deliberately refuses explicit monitors instead
+      // of emitting unsynchronized Java. Test that refusal; the forced return
+      // fixture uses the original lock helper as a native dependency. Only the
+      // normal reconstruction is used for the lock-exit differential proof.
+      let lockSource=locks;
+      if(forced)assert.throws(()=>decompileClassFile(path.join(native,'ReturnLocks.class')),
+        /fallback marker[^\n]*monitorenter/);
+      else {lockSource=decompileClassFile(path.join(native,'ReturnLocks.class'));assertNoFallback(lockSource);}
+      for(const [name,text] of Object.entries({ReturnTails:source,ReturnEffects:effects,ReturnLocks:lockSource,ReturnTailRunner:driver}))fs.writeFileSync(path.join(rebuilt,name+'.java'),text);
+      run('javac',['--release','8','-d',rebuilt,...['ReturnTails','ReturnEffects','ReturnLocks','ReturnTailRunner'].map(name=>path.join(rebuilt,name+'.java'))],rebuilt);
+      assert.equal(run('java',['-cp',rebuilt,'ReturnTailRunner'],rebuilt),expected);
+    }
+  } finally {
+    if(previous===undefined)delete process.env.CFR_JS_FORCE_STATE_MACHINE;else process.env.CFR_JS_FORCE_STATE_MACHINE=previous;
+    fs.rmSync(temporary,{recursive:true,force:true});
+  }
+});
+
 test('handler cleanup cannot enter a shadowed sibling catch during a loop exit', () => {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-shadowed-loop-exits-'));
   const previous = process.env.CFR_JS_FORCE_STATE_MACHINE;
