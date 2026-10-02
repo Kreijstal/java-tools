@@ -381,13 +381,63 @@ function promoteBooleanStackCarriers(source, declarations, carrierTypes, localTy
   return {source, declarations, promoted, removed};
 }
 
-function lowerIfStatements(condition, thenStatements, elseStatements, inverted, localType) {
+const emittedStatementSources = new WeakMap();
+function statementSource(statement) {
+  if (!emittedStatementSources.has(statement))
+    emittedStatementSources.set(statement, emitStatements([statement]));
+  return emittedStatementSources.get(statement);
+}
+
+function commonBranchTail(thenStatements, elseStatements) {
+  // An if introduces no handler, monitor or jump target. Moving an identical
+  // whole statement past it retains all three, including a try/lock *inside*
+  // that statement. Never extract a tail from inside such a construct.
+  // Both prefixes and the tail must have no declarations whose scope changes:
+  // an identical spelling can otherwise denote two different branch locals.
+  if (continuation(thenStatements) !== thenStatements
+      || continuation(elseStatements) !== elseStatements) return 0;
+  let count = 0;
+  while (count < Math.min(thenStatements.length, elseStatements.length)) {
+    const taken = thenStatements[thenStatements.length - count - 1];
+    const other = elseStatements[elseStatements.length - count - 1];
+    if (statementSource(taken) !== statementSource(other)) break;
+    count++;
+  }
+  // Sharing just `return false` can turn a readable guard ladder into nested
+  // positive tests. Keep empty exit guards and prefixes containing transfers;
+  // meaningful shared work before the transfer still gets factored.
+  const transfers = new Set(['ReturnStatement', 'ThrowStatement', 'BreakStatement', 'ContinueStatement']);
+  const parsed = statement => statement.kind === 'UnsupportedStatement'
+    ? parsedStraightBlock(statement) : statement;
+  const hasTransfer = statement => anyStatement(parsed(statement), node => transfers.has(node.kind));
+  const tail = thenStatements.slice(-count);
+  const onlyTransfers = count && tail.every(statement => {
+    const node = parsed(statement);
+    return node?.kind === 'BlockStatement' ? node.statements.length === 1 && transfers.has(node.statements[0].kind)
+      : transfers.has(node?.kind);
+  });
+  if (onlyTransfers && (thenStatements.length === count && elseStatements.length !== count
+      || elseStatements.length === count && thenStatements.length !== count
+      || [...thenStatements.slice(0, -count), ...elseStatements.slice(0, -count)].some(hasTransfer))) return 0;
+  return count;
+}
+
+function lowerIfStatements(condition, thenStatements, elseStatements, inverted, localType, factorTails = false) {
   const makeIf = (source, body, alternate = null) => createNode('IfStatement', {
     condition: rawExpression(source), consequent: block(body), alternate,
   });
   // All children have already been rendered in CFG order. Only rearrange the
   // resulting AST, because rendering itself binds local names and types.
   const inverse = () => (inverted && inverted()) || `!(${condition})`;
+  const shared = factorTails ? commonBranchTail(thenStatements, elseStatements) : 0;
+  if (shared) {
+    const taken = thenStatements.slice(0, -shared);
+    const other = elseStatements.slice(0, -shared);
+    // Even when both prefixes are empty the condition must still execute:
+    // field reads, calls and boxed Boolean unboxing can throw or have effects.
+    return [...lowerIfStatements(condition, taken, other, inverted, localType, true),
+      ...thenStatements.slice(-shared)];
+  }
   const value = valueProducingBranch(condition, thenStatements, elseStatements, localType);
   if (value) return [value];
   if (!thenStatements.length && elseStatements.length) {
@@ -406,6 +456,118 @@ function lowerIfStatements(condition, thenStatements, elseStatements, inverted, 
     }
   }
   return [makeIf(condition, thenStatements, elseStatements.length ? block(elseStatements) : null)];
+}
+
+// Run after stack-carrier cleanup: two copies of the same CFG tail may initially
+// spell the same Boolean argument using different temporary names. Parse the
+// final source for control/scope proofs, while retaining original expression
+// bytes (the parser's node ranges often cover only the leading token).
+function factorCommonBranchTails(source) {
+  const unchanged = () => ({source, branches: 0});
+  if (/\\u+[0-9a-fA-F]{4}/.test(source)) return unchanged();
+  let parsed, tokens;
+  const wrapped = `{\n${source}\n}`;
+  try {
+    parsed = statementParser.parseStatement(wrapped, {requireComplete: true});
+    const lexed = tokenizeJava(wrapped);
+    if (lexed.diagnostics.length) return unchanged();
+    tokens = lexed.tokens.filter(token => !['comment', 'whitespace', 'eof'].includes(token.kind));
+  } catch (_) { return unchanged(); }
+  function known(node) {
+    if (!node || typeof node !== 'object') return true;
+    if (Array.isArray(node)) return node.every(known);
+    if (node.kind?.startsWith('Unsupported')) return false;
+    return Object.entries(node).every(([key, value]) => ['range', 'meta', 'tokens'].includes(key) || known(value));
+  }
+  if (!known(parsed)) return unchanged();
+  const starts = new Map(tokens.map((token, index) => [token.range.startOffset, index]));
+  const pairs = new Map(), stack = [];
+  for (let index = 0; index < tokens.length; index++) {
+    const text = tokens[index].text;
+    if (['(', '[', '{'].includes(text)) stack.push(index);
+    else if ([')', ']', '}'].includes(text)) {
+      const open = stack.pop();
+      if (open === undefined || '([{'.indexOf(tokens[open].text) !== ')]}'.indexOf(text)) return unchanged();
+      pairs.set(open, index);
+    }
+  }
+  if (stack.length) return unchanged();
+  let branches = 0;
+  function inverse(condition) {
+    // Equality has an exact complement even for floating-point NaNs. Do not
+    // replace relational comparisons by their opposite: !(x < y) includes NaN.
+    let text = condition.trim();
+    try {
+      let expression = statementParser.parseStatement(`if (${text}) {}`, {requireComplete: true}).condition;
+      let items = tokenizeJava(text).tokens.filter(token => !['comment', 'whitespace', 'eof'].includes(token.kind));
+      while (expression.kind === 'ParenthesizedExpression') {
+        text = text.slice(items[0].range.endOffset, items.at(-1).range.startOffset).trim();
+        items = tokenizeJava(text).tokens.filter(token => !['comment', 'whitespace', 'eof'].includes(token.kind));
+        expression = expression.expression;
+      }
+      if (expression.kind === 'UnaryExpression' && expression.operator === '!')
+        return text.slice(items[0].range.endOffset).trim();
+      if (expression.kind === 'BinaryExpression' && ['==', '!='].includes(expression.operator)) {
+        let depth = 0;
+        for (const token of items) {
+          if (['(', '[', '{'].includes(token.text)) depth++;
+          else if ([')', ']', '}'].includes(token.text)) depth--;
+          else if (!depth && token.text === expression.operator)
+            return text.slice(0, token.range.startOffset) + (token.text === '==' ? '!=' : '==') + text.slice(token.range.endOffset);
+        }
+      }
+    } catch (_) { /* Preserve an unknown condition verbatim under negation. */ }
+    return `!(${condition})`;
+  }
+  const fragment = (start, end) => {
+    const text = wrapped.slice(start, end).trim();
+    const lines = text.split('\n');
+    // Strings keep their token spelling. Java 8 has no text blocks; only
+    // indentation before subsequent source lines is adjusted.
+    const indent = Math.min(...lines.slice(1).filter(line => line.trim()).map(line => /^\s*/.exec(line)[0].length));
+    return lines.map((line, index) => index ? line.slice(Math.min(indent, /^\s*/.exec(line)[0].length)) : line).join('\n');
+  };
+  function statements(node) {
+    if (node.kind !== 'BlockStatement') throw new Error('unproven block');
+    const open = starts.get(node.range?.startOffset), close = pairs.get(open);
+    if (tokens[open]?.text !== '{' || tokens[close]?.text !== '}') throw new Error('unproven block extent');
+    let result = [];
+    for (let index = 0; index < node.statements.length; index++) {
+      const child = node.statements[index];
+      const start = child.range?.startOffset;
+      const end = node.statements[index + 1]?.range?.startOffset ?? tokens[close].range.startOffset;
+      if (!starts.has(start) || end <= start) throw new Error('unproven statement extent');
+      if (child.kind === 'IfStatement' && child.consequent?.kind === 'BlockStatement'
+          && (!child.alternate || child.alternate.kind === 'BlockStatement')) {
+        const keyword = starts.get(start), conditionOpen = keyword + 1, conditionClose = pairs.get(conditionOpen);
+        if (tokens[keyword].text !== 'if' || tokens[conditionOpen]?.text !== '(' || conditionClose === undefined)
+          throw new Error('unproven condition extent');
+        const condition = wrapped.slice(tokens[conditionOpen].range.endOffset, tokens[conditionClose].range.startOffset);
+        const taken = statements(child.consequent), other = child.alternate ? statements(child.alternate) : [];
+        if (commonBranchTail(taken, other)) branches++;
+        result.push(...lowerIfStatements(condition, taken, other, () => inverse(condition), null, true));
+      } else {
+        result.push(rawStatement(fragment(start, end)));
+      }
+    }
+    // Early-exit lowering can have already put one clone after its guard.
+    // Reconstitute only a proven abrupt arm with an identical block suffix.
+    // A return/throw/outer jump still skips the shared tail on the same paths.
+    for (let index = result.length - 2; index >= 0; index--) {
+      const child = result[index];
+      if (child.kind !== 'IfStatement' || child.alternate || !provenAbrupt(child.consequent.statements)) continue;
+      const rest = result.slice(index + 1);
+      if (!commonBranchTail(child.consequent.statements, rest)) continue;
+      branches++;
+      result = [...result.slice(0, index), ...lowerIfStatements(child.condition.source,
+        child.consequent.statements, rest, () => inverse(child.condition.source), null, true)];
+    }
+    return result;
+  }
+  try {
+    const result = statements(parsed);
+    return branches ? {source: emitStatements(result), branches} : unchanged();
+  } catch (_) { return unchanged(); }
 }
 
 function treeToStatements(tree, render) {
@@ -748,4 +910,5 @@ function hasUnreachableStatement(statements) {
 module.exports = {
   treeToStatements, emitStatements, rawExpression, rawStatement, hasUnreachableStatement,
   promoteBooleanStackCarriers,
+  factorCommonBranchTails,
 };

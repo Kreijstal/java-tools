@@ -6,7 +6,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const {spawnSync} = require('child_process');
-const {treeToStatements, emitStatements, promoteBooleanStackCarriers} = require('../src/decompiler/javaAstEmitter');
+const {treeToStatements, emitStatements, promoteBooleanStackCarriers, factorCommonBranchTails} = require('../src/decompiler/javaAstEmitter');
 const {printTree} = require('../src/decompiler/structurer');
 const {JavaParser} = require('../src/java-frontend/parser');
 const {decompileClassFile, assertNoFallback} = require('../src/decompiler/cfr');
@@ -561,5 +561,96 @@ test('Boolean snapshots and safe inlining match native values, failure priority 
     const javaFile=path.join(temporary,'BooleanCarriers.java');fs.writeFileSync(javaFile,source);
     run('javac',['--release','8','-d',temporary,javaFile],temporary);
     assert.equal(run('java',['-cp',temporary,'BooleanCarriers'],temporary).trim().split('\n').length,810);
+  } finally {fs.rmSync(temporary,{recursive:true,force:true});}
+});
+
+test('identical branch tails are factored only with complete scope and extent proofs', () => {
+  const factor = source => factorCommonBranchTails(source);
+  for (const source of [
+    'if (pick()) { left(); finish(); return; } else { right(); finish(); return; }',
+    'if (pick()) { left(); finish(); return; } right(); finish(); return;',
+    'if (pick()) { if (stop()) { return; } left(); finish(); } else { right(); finish(); }',
+  ]) {
+    const result = factor(source);
+    assert.ok(result.branches > 0, source);
+    assert.equal((result.source.match(/finish\(\)/g) || []).length, 1, result.source);
+  }
+  const empty = factor('if (pick()) { finish(); } else { finish(); }');
+  assert.match(empty.source, /if \(pick\(\)\) \{\s*\}\s*finish\(\);/);
+  for (const source of [
+    'if (flag) { int value = 1; use(value); } else { int value = 2; use(value); }',
+    'if (flag) { class Value {} use(Value.class); } else { class Value {} use(Value.class); }',
+    'if (flag) { synchronized (lock) { finish(); } } else { finish(); }',
+    'if (flag) { try { finish(); } catch (RuntimeException error) { caught(); } } else { finish(); }',
+    'if (flag) { finish(); } else { changed(); }',
+    'if (first) { return false; } if (second) { return false; } work(); return false;',
+    'if (flag) { finish(); } else { finish(); } trailing !',
+    'if (flag) { finish(); } else { finish(); } // \\u000a',
+  ]) assert.deepEqual(factor(source), {source, branches: 0}, source);
+  const nested = factor('if (flag) { left(); if (other) { a(); finish(); } else { b(); finish(); } } else { right(); }');
+  assert.ok(nested.branches > 0);
+  assert.equal((nested.source.match(/finish\(\)/g) || []).length, 1);
+});
+
+test('factored tails preserve native conditions, snapshots, scopes and protected effect order', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-emitter-shared-tails-'));
+  try {
+    const variants = [
+      'if (pick(x,boxed,trace)) { trace.append("a"); finish(x,trace); } else { trace.append("b"); finish(x,trace); } return done(trace);',
+      'if (pick(x,boxed,trace)) { finish(x,trace); return done(trace); } else { finish(x,trace); return done(trace); }',
+      'if (pick(x,boxed,trace)) { trace.append("a"); finish(x,trace); return done(trace); } trace.append("b"); finish(x,trace); return done(trace);',
+      'if (pick(x,boxed,trace)) { if (x == 7) { return done(trace); } trace.append("a"); finish(x,trace); } else { trace.append("b"); finish(x,trace); } return done(trace);',
+      'if (pick(x,boxed,trace)) { trace.append("a"); x = -x; finish(x,trace); } else { trace.append("b"); x += 1; finish(x,trace); } return done(trace);',
+      'if (pick(x,boxed,trace)) { finish(x,trace); } else { finish(x,trace); } return done(trace);',
+      'if (pick(x,boxed,trace)) { trace.append("a"); if (x < 0) { synchronized (lock) { locked(x,lock,trace); } } else { trace.append("c"); synchronized (lock) { locked(x,lock,trace); } } } else { trace.append("b"); } return done(trace);',
+      'if (pick(x,boxed,trace)) { trace.append("a"); try { finish(x,trace); } catch (IllegalArgumentException failure) { trace.append("c"); } } else { trace.append("b"); try { finish(x,trace); } catch (IllegalArgumentException failure) { trace.append("c"); } } return done(trace);',
+      'if (pick(x,boxed,trace)) { trace.append("a"); return done(trace); } else { int value = 2; trace.append(value); return done(trace); }',
+      'if (pick(x,boxed,trace)) { trace.append("a"); if (x == x) { trace.append("c"); finish(x,trace); } else { finish(x,trace); } } else { trace.append("b"); } return done(trace);',
+      'if (pick(x,boxed,trace)) { trace.append("a"); if (x < 0) { trace.append("c"); finish(x,trace); } else { finish(x,trace); } } else { trace.append("b"); } return done(trace);',
+      'Outer: { if (pick(x,boxed,trace)) { trace.append("a"); finish(x,trace); break Outer; } else { trace.append("b"); finish(x,trace); break Outer; } } return done(trace);',
+      'for (int i=0;i<2;i++) { if (pick(x,boxed,trace)) { trace.append("a"); finish(x,trace); continue; } else { trace.append("b"); finish(x,trace); continue; } } return done(trace);',
+    ];
+    const methods = [];
+    variants.forEach((original,index) => {
+      const result = factorCommonBranchTails(original);
+      if (index < 8 || index === 9 || index === 10) assert.ok(result.branches > 0, original);
+      // Whole loops/labeled constructs are kept, including their inner tails.
+      if (index >= 11) assert.equal(result.source, original);
+      for (const [label,body] of [['original',original],['rebuilt',result.source]])
+        methods.push(`static String ${label}${index}(double x,Boolean boxed,Object lock) {
+          StringBuilder trace = new StringBuilder(); try { ${body} }
+          catch (RuntimeException failure) { return failure.getClass().getName()+":"+trace; }
+        }`);
+    });
+    const source = `public class SharedTails {
+      static int mode;
+      static boolean pick(double x,Boolean boxed,StringBuilder trace) {
+        trace.append('q'); if (mode == 1) throw new IllegalStateException();
+        return mode == 2 ? boxed : x <= 0;
+      }
+      static void finish(double x,StringBuilder trace) {
+        trace.append('f'); if (x == 7 || Double.isNaN(x)) throw new IllegalArgumentException();
+        trace.append(Double.doubleToRawLongBits(x));
+      }
+      static void locked(double x,Object lock,StringBuilder trace) {
+        if (!Thread.holdsLock(lock)) throw new AssertionError(); finish(x,trace);
+      }
+      static String done(StringBuilder trace) { return trace.toString(); }
+      ${methods.join('\n')}
+      public static void main(String[] args) {
+        Object lock=new Object();
+        for (mode=0;mode<3;mode++) for (double x : new double[]{Double.NEGATIVE_INFINITY,-7,-0d,0d,7,Double.POSITIVE_INFINITY,Double.NaN})
+          for (Boolean boxed : new Boolean[]{false,true,null}) {
+            ${variants.map((_,index)=>`{
+              String expected=original${index}(x,boxed,lock),actual=rebuilt${index}(x,boxed,lock);
+              if (!expected.equals(actual) || Thread.holdsLock(lock)) throw new AssertionError(${index}+":"+mode+":"+x+":"+boxed+":"+expected+":"+actual);
+              System.out.println(${index}+":"+mode+":"+x+":"+boxed+":"+actual);
+            }`).join('\n')}
+          }
+      }
+    }`;
+    const javaFile=path.join(temporary,'SharedTails.java');fs.writeFileSync(javaFile,source);
+    run('javac',['--release','8','-d',temporary,javaFile],temporary);
+    assert.equal(run('java',['-cp',temporary,'SharedTails'],temporary).trim().split('\n').length,variants.length*63);
   } finally {fs.rmSync(temporary,{recursive:true,force:true});}
 });
