@@ -4976,7 +4976,11 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
 
     if (NEGATE_OPS.has(op)) {
       const value = pop(stack);
-      stack.push(expr(`-${wrap(value, 90)}`, value.type, 90));
+      const operand = wrap(value, 90);
+      // Java's lexer reads adjacent '-' tokens as pre-decrement, even when
+      // the JVM only negates a value twice. Negative literals have atomic
+      // precedence too, so guarding precedence alone does not prevent '--7'.
+      stack.push(expr(`-${operand.trimStart().startsWith('-') ? `(${operand})` : operand}`, value.type, 90));
       continue;
     }
 

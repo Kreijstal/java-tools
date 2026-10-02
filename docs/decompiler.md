@@ -729,3 +729,26 @@ forced-dispatcher reconstruction. The 220 methods cover all six comparisons,
 both operand orders, nine constants at each width, 15 boundary inputs plus
 throwing calls, byte narrowing, another XOR mask and two effectful operands.
 All 7,040 result/effect-trace comparisons must match.
+
+## Nested numeric negation must not become a decrement
+
+JVM `ineg`, `lneg`, `fneg` and `dneg` change a value, not the local that supplied
+it. Adjacent rendered minus signs are unsafe: Java lexes `--x` as a decrement,
+so two JVM negations printed without parentheses mutate `x`. Negative literals
+have atomic precedence too, so precedence checks alone cannot prevent `--7`.
+The numeric-negation renderer now parenthesizes an operand beginning with a
+minus sign, producing `-(-x)` or `-(-7)` without folding its evaluation.
+
+The actual GeoBlox result-sequence probe found this in sprite rotation: the
+source-pivot calculation decremented its argument, changing the rendered pixel
+buffer and later result timing. A fresh export changes six expressions across
+`dm.java` and `il.java`; bytecode inputs and method/local identities are unchanged.
+The generic fix is not a patch to those game classes.
+
+Run `node test/cfrNumericNegation.test.js` for 274 native JVM comparisons in
+ordinary and forced-dispatcher modes. The fixture retains two, three and four
+successive negations for all four numeric types, tests signed integer limits,
+floating-point signed zero, subnormals, infinities and NaN payloads, checks an
+unchanged input used again, negative literals, a real decrement and one evaluated
+call with normal and throwing outcomes. This tests numeric emission and evaluation
+order, not whole-game equivalence.
