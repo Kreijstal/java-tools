@@ -481,6 +481,41 @@ destinations, duplicate sink IDs, and destination-only legacy contracts are
 refused. This adds a check of sink-to-transfer identity; it does not prove the
 whole collapsed CFG or expression reconstruction equivalent.
 
+Exception-region reconstruction also checks the normal control-flow edges of
+each try and handler component. The contract retains the source graph before
+controlled splitting. An independent tree traversal resolves labeled breaks,
+continues and fallthroughs to the next executed block, then compares each
+conditional arm and switch key with that graph. Switches follow Java's case
+fallthrough rules, so a lost case exit cannot masquerade as normal completion.
+Every emitted copy must keep
+those edges. Terminal-only components are checked as well. After nested regions
+are composed and labels renamed, these checks run again, followed by a check of
+the outer collapsed graph and its selector-routing branches. Failure declines
+structured recovery and preserves the existing CFG fallback.
+
+This catches gaps that sink identity alone cannot detect: deleting both a sink
+and its transfer while a sibling still reaches that sink, swapping two intact
+exit branches, or redirecting a continue to another valid enclosing loop. Inner
+collapsed regions are opaque blocks in their parent's graph and have separate
+component checks. These checks cover normal control flow before printer cleanup;
+they do not prove expression evaluation, exception-table normalization, selector
+expression generation, or whole-program equivalence.
+
+Focused regression commands:
+
+```sh
+node test/structuredFlowVerifier.test.js    # 6 graph checks
+node test/exceptionStructurer.test.js       # 25 checks, including damaged trees
+node test/cfrExceptionLoopExits.test.js     # 504 native JVM comparisons
+node test/cfrNestedLoopSplitting.test.js    # 840 native JVM comparisons
+```
+
+An isolated export from the pass-14 decompiler plus these checks reproduces all
+303 pinned GeoBlox Java files byte for byte, and all 303 compile with the frozen
+FunOrb stubs. Its two existing operand-stack dispatchers remain unchanged; this
+exit-validation change introduces no additional fallback. Earlier uncommitted
+parallel-backedge improvements are excluded from that comparison.
+
 Explicit legacy `regionExit` nodes also participate in label uniquification.
 Both that pass and the printer resolve the nearest matching lexical frame,
 including blocks, and require it to be a loop. A block shadowing a loop label

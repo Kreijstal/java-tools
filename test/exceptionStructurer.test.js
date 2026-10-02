@@ -2,8 +2,9 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { structureMethod, verifyRegionExitContracts } = require('../src/decompiler/exceptionStructurer');
+const { structureMethod, verifyRegionExitContracts, verifyRegionFlowContracts } = require('../src/decompiler/exceptionStructurer');
 const { printTree } = require('../src/decompiler/structurer');
+const {verifyStructuredFlow} = require('../src/decompiler/structuredFlowVerifier');
 
 // Render a method (codeItems + exception table) and return { ok, src, r }.
 function run(codeItems, exceptionTable) {
@@ -15,6 +16,97 @@ function run(codeItems, exceptionTable) {
 function assertGotoFree(src) {
   assert.ok(!/\bgoto\b/.test(src), `expected no goto in:\n${src}`);
 }
+
+function multiExitResult() {
+  return structureMethod([
+    {labelDef: 'L0:', pc: 0, instruction: 'iload_0'},
+    {pc: 1, instruction: {op: 'ifeq', arg: 'L12'}},
+    {labelDef: 'L4:', pc: 4, instruction: {op: 'goto', arg: 'L16'}},
+    {labelDef: 'L7:', pc: 7, instruction: 'astore_1'},
+    {pc: 8, instruction: {op: 'goto', arg: 'L12'}},
+    {labelDef: 'L12:', pc: 12, instruction: 'return'},
+    {labelDef: 'L16:', pc: 16, instruction: 'return'},
+  ], [{start_pc: 0, end_pc: 7, handler_pc: 7, catch_type: 'java/lang/Exception'}]);
+}
+
+function visitTree(node, visit) {
+  if (!node) return;
+  visit(node);
+  if (node.t === 'seq') node.body.forEach(child => visitTree(child, visit));
+  else if (node.t === 'if') { visitTree(node.then, visit); visitTree(node.els, visit); }
+  else if (node.t === 'switch') {
+    node.cases.forEach(item => visitTree(item.body, visit)); visitTree(node.dflt, visit);
+  } else if (['block', 'loop', 'try', 'synchronized'].includes(node.t)) {
+    visitTree(node.body, visit);
+    (node.catches || []).forEach(item => visitTree(item.body, visit));
+  }
+}
+
+test('source-flow contracts reject deletion of both sink and transfer despite a valid sibling', () => {
+  const result = multiExitResult();
+  assert.equal(result.ok, true, result.reason);
+  assert.equal(verifyRegionFlowContracts(result.tree, result.regionExitContracts), true);
+  let branch;
+  visitTree(result.tree, node => { if (node.t === 'if' && node.block === 0) branch = node; });
+  assert.ok(branch);
+  branch.then = {t: 'seq', body: []};
+  // The catch still reaches this sink, so existence/identity alone accepts it.
+  assert.equal(verifyRegionExitContracts(result.tree, result.regionExitContracts), true);
+  assert.equal(verifyRegionFlowContracts(result.tree, result.regionExitContracts), false);
+});
+
+test('source-flow contracts reject exchanged branches with intact sink identities', () => {
+  const result = multiExitResult();
+  let branch;
+  visitTree(result.tree, node => { if (node.t === 'if' && node.block === 0) branch = node; });
+  assert.ok(branch);
+  [branch.then, branch.els] = [branch.els, branch.then];
+  assert.equal(verifyRegionExitContracts(result.tree, result.regionExitContracts), true);
+  assert.equal(verifyRegionFlowContracts(result.tree, result.regionExitContracts), false);
+});
+
+test('source-flow contracts require every component and reject a damaged duplicate', () => {
+  const result = multiExitResult();
+  let component;
+  visitTree(result.tree, node => { if (node.regionFlowComponent === 0) component = node; });
+  assert.ok(component);
+  delete component.regionFlowComponent;
+  assert.equal(verifyRegionFlowContracts(result.tree, result.regionExitContracts), false);
+  component.regionFlowComponent = 0;
+  const copy = JSON.parse(JSON.stringify(component));
+  copy.body = {t: 'seq', body: []};
+  assert.equal(verifyRegionFlowContracts({t: 'seq', body: [result.tree, copy]},
+    result.regionExitContracts), false);
+});
+
+test('source-flow contracts retain terminal-only try and catch components', () => {
+  const result = structureMethod([
+    {labelDef: 'L0:', pc: 0, instruction: {op: 'invokestatic', arg: ['Method', 'X', ['work', '()V']]}},
+    {pc: 3, instruction: 'return'},
+    {labelDef: 'L4:', pc: 4, instruction: 'astore_0'},
+    {pc: 5, instruction: 'return'},
+  ], [{start_pc: 0, end_pc: 4, handler_pc: 4, catch_type: 'java/lang/Exception'}]);
+  assert.equal(result.ok, true, result.reason);
+  assert.deepEqual(result.regionExitContracts[0].exits, []);
+  assert.equal(verifyRegionFlowContracts(result.tree, result.regionExitContracts), true);
+  visitTree(result.tree, node => {
+    if (node.regionFlowComponent === 0) node.body = [];
+  });
+  assert.equal(verifyRegionExitContracts(result.tree, result.regionExitContracts), true);
+  assert.equal(verifyRegionFlowContracts(result.tree, result.regionExitContracts), false);
+});
+
+test('outer selector routing is checked separately from intact component transfers', () => {
+  const result = multiExitResult();
+  assert.equal(verifyStructuredFlow(result.tree, result.regionMethodFlow), true);
+  let routing;
+  visitTree(result.tree, node => { if (node.t === 'if' && node.block !== 0) routing = node; });
+  assert.ok(routing);
+  [routing.then, routing.els] = [routing.els, routing.then];
+  assert.equal(verifyRegionExitContracts(result.tree, result.regionExitContracts), true);
+  assert.equal(verifyRegionFlowContracts(result.tree, result.regionExitContracts), true);
+  assert.equal(verifyStructuredFlow(result.tree, result.regionMethodFlow), false);
+});
 
 const regionContract = targets => [{owner: 7,
   exits: targets.map(target => ({sink: target + 10, target}))}];

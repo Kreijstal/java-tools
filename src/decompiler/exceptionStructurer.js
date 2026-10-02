@@ -20,14 +20,13 @@
  *     one successor is the join. The outer control flow then structures normally,
  *     with the try/catch appearing as one opaque node.
  *
- * v1 is deliberately conservative: anything it cannot carve cleanly (multiple
- * external exits, ranges that don't land on block boundaries, an irreducible
+ * Deliberately conservative: anything it cannot carve cleanly (unsafe entries,
+ * ranges that don't land on block boundaries, an irreducible
  * sub-region, an ambiguous join) is reported as `{ ok:false, reason }` so the
  * caller can fall back rather than emit wrong Java. Graceful bail is a feature.
  *
- * Deferred (bail on encounter): overlapping ranges of unlike types, same-target
- * row merging, try-body extension over trailing no-throw ops, multicatch, and
- * finally/synchronized. javac output rarely needs these for a single try/catch.
+ * Multi-exit regions use selector sinks. Bounded splitting handles some
+ * irreducible components; unsupported exception shapes retain the fallback.
  */
 
 const {
@@ -43,6 +42,7 @@ const {
   succOfTerm,
   succAllOfTerm,
 } = require('./structurer');
+const {verifyStructuredFlow} = require('./structuredFlowVerifier');
 
 // A sentinel returned by the internal helpers to unwind a graceful bail without
 // throwing through the recursion.
@@ -376,12 +376,20 @@ function structureRegion(work, memberSet, entryLocal, externalToRenderId, ctx) {
 
   // Map sub ids back to original/synthetic ids so every straight/cond in the
   // combined tree names a real (or synthetic super-/sink) block.
-  const toOrig = (subId) => {
-    const originalSubId = origins[subId];
+  const originalId = (originalSubId) => {
     if (originalSubId < members.length) return work.ids[members[originalSubId]];
     return externalToRenderId.get(externals[originalSubId - members.length]);
   };
-  return remapTreeBlocks(res.tree, toOrig);
+  const toOrig = subId => originalId(origins[subId]);
+  const tree = remapTreeBlocks(res.tree, toOrig);
+  // Retain the unsplit source edges, not the transformed graph we are checking.
+  // Every emitted copy must agree with the same original terminator.
+  const flow = {entry: originalId(subOf.get(entryLocal)),
+    blocks: subTerm.map((term, index) => ({block: originalId(index),
+      term: remapTermTargets(term, originalId)}))};
+  if (!verifyStructuredFlow(tree, flow))
+    return new Bail('exception component changed its source control-flow edges');
+  return {tree, flow};
 }
 
 // Controlled node splitting for an induced exception sub-CFG. A single-entry
@@ -526,7 +534,7 @@ function remapTermTargets(t, map) {
 function remapTreeBlocks(node, f) {
   if (!node) return node;
   switch (node.t) {
-    case 'seq': return { t: 'seq', body: node.body.map((c) => remapTreeBlocks(c, f)) };
+    case 'seq': return { ...node, body: node.body.map((c) => remapTreeBlocks(c, f)) };
     case 'straight': return { t: 'straight', block: f(node.block) };
     case 'block': return { ...node, body: remapTreeBlocks(node.body, f) };
     case 'loop': return { t: 'loop', label: node.label, body: remapTreeBlocks(node.body, f) };
@@ -538,13 +546,13 @@ function remapTreeBlocks(node, f) {
     };
     case 'break': case 'continue': return { ...node };
     case 'try': return {
-      t: 'try', body: remapTreeBlocks(node.body, f),
+      ...node, body: remapTreeBlocks(node.body, f),
       catches: node.catches.map((c) => ({
         types: c.types, varName: c.varName, carrierName: c.carrierName, body: remapTreeBlocks(c.body, f),
       })),
     };
     case 'synchronized': return {
-      t: 'synchronized', lockLocal: node.lockLocal, lockPc: node.lockPc,
+      ...node,
       body: remapTreeBlocks(node.body, f),
     };
     default: return node;
@@ -710,7 +718,7 @@ function substituteSupers(node, overrides) {
     return substituteSupers(overrides.get(node.block), overrides);
   }
   switch (node.t) {
-    case 'seq': return { t: 'seq', body: node.body.map((c) => substituteSupers(c, overrides)) };
+    case 'seq': return { ...node, body: node.body.map((c) => substituteSupers(c, overrides)) };
     case 'block': return { ...node, body: substituteSupers(node.body, overrides) };
     case 'loop': return { t: 'loop', label: node.label, body: substituteSupers(node.body, overrides) };
     case 'if': return { t: 'if', block: node.block, then: substituteSupers(node.then, overrides), els: node.els ? substituteSupers(node.els, overrides) : null };
@@ -720,13 +728,13 @@ function substituteSupers(node, overrides) {
       dflt: node.dflt ? substituteSupers(node.dflt, overrides) : null,
     };
     case 'try': return {
-      t: 'try', body: substituteSupers(node.body, overrides),
+      ...node, body: substituteSupers(node.body, overrides),
       catches: node.catches.map((c) => ({
         types: c.types, varName: c.varName, carrierName: c.carrierName, body: substituteSupers(c.body, overrides),
       })),
     };
     case 'synchronized': return {
-      t: 'synchronized', lockLocal: node.lockLocal, lockPc: node.lockPc,
+      ...node,
       body: substituteSupers(node.body, overrides),
     };
     default: return node;
@@ -756,6 +764,10 @@ function structureMethod(codeItems, exceptionTable, opts = {}) {
       if (res.regionExitContracts) {
         if (!verifyRegionExitContracts(res.tree, res.regionExitContracts))
           return { ok: false, reason: 'exception-region exit contract failed after tree composition' };
+        if (!verifyRegionFlowContracts(res.tree, res.regionExitContracts))
+          return { ok: false, reason: 'exception-region source control-flow contract failed after tree composition' };
+        if (!verifyStructuredFlow(res.tree, res.regionMethodFlow))
+          return { ok: false, reason: 'collapsed exception-region routing changed its source control-flow edges' };
         res.regionExitsVerified = true;
       }
     } catch (err) {
@@ -918,7 +930,10 @@ function structureWithExceptions(codeItems, exceptionTable, methodCfg, render, o
   // Names carried in `work.ids` are original/synthetic ids already.
   let tree = remapTreeBlocks(res.tree, (localId) => work.ids[localId]);
   tree = substituteSupers(tree, overrides);
-  return { ok: true, tree, render, synthetic, selectorDecls, regionExitContracts };
+  const regionMethodFlow = {entry: work.ids[work.entry],
+    blocks: work.ids.map((block, index) => ({block,
+      term: remapTermTargets(work.term[index], target => work.ids[target])}))};
+  return { ok: true, tree, render, synthetic, selectorDecls, regionExitContracts, regionMethodFlow };
 }
 
 /** Carve and collapse one try group in `work`. On success calls `commit(work')`
@@ -1147,7 +1162,8 @@ function processGroup(work, group, ctx, commit) {
   // that block. Wrap each sub-region in a labeled block and make every sink an
   // explicit `break` to it: reaching a sink always means "leave the region now".
   const sinkRids = new Set(externalToRenderId.values());
-  const wrapRegionExits = (tree) => {
+  const components = [];
+  const wrapRegionExits = ({tree, flow}) => {
     let used = false;
     const walk = (node) => {
       if (!node) return node;
@@ -1171,7 +1187,14 @@ function processGroup(work, group, ctx, commit) {
       }
     };
     const body = walk(tree);
-    return used ? { t: 'block', label: REGION_EXIT_LABEL, regionExitOwner: superId, body } : body;
+    const component = components.length;
+    components.push(flow);
+    // Terminal-only components also need an identity: deleting a real return
+    // must not turn their normal completion into the region's continuation.
+    if (!used) return {t: 'seq', regionFlowOwner: superId,
+      regionFlowComponent: component, body: [body]};
+    return { t: 'block', label: REGION_EXIT_LABEL, regionExitOwner: superId,
+      regionFlowOwner: superId, regionFlowComponent: component, body };
   };
 
   let tryTree = structureRegion(work, tryset, tryEntry, externalToRenderId, ctx);
@@ -1222,11 +1245,55 @@ function processGroup(work, group, ctx, commit) {
       };
     }
   }
+  tryNode.regionFlowBlock = superId;
   ctx.overrides.set(superId, tryNode);
   ctx.regionExitContracts.push({ owner: superId,
-    exits: [...exitTargets].map(([sink, target]) => ({sink, target})) });
+    exits: [...exitTargets].map(([sink, target]) => ({sink, target})), components });
   commit(collapseRegion(work, region, superId, group.start_pc, exits, ctx));
   return undefined;
+}
+
+// Check every emitted copy of every try/handler component. Inner collapsed
+// regions are opaque source blocks here and have independent component checks.
+function verifyRegionFlowContracts(tree, contracts) {
+  const expected = new Map();
+  for (const contract of contracts || []) {
+    if (!contract || expected.has(contract.owner) || !Array.isArray(contract.components) ||
+        !contract.components.length) return false;
+    expected.set(contract.owner, contract.components);
+  }
+  const seen = new Map([...expected].map(([owner]) => [owner, new Set()]));
+  let valid = true;
+  const walk = node => {
+    if (!node || !valid) return;
+    if (node.regionFlowBlock != null && (!expected.has(node.regionFlowBlock) ||
+        !['try', 'synchronized'].includes(node.t))) {
+      valid = false;
+      return;
+    }
+    if (node.regionFlowOwner != null || node.regionFlowComponent != null) {
+      const components = expected.get(node.regionFlowOwner);
+      const component = node.regionFlowComponent;
+      if (!components || !Number.isSafeInteger(component) || component < 0 ||
+          component >= components.length || !verifyStructuredFlow(node, components[component])) {
+        valid = false;
+        return;
+      }
+      seen.get(node.regionFlowOwner).add(component);
+    }
+    if (node.t === 'seq') (node.body || []).forEach(walk);
+    else if (node.t === 'if') { walk(node.then); walk(node.els); }
+    else if (node.t === 'switch') {
+      for (const item of node.cases || []) walk(item.body);
+      walk(node.dflt);
+    } else if (['block', 'loop', 'try', 'synchronized'].includes(node.t)) {
+      walk(node.body);
+      for (const item of node.catches || []) walk(item.body);
+    }
+  };
+  walk(tree);
+  return valid && [...expected].every(([owner, components]) =>
+    seen.get(owner).size === components.length);
 }
 
 // Check the composed tree after label uniquification, before printer cleanup.
@@ -1298,6 +1365,7 @@ module.exports = {
   structureMethod,
   splitIrreducibleTerms,
   verifyRegionExitContracts,
+  verifyRegionFlowContracts,
   // exposed for tests
   normalizeTable,
   renderCatchType,
