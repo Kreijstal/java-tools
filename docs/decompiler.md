@@ -862,3 +862,55 @@ supplies the failure-path evidence.
 The published readable input remains pinned to its recorded generator. These
 fresh export artifacts are validation output, not an updated publication or a
 declaration/name migration. The checks do not establish whole-game equivalence.
+
+## Preserve JVM floating comparison behavior
+
+The expression IR now retains the opcode for `fcmpl`, `fcmpg`, `dcmpl`,
+`dcmpg` and `lcmp`. The low variants yield -1 for unordered operands; the
+high variants yield +1. Rendering each as a Java relational comparison loses
+NaN behavior. In GeoBlox's score-popup loop, native `fcmpl; iflt` keeps a
+NaN-progress popup active, but the previous `progress < 1.0f` source credited
+it instead. The corrected branch is `!(progress >= 1.0f)`.
+
+Branch emission selects the ordered relation or its logical complement from
+the exact opcode and integer branch. Negation retains this comparison metadata,
+including across nested materialized booleans. Relational expressions without
+integral type evidence retain logical `!` rather than exchanging `<` for `>=`.
+This preserves NaN behavior; equality comparisons may still invert directly.
+Redundant outer logical negations can cancel without assuming an ordered value.
+
+A compare result used as a value now calls a small primitive helper rather
+than an undefined `compare(...)` placeholder or a ternary that repeats operand
+expressions. This covers stores, arithmetic, arguments and duplicate results.
+Helper parameters evaluate the original operands once in left-to-right order,
+including when either operand throws. Helper comparisons treat signed zero as
+equal and never return zero for NaN; `Float.compare` and `Double.compare` would
+not match those JVM rules. Only helpers called in accepted source are emitted,
+with deterministic names that avoid existing methods/fields. Java 8 interfaces
+receive public static helpers, rather than unsupported private methods.
+
+Focused validation:
+
+```sh
+node test/cfrFloatingComparisons.test.js
+node test/cfrComplementComparisons.test.js
+node test/cfrNumericNegation.test.js
+node test/cfrStateMachineReadability.test.js
+node node_modules/tape/bin/tape test/cfrStructuredFeatures.test.js test/cfrAdditionalFeatures.test.js
+```
+
+The floating fixture performs 75,000 native comparisons over float/double
+NaNs with distinct payloads and signs, infinities, finite extremes, subnormal
+values, both zeros and signed long extremes. Every comparison opcode is tested
+against all six unary branches, inverted returns, materialized/nested boolean
+joins, stored results, arithmetic, method arguments, operand effects and
+duplication. It also checks failure order and throwable identity, existing
+helper-name collisions and interface compilation. Default structured output
+and forced CFG output both compile under `javac --release 8` and match native
+version-49/52 bytecode traces. The branch, value and unknown-type negation
+regressions fail on `824823f7c767cd61f75f0a2b62e786c529e1a48b` before this fix.
+
+The standalone state-machine fixtures also now supply the same throw-owner
+and generic escape helper that production class emission already provides.
+This corrects a stale test harness after the prior unmatched-throw hardening;
+all 11 dispatcher readability checks compile and pass.

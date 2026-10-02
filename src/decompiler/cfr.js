@@ -450,7 +450,7 @@ function decompileClassAst(cls, options = {}) {
   }
   const out = [];
   const requiredImports = options.requiredImports || new Set();
-  const renderOptions = { ...options, requiredImports };
+  const renderOptions = { ...options, requiredImports, comparisonHelpers: makeComparisonHelpers(cls) };
   if (!options.omitHeader) {
     out.push('/*');
     out.push(` * Decompiled by ${VERSION}.`);
@@ -542,11 +542,39 @@ function decompileClassAst(cls, options = {}) {
     out.push('    }');
   }
 
+  // Speculative CFG analysis can request helpers that the final source never
+  // uses. Emit only helpers called by the accepted method bodies.
+  const acceptedSource = out.join('\n');
+  for (const [opcode, name] of renderOptions.comparisonHelpers.names) {
+    if (!acceptedSource.includes(`${name}(`)) continue;
+    const type = opcode === 'lcmp' ? 'long' : opcode.startsWith('f') ? 'float' : 'double';
+    const lowNaN = opcode.endsWith('l');
+    out.push('', `    ${isInterface ? '' : 'private '}static int ${name}(${type} left, ${type} right) {`,
+      `        return left ${lowNaN ? '>' : '<'} right ? ${lowNaN ? '1' : '-1'} : (left == right ? 0 : ${lowNaN ? '-1' : '1'});`,
+      '    }');
+  }
+
   out.push('}');
   for (const requiredImport of requiredImports) imports.push(`import ${requiredImport};`);
   const uniqueImports = [...new Set(imports)];
   if (uniqueImports.length) out.splice(classDeclarationIndex, 0, ...uniqueImports, '');
   return out.join('\n');
+}
+
+function makeComparisonHelpers(cls) {
+  const reserved = new Set((cls.items || []).map(item => item.method?.name || item.field?.name).filter(Boolean));
+  const names = new Map();
+  return {owner: cls.className, names,
+    name(opcode) {
+      if (!names.has(opcode)) {
+        const base = `$cfr$${opcode}`;
+        let name = base, suffix = 0;
+        while (reserved.has(name)) name = `${base}$${++suffix}`;
+        reserved.add(name); names.set(opcode, name);
+      }
+      return names.get(opcode);
+    },
+  };
 }
 
 function annotationDescriptorType(descriptor) {
@@ -5004,7 +5032,14 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
     if (COMPARE_OPS.has(op)) {
       const right = pop(stack);
       const left = pop(stack);
-      stack.push(expr(`compare(${left.code}, ${right.code})`, 'int', 100, { compare: { left, right } }));
+      const helpers = localState.comparisonHelpers;
+      const helper = helpers.name(op);
+      const owner = helpers.owner === cls.className ? '' : `${sourceOwnerType(helpers.owner, localState)}.`;
+      // A helper call is already valid Java for arithmetic/arguments/joins.
+      // Its primitive parameters evaluate the two operands once, left first.
+      // Branches retain the opcode and can render a direct comparison instead.
+      stack.push(expr(`${owner}${helper}(${left.code}, ${right.code})`, 'int', 100,
+        { compare: { left, right, opcode: op } }));
       continue;
     }
 
@@ -8095,7 +8130,8 @@ function conditionForBranch(branch, stack, invert) {
       const newRight = left.type === 'boolean' ? right : intBool;
       return expr(`${wrap(newLeft, 60)} ${operator} ${wrap(newRight, 60, true)}`, 'boolean', 60);
     }
-    return expr(`${wrap(left, 60)} ${operator} ${wrap(right, 60, true)}`, 'boolean', 60);
+    return expr(`${wrap(left, 60)} ${operator} ${wrap(right, 60, true)}`, 'boolean', 60,
+      {integralComparison: true});
   }
 
   if (op === 'ifnull' || op === 'ifnonnull') {
@@ -8110,13 +8146,15 @@ function conditionForBranch(branch, stack, invert) {
     const value = pop(stack);
     const operator = invert ? invertOperator(unaryOps[op]) : unaryOps[op];
     if (value.compare) {
+      if (value.compare.opcode !== 'lcmp') return floatingCompareCondition(value.compare, operator);
       const complementedComparison = simplifyBitwiseComplementComparison(
         value.compare.left,
         operator,
         value.compare.right,
       );
       if (complementedComparison) return complementedComparison;
-      return expr(`${wrap(value.compare.left, 60)} ${operator} ${wrap(value.compare.right, 60)}`, 'boolean', 60);
+      return expr(`${wrap(value.compare.left, 60)} ${operator} ${wrap(value.compare.right, 60)}`, 'boolean', 60,
+        {integralComparison: true});
     }
     if (isBooleanExpression(value) && (op === 'ifeq' || op === 'ifne')) {
       const isTruthy = operator === '!=';
@@ -8133,10 +8171,21 @@ function conditionForBranch(branch, stack, invert) {
     const literalComparison = evaluateLiteralIntegerComparison(
       value, operator, expr('0', 'int', 100, { constantValue: 0 }));
     if (literalComparison !== null) return expr(String(literalComparison), 'boolean', 100);
-    return expr(`${wrap(value, 60)} ${operator} 0`, 'boolean', 60);
+    return expr(`${wrap(value, 60)} ${operator} 0`, 'boolean', 60, {integralComparison: true});
   }
 
   return expr(`/* unsupported condition ${op} */`, 'boolean');
+}
+
+function floatingCompareCondition(comparison, operator) {
+  // fcmpl/dcmpl produce -1 for unordered operands; fcmpg/dcmpg produce +1.
+  // The complemented relation deliberately includes NaN. Inverting it again
+  // must invert the integer cmp result, not replace a Java floating relation.
+  const includesNaN = comparison.opcode.endsWith('l')
+    ? ['<', '<='].includes(operator) : ['>', '>='].includes(operator);
+  const relation = `${wrap(comparison.left, 60)} ${includesNaN ? invertOperator(operator) : operator} ${wrap(comparison.right, 60, true)}`;
+  return expr(includesNaN ? `!(${relation})` : relation, 'boolean', includesNaN ? 90 : 60,
+    {floatingJvmComparison: {...comparison, operator}});
 }
 
 function evaluateLiteralIntegerComparison(left, operator, right) {
@@ -8163,6 +8212,14 @@ function integerLiteralValue(value) {
 
 function simplifyMaterializedBooleanCondition(value, operator) {
   if (!value || !value.code || (operator !== '==' && operator !== '!=')) return null;
+  if (value.conditional) {
+    const {condition, trueValue, falseValue} = value.conditional;
+    if (['0', '1'].includes(trueValue.code) && ['0', '1'].includes(falseValue.code)
+        && trueValue.code !== falseValue.code) {
+      return (trueValue.code === '1') === (operator === '!=')
+        ? condition : negateBooleanExpression(condition);
+    }
+  }
   const nested = simplifyNestedMaterializedBooleanCondition(value, operator);
   if (nested) return nested;
   const match = /^(?:\(([^?]+)\)|([^?]+)) \? ([01]) : ([01])$/.exec(value.code);
@@ -8180,9 +8237,12 @@ function simplifyMaterializedBooleanCondition(value, operator) {
 function simplifyNestedMaterializedBooleanCondition(value, operator) {
   const match = /^(.+?) \? ([01]) : (.+?) \? ([01]) : ([01])$/.exec(value.code);
   if (!match) return null;
-  const firstCondition = expr(match[1], 'boolean', 20);
+  const firstCondition = value.conditional?.condition?.code === match[1]
+    ? value.conditional.condition : expr(match[1], 'boolean', 20);
   const firstValue = materializedIntMeansConditionTrue(match[2], operator);
-  const secondCondition = expr(match[3], 'boolean', 20);
+  const nested = value.conditional?.falseValue?.conditional;
+  const secondCondition = nested?.condition?.code === match[3]
+    ? nested.condition : expr(match[3], 'boolean', 20);
   const secondValue = materializedIntMeansConditionTrue(match[4], operator);
   const finalValue = materializedIntMeansConditionTrue(match[5], operator);
 
@@ -8310,8 +8370,15 @@ function isBracketBalanced(fragment) {
 }
 
 function negateBooleanExpression(value) {
+  if (value.floatingJvmComparison) {
+    const comparison = value.floatingJvmComparison;
+    return floatingCompareCondition(comparison, invertOperator(comparison.operator));
+  }
   if (value.code === 'true') return expr('false', 'boolean');
   if (value.code === 'false') return expr('true', 'boolean');
+  if (value.code.startsWith('!(') && value.code.endsWith(')')
+      && isBracketBalanced(value.code.slice(2, -1)))
+    return expr(value.code.slice(2, -1), 'boolean', 20);
   if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(value.code)) return expr(`!${value.code}`, 'boolean', 90);
   const comparison = /^(.+) (==|!=|<|<=|>|>=) (.+)$/.exec(value.code);
   // Only invert an operator that is genuinely the TOP-LEVEL comparison. The
@@ -8321,9 +8388,12 @@ function negateBooleanExpression(value) {
   //   ((nm) x).a(a, b, c, stackIn_41_4 != 0, 2, param4)
   // rewrote the ARGUMENT to `== 0`, inverting the lobby list's skip-the-walk
   // flag and leaving the player list clipped to nothing. Balanced brackets on
-  // both sides prove the operator is not nested.
-  if (comparison && isBracketBalanced(comparison[1]) && isBracketBalanced(comparison[3])) {
-    return expr(`${comparison[1]} ${invertOperator(comparison[2])} ${comparison[3]}`, 'boolean', 60);
+  // both sides prove the operator is not nested. Relational inversion also
+  // needs integral type evidence: !(NaN < x) is true, but NaN >= x is false.
+  if (comparison && isBracketBalanced(comparison[1]) && isBracketBalanced(comparison[3])
+      && (['==', '!='].includes(comparison[2]) || value.integralComparison)) {
+    return expr(`${comparison[1]} ${invertOperator(comparison[2])} ${comparison[3]}`, 'boolean', 60,
+      {integralComparison: value.integralComparison});
   }
   return expr(`!${wrap(value, 90)}`, 'boolean', 90);
 }
@@ -9082,6 +9152,7 @@ function makeLocalState(paramTypes, isStatic, code = null, plainRefSlots = null,
   }
 
   return {
+    comparisonHelpers: renderOptions && renderOptions.comparisonHelpers,
     paramNames,
     preserveFieldNames: renderOptions && renderOptions.preserveFieldNames,
     recordConstructorInvocation(target, args) {
@@ -9639,7 +9710,8 @@ function simplifyBitwiseComplementComparison(left, operator, right) {
   const renderedConstant = type === 'long'
     ? `${String(complementedConstant)}L`
     : String(complementedConstant);
-  return expr(`${wrap(value, 60)} ${simplifiedOperator} ${renderedConstant}`, 'boolean', 60);
+  return expr(`${wrap(value, 60)} ${simplifiedOperator} ${renderedConstant}`, 'boolean', 60,
+    {integralComparison: true});
 }
 
 function experimentalConstantEvaluationEnabled() {
@@ -9732,9 +9804,7 @@ function conditionalExpr(condition, trueValue, falseValue, type = null) {
 
 function renderStoreExpression(value) {
   if (value && value.compare) {
-    const left = wrap(value.compare.left, 60);
-    const right = wrap(value.compare.right, 60, true);
-    return expr(`(${left} < ${right} ? -1 : (${left} == ${right} ? 0 : 1))`, 'int', 20);
+    return expr(value.code, 'int', value.precedence);
   }
   if (!value || !value.arrayLiteral) return value;
   const literal = value.arrayLiteral;
