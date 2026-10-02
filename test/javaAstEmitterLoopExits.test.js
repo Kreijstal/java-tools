@@ -288,3 +288,106 @@ test('a retained declaration block does not acquire an unreachable default retur
     assert.equal(run('java', ['-cp', rebuilt, 'ScopeRunner'], temporary), expected);
   } finally { fs.rmSync(temporary, {recursive: true, force: true}); }
 });
+
+test('value-producing branches require identical primitive arms and a proven local type', () => {
+  const renderPair = (taken, other, type = 'int') => emitStatements(treeToStatements({
+    t: 'if', block: 0, then: straight(1), els: straight(2),
+  }, {cond: () => 'pick()', straight: id => [id === 1 ? taken : other],
+    localType: name => name === 'value' ? type : null}));
+  assert.equal(renderPair('value = 0;', 'value = 1;'), 'value = (pick()) ? 0 : 1;');
+  assert.equal(renderPair('value = true;', 'value = false;', 'boolean'),
+    'value = (pick()) ? true : false;');
+  assert.equal(renderPair('value = -0x8000000000000000L;', 'value = 0b1L;', 'long'),
+    'value = (pick()) ? -0x8000000000000000L : 0b1L;');
+  // Java allows these separately assigned constants; a conditional expression
+  // can introduce narrowing, numeric promotion, rounding, or unboxing.
+  for (const [taken, other, type] of [
+    ['value = 0;', 'value = 1;', null],
+    ['value = 0;', 'value = 1;', 'byte'],
+    ['value = 0;', 'value = 65535;', 'char'],
+    ['value = 0;', 'value = 1;', 'short'],
+    ['value = 16777217;', 'value = 1.0f;', 'double'],
+    ['value = 9007199254740993L;', 'value = 1.0;', 'double'],
+    ['value = true;', 'value = false;', 'Boolean'],
+    ['value = null;', 'value = 1;', 'Integer'],
+    ['value = left();', 'value = right();', 'int'],
+    ['value += 0;', 'value += 1;', 'int'],
+    ['value = 0; work();', 'value = 1;', 'int'],
+    ['{ value = 0; }', 'value = 1;', 'int'],
+    ['holder.value = 0;', 'holder.value = 1;', 'int'],
+    ['array[index()] = 0;', 'array[index()] = 1;', 'int'],
+    ['int value = 0;', 'int value = 1;', 'int'],
+    ['value = 0;', 'different = 1;', 'int'],
+  ]) assert.match(renderPair(taken, other, type), /else/, `${taken} / ${other} / ${type}`);
+  const calls = [];
+  emitStatements(treeToStatements({t: 'if', block: 0, then: straight(1), els: straight(2)}, {
+    cond: () => { calls.push('condition'); return 'pick()'; },
+    straight: id => { calls.push(id); return [`value = ${id};`]; },
+    localType: name => { calls.push(name); return 'int'; },
+    condInverted: () => { throw new Error('value branches need no inverse'); },
+  }));
+  assert.deepEqual(calls, ['condition', 1, 2, 'value']);
+});
+
+test('conditional assignments preserve native bits, unboxing, exceptions and effect order', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-emitter-value-branches-'));
+  try {
+    const variants = [
+      ['int', '0', '1', 'Integer.toString(value)'],
+      ['int', '-0x80000000', '0x7fffffff', 'Integer.toString(value)'],
+      ['long', '-0x8000000000000000L', '0x7fffffffffffffffL', 'Long.toString(value)'],
+      ['long', '9_007_199_254_740_993L', '0b1L', 'Long.toString(value)'],
+      ['float', '-0.0f', '0.0f', 'Integer.toString(Float.floatToRawIntBits(value))'],
+      ['float', '3.4028235e38f', '1.4e-45f', 'Integer.toString(Float.floatToRawIntBits(value))'],
+      ['double', '-0.0', '0.0', 'Long.toString(Double.doubleToRawLongBits(value))'],
+      ['double', '1.7976931348623157E308', '4.9E-324', 'Long.toString(Double.doubleToRawLongBits(value))'],
+      ['boolean', 'true', 'false', 'Boolean.toString(value)'],
+      ['boolean', 'false', 'true', 'Boolean.toString(value)'],
+    ];
+    const methods = [];
+    variants.forEach(([type, taken, other, result], index) => {
+      const reconstructed = emitStatements(treeToStatements({t: 'if', block: 0,
+        then: straight(1), els: straight(2)}, {
+        cond: () => 'pick(x, trace)',
+        straight: id => [`value = ${id === 1 ? taken : other};`],
+        localType: name => name === 'value' ? type : null,
+      }));
+      assert.doesNotMatch(reconstructed, /\bif\b|\belse\b/);
+      for (const [name, body] of [['original', `if (pick(x, trace)) { value = ${taken}; }
+        else { value = ${other}; }`], ['rebuilt', reconstructed]]) {
+        methods.push(`static String ${name}${index}(double x) {
+          StringBuilder trace = new StringBuilder(); ${type} value;
+          try { synchronized (trace) { ${body} trace.append('a'); }
+            return receive(trace).done(before(trace), ${result}) + ":" + trace;
+          } catch (RuntimeException failure) { return failure.getClass().getName()+":"+trace; }
+        }`);
+      }
+    });
+    const source = `public class ValueBranches {
+      static Boolean pick(double x, StringBuilder trace) {
+        trace.append('q'); if (x == 7) throw new IllegalArgumentException();
+        return Double.isNaN(x) ? null : x <= 0;
+      }
+      static ValueBranches receive(StringBuilder trace) { trace.append('r'); return new ValueBranches(); }
+      static int before(StringBuilder trace) { trace.append('b'); return 7; }
+      String done(int ignored, String result) { return result; }
+      ${methods.join('\n')}
+      public static void main(String[] args) {
+        double[] values = {Double.NEGATIVE_INFINITY, -2147483648d, -7d, -0d, 0d,
+          7d, 2147483647d, Double.POSITIVE_INFINITY, Double.NaN};
+        for (double value : values) {
+          ${variants.map((_, index) => `{
+            String expected = original${index}(value), actual = rebuilt${index}(value);
+            if (!expected.equals(actual)) throw new AssertionError(${index}+":"+value+":"+expected+":"+actual);
+            System.out.println(${index}+":"+value+":"+actual);
+          }`).join('\n')}
+        }
+      }
+    }`;
+    const javaFile = path.join(temporary, 'ValueBranches.java');
+    fs.writeFileSync(javaFile, source);
+    run('javac', ['--release', '8', '-d', temporary, javaFile], temporary);
+    assert.equal(run('java', ['-cp', temporary, 'ValueBranches'], temporary)
+      .trim().split('\n').length, 90);
+  } finally { fs.rmSync(temporary, {recursive: true, force: true}); }
+});

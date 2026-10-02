@@ -3867,10 +3867,12 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     type === 'RuntimeException' || type === 'java.lang.RuntimeException')
     ? 'RuntimeException' : 'Throwable';
   const declarations = localState.liftAllDeclarations(initializeLiftedLocals);
+  const stackCarrierTypes = new Map();
   for (const block of cfg.blocks) {
     if (!handlerEntries.has(block.headLabel)) {
       const entryValues = entryStacks.get(block.id) || [];
       entryValues.forEach((value, slot) => {
+        stackCarrierTypes.set(stackInName(block.id, slot), simplifyType(value.type));
         requireRenderedTypeImport(options, value.qualifiedType || value.type);
         const tail = getInstructionFromItem(codeItems[block.insns[block.insns.length - 1]]);
         const returnCarrier = useStateMachine || tail && (
@@ -4096,6 +4098,9 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
   };
 
   let render = {
+    localType(name) {
+      return stackCarrierTypes.get(name) || localState.sourceTypeForName(name);
+    },
     straight(blockId) {
       return evaluate(blockId).lines;
     },
@@ -4145,6 +4150,7 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
         return syntheticRender.get(id) ? null : base.condInverted(id);
       },
       blockTerminates: (id) => (syntheticRender.get(id) ? false : base.blockTerminates(id)),
+      localType: (name) => base.localType(name),
       switchValue: (id) => base.switchValue(id),
       syncLock: (lockLocal, lockPc) => base.syncLock(lockLocal, lockPc),
     };

@@ -133,13 +133,60 @@ function statementCount(statements) {
   return count;
 }
 
-function lowerIfStatements(condition, thenStatements, elseStatements, inverted) {
+function literalAssignment(statements) {
+  if (statements.length !== 1 || statements[0].kind !== 'UnsupportedStatement') return null;
+  const parsed = parsedStraightBlock(statements[0]);
+  if (!parsed || parsed.statements.length !== 1) return null;
+  const statement = parsed.statements[0];
+  const assignment = statement.kind === 'ExpressionStatement' && statement.expression;
+  if (!assignment || assignment.kind !== 'AssignmentExpression' || assignment.operator !== '='
+      || assignment.left.kind !== 'Identifier') return null;
+  let value = assignment.right;
+  let sign = '';
+  if (value.kind === 'UnaryExpression' && value.prefix && ['-', '+'].includes(value.operator)) {
+    sign = value.operator;
+    value = value.operand;
+  }
+  if (value.kind !== 'LiteralExpression') return null;
+  if (!sign && value.literalKind === 'boolean') return {
+    name: assignment.left.name, type: 'boolean', source: String(value.value),
+  };
+  if (value.literalKind !== 'number') return null;
+  const source = value.raw;
+  let type = null;
+  // Read the spelling rather than converting through JS Number: large Java
+  // integers, negative zero and hexadecimal literals must retain their bits.
+  const integer = '(?:0[xX][0-9a-fA-F_]+|0[bB][01_]+|[0-9][0-9_]*)';
+  if (new RegExp(`^${integer}$`).test(source)) type = 'int';
+  else if (new RegExp(`^${integer}[lL]$`).test(source)) type = 'long';
+  else if (/^(?:\d[\d_]*(?:\.[\d_]*)?|\.[\d_]+)(?:[eE][+-]?[\d_]+)?[fF]$/.test(source)) type = 'float';
+  else if (/^(?:\d[\d_]*\.[\d_]*|\.[\d_]+|\d[\d_]*[eE][+-]?[\d_]+)(?:[eE][+-]?[\d_]+)?[dD]?$/.test(source)) type = 'double';
+  return type ? {name: assignment.left.name, type, source: sign + source} : null;
+}
+
+function valueProducingBranch(condition, thenStatements, elseStatements, localType) {
+  if (!localType) return null;
+  const taken = literalAssignment(thenStatements);
+  const other = literalAssignment(elseStatements);
+  if (!taken || !other || taken.name !== other.name || taken.type !== other.type) return null;
+  const destination = localType(taken.name);
+  // Same-type primitive arms have no conditional numeric promotion, boxing or
+  // reference type inference. Require an identical destination type as well:
+  // byte/short/char constant assignment permits narrowing that a ternary might
+  // reject. An unproven name could be an unqualified (possibly volatile) field.
+  if (destination !== taken.type) return null;
+  return rawStatement(`${taken.name} = (${condition}) ? ${taken.source} : ${other.source};`);
+}
+
+function lowerIfStatements(condition, thenStatements, elseStatements, inverted, localType) {
   const makeIf = (source, body, alternate = null) => createNode('IfStatement', {
     condition: rawExpression(source), consequent: block(body), alternate,
   });
   // All children have already been rendered in CFG order. Only rearrange the
   // resulting AST, because rendering itself binds local names and types.
   const inverse = () => (inverted && inverted()) || `!(${condition})`;
+  const value = valueProducingBranch(condition, thenStatements, elseStatements, localType);
+  if (value) return [value];
   if (!thenStatements.length && elseStatements.length) {
     return [makeIf(inverse(), elseStatements)];
   }
@@ -239,7 +286,7 @@ function treeToStatements(tree, render) {
             condition: rawExpression('true'),
             body: block([
               ...(taken === 'true' ? thenStatements : taken === 'false' ? elseStatements
-                : lowerIfStatements(taken, thenStatements, elseStatements, () => notTaken)),
+                : lowerIfStatements(taken, thenStatements, elseStatements, () => notTaken, render.localType)),
               ...restStatements,
             ]),
           }),
@@ -260,7 +307,7 @@ function treeToStatements(tree, render) {
       const thenStatements = treeToStatements(tree.then, render);
       const elseStatements = tree.els ? treeToStatements(tree.els, render) : [];
       return lowerIfStatements(conditionSource, thenStatements, elseStatements,
-        render.condInverted ? () => render.condInverted(tree.block) : null);
+        render.condInverted ? () => render.condInverted(tree.block) : null, render.localType);
     }
     case 'switch': return [createNode('SwitchStatement', {
       expression: rawExpression(render.switchValue(tree.block)),
