@@ -29,7 +29,7 @@ function machine(bodies, terms, handlers = [], conditions = {}) {
     const source = printCfgStateMachine(cfg,
       {cond: id => conditions[id] ?? 'input > 0', switchValue: () => 'input'},
       id => ({lines: bodies[id]}), code, handlers, declarations, 'int',
-      {coalesceLinearStates, stats});
+      {coalesceLinearStates, stats, throwOwner: 'MachineFixture'});
     const body = [...declarations, source].join('\n');
     assertNoFallback(body);
     return {body, stats};
@@ -48,6 +48,8 @@ function behavior(render, expected, after) {
       fs.writeFileSync(path.join(directory, 'MachineFixture.java'),
         `public class MachineFixture {
           static int shadowed = 9;
+          @SuppressWarnings("unchecked")
+          static <T extends Throwable> RuntimeException $cfr$sneakyThrow(Throwable error) throws T { throw (T) error; }
           static int compute(int input) { ${rendered.body} }
           public static void main(String[] args) { ${calls} }
         }`);
