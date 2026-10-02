@@ -797,11 +797,28 @@ Before accepting a collapse, all retained throwing PCs must also match the
 entry's coverage in every remaining exception group; incompatible protected
 bodies or handler entries decline reconstruction and retain the CFG fallback.
 
+Sibling catches with overlapping types also need exact exception coverage.
+When identical complete protected-range sets list `RuntimeException` before
+`IllegalArgumentException`, the later catch cannot handle an exception thrown
+by the first handler. Nesting those catches to satisfy javac widens coverage:
+the old reconstruction swallowed a cleanup failure and continued the loop.
+The first native mismatch was `0:1:1:1:93:W1,CNW2,W3,`; the original bytecode
+returned `0:1:1:1:IllegalArgumentException:true:W1,C`.
+
+Such sibling groups now decline reconstruction with `shadowed sibling catch
+requires exact exception-table routing`. The existing CFG dispatcher preserves
+their ordered table rows, original throw sites and throwable identity. This
+also covers partially shadowed multi-catch alternatives, catch-all rows and
+application types resolved through the supplied hierarchy. Specific-before-
+supertype siblings still structure normally. Genuine enclosing catches have
+different complete range sets and retain their existing reconstruction; no
+handler coverage is invented merely because Java rejects a sibling catch.
+
 Focused commands:
 
 ```sh
-node test/exceptionStructurer.test.js       # 31 checks; includes protected-range continuation boundaries
-node test/cfrExceptionLoopExits.test.js     # 3,216 native result/effect comparisons
+node test/exceptionStructurer.test.js       # 32 checks; includes protected-range continuation boundaries and shadowed siblings
+node test/cfrExceptionLoopExits.test.js     # 6,816 native result/effect comparisons
 node test/cfrNestedLoopSplitting.test.js    # 840 native comparisons
 node test/structuredFlowVerifier.test.js    # 6 checks
 node test/javaAstEmitterLoopExits.test.js   # 7 checks, including 424 native comparisons
@@ -821,6 +838,16 @@ overriding pending transfers, and escaped throwable identity. Both ordinary
 structured output and the forced CFG dispatcher must match native execution.
 The finally fixture and the new structural boundary check fail on commit
 `8e04627fac5198652db34c7bf8c363463a1e3b0c` before handler carving was bounded.
+
+The shadowed-sibling fixture adds 3,600 native comparisons. Version-49 bytecode
+tests runtime-supertype and catch-all priority tables, plus a valid ordered
+control, across loop continues, breaks, returns and normal continuation. Work
+and handler cleanup can throw specific runtime exceptions, other runtime
+exceptions, errors or checked exceptions. Both default and forced-dispatcher
+exports compile with `javac --release 8` and match native result/effect traces
+and escaped throwable identity. Shadowed default output must retain its
+dispatcher, while the ordered control must remain structured. The native and
+structural regressions fail on `38a83d19e58776bbc4dd1b794811aa1a5963996a`.
 
 The earlier component-binding hardening preserved all 303 pinned GeoBlox
 sources byte for byte. Bounding handler continuations changes only `oc.java`:

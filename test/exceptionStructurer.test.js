@@ -64,6 +64,46 @@ function twoHandlerResult() {
   ]);
 }
 
+test('shadowed sibling catches cannot gain coverage over an earlier handler', () => {
+  const code = [
+    {labelDef: 'L0:', pc: 0, instruction: {op: 'invokestatic', arg: ['Method', 'X', ['work', '()V']]}},
+    {pc: 3, instruction: {op: 'goto', arg: 'L20'}},
+    {labelDef: 'L6:', pc: 6, instruction: 'astore_0'},
+    {pc: 7, instruction: {op: 'invokestatic', arg: ['Method', 'X', ['cleanup', '()V']]}},
+    {pc: 10, instruction: {op: 'goto', arg: 'L20'}},
+    {labelDef: 'L13:', pc: 13, instruction: 'astore_1'},
+    {pc: 14, instruction: {op: 'invokestatic', arg: ['Method', 'X', ['narrow', '()V']]}},
+    {pc: 17, instruction: {op: 'goto', arg: 'L20'}},
+    {labelDef: 'L20:', pc: 20, instruction: 'return'},
+  ];
+  const table = [
+    {start_pc: 0, end_pc: 3, handler_pc: 6, catch_type: 'java/lang/RuntimeException'},
+    {start_pc: 0, end_pc: 3, handler_pc: 13, catch_type: 'java/lang/IllegalArgumentException'},
+  ];
+  const result = structureMethod(code, table);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /shadowed sibling catch/);
+  for (const [first, second, options] of [
+    ['any', 'ApplicationFailure', {}],
+    ['java/lang/RuntimeException', ['java/io/IOException', 'java/lang/IllegalArgumentException'], {}],
+    ['ApplicationFailure', 'SpecificFailure', {
+      isCatchAssignable: (subtype, supertype) => subtype === supertype ||
+        subtype === 'SpecificFailure' && supertype === 'ApplicationFailure',
+    }],
+  ]) {
+    const priority = table.map((row, index) => ({...row, catch_type: index ? second : first}));
+    const declined = structureMethod(code, priority, options);
+    assert.equal(declined.ok, false);
+    assert.match(declined.reason, /shadowed sibling catch/);
+  }
+  // Specific-before-supertype priority is expressible without widening either
+  // handler's coverage. Genuine enclosing catches have different range sets.
+  [table[0].catch_type, table[1].catch_type] = [table[1].catch_type, table[0].catch_type];
+  const ordered = structureMethod(code, table);
+  assert.equal(ordered.ok, true, ordered.reason);
+  assert.equal(verifyRegionFlowContracts(ordered.tree, ordered.regionExitContracts), true);
+});
+
 test('handler cleanup outside an enclosing protected range cannot be collapsed into it', () => {
   const code = [
     {labelDef: 'L0:', pc: 0, instruction: {op: 'invokestatic', arg: ['Method', 'X', ['work', '()V']]}},

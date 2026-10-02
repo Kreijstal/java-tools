@@ -950,6 +950,15 @@ function structureWithExceptions(codeItems, exceptionTable, methodCfg, render, o
  * a Bail. */
 function processGroup(work, group, ctx, commit) {
   const n = work.ids.length;
+  // These catches have identical complete protected-range sets. Nesting a
+  // shadowed sibling to satisfy javac would also protect the earlier handler,
+  // which the JVM table does not do. A genuine enclosing catch is a separate
+  // group with coverage over that handler; retain the exact-table fallback
+  // when sibling priority cannot be expressed directly as Java catches.
+  if (group.catches.some((item, index) => group.catches.slice(0, index).some(earlier =>
+    catchTypesSubsumes(renderCatchTypes(earlier.catch_type),
+      renderCatchTypes(item.catch_type), ctx.isCatchAssignable))))
+    return new Bail('shadowed sibling catch requires exact exception-table routing');
   const localOfStartPc = (pc) => {
     for (let i = 0; i < n; i++) if (work.startPc[i] === pc) return i;
     return -1;
@@ -1259,24 +1268,6 @@ function processGroup(work, group, ctx, commit) {
       });
     }
     tryNode = { t: 'try', body: tryTree, catches };
-    // A broader handler followed by a narrower one cannot be represented as
-    // sibling Java catches ("exception X has already been caught"). Such JVM
-    // tables describe nested protected ranges: the later handler also covers
-    // failures thrown by the earlier handler. Keep that ordering by wrapping
-    // the earlier handlers in an inner try. Repeat while any later catch is
-    // still subsumed by an earlier sibling.
-    for (;;) {
-      const siblings = tryNode.catches;
-      const shadowed = siblings.findIndex((item, index) => index > 0
-        && siblings.slice(0, index).some((earlier) => catchTypesSubsumes(
-          earlier.types, item.types, ctx.isCatchAssignable)));
-      if (shadowed <= 0) break;
-      tryNode = {
-        t: 'try',
-        body: { t: 'try', body: tryNode.body, catches: siblings.slice(0, shadowed) },
-        catches: siblings.slice(shadowed),
-      };
-    }
   }
   tryNode.regionFlowBlock = superId;
   ctx.overrides.set(superId, tryNode);

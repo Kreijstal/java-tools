@@ -7,6 +7,7 @@ const os = require('os');
 const path = require('path');
 const {spawnSync} = require('child_process');
 const {decompileClassFile, assertNoFallback} = require('../src/decompiler/cfr');
+const {assembleJasminSource} = require('../src/utils/jasminAssembly');
 
 function run(command, args, directory) {
   const files = ['stdout', 'stderr'].map(name => path.join(directory, name));
@@ -21,6 +22,148 @@ function run(command, args, directory) {
     return fs.readFileSync(files[0], 'utf8');
   } finally { fds.forEach(fd => fs.closeSync(fd)); }
 }
+
+test('handler cleanup cannot enter a shadowed sibling catch during a loop exit', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-shadowed-loop-exits-'));
+  const previous = process.env.CFR_JS_FORCE_STATE_MACHINE;
+  try {
+    const effects = `class Effects {
+      static StringBuilder trace; static Throwable failed;
+      @SuppressWarnings("unchecked")
+      static <T extends Throwable> RuntimeException raise(Throwable error) throws T { throw (T) error; }
+      static void fail(int kind) {
+        if (kind == 0) return;
+        if (kind == 1) failed = new IllegalArgumentException();
+        else if (kind == 2) failed = new IllegalStateException();
+        else if (kind == 3) failed = new AssertionError();
+        else failed = new java.io.IOException();
+        throw Effects.<RuntimeException>raise(failed);
+      }
+      static int next(int step, int throwAt, int kind) {
+        trace.append('W').append(step).append(',');
+        if (step == throwAt) fail(kind);
+        return step * 31;
+      }
+      static void cleanup(int kind) { trace.append('C'); fail(kind); }
+      static void narrow() { trace.append('N'); }
+    }`;
+    const driver = `class ShadowedRunner { public static void main(String[] args) {
+      for (int mode = 0; mode < 4; mode++) for (int throwAt = -1; throwAt <= 4; throwAt++)
+        for (int workKind = 0; workKind < 5; workKind++) for (int cleanupKind = 0; cleanupKind < 5; cleanupKind++) {
+          Effects.trace = new StringBuilder(); Effects.failed = null; String result;
+          try { result = "" + ShadowedLoopExits.compute(mode, throwAt, workKind, cleanupKind); }
+          catch (Throwable error) { result = error.getClass().getSimpleName()+":"+(error == Effects.failed); }
+          System.out.println(mode+":"+throwAt+":"+workKind+":"+cleanupKind+":"+result+":"+Effects.trace);
+        }
+    } }`;
+    for (const [first, second, shadowed] of [
+      ['java/lang/RuntimeException', 'java/lang/IllegalArgumentException', true],
+      ['java/lang/Throwable', 'java/lang/IllegalArgumentException', true],
+      ['java/lang/IllegalArgumentException', 'java/lang/RuntimeException', false],
+    ]) {
+      const native = path.join(temporary, first.replaceAll('/', '_'));
+      fs.mkdirSync(native);
+      const assembly = `.version 49 0
+        .class public super ShadowedLoopExits
+        .super java/lang/Object
+        .method public static compute : (IIII)I
+          .code stack 3 locals 7
+          .catch ${first} from Ltry to LtryEnd using Lfirst
+          .catch ${second} from Ltry to LtryEnd using Lsecond
+          iconst_0
+          istore 4
+          iconst_0
+          istore 5
+        Lloop:
+          iload 5
+          iconst_3
+          if_icmpge Ldone
+          iinc 5 1
+        Ltry:
+          iload 5
+          iload_1
+          iload_2
+          invokestatic Method Effects next (III)I
+          istore 4
+        LtryEnd:
+          goto Lexit
+        Lfirst:
+          astore 6
+          iload_3
+          invokestatic Method Effects cleanup (I)V
+          bipush -7
+          istore 4
+          goto Lexit
+        Lsecond:
+          astore 6
+          invokestatic Method Effects narrow ()V
+          bipush -99
+          istore 4
+          goto Lexit
+        Lexit:
+          iload_0
+          ifeq Lloop
+          iload_0
+          iconst_1
+          if_icmpeq Ldone
+          iload_0
+          iconst_2
+          if_icmpeq Lreturn
+          iinc 5 1
+          iload 5
+          iload_1
+          iload_2
+          invokestatic Method Effects next (III)I
+          istore 4
+          goto Lloop
+        Lreturn:
+          iload 4
+          ireturn
+        Ldone:
+          iload 4
+          ireturn
+          .end code
+        .end method
+        .end class`;
+      const classFile = path.join(native, 'ShadowedLoopExits.class');
+      assembleJasminSource(assembly, classFile);
+      fs.writeFileSync(path.join(native, 'Effects.java'), effects);
+      fs.writeFileSync(path.join(native, 'ShadowedRunner.java'), driver);
+      run('javac', ['--release', '8', '-cp', native, '-d', native,
+        path.join(native, 'Effects.java'), path.join(native, 'ShadowedRunner.java')], native);
+      const expected = run('java', ['-cp', native, 'ShadowedRunner'], native);
+      assert.equal(expected.trim().split('\n').length, 600);
+      assert.match(expected, /IOException:true/);
+      assert.doesNotMatch(expected, /:false:/);
+      if (shadowed) assert.doesNotMatch(expected, /,N/);
+      else assert.match(expected, /,N/);
+      for (const forced of [false, true]) {
+        if (forced) process.env.CFR_JS_FORCE_STATE_MACHINE = '1';
+        else delete process.env.CFR_JS_FORCE_STATE_MACHINE;
+        const diagnostics = [];
+        const source = decompileClassFile(classFile, {diagnostics});
+        assertNoFallback(source);
+        const rebuilt = path.join(native, forced ? 'forced' : 'ordinary');
+        fs.mkdirSync(rebuilt);
+        fs.writeFileSync(path.join(rebuilt, 'ShadowedLoopExits.java'), source);
+        fs.writeFileSync(path.join(rebuilt, 'Effects.java'), effects);
+        fs.writeFileSync(path.join(rebuilt, 'ShadowedRunner.java'), driver);
+        run('javac', ['--release', '8', '-d', rebuilt,
+          ...['ShadowedLoopExits', 'Effects', 'ShadowedRunner'].map(name => path.join(rebuilt, name + '.java'))], rebuilt);
+        const actual = run('java', ['-cp', rebuilt, 'ShadowedRunner'], rebuilt);
+        const actualLines = actual.trim().split('\n'), expectedLines = expected.trim().split('\n');
+        assert.equal(actualLines.length, expectedLines.length);
+        expectedLines.forEach((line, index) => assert.equal(actualLines[index], line,
+          `${first} before ${second}, forced=${forced}, scenario=${index}`));
+        assert.equal(source.includes('switch (statePc)'), forced || shadowed, JSON.stringify(diagnostics));
+      }
+    }
+  } finally {
+    if (previous === undefined) delete process.env.CFR_JS_FORCE_STATE_MACHINE;
+    else process.env.CFR_JS_FORCE_STATE_MACHINE = previous;
+    fs.rmSync(temporary, {recursive: true, force: true});
+  }
+});
 
 test('finally cleanup preserves pending loop exits, returns and throwable identity', () => {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-finally-loop-exits-'));
