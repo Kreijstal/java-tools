@@ -613,3 +613,24 @@ using structured and forced-dispatcher reconstruction. They cover prefixes
 carried over branch joins, the same pattern in a runtime catch, and repeated
 mutations of a caller-owned builder. Known complete inline chains still become
 concatenations and are checked by `test/cfrAdditionalFeatures.test.js`.
+
+## Typed complement comparison readability
+
+Integer and long XOR with a literal -1 now render as `~value` by default.
+Comparisons of that expression against a literal at the same signed JVM width
+reverse the operator and complement the constant. For example,
+`(characterCode ^ -1) <= -129` becomes `characterCode >= 128`. Constant-first
+comparisons preserve evaluation of the other operand exactly once.
+
+Only canonical decimal literals within the signed 32-bit or 64-bit range are
+accepted. Inferred constant metadata does not authorize removing a call, and
+casts do not retain complement identity. Other XOR masks, booleans, mismatched
+widths and floating-point operands remain outside this rewrite. Experimental
+identity folding and interclass DCE retain their existing opt-in flag.
+
+`node test/cfrComplementComparisons.test.js` validates default behavior and
+refusals, then compares original verified JVM execution with structured and
+forced-dispatcher reconstruction. The 220 methods cover all six comparisons,
+both operand orders, nine constants at each width, 15 boundary inputs plus
+throwing calls, byte narrowing, another XOR mask and two effectful operands.
+All 7,040 result/effect-trace comparisons must match.

@@ -9489,14 +9489,15 @@ function binaryExpr(left, symbol, right, type) {
   }
   const identity = simplifyIntegralIdentityExpression(left, symbol, right, type);
   if (identity) return identity;
-  if (experimentalConstantEvaluationEnabled()
-    && symbol === '^' && (type === 'int' || type === 'long')) {
-    const leftConstant = integralConstantValue(left, type);
-    const rightConstant = integralConstantValue(right, type);
-    if (leftConstant === minusOneForType(type)) {
+  // JVM int/long XOR with a literal all-ones mask is precisely complement.
+  // This local rewrite does not enable the experimental identity/DCE passes.
+  if (symbol === '^' && (type === 'int' || type === 'long')) {
+    const leftConstant = integralLiteralValue(left, type);
+    const rightConstant = integralLiteralValue(right, type);
+    if (leftConstant === minusOneForType(type) && integralComplementOperand(right, type)) {
       return expr(`~${wrap(right, 90)}`, type, 90, { bitwiseComplement: right });
     }
-    if (rightConstant === minusOneForType(type)) {
+    if (rightConstant === minusOneForType(type) && integralComplementOperand(left, type)) {
       return expr(`~${wrap(left, 90)}`, type, 90, { bitwiseComplement: left });
     }
   }
@@ -9528,7 +9529,7 @@ function simplifyIntegralIdentityExpression(left, symbol, right, type) {
 }
 
 function simplifyBitwiseComplementComparison(left, operator, right) {
-  if (!experimentalConstantEvaluationEnabled()) return null;
+  if (!['==', '!=', '<', '<=', '>', '>='].includes(operator)) return null;
   let value = null;
   let constantExpression = null;
   let normalizedOperator = operator;
@@ -9544,8 +9545,11 @@ function simplifyBitwiseComplementComparison(left, operator, right) {
   }
 
   const type = simplifyType(left && left.bitwiseComplement ? left.type : right.type);
-  if (type !== 'int' && type !== 'long') return null;
-  const constant = integralConstantValue(constantExpression, type);
+  if (!integralComplementOperand(value, type)) return null;
+  // Signed complement reverses order at the same JVM width. Moving a literal
+  // across the comparison cannot reorder effects; inferred constants cannot
+  // provide that guarantee. Casts discard complement identity in the IR.
+  const constant = integralLiteralValue(constantExpression, type);
   if (constant == null) return null;
   const complementedConstant = complementConstant(constant, type);
   const simplifiedOperator = reverseComparisonOperator(normalizedOperator);
@@ -9557,6 +9561,25 @@ function simplifyBitwiseComplementComparison(left, operator, right) {
 
 function experimentalConstantEvaluationEnabled() {
   return process.env.PIPELINE_EXPERIMENTAL_INTERCLASS_DCE === '1';
+}
+
+function integralLiteralValue(value, type) {
+  if (!value || simplifyType(value.type) !== type) return null;
+  if (type === 'int' && /^-?(?:0|[1-9]\d*)$/.test(value.code || '')) {
+    const number = Number(value.code);
+    return Number.isInteger(number) && number >= -2147483648 && number <= 2147483647
+      ? number : null;
+  }
+  if (type === 'long' && /^-?(?:0|[1-9]\d*)L$/.test(value.code || '')) {
+    const number = BigInt(value.code.slice(0, -1));
+    return BigInt.asIntN(64, number) === number ? number : null;
+  }
+  return null;
+}
+
+function integralComplementOperand(value, type) {
+  return type === 'int' ? ['int', 'byte', 'short', 'char'].includes(simplifyType(value?.type))
+    : type === 'long' && simplifyType(value?.type) === 'long';
 }
 
 function integralConstantValue(value, type) {
