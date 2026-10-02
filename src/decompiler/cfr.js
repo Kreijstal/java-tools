@@ -1911,6 +1911,7 @@ function decompileCode(code, method, cls, localState, options = {}) {
     }
   }
   const preferOwnedStructurer = options.forceOwnedStructurer === true
+    || hasStackPermutationBackedge(codeItemsForSelection)
     || tableHasTrivialCheckedHandler(code)
     // A ladder of conditional branches sharing one exit makes the legacy
     // range recognizer explore overlapping suffixes repeatedly. Obfuscated
@@ -2002,6 +2003,25 @@ function hasHighConditionalTargetFanIn(codeItems, minimumFanIn = 6) {
     targetCounts.set(target, count);
   }
   return false;
+}
+
+// A range recognizer does not carry the operand stack around a loop. Stack
+// permutations on a retreating edge need the owned CFG's explicit join values.
+function hasStackPermutationBackedge(codeItems) {
+  const labels = buildLabelIndex(codeItems);
+  const permutations = new Set(['swap', 'dup_x1', 'dup_x2', 'dup2_x1', 'dup2_x2']);
+  const prefix = [0];
+  for (const item of codeItems) {
+    const instruction = getInstructionFromItem(item);
+    prefix.push(prefix[prefix.length - 1] + (permutations.has(instruction?.op) ? 1 : 0));
+  }
+  return codeItems.some((item, index) => {
+    const instruction = getInstructionFromItem(item);
+    return branchTargetLabels(instruction).some(label => {
+      const target = labels.get(String(label).replace(/:$/, ''));
+      return target != null && target <= index && prefix[index + 1] > prefix[target];
+    });
+  });
 }
 
 function nopNormallyUnreachableBlocks(code) {
@@ -3720,14 +3740,9 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
       regularPredecessors[successor].push(predecessor.id);
     }
   }
-  // A loop header with two or more live operand values is not a Java
-  // expression join. Obfuscators use this shape to park a comparison beneath
-  // an opaque predicate and branch back to the comparison instruction. The
-  // structured printer can otherwise mistake the two different comparisons
-  // reaching that header for one loop condition, dropping the increment block
-  // or repeating one iteration forever. Keep ordinary one-value accumulator
-  // loops structured, but render these multi-value backedge phis through the
-  // exact CFG state machine.
+  // Multiple live operands require initialized, explicit join carriers. They
+  // do not by themselves require a dispatcher: the CFG structurer preserves
+  // each edge, and evaluate() snapshots overlapping copies before writing them.
   const hasMultiValueStackBackedge = cfg.blocks.some((block) => {
     const predecessors = regularPredecessors[block.id] || [];
     return (entryStacks.get(block.id) || []).length >= 2
@@ -3792,18 +3807,6 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     }
     return false;
   });
-  // The multi-value backedge state machine cannot represent synchronized
-  // regions (it renders the lowered monitor plumbing as plain code). When a
-  // synchronized method also has this shape, do NOT bail to the fallbacks:
-  // the ordinary owned-structurer rendering (reached with useStateMachine
-  // false) already materializes the backedge operands through stackIn/stackOut
-  // carriers, which is exactly how these methods structured before the state
-  // machine existed. Bailing here instead discards correct structured output
-  // and hard-fails otherwise-valid synchronized methods (e.g. oe.h, ena.a).
-  if (!useStateMachine && hasMultiValueStackBackedge && !syncHandlers.size) {
-    useStateMachine = true;
-    stateMachineReason = 'multi-value operand stack carried across a CFG backedge';
-  }
   if (!useStateMachine && hasInvariantConditionalBackedgeFanout &&
       exceptionTable.length > 0 && !structured.regionExitsVerified && !syncHandlers.size) {
     useStateMachine = true;
@@ -3886,6 +3889,7 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
         const incoming = forwardingPredecessor.exitStack &&
           forwardingPredecessor.exitStack[slot];
         if (incoming && /^stackIn_\d+_\d+$/.test(incoming.code) &&
+            incoming.code !== stackInName(blockId, slot) &&
             simplifyType(incoming.type) === simplifyType(value.type)) {
           forwardedStackIns.add(stackInName(blockId, slot));
           code = incoming.code;
@@ -3934,7 +3938,7 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
       }
     }
 
-    if (regularSuccessors.length) exitStack.forEach((value, slot) => {
+    const storedExitValues = regularSuccessors.length ? exitStack.map((value) => {
       requireRenderedTypeImport(options, value.qualifiedType || value.type);
       const rawStoredValue = renderStoreExpression(value);
       const canonicalSourceType = rawStoredValue && localState.sourceTypeForName(rawStoredValue.code);
@@ -3949,6 +3953,57 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
       const rendered = value.pendingNew
         ? expr('null', value.type)
         : coerceExpressionForType(typedStoredValue, value.type);
+      return rendered;
+    }) : [];
+    const assignedCarriers = new Set();
+    for (const successor of regularSuccessors) {
+      (entryStacks.get(successor) || []).forEach((value, slot) => {
+        if (slot < exitStack.length) assignedCarriers.add(stackInName(successor, slot));
+      });
+    }
+    const readsAssignedCarrier = code => [...String(code).matchAll(/\bstackIn_\d+_\d+\b/g)]
+      .some(match => assignedCarriers.has(match[0]));
+    let branchCondition = null;
+    let switchSelector = null;
+    const originalCondition = isConditionalBranch(op)
+      ? conditionForBranch(terminator, stack.slice(), false) : null;
+    const originalSelector = op === 'tableswitch' || op === 'lookupswitch'
+      ? stack[stack.length - 1] : null;
+    const needsSnapshot = storedExitValues.some(value => readsAssignedCarrier(value.code)) ||
+      (originalCondition && readsAssignedCarrier(originalCondition.code)) ||
+      (originalSelector && readsAssignedCarrier(originalSelector.code));
+    if (needsSnapshot) {
+      // Edge stores are a parallel copy. Snapshot in operand order before any
+      // target store, including the consumed condition/selector when it reads
+      // a target. Otherwise a swap loses a value or tests the updated operand.
+      const captured = new Map();
+      storedExitValues.forEach((value, slot) => {
+        const original = exitStack[slot];
+        if (!captured.has(original)) {
+          const name = localState.nextSyntheticName('edgeValue');
+          declarations.push(`${simplifyType(value.type)} ${name};`);
+          lines.push(`${name} = ${value.code};`);
+          captured.set(original, expr(name, value.type));
+        }
+        storedExitValues[slot] = captured.get(original);
+      });
+      if (originalCondition) {
+        const condition = conditionForBranch(terminator,
+          stack.map(value => captured.get(value) || value), false);
+        const name = localState.nextSyntheticName('edgeCondition');
+        declarations.push(`boolean ${name};`);
+        lines.push(`${name} = ${condition.code};`);
+        branchCondition = expr(name, 'boolean');
+      } else if (originalSelector) {
+        const selector = captured.get(originalSelector) || originalSelector;
+        const name = localState.nextSyntheticName('edgeSelector');
+        declarations.push(`${simplifyType(selector.type)} ${name};`);
+        lines.push(`${name} = ${selector.code};`);
+        switchSelector = expr(name, selector.type);
+      }
+    }
+    if (regularSuccessors.length) exitStack.forEach((value, slot) => {
+      const rendered = storedExitValues[slot];
       const targets = regularSuccessors.map((successor) => ({
         successor,
         value: (entryStacks.get(successor) || [])[slot],
@@ -3974,6 +4029,10 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
             `${coerceExpressionForType(outgoing, target.value.type).code};`);
           recordEdgeStackInSource(targetName, firstName);
         }
+        // A single-predecessor successor may forward this carrier. Raw source
+        // expressions describe values before the parallel stores and can now
+        // read overwritten names; expose the post-copy value instead.
+        if (needsSnapshot) exitStack[slot] = outgoing;
       } else {
         // Different verifier types can require distinct coercions. Retain one
         // source-typed carrier so no narrowing performed for one successor is
@@ -3987,9 +4046,10 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
             `${coerceExpressionForType(outgoing, target.value.type).code};`);
           recordEdgeStackInSource(targetName, null);
         }
+        if (needsSnapshot) exitStack[slot] = outgoing;
       }
     });
-    const value = { lines, stack, exitStack, terminator };
+    const value = { lines, stack, exitStack, terminator, branchCondition, switchSelector };
     cache.set(blockId, value);
     evaluating.delete(blockId);
     return value;
@@ -4001,10 +4061,12 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     },
     cond(blockId) {
       const state = evaluate(blockId);
+      if (state.branchCondition) return state.branchCondition.code;
       return conditionForBranch(state.terminator, state.stack.slice(), false).code;
     },
     condInverted(blockId) {
       const state = evaluate(blockId);
+      if (state.branchCondition) return negateBooleanExpression(state.branchCondition).code;
       return conditionForBranch(state.terminator, state.stack.slice(), true).code;
     },
     blockTerminates(blockId) {
@@ -4013,6 +4075,7 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     },
     switchValue(blockId) {
       const state = evaluate(blockId);
+      if (state.switchSelector) return state.switchSelector.code;
       return pop(state.stack.slice()).code;
     },
     syncLock(lockLocal, lockPc) {
@@ -4142,14 +4205,20 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
         let current = name;
         while (redundantStackInAliases.has(current)) {
           const next = redundantStackInAliases.get(current);
-          if (seen.has(next)) return name;
+          if (seen.has(next)) return null;
           seen.add(next);
           current = next;
         }
         return current;
       };
-      for (const [target, source] of redundantStackInAliases) {
-        redundantStackInAliases.set(target, resolveAlias(source));
+      // Resolve against the complete original map. Cyclic aliases (and chains
+      // feeding a cycle) still carry runtime values and must keep their stores
+      // and declarations rather than being substituted and deleted together.
+      const resolvedAliases = [...redundantStackInAliases].map(([target]) =>
+        [target, resolveAlias(target)]);
+      for (const [target, replacement] of resolvedAliases) {
+        if (replacement == null || replacement === target) redundantStackInAliases.delete(target);
+        else redundantStackInAliases.set(target, replacement);
       }
     }
     if (forwardedStackIns.size) {

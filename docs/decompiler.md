@@ -516,6 +516,30 @@ FunOrb stubs. Its two existing operand-stack dispatchers remain unchanged; this
 exit-validation change introduces no additional fallback. Earlier uncommitted
 parallel-backedge improvements are excluded from that comparison.
 
+## Parallel operand copies at loop backedges
+
+Multiple live operand-stack values no longer force a dispatcher by themselves.
+The owned CFG renderer uses typed join carriers. If outgoing values or the
+consumed condition/selector read a carrier that the edge is about to overwrite,
+it snapshots those values before assigning the destination carriers. Copies are
+parallel: a swap must not overwrite the source of its second assignment. The
+post-copy values are also retained for forwarding through single-predecessor
+blocks, so a later branch or return cannot read the overwritten old expression.
+A successor cannot forward its own carrier away; cyclic aliases retain their
+stores and declarations rather than deleting each other.
+
+The legacy range recognizer does not carry permutations around loops. A
+backedge containing swap or an inserting dup therefore selects the owned CFG
+renderer, including when a switch is the only backward transfer. Existing
+exception-region, synchronized, source-flow and code-size gates still apply.
+
+`node test/cfrParallelBackedges.test.js` covers six operand-permutation fixtures
+and six comparison fixtures. It compares original verified bytecode with both
+structured and forced-dispatcher execution: 6,650 result/effect comparisons,
+including int, long, references, consumed conditions/selectors, nonzero flags,
+array failures and catches. This is scoped differential evidence, not proof of
+whole-game equivalence.
+
 Explicit legacy `regionExit` nodes also participate in label uniquification.
 Both that pass and the printer resolve the nearest matching lexical frame,
 including blocks, and require it to be a loop. A block shadowing a loop label

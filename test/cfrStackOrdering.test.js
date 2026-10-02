@@ -455,8 +455,8 @@ test('multi-value operand-stack backedges retain their distinct CFG edges', (t) 
       'MultiValueBackedge',
       MULTI_VALUE_STACK_BACKEDGE,
     );
-    t.match(source, /while \(true\) \{\s*switch \(statePc\)/,
-      'opaque comparison carriers use the exact CFG state machine');
+    t.notOk(source.includes('switch (statePc)'),
+      'explicit operand carriers preserve the distinct comparisons in structured loops');
 
     fs.writeFileSync(path.join(tempDir, 'MultiValueBackedge.java'), source);
     fs.writeFileSync(path.join(tempDir, 'MultiValueBackedgeRunner.java'),
