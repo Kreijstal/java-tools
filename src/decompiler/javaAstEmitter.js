@@ -35,8 +35,13 @@ function alwaysExits(tree, render) {
   switch (tree.t) {
     case 'straight': return !!(render.blockTerminates && render.blockTerminates(tree.block));
     case 'seq': return (tree.body || []).some((child) => alwaysExits(child, render));
-    case 'block': return alwaysExits(tree.body, render);
-    case 'loop': return true; // a `while (true)` is left by break/return, never by falling out
+    // A transfer consumed by this construct completes it normally. It does
+    // not leave the surrounding arm, even though its own statement is abrupt.
+    // Be conservative about conditional/unreachable breaks: keeping the
+    // original loop is safe when we cannot prove the arm always leaves.
+    case 'block': return !referencesLabel(tree.body, tree.label, 'break')
+      && alwaysExits(tree.body, render);
+    case 'loop': return !referencesLabel(tree.body, tree.label, 'break');
     case 'if': return alwaysExits(tree.then, render) && alwaysExits(tree.els, render);
     case 'switch': return !!tree.dflt && tree.cases.every((item) => alwaysExits(item.body, render))
       && alwaysExits(tree.dflt, render);
@@ -46,20 +51,21 @@ function alwaysExits(tree, render) {
   }
 }
 
-function referencesLabel(tree, label) {
+function referencesLabel(tree, label, transfer = null) {
   if (!tree) return false;
   switch (tree.t) {
     case 'break':
-    case 'continue': return tree.label === label;
-    case 'seq': return (tree.body || []).some((child) => referencesLabel(child, label));
+    case 'continue': return tree.label === label && (!transfer || tree.t === transfer);
+    case 'seq': return (tree.body || []).some((child) => referencesLabel(child, label, transfer));
     case 'block':
     case 'loop':
     case 'synchronized':
-    case 'try': return referencesLabel(tree.body, label)
-      || (tree.catches || []).some((item) => referencesLabel(item.body, label));
-    case 'if': return referencesLabel(tree.then, label) || referencesLabel(tree.els, label);
-    case 'switch': return (tree.cases || []).some((item) => referencesLabel(item.body, label))
-      || referencesLabel(tree.dflt, label);
+    case 'try': return referencesLabel(tree.body, label, transfer)
+      || (tree.catches || []).some((item) => referencesLabel(item.body, label, transfer));
+    case 'if': return referencesLabel(tree.then, label, transfer)
+      || referencesLabel(tree.els, label, transfer);
+    case 'switch': return (tree.cases || []).some((item) => referencesLabel(item.body, label, transfer))
+      || referencesLabel(tree.dflt, label, transfer);
     default: return false;
   }
 }

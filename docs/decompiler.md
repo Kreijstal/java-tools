@@ -505,6 +505,7 @@ Focused regression commands:
 
 ```sh
 node test/structuredFlowVerifier.test.js    # 6 graph checks
+node test/javaAstEmitterLoopExits.test.js   # 7 checks, including 424 native comparisons
 node test/exceptionStructurer.test.js       # 25 checks, including damaged trees
 node test/cfrExceptionLoopExits.test.js     # 504 native JVM comparisons
 node test/cfrNestedLoopSplitting.test.js    # 840 native JVM comparisons
@@ -515,6 +516,41 @@ An isolated export from the pass-14 decompiler plus these checks reproduces all
 FunOrb stubs. Its two existing operand-stack dispatchers remain unchanged; this
 exit-validation change introduces no additional fallback. Earlier uncommitted
 parallel-backedge improvements are excluded from that comparison.
+
+### Loop-header reconstruction must distinguish internal breaks
+
+The Java emitter also needs an exit proof when moving an arm or trailing
+statements out of a `while (true)` loop and rebuilding its header condition.
+An inner loop is not automatically an abrupt exit from the outer arm: a break
+to that inner loop completes it normally. The same is true of a labelled block
+whose body breaks to its own label. Treating either as an unconditional exit
+can move work outside the outer loop and change iteration behavior, even when
+the source-edge contracts passed before emission.
+
+`alwaysExits` now checks the destination of breaks before claiming that a loop
+or labelled block always leaves the arm. The search includes conditional arms,
+switch cases, catch handlers, and synchronized bodies. A possible internal break
+keeps the original loop structure. This is deliberately conservative about dead
+branches: it does not attempt a new reachability proof. Real returns, transfers
+to enclosing labels, and inner loops without an internal break can still justify
+header reconstruction.
+
+`node test/javaAstEmitterLoopExits.test.js` exercises both exit-arm and trailing
+statement reconstruction. Four printed Java fixtures compare results and effect
+traces against native Java over 106 limits each, including exceptions caught
+inside the inner loop and exits through synchronized bodies. Against the prior
+emitter, the regression tests fail and the first printed fixture loses the
+outer iteration, producing a missing-return javac error. With the destination
+check, all seven tests and all 424 comparisons pass. The existing exception-loop
+fixture's 504 comparisons, nested-cycle fixture's 840 comparisons and parallel
+operand fixture's 6,650 comparisons also pass.
+
+A fresh export with this emitter change reproduces the pass-15 GeoBlox output
+and diagnostics byte for byte: 303 Java files, zero hard failures and zero
+dispatchers. Its Java source tree SHA-256 remains
+`6b638e579bfeb73adbb6583b0581f4d6df93c9ca5930816ea81bf1a48aa3f015`.
+This is an output compatibility check, not whole-game behavioral equivalence;
+the existing publication remains pinned to its original generator commit.
 
 ## Parallel operand copies at loop backedges
 
