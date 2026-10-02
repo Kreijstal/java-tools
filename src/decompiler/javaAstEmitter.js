@@ -47,9 +47,21 @@ function alwaysExits(tree, render) {
     case 'if': return alwaysExits(tree.then, render) && alwaysExits(tree.els, render);
     case 'switch': return !!tree.dflt && tree.cases.every((item) => alwaysExits(item.body, render))
       && alwaysExits(tree.dflt, render);
+    // Move an intact protected exit arm only when its normal body and every
+    // handler leave. A normally completing catch can resume the loop, and an
+    // inner consumed break does not leave this arm. The containing try/catch
+    // stays whole, so no expression changes its exception binding.
+    case 'try': return !tree.finallyBlock && !tree.finally
+      && Array.isArray(tree.catches) && tree.catches.length > 0
+      && alwaysExits(tree.body, render)
+      && tree.catches.every((item) => alwaysExits(item.body, render));
+    // Java releases the monitor for an abrupt completion. Moving this whole
+    // arm after the loop test preserves acquisition, evaluation and release;
+    // the caller separately refuses references to the rotated loop label.
+    case 'synchronized': return alwaysExits(tree.body, render);
     case 'break': return true;
     case 'continue': return true;
-    default: return false; // try/synchronized and anything new: assume it falls through
+    default: return false; // anything new: assume it falls through
   }
 }
 

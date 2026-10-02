@@ -69,6 +69,106 @@ test('real returns and loops without an internal break still permit rotation', (
     /Outer: while \(count >= limit\)/);
 });
 
+test('intact protected exit arms require abrupt bodies and every abrupt handler', () => {
+  const protectedExit = {t: 'try', body: straight(4), catches: [
+    {types: ['IllegalArgumentException'], varName: 'error', body: straight(4)},
+  ]};
+  for (const trailing of [false, true]) {
+    assert.match(emitted(candidate(protectedExit, trailing)), /Outer: while \(count >= limit\)/);
+  }
+  for (const exit of [
+    {...protectedExit, body: straight(1)},
+    {...protectedExit, catches: [...protectedExit.catches,
+      {types: ['Exception'], varName: 'other', body: straight(1)}]},
+    {...protectedExit, catches: [{types: ['IllegalArgumentException'], varName: 'error',
+      body: {t: 'block', label: 'Consumed', body: jump('break', 'Consumed')}}]},
+    {...protectedExit, catches: [{types: ['IllegalArgumentException'], varName: 'error',
+      body: jump('continue', 'Outer')}]},
+  ]) {
+    for (const trailing of [false, true]) {
+      assert.match(emitted(candidate(exit, trailing)), /Outer: while \(true\)/);
+    }
+  }
+});
+
+test('whole synchronized exit arms preserve monitor scope and refuse consumed breaks', () => {
+  const exit = {t: 'synchronized', lockLocal: 0, body: straight(4)};
+  const source = emitted(candidate(exit));
+  assert.match(source, /Outer: while \(count >= limit\)/);
+  assert.match(source, /\}\s+synchronized \(lock0\) \{\s+return/);
+  for (const body of [straight(1),
+    {t: 'loop', label: 'Consumed', body: seq(straight(1), jump('break', 'Consumed'))},
+  ]) assert.match(emitted(candidate({...exit, body})), /Outer: while \(true\)/);
+  // An exit that continues this loop cannot be moved out of its label scope.
+  assert.match(emitted(candidate({...exit, body: jump('continue', 'Outer')})), /Outer: while \(true\)/);
+});
+
+test('protected loop-exit rotation matches native catch priority and monitor release', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-protected-loop-rotation-'));
+  try {
+    const body = "trace.append('t'); if(mode==1) throw failure; if(mode==2) throw fatal; return finish(count,trace,lock0);";
+    const caught = "trace.append('c'); return finish(count,trace,lock0);";
+    const general = "trace.append('g'); return count+\":\"+trace;";
+    const variants = [
+      {tree: {t: 'try', body: straight(10), catches: [
+        {types: ['IllegalArgumentException'], varName: 'error', body: straight(11)},
+      ]}, source: `try { ${body} } catch(IllegalArgumentException error) { ${caught} }`},
+      {tree: {t: 'synchronized', lockLocal: 0, body: straight(10)},
+        source: `synchronized(lock0) { ${body} }`},
+      {tree: {t: 'synchronized', lockLocal: 0, body: {t: 'try', body: straight(10), catches: [
+        {types: ['IllegalArgumentException'], varName: 'error', body: straight(11)},
+      ]}}, source: `synchronized(lock0) { try { ${body} } catch(IllegalArgumentException error) { ${caught} } }`},
+      {tree: {t: 'try', body: {t: 'synchronized', lockLocal: 0, body: straight(10)}, catches: [
+        {types: ['IllegalArgumentException'], varName: 'error', body: straight(11)},
+      ]}, source: `try { synchronized(lock0) { ${body} } } catch(IllegalArgumentException error) { ${caught} }`},
+      {tree: {t: 'try', body: straight(10), catches: [
+        {types: ['IllegalArgumentException'], varName: 'specific', body: straight(11)},
+        {types: ['RuntimeException'], varName: 'general', body: straight(12)},
+      ]}, source: `try { ${body} } catch(IllegalArgumentException specific) { ${caught} }
+        catch(RuntimeException other) { ${general} }`},
+    ];
+    const renderer = {...render,
+      straight: id => id===10?[body]:id===11?[caught]:id===12?[general]:render.straight(id),
+      blockTerminates: id => [10,11,12].includes(id)||render.blockTerminates(id)};
+    let cases = 0;
+    for (const [variantIndex, variant] of variants.entries()) for (const trailing of [false, true]) {
+      const index = variantIndex * 2 + Number(trailing);
+      const rebuilt=emitStatements(treeToStatements(candidate(variant.tree, trailing),renderer));
+      assert.match(rebuilt,/Outer: while \(count >= limit\)/);
+      const original=`outer: while(true) { if(count < limit) { ${trailing ? '' : variant.source} }
+        else { trace.append('o'); if(++count > limit+10) return count+":"+trace; continue outer; }
+        ${trailing ? variant.source : ''} }`;
+      const source=`public class ProtectedRotation${index} {
+        static final IllegalArgumentException failure=new IllegalArgumentException();
+        static final Error fatal=new Error();static Object lastLock;static String lastTrace;
+        static String finish(int count,StringBuilder trace,Object lock) {
+          return count+":"+trace+":"+Thread.holdsLock(lock);
+        }
+        ${Object.entries({original,rebuilt}).map(([name,body])=>`static String ${name}(int limit,int mode) {
+          int count=0;StringBuilder trace=new StringBuilder();Object lock0=mode==3?null:new Object();
+          lastLock=lock0;try { ${body} } finally { lastTrace=trace.toString(); }
+        }`).join('\n')}
+        static String invoke(boolean rebuilt,int limit,int mode) {
+          String result;try { result=rebuilt?rebuilt(limit,mode):original(limit,mode); }
+          catch(Throwable error) {result=error==failure?"same-failure":error==fatal?"same-fatal":error.getClass().getName();}
+          if(lastLock!=null&&Thread.holdsLock(lastLock))throw new AssertionError("leaked monitor");
+          return result+":"+lastTrace;
+        }
+        public static void main(String[]args) { for(int limit=-15;limit<=40;limit++)for(int mode=0;mode<4;mode++) {
+          String expected=invoke(false,limit,mode),actual=invoke(true,limit,mode);
+          if(!expected.equals(actual))throw new AssertionError(limit+":"+mode+":"+expected+":"+actual);
+          System.out.println(limit+":"+mode+":"+actual);
+        } }
+      }`;
+      const file=path.join(temporary,`ProtectedRotation${index}.java`);fs.writeFileSync(file,source);
+      run('javac',['--release','8','-d',temporary,file],temporary);
+      const output=run('java',['-cp',temporary,`ProtectedRotation${index}`],temporary);
+      assert.equal(output.trim().split('\n').length,224);cases+=224;
+    }
+    assert.equal(cases,2240);
+  } finally {fs.rmSync(temporary,{recursive:true,force:true});}
+});
+
 function run(command, args, directory) {
   const files = ['stdout', 'stderr'].map(name => path.join(directory, name));
   const fds = files.map(file => fs.openSync(file, 'w'));

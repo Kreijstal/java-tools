@@ -552,6 +552,43 @@ dispatchers. Its Java source tree SHA-256 remains
 This is an output compatibility check, not whole-game behavioral equivalence;
 the existing publication remains pinned to its original generator commit.
 
+### Reconstruct terminal protected loop arms without splitting their regions
+
+The emitter can now recognize an intact `try/catch` arm as an unconditional
+exit when both its body and every catch always leave. A normally completing
+body or catch, or a break consumed by an inner block or loop, retains the
+original `while (true)`. A `synchronized` arm can likewise leave when its body
+always leaves. Unsupported finally-bearing trees remain conservative. The
+existing rotation checks still refuse references to the rotated loop label
+and work before its condition.
+
+This moves the entire protected arm after the reconstructed loop header; it
+does not move individual expressions across a try or monitor boundary. Catch
+order, nested protection, monitor acquisition and release, and original
+rendering order stay intact. The same proof applies to protected trailing
+statements after an empty exit arm.
+
+Focused validation:
+
+```sh
+NODE_PATH=/home/kreijstal/git/java-tools/node_modules node test/javaAstEmitterLoopExits.test.js
+NODE_PATH=/home/kreijstal/git/java-tools/node_modules node test/cfrExceptionLoopExits.test.js
+NODE_PATH=/home/kreijstal/git/java-tools/node_modules node test/exceptionStructurer.test.js
+```
+
+The emitter suite has 26 groups, including 2,240 new native comparisons across
+both rotation shapes and five protected-region layouts. They compare values,
+effect traces, specific-before-general catch priority, throwable identity,
+null monitor failures, lock ownership during completion, and monitor release.
+The other two suites retain their six and 36 passing groups respectively.
+
+The fresh export still reproduces all 303 currently pinned GeoBlox sources
+byte for byte, with zero hard failures and zero fallback methods. This proof
+extension does **not** remove any of its 11 retained region selectors or improve
+its current source layout. The readable publication and its generator pin are
+unchanged. Those selectors need a separate proof for their shared continuations;
+this check does not establish whole-game behavioral equivalence.
+
 ## Parallel operand copies at loop backedges
 
 Multiple live operand-stack values no longer force a dispatcher by themselves.
