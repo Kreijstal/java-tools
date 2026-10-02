@@ -104,6 +104,75 @@ test('shadowed sibling catches cannot gain coverage over an earlier handler', ()
   assert.equal(verifyRegionFlowContracts(ordered.tree, ordered.regionExitContracts), true);
 });
 
+test('nested range size cannot override the original exception-table priority', () => {
+  const code = [
+    {labelDef: 'L0:', pc: 0, instruction: {op: 'invokestatic', arg: ['Method', 'X', ['work', '()V']]}},
+    {pc: 3, instruction: {op: 'goto', arg: 'L20'}},
+    {labelDef: 'L6:', pc: 6, instruction: 'astore_0'},
+    {pc: 7, instruction: {op: 'invokestatic', arg: ['Method', 'X', ['cleanup', '()V']]}},
+    {pc: 10, instruction: {op: 'goto', arg: 'L20'}},
+    {labelDef: 'L13:', pc: 13, instruction: 'astore_1'},
+    {pc: 14, instruction: {op: 'goto', arg: 'L20'}},
+    {labelDef: 'L20:', pc: 20, instruction: 'return'},
+  ];
+  const outer = {start_pc: 0, end_pc: 13, handler_pc: 13, catch_type: 'java/lang/RuntimeException'};
+  const inner = {start_pc: 0, end_pc: 3, handler_pc: 6, catch_type: 'java/lang/IllegalArgumentException'};
+  const declined = structureMethod(code, [outer, inner]);
+  assert.equal(declined.ok, false);
+  assert.match(declined.reason, /exception-table priority or coverage changes at throwing pc 0/);
+  const safe = structureMethod(code, [inner, outer]);
+  assert.equal(safe.ok, true, safe.reason);
+  assert.equal(verifyRegionFlowContracts(safe.tree, safe.regionExitContracts), true);
+});
+
+test('split protected ranges cannot inherit the priority of their first table rows', () => {
+  const invoke = pc => ({labelDef: `L${pc}:`, pc,
+    instruction: {op: 'invokestatic', arg: ['Method', 'X', ['work', '()V']]}});
+  const code = [invoke(0), invoke(3),
+    {pc: 6, instruction: {op: 'goto', arg: 'L20'}},
+    {labelDef: 'L10:', pc: 10, instruction: 'astore_0'},
+    {pc: 11, instruction: {op: 'goto', arg: 'L20'}},
+    {labelDef: 'L15:', pc: 15, instruction: 'astore_1'},
+    {pc: 16, instruction: {op: 'goto', arg: 'L20'}},
+    {labelDef: 'L20:', pc: 20, instruction: 'return'},
+  ];
+  const row = (start, end, handler, type) =>
+    ({start_pc: start, end_pc: end, handler_pc: handler, catch_type: type});
+  const table = [
+    row(0, 3, 10, 'java/lang/IllegalArgumentException'),
+    row(0, 3, 15, 'java/lang/RuntimeException'),
+    row(3, 6, 15, 'java/lang/RuntimeException'),
+    row(3, 6, 10, 'java/lang/IllegalArgumentException'),
+  ];
+  const result = structureMethod(code, table);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /exception-table priority or coverage changes at throwing pc 3/);
+  // A handler reached only through an exception is still live and checked.
+  code[1] = {pc: 3, instruction: {op: 'goto', arg: 'L20'}};
+  code[4] = invoke(11);
+  table[2].start_pc = table[3].start_pc = 11;
+  table[2].end_pc = table[3].end_pc = 14;
+  const handlerResult = structureMethod(code, table);
+  assert.equal(handlerResult.ok, false);
+  assert.match(handlerResult.reason, /exception-table priority or coverage changes at throwing pc 11/);
+});
+
+test('normalization must not drop throwing instructions in a self-protected handler', () => {
+  const code = [
+    {labelDef: 'L0:', pc: 0, instruction: 'astore_0'},
+    {pc: 1, instruction: {op: 'invokestatic', arg: ['Method', 'X', ['cleanup', '()V']]}},
+    {labelDef: 'L4:', pc: 4, instruction: 'return'},
+  ];
+  const result = structureMethod(code,
+    [{start_pc: 0, end_pc: 4, handler_pc: 0, catch_type: 'any'}]);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /exception-table priority or coverage changes at throwing pc 1/);
+  code[1] = {pc: 1, instruction: 'nop'};
+  const safe = structureMethod(code,
+    [{start_pc: 0, end_pc: 4, handler_pc: 0, catch_type: 'any'}]);
+  assert.equal(safe.ok, true, safe.reason);
+});
+
 test('handler cleanup outside an enclosing protected range cannot be collapsed into it', () => {
   const code = [
     {labelDef: 'L0:', pc: 0, instruction: {op: 'invokestatic', arg: ['Method', 'X', ['work', '()V']]}},

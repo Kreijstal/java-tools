@@ -819,6 +819,50 @@ function structureMethodImpl(codeItems, exceptionTable, opts = {}) {
 function structureWithExceptions(codeItems, exceptionTable, methodCfg, render, opts = {}) {
   const { groups } = normalizeTable(
     exceptionTable, opts.syncHandlers || null, opts.isCatchAssignable || null);
+  // Innermost first, with later equal-size ranges processed first so a handler
+  // cannot absorb an unstructured copy of finally cleanup as its continuation.
+  const ordered = groups.slice().sort((a, b) =>
+    (a.end_pc - a.start_pc) - (b.end_pc - b.start_pc) || b.start_pc - a.start_pc);
+
+  // Range nesting is not proof of JVM catch priority. A broad outer row can
+  // precede a narrower inner row, or split ranges can use different priorities.
+  // Check the actual table at every live throwing instruction before carving
+  // regions. Adjacent alternatives with the same handler may be combined, but
+  // moving an alternative across another handler must retain exact routing.
+  const signature = rows => {
+    const catches = [];
+    for (const row of rows) {
+      let last = catches[catches.length - 1];
+      if (!last || last.handler !== row.handler_pc) {
+        last = {handler: row.handler_pc, types: []};
+        catches.push(last);
+      }
+      for (const type of renderCatchTypes(row.catch_type))
+        if (!last.types.includes(type)) last.types.push(type);
+    }
+    for (const item of catches) item.types = item.types.filter(type =>
+      !item.types.some(other => other !== type &&
+        catchTypesSubsumes([other], [type], opts.isCatchAssignable))).sort();
+    return JSON.stringify(catches);
+  };
+  const roots = [methodCfg.entry];
+  for (const row of exceptionTable) {
+    const handler = methodCfg.blocks.find(block => codeItems[block.insns[0]].pc === row.handler_pc);
+    if (handler) roots.push(handler.id);
+  }
+  const live = livenessFrom({ids: methodCfg.blocks.map(block => block.id), term: methodCfg.term}, roots);
+  for (const block of methodCfg.blocks) {
+    if (!live[block.id]) continue;
+    for (const index of block.insns) {
+      const item = codeItems[index];
+      if (!canThrow(insnOp(item))) continue;
+      const original = exceptionTable.filter(row => item.pc >= row.start_pc && item.pc < row.end_pc);
+      const reconstructed = ordered.filter(group => inAnyRange(item.pc, group.ranges))
+        .flatMap(group => group.catches);
+      if (signature(original) !== signature(reconstructed))
+        return {ok: false, reason: `exception-table priority or coverage changes at throwing pc ${item.pc}`};
+    }
+  }
   if (groups.length === 0) {
     const { tree } = structure(methodCfg);
     return { ok: true, tree, render };
@@ -908,14 +952,6 @@ function structureWithExceptions(codeItems, exceptionTable, methodCfg, render, o
     for (const ii of b.insns) if (canThrow(insnOp(codeItems[ii]))) return false;
     return true;
   };
-
-  // Innermost first: smallest protected range. For equal-size regions, process
-  // the later bytecode range first: javac duplicates finally bodies after the
-  // primary try/catch, and an earlier handler can normally flow into that later
-  // copy. Collapsing the later region first keeps its entry from being absorbed
-  // as ordinary handler continuation before it has been structured.
-  const ordered = groups.slice().sort((a, b) =>
-    (a.end_pc - a.start_pc) - (b.end_pc - b.start_pc) || b.start_pc - a.start_pc);
 
   for (let groupIndex = 0; groupIndex < ordered.length; groupIndex++) {
     const g = ordered[groupIndex];

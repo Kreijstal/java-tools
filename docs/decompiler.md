@@ -814,11 +814,35 @@ supertype siblings still structure normally. Genuine enclosing catches have
 different complete range sets and retain their existing reconstruction; no
 handler coverage is invented merely because Java rejects a sibling catch.
 
+Range nesting also does not establish the original table's priority. A broader
+outer row may precede a narrower inner row even when the outer range covers the
+inner handler. Reconstructing the smaller range first then sends an exception
+to the inner handler, although native execution chooses the outer handler.
+The version-49 regression demonstrates this on a catch-arm loop continuation:
+native `0:1:0:0:93:W1,OW2,W3,` became `0:1:0:0:93:W1,IW2,W3,`. The return
+value agrees, but the handler effects differ.
+
+Before carving, the structurer now compares the original table with the planned
+region order at each live instruction that can throw. Adjacent alternatives
+with the same handler may combine, and redundant alternatives covered by a
+broader type in that same handler may disappear. Handler order and coverage
+otherwise have to agree exactly. This also catches priorities that change
+between disjoint protected ranges, and self-protected handlers whose throwing
+instructions would be lost by normalization. Liveness includes all exception
+handler entries, not just normal paths from the method entry. Proven nonthrowing
+instructions do not require exception coverage.
+
+A mismatch reports `exception-table priority or coverage changes at throwing
+pc ...` and retains the original-table dispatcher. The check is intentionally
+conservative: even a different order of unrelated handlers may decline. Existing
+exit, component-binding and enclosing-coverage checks still run for regions
+that pass this preflight.
+
 Focused commands:
 
 ```sh
-node test/exceptionStructurer.test.js       # 32 checks; includes protected-range continuation boundaries and shadowed siblings
-node test/cfrExceptionLoopExits.test.js     # 6,816 native result/effect comparisons
+node test/exceptionStructurer.test.js       # 35 checks; includes boundaries, sibling and nested table priority
+node test/cfrExceptionLoopExits.test.js     # 7,200 native result/effect comparisons
 node test/cfrNestedLoopSplitting.test.js    # 840 native comparisons
 node test/structuredFlowVerifier.test.js    # 6 checks
 node test/javaAstEmitterLoopExits.test.js   # 7 checks, including 424 native comparisons
@@ -848,6 +872,18 @@ exports compile with `javac --release 8` and match native result/effect traces
 and escaped throwable identity. Shadowed default output must retain its
 dispatcher, while the ordered control must remain structured. The native and
 structural regressions fail on `38a83d19e58776bbc4dd1b794811aa1a5963996a`.
+
+The nested-priority fixture adds 384 native comparisons across outer-first and
+inner-first tables, four loop-exit modes, six work-failure positions and both
+inner/outer cleanup failures. Default and forced-dispatcher Java must match
+native return values, ordered effects and escaped throwable identity. Only the
+outer-first default requires the dispatcher; the inner-first control remains
+structured. This regression fails on
+`e6dd72c89fa7f51cc34cd78d08cf5c6227799126` before the priority preflight.
+The updated generator reproduces all 303 pass-20 GeoBlox sources and diagnostics
+byte for byte, with zero dispatchers or hard failures. The source-tree SHA-256
+remains `07610c2d655bf96e59584f07be867c62e47cf3b3c484063504d9958443e89da2`;
+this is a game-source digest, separate from the decompiler source-archive digest.
 
 The earlier component-binding hardening preserved all 303 pinned GeoBlox
 sources byte for byte. Bounding handler continuations changes only `oc.java`:

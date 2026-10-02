@@ -165,6 +165,144 @@ test('handler cleanup cannot enter a shadowed sibling catch during a loop exit',
   }
 });
 
+test('loop exits preserve table priority between nested protected ranges', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-nested-priority-loop-exits-'));
+  const previous = process.env.CFR_JS_FORCE_STATE_MACHINE;
+  try {
+    const effects = `class Effects {
+      static StringBuilder trace; static Throwable failed;
+      static int work(int step, int throwAt) {
+        trace.append('W').append(step).append(',');
+        if (step == throwAt) { failed = new IllegalArgumentException(); throw (IllegalArgumentException) failed; }
+        return step * 31;
+      }
+      static void inner(int kind) {
+        trace.append('I');
+        if (kind != 0) { failed = new IllegalArgumentException(); throw (IllegalArgumentException) failed; }
+      }
+      static void outer(int kind) {
+        trace.append('O');
+        if (kind != 0) { failed = new AssertionError(); throw (AssertionError) failed; }
+      }
+    }`;
+    const driver = `class PriorityRunner { public static void main(String[] args) {
+      for (int mode = 0; mode < 4; mode++) for (int throwAt = -1; throwAt <= 4; throwAt++)
+        for (int innerKind = 0; innerKind < 2; innerKind++) for (int outerKind = 0; outerKind < 2; outerKind++) {
+          Effects.trace = new StringBuilder(); Effects.failed = null; String result;
+          try { result = "" + PriorityLoopExits.compute(mode, throwAt, innerKind, outerKind); }
+          catch (Throwable error) { result = error.getClass().getSimpleName()+":"+(error == Effects.failed); }
+          System.out.println(mode+":"+throwAt+":"+innerKind+":"+outerKind+":"+result+":"+Effects.trace);
+        }
+    } }`;
+    for (const outerFirst of [true, false]) {
+      const native = path.join(temporary, outerFirst ? 'outer-first' : 'inner-first');
+      fs.mkdirSync(native);
+      const catches = [
+        '.catch java/lang/RuntimeException from Ltry to Lexit using Louter',
+        '.catch java/lang/IllegalArgumentException from Ltry to LtryEnd using Linner',
+      ];
+      if (!outerFirst) catches.reverse();
+      const assembly = `.version 49 0
+        .class public super PriorityLoopExits
+        .super java/lang/Object
+        .method public static compute : (IIII)I
+          .code stack 2 locals 7
+          ${catches.join('\n')}
+          iconst_0
+          istore 4
+          iconst_0
+          istore 5
+        Lloop:
+          iload 5
+          iconst_3
+          if_icmpge Ldone
+          iinc 5 1
+        Ltry:
+          iload 5
+          iload_1
+          invokestatic Method Effects work (II)I
+          istore 4
+        LtryEnd:
+          goto Lexit
+        Linner:
+          astore 6
+          iload_2
+          invokestatic Method Effects inner (I)V
+          bipush -7
+          istore 4
+          goto Lexit
+        Lexit:
+          goto Ltransfer
+        Louter:
+          astore 6
+          iload_3
+          invokestatic Method Effects outer (I)V
+          bipush -99
+          istore 4
+        Ltransfer:
+          iload_0
+          ifeq Lloop
+          iload_0
+          iconst_1
+          if_icmpeq Ldone
+          iload_0
+          iconst_2
+          if_icmpeq Lreturn
+          iinc 5 1
+          iload 5
+          iload_1
+          invokestatic Method Effects work (II)I
+          istore 4
+          goto Lloop
+        Lreturn:
+          iload 4
+          ireturn
+        Ldone:
+          iload 4
+          ireturn
+          .end code
+        .end method
+        .end class`;
+      const classFile = path.join(native, 'PriorityLoopExits.class');
+      assembleJasminSource(assembly, classFile);
+      const names = ['PriorityLoopExits', 'Effects', 'PriorityRunner'];
+      fs.writeFileSync(path.join(native, 'Effects.java'), effects);
+      fs.writeFileSync(path.join(native, 'PriorityRunner.java'), driver);
+      run('javac', ['--release', '8', '-cp', native, '-d', native,
+        ...names.slice(1).map(name => path.join(native, name + '.java'))], native);
+      const expected = run('java', ['-cp', native, 'PriorityRunner'], native);
+      assert.equal(expected.trim().split('\n').length, 96);
+      assert.match(expected, /AssertionError:true/);
+      assert.doesNotMatch(expected, /:false:/);
+      if (outerFirst) assert.doesNotMatch(expected, /,I/);
+      else assert.match(expected, /,I/);
+      for (const forced of [false, true]) {
+        if (forced) process.env.CFR_JS_FORCE_STATE_MACHINE = '1';
+        else delete process.env.CFR_JS_FORCE_STATE_MACHINE;
+        const diagnostics = [];
+        const source = decompileClassFile(classFile, {diagnostics});
+        assertNoFallback(source);
+        const rebuilt = path.join(native, forced ? 'forced' : 'ordinary');
+        fs.mkdirSync(rebuilt);
+        for (const [name, text] of Object.entries({PriorityLoopExits: source, Effects: effects,
+          PriorityRunner: driver})) fs.writeFileSync(path.join(rebuilt, name + '.java'), text);
+        run('javac', ['--release', '8', '-d', rebuilt,
+          ...names.map(name => path.join(rebuilt, name + '.java'))], rebuilt);
+        const actual = run('java', ['-cp', rebuilt, 'PriorityRunner'], rebuilt);
+        const actualLines = actual.trim().split('\n'), expectedLines = expected.trim().split('\n');
+        assert.equal(actualLines.length, expectedLines.length);
+        expectedLines.forEach((line, index) => assert.equal(actualLines[index], line,
+          `outerFirst=${outerFirst}, forced=${forced}, scenario=${index}`));
+        assert.equal(source.includes('switch (statePc)'), forced || outerFirst, JSON.stringify(diagnostics));
+      }
+    }
+  } finally {
+    if (previous === undefined) delete process.env.CFR_JS_FORCE_STATE_MACHINE;
+    else process.env.CFR_JS_FORCE_STATE_MACHINE = previous;
+    fs.rmSync(temporary, {recursive: true, force: true});
+  }
+});
+
 test('finally cleanup preserves pending loop exits, returns and throwable identity', () => {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-finally-loop-exits-'));
   const previous = process.env.CFR_JS_FORCE_STATE_MACHINE;
