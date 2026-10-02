@@ -391,3 +391,49 @@ test('conditional assignments preserve native bits, unboxing, exceptions and eff
       .trim().split('\n').length, 90);
   } finally { fs.rmSync(temporary, {recursive: true, force: true}); }
 });
+
+test('folding a value branch can shorten an enclosing return guard without reordering effects', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-emitter-nested-value-branches-'));
+  try {
+    const tree = {t: 'if', block: 0, then: seq(straight(1), straight(2), straight(3), straight(4)),
+      els: seq({t: 'if', block: 5, then: straight(6), els: straight(7)}, straight(8))};
+    const sources = {1: "trace.append('a');", 2: "trace.append('c');",
+      3: "trace.append('d');", 4: 'return done(3 / divisor, trace);',
+      6: 'value = 0;', 7: 'value = 1;', 8: 'return done(value / divisor, trace);'};
+    const render = {cond: id => id ? 'inner(x, trace)' : 'outer(first, trace)',
+      straight: id => [sources[id]], localType: name => name === 'value' ? 'int' : null};
+    const folded = emitStatements(treeToStatements(tree, render));
+    const previous = emitStatements(treeToStatements(tree, {...render, localType: undefined}));
+    assert.match(previous, /^if \(outer\(first, trace\)\)/);
+    assert.match(folded, /^if \(!\(outer\(first, trace\)\)\)/);
+    assert.match(folded, /value = \(inner\(x, trace\)\) \? 0 : 1;/);
+    const source = `public class NestedValueBranches {
+      static boolean outer(boolean first, StringBuilder trace) { trace.append('o'); return first; }
+      static Boolean inner(double x, StringBuilder trace) {
+        trace.append('i'); if (x == 7) throw new IllegalArgumentException();
+        return Double.isNaN(x) ? null : x <= 0;
+      }
+      static String done(int value, StringBuilder trace) { trace.append('r'); return value+":"+trace; }
+      ${[['original', previous], ['rebuilt', folded]].map(([name, body]) => `
+        static String ${name}(boolean first, double x, int divisor) {
+          StringBuilder trace = new StringBuilder(); int value;
+          try { ${body} } catch (RuntimeException failure) { return failure.getClass().getName()+":"+trace; }
+        }`).join('\n')}
+      public static void main(String[] args) {
+        double[] values = {Double.NEGATIVE_INFINITY, -2147483648d, -7d, -0d, 0d,
+          7d, 2147483647d, Double.POSITIVE_INFINITY, Double.NaN};
+        for (boolean first : new boolean[]{false,true}) for (double x : values)
+          for (int divisor : new int[]{-1,0,1}) {
+            String expected = original(first,x,divisor), actual = rebuilt(first,x,divisor);
+            if (!expected.equals(actual)) throw new AssertionError(first+":"+x+":"+divisor+":"+expected+":"+actual);
+            System.out.println(first+":"+x+":"+divisor+":"+actual);
+          }
+      }
+    }`;
+    const javaFile = path.join(temporary, 'NestedValueBranches.java');
+    fs.writeFileSync(javaFile, source);
+    run('javac', ['--release', '8', '-d', temporary, javaFile], temporary);
+    assert.equal(run('java', ['-cp', temporary, 'NestedValueBranches'], temporary)
+      .trim().split('\n').length, 54);
+  } finally { fs.rmSync(temporary, {recursive: true, force: true}); }
+});
