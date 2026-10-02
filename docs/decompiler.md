@@ -1051,3 +1051,31 @@ The standalone state-machine fixtures also now supply the same throw-owner
 and generic escape helper that production class emission already provides.
 This corrects a stale test harness after the prior unmatched-throw hardening;
 all 11 dispatcher readability checks compile and pass.
+
+## Proving loop updates before recovering `for`
+
+While-to-for recovery now parses the complete body and proves that every normal
+or own-continue backedge contains exactly one update selected for removal.
+Every break/return/throw/other exit must contain none. Other writes to the
+counter, shadow declarations, unsupported syntax and Unicode escapes refuse
+recovery. Nested loop, label, try, finally and monitor bodies remain opaque;
+updates or own continues within them cannot move to the header. Both the early
+linear loop renderer and later CFG text cleanup use this proof.
+
+The former continue-only inference found an increment before a null-entry
+continue in GeoBlox dispatcher shutdown and lifted it into the for header,
+leaving increments in the success/catch arms. This skipped cache indices 1 and
+3 in a five-entry fixture. Native bytecode closes every entry. Preferences
+search has the same continue/caught-failure shape. These loops now retain
+explicit while backedges at their original protected boundaries. Eligible
+ordinary counting loops still become for loops.
+
+`test/cfrExceptionLoopExits.test.js` includes direct refusal/acceptance checks
+and 600 native protected-counter cases, each compared with structured and
+forced-dispatcher recompilation (1,200 comparisons). The independent visitation
+oracle checks skipped/present entries, caught IOException, uncaught runtime
+failures/errors, final counters, effect order and throwable identity. GeoBlox's
+existing native probe separately covers 96 cache-shutdown combinations of null
+entries and close failures, including handle retention and monitor release.
+This is evidence for those scopes; goto-free output and successful compilation
+alone do not establish whole-corpus runtime equivalence.

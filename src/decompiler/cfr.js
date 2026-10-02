@@ -7035,6 +7035,76 @@ function loopUpdateStatement(body, label) {
   return { update, drop };
 }
 
+// Moving an update to a for header changes every normal/continue backedge.
+// Prove each such path has exactly one selected update, and every other exit
+// has none. Never lift an update across a handler, monitor or nested loop.
+function canLiftLoopUpdate(body, label, found, variable) {
+  const source = `{\n${body.join('\n')}\n}`;
+  if (/\\u+[0-9a-fA-F]{4}/.test(source)) return false;
+  let parsed;
+  try { parsed = javaStatementParser.parseStatement(source, {requireComplete: true}); }
+  catch (_) { return false; }
+  const selected = new Set();
+  let offset = 2;
+  for (let index = 0; index < body.length; index++) {
+    if (found.drop.includes(index)) selected.add(offset + leadingWhitespace(body[index]).length);
+    offset += body[index].length + 1;
+  }
+  let valid = true;
+  function inspect(node, statement = null) {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) { for (const child of node) inspect(child, statement); return; }
+    if (node.kind?.startsWith('Unsupported') || ['LambdaExpression', 'ClassDeclaration',
+      'InterfaceDeclaration', 'EnumDeclaration', 'RecordDeclaration'].includes(node.kind)
+      || node.kind === 'NewClassExpression' && node.body != null) valid = false;
+    if (node.kind === 'VariableDeclarator' && node.name === variable
+      || node.kind === 'CatchClause' && node.parameter?.name === variable) valid = false;
+    if (node.kind?.endsWith('Statement')) statement = node;
+    const write = node.kind === 'AssignmentExpression' ? node.left
+      : node.kind === 'UnaryExpression' && ['++', '--'].includes(node.operator) ? node.operand : null;
+    if (write?.kind === 'Identifier' && write.name === variable &&
+        !(statement?.kind === 'ExpressionStatement' && statement.expression === node
+          && selected.has(statement.range?.startOffset))) valid = false;
+    for (const [key, child] of Object.entries(node)) if (key !== 'range') inspect(child, statement);
+  }
+  inspect(parsed);
+  if (!valid) return false;
+  const unique = paths => [...new Map(paths.map(path => [`${path.exit}:${path.count}`, path])).values()];
+  const normal = count => [{exit: 'normal', count}];
+  function opaqueSafe(node, nested = 0) {
+    if (!node || typeof node !== 'object') return true;
+    if (Array.isArray(node)) return node.every(child => opaqueSafe(child, nested));
+    if (selected.has(node.range?.startOffset) && node.kind === 'ExpressionStatement') return false;
+    if (node.kind === 'ContinueStatement' && (node.label ? node.label === label : nested === 0)) return false;
+    if (['WhileStatement', 'ForStatement', 'EnhancedForStatement', 'DoWhileStatement'].includes(node.kind)) nested++;
+    return Object.entries(node).every(([key, child]) => key === 'range' || opaqueSafe(child, nested));
+  }
+  function flow(node) {
+    if (node.kind === 'BlockStatement') {
+      let paths = normal(0);
+      for (const child of node.statements) {
+        const next = flow(child); if (!next) return null;
+        paths = unique(paths.flatMap(path => path.exit === 'normal'
+          ? next.map(tail => ({exit: tail.exit, count: Math.min(2, path.count + tail.count)})) : [path]));
+      }
+      return paths;
+    }
+    if (node.kind === 'IfStatement') {
+      const yes = flow(node.consequent), no = node.alternate ? flow(node.alternate) : normal(0);
+      return yes && no ? unique([...yes, ...no]) : null;
+    }
+    if (node.kind === 'ExpressionStatement') return normal(selected.has(node.range?.startOffset) ? 1 : 0);
+    if (node.kind === 'ContinueStatement') return [{exit: node.label && node.label !== label ? 'escape' : 'continue', count: 0}];
+    if (['BreakStatement', 'ReturnStatement', 'ThrowStatement'].includes(node.kind)) return [{exit: 'escape', count: 0}];
+    // These intact constructs may finish normally; abrupt internal paths never
+    // acquire a header update. Refuse any selected update or own continue in
+    // them rather than assuming exception/finally/monitor/loop completion.
+    return opaqueSafe(node) ? normal(0) : null;
+  }
+  const paths = flow(parsed);
+  return paths && paths.every(path => path.count === (['normal', 'continue'].includes(path.exit) ? 1 : 0));
+}
+
 function rewriteWhileLoopsAsFor(lines) {
   const out = lines.slice();
   for (let index = 1; index < out.length; index += 1) {
@@ -7049,7 +7119,7 @@ function rewriteWhileLoopsAsFor(lines) {
     const found = loopUpdateStatement(body, label);
     if (!found) continue;
     const variable = updateVariableName(found.update);
-    if (!variable) continue;
+    if (!variable || !canLiftLoopUpdate(body, label, found, variable)) continue;
     const initMatch = /^(?:(?:[A-Za-z_$][A-Za-z0-9_$]*(?:\[\])?|[A-Za-z_$][A-Za-z0-9_$.<>?, ]+)\s+)?([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*.+;$/
       .exec(String(out[index - 1]).trim());
     if (!initMatch || initMatch[1] !== variable) continue;
@@ -7281,7 +7351,8 @@ function rewriteWhileAsFor(previousLine, loopLines) {
 
   const updateLine = body[body.length - 1].trim();
   const updateVariable = updateVariableName(updateLine);
-  if (!updateVariable) return null;
+  if (!updateVariable || !canLiftLoopUpdate(body, null,
+    {drop: [body.length - 1]}, updateVariable)) return null;
 
   const initMatch = /^(?:(?:[A-Za-z_$][A-Za-z0-9_$]*(?:\[\])?|[A-Za-z_$][A-Za-z0-9_$.<>?, ]+)\s+)?([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*.+;$/.exec(previousLine.trim());
   if (!initMatch || initMatch[1] !== updateVariable) return null;
@@ -10333,6 +10404,8 @@ module.exports = {
     javaTypeFromInternalName,
     normalizeLegacyClassFile,
     rewriteDuplicateLocalDeclarations,
+    rewriteWhileLoopsAsFor,
+    rewriteWhileAsFor,
     printCfgStateMachine,
   },
 };

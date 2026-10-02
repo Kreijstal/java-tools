@@ -801,3 +801,118 @@ test('ordered catch arms preserve inner and outer exits and uncaught exception e
     fs.rmSync(temporary, {recursive: true, force: true});
   }
 });
+
+
+test('for recovery proves all backedges and preserves protected updates', () => {
+  const {rewriteWhileLoopsAsFor, rewriteWhileAsFor} = require('../src/decompiler/cfr')._internals;
+  const lines = body => ['i = 0;', 'L: while (i < limit) {', ...body, '}'];
+  for (const body of [
+    ['  if (skip()) {', '    i++;', '    continue L;', '  }', '  try {', '    close(i);', '    i++;', '  } catch (IOException e) {', '    i++;', '  }'],
+    ['  if (skip()) {', '    i++;', '    continue L;', '  }', '  work();'],
+    ['  try {', '    i++;', '    continue L;', '  } finally {', '    observe(i);', '  }'],
+    ['  synchronized (lock) {', '    i++;', '    continue L;', '  }'],
+    ['  if (skip()) {', '    i++;', '    continue L;', '  }', '  i += 2;', '  i++;'],
+    ['  while (inner()) {', '    i++;', '    continue L;', '  }', '  i++;'],
+    ['  int i = 10;', '  i++;'],
+    ['  unknown ???;', '  i++;'],
+  ]) assert.deepEqual(rewriteWhileLoopsAsFor(lines(body)), lines(body));
+  for (const body of [
+    ['  work(i);', '  i++;'],
+    ['  if (skip()) {', '    i++;', '    continue L;', '  }', '  work(i);', '  i++;'],
+    ['  if (skip()) {', '    i++;', '    continue L;', '  } else {', '    i++;', '    continue L;', '  }'],
+    ['  while (inner()) {', '    work(i);', '    continue;', '  }', '  i++;'],
+    ['  try {', '    work(i);', '  } catch (IOException e) {', '    caught(e);', '  }', '  i++;'],
+    ['  if (stop()) {', '    break;', '  }', '  i++;'],
+  ]) assert.match(rewriteWhileLoopsAsFor(lines(body)).join('\n'), /for \(i = 0;/);
+  const early = ['while (i < limit) {','  if (skip()) {','    continue;','  }','  i++;','}'];
+  assert.equal(rewriteWhileAsFor('i = 0;',early),null,'early text structuring cannot add an update to an existing continue');
+  assert.match(rewriteWhileAsFor('i = 0;',['while (i < limit) {','  work(i);','  i++;','}']).join('\n'),/for \(i = 0;/);
+});
+
+test('protected counter backedges visit every entry and match native failure effects', () => {
+  const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'cfr-protected-counter-'));
+  const previous=process.env.CFR_JS_FORCE_STATE_MACHINE;
+  try {
+    const native=path.join(temporary,'native');fs.mkdirSync(native);
+    const assembly=`.version 49 0
+    .class public super ProtectedCounter
+    .super java/lang/Object
+    .method public static visit : (IIII)I
+      .code stack 3 locals 6
+      .catch java/io/IOException from Lwork to LworkEnd using Lcatch
+      iconst_0
+      istore 4
+    Lhead:
+      iload 4
+      iload_0
+      if_icmpge Ldone
+      iload_1
+      iconst_1
+      iload 4
+      ishl
+      iand
+      ifne Lwork
+      iinc 4 1
+      goto Lhead
+    Lwork:
+      iload 4
+      iload_2
+      iload_3
+      invokestatic Method CounterEffects close (III)V
+    LworkEnd:
+      iinc 4 1
+      goto Lhead
+    Lcatch:
+      astore 5
+      aload 5
+      invokestatic Method CounterEffects caught (Ljava/lang/Throwable;)V
+      iinc 4 1
+      goto Lhead
+    Ldone:
+      iload 4
+      ireturn
+      .end code
+    .end method
+    .end class`;
+    const classFile=path.join(native,'ProtectedCounter.class');assembleJasminSource(assembly,classFile);
+    const effects=`class CounterEffects {
+      static String trace;static Throwable failure;
+      static void close(int index,int throwAt,int kind)throws java.io.IOException {
+        trace+="C"+index;if(index!=throwAt || kind==0)return;
+        failure=kind==1?new java.io.IOException():kind==2?new IllegalArgumentException():new AssertionError();
+        if(kind==1)throw (java.io.IOException)failure;if(kind==2)throw (RuntimeException)failure;throw (Error)failure;
+      }
+      static void caught(Throwable error){if(error!=failure)throw new AssertionError("caught identity");trace+="H";}
+    }`;
+    const driver=`class CounterRunner {public static void main(String[] args)throws Exception {
+      int cases=0;
+      for(int limit:new int[]{-1,0,1,2,5,8})for(int mask:new int[]{0,1,3,42,255})
+      for(int throwAt:new int[]{-1,0,1,4,7})for(int kind=0;kind<4;kind++) {
+        CounterEffects.trace="";CounterEffects.failure=null;String outcome;
+        try{outcome=""+ProtectedCounter.visit(limit,mask,throwAt,kind);}
+        catch(RuntimeException|Error error){if(error!=CounterEffects.failure)throw new AssertionError("escaping identity");outcome=error.getClass().getSimpleName();}
+        String expected="";boolean fails=false;
+        for(int i=0;i<limit;i++)if((mask&(1<<i))!=0){expected+="C"+i;if(i==throwAt&&kind!=0){if(kind==1)expected+="H";else{fails=true;break;}}}
+        if(!CounterEffects.trace.equals(expected))throw new AssertionError("visited entries: "+CounterEffects.trace+" != "+expected);
+        if(!fails&&!outcome.equals(""+Math.max(0,limit)))throw new AssertionError("final counter");
+        System.out.println(limit+":"+mask+":"+throwAt+":"+kind+":"+outcome+":"+CounterEffects.trace);cases++;
+      }
+      if(cases!=600)throw new AssertionError("coverage");System.out.println("counter-complete:"+cases);
+    }} `;
+    for(const [name,text] of Object.entries({CounterEffects:effects,CounterRunner:driver}))fs.writeFileSync(path.join(native,name+'.java'),text);
+    run('javac',['--release','8','-cp',native,'-d',native,...['CounterEffects','CounterRunner'].map(name=>path.join(native,name+'.java'))],native);
+    const expected=run('java',['-cp',native,'CounterRunner'],native);assert.match(expected,/counter-complete:600\n$/);
+    for(const forced of [false,true]) {
+      if(forced)process.env.CFR_JS_FORCE_STATE_MACHINE='1';else delete process.env.CFR_JS_FORCE_STATE_MACHINE;
+      const source=decompileClassFile(classFile);assertNoFallback(source);
+      assert.equal(source.includes('switch (statePc)'),forced);
+      const rebuilt=path.join(temporary,forced?'forced':'structured');fs.mkdirSync(rebuilt);
+      for(const [name,text] of Object.entries({ProtectedCounter:source,CounterEffects:effects,CounterRunner:driver}))fs.writeFileSync(path.join(rebuilt,name+'.java'),text);
+      run('javac',['--release','8','-d',rebuilt,...['ProtectedCounter','CounterEffects','CounterRunner'].map(name=>path.join(rebuilt,name+'.java'))],rebuilt);
+      assert.equal(run('java',['-cp',rebuilt,'CounterRunner'],rebuilt),expected);
+    }
+  } finally {
+    if(previous===undefined)delete process.env.CFR_JS_FORCE_STATE_MACHINE;else process.env.CFR_JS_FORCE_STATE_MACHINE=previous;
+    fs.rmSync(temporary,{recursive:true,force:true});
+  }
+});
