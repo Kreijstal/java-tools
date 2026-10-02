@@ -6,7 +6,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const {spawnSync} = require('child_process');
-const {treeToStatements, emitStatements} = require('../src/decompiler/javaAstEmitter');
+const {treeToStatements, emitStatements, promoteBooleanStackCarriers} = require('../src/decompiler/javaAstEmitter');
 const {printTree} = require('../src/decompiler/structurer');
 const {JavaParser} = require('../src/java-frontend/parser');
 const {decompileClassFile, assertNoFallback} = require('../src/decompiler/cfr');
@@ -436,4 +436,130 @@ test('folding a value branch can shorten an enclosing return guard without reord
     assert.equal(run('java', ['-cp', temporary, 'NestedValueBranches'], temporary)
       .trim().split('\n').length, 54);
   } finally { fs.rmSync(temporary, {recursive: true, force: true}); }
+});
+
+const booleanCarrier = 'stackIn_1_0';
+function promote(source, localType = name => name === 'flag' ? 'boolean' : name === 'x' ? 'double' : null) {
+  return promoteBooleanStackCarriers(source, [`int ${booleanCarrier} = 0;`],
+    new Map([[booleanCarrier, 'int']]), localType);
+}
+
+test('Boolean carrier proofs preserve snapshots and inline only a single adjacent pure use', () => {
+  const name = booleanCarrier;
+  const inline = promote(`${name} = (flag) ? 0 : 1; accept(${name} != 0);`);
+  assert.deepEqual(inline.removed, [name]);
+  assert.deepEqual(inline.declarations, []);
+  assert.equal(inline.source.trim(), 'accept(!flag);');
+  const snapshot = promote(`${name} = (pick()) ? 0 : 1; receive().accept(${name} != 0);`);
+  assert.deepEqual(snapshot.promoted, [name]);
+  assert.match(snapshot.source, /stackIn_1_0 = !\(pick\(\)\); receive\(\)\.accept\(stackIn_1_0\);/);
+  assert.deepEqual(snapshot.declarations, ['boolean stackIn_1_0 = false;']);
+  for (const source of [
+    `${name} = (flag) ? 0 : 1; accept(flag = !flag, ${name} != 0);`,
+    `${name} = (flag) ? 0 : 1; flag = !flag; accept(${name} != 0);`,
+    `${name} = (flag) ? 0 : 1; while (${name} != 0) { flag = !flag; break; }`,
+    `${name} = (flag) ? 0 : 1; accept(${name} != 0, ${name} == 0);`,
+    `if (flag) { ${name} = 1; } accept(${name} != 0);`,
+  ]) assert.deepEqual(promote(source).promoted, [name], source);
+  const boxed = promote(`${name} = (flag) ? 0 : 1; receive().accept(${name} != 0);`,
+    () => 'Boolean');
+  assert.deepEqual(boxed.promoted, [name]);
+  assert.match(boxed.source, /stackIn_1_0 = !\(flag\); receive\(\)\.accept\(stackIn_1_0\)/);
+  const literals = promote(`${name} = 1; return 0 == ${name};`);
+  assert.equal(literals.source.trim(), 'return false;');
+});
+
+test('numeric uses, shadowing, partial parses and textual lookalikes cannot retype a carrier', () => {
+  const name = booleanCarrier;
+  for (const source of [
+    `${name} = 2; return ${name} != 0;`,
+    `${name} = (flag) ? 0 : 2; return ${name} != 0;`,
+    `${name} = 1; return ${name};`,
+    `${name} = 1; return ${name} + 1 != 0;`,
+    `${name} = 1; return ${name} != (0 + call());`,
+    `${name} = 1; return ${name} != 0 * call();`,
+    `${name} = 1; return ${name} != 1;`,
+    `${name} = 1; ${name}++; return ${name} != 0;`,
+    `accept(${name} = 1); return ${name} != 0;`,
+    `if (flag) { int ${name} = 1; accept(${name} != 0); }`,
+    `try { ${name} = 1; } catch (Error ${name}) { work(); } return ${name} != 0;`,
+    `${name} = 1; accept(holder.${name} != 0);`,
+    `${name} = 1; Object x = new Base() { boolean get() { return ${name} != 0; } };`,
+    `${name} = 1; Runnable x = () -> accept(${name} != 0);`,
+    `${name} = 1; return ${name} != 0; } trailing();`,
+    `${name} = 1; String x = "\\u0041"; return ${name} != 0;`,
+  ]) {
+    const result = promote(source);
+    assert.equal(result.source, source, source);
+    assert.deepEqual(result.promoted, [], source);
+    assert.deepEqual(result.removed, [], source);
+  }
+  const quoted = promote(`${name} = 1; String message = "${name} != 0"; return ${name} != 0;`);
+  assert.deepEqual(quoted.promoted, [name]);
+  assert.match(quoted.source, /String message = "stackIn_1_0 != 0"/);
+});
+
+test('Boolean snapshots and safe inlining match native values, failure priority and effect order', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-emitter-boolean-carriers-'));
+  try {
+    const name = booleanCarrier;
+    const variants = [
+      `${name} = (flag) ? 0 : 1; return accept(${name} != 0, trace);`,
+      `${name} = (flag) ? 1 : 0; return accept(0 == ${name}, trace);`,
+      `${name} = 1; return accept(${name} == 0, trace);`,
+      `${name} = (pick(x, trace)) ? 0 : 1; return receive(trace).done(before(trace), ${name} != 0, trace);`,
+      `${name} = (boxed) ? 0 : 1; return receive(trace).done(before(trace), ${name} != 0, trace);`,
+      `${name} = (flag) ? 0 : 1; return receive(trace).done(before(trace), (flag = !flag) && ${name} != 0, trace);`,
+      `${name} = (flag) ? 0 : 1; flag = !flag; return accept(${name} != 0, trace);`,
+      `${name} = (pick(x, trace)) ? 0 : 0; return accept(${name} != 0, trace);`,
+      `${name} = (pick(x, trace)) ? 1 : 1; return accept(${name} == 0, trace);`,
+      `if (flag) { ${name} = 1; } return accept(${name} != 0, trace);`,
+      `${name} = (flag) ? 0 : 1; if (${name} != 0) return accept(true, trace); return accept(${name} == 0, trace);`,
+      `${name} = (flag) ? 0 : 1; for (int i=0; i<2 && ${name} != 0; i++) { trace.append(i); flag = !flag; } return accept(flag, trace);`,
+      `${name} = (x >= 0d) ? 0 : 1; return receive(trace).done(before(trace), ${name} != 0, trace);`,
+      `${name} = (x < -2147483648) ? 0 : 1; return accept(${name} == 0, trace);`,
+      `${name} = (x >= -9223372036854775808L) ? 1 : 0; return receive(trace).done(before(trace), (x = 1.0d) > 0 && ${name} != 0, trace);`,
+    ];
+    const methods = [];
+    variants.forEach((original, index) => {
+      const rebuilt = promote(original);
+      assert.equal(rebuilt.promoted.length + rebuilt.removed.length, 1, original);
+      for (const [label, declarations, body] of [['original', [`int ${name} = 0;`], original],
+        ['rebuilt', rebuilt.declarations, rebuilt.source]]) {
+        methods.push(`static String ${label}${index}(boolean flag,double x,Boolean boxed) {
+          StringBuilder trace = new StringBuilder(); ${declarations.join('\n')}
+          try { ${body} } catch (RuntimeException failure) { return failure.getClass().getName()+":"+trace; }
+        }`);
+      }
+    });
+    const source = `public class BooleanCarriers {
+      static int mode;
+      static Boolean pick(double x,StringBuilder trace) {
+        trace.append('q'); if (x == 7) throw new IllegalArgumentException();
+        return Double.isNaN(x) ? null : x <= 0;
+      }
+      static BooleanCarriers receive(StringBuilder trace) {
+        trace.append('r'); if (mode == 1) throw new IllegalStateException(); return new BooleanCarriers();
+      }
+      static int before(StringBuilder trace) {
+        trace.append('b'); if (mode == 2) throw new UnsupportedOperationException(); return 7;
+      }
+      static String accept(boolean flag,StringBuilder trace) { trace.append('a'); return flag+":"+trace; }
+      String done(int ignored,boolean flag,StringBuilder trace) { return accept(flag,trace); }
+      ${methods.join('\n')}
+      public static void main(String[] args) {
+        for (mode=0;mode<3;mode++) for (boolean flag : new boolean[]{false,true})
+          for (double x : new double[]{-0d,7d,Double.NaN}) for (Boolean boxed : new Boolean[]{false,true,null}) {
+            ${variants.map((_, index) => `{
+              String expected=original${index}(flag,x,boxed),actual=rebuilt${index}(flag,x,boxed);
+              if (!expected.equals(actual)) throw new AssertionError(${index}+":"+mode+":"+flag+":"+x+":"+boxed+":"+expected+":"+actual);
+              System.out.println(${index}+":"+mode+":"+flag+":"+x+":"+boxed+":"+actual);
+            }`).join('\n')}
+          }
+      }
+    }`;
+    const javaFile=path.join(temporary,'BooleanCarriers.java');fs.writeFileSync(javaFile,source);
+    run('javac',['--release','8','-d',temporary,javaFile],temporary);
+    assert.equal(run('java',['-cp',temporary,'BooleanCarriers'],temporary).trim().split('\n').length,810);
+  } finally {fs.rmSync(temporary,{recursive:true,force:true});}
 });

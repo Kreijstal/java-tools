@@ -7,6 +7,7 @@ const {
   classType,
 } = require('../java-frontend/ast');
 const { JavaParser } = require('../java-frontend/parser');
+const { tokenizeJava } = require('../java-frontend/lexer');
 
 const rawExpression = (source) => createNode('UnsupportedExpression', { source: String(source) });
 const rawStatement = (source) => createNode('UnsupportedStatement', { source: String(source) });
@@ -176,6 +177,208 @@ function valueProducingBranch(condition, thenStatements, elseStatements, localTy
   // reject. An unproven name could be an unqualified (possibly volatile) field.
   if (destination !== taken.type) return null;
   return rawStatement(`${taken.name} = (${condition}) ? ${taken.source} : ${other.source};`);
+}
+
+// Prove every use before changing a generated stack slot's representation.
+// AST nodes establish allowed stores/reads; lexer offsets preserve all other
+// source bytes. Effectful conditions remain snapshots at their original point.
+function promoteBooleanStackCarriers(source, declarations, carrierTypes, localType) {
+  const unchanged = () => ({source, declarations, promoted: [], removed: []});
+  if (/\\u+[0-9a-fA-F]{4}/.test(source)) return unchanged(); // translated offsets differ
+  const candidates = new Map();
+  for (const declaration of declarations) {
+    const match = /^int (stackIn_\d+_\d+)(?: = ([01]))?;$/.exec(declaration);
+    if (match && carrierTypes.get(match[1]) === 'int') candidates.set(match[1], {
+      writes: [], reads: [], occurrences: 0, invalid: false,
+    });
+  }
+  if (!candidates.size) return unchanged();
+  let parsed, tokens;
+  try {
+    parsed = statementParser.parseStatement(`{\n${source}\n}`, {requireComplete: true});
+    const lexed = tokenizeJava(source);
+    if (lexed.diagnostics.length) return unchanged();
+    tokens = lexed.tokens.filter(token => !['comment', 'whitespace', 'eof'].includes(token.kind));
+  } catch (_) { return unchanged(); }
+  const bit = node => node && node.kind === 'LiteralExpression'
+    && node.literalKind === 'number' && ['0', '1'].includes(node.raw) ? node.raw : null;
+  const zero = node => bit(node) === '0';
+  let unknown = false;
+  function walk(node, parent = null, key = null, statement = null, blockNode = null, unsafe = false) {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) { for (const child of node) walk(child, parent, key, statement, blockNode, unsafe); return; }
+    if (node.kind) {
+      if (node.kind.startsWith('Unsupported')) unknown = true;
+      unsafe ||= ['ClassDeclaration', 'InterfaceDeclaration', 'EnumDeclaration', 'RecordDeclaration',
+        'MethodDeclaration', 'ConstructorDeclaration', 'LambdaExpression'].includes(node.kind)
+        || node.kind === 'NewClassExpression' && node.body != null;
+      if (node.kind === 'BlockStatement') blockNode = node;
+      if (node.kind.endsWith('Statement')) statement = node;
+      if (node.kind === 'Identifier' && candidates.has(node.name)) {
+        const state = candidates.get(node.name); state.occurrences++;
+        if (unsafe) state.invalid = true;
+        else if (parent?.kind === 'AssignmentExpression' && key === 'left'
+            && parent.operator === '=' && statement?.kind === 'ExpressionStatement'
+            && statement.expression === parent) {
+          const value = parent.right;
+          if (bit(value) !== null || value.kind === 'ConditionalExpression'
+              && bit(value.consequent) !== null && bit(value.alternate) !== null)
+            state.writes.push({value, statement, blockNode});
+          else state.invalid = true;
+        } else if (parent?.kind === 'BinaryExpression' && ['==', '!='].includes(parent.operator)
+            && (key === 'left' && zero(parent.right) || key === 'right' && zero(parent.left))) {
+          state.reads.push({comparison: parent, statement, blockNode});
+        } else state.invalid = true;
+      }
+    }
+    for (const [childKey, child] of Object.entries(node)) {
+      if (['range', 'tokens', 'meta', 'kind'].includes(childKey)) continue;
+      if (child && typeof child === 'object') walk(child, node, childKey, statement, blockNode, unsafe);
+    }
+  }
+  walk(parsed);
+  if (unknown) return unchanged();
+  const indices = new Map([...candidates.keys()].map(name => [name, []]));
+  tokens.forEach((token, index) => { if (token.kind === 'identifier' && indices.has(token.text)) indices.get(token.text).push(index); });
+  const edits = [], promoted = [], removed = [];
+  const numericTypes = new Set(['byte', 'short', 'char', 'int', 'long', 'float', 'double']);
+  const pureNumber = node => {
+    if (node.kind === 'ParenthesizedExpression') return pureNumber(node.expression);
+    if (node.kind === 'Identifier' && numericTypes.has(localType?.(node.name))) return new Set([node.name]);
+    if (node.kind === 'LiteralExpression' && node.literalKind === 'number') return new Set();
+    if (node.kind === 'UnaryExpression' && ['+', '-', '~'].includes(node.operator)) return pureNumber(node.operand);
+    return null;
+  };
+  const pureBoolean = node => {
+    if (node.kind === 'ParenthesizedExpression') return pureBoolean(node.expression);
+    if (node.kind === 'Identifier' && localType?.(node.name) === 'boolean') return new Set([node.name]);
+    if (node.kind === 'UnaryExpression' && node.operator === '!') return pureBoolean(node.operand);
+    if (node.kind === 'LiteralExpression' && node.literalKind === 'boolean') return new Set();
+    if (node.kind === 'BinaryExpression') {
+      let left = null, right = null;
+      if (['==', '!=', '<', '>', '<=', '>='].includes(node.operator)) {
+        left = pureNumber(node.left); right = pureNumber(node.right);
+        if ((!left || !right) && ['==', '!='].includes(node.operator)) {
+          left = pureBoolean(node.left); right = pureBoolean(node.right);
+        }
+      } else if (['&&', '||'].includes(node.operator)) {
+        left = pureBoolean(node.left); right = pureBoolean(node.right);
+      }
+      if (left && right) return new Set([...left, ...right]);
+    }
+    return null;
+  };
+  function pureSource(node) {
+    if (node.kind === 'ParenthesizedExpression') return pureSource(node.expression);
+    if (node.kind === 'UnaryExpression') {
+      const operand = pureSource(node.operand);
+      // Decimal MIN_VALUE literals are legal only directly under unary minus.
+      return `${node.operator}${['Identifier', 'LiteralExpression'].includes(node.operand.kind) ? operand : `(${operand})`}`;
+    }
+    if (node.kind === 'BinaryExpression') return `(${pureSource(node.left)} ${node.operator} ${pureSource(node.right)})`;
+    return node.kind === 'Identifier' ? node.name : node.raw || String(node.value);
+  }
+  function negatePure(value) {
+    if (value === 'true') return 'false';
+    if (value === 'false') return 'true';
+    return value.startsWith('!') ? value.slice(1) : `!${value}`;
+  }
+  function writesNames(node, names) {
+    if (!node || typeof node !== 'object') return false;
+    if ((node.kind === 'AssignmentExpression' && node.left?.kind === 'Identifier' && names.has(node.left.name))
+        || (node.kind === 'UnaryExpression' && ['++', '--'].includes(node.operator)
+          && node.operand?.kind === 'Identifier' && names.has(node.operand.name))) return true;
+    return Object.entries(node).some(([key, child]) => !['range', 'tokens', 'meta'].includes(key)
+      && child && typeof child === 'object' && writesNames(child, names));
+  }
+  for (const [name, state] of candidates) {
+    if (state.invalid || !state.writes.length || !state.reads.length
+        || indices.get(name).length !== state.occurrences) continue;
+    const localEdits = [], assignments = [], comparisons = [];
+    let valid = true;
+    for (const index of indices.get(name)) {
+      const token = tokens[index];
+      if (tokens[index + 1]?.text === '=') {
+        // The semicolon is outside the condition's parentheses/initializers.
+        // Literal conditional arms occupy the last four tokens of the RHS.
+        let end = index + 2, depth = 0;
+        for (; end < tokens.length; end++) {
+          const text = tokens[end].text;
+          if (text === '(' || text === '[' || text === '{') depth++;
+          else if (text === ')' || text === ']' || text === '}') depth--;
+          if (text === ';' && depth === 0) break;
+        }
+        const rhs = tokens.slice(index + 2, end);
+        const proof = state.writes[assignments.length];
+        let value = null;
+        if (proof && bit(proof.value) !== null && rhs.length === 1 && rhs[0].text === bit(proof.value))
+          value = rhs[0].text === '1' ? 'true' : 'false';
+        else if (proof?.value.kind === 'ConditionalExpression' && rhs.length > 4
+            && rhs.at(-4).text === '?' && rhs.at(-3).text === bit(proof.value.consequent)
+            && rhs.at(-2).text === ':' && rhs.at(-1).text === bit(proof.value.alternate)) {
+          const pure = pureBoolean(proof.value.condition);
+          const condition = pure ? pureSource(proof.value.condition)
+            : source.slice(rhs[0].range.startOffset, rhs.at(-5).range.endOffset);
+          const taken = bit(proof.value.consequent), other = bit(proof.value.alternate);
+          value = taken === other ? pure ? String(taken === '1') : `${condition} ? ${taken === '1'} : ${other === '1'}`
+            : taken === '1' ? condition : pure ? negatePure(condition)
+              : proof.value.condition.kind === 'ParenthesizedExpression' ? `!${condition}` : `!(${condition})`;
+        }
+        if (value === null || !tokens[end] || depth !== 0) { valid = false; break; }
+        assignments.push({proof, value, start: token.range.startOffset, end: tokens[end].range.endOffset});
+        localEdits.push({start: rhs[0].range.startOffset, end: rhs.at(-1).range.endOffset, value});
+      } else {
+        let first = index, last = index + 2;
+        if (tokens[index - 1]?.text === '==' || tokens[index - 1]?.text === '!=') {first = index - 2; last = index;}
+        const comparison = state.reads[comparisons.length]?.comparison;
+        const operator = tokens[first + 1]?.text;
+        if (!comparison || comparison.operator !== operator || !['==', '!='].includes(operator)
+            || !(tokens[first].text === name && tokens[last]?.text === '0'
+              || tokens[first].text === '0' && tokens[last]?.text === name)) {valid = false; break;}
+        comparisons.push({start: tokens[first].range.startOffset, end: tokens[last].range.endOffset, operator});
+      }
+    }
+    if (!valid || assignments.length !== state.writes.length || comparisons.length !== state.reads.length) continue;
+    let inline = false;
+    if (assignments.length === 1 && comparisons.length === 1) {
+      const write = assignments[0].proof, read = state.reads[0];
+      const names = write.value.kind === 'ConditionalExpression' ? pureBoolean(write.value.condition) : new Set();
+      const siblings = write.blockNode?.statements || [];
+      inline = !!names && write.blockNode === read.blockNode
+        && siblings[siblings.indexOf(write.statement) + 1] === read.statement
+        && ['ExpressionStatement', 'ReturnStatement', 'ThrowStatement'].includes(read.statement.kind)
+        && !writesNames(read.statement, names);
+    }
+    if (inline) {
+      removed.push(name);
+      const assignment = assignments[0];
+      let {start, end} = assignment;
+      const lineStart = source.lastIndexOf('\n', start - 1) + 1;
+      const lineEnd = source.indexOf('\n', end);
+      if (lineEnd >= 0 && !source.slice(lineStart, start).trim() && !source.slice(end, lineEnd).trim()) {
+        start = lineStart; end = lineEnd + 1;
+      }
+      edits.push({start, end, value: ''});
+    } else {
+      promoted.push(name); edits.push(...localEdits);
+    }
+    for (const comparison of comparisons) {
+      const value = inline ? assignments[0].value : name;
+      edits.push({...comparison, value: comparison.operator === '!=' ? value : negatePure(value)});
+    }
+  }
+  edits.sort((a, b) => a.start - b.start);
+  if (edits.some((edit, index) => index && edits[index - 1].end > edit.start)) return unchanged();
+  for (const edit of edits.reverse()) source = source.slice(0, edit.start) + edit.value + source.slice(edit.end);
+  const retyped = new Set(promoted), eliminated = new Set(removed);
+  declarations = declarations.flatMap(declaration => {
+    const match = /^int (stackIn_\d+_\d+)(?: = ([01]))?;$/.exec(declaration);
+    if (!match) return [declaration];
+    if (eliminated.has(match[1])) return [];
+    if (!retyped.has(match[1])) return [declaration];
+    return [`boolean ${match[1]}${match[2] === undefined ? '' : ` = ${match[2] === '1'}`};`];
+  });
+  return {source, declarations, promoted, removed};
 }
 
 function lowerIfStatements(condition, thenStatements, elseStatements, inverted, localType) {
@@ -544,4 +747,5 @@ function hasUnreachableStatement(statements) {
 
 module.exports = {
   treeToStatements, emitStatements, rawExpression, rawStatement, hasUnreachableStatement,
+  promoteBooleanStackCarriers,
 };
