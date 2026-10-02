@@ -8,6 +8,8 @@ const path = require('path');
 const {spawnSync} = require('child_process');
 const {treeToStatements, emitStatements} = require('../src/decompiler/javaAstEmitter');
 const {printTree} = require('../src/decompiler/structurer');
+const {JavaParser} = require('../src/java-frontend/parser');
+const {decompileClassFile, assertNoFallback} = require('../src/decompiler/cfr');
 
 const seq = (...body) => ({t: 'seq', body});
 const straight = block => ({t: 'straight', block});
@@ -124,5 +126,165 @@ test('emitted nested-loop and protected exits match native Java effect order', (
       assert.equal(run('java', ['-cp', temporary, `LoopExit${index}`], temporary)
         .trim().split('\n').length, 106);
     }
+  } finally { fs.rmSync(temporary, {recursive: true, force: true}); }
+});
+
+test('early-exit lowering renders both arms in their original order', () => {
+  const calls = [];
+  const output = emitStatements(treeToStatements({t: 'if', block: 0,
+    then: straight(1), els: straight(2)}, {
+    cond: () => { calls.push('condition'); return 'pick()'; },
+    straight: id => { calls.push(id); return [id === 1 ? 'work();' : 'return 7;']; },
+    condInverted: () => { calls.push('inverse'); return '!pick()'; },
+  }));
+  assert.deepEqual(calls, ['condition', 1, 2, 'inverse']);
+  assert.match(output, /if \(!pick\(\)\) \{\s+return 7;\s+\}\s+work\(\);/);
+  assert.doesNotMatch(output, /else/);
+});
+
+test('scope and exit proofs parse every statement and reject trailing input', () => {
+  const parser = new JavaParser();
+  assert.throws(() => parser.parseStatement('{ return 1; } int hidden = 2;',
+    {requireComplete: true}), /trailing tokens/);
+  // Keep the existing public parser's permissive default for its other users.
+  assert.equal(parser.parseStatement('return 1; return 2;').kind, 'ReturnStatement');
+  const renderSources = (thenSource, elseSource) => emitStatements(treeToStatements({
+    t: 'if', block: 0, then: straight(1), els: straight(2),
+  }, {cond: () => 'test', straight: id => [id === 1 ? thenSource : elseSource]}));
+  assert.match(renderSources('if (nested)\nreturn 1;', 'work();'), /else/);
+  assert.match(renderSources('Inner: { break Inner; }', 'work();'), /else/);
+  assert.match(renderSources('return 1;', 'work(); int value = 7; use(value);'),
+    /\}\s+\{\s+work\(\); int value = 7;/);
+  assert.match(renderSources('return 1;', 'class Value {} use(new Value());'),
+    /\}\s+\{\s+class Value/);
+  assert.doesNotMatch(renderSources('if (nested) return 1; else return 2;', 'work();'), /\} else \{\s+work/);
+  assert.match(renderSources('work();', 'return 2;'), /if \(!\(test\)\)/);
+  const shorterGuard = emitStatements(treeToStatements({t: 'if', block: 0,
+    then: {t: 'if', block: 1, then: straight(1), els: straight(2)},
+    els: straight(3)}, {
+    cond: id => id ? 'nested' : 'test',
+    straight: id => [`return ${id};`],
+  }));
+  assert.match(shorterGuard, /^if \(!\(test\)\) \{\s+return 3;\s+\}\s+if \(nested\)/);
+});
+
+test('early exits preserve native scopes, effects, NaNs and protected transfers', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-emitter-early-exits-'));
+  try {
+    const values = [-Infinity, -2147483648, -7, -0, 0, 7, 2147483647, Infinity, NaN];
+    const variants = [
+      {then: "trace.append('a'); return done(1, trace);",
+        els: "trace.append('b');", tail: "trace.append('z'); return done(2, trace);"},
+      {then: "trace.append('a');", els: "trace.append('b'); return done(2, trace);",
+        tail: "trace.append('z'); return done(1, trace);", invert: true},
+      {then: "if (x < -3) { trace.append('n'); return done(1, trace); } else { trace.append('p'); return done(2, trace); }",
+        els: "trace.append('b'); return done(3, trace);", tail: ''},
+      {then: 'return done(1, trace);', els: "trace.append('b'); int value = 7; trace.append(value);",
+        tail: 'int value = 3; trace.append(value); return done(value, trace);', scope: true},
+      {then: 'return done(1, trace);',
+        els: 'class Value { int get() { return 7; } } trace.append(new Value().get());',
+        tail: 'class Value { int get() { return 3; } } trace.append(new Value().get()); return done(3, trace);', scope: true},
+      {then: "trace.append('a'); if (x < -3)\nreturn done(1, trace);", els: "trace.append('b');",
+        tail: "trace.append('z'); return done(2, trace);", keepsElse: true},
+      {then: "Inner: { trace.append('a'); break Inner; }", els: "trace.append('b');",
+        tail: "trace.append('z'); return done(2, trace);", keepsElse: true},
+      {then: "synchronized (lock0) { if (!Thread.holdsLock(lock0)) throw new AssertionError(); trace.append('a'); return done(1, trace); }",
+        els: "if (Thread.holdsLock(lock0)) throw new AssertionError(); trace.append('b');",
+        tail: 'return done(2, trace);'},
+      {then: "try { trace.append('t'); if (x < -3) throw failure; return done(1, trace); } catch (IllegalArgumentException caught) { if (caught != failure) throw new AssertionError(); trace.append('c'); return done(2, trace); }",
+        els: "trace.append('b');", tail: 'return done(3, trace);'},
+      {then: "trace.append('t'); throw failure;", els: "trace.append('b');",
+        tail: 'return done(3, trace);'},
+    ];
+    const methods = [];
+    variants.forEach((variant, index) => {
+      const rebuilt = emitStatements(treeToStatements({t: 'if', block: 0,
+        then: straight(1), els: straight(2)}, {
+        cond: () => 'pick(x, trace)',
+        // This is the exact complement, including NaN; >= is not the
+        // complement of a floating-point < comparison.
+        condInverted: variant.invert ? () => '!pick(x, trace)' : undefined,
+        straight: id => [id === 1 ? variant.then : variant.els],
+      }));
+      if (variant.keepsElse) assert.match(rebuilt, /else/);
+      else assert.doesNotMatch(rebuilt, /^\} else \{/m);
+      if (variant.scope) assert.match(rebuilt, /\}\s+\{/);
+      if (variant.invert) assert.match(rebuilt, /if \(!pick\(x, trace\)\)/);
+      const original = `if (pick(x, trace)) { ${variant.then} } else { ${variant.els} }`;
+      for (const [name, body] of [['original', original], ['rebuilt', rebuilt]]) {
+        methods.push(`static String ${name}${index}(double x, Object lock0, IllegalArgumentException failure) {
+          StringBuilder trace = new StringBuilder();
+          try { ${body} ${variant.tail} } catch (IllegalArgumentException caught) {
+            if (caught != failure) throw new AssertionError();
+            return done(99, trace);
+          }
+        }`);
+      }
+    });
+    const source = `public class EarlyExits {
+      static boolean pick(double x, StringBuilder trace) { trace.append('q'); return x <= 0; }
+      static String done(int result, StringBuilder trace) { return result+":"+trace; }
+      ${methods.join('\n')}
+      public static void main(String[] args) {
+        Object lock = new Object(); IllegalArgumentException failure = new IllegalArgumentException();
+        double[] values = {Double.NEGATIVE_INFINITY, -2147483648d, -7d, -0d, 0d,
+          7d, 2147483647d, Double.POSITIVE_INFINITY, Double.NaN};
+        for (double value : values) {
+          ${variants.map((_, index) => `{
+            String expected = original${index}(value, lock, failure);
+            String actual = rebuilt${index}(value, lock, failure);
+            if (!expected.equals(actual) || Thread.holdsLock(lock))
+              throw new AssertionError(${index}+":"+value+":"+expected+":"+actual);
+            System.out.println(${index}+":"+value+":"+actual);
+          }`).join('\n')}
+        }
+      }
+    }`;
+    const javaFile = path.join(temporary, 'EarlyExits.java');
+    fs.writeFileSync(javaFile, source);
+    run('javac', ['--release', '8', '-d', temporary, javaFile], temporary);
+    assert.equal(run('java', ['-cp', temporary, 'EarlyExits'], temporary)
+      .trim().split('\n').length, variants.length * values.length);
+  } finally { fs.rmSync(temporary, {recursive: true, force: true}); }
+});
+
+test('a retained declaration block does not acquire an unreachable default return', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-emitter-scoped-return-'));
+  try {
+    const native = path.join(temporary, 'native');
+    const rebuilt = path.join(temporary, 'rebuilt');
+    fs.mkdirSync(native); fs.mkdirSync(rebuilt);
+    const source = `public class ScopedReturn {
+      public static int run(int count, boolean early) {
+        try {
+          if (early) return 52;
+          else {
+            int total = 0;
+            for (int index = 0; index < count; index++) total += 7 / (index - 2);
+            return total;
+          }
+        } catch (RuntimeException failure) { return -99; }
+      }
+    }`;
+    const javaFile = path.join(native, 'ScopedReturn.java');
+    fs.writeFileSync(javaFile, source);
+    run('javac', ['--release', '8', '-d', native, javaFile], temporary);
+    const decompiled = decompileClassFile(path.join(native, 'ScopedReturn.class'));
+    assertNoFallback(decompiled);
+    fs.writeFileSync(path.join(rebuilt, 'ScopedReturn.java'), decompiled);
+    const driver = `class ScopeRunner {
+      public static void main(String[] args) {
+        for (int count = -5; count <= 15; count++) for (boolean early : new boolean[]{false,true})
+          System.out.println(count+":"+early+":"+ScopedReturn.run(count,early));
+      }
+    }`;
+    for (const directory of [native, rebuilt]) {
+      fs.writeFileSync(path.join(directory, 'ScopeRunner.java'), driver);
+      run('javac', ['--release', '8', '-d', directory,
+        path.join(directory, 'ScopedReturn.java'), path.join(directory, 'ScopeRunner.java')], temporary);
+    }
+    const expected = run('java', ['-cp', native, 'ScopeRunner'], temporary);
+    assert.equal(expected.trim().split('\n').length, 42);
+    assert.equal(run('java', ['-cp', rebuilt, 'ScopeRunner'], temporary), expected);
   } finally { fs.rmSync(temporary, {recursive: true, force: true}); }
 });

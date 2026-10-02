@@ -1652,6 +1652,12 @@ function statementCompletesAbruptly(statement) {
   if (!trimmed.length) return false;
   const head = trimmed[0];
   if (/^(?:return|throw)\b/.test(head)) return true;
+  if (head === '{') {
+    // Early-exit lowering retains a plain block when removing else would
+    // widen declaration scopes. Such a block can still return on every path.
+    const segments = statementSegments(statement);
+    return segments.length === 1 && bodyCompletesAbruptly(segments[0].body);
+  }
   if (/^if\s*\(/.test(head)) {
     const segments = statementSegments(statement);
     const last = segments[segments.length - 1];

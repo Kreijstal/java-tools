@@ -6,6 +6,7 @@ const {
   formalParameter,
   classType,
 } = require('../java-frontend/ast');
+const { JavaParser } = require('../java-frontend/parser');
 
 const rawExpression = (source) => createNode('UnsupportedExpression', { source: String(source) });
 const rawStatement = (source) => createNode('UnsupportedStatement', { source: String(source) });
@@ -88,6 +89,75 @@ function endsWithContinueTo(statements, label) {
   return !!last && last.kind === 'ContinueStatement' && last.label === label;
 }
 
+const statementParser = new JavaParser();
+// Weak keys keep this proof cache from retaining completed methods or their
+// generated source. Parse the whole straight block, not just its first line.
+const parsedStraightBlocks = new WeakMap();
+function parsedStraightBlock(node) {
+  if (!parsedStraightBlocks.has(node)) {
+    let parsed = null;
+    try {
+      parsed = statementParser.parseStatement(`{\n${node.source}\n}`, { requireComplete: true });
+    } catch (_) { /* Unknown Java stays in its original scope/control flow. */ }
+    parsedStraightBlocks.set(node, parsed);
+  }
+  return parsedStraightBlocks.get(node);
+}
+
+function provenAbrupt(statements) {
+  const state = { unreachable: false };
+  return !sequenceCompletesNormally(statements, state, true) && !state.unreachable;
+}
+
+function continuation(statements) {
+  // Removing the enclosing else must not extend a variable or local type's
+  // scope into subsequent statements. In doubtful cases keep a plain block.
+  const scopedOrNondeclaring = new Set([
+    'BlockStatement', 'LabeledStatement', 'IfStatement', 'WhileStatement',
+    'ForStatement', 'DoWhileStatement', 'SwitchStatement', 'TryStatement',
+    'SynchronizedStatement', 'ExpressionStatement', 'ReturnStatement',
+    'ThrowStatement', 'BreakStatement', 'ContinueStatement', 'EmptyStatement',
+    'AssertStatement',
+  ]);
+  const scopeSafe = statements.every((statement) => {
+    if (statement.kind !== 'UnsupportedStatement') return scopedOrNondeclaring.has(statement.kind);
+    const parsed = parsedStraightBlock(statement);
+    return parsed && parsed.statements.every((child) => scopedOrNondeclaring.has(child.kind));
+  });
+  return scopeSafe ? statements : [block(statements)];
+}
+
+function statementCount(statements) {
+  let count = 0;
+  for (const statement of statements) anyStatement(statement, () => { count++; return false; });
+  return count;
+}
+
+function lowerIfStatements(condition, thenStatements, elseStatements, inverted) {
+  const makeIf = (source, body, alternate = null) => createNode('IfStatement', {
+    condition: rawExpression(source), consequent: block(body), alternate,
+  });
+  // All children have already been rendered in CFG order. Only rearrange the
+  // resulting AST, because rendering itself binds local names and types.
+  const inverse = () => (inverted && inverted()) || `!(${condition})`;
+  if (!thenStatements.length && elseStatements.length) {
+    return [makeIf(inverse(), elseStatements)];
+  }
+  if (elseStatements.length) {
+    const thenExits = provenAbrupt(thenStatements);
+    const elseExits = provenAbrupt(elseStatements);
+    // When both arms leave, use the shorter arm as the guard. This avoids
+    // retaining a deep conditional ladder in the guard's body.
+    if (thenExits && (!elseExits || statementCount(thenStatements) <= statementCount(elseStatements))) {
+      return [makeIf(condition, thenStatements), ...continuation(elseStatements)];
+    }
+    if (elseExits) {
+      return [makeIf(inverse(), elseStatements), ...continuation(thenStatements)];
+    }
+  }
+  return [makeIf(condition, thenStatements, elseStatements.length ? block(elseStatements) : null)];
+}
+
 function treeToStatements(tree, render) {
   if (!tree) return [];
   switch (tree.t) {
@@ -168,19 +238,8 @@ function treeToStatements(tree, render) {
           statement: createNode('WhileStatement', {
             condition: rawExpression('true'),
             body: block([
-              ...(taken === 'true' ? thenStatements : taken === 'false' ? elseStatements : [
-                !thenStatements.length && elseStatements.length && notTaken
-                  ? createNode('IfStatement', {
-                    condition: rawExpression(notTaken),
-                    consequent: block(elseStatements),
-                    alternate: null,
-                  })
-                  : createNode('IfStatement', {
-                    condition: rawExpression(taken),
-                    consequent: block(thenStatements),
-                    alternate: elseStatements.length ? block(elseStatements) : null,
-                  }),
-              ]),
+              ...(taken === 'true' ? thenStatements : taken === 'false' ? elseStatements
+                : lowerIfStatements(taken, thenStatements, elseStatements, () => notTaken)),
               ...restStatements,
             ]),
           }),
@@ -200,24 +259,8 @@ function treeToStatements(tree, render) {
       if (conditionSource === 'false') return tree.els ? treeToStatements(tree.els, render) : [];
       const thenStatements = treeToStatements(tree.then, render);
       const elseStatements = tree.els ? treeToStatements(tree.els, render) : [];
-      // An arm that came out empty - a fall-through break the tree pass removed -
-      // leaves `if (c) {} else { … }`. Negating the branch condition is better
-      // than wrapping the original in `!(…)`: the inverse of `v[2] <= 0.2` is the
-      // `v[2] > 0.2` that was written, not a double negative.
-      const inverse = !thenStatements.length && elseStatements.length && render.condInverted
-        ? render.condInverted(tree.block) : null;
-      if (inverse) {
-        return [createNode('IfStatement', {
-          condition: rawExpression(inverse),
-          consequent: block(elseStatements),
-          alternate: null,
-        })];
-      }
-      return [createNode('IfStatement', {
-        condition: rawExpression(conditionSource),
-        consequent: block(thenStatements),
-        alternate: elseStatements.length ? block(elseStatements) : null,
-      })];
+      return lowerIfStatements(conditionSource, thenStatements, elseStatements,
+        render.condInverted ? () => render.condInverted(tree.block) : null);
     }
     case 'switch': return [createNode('SwitchStatement', {
       expression: rawExpression(render.switchValue(tree.block)),
@@ -384,56 +427,64 @@ function rawStatementCompletes(source) {
   return !/^(return|throw|break|continue)\b/.test(lines[lines.length - 1]);
 }
 
-function statementCompletesNormally(node, state) {
+function statementCompletesNormally(node, state, parseRaw = false) {
   if (!node) return true;
   switch (node.kind) {
-    case 'BlockStatement': return sequenceCompletesNormally(node.statements || [], state);
-    case 'UnsupportedStatement': return rawStatementCompletes(node.source);
+    case 'BlockStatement': return sequenceCompletesNormally(node.statements || [], state, parseRaw);
+    case 'UnsupportedStatement': {
+      if (!parseRaw) return rawStatementCompletes(node.source);
+      // Parser-produced unsupported statements have no source and cannot
+      // establish a proof. A last-line return alone is not enough: it might
+      // belong to an unbraced conditional.
+      if (node.source == null) return true;
+      const parsed = parsedStraightBlock(node);
+      return parsed ? statementCompletesNormally(parsed, state, true) : true;
+    }
     case 'BreakStatement':
     case 'ContinueStatement':
     case 'ReturnStatement':
     case 'ThrowStatement':
       return false;
     case 'LabeledStatement':
-      return statementCompletesNormally(node.statement, state)
+      return statementCompletesNormally(node.statement, state, parseRaw)
         || containsBreakToLabel(node.statement, node.label);
     case 'WhileStatement': {
-      statementCompletesNormally(node.body, state); // walk for nested unreachable
+      statementCompletesNormally(node.body, state, parseRaw); // walk for nested unreachable
       const cond = node.condition && node.condition.kind === 'UnsupportedExpression'
         ? String(node.condition.source).trim() : '';
       return cond === 'true' ? containsUnlabeledBreak(node.body) : true;
     }
     case 'DoWhileStatement':
     case 'ForStatement':
-      statementCompletesNormally(node.body, state);
+      statementCompletesNormally(node.body, state, parseRaw);
       return true; // conservative: a non-`while (true)` loop may exit
     case 'IfStatement': {
-      const thenCompletes = statementCompletesNormally(node.consequent, state);
-      const elseCompletes = node.alternate ? statementCompletesNormally(node.alternate, state) : true;
+      const thenCompletes = statementCompletesNormally(node.consequent, state, parseRaw);
+      const elseCompletes = node.alternate ? statementCompletesNormally(node.alternate, state, parseRaw) : true;
       return thenCompletes || elseCompletes;
     }
     case 'SwitchStatement':
-      for (const group of node.groups || []) sequenceCompletesNormally(group.statements || [], state);
+      for (const group of node.groups || []) sequenceCompletesNormally(group.statements || [], state, parseRaw);
       return true; // conservative
     case 'TryStatement': {
-      const bodyCompletes = statementCompletesNormally(node.block, state);
+      const bodyCompletes = statementCompletesNormally(node.block, state, parseRaw);
       let anyCatchCompletes = false;
       for (const clause of node.catches || []) {
-        if (statementCompletesNormally(clause.body, state)) anyCatchCompletes = true;
+        if (statementCompletesNormally(clause.body, state, parseRaw)) anyCatchCompletes = true;
       }
-      if (node.finallyBlock && !statementCompletesNormally(node.finallyBlock, state)) return false;
+      if (node.finallyBlock && !statementCompletesNormally(node.finallyBlock, state, parseRaw)) return false;
       return bodyCompletes || anyCatchCompletes;
     }
-    case 'SynchronizedStatement': return statementCompletesNormally(node.body, state);
+    case 'SynchronizedStatement': return statementCompletesNormally(node.body, state, parseRaw);
     default: return true;
   }
 }
 
-function sequenceCompletesNormally(statements, state) {
+function sequenceCompletesNormally(statements, state, parseRaw = false) {
   let reachable = true;
   for (const statement of statements) {
     if (!reachable) { state.unreachable = true; return false; }
-    reachable = statementCompletesNormally(statement, state);
+    reachable = statementCompletesNormally(statement, state, parseRaw);
   }
   return reachable;
 }

@@ -1961,7 +1961,11 @@ class JavaParser {
 
   parseStatement(source, options = {}) {
     const parser = new ParserImpl(source, { ...this.options, ...options });
-    return parser.parseStatement();
+    const statement = parser.parseStatement();
+    if (options.requireComplete && !parser.eof) {
+      throw new SyntaxError('trailing tokens after Java statement');
+    }
+    return statement;
   }
 
   parseExpression(source, options = {}) {
