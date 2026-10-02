@@ -4295,7 +4295,9 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
       }
       retainedDeclarations = booleans ? booleans.declarations : uniqueDeclarations;
     }
-    if (!useStateMachine) source = factorCommonBranchTails(source).source;
+    if (!useStateMachine) source = factorCommonBranchTails(source, {
+      integralConditions: integralConditionsFromCache(cache),
+    }).source;
     let lines = source ? source.split('\n') : [];
     lines.unshift(...retainedDeclarations);
     if (lines[lines.length - 1] === 'return;') lines.pop();
@@ -8392,6 +8394,40 @@ function isBracketBalanced(fragment) {
   return depth === 0;
 }
 
+function integralConditionsFromCache(cache) {
+  const proven = new Set(), ambiguous = new Set(), complements = new Map();
+  const record = (predicate, inverse) => {
+    if (!predicate?.code || !inverse?.code) return;
+    // A textual match is usable only if every occurrence has integral evidence.
+    // An untyped/floating occurrence invalidates both it and its complement.
+    const source = predicate.code.trim(), opposite = inverse.code.trim();
+    const links = complements.get(source) || new Set();
+    links.add(opposite); complements.set(source, links);
+    (predicate.integralComparison === true && inverse.integralComparison === true
+      ? proven : ambiguous).add(source);
+  };
+  for (const state of cache.values()) {
+    if (!state.terminator || !isConditionalBranch(state.terminator.op)) continue;
+    // Reuse already-rendered operands. Do not evaluate blocks again: evaluation
+    // binds names and types in CFG order, even for branches later printed first.
+    const condition = state.branchCondition
+      || conditionForBranch(state.terminator, state.stack.slice(), false);
+    const opposite = negateBooleanExpression(condition);
+    record(condition, opposite);
+    record(opposite, condition);
+  }
+  // Conflicting evidence must not survive under the spelling of an inverse
+  // derived earlier from an integral occurrence with the same source text.
+  const pending = [...ambiguous];
+  for (let index = 0; index < pending.length; index++) {
+    const source = pending[index]; proven.delete(source);
+    for (const opposite of complements.get(source) || []) if (!ambiguous.has(opposite)) {
+      ambiguous.add(opposite); pending.push(opposite);
+    }
+  }
+  return proven;
+}
+
 function negateBooleanExpression(value) {
   if (value.floatingJvmComparison) {
     const comparison = value.floatingJvmComparison;
@@ -10277,6 +10313,7 @@ module.exports = {
     negateNumericExpression,
     coerceExpressionForType,
     negateBooleanExpression,
+    integralConditionsFromCache,
     isBracketBalanced,
     dropUnthrowableProtectedRows,
     isCheckedThrow,

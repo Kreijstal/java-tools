@@ -467,7 +467,7 @@ function lowerIfStatements(condition, thenStatements, elseStatements, inverted, 
 // spell the same Boolean argument using different temporary names. Parse the
 // final source for control/scope proofs, while retaining original expression
 // bytes (the parser's node ranges often cover only the leading token).
-function factorCommonBranchTails(source) {
+function factorCommonBranchTails(source, {integralConditions = new Set()} = {}) {
   const unchanged = () => ({source, branches: 0});
   if (/\\u+[0-9a-fA-F]{4}/.test(source)) return unchanged();
   let parsed, tokens;
@@ -499,8 +499,9 @@ function factorCommonBranchTails(source) {
   if (stack.length) return unchanged();
   let branches = 0;
   function inverse(condition) {
-    // Equality has an exact complement even for floating-point NaNs. Do not
-    // replace relational comparisons by their opposite: !(x < y) includes NaN.
+    // Equality has an exact complement even for floating-point NaNs. Relational
+    // complements additionally require the cached JVM predicate's integral
+    // evidence; an unproven !(x < y) must still include NaN.
     let text = condition.trim();
     try {
       let expression = statementParser.parseStatement(`if (${text}) {}`, {requireComplete: true}).condition;
@@ -512,13 +513,15 @@ function factorCommonBranchTails(source) {
       }
       if (expression.kind === 'UnaryExpression' && expression.operator === '!')
         return text.slice(items[0].range.endOffset).trim();
-      if (expression.kind === 'BinaryExpression' && ['==', '!='].includes(expression.operator)) {
+      const opposites = {'==': '!=', '!=': '==', '<': '>=', '>=': '<', '>': '<=', '<=': '>'};
+      if (expression.kind === 'BinaryExpression' && (['==', '!='].includes(expression.operator)
+          || integralConditions.has(text) && ['<', '>=', '>', '<='].includes(expression.operator))) {
         let depth = 0;
         for (const token of items) {
           if (['(', '[', '{'].includes(token.text)) depth++;
           else if ([')', ']', '}'].includes(token.text)) depth--;
           else if (!depth && token.text === expression.operator)
-            return text.slice(0, token.range.startOffset) + (token.text === '==' ? '!=' : '==') + text.slice(token.range.endOffset);
+            return text.slice(0, token.range.startOffset) + opposites[token.text] + text.slice(token.range.endOffset);
         }
       }
     } catch (_) { /* Preserve an unknown condition verbatim under negation. */ }

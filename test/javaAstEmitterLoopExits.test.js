@@ -768,3 +768,76 @@ test('nested continuation reconstruction matches native partial effects, failure
     assert.equal(run('java',['-cp',temporary,'NestedTails'],temporary).trim().split('\n').length,2520);
   } finally {fs.rmSync(temporary,{recursive:true,force:true});}
 });
+
+test('integral predicate facts reuse cached operands and discard both sides of ambiguous complements', () => {
+  const {integralConditionsFromCache} = require('../src/decompiler/cfr')._internals;
+  const state = (code, integralComparison) => ({terminator:{op:'ifne'},
+    branchCondition:{code,type:'boolean',precedence:60,integralComparison}});
+  const cache = new Map([[0,state('count >= 7',true)], [1,state('value < limit',true)],
+    [2,state('floating < limit',false)], [3,state('value < limit',false)]]);
+  assert.deepEqual([...integralConditionsFromCache(cache)].sort(), ['count < 7','count >= 7']);
+  const operands = [{code:'left()',type:'int',precedence:90}, {code:'right()',type:'int',precedence:90}];
+  const bytecodeState={terminator:{op:'if_icmpge'},stack:operands};
+  const before=JSON.stringify(bytecodeState);
+  assert.deepEqual([...integralConditionsFromCache(new Map([[0,bytecodeState]]))].sort(),
+    ['left() < right()','left() >= right()']);
+  assert.equal(JSON.stringify(bytecodeState),before);
+  assert.equal(integralConditionsFromCache(new Map([[0,state('a >= b',true)],
+    [1,state('a < b',false)]])).size,0);
+  const source='if (outer) { if (count >= 7) { finish(); return done(); } step(); } finish(); return done();';
+  assert.match(factorCommonBranchTails(source).source,/!\(count >= 7\)/);
+  const typed=factorCommonBranchTails(source,{integralConditions:new Set(['count >= 7'])});
+  assert.match(typed.source,/if \(count < 7\)/);
+  assert.equal((typed.source.match(/finish\(\)/g)||[]).length,1);
+});
+
+test('typed integral tail guards preserve native boundaries, unboxing, NaNs and operand failure order', () => {
+  const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'cfr-emitter-typed-tail-guards-'));
+  try {
+    const variants=[];
+    for (const [operator,opposite] of [['>=','<'],['>','<='],['<','>='],['<=','>']]) {
+      const condition=`left(x,trace) ${operator} right(y,trace)`;
+      const source=`if (flag) { if (${condition}) { finish(trace); return done(trace); } before(trace); } finish(trace); return done(trace);`;
+      variants.push({source,condition,opposite,kind:'typed'});
+    }
+    variants.push({kind:'unknown',source:'if (flag) { if (floating < 0d) { finish(trace); return done(trace); } before(trace); } finish(trace); return done(trace);'});
+    variants.push({kind:'unknown',source:'if (flag) { if (boxed >= y) { finish(trace); return done(trace); } before(trace); } finish(trace); return done(trace);'});
+    const methods=[];
+    variants.forEach((variant,index)=>{
+      const integralConditions=new Set(variant.condition?[variant.condition]:[]);
+      const rebuilt=factorCommonBranchTails(variant.source,{integralConditions});
+      assert.ok(rebuilt.branches > 0);
+      if (variant.kind==='typed') assert.ok(rebuilt.source.includes(`left(x,trace) ${variant.opposite} right(y,trace)`));
+      else assert.match(rebuilt.source,/!\(/);
+      for (const [label,body] of [['original',variant.source],['rebuilt',rebuilt.source]])
+        methods.push(`static String ${label}${index}(boolean flag,long x,long y,double floating,Long boxed) {
+          StringBuilder trace=new StringBuilder(); try { ${body} }
+          catch (RuntimeException failure) { return failure.getClass().getName()+":"+trace; }
+        }`);
+    });
+    const source=`public class TypedTailGuards {
+      static int mode;
+      static long left(long value,StringBuilder trace) { trace.append('l'); if(mode==1)throw new IllegalStateException();return value; }
+      static long right(long value,StringBuilder trace) { trace.append('r'); if(mode==2)throw new IllegalArgumentException();return value; }
+      static void before(StringBuilder trace) { trace.append('b'); if(mode==3)throw new UnsupportedOperationException(); }
+      static void finish(StringBuilder trace) { trace.append('f'); }
+      static String done(StringBuilder trace) { return trace.toString(); }
+      ${methods.join('\n')}
+      public static void main(String[] args) {
+        long[] integers={Long.MIN_VALUE,Integer.MIN_VALUE,-1,0,1,Integer.MAX_VALUE,Long.MAX_VALUE};
+        double[] reals={Double.NEGATIVE_INFINITY,-0d,0d,Double.POSITIVE_INFINITY,Double.NaN};
+        for(mode=0;mode<4;mode++)for(boolean flag:new boolean[]{false,true})for(long x:integers)for(long y:integers)
+          for(double floating:reals)for(Long boxed:new Long[]{null,-1L,Long.MAX_VALUE}) {
+            ${variants.map((_,index)=>`{
+              String expected=original${index}(flag,x,y,floating,boxed),actual=rebuilt${index}(flag,x,y,floating,boxed);
+              if(!expected.equals(actual))throw new AssertionError(${index}+":"+mode+":"+flag+":"+x+":"+y+":"+floating+":"+boxed+":"+expected+":"+actual);
+              System.out.println(${index}+":"+actual);
+            }`).join('\n')}
+          }
+      }
+    }`;
+    const javaFile=path.join(temporary,'TypedTailGuards.java');fs.writeFileSync(javaFile,source);
+    run('javac',['--release','8','-d',temporary,javaFile],temporary);
+    assert.equal(run('java',['-cp',temporary,'TypedTailGuards'],temporary).trim().split('\n').length,35280);
+  } finally {fs.rmSync(temporary,{recursive:true,force:true});}
+});
