@@ -64,6 +64,38 @@ function twoHandlerResult() {
   ]);
 }
 
+test('handler cleanup outside an enclosing protected range cannot be collapsed into it', () => {
+  const code = [
+    {labelDef: 'L0:', pc: 0, instruction: {op: 'invokestatic', arg: ['Method', 'X', ['work', '()V']]}},
+    {pc: 3, instruction: {op: 'goto', arg: 'L20'}},
+    {labelDef: 'L6:', pc: 6, instruction: 'astore_0'},
+    {pc: 7, instruction: {op: 'invokestatic', arg: ['Method', 'X', ['cleanup', '()V']]}},
+    {pc: 10, instruction: {op: 'goto', arg: 'L20'}},
+    {labelDef: 'L13:', pc: 13, instruction: 'astore_1'},
+    {pc: 14, instruction: {op: 'invokestatic', arg: ['Method', 'X', ['cleanup', '()V']]}},
+    {pc: 17, instruction: 'aload_1'},
+    {pc: 18, instruction: 'athrow'},
+    {labelDef: 'L20:', pc: 20, instruction: 'return'},
+  ];
+  const table = [
+    {start_pc: 0, end_pc: 3, handler_pc: 6, catch_type: 'java/lang/IllegalArgumentException'},
+    {start_pc: 0, end_pc: 3, handler_pc: 13, catch_type: 'any'},
+    {start_pc: 6, end_pc: 7, handler_pc: 13, catch_type: 'any'},
+  ];
+  const result = structureMethod(code, table);
+  assert.equal(result.ok, true, result.reason);
+  // The cleanup at PC 7 is an external continuation, not part of the inner
+  // handler protected by the outer catch. It must have its own exit sink.
+  const first = result.regionExitContracts[0];
+  assert.equal(first.exits.length, 2);
+  assert.ok(first.exits.some(exit => result.render.straight(exit.target).includes('invokestatic;')));
+  // Widening only across a nonthrowing cleanup instruction remains safe.
+  code[3] = {pc: 7, instruction: {op: 'iinc', arg: [2, 1]}};
+  const safe = structureMethod(code, table);
+  assert.equal(safe.ok, true, safe.reason);
+  assert.equal(verifyRegionFlowContracts(safe.tree, safe.regionExitContracts), true);
+});
+
 test('intact components cannot exchange protected-body and catch-arm positions', () => {
   const result = multiExitResult();
   const region = regionNode(result);

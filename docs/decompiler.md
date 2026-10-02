@@ -779,11 +779,29 @@ order. Only an actual `Throwable`/catch-all row supplies an unconditional target
 otherwise it rethrows the same throwable through the existing generic helper.
 It does not wrap checked exceptions or execute handler effects on a mismatch.
 
+Handler dominance also does not prove that its whole normal continuation shares
+the same enclosing exception coverage. javac duplicates `finally` cleanup after
+catch-arm breaks, continues and returns, outside the outer catch-all's protected
+ranges. Absorbing that cleanup into a collapsed inner catch moved it under the
+outer catch-all. If cleanup threw, the reconstructed method ran cleanup again.
+The native regression's first failing trace was `1:0,CF1,F2,`; native execution
+produced `1:0,CF1,` and propagated the same `AssertionError` after one cleanup.
+
+Region collapse now retains the original throwing instruction PCs, including
+those in previously collapsed components. Handler carving stops before a block
+whose enclosing protected-range coverage differs from the region entry, and
+keeps only the handler blocks reachable without crossing that boundary. The
+excluded continuation becomes an explicit exit sink, so cleanup stays outside
+the enclosing catch. Widening over proven nonthrowing glue remains supported.
+Before accepting a collapse, all retained throwing PCs must also match the
+entry's coverage in every remaining exception group; incompatible protected
+bodies or handler entries decline reconstruction and retain the CFG fallback.
+
 Focused commands:
 
 ```sh
-node test/exceptionStructurer.test.js       # 30 checks; five new groups fail before the fix
-node test/cfrExceptionLoopExits.test.js     # 1,368 native result/effect comparisons
+node test/exceptionStructurer.test.js       # 31 checks; includes protected-range continuation boundaries
+node test/cfrExceptionLoopExits.test.js     # 3,216 native result/effect comparisons
 node test/cfrNestedLoopSplitting.test.js    # 840 native comparisons
 node test/structuredFlowVerifier.test.js    # 6 checks
 node test/javaAstEmitterLoopExits.test.js   # 7 checks, including 424 native comparisons
@@ -796,10 +814,24 @@ the try and both catch arms, specific-before-supertype handler priority,
 exceptions outside the protected range, unmatched errors and checked exceptions,
 and escaped throwable identity. Structured and forced-dispatcher output must
 match native execution. The original fixture contributes 504 comparisons and
-the new fixture contributes 864.
+the ordered-handler fixture contributes 864. The finally fixture adds 1,848
+comparisons across six exit modes, 14 exception positions and 11 cleanup-failure
+positions. It checks cleanup effects, preserved return values, cleanup exceptions
+overriding pending transfers, and escaped throwable identity. Both ordinary
+structured output and the forced CFG dispatcher must match native execution.
+The finally fixture and the new structural boundary check fail on commit
+`8e04627fac5198652db34c7bf8c363463a1e3b0c` before handler carving was bounded.
 
-A fresh export of all 303 pinned GeoBlox classes preserves the corrected pass-17
-source and diagnostics byte for byte: zero hard failures and zero dispatchers.
-The published readable input remains pinned to its recorded generator; this
-hardening does not require hand edits or declaration/name migrations. The
-checks do not establish whole-game runtime equivalence.
+The earlier component-binding hardening preserved all 303 pinned GeoBlox
+sources byte for byte. Bounding handler continuations changes only `oc.java`:
+the arithmetic guard after a swallowed `maxMemory` reflection failure now stays
+outside the enclosing `Exception` handler, as in the bytecode. The fresh export
+still has zero hard failures and zero dispatchers, and diagnostics are unchanged.
+All 303 sources compile in the result-sequence probe and match the recorded native
+trace through 27 result scenarios and 26,043 ticks per variant. That probe does
+not inject reflection failures into `oc.a(I)V`; the generic finally fixture
+supplies the failure-path evidence.
+
+The published readable input remains pinned to its recorded generator. These
+fresh export artifacts are validation output, not an updated publication or a
+declaration/name migration. The checks do not establish whole-game equivalence.

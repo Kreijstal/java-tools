@@ -877,6 +877,13 @@ function structureWithExceptions(codeItems, exceptionTable, methodCfg, render, o
   render.synthetic = synthetic; // exposed for the exceptionStructurer's own printTree
   const selectorDecls = [];
   const regionExitContracts = [];
+  // A collapsed region is represented by its entry PC in later groups. Keep
+  // every original throwing PC as well: a handler continuation may cross a
+  // gap in an enclosing protected range (for example, duplicated finally
+  // cleanup). Moving that whole component under the enclosing catch changes
+  // exception routing even when every normal edge and exit sink is intact.
+  const regionThrowPcs = new Map(origBlocks.map(block => [block.id,
+    block.insns.filter(ii => canThrow(insnOp(codeItems[ii]))).map(ii => codeItems[ii].pc)]));
   let nextSelector = 0;
   const allocSelector = () => {
     const name = `decompiledRegionSelector${nextSelector++}`;
@@ -910,12 +917,14 @@ function structureWithExceptions(codeItems, exceptionTable, methodCfg, render, o
   const ordered = groups.slice().sort((a, b) =>
     (a.end_pc - a.start_pc) - (b.end_pc - b.start_pc) || b.start_pc - a.start_pc);
 
-  for (const g of ordered) {
+  for (let groupIndex = 0; groupIndex < ordered.length; groupIndex++) {
+    const g = ordered[groupIndex];
     const bail = processGroup(work, g, {
       overrides, allocId, emptyId, isNoThrowBlock, allHandlerPcs,
       synthetic, allocSelector, regionExitContracts,
       syncHandlers: opts.syncHandlers || null,
       isCatchAssignable: opts.isCatchAssignable || null,
+      regionThrowPcs, pendingGroups: ordered.slice(groupIndex + 1),
     }, (w) => { work = w; });
     if (bail instanceof Bail) return { ok: false, reason: bail.reason };
   }
@@ -1078,20 +1087,37 @@ function processGroup(work, group, ctx, commit) {
   // method entry + all handler entries), minus the try body.
   const handlerSets = [];
   const inSomeHandler = new Set();
+  const preservesEnclosingCoverage = local => ctx.pendingGroups.every(enclosing => {
+    const protectsEntry = inAnyRange(group.start_pc, enclosing.ranges);
+    return (ctx.regionThrowPcs.get(work.ids[local]) || []).every(pc =>
+      inAnyRange(pc, enclosing.ranges) === protectsEntry);
+  });
   for (const h of handlerLocals) {
     const hs = new Set();
     for (let b = 0; b < n; b++) {
       if (!reachable[b] || tryset.has(b)) continue;
       if (dominates(idom, h, b)) {
         if (inSomeHandler.has(b)) return new Bail('overlapping handler regions');
-        inSomeHandler.add(b);
         hs.add(b);
       }
     }
     if (!hs.has(h)) {
       return new Bail('handler entry unreachable / not self-dominating');
     }
-    handlerSets.push(hs);
+    // Dominance alone can absorb the unprotected copy of a finally body.
+    // End the handler component before a throwing block with different outer
+    // coverage; its normal edge becomes an explicit region exit instead.
+    // Retain only blocks still reachable without crossing that boundary.
+    const bounded = new Set(), pending = [h];
+    while (pending.length) {
+      const b = pending.pop();
+      if (bounded.has(b) || !hs.has(b) || !preservesEnclosingCoverage(b)) continue;
+      bounded.add(b);
+      pending.push(...succOfTerm(work.term[b]));
+    }
+    if (!bounded.has(h)) return new Bail('exception handler entry has incompatible enclosing coverage');
+    for (const b of bounded) inSomeHandler.add(b);
+    handlerSets.push(bounded);
   }
 
   // Whole region and the exits of each independently structured component.
@@ -1101,6 +1127,12 @@ function processGroup(work, group, ctx, commit) {
   // reentry at the actual try entry may map to the collapsed super-block;
   // other internal continuations are refused below.
   const region = new Set([...tryset, ...inSomeHandler]);
+  const throwingPcs = [...region].flatMap(local => ctx.regionThrowPcs.get(work.ids[local]) || []);
+  for (const enclosing of ctx.pendingGroups) {
+    const protectsEntry = inAnyRange(group.start_pc, enclosing.ranges);
+    if (throwingPcs.some(pc => inAnyRange(pc, enclosing.ranges) !== protectsEntry))
+      return new Bail('collapsed exception region crosses an enclosing protected-range boundary');
+  }
   const externals = new Set();
   for (const component of [tryset, ...handlerSets]) {
     for (const b of component) {
@@ -1130,6 +1162,7 @@ function processGroup(work, group, ctx, commit) {
   // selector variable; each sink assigns `selector = <index>` and the collapsed
   // super-block dispatches on it.
   const superId = ctx.allocId();
+  ctx.regionThrowPcs.set(superId, throwingPcs);
   const exitTargets = new Map();
   const externalToRenderId = new Map();
   let exits;

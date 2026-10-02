@@ -22,6 +22,109 @@ function run(command, args, directory) {
   } finally { fds.forEach(fd => fs.closeSync(fd)); }
 }
 
+test('finally cleanup preserves pending loop exits, returns and throwable identity', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-finally-loop-exits-'));
+  const previous = process.env.CFR_JS_FORCE_STATE_MACHINE;
+  try {
+    const original = `public class FinallyLoopExits {
+      public static int compute(int mode, int throwAt, int cleanupAt) {
+        int result = 0, step = 0, cleanups = 0;
+        outer: for (int i = 0; i < 3; i++) {
+          inner: for (int j = 0; j < 3; j++) {
+            try {
+              result = Effects.next(result, ++step, throwAt, i * 10 + j);
+              switch (mode) {
+                case 0: continue inner;
+                case 1: continue outer;
+                case 2: break inner;
+                case 3: break outer;
+                case 4: return result;
+                default: result = result * 31 + 100;
+              }
+            } catch (IllegalArgumentException error) {
+              Effects.mark(); result = result * 31 - 7;
+              if (mode == 0) continue outer;
+              if (mode == 1) break inner;
+              if (mode == 2) break outer;
+              if (mode == 4) return result;
+            } finally {
+              Effects.cleanup(++cleanups, cleanupAt);
+            }
+            result = Effects.next(result, ++step, throwAt, 200);
+          }
+          result = Effects.next(result, ++step, throwAt, 300);
+        }
+        return result;
+      }
+    }`;
+    const effects = `class Effects {
+      static StringBuilder trace;
+      static Throwable failed;
+      static void mark() { trace.append('C'); }
+      static int next(int result, int step, int throwAt, int kind) {
+        trace.append(step).append(':').append(kind).append(',');
+        if (step == throwAt) { failed = new IllegalArgumentException(); throw (IllegalArgumentException) failed; }
+        return result * 31 + kind;
+      }
+      static void cleanup(int count, int cleanupAt) {
+        trace.append('F').append(count).append(',');
+        if (count == cleanupAt) { failed = new AssertionError(); throw (AssertionError) failed; }
+      }
+    }`;
+    const driver = `class FinallyLoopRunner { public static void main(String[] args) {
+      for (int mode = 0; mode < 6; mode++) for (int throwAt = -1; throwAt <= 12; throwAt++)
+        for (int cleanupAt = -1; cleanupAt <= 9; cleanupAt++) {
+          Effects.trace = new StringBuilder(); Effects.failed = null; String result;
+          try { result = "" + FinallyLoopExits.compute(mode, throwAt, cleanupAt); }
+          catch (Throwable error) { result = error.getClass().getSimpleName()+":"+(error == Effects.failed); }
+          System.out.println(mode+":"+throwAt+":"+cleanupAt+":"+result+":"+Effects.trace);
+        }
+    } }`;
+    const names = ['FinallyLoopExits', 'Effects', 'FinallyLoopRunner'];
+    const native = path.join(temporary, 'native');
+    fs.mkdirSync(native);
+    for (const [name, source] of Object.entries({FinallyLoopExits: original, Effects: effects,
+      FinallyLoopRunner: driver})) fs.writeFileSync(path.join(native, name + '.java'), source);
+    run('javac', ['--release', '8', '-d', native,
+      ...names.map(name => path.join(native, name + '.java'))], native);
+    const expected = run('java', ['-cp', native, 'FinallyLoopRunner'], native);
+    assert.equal(expected.trim().split('\n').length, 924);
+    assert.match(expected, /AssertionError:true/);
+    assert.match(expected, /IllegalArgumentException:true/);
+    assert.doesNotMatch(expected, /:false:/);
+    for (const forced of [false, true]) {
+      if (forced) process.env.CFR_JS_FORCE_STATE_MACHINE = '1';
+      else delete process.env.CFR_JS_FORCE_STATE_MACHINE;
+      const diagnostics = [];
+      const source = decompileClassFile(path.join(native, 'FinallyLoopExits.class'), {diagnostics});
+      assertNoFallback(source);
+      assert.equal(source.includes('switch (statePc)'), forced, JSON.stringify(diagnostics));
+      const rebuilt = path.join(temporary, forced ? 'forced' : 'structured');
+      fs.mkdirSync(rebuilt);
+      for (const [name, text] of Object.entries({FinallyLoopExits: source, Effects: effects,
+        FinallyLoopRunner: driver})) fs.writeFileSync(path.join(rebuilt, name + '.java'), text);
+      run('javac', ['--release', '8', '-d', rebuilt,
+        ...names.map(name => path.join(rebuilt, name + '.java'))], rebuilt);
+      const actual = run('java', ['-cp', rebuilt, 'FinallyLoopRunner'], rebuilt);
+      if (process.env.CFR_JS_EXCEPTION_LOOP_DIAGNOSTICS) {
+        const directory = process.env.CFR_JS_EXCEPTION_LOOP_DIAGNOSTICS;
+        fs.mkdirSync(directory, {recursive: true});
+        fs.writeFileSync(path.join(directory, forced ? 'finally-forced.java' : 'finally-structured.java'), source);
+        fs.writeFileSync(path.join(directory, 'finally-native.txt'), expected);
+        fs.writeFileSync(path.join(directory, forced ? 'finally-forced.txt' : 'finally-structured.txt'), actual);
+      }
+      const expectedLines = expected.trim().split('\n'), actualLines = actual.trim().split('\n');
+      assert.equal(actualLines.length, expectedLines.length);
+      expectedLines.forEach((line, index) => assert.equal(actualLines[index], line,
+        `${forced ? 'forced' : 'structured'} cleanup scenario ${index}: ${JSON.stringify(diagnostics)}`));
+    }
+  } finally {
+    if (previous === undefined) delete process.env.CFR_JS_FORCE_STATE_MACHINE;
+    else process.env.CFR_JS_FORCE_STATE_MACHINE = previous;
+    fs.rmSync(temporary, {recursive: true, force: true});
+  }
+});
+
 test('try and catch exits preserve nested-loop destinations and effect order', () => {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-exception-loop-exits-'));
   const previous = process.env.CFR_JS_FORCE_STATE_MACHINE;
