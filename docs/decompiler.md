@@ -615,6 +615,44 @@ methods; retained selectors decrease from 11 to 10. This does not justify
 removing selectors that choose observable or throwing continuations, nor does
 it establish whole-game equivalence.
 
+### Coalesce terminal work inside existing plain blocks
+
+Tail reconstruction now descends into plain blocks while retaining their braces
+and declaration scopes. Each block and braced conditional arm uses its own
+terminal continuation. Existing loop, label, try and monitor bodies remain
+opaque; no loop-completion assumption is added.
+
+When ordinary continuation factoring refuses an opaque prefix, exact whole
+return/throw tails can still use the existing plain-block skip proof. Breaks
+at the end of that newly introduced block are removed only through trailing
+ifs and plain blocks. Conditions still evaluate; old labels and protected
+regions are not entered. A new label with no remaining transfer is discarded.
+A retained new label is refused when its prefix exceeds 512 Java tokens, avoiding
+an extra exit frame around a large method merely to share a small cleanup.
+
+The GeoBlox candidate removes 189 lines across seven files and reduces retained
+selectors from ten to nine. `ba.b(I)V` now clears its task reference
+once after the null-task/status/join paths. Its synchronized close/notification,
+volatile status-wait loop and InterruptedException handler stay intact; the
+resulting empty selector test is removed by the existing allocator-bound cleanup.
+No generated plain-block exit label remains in the game export. This does not
+establish equivalence of asset-dependent rendering or live network operation.
+
+Focused checks:
+
+```sh
+NODE_PATH=/home/kreijstal/git/java-tools/node_modules node test/javaAstEmitterLoopExits.test.js
+NODE_PATH=/home/kreijstal/git/java-tools/node_modules node test/cfrExceptionLoopExits.test.js
+NODE_PATH=/home/kreijstal/git/java-tools/node_modules node test/cfrNestedLoopSplitting.test.js
+```
+
+The emitter has 31 passing groups, including 432 new native comparisons for
+plain-block scopes, retained skips over intervening work, finite/infinite-loop
+syntax, nullable tests, catch priority, checked/fatal throwable identity,
+finally effects and monitor ownership/release. The two integration suites retain
+six and three passing groups. Original shadowed locals and opaque region bodies
+remain unchanged in the refusal fixtures.
+
 ## Parallel operand copies at loop backedges
 
 Multiple live operand-stack values no longer force a dispatcher by themselves.

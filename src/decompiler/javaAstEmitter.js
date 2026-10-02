@@ -653,6 +653,10 @@ function factorCommonBranchTails(source, {integralConditions = new Set()} = {}) 
         const taken = statements(child.consequent), other = child.alternate ? statements(child.alternate) : [];
         if (commonBranchTail(taken, other)) branches++;
         result.push(...lowerIfStatements(condition, taken, other, () => inverse(condition), null, true));
+      } else if (child.kind === 'BlockStatement') {
+        // Reconstruct tails within an existing plain block, keeping its scope
+        // intact. Try/monitor/loop/label bodies remain opaque at this layer.
+        result.push(block(statements(child)));
       } else {
         result.push(rawStatement(fragment(start, end)));
       }
@@ -669,7 +673,7 @@ function factorCommonBranchTails(source, {integralConditions = new Set()} = {}) 
       result = [...result.slice(0, index), ...lowerIfStatements(child.condition.source,
         child.consequent.statements, rest, () => inverse(child.condition.source), null, true)];
     }
-    return result;
+    return terminalContinuation(result) ? contextualTails(result) : result;
   }
   function terminalContinuation(items) {
     if (!items.length) return false;
@@ -746,8 +750,33 @@ function factorCommonBranchTails(source, {integralConditions = new Set()} = {}) 
           alternate: statement.alternate ? block(replace(statement.alternate.statements)) : null,
         }) : statement);
       }
-      const rewritten = replace(prefix);
+      function trimTerminalBreak(body) {
+        if (!body.length) return body;
+        const last = body.at(-1);
+        if (last.kind === 'BreakStatement' && last.label === label) return body.slice(0, -1);
+        if (last.kind === 'IfStatement') return [...body.slice(0, -1), createNode('IfStatement', {
+          condition: last.condition, consequent: block(trimTerminalBreak(last.consequent.statements)),
+          alternate: last.alternate ? block(trimTerminalBreak(last.alternate.statements)) : null,
+        })];
+        if (last.kind === 'BlockStatement') return [...body.slice(0, -1), block(trimTerminalBreak(last.statements))];
+        // Do not enter existing labels, loops, monitors or protected regions.
+        return body;
+      }
+      const rewritten = trimTerminalBreak(replace(prefix));
       if (matches) {
+        // A break at the very end of the newly introduced block is redundant:
+        // normal completion reaches the identical suffix. Keep conditions and
+        // original scopes; drop only our new label if no transfer uses it.
+        if (!rewritten.some(statement => anyStatement(statement,
+          node => node.kind === 'BreakStatement' && node.label === label))) {
+          branches += matches;
+          return [...rewritten, ...suffix];
+        }
+        // Avoid wrapping a large method prefix in another exit frame just to
+        // share a small cleanup. Count tokens, not indentation or line layout.
+        const prefixTokens = tokenizeJava(emitStatements(rewritten)).tokens
+          .filter(token => !['comment', 'whitespace', 'eof'].includes(token.kind));
+        if (prefixTokens.length > 512) continue;
         branches += matches;
         return [createNode('LabeledStatement', {label, statement: block(rewritten)}), ...suffix];
       }
@@ -783,14 +812,18 @@ function factorCommonBranchTails(source, {integralConditions = new Set()} = {}) 
           result = labeledTail(child, result) || original;
         }
       } else {
-        result = provenAbrupt([child]) ? [child] : [child, ...result];
+        // If loop/label completion is uncertain, do not append a continuation
+        // inside it. The existing labeled-tail proof can instead replace exact
+        // terminal clones with a skip over the intact prefix.
+        result = provenAbrupt([child]) ? [child]
+          : child.kind === 'IfStatement' ? labeledTail(child, result) || [child, ...result]
+            : [child, ...result];
       }
     }
     return result;
   }
   try {
-    let result = statements(parsed);
-    if (terminalContinuation(result)) result = contextualTails(result);
+    const result = statements(parsed);
     return branches ? {source: emitStatements(result), branches} : unchanged();
   } catch (_) { return unchanged(); }
 }

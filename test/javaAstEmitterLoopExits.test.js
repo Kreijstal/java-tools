@@ -999,6 +999,107 @@ test('integral predicate facts reuse cached operands and discard both sides of a
   assert.equal((typed.source.match(/finish\(\)/g)||[]).length,1);
 });
 
+test('plain block tails keep scopes and coalesce exits without assuming opaque loop completion', () => {
+  const source = '{ if (task != null) { L2: while (task.status == 0) { waitForTask(); } if (joinNeeded) { try { join(); decompiledRegionSelector0 = 0; } catch (InterruptedException error) { decompiledRegionSelector0 = 1; } if (decompiledRegionSelector0 == 0) { task = null; return; } } } task = null; return; }';
+  const factored = factorCommonBranchTails(source);
+  assert.ok(factored.branches > 0);
+  assert.equal(factored.source.match(/task = null;/g).length, 1);
+  assert.match(factored.source, /L2: while \(task.status == 0\) \{ waitForTask\(\); \}/);
+  assert.match(factored.source, /try \{ join\(\); decompiledRegionSelector0 = 0; \} catch \(InterruptedException error\) \{ decompiledRegionSelector0 = 1; \}/);
+  assert.doesNotMatch(factored.source, /sharedTailExit_/);
+  const cleaned = removeDeadRegionSelectors(factored.source, ['int decompiledRegionSelector0 = 0;'], ['decompiledRegionSelector0']);
+  assert.deepEqual(cleaned.removed, ['decompiledRegionSelector0']);
+  assert.doesNotMatch(cleaned.source, /decompiledRegionSelector/);
+  const skipped = factorCommonBranchTails('{ if (flag) { while (true) { if (stop()) break; } if (pick()) { finish(); return; } before(); } after(); finish(); return; }');
+  assert.equal(skipped.source.match(/finish\(\);/g).length, 1);
+  assert.match(skipped.source, /sharedTailExit_\d+:/);
+  // The skip must remain: returning before these effects originally skipped them.
+  assert.match(skipped.source, /break sharedTailExit_\d+;/);
+  const largePrefix = '{ if (flag) { if (pick()) { finish(); return; } before(); } '
+    + 'after(); '.repeat(300) + 'finish(); return; }';
+  assert.equal(factorCommonBranchTails(largePrefix).source, largePrefix);
+  for (const opaque of [
+    'try { if (flag) { finish(); return; } finish(); return; } catch (Exception error) { return; }',
+    'synchronized (lock) { if (flag) { finish(); return; } finish(); return; }',
+    'while (true) { if (flag) { finish(); return; } finish(); return; }',
+    'Existing: { if (flag) { finish(); return; } finish(); return; }',
+  ]) assert.equal(factorCommonBranchTails(opaque).source, opaque);
+  const shadowed = '{ if (flag) { int value = 7; finish(value); return value; } finish(value); return value; }';
+  const scoped = factorCommonBranchTails(shadowed);
+  assert.equal(scoped.branches, 0);
+  assert.equal(scoped.source, shadowed);
+});
+
+test('plain block tail recovery matches native scopes, loop skips and protected failures', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-plain-block-tails-'));
+  try {
+    const tail = 'finish(trace); return done(trace);';
+    const variants = [
+      `{{ if (flag) { if (pick(boxed,trace)) { ${tail} } before(trace); } ${tail} }}`,
+      `{ if (flag) { L2: while (loop(trace)) {} if (pick(boxed,trace)) {
+         try { join(trace); decompiledRegionSelector0 = 0; }
+         catch (InterruptedException error) { trace.append('c'); decompiledRegionSelector0 = 1; }
+         if (decompiledRegionSelector0 == 0) { ${tail} }
+       } } ${tail} }`,
+      `{ if (flag) { L2: while (true) { if (loop(trace)) break L2; }
+         if (pick(boxed,trace)) { ${tail} } before(trace); }
+         trace.append('a'); ${tail} }`,
+      `{ if (flag) { int value = 7; if (pick(boxed,trace)) { trace.append(value); return done(trace); } }
+         trace.append(value); return done(trace); }`,
+      `{ if (flag) { try { before(trace); } finally { trace.append('f'); if (mode == 5) throw fatal; }
+         if (pick(boxed,trace)) { ${tail} } } ${tail} }`,
+      `{ if (flag) { synchronized (lock) { trace.append(Thread.holdsLock(lock)); before(trace); }
+         if (pick(boxed,trace)) { ${tail} } } ${tail} }`,
+    ];
+    const methods = [];
+    variants.forEach((original, index) => {
+      const factored = factorCommonBranchTails(original);
+      if (index !== 3) assert.ok(factored.branches > 0);
+      const cleaned = removeDeadRegionSelectors(factored.source,
+        ['int decompiledRegionSelector0 = 0;'], ['decompiledRegionSelector0']);
+      assert.deepEqual(cleaned.removed, ['decompiledRegionSelector0']);
+      for (const [label, body] of [['original', 'int decompiledRegionSelector0 = 0;\n' + original],
+        ['rebuilt', cleaned.source]]) methods.push(`static String ${label}${index}(boolean flag,Boolean boxed) throws Throwable { ${body} }`);
+    });
+    const source = `public class PlainBlockTails {
+      static int mode,value=30,loopCalls; static Object lock; static StringBuilder trace;
+      static final InterruptedException interrupted=new InterruptedException();
+      static final IllegalStateException general=new IllegalStateException(); static final Error fatal=new Error();
+      static boolean loop(StringBuilder trace) { trace.append('l'); return ++loopCalls % 2 == 0; }
+      static boolean pick(Boolean boxed,StringBuilder trace) { trace.append('p'); if(mode==3)throw fatal; return boxed; }
+      static void before(StringBuilder trace) { trace.append('b'); if(mode==2)throw general; }
+      static void join(StringBuilder trace) throws InterruptedException { trace.append('j'); if(mode==1)throw interrupted; }
+      static void finish(StringBuilder trace) throws InterruptedException {
+        trace.append('x').append(lock!=null && Thread.holdsLock(lock)); if(mode==4)throw interrupted;
+      }
+      static String done(StringBuilder trace) { return "done:"+trace; }
+      ${methods.join('\n')}
+      interface Call { String call() throws Throwable; }
+      static String invoke(Call call,boolean nullLock) {
+        trace=new StringBuilder();loopCalls=0;lock=nullLock?null:new Object();String result;
+        try {result=call.call();}catch(Throwable error) {
+          result=error==interrupted?"same-interrupted":error==general?"same-general":error==fatal?"same-fatal":error.getClass().getName();
+        }
+        if(lock!=null && Thread.holdsLock(lock))throw new AssertionError("monitor retained");
+        return result+":"+trace+":"+loopCalls;
+      }
+      public static void main(String[]args) {
+        for(mode=0;mode<6;mode++)for(boolean flag:new boolean[]{false,true})
+        for(Boolean boxed:new Boolean[]{null,false,true})for(boolean nullLock:new boolean[]{false,true}) {
+          ${variants.map((_,index)=>`{
+            String expected=invoke(()->original${index}(flag,boxed),nullLock),actual=invoke(()->rebuilt${index}(flag,boxed),nullLock);
+            if(!expected.equals(actual))throw new AssertionError(${index}+":"+mode+":"+flag+":"+boxed+":"+nullLock+":"+expected+":"+actual);
+            System.out.println(${index}+":"+actual);
+          }`).join('\n')}
+        }
+      }
+    }`;
+    const file = path.join(temporary, 'PlainBlockTails.java'); fs.writeFileSync(file, source);
+    run('javac', ['--release', '8', '-d', temporary, file], temporary);
+    assert.equal(run('java', ['-cp', temporary, 'PlainBlockTails'], temporary).trim().split('\n').length, 432);
+  } finally { fs.rmSync(temporary, {recursive: true, force: true}); }
+});
+
 test('typed integral tail guards preserve native boundaries, unboxing, NaNs and operand failure order', () => {
   const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'cfr-emitter-typed-tail-guards-'));
   try {
