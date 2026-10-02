@@ -654,3 +654,117 @@ test('factored tails preserve native conditions, snapshots, scopes and protected
     assert.equal(run('java',['-cp',temporary,'SharedTails'],temporary).trim().split('\n').length,variants.length*63);
   } finally {fs.rmSync(temporary,{recursive:true,force:true});}
 });
+
+test('nested terminal clones require exact enclosing continuations and unchanged binding scopes', () => {
+  const nested = 'if (outer) { before(); if (inner) { finish(); return done(); } after(); } finish(); return done();';
+  const result = factorCommonBranchTails(nested);
+  assert.ok(result.branches > 0);
+  assert.equal((result.source.match(/finish\(\)/g) || []).length, 1);
+  assert.match(result.source,/if \(outer\) \{\s+before\(\);\s+if \(!\(inner\)\) \{\s+after\(\);/);
+  const labeledSource = 'touch(sharedTailExit_0); if (outer) { if (inner) { if (last) { finish(); return done(); } left(); } right(); } finish(); return done();';
+  const labeled = factorCommonBranchTails(labeledSource);
+  assert.ok(labeled.branches > 0);
+  assert.match(labeled.source, /sharedTailExit_[1-9]\d*: \{/);
+  assert.doesNotMatch(labeled.source, /sharedTailExit_0:/);
+  assert.match(labeled.source, /break sharedTailExit_[1-9]\d*;/);
+  for (const name of ['finish', 'done', 'left', 'right', 'touch'])
+    assert.equal((labeled.source.match(new RegExp(`\\b${name}\\(`,'g')) || []).length, 1);
+  assert.deepEqual(factorCommonBranchTails(labeledSource), labeled);
+  for (const source of [
+    'if (outer) { int value = 1; if (inner) { finish(value); return done(); } after(); } finish(value); return done();',
+    'if (outer) { if (inner) { finish(); return other(); } after(); } finish(); return done();',
+    'if (outer) { if (inner) { other(); return done(); } after(); } finish(); return done();',
+    'if (outer) { synchronized (lock) { if (inner) { finish(); return done(); } after(); } } finish(); return done();',
+    'if (outer) { try { if (inner) { finish(); return done(); } after(); } finally { cleanup(); } } finish(); return done();',
+    'if (outer) { for (;;) { if (inner) { finish(); return done(); } after(); } } finish(); return done();',
+    'if (outer) { Label: { if (inner) { finish(); return done(); } after(); } } finish(); return done();',
+    'if (first) { return false; } if (second) { return false; } work(); return false;',
+  ]) assert.deepEqual(factorCommonBranchTails(source), {source,branches:0},source);
+});
+
+test('nested continuation reconstruction matches native partial effects, failure order and scopes', () => {
+  const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'cfr-emitter-nested-tails-'));
+  try {
+    const tail='finish(x,trace); return done(trace);';
+    const lockTail='synchronized (lock) { locked(x,lock,trace); } return done(trace);';
+    const protectedTail='try { finish(x,trace); } catch (IllegalArgumentException failure) { trace.append("c"); } finally { trace.append("z"); } return done(trace);';
+    const nextTail='finish(next(x,trace),trace); return done(trace);';
+    const variants=[
+      `if (flag) { trace.append("a"); if (pick(x,boxed,trace)) { ${tail} } trace.append("b"); } ${tail}`,
+      `touch(sharedTailExit_0,trace); if (flag) { trace.append("a"); if (pick(x,boxed,trace)) { if (x == x) { ${tail} } trace.append("i"); x++; } trace.append("b"); x=-x; } ${tail}`,
+      `if (flag) { trace.append("a"); if (pick(x,boxed,trace)) { ${tail} } trace.append("b"); if (x >= 0) { ${tail} } trace.append("c"); } ${tail}`,
+      `if (flag) { if (pick(x,boxed,trace)) { trace.append("a"); ${tail} } else { trace.append("b"); ${tail} } } ${tail}`,
+      `if (flag) { if (pick(x,boxed,trace)) { if (x == x) { ${tail} } trace.append("b"); } trace.append("a"); } ${tail}`,
+      `if (flag) { if (pick(x,boxed,trace)) { if (x < 0) { ${tail} } trace.append("b"); } trace.append("a"); } ${tail}`,
+      `if (flag) { if (pick(x,boxed,trace)) { ${lockTail} } trace.append("b"); } ${lockTail}`,
+      `if (flag) { if (pick(x,boxed,trace)) { ${protectedTail} } trace.append("b"); } ${protectedTail}`,
+      'if (flag) { double value=x; if (pick(x,boxed,trace)) { finish(value,trace); return done(trace); } trace.append("b"); } finish(value,trace); return done(trace);',
+      `if (flag) { if (pick(x,boxed,trace)) { finish(x,trace); return different(trace); } trace.append("b"); } ${tail}`,
+      `if (flag) { if (pick(x,boxed,trace)) { ${nextTail} } trace.append("b"); } ${nextTail}`,
+      `if (flag) { if (pick(x,boxed,trace)) { if (counter++ == 0) { ${nextTail} } trace.append("i"); } trace.append("b"); } ${nextTail}`,
+      `if (flag) { if (pick(x,boxed,trace)) { if (counter++ == 0) { ${tail} } trace.append("i"); counter++; } before(x,trace); } ${tail}`,
+      `if (flag) { before(x,trace); if (pick(x,boxed,trace)) { ${tail} } before(-x,trace); } ${tail}`,
+      'if (flag) { if (pick(x,boxed,trace)) { if (x == x) { trace.append("f"); throw sentinel; } trace.append("i"); } trace.append("b"); } trace.append("f"); throw sentinel;',
+    ];
+    const methods=[];
+    variants.forEach((original,index)=>{
+      const result=factorCommonBranchTails(original);
+      if (![8,9].includes(index)) assert.ok(result.branches > 0,original);
+      if ([8,9].includes(index)) assert.equal(result.source,original);
+      if (index === 1) {
+        assert.match(result.source, /sharedTailExit_[1-9]\d*:/);
+        assert.doesNotMatch(result.source, /sharedTailExit_0:/);
+      }
+      for (const [label,body] of [['original',original],['rebuilt',result.source]])
+        methods.push(`static String ${label}${index}(boolean flag,double x,Boolean boxed,Object lock) {
+          StringBuilder trace=new StringBuilder(); try { ${body} }
+          catch (RuntimeException failure) { return failure.getClass().getName()+":"+trace+":"+(failure == sentinel); }
+        }`);
+    });
+    const source=`public class NestedTails {
+      static int mode,counter; static double value=3;
+      static int sharedTailExit_0=7;
+      static final IllegalStateException sentinel=new IllegalStateException();
+      static void touch(int value,StringBuilder trace) { trace.append('v').append(value); }
+      static boolean pick(double x,Boolean boxed,StringBuilder trace) {
+        trace.append('q'); if (mode == 1) throw new IllegalStateException();
+        return mode == 2 ? boxed : x <= 0;
+      }
+      static void before(double x,StringBuilder trace) {
+        trace.append('b'); if (x == 7) throw new IllegalArgumentException();
+      }
+      static double next(double x,StringBuilder trace) {
+        trace.append('n'); counter++; if (counter > 1) throw new IndexOutOfBoundsException(); return x;
+      }
+      static void finish(double x,StringBuilder trace) {
+        trace.append('f'); if (x == 7 || Double.isNaN(x)) throw new IllegalArgumentException();
+        trace.append(Double.doubleToRawLongBits(x));
+      }
+      static void locked(double x,Object lock,StringBuilder trace) {
+        if (!Thread.holdsLock(lock)) throw new AssertionError(); finish(x,trace);
+      }
+      static String done(StringBuilder trace) {
+        trace.append('d'); if (mode == 3) throw new UnsupportedOperationException(); return trace.toString();
+      }
+      static String different(StringBuilder trace) { trace.append('!'); return done(trace); }
+      ${methods.join('\n')}
+      public static void main(String[] args) {
+        Object lock=new Object();
+        for (mode=0;mode<4;mode++) for (boolean flag:new boolean[]{false,true})
+          for (double x:new double[]{Double.NEGATIVE_INFINITY,-7,-0d,0d,7,Double.POSITIVE_INFINITY,Double.NaN})
+            for (Boolean boxed:new Boolean[]{false,true,null}) {
+              ${variants.map((_,index)=>`{
+                counter=0; String expected=original${index}(flag,x,boxed,lock); int expectedCounter=counter;
+                counter=0; String actual=rebuilt${index}(flag,x,boxed,lock);
+                if (!expected.equals(actual) || counter != expectedCounter || Thread.holdsLock(lock))
+                  throw new AssertionError(${index}+":"+mode+":"+flag+":"+x+":"+boxed+":"+expected+":"+actual+":"+expectedCounter+":"+counter);
+                System.out.println(${index}+":"+mode+":"+flag+":"+x+":"+boxed+":"+actual+":"+counter);
+              }`).join('\n')}
+            }
+      }
+    }`;
+    const javaFile=path.join(temporary,'NestedTails.java');fs.writeFileSync(javaFile,source);
+    run('javac',['--release','8','-d',temporary,javaFile],temporary);
+    assert.equal(run('java',['-cp',temporary,'NestedTails'],temporary).trim().split('\n').length,2520);
+  } finally {fs.rmSync(temporary,{recursive:true,force:true});}
+});

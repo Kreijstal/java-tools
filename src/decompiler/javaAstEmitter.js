@@ -388,6 +388,13 @@ function statementSource(statement) {
   return emittedStatementSources.get(statement);
 }
 
+const transferKinds = new Set(['ReturnStatement', 'ThrowStatement', 'BreakStatement', 'ContinueStatement']);
+function containsExplicitTransfer(statement) {
+  return anyStatement(statement, node => transferKinds.has(node.kind)
+    || node.kind === 'UnsupportedStatement' && anyStatement(parsedStraightBlock(node),
+      parsed => transferKinds.has(parsed.kind)));
+}
+
 function commonBranchTail(thenStatements, elseStatements) {
   // An if introduces no handler, monitor or jump target. Moving an identical
   // whole statement past it retains all three, including a try/lock *inside*
@@ -406,19 +413,17 @@ function commonBranchTail(thenStatements, elseStatements) {
   // Sharing just `return false` can turn a readable guard ladder into nested
   // positive tests. Keep empty exit guards and prefixes containing transfers;
   // meaningful shared work before the transfer still gets factored.
-  const transfers = new Set(['ReturnStatement', 'ThrowStatement', 'BreakStatement', 'ContinueStatement']);
   const parsed = statement => statement.kind === 'UnsupportedStatement'
     ? parsedStraightBlock(statement) : statement;
-  const hasTransfer = statement => anyStatement(parsed(statement), node => transfers.has(node.kind));
   const tail = thenStatements.slice(-count);
   const onlyTransfers = count && tail.every(statement => {
     const node = parsed(statement);
-    return node?.kind === 'BlockStatement' ? node.statements.length === 1 && transfers.has(node.statements[0].kind)
-      : transfers.has(node?.kind);
+    return node?.kind === 'BlockStatement' ? node.statements.length === 1 && transferKinds.has(node.statements[0].kind)
+      : transferKinds.has(node?.kind);
   });
   if (onlyTransfers && (thenStatements.length === count && elseStatements.length !== count
       || elseStatements.length === count && thenStatements.length !== count
-      || [...thenStatements.slice(0, -count), ...elseStatements.slice(0, -count)].some(hasTransfer))) return 0;
+      || [...thenStatements.slice(0, -count), ...elseStatements.slice(0, -count)].some(containsExplicitTransfer))) return 0;
   return count;
 }
 
@@ -564,8 +569,126 @@ function factorCommonBranchTails(source) {
     }
     return result;
   }
+  function terminalContinuation(items) {
+    if (!items.length) return false;
+    const last = items.at(-1);
+    const parsed = last.kind === 'UnsupportedStatement' ? parsedStraightBlock(last) : last;
+    const statement = parsed?.kind === 'BlockStatement' && parsed.statements.length === 1
+      ? parsed.statements[0] : parsed;
+    return ['ReturnStatement', 'ThrowStatement', 'BreakStatement', 'ContinueStatement'].includes(statement?.kind);
+  }
+  function acceptsContinuation(body) {
+    if (continuation(body) !== body) return false;
+    // The existing abrupt-completion proof is deliberately conservative about
+    // loops and switches. Do not append a continuation after such a construct:
+    // a missed infinite loop would make the appended Java unreachable. A raw
+    // try/monitor is kept whole; its completion can be proved without entering
+    // its exception/monitor region or changing any internal transfer destination.
+    const uncertain = new Set(['WhileStatement', 'ForStatement', 'EnhancedForStatement',
+      'DoWhileStatement', 'SwitchStatement', 'LabeledStatement']);
+    return !body.some(statement => anyStatement(statement, node => uncertain.has(node.kind)
+      || node.kind === 'UnsupportedStatement' && anyStatement(parsedStraightBlock(node),
+        parsed => uncertain.has(parsed.kind))));
+  }
+  const labelNames = new Set(tokens.filter(token => token.kind === 'identifier').map(token => token.text));
+  const generatedLabels = new Set();
+  let labelOrdinal = 0;
+  function doesNotDuplicate(before, after) {
+    const rawCounts = statements => {
+      const counts = new Map();
+      for (const statement of statements) anyStatement(statement, node => {
+        // createNode deep-copies its children, so object identity is not a
+        // provenance key. Exact source spelling survives those AST copies.
+        if (node.kind === 'UnsupportedStatement') counts.set(node.source, (counts.get(node.source) || 0) + 1);
+        return false;
+      });
+      return counts;
+    };
+    const originalRaw = rawCounts(before);
+    if ([...rawCounts(after)].some(([node, count]) => count > (originalRaw.get(node) || 0))) return false;
+    const identifiers = statements => {
+      const counts = new Map();
+      for (const token of tokenizeJava(emitStatements(statements)).tokens)
+        if (token.kind === 'identifier' && !generatedLabels.has(token.text))
+          counts.set(token.text, (counts.get(token.text) || 0) + 1);
+      return counts;
+    };
+    const originalNames = identifiers(before);
+    return [...identifiers(after)].every(([name, count]) => count <= (originalNames.get(name) || 0));
+  }
+  function labeledTail(child, following) {
+    // A break from a new plain block skips all intervening prefix statements
+    // exactly as the original terminal clone did. No condition is evaluated
+    // again, and no try/monitor/loop/old-label body is entered by the search.
+    for (let length = following.length; length >= 2; length--) {
+      const suffix = following.slice(-length), prefix = [child, ...following.slice(0, -length)];
+      if (continuation(suffix) !== suffix || continuation(prefix) !== prefix) continue;
+      const last = suffix.at(-1), parsedLast = last.kind === 'UnsupportedStatement' ? parsedStraightBlock(last) : last;
+      const terminal = parsedLast?.kind === 'BlockStatement' && parsedLast.statements.length === 1
+        ? parsedLast.statements[0] : parsedLast;
+      if (!['ReturnStatement', 'ThrowStatement'].includes(terminal?.kind)) continue;
+      let label, matches = 0;
+      function replace(body) {
+        if (continuation(body) !== body) return body;
+        if (body.length >= suffix.length && suffix.every((statement, index) =>
+            statementSource(statement) === statementSource(body[body.length - suffix.length + index]))) {
+          if (!label) {
+            do { label = `sharedTailExit_${labelOrdinal++}`; } while (labelNames.has(label));
+            labelNames.add(label); generatedLabels.add(label);
+          }
+          matches++;
+          return [...body.slice(0, -suffix.length), createNode('BreakStatement', {label})];
+        }
+        return body.map(statement => statement.kind === 'IfStatement' ? createNode('IfStatement', {
+          condition: statement.condition, consequent: block(replace(statement.consequent.statements)),
+          alternate: statement.alternate ? block(replace(statement.alternate.statements)) : null,
+        }) : statement);
+      }
+      const rewritten = replace(prefix);
+      if (matches) {
+        branches += matches;
+        return [createNode('LabeledStatement', {label, statement: block(rewritten)}), ...suffix];
+      }
+    }
+    return null;
+  }
+  function contextualTails(body, following = []) {
+    // Normalize both arms with their actual enclosing continuation, then share
+    // identical suffixes immediately. An existing return/throw/jump ends its
+    // path and discards that virtual continuation. This also preserves skipped
+    // statements at multiple enclosing levels without inventing a jump label.
+    // Scope checks precede every copy; branch-local declarations must never
+    // capture a name from a continuation that originally followed the if.
+    let result = following;
+    for (let index = body.length - 1; index >= 0; index--) {
+      const child = body[index];
+      if (child.kind === 'IfStatement' && acceptsContinuation(result)
+          && acceptsContinuation(child.consequent.statements)
+          && (!child.alternate || acceptsContinuation(child.alternate.statements))
+          && !(result.length === 1 && terminalContinuation(result)
+            && !child.consequent.statements.some(containsExplicitTransfer)
+            && !(child.alternate?.statements || []).some(containsExplicitTransfer))) {
+        const original = [child, ...result], previousBranches = branches;
+        const taken = contextualTails(child.consequent.statements, result);
+        const other = child.alternate ? contextualTails(child.alternate.statements, result) : result;
+        const lowered = lowerIfStatements(child.condition.source, taken, other,
+          () => inverse(child.condition.source), null, true);
+        if (doesNotDuplicate(original, lowered)) {
+          if (emitStatements(lowered) !== emitStatements(original)) branches++;
+          result = lowered;
+        } else {
+          branches = previousBranches;
+          result = labeledTail(child, result) || original;
+        }
+      } else {
+        result = provenAbrupt([child]) ? [child] : [child, ...result];
+      }
+    }
+    return result;
+  }
   try {
-    const result = statements(parsed);
+    let result = statements(parsed);
+    if (terminalContinuation(result)) result = contextualTails(result);
     return branches ? {source: emitStatements(result), branches} : unchanged();
   } catch (_) { return unchanged(); }
 }
