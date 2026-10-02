@@ -1098,3 +1098,45 @@ before optional structured-method partitioning; dispatcher fallback is unchanged
 catch priority, finally overriding pending failures, null locks and monitor
 release. These fixtures establish that limited transformation scope; full
 GeoBlox execution remains separately unverified.
+
+## Resolving equivalent stack joins to a fixed point
+
+Typed operand-stack copies previously survived when the incoming edges named
+several carriers that earlier proofs already aliased to one value. The renderer
+now revisits complete incoming-edge proofs until no further same-type copies
+can be resolved. It keeps incomplete or effectful edges, conflicting values,
+self references and alias cycles (including chains feeding cycles). Reference
+copies between allocator-owned carriers of exactly the same declared type no
+longer widen through Object; ordinary locals and differing verifier types keep
+the existing coercions. Conditions, parallel-copy snapshots, handlers and
+monitors remain at their original execution points.
+
+Deleted stores also left large runs of blank lines. A lexical pass compacts only
+gaps containing whitespace; comment-containing gaps, string/character/text-block
+tokens, Unicode escapes and lexing failures retain their original bytes.
+This presentation step runs after helper partitioning and loop recovery.
+
+The partition suite exposed a pre-existing budget defect, reproduced at
+049d323: helpers budgeted original returns, then expanded them into shared
+completion-flag stores. Two helpers reached 24,290/24,296 characters and were
+rejected, producing a dispatcher. Packing now includes the actual return-store
+expansion instead of raising the budget or changing the fixture expectation.
+All six partition regressions check their expected structured/fallback modes
+and native behavior, including parameter mutation, checked catches and
+nonlocal loop exits.
+
+`node test/cfrParallelBackedges.test.js` passes 16 groups: the existing 6,650
+native comparisons plus 1,440 new comparisons for protected/unprotected typed
+joins in structured and forced-dispatcher modes. The new fixtures retain the
+original reference and integer after parameter reassignment and check identity,
+null/empty strings, signed overflow and caught/uncaught failures. Pure graph
+checks cover multi-pass discovery, incomplete edge counts, type conflicts and
+cycles. Separate tests protect comment/literal bytes during blank-line cleanup.
+
+The fixed 303-class GeoBlox export compiles. It removes 1,075 allocator-owned
+carrier declarations (1,073 locals and two partitioned carrier fields), adds no
+declarations and retains all 388 override relationships. Its raw source shrinks
+from 85,591 to 80,520 lines across 176 changed files. The pointer-spawn method
+loses 15 intermediate locals; genuinely different variant/category values
+remain explicit. These are source reconstruction checks, not full-game runtime
+or browser-performance evidence.

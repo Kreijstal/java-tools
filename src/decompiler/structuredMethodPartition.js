@@ -135,7 +135,18 @@ function partitionStructuredVoidBody(lines, options) {
   const outline = (block, catches) => {
     const span = spans.get(block);
     if (replace(span.start, span.end).length <= budget) return;
-    let group = [];
+    let group = [], groupReturnGrowth = 0;
+    const returnGrowth = statement => {
+      let growth = 0;
+      walk(statement, node => {
+        if (node.kind !== 'ReturnStatement') return;
+        const position = spans.get(node);
+        if (edits.some(edit => edit.start <= position.start && edit.end >= position.end)) return;
+        if (node.expression) throw new Error('non-void outlined return');
+        growth += 'finished = true; return;'.length - (position.end - position.start);
+      });
+      return growth;
+    };
     const flush = () => {
       if (!group.length) return;
       if (helpers.length >= 256) throw new Error('structured helper budget exhausted');
@@ -158,16 +169,23 @@ function partitionStructuredVoidBody(lines, options) {
         if (edits[i].start >= firstSpan.start && edits[i].end <= lastSpan.end) edits.splice(i, 1);
       edits.push({start: firstSpan.start, end: lastSpan.end, text: `${name}();\n${prefix}if (finished) return;`});
       group = [];
+      groupReturnGrowth = 0;
     };
     for (const statement of block.statements) {
       const position = spans.get(statement);
-      const size = replace(position.start, position.end).length + 1;
+      // A void return becomes a shared completion flag plus a helper return.
+      // Include that expansion while packing, rather than rejecting the fully
+      // rewritten helpers afterward and falling back to a dispatcher.
+      const growth = returnGrowth(statement);
+      const size = replace(position.start, position.end).length + growth + 1;
       if (size > budget) throw new Error('statement cannot safely cross a helper boundary');
       // A small transfer to an enclosing loop/label can stay at its exact
       // original site between outlined runs. It must never enter a helper.
       if (!closed(statement)) { flush(); continue; }
-      if (group.length && replace(spans.get(group[0]).start, position.end).length > budget) flush();
+      if (group.length && replace(spans.get(group[0]).start, position.end).length
+          + groupReturnGrowth + growth > budget) flush();
       group.push(statement);
+      groupReturnGrowth += growth;
     }
     flush();
   };

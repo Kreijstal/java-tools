@@ -6,7 +6,7 @@ const os = require('os');
 const path = require('path');
 const {spawnSync} = require('child_process');
 const {assembleJasminSource} = require('../src/utils/jasminAssembly');
-const {decompileClassFile, assertNoFallback} = require('../src/decompiler/cfr');
+const {decompileClassFile, assertNoFallback, _internals: {resolveStackCarrierAliases, compactBlankSourceLines}} = require('../src/decompiler/cfr');
 
 function run(command, args, directory) {
   const paths = ['stdout','stderr'].map(name => path.join(directory,name));
@@ -157,6 +157,106 @@ Lreturn: return
       const rebuilt=path.join(temporary,forced?'forced':'structured');fs.mkdirSync(rebuilt);
       for(const [name,text] of Object.entries({MultiComparisons:source,Effects:effects,Runner:driver}))fs.writeFileSync(path.join(rebuilt,name+'.java'),text);
       run('javac',['--release','8','-d',rebuilt,...['MultiComparisons','Effects','Runner'].map(name=>path.join(rebuilt,name+'.java'))],rebuilt);
+      assert.equal(run('java',['-cp',rebuilt,'Runner'],rebuilt),expected);
+    }
+  } finally {
+    if(previous===undefined)delete process.env.CFR_JS_FORCE_STATE_MACHINE;else process.env.CFR_JS_FORCE_STATE_MACHINE=previous;
+    fs.rmSync(temporary,{recursive:true,force:true});
+  }
+});
+
+
+test('join aliases reach a fixed point without accepting incomplete edges or cycles',()=>{
+  const name = index => `stackIn_${index}_0`;
+  const initial = new Map([[name(2),name(1)],[name(3),name(1)],[name(6),name(1)]]);
+  const state = (sources,edges=2,invalid=false) => ({sources:new Set(sources.map(name)),edges,invalid});
+  const incoming = new Map([[name(7),state([5,6])],[name(5),state([2,3])]]);
+  const preds=[];preds[5]=[2,3];preds[7]=[5,6];
+  const types=new Map([1,2,3,5,6,7].map(index=>[name(index),'String']));
+  const resolved=resolveStackCarrierAliases(initial,incoming,preds,types);
+  for(const index of [2,3,5,6,7]) assert.equal(resolved.get(name(index)),name(1));
+  assert.equal(initial.size,3);assert.equal(incoming.get(name(7)).sources.size,2);
+  for(const bad of [state([2,3],1),state([2,3],3),state([2,3],2,true),state([2,4]),state([2,5])]) {
+    const result=resolveStackCarrierAliases(initial,new Map([[name(5),bad]]),preds,types);
+    assert.equal(result.has(name(5)),false);
+  }
+  const different=new Map(types);different.set(name(5),'Object');
+  assert.equal(resolveStackCarrierAliases(initial,incoming,preds,different).has(name(5)),false);
+  const cycle=new Map([[name(2),name(3)],[name(3),name(2)],[name(6),name(2)]]);
+  assert.equal(resolveStackCarrierAliases(cycle,incoming,preds,types).size,0);
+  const self=new Map([[name(2),name(2)],[name(3),name(2)]]);
+  assert.equal(resolveStackCarrierAliases(self,incoming,preds,types).size,0);
+});
+
+test('blank carrier lines compact without changing comments, literals or Unicode translation',()=>{
+  const source='first();\n  \n\n  second("a\\nb");\n\n  third();';
+  assert.equal(compactBlankSourceLines(source),'first();\n  second("a\\nb");\n  third();');
+  for(const body of [
+    'first(); /* comment\n\nend */ second();',
+    'first(); // comment\n\nsecond();',
+    'String text="""\n\nkeep this\n\n""";',
+    'first(); /* \\u000a */\n\nsecond();',
+    'String text="unterminated;\n\n',
+  ]) assert.equal(compactBlankSourceLines(body),body);
+});
+
+for(const protection of [false,true]) test(`typed multi-level joins preserve snapshots, identity and failures: protected=${protection}`,()=>{
+  const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'cfr-typed-join-'));
+  const previous=process.env.CFR_JS_FORCE_STATE_MACHINE;
+  try {
+    const native=path.join(temporary,'native');fs.mkdirSync(native);
+    const file=path.join(native,'TypedJoin.class');
+    assembleJasminSource(`.version 49 0
+.class public super TypedJoin
+.super java/lang/Object
+.method public static compute : (Ljava/lang/String;IIZ)Ljava/lang/String;
+.code stack 5 locals 4
+ ${protection?'.catch java/lang/RuntimeException from Lstart to Lend using Lhandler':''}
+Lstart: aload_0\n iload_1\n iload_2\n ifne Lfirst
+ ldc "changed-zero"\n astore_0\n iinc 1 10\n iconst_4\n goto Ljoin
+Lfirst: ldc "changed-one"\n astore_0\n iinc 1 -10\n iconst_5
+Ljoin: iload_3\n ifne Lsecond
+ bipush 6\n goto Lfinish
+Lsecond: bipush 7
+Lfinish: invokestatic Method Effects finish (Ljava/lang/String;III)Ljava/lang/String;
+Lend: areturn
+ ${protection?'Lhandler: invokestatic Method Effects caught (Ljava/lang/Throwable;)Ljava/lang/String;\n areturn':''}
+.end code
+.end method
+.end class`,file);
+    const effects=`class Effects {static String expected; static int mode;static StringBuilder trace;
+      static final RuntimeException failure=new IllegalArgumentException();
+      static String finish(String value,int original,int first,int second) {
+        if(value!=expected)throw new AssertionError("reference identity changed");
+        trace.append(original).append(':').append(first).append(':').append(second);
+        if(mode==1)throw failure;if(mode==2)return value.substring(0,1);return value;
+      }
+      static String caught(Throwable error){trace.append("caught:").append(error==failure);return "caught";}
+    }`;
+    const driver=`class Runner {public static void main(String[] args) {
+      for(String input:new String[]{null,new String(""),new String("same"),new String("different")})
+      for(int original:new int[]{Integer.MIN_VALUE,-1,0,1,Integer.MAX_VALUE})
+      for(int first:new int[]{-1,0,1})for(boolean second:new boolean[]{false,true})for(int mode=0;mode<3;mode++) {
+        Effects.expected=input;Effects.mode=mode;Effects.trace=new StringBuilder();String result="ok";String value=null;
+        try{value=TypedJoin.compute(input,original,first,second);}catch(Throwable error){result=error.getClass().getName()+":"+(error==Effects.failure);}
+        System.out.println(result+":"+value+":"+(value==input)+":"+Effects.trace);
+      }
+    }}`;
+    for(const [name,source] of Object.entries({Effects:effects,Runner:driver}))fs.writeFileSync(path.join(native,name+'.java'),source);
+    run('javac',['--release','8','-cp',native,'-d',native,path.join(native,'Effects.java'),path.join(native,'Runner.java')],native);
+    const expected=run('java',['-cp',native,'Runner'],native);assert.equal(expected.trim().split('\n').length,360);
+    for(const forced of [false,true]) {
+      if(forced)process.env.CFR_JS_FORCE_STATE_MACHINE='1';else delete process.env.CFR_JS_FORCE_STATE_MACHINE;
+      const source=decompileClassFile(file,{forceOwnedStructurer:true});assertNoFallback(source);
+      assert.equal(source.includes('switch (statePc)'),forced);
+      if(!forced) {
+        const stringCarriers=source.match(/String stackIn_\d+_\d+/g)||[];
+        assert.equal(stringCarriers.length,protection?2:1,source);
+        assert.doesNotMatch(source,/stackIn_\d+_\d+ = \(String\) \(\(Object\) stackIn_/);
+      }
+      const rebuilt=path.join(temporary,forced?'forced':'structured');fs.mkdirSync(rebuilt);
+      for(const [name,text] of Object.entries({TypedJoin:source,Effects:effects,Runner:driver}))fs.writeFileSync(path.join(rebuilt,name+'.java'),text);
+      run('javac',['--release','8','-d',rebuilt,...['TypedJoin','Effects','Runner'].map(name=>path.join(rebuilt,name+'.java'))],rebuilt);
       assert.equal(run('java',['-cp',rebuilt,'Runner'],rebuilt),expected);
     }
   } finally {

@@ -3990,7 +3990,13 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
       const simpleLocalReference = rawStoredValue
         && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(rawStoredValue.code)
         && !primitiveStackTypes.has(targetStackType) && targetStackType !== 'Object';
-      const typedStoredValue = simpleLocalReference
+      // An allocator-owned carrier already has an explicit source declaration.
+      // For an identical reference type, widening it to Object and casting back
+      // only hides a pure copy from the join-alias proof. Ordinary locals and
+      // differing verifier types still need the existing coercion path.
+      const exactReferenceCarrier = simpleLocalReference
+        && stackCarrierTypes.get(rawStoredValue.code) === targetStackType;
+      const typedStoredValue = simpleLocalReference && !exactReferenceCarrier
         ? { ...rawStoredValue, type: 'Object' }
         : (canonicalSourceType ? { ...rawStoredValue, type: canonicalSourceType } : rawStoredValue);
       const rendered = value.pendingNew
@@ -4248,26 +4254,11 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
           if (source !== target) redundantStackInAliases.set(target, source);
         }
       }
-      const resolveAlias = (name) => {
-        const seen = new Set([name]);
-        let current = name;
-        while (redundantStackInAliases.has(current)) {
-          const next = redundantStackInAliases.get(current);
-          if (seen.has(next)) return null;
-          seen.add(next);
-          current = next;
-        }
-        return current;
-      };
-      // Resolve against the complete original map. Cyclic aliases (and chains
-      // feeding a cycle) still carry runtime values and must keep their stores
-      // and declarations rather than being substituted and deleted together.
-      const resolvedAliases = [...redundantStackInAliases].map(([target]) =>
-        [target, resolveAlias(target)]);
-      for (const [target, replacement] of resolvedAliases) {
-        if (replacement == null || replacement === target) redundantStackInAliases.delete(target);
-        else redundantStackInAliases.set(target, replacement);
-      }
+      const resolvedAliases = resolveStackCarrierAliases(redundantStackInAliases,
+        edgeStackInSources, regularPredecessors, stackCarrierTypes);
+      redundantStackInAliases.clear();
+      for (const [target, replacement] of resolvedAliases)
+        redundantStackInAliases.set(target, replacement);
     }
     if (forwardedStackIns.size) {
       const escapedNames = [...forwardedStackIns].map((name) =>
@@ -4327,7 +4318,7 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
           methodName: method.name, descriptor: method.descriptor,
           helpers: partitioned.helpers, sharedLocals: partitioned.sharedLocals,
         });
-        return partitioned.lines;
+        return compactBlankSourceLines(partitioned.lines.join('\n')).split('\n');
       }
       // A helper boundary must not strand a labeled transfer or a local scope.
       // Retain the typed CFG representation when closed statement extraction
@@ -4354,7 +4345,8 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     if (partitionOversizedMethod) {
       return partitionVoidStateMachine(lines, method, localState);
     }
-    return coalesceDefaultConstructorBody(sinkForInitDeclarations(rewriteWhileLoopsAsFor(lines)), method);
+    const body = coalesceDefaultConstructorBody(sinkForInitDeclarations(rewriteWhileLoopsAsFor(lines)), method);
+    return useStateMachine ? body : compactBlankSourceLines(body.join('\n')).split('\n');
   } catch (err) {
     // Expression reconstruction can still decline stack-carrying joins. The
     // old recognizers remain a safe fallback while that dataflow grows.
@@ -8473,6 +8465,65 @@ function isBracketBalanced(fragment) {
   return depth === 0;
 }
 
+// Removed edge stores can leave hundreds of blank lines. Only compact gaps
+// proven to contain whitespace; token bodies and comment-containing gaps stay
+// byte-exact, including text blocks, diagnostic strings and comment line ends.
+function compactBlankSourceLines(source) {
+  if (/\\u+[0-9a-fA-F]{4}/.test(source)) return source;
+  const {tokens, diagnostics} = tokenizeJava(source);
+  if (diagnostics.length) return source;
+  let output = '', previous = 0;
+  const compact = gap => /^[ \t\r\n\f]*$/.test(gap)
+    ? gap.replace(/\n[ \t\r\f]*(?=\n)/g, '') : gap;
+  for (const token of tokens) {
+    output += compact(source.slice(previous, token.range.startOffset));
+    output += source.slice(token.range.startOffset, token.range.endOffset);
+    previous = token.range.endOffset;
+  }
+  return output + compact(source.slice(previous));
+}
+
+// A later phi may name several earlier aliases of the same stack value.
+// Revisit complete incoming-edge proofs until no further copies become aliases.
+// Only same-type allocator carriers qualify; incomplete edges, effects,
+// differing values, self references and alias cycles remain runtime copies.
+function resolveStackCarrierAliases(initialAliases, incomingSources, predecessors, carrierTypes) {
+  const aliases = new Map(initialAliases);
+  const resolve = name => {
+    const seen = new Set([name]);
+    let current = name;
+    while (aliases.has(current)) {
+      const next = aliases.get(current);
+      if (seen.has(next)) return null;
+      seen.add(next);
+      current = next;
+    }
+    return current;
+  };
+  let changed;
+  do {
+    changed = false;
+    for (const [target, state] of incomingSources) {
+      if (aliases.has(target) || state.invalid || state.sources.size < 2) continue;
+      const match = /^stackIn_(\d+)_\d+$/.exec(target);
+      const count = match ? (predecessors[Number(match[1])] || []).length : 0;
+      if (!count || state.edges !== count || !carrierTypes.has(target)) continue;
+      const sources = [...state.sources].map(resolve);
+      const source = sources[0];
+      if (source === null || source === target || !sources.every(value => value === source)
+          || carrierTypes.get(source) !== carrierTypes.get(target)) continue;
+      aliases.set(target, source);
+      changed = true;
+    }
+  } while (changed);
+  const resolved = new Map();
+  for (const [target] of aliases) {
+    const source = resolve(target);
+    if (source !== null && source !== target) resolved.set(target, source);
+  }
+  return resolved;
+}
+
 function integralConditionsFromCache(cache) {
   const proven = new Set(), ambiguous = new Set(), complements = new Map();
   const record = (predicate, inverse) => {
@@ -10393,6 +10444,8 @@ module.exports = {
     coerceExpressionForType,
     negateBooleanExpression,
     integralConditionsFromCache,
+    resolveStackCarrierAliases,
+    compactBlankSourceLines,
     isBracketBalanced,
     dropUnthrowableProtectedRows,
     isCheckedThrow,
