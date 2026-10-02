@@ -15,7 +15,7 @@ const { listRegionSplitCandidates, applyRegionSplit } = require('../passes/regio
 const { jreClassInfo, jreMethodCandidates } = require('../java-frontend/jreMetadata');
 const { JavaParser } = require('../java-frontend/parser');
 const { tokenizeJava } = require('../java-frontend/lexer');
-const { promoteBooleanStackCarriers, factorCommonBranchTails, removeDeadRegionSelectors } = require('./javaAstEmitter');
+const { promoteBooleanStackCarriers, factorCommonBranchTails, removeDeadRegionSelectors, removeDeadReceiverSnapshots } = require('./javaAstEmitter');
 
 const VERSION = 'CFR-JS 0.4.0';
 const javaStatementParser = new JavaParser();
@@ -4302,6 +4302,9 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
       const selectors = removeDeadRegionSelectors(source, retainedDeclarations, structured.selectorDecls);
       source = selectors.source;
       retainedDeclarations = selectors.declarations;
+      const receivers = removeDeadReceiverSnapshots(source, retainedDeclarations, stackCarrierTypes.keys());
+      source = receivers.source;
+      retainedDeclarations = receivers.declarations;
     }
     let lines = source ? source.split('\n') : [];
     lines.unshift(...retainedDeclarations);

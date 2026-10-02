@@ -1079,3 +1079,22 @@ existing native probe separately covers 96 cache-shutdown combinations of null
 entries and close failures, including handle retention and monitor release.
 This is evidence for those scopes; goto-free output and successful compilation
 alone do not establish whole-corpus runtime equivalence.
+
+### Unread receiver snapshots
+
+The structured renderer can discard allocator-owned Object stack slots when
+their complete source occurrences are standalone assignments of `this` or
+`null`. A single default-null declaration must match the allocator identity;
+parsed AST statements and lexer offsets account for every occurrence. Reads,
+other initializers or right-hand sides, casts, aliases, field access, shadowing,
+scalar statement bodies, unsupported syntax and Unicode escapes refuse cleanup.
+Conditions, handler ranges, monitors, loops and transfers stay in place. No
+allocation, field/array read, call, class initialization or throwing cast is
+deleted by this proof. The pass applies after existing selector cleanup and
+before optional structured-method partitioning; dispatcher fallback is unchanged.
+
+`test/javaAstEmitterLoopExits.test.js` adds proof acceptance/refusal checks and
+96 native original/rebuilt comparisons for condition effects, failure identity,
+catch priority, finally overriding pending failures, null locks and monitor
+release. These fixtures establish that limited transformation scope; full
+GeoBlox execution remains separately unverified.

@@ -562,6 +562,75 @@ function removeDeadRegionSelectors(source, declarations, selectorNames) {
     declarations: declarations.filter(declaration => !removed.some(name => declaration === candidates.get(name).declaration))};
 }
 
+// Remove only allocator-owned, unread Object stack slots whose complete body
+// occurrences are standalone stores of this/null. Neither right-hand side can
+// throw, allocate, initialize a class or perform a field/array/volatile read.
+// Retain all surrounding conditions, protected regions, monitors and transfers.
+function removeDeadReceiverSnapshots(source, declarations, carrierNames) {
+  const unchanged = () => ({source, declarations, removed: []});
+  const candidates = new Map();
+  for (const name of carrierNames || []) {
+    if (!/^stackIn_\d+_\d+$/.test(name)) continue;
+    const declaration = `Object ${name} = null;`;
+    if (declarations.filter(item => item === declaration).length === 1)
+      candidates.set(name, {declaration, allowed: new Set(), edits: []});
+  }
+  if (!candidates.size || [source, ...declarations].some(text => /\\u+[0-9a-fA-F]{4}/.test(text))) return unchanged();
+  const wrapped = `{\n${source}\n}`;
+  let parsed, tokens;
+  try {
+    parsed = statementParser.parseStatement(wrapped, {requireComplete: true});
+    const lexed = tokenizeJava(wrapped);
+    if (lexed.diagnostics.length) return unchanged();
+    tokens = lexed.tokens.filter(token => !['comment', 'whitespace', 'eof'].includes(token.kind));
+  } catch (_) { return unchanged(); }
+  const starts = new Map(tokens.map((token, index) => [token.range.startOffset, index]));
+  let unknown = false;
+  function walk(node, parent = null) {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) { for (const child of node) walk(child, parent); return; }
+    if (node.kind?.startsWith('Unsupported')) unknown = true;
+    const expression = node.expression;
+    if (node.kind === 'ExpressionStatement' && parent?.kind === 'BlockStatement'
+        && parent.statements.includes(node) && expression?.kind === 'AssignmentExpression'
+        && expression.operator === '=' && expression.left.kind === 'Identifier') {
+      const state = candidates.get(expression.left.name);
+      const index = starts.get(node.range?.startOffset);
+      const right = expression.right;
+      if (state && tokens[index]?.text === expression.left.name && tokens[index + 1]?.text === '='
+          && tokens[index + 3]?.text === ';' && (right.kind === 'ThisExpression' && tokens[index + 2]?.text === 'this'
+            || right.kind === 'LiteralExpression' && right.literalKind === 'null' && tokens[index + 2]?.text === 'null')) {
+        state.allowed.add(index);
+        state.edits.push({start: tokens[index].range.startOffset, end: tokens[index + 3].range.endOffset});
+      }
+    }
+    for (const [key, child] of Object.entries(node))
+      if (!['range', 'meta', 'tokens', 'kind'].includes(key)) walk(child, node);
+  }
+  walk(parsed);
+  if (unknown) return unchanged();
+  const removed = [], edits = [];
+  for (const [name, state] of candidates) {
+    if (tokens.some((token, index) => token.kind === 'identifier' && token.text === name && !state.allowed.has(index))) continue;
+    if (declarations.some(declaration => declaration !== state.declaration &&
+        tokenizeJava(declaration).tokens.some(token => token.kind === 'identifier' && token.text === name))) continue;
+    removed.push(name); edits.push(...state.edits);
+  }
+  edits.sort((a,b) => a.start - b.start);
+  for (const edit of edits) {
+    const start = wrapped.lastIndexOf('\n', edit.start - 1) + 1;
+    const end = wrapped.indexOf('\n', edit.end);
+    if (end >= 0 && !wrapped.slice(start, edit.start).trim() && !wrapped.slice(edit.end, end).trim()) {
+      edit.start = start; edit.end = end + 1;
+    }
+  }
+  if (edits.some((edit, index) => index && edits[index - 1].end > edit.start)) return unchanged();
+  let output = wrapped;
+  for (const edit of edits.reverse()) output = output.slice(0, edit.start) + output.slice(edit.end);
+  return {source: output.slice(2, -2), removed,
+    declarations: declarations.filter(declaration => !removed.some(name => declaration === candidates.get(name).declaration))};
+}
+
 // Run after stack-carrier cleanup: two copies of the same CFG tail may initially
 // spell the same Boolean argument using different temporary names. Parse the
 // final source for control/scope proofs, while retaining original expression
@@ -1170,4 +1239,5 @@ module.exports = {
   promoteBooleanStackCarriers,
   factorCommonBranchTails,
   removeDeadRegionSelectors,
+  removeDeadReceiverSnapshots,
 };

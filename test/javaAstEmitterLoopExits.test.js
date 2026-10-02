@@ -7,7 +7,7 @@ const os = require('os');
 const path = require('path');
 const {spawnSync} = require('child_process');
 const {treeToStatements, emitStatements, promoteBooleanStackCarriers, factorCommonBranchTails,
-  removeDeadRegionSelectors} = require('../src/decompiler/javaAstEmitter');
+  removeDeadRegionSelectors, removeDeadReceiverSnapshots} = require('../src/decompiler/javaAstEmitter');
 const {printTree} = require('../src/decompiler/structurer');
 const {JavaParser} = require('../src/java-frontend/parser');
 const {decompileClassFile, assertNoFallback} = require('../src/decompiler/cfr');
@@ -1148,5 +1148,78 @@ test('typed integral tail guards preserve native boundaries, unboxing, NaNs and 
     const javaFile=path.join(temporary,'TypedTailGuards.java');fs.writeFileSync(javaFile,source);
     run('javac',['--release','8','-d',temporary,javaFile],temporary);
     assert.equal(run('java',['-cp',temporary,'TypedTailGuards'],temporary).trim().split('\n').length,35280);
+  } finally {fs.rmSync(temporary,{recursive:true,force:true});}
+});
+
+
+test('unread receiver snapshot cleanup requires allocator identities and complete safe stores', () => {
+  const name='stackIn_2_0', declaration=`Object ${name} = null;`;
+  const source=`trace.append("${name}"); // ${name}
+if(pick()) { ${name} = this; work(); } else { ${name} = null; }
+try { ${name} = this; fail(); } catch(Exception error) { ${name} = this; caught(error); }
+synchronized(lock) { ${name} = null; finish(); }`;
+  const result=removeDeadReceiverSnapshots(source,[declaration,'int count = 0;'],[name]);
+  assert.deepEqual(result.removed,[name]);assert.deepEqual(result.declarations,['int count = 0;']);
+  assert.equal(result.source,`trace.append("${name}"); // ${name}
+if(pick()) {  work(); } else {  }
+try {  fail(); } catch(Exception error) {  caught(error); }
+synchronized(lock) {  finish(); }`);
+  for(const [declarations,names] of [[[declaration],[]],[[declaration,declaration],[name]],
+    [[`Thing ${name} = null;`],[name]],[[`Object ${name};`],[name]]])
+    assert.equal(removeDeadReceiverSnapshots(source,declarations,names).source,source);
+  for(const body of [
+    `${name}=this; return ${name};`, `${name}=effect();`, `${name}=other;`, `${name}=new Object();`,
+    `${name}=this.field;`, `${name}=(Object)this;`, `${name}=Outer.this;`, `${name}=this; use(other.${name});`,
+    `${name}=this; use(${name});`, `${name}=this; Object alias=${name};`, `${name}=(${name}=this);`,
+    `{ Object ${name}=null; ${name}=this; }`, `if(pick()) ${name}=this;`, `label: ${name}=null;`,
+    `${name}=this; unknown @ syntax;`, `${name}=this; /* \\u0061 */`,
+    `${name}=this; } return; {`, `for(${name}=this; false;) {}`,
+  ]) {
+    const refused=removeDeadReceiverSnapshots(body,[declaration],[name]);
+    assert.equal(refused.source,body,body);assert.deepEqual(refused.removed,[],body);
+  }
+  assert.equal(removeDeadReceiverSnapshots(source,[declaration,`Object alias=${name};`],[name]).source,source);
+  const mixed=`${source}\nstackIn_3_0 = this; return stackIn_3_0;`;
+  assert.deepEqual(removeDeadReceiverSnapshots(mixed,[declaration,'Object stackIn_3_0 = null;'],[name,'stackIn_3_0']).removed,[name]);
+});
+
+test('receiver snapshot cleanup preserves native effects, failures, catch/finally and lock scope', () => {
+  const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'cfr-dead-receiver-'));
+  try {
+    const name='stackIn_2_0', declaration=`Object ${name} = null;`;
+    const body=`try {
+      if(branch()) { ${name}=this; work(mode); } else { ${name}=null; work(mode); }
+      synchronized(lock) { ${name}=this; trace.append(Thread.holdsLock(lock)); work(mode); }
+    } catch(IllegalArgumentException error) { ${name}=this; trace.append(error==specific); }
+      catch(RuntimeException error) { ${name}=null; trace.append(error==general); }
+      finally { ${name}=this; trace.append('f'); work(finalFailure); }
+    trace.append('e');`;
+    const result=removeDeadReceiverSnapshots(body,[declaration],[name]);
+    assert.deepEqual(result.removed,[name]);
+    const source=`public class ReceiverSnapshots {
+      static final RuntimeException specific=new IllegalArgumentException(),general=new IllegalStateException();
+      static final Error fatal=new AssertionError();static Object lock;static StringBuilder trace;static int branchMode;
+      static boolean branch(){trace.append('b');if(branchMode==2)throw general;return branchMode!=0;}
+      static void work(int mode){trace.append('w');if(mode==1)throw specific;if(mode==2)throw general;if(mode==3)throw fatal;}
+      void original(int mode,int finalFailure){${declaration}\n${body}}
+      void rebuilt(int mode,int finalFailure){${result.source}}
+      static String invoke(boolean rebuild,int mode,int finalFailure,int branch,boolean nullLock) {
+        trace=new StringBuilder();lock=nullLock?null:new Object();branchMode=branch;String escaped="ok";
+        try{if(rebuild)new ReceiverSnapshots().rebuilt(mode,finalFailure);else new ReceiverSnapshots().original(mode,finalFailure);}
+        catch(Throwable error){escaped=error==specific?"specific":error==general?"general":error==fatal?"fatal":error.getClass().getName();}
+        if(lock!=null && Thread.holdsLock(lock))throw new AssertionError("monitor escaped");return escaped+":"+trace;
+      }
+      public static void main(String[] args){int cases=0;
+        for(int mode=0;mode<4;mode++)for(int finalFailure=0;finalFailure<4;finalFailure++)
+        for(int branch=0;branch<3;branch++)for(boolean nullLock:new boolean[]{false,true}){
+          String expected=invoke(false,mode,finalFailure,branch,nullLock),actual=invoke(true,mode,finalFailure,branch,nullLock);
+          if(!expected.equals(actual))throw new AssertionError(expected+" != "+actual);
+          System.out.println(mode+":"+finalFailure+":"+branch+":"+nullLock+":"+actual);cases++;
+        }if(cases!=96)throw new AssertionError("case count");
+      }
+    }`;
+    const file=path.join(temporary,'ReceiverSnapshots.java');fs.writeFileSync(file,source);
+    run('javac',['--release','8','-d',temporary,file],temporary);
+    assert.equal(run('java',['-cp',temporary,'ReceiverSnapshots'],temporary).trim().split('\n').length,96);
   } finally {fs.rmSync(temporary,{recursive:true,force:true});}
 });
