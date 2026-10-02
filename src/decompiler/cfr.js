@@ -9636,6 +9636,16 @@ function constantExpression(value, op) {
 }
 
 function binaryExpr(left, symbol, right, type) {
+  // JVM shift distances use five bits for int and six for long. Normalize only
+  // a literal int operand: rewriting an inferred value could discard effects
+  // or a throwing computation, and the result width comes from the opcode.
+  if ((type === 'int' || type === 'long') && ['<<', '>>', '>>>'].includes(symbol)) {
+    const distance = integralLiteralValue(right, 'int');
+    if (distance !== null) {
+      const masked = distance & (type === 'long' ? 63 : 31);
+      right = expr(String(masked), 'int', 100, { constantValue: masked });
+    }
+  }
   if (['&', '|', '^'].includes(symbol) && left.type === 'boolean' && right.type === 'boolean') type = 'boolean';
   if (['&', '|', '^'].includes(symbol) && (left.type === 'boolean') !== (right.type === 'boolean')) {
     left = coerceExpressionForType(left, 'int');
