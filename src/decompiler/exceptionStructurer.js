@@ -1248,9 +1248,39 @@ function processGroup(work, group, ctx, commit) {
   tryNode.regionFlowBlock = superId;
   ctx.overrides.set(superId, tryNode);
   ctx.regionExitContracts.push({ owner: superId,
-    exits: [...exitTargets].map(([sink, target]) => ({sink, target})), components });
+    exits: [...exitTargets].map(([sink, target]) => ({sink, target})), components,
+    bindings: regionComponentBindings(tryNode, superId) });
   commit(collapseRegion(work, region, superId, group.start_pc, exits, ctx));
   return undefined;
+}
+
+// A component's normal edges do not identify its exception context. Swapping
+// intact try/handler components, changing catch priority, or moving a handler
+// under another try can preserve every normal edge and still change behavior.
+// Record the protected-body/catch binding after intentional catch nesting, but
+// before composition. Component bodies are opaque here; their CFGs are checked
+// separately. Labels and catch parameter names deliberately do not participate.
+function regionComponentBindings(node, owner) {
+  if (!node) return null;
+  if (node.regionFlowOwner != null || node.regionFlowComponent != null) {
+    if (node.regionFlowOwner !== owner || !Number.isSafeInteger(node.regionFlowComponent) ||
+        node.regionFlowComponent < 0 || !['seq', 'block'].includes(node.t)) return null;
+    return {component: node.regionFlowComponent};
+  }
+  if (node.t === 'try' && Array.isArray(node.catches)) {
+    const body = regionComponentBindings(node.body, owner);
+    if (node.catches.some(item => !Array.isArray(item.types) || !item.types.length ||
+        item.types.some(type => typeof type !== 'string'))) return null;
+    const catches = node.catches.map(item => ({types: [...item.types],
+      body: regionComponentBindings(item.body, owner)}));
+    if (!body || catches.some(item => !item.body)) return null;
+    return {kind: 'try', body, catches};
+  }
+  if (node.t === 'synchronized') {
+    const body = regionComponentBindings(node.body, owner);
+    return body ? {kind: 'synchronized', lockLocal: node.lockLocal, lockPc: node.lockPc, body} : null;
+  }
+  return null;
 }
 
 // Check every emitted copy of every try/handler component. Inner collapsed
@@ -1259,41 +1289,46 @@ function verifyRegionFlowContracts(tree, contracts) {
   const expected = new Map();
   for (const contract of contracts || []) {
     if (!contract || expected.has(contract.owner) || !Array.isArray(contract.components) ||
-        !contract.components.length) return false;
-    expected.set(contract.owner, contract.components);
+        !contract.components.length || !contract.bindings) return false;
+    expected.set(contract.owner, contract);
   }
   const seen = new Map([...expected].map(([owner]) => [owner, new Set()]));
   let valid = true;
-  const walk = node => {
+  const walk = (node, enclosingOwner = null) => {
     if (!node || !valid) return;
-    if (node.regionFlowBlock != null && (!expected.has(node.regionFlowBlock) ||
-        !['try', 'synchronized'].includes(node.t))) {
-      valid = false;
-      return;
+    if (node.regionFlowBlock != null) {
+      const contract = expected.get(node.regionFlowBlock);
+      const bindings = regionComponentBindings(node, node.regionFlowBlock);
+      if (!contract || !bindings || JSON.stringify(bindings) !== JSON.stringify(contract.bindings)) {
+        valid = false;
+        return;
+      }
+      enclosingOwner = node.regionFlowBlock;
     }
     if (node.regionFlowOwner != null || node.regionFlowComponent != null) {
-      const components = expected.get(node.regionFlowOwner);
+      const components = expected.get(node.regionFlowOwner)?.components;
       const component = node.regionFlowComponent;
-      if (!components || !Number.isSafeInteger(component) || component < 0 ||
+      if (enclosingOwner !== node.regionFlowOwner || !components ||
+          !Number.isSafeInteger(component) || component < 0 ||
           component >= components.length || !verifyStructuredFlow(node, components[component])) {
         valid = false;
         return;
       }
       seen.get(node.regionFlowOwner).add(component);
     }
-    if (node.t === 'seq') (node.body || []).forEach(walk);
-    else if (node.t === 'if') { walk(node.then); walk(node.els); }
+    if (node.t === 'seq') (node.body || []).forEach(child => walk(child, enclosingOwner));
+    else if (node.t === 'if') { walk(node.then, enclosingOwner); walk(node.els, enclosingOwner); }
     else if (node.t === 'switch') {
-      for (const item of node.cases || []) walk(item.body);
-      walk(node.dflt);
+      for (const item of node.cases || []) walk(item.body, enclosingOwner);
+      walk(node.dflt, enclosingOwner);
     } else if (['block', 'loop', 'try', 'synchronized'].includes(node.t)) {
-      walk(node.body);
-      for (const item of node.catches || []) walk(item.body);
+      walk(node.body, enclosingOwner);
+      for (const item of node.catches || []) walk(item.body, enclosingOwner);
     }
   };
   walk(tree);
-  return valid && [...expected].every(([owner, components]) =>
-    seen.get(owner).size === components.length);
+  return valid && [...expected].every(([owner, contract]) =>
+    seen.get(owner).size === contract.components.length);
 }
 
 // Check the composed tree after label uniquification, before printer cleanup.

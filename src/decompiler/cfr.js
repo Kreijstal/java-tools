@@ -4130,6 +4130,7 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     // folding), which is what javac sees — not the raw structurer tree.
     const stateMachineStats = {};
     const stateMachineConfiguration = {
+      throwOwner: simpleClassName(cls.className || 'Class'),
       coalesceLinearStates: options.coalesceStateMachineChains
         ?? (process.env.CFR_JS_COALESCE_STATE_MACHINE_CHAINS !== '0'),
       stats: stateMachineStats,
@@ -4845,11 +4846,20 @@ function printCfgStateMachine(cfg, render, evaluate, codeItems, exceptionTable, 
     if (handlers.length) {
       const caught = `stateCaught_${block.id}`;
       lines.push(`            } catch (Throwable ${caught}) {`);
-      const dispatchExpression = handlers.slice(0, -1).reduceRight((fallback, handler) =>
+      // Only an actual catch-all row accepts an unmatched throwable. Treating
+      // the last typed row as an unconditional default changes uncaught errors
+      // into handler effects or a ClassCastException at the handler's store.
+      const lastHandler = handlers[handlers.length - 1];
+      const catchesAll = ['Throwable', 'java.lang.Throwable'].includes(lastHandler.catchType);
+      const typedHandlers = catchesAll ? handlers.slice(0, -1) : handlers;
+      const dispatchExpression = typedHandlers.reduceRight((fallback, handler) =>
         `(${caught} instanceof ${handler.catchType} ? ${stateTarget(handler.target)} : ${fallback})`,
-      String(stateTarget(handlers[handlers.length - 1].target)));
-      lines.push(`                caughtException = ${caught};`);
+      catchesAll ? String(stateTarget(lastHandler.target)) : '-1');
       lines.push(`                statePc = ${dispatchExpression};`);
+      if (!catchesAll) lines.push('                if (statePc == -1) {',
+        `                    throw ${configuration.throwOwner}.<RuntimeException>$cfr$sneakyThrow(${caught});`,
+        '                }');
+      lines.push(`                caughtException = ${caught};`);
       lines.push('                continue stateLoop;');
       lines.push('            }');
     }

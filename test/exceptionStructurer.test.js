@@ -42,6 +42,98 @@ function visitTree(node, visit) {
   }
 }
 
+function regionNode(result) {
+  let region;
+  visitTree(result.tree, node => { if (node.regionFlowBlock != null) region = node; });
+  assert.ok(region);
+  return region;
+}
+
+function twoHandlerResult() {
+  return structureMethod([
+    {labelDef: 'L0:', pc: 0, instruction: {op: 'invokestatic', arg: ['Method', 'X', ['work', '()V']]}},
+    {labelDef: 'L3:', pc: 3, instruction: {op: 'goto', arg: 'L14'}},
+    {labelDef: 'L6:', pc: 6, instruction: 'astore_0'},
+    {pc: 7, instruction: {op: 'goto', arg: 'L14'}},
+    {labelDef: 'L10:', pc: 10, instruction: 'astore_0'},
+    {pc: 11, instruction: {op: 'goto', arg: 'L14'}},
+    {labelDef: 'L14:', pc: 14, instruction: 'return'},
+  ], [
+    {start_pc: 0, end_pc: 3, handler_pc: 6, catch_type: 'java/lang/IllegalArgumentException'},
+    {start_pc: 0, end_pc: 3, handler_pc: 10, catch_type: 'java/lang/RuntimeException'},
+  ]);
+}
+
+test('intact components cannot exchange protected-body and catch-arm positions', () => {
+  const result = multiExitResult();
+  const region = regionNode(result);
+  [region.body, region.catches[0].body] = [region.catches[0].body, region.body];
+  // Neither normal component edges nor sink destinations detect this change.
+  assert.equal(verifyRegionExitContracts(result.tree, result.regionExitContracts), true);
+  assert.equal(verifyStructuredFlow(result.tree, result.regionMethodFlow), true);
+  visitTree(result.tree, node => {
+    if (node.regionFlowComponent != null) assert.equal(verifyStructuredFlow(node,
+      result.regionExitContracts[0].components[node.regionFlowComponent]), true);
+  });
+  assert.equal(verifyRegionFlowContracts(result.tree, result.regionExitContracts), false);
+});
+
+test('catch priority and handler-to-type bindings survive composition', () => {
+  for (const mutate of [
+    region => region.catches.reverse(),
+    region => { [region.catches[0].body, region.catches[1].body] =
+      [region.catches[1].body, region.catches[0].body]; },
+  ]) {
+    const result = twoHandlerResult();
+    assert.equal(result.ok, true, result.reason);
+    assert.equal(verifyRegionFlowContracts(result.tree, result.regionExitContracts), true);
+    mutate(regionNode(result));
+    assert.equal(verifyRegionExitContracts(result.tree, result.regionExitContracts), true);
+    assert.equal(verifyRegionFlowContracts(result.tree, result.regionExitContracts), false);
+  }
+});
+
+test('catch-type snapshots are independent of later in-place mutations', () => {
+  for (const mutate of [
+    types => { types[0] = 'java.lang.Throwable'; },
+    types => types.push('java.io.IOException'),
+    types => types.pop(),
+  ]) {
+    const result = multiExitResult();
+    const recorded = JSON.stringify(result.regionExitContracts);
+    mutate(regionNode(result).catches[0].types);
+    assert.equal(JSON.stringify(result.regionExitContracts), recorded);
+    assert.equal(verifyRegionFlowContracts(result.tree, result.regionExitContracts), false);
+  }
+});
+
+test('components cannot escape their owning region or acquire another exception scope', () => {
+  const result = multiExitResult();
+  const region = regionNode(result);
+  const copy = JSON.parse(JSON.stringify(region.body));
+  assert.equal(verifyRegionFlowContracts({t: 'seq', body: [result.tree, copy]},
+    result.regionExitContracts), false);
+  region.body = {t: 'try', body: region.body, catches: []};
+  assert.equal(verifyRegionFlowContracts(result.tree, result.regionExitContracts), false);
+});
+
+test('valid copies and label/parameter renaming retain exception bindings', () => {
+  const result = twoHandlerResult();
+  const copy = JSON.parse(JSON.stringify(result.tree));
+  visitTree(copy, node => {
+    if (node.label) node.label += 'Copy';
+    for (const item of node.catches || []) item.varName += 'Copy';
+  });
+  assert.equal(verifyRegionFlowContracts({t: 'seq', body: [result.tree, copy]},
+    result.regionExitContracts), true);
+  // Each emitted copy is checked independently.
+  let copiedRegion;
+  visitTree(copy, node => { if (node.regionFlowBlock != null) copiedRegion = node; });
+  copiedRegion.catches.reverse();
+  assert.equal(verifyRegionFlowContracts({t: 'seq', body: [result.tree, copy]},
+    result.regionExitContracts), false);
+});
+
 test('source-flow contracts reject deletion of both sink and transfer despite a valid sibling', () => {
   const result = multiExitResult();
   assert.equal(result.ok, true, result.reason);
@@ -419,6 +511,12 @@ test('trailing synchronized glue does not absorb the next loop lock setup', () =
   assert.ok(syncBody, `expected synchronized body:\n${src}`);
   assert.doesNotMatch(syncBody[1], /astore_1/,
     `lock setup must not rotate into the previous iteration's body:\n${src}`);
+  for (const field of ['lockLocal', 'lockPc']) {
+    const copy = JSON.parse(JSON.stringify(r.tree));
+    visitTree(copy, node => { if (node.t === 'synchronized') node[field]++; });
+    assert.equal(verifyRegionFlowContracts(copy, r.regionExitContracts), false,
+      `synchronized bindings retain ${field}`);
+  }
 });
 
 // ---------------------------------------------------------------------------

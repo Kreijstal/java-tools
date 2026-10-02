@@ -506,8 +506,8 @@ Focused regression commands:
 ```sh
 node test/structuredFlowVerifier.test.js    # 6 graph checks
 node test/javaAstEmitterLoopExits.test.js   # 7 checks, including 424 native comparisons
-node test/exceptionStructurer.test.js       # 25 checks, including damaged trees
-node test/cfrExceptionLoopExits.test.js     # 504 native JVM comparisons
+node test/exceptionStructurer.test.js       # 30 checks, including damaged trees
+node test/cfrExceptionLoopExits.test.js     # 1,368 native JVM comparisons
 node test/cfrNestedLoopSplitting.test.js    # 840 native JVM comparisons
 ```
 
@@ -752,3 +752,54 @@ floating-point signed zero, subnormals, infinities and NaN payloads, checks an
 unchanged input used again, negative literals, a real decrement and one evaluated
 call with normal and throwing outcomes. This tests numeric emission and evaluation
 order, not whole-game equivalence.
+
+## Preserve exception context when reconstructing loop exits
+
+Normal CFG edges and sink-to-transfer identities alone cannot prove a try/catch
+composition safe. Exchanging intact try and handler components preserves their
+internal edges, but changes which effects execute normally and which exceptions
+protect them. Reordering whole catches also preserves component graphs while
+changing handler priority.
+
+Each collapsed region now retains an independent snapshot of the protected-body
+and catch-arm bindings, including ordered catch types and intentional nested
+catch structure. Synchronized components retain the lock local and acquisition
+PC. After composition, every emitted region copy must match that snapshot, and
+every component must remain under its own region. Catch-type arrays are copied,
+so later in-place mutations cannot change the evidence. Label and catch-parameter
+renaming remain valid. A mismatch declines reconstruction and keeps the CFG
+fallback. This checks composition, not the original exception-table normalization
+or subsequent expression/printer transformations.
+
+The expanded native loop-exit fixture also exposed a fallback bug: the last
+typed handler was treated as an unconditional catch-all. An unmatched
+`AssertionError` went into a `RuntimeException` handler and became a
+`ClassCastException`. The dispatcher now tests every typed handler in table
+order. Only an actual `Throwable`/catch-all row supplies an unconditional target;
+otherwise it rethrows the same throwable through the existing generic helper.
+It does not wrap checked exceptions or execute handler effects on a mismatch.
+
+Focused commands:
+
+```sh
+node test/exceptionStructurer.test.js       # 30 checks; five new groups fail before the fix
+node test/cfrExceptionLoopExits.test.js     # 1,368 native result/effect comparisons
+node test/cfrNestedLoopSplitting.test.js    # 840 native comparisons
+node test/structuredFlowVerifier.test.js    # 6 checks
+node test/javaAstEmitterLoopExits.test.js   # 7 checks, including 424 native comparisons
+node test/exceptionRegionSplitting.test.js  # 4 checks, including 512 routed traces
+node node_modules/tape/bin/tape test/cfrCatchSemanticsRegressions.test.js
+```
+
+The new ordered-handler fixture covers inner/outer breaks and continues from
+the try and both catch arms, specific-before-supertype handler priority,
+exceptions outside the protected range, unmatched errors and checked exceptions,
+and escaped throwable identity. Structured and forced-dispatcher output must
+match native execution. The original fixture contributes 504 comparisons and
+the new fixture contributes 864.
+
+A fresh export of all 303 pinned GeoBlox classes preserves the corrected pass-17
+source and diagnostics byte for byte: zero hard failures and zero dispatchers.
+The published readable input remains pinned to its recorded generator; this
+hardening does not require hand edits or declaration/name migrations. The
+checks do not establish whole-game runtime equivalence.
