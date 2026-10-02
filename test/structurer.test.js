@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { structure, printTree, IrreducibleError } = require('../src/decompiler/structurer');
+const { structure, printTree, uniquifyLabels, IrreducibleError } = require('../src/decompiler/structurer');
 
 // Build a CFG from a compact description. Each block: { term }.
 function cfgFrom(blocks) {
@@ -117,6 +117,31 @@ test('an ordinary empty if arm inside a loop does not infer a loop exit', () => 
   const src = printTree(tree);
   assert.doesNotMatch(src, /break L0;/);
   assert.match(src, /stmt_2\(\);\n\s*continue L0;/);
+});
+
+test('an explicit region loop exit cannot resolve through a shadowing block', () => {
+  for (const mode of ['break', 'continue']) {
+    const tree = {t: 'loop', label: 'Same', body: {
+      t: 'block', label: 'Same', body: {t: 'regionExit', label: 'Same', mode},
+    }};
+    assert.throws(() => printTree(tree), /requires an explicit enclosing loop and transfer mode/);
+    assert.throws(() => uniquifyLabels(tree), /requires an explicit enclosing loop and transfer mode/);
+  }
+});
+
+test('label uniquification preserves explicit region loop exits', () => {
+  const tree = {t: 'loop', label: 'Outer', body: {
+    t: 'loop', label: 'Inner', body: {t: 'regionExit', label: 'Outer', mode: 'continue'},
+  }};
+  uniquifyLabels(tree);
+  assert.match(printTree(tree), /continue L0;/);
+});
+
+test('a continue to a block is refused before label uniquification', () => {
+  const tree = {t: 'loop', label: 'Same', body: {
+    t: 'block', label: 'Same', body: {t: 'continue', label: 'Same'},
+  }};
+  assert.throws(() => uniquifyLabels(tree), /continue target Same is not a loop/);
 });
 
 test('printing a control tree repeatedly does not mutate its exits', () => {

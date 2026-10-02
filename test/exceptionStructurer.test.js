@@ -16,38 +16,83 @@ function assertGotoFree(src) {
   assert.ok(!/\bgoto\b/.test(src), `expected no goto in:\n${src}`);
 }
 
+const regionContract = targets => [{owner: 7,
+  exits: targets.map(target => ({sink: target + 10, target}))}];
+const regionTransfer = target => ({t: 'break', label: 'Region', regionExitOwner: 7,
+  regionExitSink: target + 10, regionExitTarget: target});
+const regionExit = target => ({t: 'seq', body: [
+  {t: 'straight', block: target + 10}, regionTransfer(target),
+]});
+
 test('region exit contracts preserve distinct targets through nested loops', () => {
-  const exit = target => ({ t: 'break', label: 'Region', regionExitOwner: 7, regionExitTarget: target });
   const tree = { t: 'block', label: 'Region', regionExitOwner: 7, body: {
-    t: 'loop', label: 'Loop', body: { t: 'if', block: 0, then: exit(4), els: exit(5) },
+    t: 'loop', label: 'Loop', body: { t: 'if', block: 0, then: regionExit(4), els: regionExit(5) },
   } };
-  assert.equal(verifyRegionExitContracts(tree, [{ owner: 7, targets: [4, 5] }]), true);
-  tree.body.body.then.label = 'Loop';
-  assert.equal(verifyRegionExitContracts(tree, [{ owner: 7, targets: [4, 5] }]), false);
+  assert.equal(verifyRegionExitContracts(tree, regionContract([4, 5])), true);
+  tree.body.body.then.body[1].label = 'Loop';
+  assert.equal(verifyRegionExitContracts(tree, regionContract([4, 5])), false);
 });
 
 test('region exit contracts refuse missing or unknown continuations', () => {
-  const tree = { t: 'block', label: 'Region', regionExitOwner: 7, body: {
-    t: 'break', label: 'Region', regionExitOwner: 7, regionExitTarget: 4,
-  } };
-  assert.equal(verifyRegionExitContracts(tree, [{ owner: 7, targets: [4, 5] }]), false);
-  assert.equal(verifyRegionExitContracts(tree, [{ owner: 7, targets: [5] }]), false);
+  const tree = { t: 'block', label: 'Region', regionExitOwner: 7, body: regionExit(4) };
+  assert.equal(verifyRegionExitContracts(tree, regionContract([4, 5])), false);
+  assert.equal(verifyRegionExitContracts(tree, regionContract([5])), false);
 });
 
 test('region exit contracts reject lost identity and changed transfer kinds', () => {
   for (const transfer of [
-    {t: 'continue', label: 'Region', regionExitOwner: 7, regionExitTarget: 4},
-    {t: 'break', label: 'Region', regionExitTarget: 4},
-    {t: 'break', label: 'Region', regionExitOwner: 7},
+    {...regionTransfer(4), t: 'continue'},
+    {...regionTransfer(4), regionExitOwner: undefined},
+    {...regionTransfer(4), regionExitTarget: undefined},
+    {...regionTransfer(4), regionExitSink: undefined},
     {t: 'break', label: 'Region'},
   ]) {
     // A valid sibling must not conceal a malformed exit to the same target.
     const tree = {t: 'block', label: 'Region', regionExitOwner: 7, body: {
-      t: 'if', block: 0, then: transfer,
-      els: {t: 'break', label: 'Region', regionExitOwner: 7, regionExitTarget: 4},
+      t: 'if', block: 0, then: {t: 'seq', body: [{t: 'straight', block: 14}, transfer]},
+      els: regionExit(4),
     }};
-    assert.equal(verifyRegionExitContracts(tree, [{owner: 7, targets: [4]}]), false);
+    assert.equal(verifyRegionExitContracts(tree, regionContract([4])), false);
   }
+});
+
+test('region exits cannot exchange sink destinations while preserving the target set', () => {
+  const contracts = [{owner: 7, exits: [
+    {sink: 10, target: 4}, {sink: 11, target: 5},
+  ]}];
+  const exit = (sink, target) => ({t: 'seq', body: [
+    {t: 'straight', block: sink},
+    {t: 'break', label: 'Region', regionExitOwner: 7, regionExitSink: sink,
+      regionExitTarget: target},
+  ]});
+  const tree = {t: 'block', label: 'Region', regionExitOwner: 7, body: {
+    t: 'if', block: 0, then: exit(10, 5), els: exit(11, 4),
+  }};
+  assert.equal(verifyRegionExitContracts(tree, contracts), false);
+});
+
+test('region transfers require their own immediately preceding sink', () => {
+  for (const body of [
+    regionTransfer(4),
+    {t: 'seq', body: [{t: 'straight', block: 15}, regionTransfer(4)]},
+    {t: 'seq', body: [{t: 'straight', block: 14}, {t: 'straight', block: 0}, regionTransfer(4)]},
+    {t: 'seq', body: [{t: 'straight', block: 14}]},
+  ]) {
+    const tree = {t: 'block', label: 'Region', regionExitOwner: 7, body: {
+      t: 'if', block: 0, then: body, els: regionExit(4),
+    }};
+    assert.equal(verifyRegionExitContracts(tree, regionContract([4])), false);
+  }
+});
+
+test('contracts reject duplicate owners, shared sinks and destination-only legacy metadata', () => {
+  const tree = {t: 'block', label: 'Region', regionExitOwner: 7, body: regionExit(4)};
+  for (const contracts of [
+    [...regionContract([4]), ...regionContract([4])],
+    [{owner: 7, exits: [{sink: 14, target: 4}, {sink: 14, target: 5}]}],
+    [...regionContract([4]), {owner: 8, exits: [{sink: 14, target: 4}]}],
+    [{owner: 7, targets: [4]}],
+  ]) assert.equal(verifyRegionExitContracts(tree, contracts), false);
 });
 
 test('a catch retry into the middle of a try body must not restart its setup', () => {

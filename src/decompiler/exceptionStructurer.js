@@ -1121,7 +1121,8 @@ function processGroup(work, group, ctx, commit) {
   if (externalsList.length <= 1) {
     for (const ext of externalsList) {
       const rid = ctx.allocId();
-      ctx.overrides.set(rid, { t: 'seq', body: [] });
+      // Keep even an empty sink's straight node until contracts are verified.
+      // Its render has no bytecode, but its identity binds the following exit.
       externalToRenderId.set(ext, rid);
       exitTargets.set(rid, work.ids[ext]);
     }
@@ -1155,7 +1156,8 @@ function processGroup(work, group, ctx, commit) {
           if (!sinkRids.has(node.block)) return node;
           used = true;
           return { t: 'seq', body: [node, { t: 'break', label: REGION_EXIT_LABEL,
-            regionExitOwner: superId, regionExitTarget: exitTargets.get(node.block) }] };
+            regionExitOwner: superId, regionExitSink: node.block,
+            regionExitTarget: exitTargets.get(node.block) }] };
         case 'seq': return { t: 'seq', body: node.body.map(walk) };
         case 'block': return { ...node, body: walk(node.body) };
         case 'loop': return { ...node, body: walk(node.body) };
@@ -1221,7 +1223,8 @@ function processGroup(work, group, ctx, commit) {
     }
   }
   ctx.overrides.set(superId, tryNode);
-  ctx.regionExitContracts.push({ owner: superId, targets: [...exitTargets.values()] });
+  ctx.regionExitContracts.push({ owner: superId,
+    exits: [...exitTargets].map(([sink, target]) => ({sink, target})) });
   commit(collapseRegion(work, region, superId, group.start_pc, exits, ctx));
   return undefined;
 }
@@ -1230,28 +1233,53 @@ function processGroup(work, group, ctx, commit) {
 // Each exit keeps both its exact original target and its own region frame;
 // lexical proximity to an unrelated loop is not evidence of an exit target.
 function verifyRegionExitContracts(tree, contracts) {
-  const expected = new Map(contracts.map(({ owner, targets }) => [owner, new Set(targets)]));
-  if (expected.size !== contracts.length) return false;
+  const expected = new Map();
+  const sinkOwners = new Map();
+  const isId = value => Number.isSafeInteger(value) && value >= 0;
+  for (const {owner, exits} of contracts) {
+    if (!isId(owner) || expected.has(owner) || !Array.isArray(exits)) return false;
+    const destinations = new Map();
+    for (const {sink, target} of exits) {
+      if (!isId(sink) || !isId(target) || sinkOwners.has(sink)) return false;
+      destinations.set(sink, target);
+      sinkOwners.set(sink, owner);
+    }
+    expected.set(owner, destinations);
+  }
   const seen = new Map(contracts.map(({ owner }) => [owner, new Set()]));
   let valid = true;
-  const walk = (node, frames) => {
+  const walk = (node, frames, previous = null, next = null) => {
     if (!node) return;
-    if (node.regionExitOwner != null || node.regionExitTarget != null) {
+    const hasIdentity = node.regionExitOwner != null || node.regionExitTarget != null ||
+      node.regionExitSink != null;
+    if (hasIdentity) {
       if (node.t !== 'block' && node.t !== 'break') valid = false;
-      if (node.t === 'block' && (!expected.has(node.regionExitOwner) || node.regionExitTarget != null))
+      if (node.t === 'block' && (!expected.has(node.regionExitOwner) ||
+          node.regionExitTarget != null || node.regionExitSink != null))
         valid = false;
     }
+    // A sink must still perform its transfer, even if its render is empty.
+    // Conversely, metadata on a break alone cannot prove which sink ran.
+    if (node.t === 'straight' && sinkOwners.has(node.block) &&
+        (next?.t !== 'break' || next.regionExitSink !== node.block ||
+         next.regionExitOwner !== sinkOwners.get(node.block))) valid = false;
     if (node.t === 'break' || node.t === 'continue') {
       const frame = [...frames].reverse().find(item => item.label === node.label);
-      if (node.regionExitOwner != null || node.regionExitTarget != null || frame?.regionExitOwner != null) {
+      if (hasIdentity || frame?.regionExitOwner != null) {
         if (node.t !== 'break' || !frame || frame.t !== 'block' ||
             frame.regionExitOwner !== node.regionExitOwner ||
-            !expected.get(node.regionExitOwner)?.has(node.regionExitTarget)) valid = false;
-        else seen.get(node.regionExitOwner).add(node.regionExitTarget);
+            previous?.t !== 'straight' || previous.block !== node.regionExitSink ||
+            !expected.get(node.regionExitOwner)?.has(node.regionExitSink) ||
+            expected.get(node.regionExitOwner).get(node.regionExitSink) !== node.regionExitTarget)
+          valid = false;
+        else seen.get(node.regionExitOwner).add(node.regionExitSink);
       }
     }
     if (node.t === 'block' || node.t === 'loop') walk(node.body, [...frames, node]);
-    else if (node.t === 'seq') for (const child of node.body || []) walk(child, frames);
+    else if (node.t === 'seq') {
+      const body = node.body || [];
+      body.forEach((child, index) => walk(child, frames, body[index - 1], body[index + 1]));
+    }
     else if (node.t === 'if') { walk(node.then, frames); walk(node.els, frames); }
     else if (node.t === 'switch') {
       for (const item of node.cases || []) walk(item.body, frames);
@@ -1263,7 +1291,7 @@ function verifyRegionExitContracts(tree, contracts) {
   };
   walk(tree, []);
   return valid && contracts.every(({ owner }) =>
-    [...expected.get(owner)].every(target => seen.get(owner).has(target)));
+    [...expected.get(owner).keys()].every(sink => seen.get(owner).has(sink)));
 }
 
 module.exports = {

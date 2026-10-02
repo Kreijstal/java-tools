@@ -307,7 +307,7 @@ function uniquifyLabels(tree) {
       case 'block':
       case 'loop': {
         const nl = fresh();
-        const inner = [{ old: node.label, fresh: nl }, ...scope];
+        const inner = [{ old: node.label, fresh: nl, t: node.t }, ...scope];
         node.label = nl;
         walk(node.body, inner);
         break;
@@ -330,9 +330,16 @@ function uniquifyLabels(tree) {
         walk(node.body, scope);
         break;
       case 'break':
-      case 'continue': {
+      case 'continue':
+      case 'regionExit': {
         const frame = scope.find((f) => f.old === node.label);
+        if (node.t === 'regionExit' && (!node.label || frame?.t !== 'loop' ||
+            !['break', 'continue'].includes(node.mode))) {
+          throw new Error('exception-region loop exit requires an explicit enclosing loop and transfer mode');
+        }
         if (!frame) throw new Error(`unresolved ${node.t} ${node.label} during label uniquify`);
+        if (node.t === 'continue' && frame.t !== 'loop')
+          throw new Error(`continue target ${node.label} is not a loop`);
         node.label = frame.fresh;
         break;
       }
@@ -545,41 +552,41 @@ function dropUnusedBlockLabels(node) {
   }
 }
 
-function repairEmptyLoopExits(node, loopLabels) {
+function repairEmptyLoopExits(node, frames) {
   if (!node) return node;
   if (node.t === 'regionExit') {
     // Legacy region nodes must identify their loop explicitly. The nearest
     // lexical loop need not be the original CFG edge's destination, and a
     // missing destination must never become an inferred break or a no-op.
-    if (!node.label || !loopLabels.includes(node.label) ||
+    const frame = [...frames].reverse().find(item => item.label === node.label);
+    if (!node.label || frame?.t !== 'loop' ||
         !['break', 'continue'].includes(node.mode)) {
       throw new Error('exception-region loop exit requires an explicit enclosing loop and transfer mode');
     }
     return { t: node.mode, label: node.label };
   }
-  if (node.t === 'loop') {
-    return { ...node, body: repairEmptyLoopExits(node.body, [...loopLabels, node.label]) };
+  if (node.t === 'loop' || node.t === 'block') {
+    return { ...node, body: repairEmptyLoopExits(node.body, [...frames, node]) };
   }
   if (node.t === 'if') {
     // An empty arm can mean an ordinary no-op, not an exit from the nearest
     // loop. Region exits already carry an explicit transfer; never infer one.
-    return { ...node, then: repairEmptyLoopExits(node.then, loopLabels),
-      els: repairEmptyLoopExits(node.els, loopLabels) };
+    return { ...node, then: repairEmptyLoopExits(node.then, frames),
+      els: repairEmptyLoopExits(node.els, frames) };
   }
   if (node.t === 'seq') {
     const body = node.body || [];
-    return { ...node, body: body.map((child) => repairEmptyLoopExits(child, loopLabels)) };
+    return { ...node, body: body.map((child) => repairEmptyLoopExits(child, frames)) };
   }
-  else if (node.t === 'block') return { ...node, body: repairEmptyLoopExits(node.body, loopLabels) };
   else if (node.t === 'switch') {
     return { ...node,
-      cases: (node.cases || []).map(item => ({ ...item, body: repairEmptyLoopExits(item.body, loopLabels) })),
-      dflt: repairEmptyLoopExits(node.dflt, loopLabels) };
+      cases: (node.cases || []).map(item => ({ ...item, body: repairEmptyLoopExits(item.body, frames) })),
+      dflt: repairEmptyLoopExits(node.dflt, frames) };
   } else if (node.t === 'try') {
-    return { ...node, body: repairEmptyLoopExits(node.body, loopLabels),
-      catches: (node.catches || []).map(item => ({ ...item, body: repairEmptyLoopExits(item.body, loopLabels) })) };
+    return { ...node, body: repairEmptyLoopExits(node.body, frames),
+      catches: (node.catches || []).map(item => ({ ...item, body: repairEmptyLoopExits(item.body, frames) })) };
   } else if (node.t === 'synchronized') {
-    return { ...node, body: repairEmptyLoopExits(node.body, loopLabels) };
+    return { ...node, body: repairEmptyLoopExits(node.body, frames) };
   }
   return node;
 }

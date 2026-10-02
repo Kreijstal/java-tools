@@ -473,6 +473,44 @@ and Java source-flow checks remain active. The compatibility printer node
 `regionExit` still exists for explicit legacy trees; the exception-region layer
 uses labeled transfers with contracts, not that nearest-loop shorthand.
 
+Exit contracts now bind each synthetic sink ID to its original destination,
+rather than checking destinations only as a set. The composed tree must retain
+the sink immediately before its matching transfer, including an empty sink in
+a single-exit region. Missing sinks, reordered transfers, exchanged
+destinations, duplicate sink IDs, and destination-only legacy contracts are
+refused. This adds a check of sink-to-transfer identity; it does not prove the
+whole collapsed CFG or expression reconstruction equivalent.
+
+Explicit legacy `regionExit` nodes also participate in label uniquification.
+Both that pass and the printer resolve the nearest matching lexical frame,
+including blocks, and require it to be a loop. A block shadowing a loop label
+cannot turn an intended loop exit into a block exit. Ordinary `continue` nodes
+targeting a block are refused during uniquification as well.
+
+`test/cfrExceptionLoopExits.test.js` compiles a nested-loop Java fixture, then
+compares the original JVM execution with both structured and forced-dispatcher
+reconstruction. Its 252 inputs cover normal exits, inner and outer loop breaks
+and continues from try and catch bodies, effect order, and exceptions in
+unprotected continuations. Both reconstructions must match all results and
+effect traces (504 comparisons). The original and rebuilt classes run with the
+JVM verifier enabled.
+
+Focused commands for this additional validation:
+
+```sh
+node test/structurer.test.js                 # 13 checks
+node test/exceptionStructurer.test.js        # 20 checks
+node test/cfrExceptionLoopExits.test.js      # 504 native behavior comparisons
+```
+
+A fresh export from the unchanged transformed GeoBlox class tree retains all
+303 Java files byte for byte, and the diagnostics JSON is unchanged. The Java
+tree SHA-256 remains
+`2b5e8eca76820cb18760a231fc0825aded6e26972d646bfc3476d4f88d77147b`.
+All 303 sources compile together against the pinned FunOrb stubs. The published
+source and naming pins remain valid; these extra checks do not recover another
+dispatcher or claim complete game runtime equivalence.
+
 Focused validation:
 
 ```sh
