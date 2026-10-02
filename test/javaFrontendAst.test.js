@@ -172,6 +172,39 @@ test('Java parser distinguishes a parenthesized cast operand from a second cast'
   t.end();
 });
 
+test('Java parser preserves qualified explicit invocation type arguments', (t) => {
+  const source = `class GenericCalls { void call() {
+    cd.<RuntimeException>sneakyThrow(error);
+    target.<java.util.Map<String, java.util.List<? extends Number>>, int[]>accept(value >>> 2, other);
+    factory().<java.util.List<java.util.List<String>>>identity(value).size();
+    super.<String>accept(value);
+  } }`;
+  const document = frontend.parseJava(source);
+  const expressions = document.root.typeDeclarations[0].body[0].body.statements.map(s => s.expression);
+  t.notOk(frontend.serializeAst(document).includes('Unsupported'), 'all qualified calls are fully structured');
+  t.equal(expressions[0].target.name, 'cd', 'receiver stays separate from type arguments');
+  t.equal(expressions[0].name, 'sneakyThrow', 'method name is preserved');
+  t.equal(expressions[0].typeArguments[0].name, 'RuntimeException', 'exception type remains explicit');
+  t.equal(expressions[1].typeArguments.length, 2, 'nested commas do not split outer type arguments');
+  const map = expressions[1].typeArguments[0];
+  t.equal(map.baseType.name, 'Map', 'qualified generic type remains structured');
+  t.equal(map.typeArguments[1].typeArguments[0].boundType.name, 'Number', 'nested bounded wildcard survives');
+  t.equal(expressions[1].typeArguments[1].kind, 'ArrayType', 'primitive arrays are reference arguments');
+  t.equal(expressions[1].arguments[0].operator, '>>>', 'call argument shifts are unchanged');
+  const identity = expressions[2].target;
+  t.equal(identity.name, 'identity', 'chained call keeps its generic invocation');
+  t.equal(identity.target.name, 'factory', 'effectful receiver remains an invocation');
+  t.equal(identity.typeArguments[0].typeArguments[0].typeArguments[0].name, 'String', 'combined nested closers preserve each type level');
+  t.equal(expressions[3].target.kind, 'SuperExpression', 'super receiver remains explicit');
+  for (const expression of ['x.<>f(v)', 'x.<int>f(v)', 'x.<?>f(v)',
+    'x.<String,>f(v)', 'x.<List<>>f(v)', 'x.<String + Other>f(v)',
+    'x.<String>>f(v)', 'x.<String>field']) {
+    const parsed = frontend.parseJava(`class A { void f() { ${expression}; } }`);
+    t.ok(frontend.serializeAst(parsed).includes('Unsupported'), `refuses incomplete/invalid invocation: ${expression}`);
+  }
+  t.end();
+});
+
 test('Java parser parses every repo Java source file outside vendored dependencies', (t) => {
   const repoRoot = path.resolve(__dirname, '..');
   const files = collectJavaFiles(repoRoot)

@@ -264,6 +264,29 @@ function isSupportedTypeNode(type) {
   return true;
 }
 
+// Explicit invocation arguments are reference types, not arbitrary expressions.
+// Validate the entire token span before using the deliberately tolerant type
+// recovery parser. Nested type arguments may contain bounded wildcards.
+function isInvocationTypeArgument(tokens, allowWildcard = false) {
+  if (!tokens.length) return false;
+  if (tokens[0].text === '?') {
+    return allowWildcard && (tokens.length === 1 ||
+      (['extends', 'super'].includes(tokens[1].text) &&
+        isInvocationTypeArgument(tokens.slice(2))));
+  }
+  const {tokens: component, dimensions} = stripArraySuffix(tokens);
+  if (dimensions) return (component.length === 1 && PRIMITIVE_TYPES.has(component[0].text))
+    || isInvocationTypeArgument(component);
+  const genericIndex = findTopLevelToken(tokens, '<');
+  const name = genericIndex < 0 ? tokens : tokens.slice(0, genericIndex);
+  if (!name.length || name.length % 2 === 0 || !name.every((token, index) =>
+    index % 2 === 0 ? isNameToken(token) : token.text === '.')) return false;
+  if (genericIndex < 0) return true;
+  if (findMatchingInTokens(tokens, genericIndex, '<', '>') !== tokens.length - 1) return false;
+  return splitTopLevel(tokens.slice(genericIndex + 1, -1), ',')
+    .every(part => isInvocationTypeArgument(part, true));
+}
+
 // JLS 15.16: a cast to a reference type is `( ReferenceType )
 // UnaryExpressionNotPlusMinus`, so `+`, `-`, `++` and `--` cannot follow it -
 // `(var21) + "<br>"` is an addition, not a cast of `+"<br>"`. Only a primitive
@@ -377,8 +400,19 @@ class TokenExpressionParser {
         continue;
       }
       if (this.match('.')) {
+        const typeArguments = this.peek() && this.peek().text === '<'
+          ? this.parseInvocationTypeArguments() : [];
+        if (!typeArguments) return null;
         const name = this.take();
         if (!name || (!isNameToken(name) && name.text !== 'class')) return null;
+        if (typeArguments.length) {
+          if (!isNameToken(name) || !this.match('(')) return null;
+          const args = this.parseInvocationArguments();
+          if (!args) return null;
+          expression = ast.methodInvocationExpression({target: expression,
+            typeArguments, name: name.text, arguments: args});
+          continue;
+        }
         if (name.text === 'class') {
           expression = ast.createNode('ClassLiteralExpression', { literalType: this.typeFromExpression(expression) });
         } else {
@@ -387,11 +421,8 @@ class TokenExpressionParser {
         continue;
       }
       if (this.match('(')) {
-        const args = [];
-        if (!this.match(')')) {
-          do { const arg = this.parseAssignment(); if (!arg) return null; args.push(arg); } while (this.match(','));
-          if (!this.match(')')) return null;
-        }
+        const args = this.parseInvocationArguments();
+        if (!args) return null;
         if (expression.kind === 'Identifier') expression = ast.methodInvocationExpression({ target: null, name: expression.name, arguments: args });
         else if (expression.kind === 'SuperExpression') expression = ast.methodInvocationExpression({ target: expression, name: '<init>', arguments: args });
         else if (expression.kind === 'ThisExpression') expression = ast.methodInvocationExpression({ target: expression, name: '<init>', arguments: args });
@@ -406,6 +437,39 @@ class TokenExpressionParser {
       break;
     }
     return expression;
+  }
+
+  parseInvocationArguments() {
+    const args = [];
+    if (!this.match(')')) {
+      do { const arg = this.parseAssignment(); if (!arg) return null; args.push(arg); } while (this.match(','));
+      if (!this.match(')')) return null;
+    }
+    return args;
+  }
+
+  parseInvocationTypeArguments() {
+    const start = this.index;
+    let depth = 0, end = -1;
+    for (let index = start; index < this.tokens.length; index++) {
+      const text = this.tokens[index].text;
+      if (text === '<') depth++;
+      else depth -= angleCloseCount(text);
+      if (depth < 0) return null;
+      if (depth === 0) {end = index; break;}
+    }
+    if (end < 0) return null;
+    // Split combined closers only in this proven type-argument span; shifts in
+    // the receiver and call arguments retain their original tokens.
+    const normalized = this.tokens.slice(start, end + 1).flatMap(token =>
+      angleCloseCount(token.text) > 1
+        ? Array.from(token.text, () => ({...token, text: '>'})) : [token]);
+    const parts = splitTopLevel(normalized.slice(1, -1), ',');
+    if (!parts.every(part => isInvocationTypeArgument(part))) return null;
+    const types = parts.map(part => this.owner.typeFromTokens(part));
+    if (!types.every(isSupportedTypeNode)) return null;
+    this.index = end + 1;
+    return types;
   }
 
   typeFromExpression(expression) {

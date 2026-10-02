@@ -1140,3 +1140,46 @@ from 85,591 to 80,520 lines across 176 changed files. The pointer-spawn method
 loses 15 intermediate locals; genuinely different variant/category values
 remain explicit. These are source reconstruction checks, not full-game runtime
 or browser-performance evidence.
+
+## Token-safe carrier aliases and primitive value joins
+
+Carrier aliases previously used whole-source regular-expression substitution.
+A native typed-join regression demonstrates that this changes an original
+`"stackIn_3_0"` diagnostic string to `"stackIn_2_0"`. Alias substitution now
+requires complete lexical and scope checks and edits identifier tokens only.
+Strings, comments, member names and method names keep their bytes. Shadowed
+declarations, types, labels, Unicode escapes and unsupported syntax refuse the
+cleanup and retain the original carrier declarations and stores.
+
+The Java parser now represents qualified explicit generic calls such as
+`cd.<RuntimeException>sneakyThrow(error)` with separate receiver, type arguments,
+method name and arguments. Nested generics, bounded nested wildcards, reference
+arrays and combined closing-angle tokens are supported; shifts in ordinary
+expressions are unchanged. Empty, incomplete or invalid invocation type
+arguments retain unsupported nodes. Type names therefore remain visible to
+alias scope checks instead of weakening the proof around generic calls.
+
+Same-type primitive local/literal branches can become a conditional assignment
+before and after carrier cleanup. Each source and destination must have a
+proven identical primitive type. Reference values, boxing, narrowing, mixed
+types and effectful right-hand sides keep the original branches. The later
+pass uses final declaration types after Boolean promotion, refuses inline
+shadowing and keeps protected, monitor, loop and label bodies opaque.
+Floating comparisons retain their original Boolean negations, including NaNs.
+
+`node test/cfrParallelBackedges.test.js` covers 18 groups and 8,210 native
+comparisons, including diagnostic-string preservation and 120 generic-call
+loop cases checking early breaks, continues, failure identity and finally
+counter observations. `node test/javaAstEmitterLoopExits.test.js` covers 36
+groups and 54,549 native comparisons. Its 11,556 new comparisons cover all
+eight primitive types, raw floating bits, overflow, condition effects,
+unboxing failures, exception identity and finally observations through both
+initial and post-cleanup emission. `node test/javaFrontendAst.test.js` passes
+248 assertions, including nested generic calls and invalid-form refusals.
+
+The fixed GeoBlox export removes 50 lines across eight files (80,520 to
+80,470), including 12 primitive value branches and an existing URL-validation
+loop recovered as a for loop. All 19,558 declarations and 388 override
+relationships remain; declaration reordering requires 14 guarded naming-map
+ordinal migrations. Native fixtures and source reconstruction do not establish
+whole-game equivalence or browser/phone performance.

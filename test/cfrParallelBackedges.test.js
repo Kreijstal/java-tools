@@ -6,7 +6,7 @@ const os = require('os');
 const path = require('path');
 const {spawnSync} = require('child_process');
 const {assembleJasminSource} = require('../src/utils/jasminAssembly');
-const {decompileClassFile, assertNoFallback, _internals: {resolveStackCarrierAliases, compactBlankSourceLines}} = require('../src/decompiler/cfr');
+const {decompileClassFile, assertNoFallback, _internals: {resolveStackCarrierAliases, compactBlankSourceLines, rewriteStackCarrierReferences, rewriteWhileLoopsAsFor}} = require('../src/decompiler/cfr');
 
 function run(command, args, directory) {
   const paths = ['stdout','stderr'].map(name => path.join(directory,name));
@@ -215,7 +215,7 @@ for(const protection of [false,true]) test(`typed multi-level joins preserve sna
 Lstart: aload_0\n iload_1\n iload_2\n ifne Lfirst
  ldc "changed-zero"\n astore_0\n iinc 1 10\n iconst_4\n goto Ljoin
 Lfirst: ldc "changed-one"\n astore_0\n iinc 1 -10\n iconst_5
-Ljoin: iload_3\n ifne Lsecond
+Ljoin: ldc "stackIn_3_0"\n invokestatic Method Effects mark (Ljava/lang/String;)V\n iload_3\n ifne Lsecond
  bipush 6\n goto Lfinish
 Lsecond: bipush 7
 Lfinish: invokestatic Method Effects finish (Ljava/lang/String;III)Ljava/lang/String;
@@ -226,6 +226,7 @@ Lend: areturn
 .end class`,file);
     const effects=`class Effects {static String expected; static int mode;static StringBuilder trace;
       static final RuntimeException failure=new IllegalArgumentException();
+      static void mark(String value){trace.append(value).append('|');}
       static String finish(String value,int original,int first,int second) {
         if(value!=expected)throw new AssertionError("reference identity changed");
         trace.append(original).append(':').append(first).append(':').append(second);
@@ -263,4 +264,81 @@ Lend: areturn
     if(previous===undefined)delete process.env.CFR_JS_FORCE_STATE_MACHINE;else process.env.CFR_JS_FORCE_STATE_MACHINE=previous;
     fs.rmSync(temporary,{recursive:true,force:true});
   }
+});
+
+
+test('carrier substitution preserves literal, comment, member and method namespaces',()=>{
+  const aliases=new Map([['stackIn_3_0','stackIn_2_0']]);
+  const source=`stackIn_3_0 = stackIn_1_0;
+trace.append("stackIn_3_0"); // stackIn_3_0
+/* stackIn_3_0 */ Owner.stackIn_3_0 = stackIn_3_0;
+stackIn_3_0(); use(Owner.stackIn_3_0, stackIn_3_0);`;
+  const result=rewriteStackCarrierReferences(source,aliases);assert.equal(result.applied,true);
+  assert.equal(result.source,`stackIn_2_0 = stackIn_1_0;
+trace.append("stackIn_3_0"); // stackIn_3_0
+/* stackIn_3_0 */ Owner.stackIn_3_0 = stackIn_2_0;
+stackIn_3_0(); use(Owner.stackIn_3_0, stackIn_2_0);`);
+  for(const body of [
+    '{Object stackIn_3_0=null; use(stackIn_3_0);}',
+    'try {fail();} catch(Exception stackIn_3_0){use(stackIn_3_0);}',
+    'use((stackIn_3_0)value);', 'use(new stackIn_3_0());',
+    'stackIn_3_0: {use(stackIn_3_0);break stackIn_3_0;}',
+    'use(stackIn_3_0); // \\u000a', 'use(stackIn_3_0); @ syntax',
+    'use(Owner::stackIn_3_0);',
+  ]) assert.deepEqual(rewriteStackCarrierReferences(body,aliases),{source:body,applied:false},body);
+  const text='use("""\nstackIn_3_0\n\n""",stackIn_3_0);';
+  assert.deepEqual(rewriteStackCarrierReferences(text,aliases),{source:text,applied:false});
+  assert.deepEqual(rewriteStackCarrierReferences(source,new Map([['other','stackIn_2_0']])),{source,applied:false});
+  const generic='Owner.<RuntimeException>accept(stackIn_3_0);';
+  assert.deepEqual(rewriteStackCarrierReferences(generic,aliases),
+    {source:'Owner.<RuntimeException>accept(stackIn_2_0);',applied:true});
+  for (const body of ['Owner.<stackIn_3_0>accept(value);',
+    'Owner.<java.util.List<stackIn_3_0>>accept(value);',
+    'Owner.<String + Other>accept(stackIn_3_0);'])
+    assert.deepEqual(rewriteStackCarrierReferences(body,aliases),{source:body,applied:false});
+});
+
+test('qualified generic calls allow loop recovery without changing failure identity or counter updates',()=>{
+  const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'generic-loop-recovery-'));
+  try {
+    const body=`index = 0;
+Loop: while (index < limit) {
+  trace.append(index).append(':');
+  if (index == failAt) {
+    throw Fixture.<RuntimeException>fail(failure);
+  }
+  if (mode == 1 && index == 1) {
+    index++;
+    continue Loop;
+  }
+  if (mode == 2 && index == 2) {
+    break Loop;
+  }
+  index++;
+}`;
+    const rebuilt=rewriteWhileLoopsAsFor(body.split('\n')).join('\n');
+    assert.match(rebuilt,/Loop: for \(index = 0; index < limit; index\+\+\)/);
+    assert.match(rebuilt,/Fixture\.<RuntimeException>fail\(failure\)/);
+    const method=(name,code)=>`static String ${name}(int limit,int failAt,int mode) {
+      int index=-99;StringBuilder trace=new StringBuilder();
+      try {${code}} catch(Throwable error){trace.append("caught:").append(error==failure);}
+      finally {trace.append("finally:").append(index);}
+      return trace.toString();
+    }`;
+    const source=`class Fixture {
+      static final Exception failure=new Exception("stackIn_3_0");
+      @SuppressWarnings("unchecked") static <T extends Throwable> RuntimeException fail(Throwable error) throws T {throw (T)error;}
+      ${method('original',body)} ${method('rebuilt',rebuilt)}
+      public static void main(String[] args) {
+        for(int limit:new int[]{-1,0,1,2,5})for(int failAt:new int[]{-1,0,1,2,3,4,5,6})for(int mode=0;mode<3;mode++) {
+          String expected=original(limit,failAt,mode),actual=rebuilt(limit,failAt,mode);
+          if(!expected.equals(actual))throw new AssertionError(expected+" != "+actual);
+          System.out.println(actual);
+        }
+      }
+    }`;
+    fs.writeFileSync(path.join(temporary,'Fixture.java'),source);
+    run('javac',['--release','8','-d',temporary,path.join(temporary,'Fixture.java')],temporary);
+    assert.equal(run('java',['-cp',temporary,'Fixture'],temporary).trim().split('\n').length,120);
+  } finally {fs.rmSync(temporary,{recursive:true,force:true});}
 });

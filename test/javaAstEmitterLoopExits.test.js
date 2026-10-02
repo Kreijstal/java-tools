@@ -1223,3 +1223,96 @@ test('receiver snapshot cleanup preserves native effects, failures, catch/finall
     assert.equal(run('java',['-cp',temporary,'ReceiverSnapshots'],temporary).trim().split('\n').length,96);
   } finally {fs.rmSync(temporary,{recursive:true,force:true});}
 });
+
+
+test('value branches fold proven primitive locals without widening or boxing',()=>{
+  const renderPair=(taken,other,types) => emitStatements(treeToStatements({
+    t:'if',block:0,then:straight(1),els:straight(2),
+  },{cond:()=> 'pick()',straight:id=>[id===1?taken:other],localType:name=>types[name]??null}));
+  for(const type of ['boolean','byte','char','short','int','long','float','double']) {
+    const result=renderPair('value = left;', 'value = right;', {value:type,left:type,right:type});
+    assert.equal(result,'value = (pick()) ? left : right;');
+  }
+  assert.equal(renderPair('value = -1;', 'value = input;', {value:'int',input:'int'}),'value = (pick()) ? -1 : input;');
+  for(const [taken,other,types] of [
+    ['value = 0;', 'value = input;',{value:'byte',input:'byte'}],
+    ['value = left;', 'value = right;',{value:'double',left:'int',right:'double'}],
+    ['value = left;', 'value = right;',{value:'long',left:'int',right:'long'}],
+    ['value = left;', 'value = right;',{value:'boolean',left:'Boolean',right:'Boolean'}],
+    ['value = 0;', 'value = field;',{value:'int'}],
+    ['value = left;', 'value = right;',{value:'String',left:'String',right:'String'}],
+    ['value = 0;', 'value = Owner.field;',{value:'int'}],
+    ['value = 0;', 'value = array[0];',{value:'int'}],
+    ['value = 0;', 'value = next();',{value:'int'}],
+    ['value = 0;', 'value = input++;',{value:'int',input:'int'}],
+  ]) assert.match(renderPair(taken,other,types),/else/);
+});
+
+test('primitive-local joins preserve native values, condition effects and failures',()=>{
+  const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'cfr-primitive-local-joins-'));
+  try {
+    const cases=[
+      {type:'int',zero:'0',values:'new int[]{Integer.MIN_VALUE,-1,0,1,Integer.MAX_VALUE}',size:5},
+      {type:'long',zero:'0L',values:'new long[]{Long.MIN_VALUE,-1L,0L,1L,Long.MAX_VALUE}',size:5},
+      {type:'float',zero:'0.0f',values:'new float[]{Float.NEGATIVE_INFINITY,-0.0f,0.0f,1.0f,Float.MAX_VALUE,Float.MIN_VALUE,Float.POSITIVE_INFINITY,Float.intBitsToFloat(0x7fc01234),Float.intBitsToFloat(0xffc01234)}',size:9},
+      {type:'double',zero:'0.0',values:'new double[]{Double.NEGATIVE_INFINITY,-0.0,0.0,1.0,Double.MAX_VALUE,Double.MIN_VALUE,Double.POSITIVE_INFINITY,Double.longBitsToDouble(0x7ff8000000001234L),Double.longBitsToDouble(0xfff8000000001234L)}',size:9},
+      {type:'boolean',zero:'false',values:'new boolean[]{false,true}',size:2},
+      {type:'byte',zero:'0',values:'new byte[]{Byte.MIN_VALUE,-1,0,1,Byte.MAX_VALUE}',size:5},
+      {type:'short',zero:'0',values:'new short[]{Short.MIN_VALUE,-1,0,1,Short.MAX_VALUE}',size:5},
+      {type:'char',zero:'0',values:'new char[]{0,1,127,32768,65535}',size:5},
+    ];
+    const methods=[],drivers=[];let expectedCases=0;
+    for(const [index,fixture] of cases.entries()) {
+      const {type,zero,values,size}=fixture;
+      const bits=type==='float'?'Float.floatToRawIntBits(value)':type==='double'?'Double.doubleToRawLongBits(value)':type==='char'?'(int)value':'value';
+      const variants=[['left','right'],...(['int','long','float','double','boolean'].includes(type)?[[zero,'right']]:[])];
+      for(const [variant,[left,right]] of variants.entries()) {
+        const name=index+'_'+variant;const original=`if(pick(flag,boxed,trace)){value = ${left};} else {value = ${right};}`;
+        const rebuilt=emitStatements(treeToStatements({t:'if',block:0,then:straight(1),els:straight(2)}, {
+          cond:()=> 'pick(flag,boxed,trace)',straight:id=>[`value = ${id===1?left:right};`],
+          localType:variable=>['value','left','right'].includes(variable)?type:null,
+        }));assert.doesNotMatch(rebuilt,/else/);
+        const post=factorCommonBranchTails(original,{localType:variable=>['value','left','right'].includes(variable)?type:null});
+        assert.ok(post.branches>0);assert.doesNotMatch(post.source,/else/);
+        for(const [label,body] of [['original',original],['rebuilt',rebuilt],['post',post.source]]) methods.push(`static String ${label}${name}(boolean flag,${type} left,${type} right,Boolean boxed) {
+          ${type} value=${zero};StringBuilder trace=new StringBuilder();String outcome="ok";
+          try {${body}} catch(RuntimeException error){outcome=error.getClass().getName()+":"+(error==failure);}
+          finally {trace.append('f').append(${bits});}
+          return outcome+":"+trace+":"+${bits};
+        }`);
+        drivers.push(`for(${type} left:${variant?'new '+type+'[]{'+zero+'}':values}) for(${type} right:${values}) for(boolean flag:new boolean[]{false,true})
+          for(Boolean boxed:new Boolean[]{false,true,null}) for(mode=0;mode<3;mode++) {
+            String expected=original${name}(flag,left,right,boxed),actual=rebuilt${name}(flag,left,right,boxed),post=post${name}(flag,left,right,boxed);
+            if(!expected.equals(actual)||!expected.equals(post))throw new AssertionError("${name}:"+expected+" != "+actual+" / "+post);System.out.println("${name}:"+actual);
+          }`);expectedCases+=(variant?1:size)*size*18;
+      }
+    }
+    const source=`public class PrimitiveJoins {
+      static int mode;static final RuntimeException failure=new IllegalStateException();
+      static boolean pick(boolean flag,Boolean boxed,StringBuilder trace) {
+        trace.append('q');if(mode==1)throw failure;return mode==2?boxed:flag;
+      }
+      ${methods.join('\n')}
+      public static void main(String[] args){${drivers.join('\n')}}
+    }`;
+    const file=path.join(temporary,'PrimitiveJoins.java');fs.writeFileSync(file,source);
+    run('javac',['--release','8','-d',temporary,file],temporary);
+    assert.equal(run('java',['-cp',temporary,'PrimitiveJoins'],temporary).trim().split('\n').length,expectedCases);
+    assert.equal(expectedCases,5778);
+  } finally {fs.rmSync(temporary,{recursive:true,force:true});}
+});
+
+
+test('post-cleanup primitive joins require unshadowed proven local types',()=>{
+  const source='if(flag) { value = -1; } else { value = input; }';
+  const types=name=>['value','input'].includes(name)?'int':null;
+  assert.equal(factorCommonBranchTails(source,{localType:types}).source,'value = (flag) ? -1 : input;');
+  for(const body of [
+    'int input=7; '+source,
+    'if(outer) { byte input=7; '+source+' }',
+    'try { '+source+' } catch(Exception error) { fail(); }',
+    'synchronized(lock) { '+source+' }',
+    'while(flag) { '+source+' }',
+    'scope: { '+source+' }',
+  ]) assert.deepEqual(factorCommonBranchTails(body,{localType:types}),{source:body,branches:0});
+});

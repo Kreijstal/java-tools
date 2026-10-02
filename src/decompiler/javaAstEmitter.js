@@ -146,7 +146,7 @@ function statementCount(statements) {
   return count;
 }
 
-function literalAssignment(statements) {
+function primitiveAssignment(statements, localType) {
   if (statements.length !== 1 || statements[0].kind !== 'UnsupportedStatement') return null;
   const parsed = parsedStraightBlock(statements[0]);
   if (!parsed || parsed.statements.length !== 1) return null;
@@ -159,6 +159,11 @@ function literalAssignment(statements) {
   if (value.kind === 'UnaryExpression' && value.prefix && ['-', '+'].includes(value.operator)) {
     sign = value.operator;
     value = value.operand;
+  }
+  if (!sign && value.kind === 'Identifier') {
+    const type = localType(value.name);
+    return ['boolean', 'byte', 'char', 'short', 'int', 'long', 'float', 'double'].includes(type)
+      ? {name: assignment.left.name, type, source: value.name} : null;
   }
   if (value.kind !== 'LiteralExpression') return null;
   if (!sign && value.literalKind === 'boolean') return {
@@ -179,8 +184,8 @@ function literalAssignment(statements) {
 
 function valueProducingBranch(condition, thenStatements, elseStatements, localType) {
   if (!localType) return null;
-  const taken = literalAssignment(thenStatements);
-  const other = literalAssignment(elseStatements);
+  const taken = primitiveAssignment(thenStatements, localType);
+  const other = primitiveAssignment(elseStatements, localType);
   if (!taken || !other || taken.name !== other.name || taken.type !== other.type) return null;
   const destination = localType(taken.name);
   // Same-type primitive arms have no conditional numeric promotion, boxing or
@@ -635,7 +640,7 @@ function removeDeadReceiverSnapshots(source, declarations, carrierNames) {
 // spell the same Boolean argument using different temporary names. Parse the
 // final source for control/scope proofs, while retaining original expression
 // bytes (the parser's node ranges often cover only the leading token).
-function factorCommonBranchTails(source, {integralConditions = new Set()} = {}) {
+function factorCommonBranchTails(source, {integralConditions = new Set(), localType = null} = {}) {
   const unchanged = () => ({source, branches: 0});
   if (/\\u+[0-9a-fA-F]{4}/.test(source)) return unchanged();
   let parsed, tokens;
@@ -653,6 +658,20 @@ function factorCommonBranchTails(source, {integralConditions = new Set()} = {}) 
     return Object.entries(node).every(([key, value]) => ['range', 'meta', 'tokens'].includes(key) || known(value));
   }
   if (!known(parsed)) return unchanged();
+  const declaredNames = new Set();
+  function declarations(node) {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) {node.forEach(declarations);return;}
+    if (['VariableDeclarator', 'FormalParameter'].includes(node.kind)) declaredNames.add(node.name);
+    for (const [key, value] of Object.entries(node))
+      if (!['range', 'tokens', 'meta'].includes(key)) declarations(value);
+  }
+  declarations(parsed);
+  // The caller proves lifted-local/parameter types. An inline declaration can
+  // shadow that identity, so refuse the whole spelling rather than guessing
+  // its lexical scope. Protected/monitor/loop/label bodies remain opaque here.
+  const unshadowedLocalType = name => declaredNames.has(name) ? null : localType?.(name);
+
   const starts = new Map(tokens.map((token, index) => [token.range.startOffset, index]));
   const pairs = new Map(), stack = [];
   for (let index = 0; index < tokens.length; index++) {
@@ -721,7 +740,9 @@ function factorCommonBranchTails(source, {integralConditions = new Set()} = {}) 
         const condition = wrapped.slice(tokens[conditionOpen].range.endOffset, tokens[conditionClose].range.startOffset);
         const taken = statements(child.consequent), other = child.alternate ? statements(child.alternate) : [];
         if (commonBranchTail(taken, other)) branches++;
-        result.push(...lowerIfStatements(condition, taken, other, () => inverse(condition), null, true));
+        const value = valueProducingBranch(condition, taken, other, unshadowedLocalType);
+        if (value) {branches++;result.push(value);}
+        else result.push(...lowerIfStatements(condition, taken, other, () => inverse(condition), unshadowedLocalType, true));
       } else if (child.kind === 'BlockStatement') {
         // Reconstruct tails within an existing plain block, keeping its scope
         // intact. Try/monitor/loop/label bodies remain opaque at this layer.
@@ -740,7 +761,7 @@ function factorCommonBranchTails(source, {integralConditions = new Set()} = {}) 
       if (!commonBranchTail(child.consequent.statements, rest)) continue;
       branches++;
       result = [...result.slice(0, index), ...lowerIfStatements(child.condition.source,
-        child.consequent.statements, rest, () => inverse(child.condition.source), null, true)];
+        child.consequent.statements, rest, () => inverse(child.condition.source), unshadowedLocalType, true)];
     }
     return terminalContinuation(result) ? contextualTails(result) : result;
   }
@@ -872,7 +893,7 @@ function factorCommonBranchTails(source, {integralConditions = new Set()} = {}) 
         const taken = contextualTails(child.consequent.statements, result);
         const other = child.alternate ? contextualTails(child.alternate.statements, result) : result;
         const lowered = lowerIfStatements(child.condition.source, taken, other,
-          () => inverse(child.condition.source), null, true);
+          () => inverse(child.condition.source), unshadowedLocalType, true);
         if (doesNotDuplicate(original, lowered)) {
           if (emitStatements(lowered) !== emitStatements(original)) branches++;
           result = lowered;

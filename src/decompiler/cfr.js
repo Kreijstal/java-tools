@@ -4260,15 +4260,26 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
       for (const [target, replacement] of resolvedAliases)
         redundantStackInAliases.set(target, replacement);
     }
+    const originalCarrierSource = source;
+    const aliasProof = rewriteStackCarrierReferences(source, redundantStackInAliases);
+    if (!aliasProof.applied) {
+      // Forwarded edge stores can feed aliases. Keep both sets of carriers
+      // when lexical/scope proof fails, rather than leaving an undeclared copy.
+      redundantStackInAliases.clear();
+      forwardedStackIns.clear();
+    }
     if (forwardedStackIns.size) {
       const escapedNames = [...forwardedStackIns].map((name) =>
         name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
       const assignment = new RegExp(`^\\s*(?:${escapedNames.join('|')})\\s*=.*;\\s*$`, 'gm');
       source = source.replace(assignment, '');
     }
-    for (const [target, replacement] of redundantStackInAliases) {
-      const escaped = target.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      source = source.replace(new RegExp(`\\b${escaped}\\b`, 'g'), replacement);
+    const aliases = rewriteStackCarrierReferences(source, redundantStackInAliases);
+    if (aliases.applied) source = aliases.source;
+    else {
+      source = originalCarrierSource;
+      redundantStackInAliases.clear();
+      forwardedStackIns.clear();
     }
     source = source.replace(/^\s*(stackIn_\d+_\d+)\s*=\s*\1;\s*$/gm, '');
     let retainedDeclarations = [];
@@ -4286,9 +4297,21 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
       }
       retainedDeclarations = booleans ? booleans.declarations : uniqueDeclarations;
     }
-    if (!useStateMachine) source = factorCommonBranchTails(source, {
-      integralConditions: integralConditionsFromCache(cache),
-    }).source;
+    if (!useStateMachine) {
+      const retainedPrimitiveTypes = new Map();
+      for (const declaration of retainedDeclarations) {
+        const match = /^(boolean|byte|char|short|int|long|float|double) ([A-Za-z_$][\w$]*)(?: = .+)?;$/.exec(declaration);
+        if (match) retainedPrimitiveTypes.set(match[2], match[1]);
+      }
+      source = factorCommonBranchTails(source, {
+        integralConditions: integralConditionsFromCache(cache),
+        // Boolean promotion may have changed an int carrier's declaration.
+        // Use its final type, and never type an eliminated carrier from stale
+        // allocator metadata. Other names must be proven actual JVM locals.
+        localType: name => retainedPrimitiveTypes.get(name)
+          || (stackCarrierTypes.has(name) ? null : localState.sourceTypeForName(name)),
+      }).source;
+    }
     if (!useStateMachine) {
       const selectors = removeDeadRegionSelectors(source, retainedDeclarations, structured.selectorDecls);
       source = selectors.source;
@@ -8483,6 +8506,46 @@ function compactBlankSourceLines(source) {
   return output + compact(source.slice(previous));
 }
 
+// Alias identities come from the operand-stack allocator, but their spelling
+// may also appear in a diagnostic string, comment, member or method name.
+// Substitute expression identifiers only after complete lexical/scope checks.
+function rewriteStackCarrierReferences(source, aliases) {
+  const unchanged = () => ({source, applied: false});
+  if (!aliases.size) return {source, applied: true};
+  if (/\\u+[0-9a-fA-F]{4}/.test(source) || [...aliases].some(([name, value]) =>
+      !/^stackIn_\d+_\d+$/.test(name) || !/^stackIn_\d+_\d+$/.test(value))) return unchanged();
+  let parsed, tokens;
+  try {
+    parsed = javaStatementParser.parseStatement(`{\n${source}\n}`, {requireComplete: true});
+    const lexed = tokenizeJava(source);
+    if (lexed.diagnostics.length) return unchanged();
+    tokens = lexed.tokens;
+  } catch (_) { return unchanged(); }
+  let blocked = false;
+  function walk(node) {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) {node.forEach(walk);return;}
+    if (node.kind?.startsWith('Unsupported') || aliases.has(node.label)) blocked = true;
+    if (aliases.has(node.name) && ['ClassType', 'VariableDeclarator',
+        'FormalParameter', 'TypeParameter', 'ClassDeclaration',
+        'InterfaceDeclaration', 'EnumDeclaration'].includes(node.kind)) blocked = true;
+    for (const [key, value] of Object.entries(node))
+      if (!['range', 'tokens', 'meta'].includes(key)) walk(value);
+  }
+  walk(parsed);
+  if (blocked) return unchanged();
+  const edits = [];
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index];
+    if (token.kind !== 'identifier' || !aliases.has(token.text)
+        || tokens[index - 1]?.text === '.' || ['(', ':'].includes(tokens[index + 1]?.text)) continue;
+    edits.push({start: token.range.startOffset, end: token.range.endOffset, value: aliases.get(token.text)});
+  }
+  for (const edit of edits.reverse())
+    source = source.slice(0, edit.start) + edit.value + source.slice(edit.end);
+  return {source, applied: true};
+}
+
 // A later phi may name several earlier aliases of the same stack value.
 // Revisit complete incoming-edge proofs until no further copies become aliases.
 // Only same-type allocator carriers qualify; incomplete edges, effects,
@@ -10445,6 +10508,7 @@ module.exports = {
     negateBooleanExpression,
     integralConditionsFromCache,
     resolveStackCarrierAliases,
+    rewriteStackCarrierReferences,
     compactBlankSourceLines,
     isBracketBalanced,
     dropUnthrowableProtectedRows,
