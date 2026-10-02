@@ -589,6 +589,32 @@ its current source layout. The readable publication and its generator pin are
 unchanged. Those selectors need a separate proof for their shared continuations;
 this check does not establish whole-game behavioral equivalence.
 
+### Remove routing that has no observable continuation
+
+A separate cleanup uses the exception structurer's allocated selector identities.
+It removes a selector only when its exact initialized `int` declaration is
+present and every source occurrence is a standalone decimal-literal store or
+an equality/inequality comparison with two empty block arms. Complete parsing
+and token accounting refuse live reads, shadowing, field lookups, captures,
+effectful stores or tests, unsupported syntax, Unicode escapes and scalar
+statement bodies that would become invalid Java when deleted. Other declarations
+cannot refer to the removed local. Only the proven statements and declaration
+are erased; try, catch, finally and monitor extents remain unchanged.
+
+`NODE_PATH=/home/kreijstal/git/java-tools/node_modules node test/javaAstEmitterLoopExits.test.js`
+passes 29 groups. The three added cleanup groups include 96 native comparisons
+of effects, specific-before-general catches, throwable identity, monitor
+ownership/release, finally effects, repeated loops and nullable empty tests that
+must still throw. The six exception-loop and 36 region-contract groups also pass.
+
+The candidate GeoBlox export changes only `ic.a(B)V`: its cache write now has
+one fewer local, two fewer stores and no empty post-catch test. The two cache
+calls, catch assignments and subsequent packet-offset update stay in their
+original regions. All 303 sources export without hard failures or fallback
+methods; retained selectors decrease from 11 to 10. This does not justify
+removing selectors that choose observable or throwing continuations, nor does
+it establish whole-game equivalence.
+
 ## Parallel operand copies at loop backedges
 
 Multiple live operand-stack values no longer force a dispatcher by themselves.

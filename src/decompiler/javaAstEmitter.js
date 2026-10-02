@@ -475,6 +475,93 @@ function lowerIfStatements(condition, thenStatements, elseStatements, inverted, 
   return [makeIf(condition, thenStatements, elseStatements.length ? block(elseStatements) : null)];
 }
 
+// A routing local is dead only if every occurrence is a literal store or a
+// pure comparison whose two arms are empty. Take identities from the region
+// allocator, not a name heuristic; keep all protected statements in place.
+function removeDeadRegionSelectors(source, declarations, selectorNames) {
+  const unchanged = () => ({source, declarations, removed: []});
+  const candidates = new Map();
+  for (const name of selectorNames || []) {
+    if (!/^decompiledRegionSelector\d+$/.test(name)) continue;
+    const declaration = `int ${name} = 0;`;
+    if (declarations.filter(item => item === declaration).length !== 1) continue;
+    candidates.set(name, {declaration, allowed: new Set(), edits: []});
+  }
+  if (!candidates.size || [source, ...declarations].some(text => /\\u+[0-9a-fA-F]{4}/.test(text))) return unchanged();
+  const wrapped = `{\n${source}\n}`;
+  let parsed, tokens;
+  try {
+    parsed = statementParser.parseStatement(wrapped, {requireComplete: true});
+    const lexed = tokenizeJava(wrapped);
+    if (lexed.diagnostics.length) return unchanged();
+    tokens = lexed.tokens.filter(token => !['comment', 'whitespace', 'eof'].includes(token.kind));
+  } catch (_) { return unchanged(); }
+  const starts = new Map(tokens.map((token, index) => [token.range.startOffset, index]));
+  const integer = token => token && /^(?:0|[1-9]\d*)$/.test(token.text)
+    && Number(token.text) <= 2147483647;
+  const empty = node => node?.kind === 'BlockStatement' && node.statements.length === 0;
+  let unknown = false;
+  function walk(node, parent = null) {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) { for (const child of node) walk(child, parent); return; }
+    if (node.kind?.startsWith('Unsupported')) unknown = true;
+    const index = starts.get(node.range?.startOffset);
+    const first = tokens[index];
+    const inBlock = parent?.kind === 'BlockStatement' && parent.statements.includes(node);
+    if (inBlock && node.kind === 'ExpressionStatement' && node.expression?.kind === 'AssignmentExpression'
+        && node.expression.operator === '=' && node.expression.left.kind === 'Identifier') {
+      const state = candidates.get(node.expression.left.name);
+      if (state && first?.text === node.expression.left.name && tokens[index + 1]?.text === '='
+          && integer(tokens[index + 2]) && tokens[index + 3]?.text === ';') {
+        state.allowed.add(index);
+        state.edits.push({start: first.range.startOffset, end: tokens[index + 3].range.endOffset});
+      }
+    } else if (inBlock && node.kind === 'IfStatement' && empty(node.consequent)
+        && (!node.alternate || empty(node.alternate))) {
+      // Only a known generated int local compared with a literal can be erased.
+      // An empty arm with an effectful/nullable/field condition must still run.
+      const state = candidates.get(tokens[index + 2]?.text);
+      if (state && first?.text === 'if' && tokens[index + 1]?.text === '('
+          && ['==', '!='].includes(tokens[index + 3]?.text) && integer(tokens[index + 4])
+          && tokens[index + 5]?.text === ')' && tokens[index + 6]?.text === '{'
+          && tokens[index + 7]?.text === '}' && (!node.alternate
+            || tokens[index + 8]?.text === 'else' && tokens[index + 9]?.text === '{'
+              && tokens[index + 10]?.text === '}')) {
+        state.allowed.add(index + 2);
+        state.edits.push({start: first.range.startOffset,
+          end: tokens[index + (node.alternate ? 10 : 7)].range.endOffset});
+      }
+    }
+    for (const [key, child] of Object.entries(node))
+      if (!['range', 'meta', 'tokens', 'kind'].includes(key)) walk(child, node);
+  }
+  walk(parsed);
+  if (unknown) return unchanged();
+  const removed = [], edits = [];
+  for (const [name, state] of candidates) {
+    // Account for every identifier token, including shadowing, qualified fields,
+    // captures and unrecognized reads. No implicit lexical-binding assumption.
+    if (tokens.some((token, index) => token.kind === 'identifier' && token.text === name
+        && !state.allowed.has(index))) continue;
+    if (declarations.some(declaration => declaration !== state.declaration
+        && tokenizeJava(declaration).tokens.some(token => token.kind === 'identifier' && token.text === name))) continue;
+    removed.push(name); edits.push(...state.edits);
+  }
+  edits.sort((a, b) => a.start - b.start);
+  for (const edit of edits) {
+    const lineStart = wrapped.lastIndexOf('\n', edit.start - 1) + 1;
+    const lineEnd = wrapped.indexOf('\n', edit.end);
+    if (lineEnd >= 0 && !wrapped.slice(lineStart, edit.start).trim() && !wrapped.slice(edit.end, lineEnd).trim()) {
+      edit.start = lineStart; edit.end = lineEnd + 1;
+    }
+  }
+  if (edits.some((edit, index) => index && edits[index - 1].end > edit.start)) return unchanged();
+  let output = wrapped;
+  for (const edit of edits.reverse()) output = output.slice(0, edit.start) + output.slice(edit.end);
+  return {source: output.slice(2, -2), removed,
+    declarations: declarations.filter(declaration => !removed.some(name => declaration === candidates.get(name).declaration))};
+}
+
 // Run after stack-carrier cleanup: two copies of the same CFG tail may initially
 // spell the same Boolean argument using different temporary names. Parse the
 // final source for control/scope proofs, while retaining original expression
@@ -1049,4 +1136,5 @@ module.exports = {
   treeToStatements, emitStatements, rawExpression, rawStatement, hasUnreachableStatement,
   promoteBooleanStackCarriers,
   factorCommonBranchTails,
+  removeDeadRegionSelectors,
 };

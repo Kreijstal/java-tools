@@ -6,7 +6,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const {spawnSync} = require('child_process');
-const {treeToStatements, emitStatements, promoteBooleanStackCarriers, factorCommonBranchTails} = require('../src/decompiler/javaAstEmitter');
+const {treeToStatements, emitStatements, promoteBooleanStackCarriers, factorCommonBranchTails,
+  removeDeadRegionSelectors} = require('../src/decompiler/javaAstEmitter');
 const {printTree} = require('../src/decompiler/structurer');
 const {JavaParser} = require('../src/java-frontend/parser');
 const {decompileClassFile, assertNoFallback} = require('../src/decompiler/cfr');
@@ -167,6 +168,113 @@ test('protected loop-exit rotation matches native catch priority and monitor rel
     }
     assert.equal(cases,2240);
   } finally {fs.rmSync(temporary,{recursive:true,force:true});}
+});
+
+test('dead selector cleanup requires allocator identities and accounts for every occurrence', () => {
+  const name = 'decompiledRegionSelector0', declaration = `int ${name} = 0;`;
+  const source = `trace.append("${name}"); // ${name} in documentation
+try { work(); ${name} = 0; } catch (Exception error) { ${name} = 1; }
+if (${name} == 0) {} else {}
+finish();`;
+  const result = removeDeadRegionSelectors(source, [declaration, 'int count = 0;'], [name]);
+  assert.deepEqual(result.removed, [name]);
+  assert.deepEqual(result.declarations, ['int count = 0;']);
+  assert.equal(result.source, `trace.append("${name}"); // ${name} in documentation
+try { work();  } catch (Exception error) {  }
+finish();`);
+  assert.equal(removeDeadRegionSelectors(source, [declaration], []).source, source);
+  assert.equal(removeDeadRegionSelectors(source, [`Integer ${name} = 0;`], [name]).source, source);
+  assert.equal(removeDeadRegionSelectors(source, [declaration, declaration], [name]).source, source);
+  const live = 'decompiledRegionSelector1';
+  const mixed = `${source}\n${live} = 1; return ${live};`;
+  const selected = removeDeadRegionSelectors(mixed, [declaration, `int ${live} = 0;`], [name, live]);
+  assert.deepEqual(selected.removed, [name]);
+  assert.match(selected.source, /decompiledRegionSelector1 = 1; return decompiledRegionSelector1;/);
+});
+
+test('selector reads, effects, shadowing, unsupported syntax and scalar bodies refuse cleanup', () => {
+  const name = 'decompiledRegionSelector0', declaration = `int ${name} = 0;`;
+  for (const source of [
+    `${name} = 0; return ${name};`,
+    `${name} = 0; if (${name} == 0) { work(); }`,
+    `${name} = work(); if (${name} == 0) {}`,
+    `${name} = nullable; if (${name} == 0) {}`,
+    `${name}++; if (${name} == 0) {}`,
+    `${name} += 1; if (${name} == 0) {}`,
+    `${name} = 1; if (other.${name} == 0) {}`,
+    `${name} = 1; if (${name} == effect()) {}`,
+    `${name} = 1; if (${name} / 0 == 0) {}`,
+    `${name} = 1; if (${name} == 0) {} else { work(); }`,
+    `if (pick()) ${name} = 0; if (${name} == 0) {}`,
+    `${name} = 1; if (pick()) if (${name} == 0) {} else { work(); }`,
+    `${name} = 1; label: if (${name} == 0) {}`,
+    `{ int ${name} = 0; if (${name} == 0) {} }`,
+    `${name} = 1; unknown @ syntax;`,
+    `${name} = 1; } return 7; {`,
+    `${name} = 1; /* \\u0061 */ if (${name} == 0) {}`,
+    `${name} = 2147483648; if (${name} == 0) {}`,
+  ]) {
+    const result = removeDeadRegionSelectors(source, [declaration], [name]);
+    assert.equal(result.source, source, source);
+    assert.deepEqual(result.removed, [], source);
+  }
+  const source = `${name} = 1; if (${name} == 0) {}`;
+  assert.equal(removeDeadRegionSelectors(source, [declaration, `int other = ${name};`], [name]).source, source);
+});
+
+test('dead routing cleanup preserves native effects, failures, catch priority and lock ownership', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-dead-region-routing-'));
+  try {
+    const name = 'decompiledRegionSelector0', declaration = `int ${name} = 0;`;
+    const guarded = `try { work(mode,trace); ${name} = 0; }
+      catch (IllegalArgumentException specific) { trace.append('s'); ${name} = 1; }
+      catch (RuntimeException general) { trace.append('g'); ${name} = 2; }
+      if (${name} == 0) {}`;
+    const variants = [guarded,
+      `synchronized(lock) { trace.append(Thread.holdsLock(lock)); ${guarded} }`,
+      `try { synchronized(lock) { ${guarded} } } finally { trace.append('f'); }`,
+      `for(int index=0;index<3;index++) { ${guarded} }
+       if (nullable) {} else {} trace.append('n');`,
+    ];
+    let cases = 0;
+    for (const [index, body] of variants.entries()) {
+      const result = removeDeadRegionSelectors(body, [declaration], [name]);
+      assert.deepEqual(result.removed, [name]);
+      const methods = {original: declaration + '\n' + body,
+        rebuilt: result.declarations.join('\n') + '\n' + result.source};
+      const source = `public class DeadRouting${index} {
+        static final IllegalArgumentException specific=new IllegalArgumentException();
+        static final RuntimeException general=new RuntimeException();
+        static final Error fatal=new Error(); static Object lock; static StringBuilder trace;
+        static void work(int mode,StringBuilder trace) {
+          trace.append('w'); if(mode==1)throw specific; if(mode==2)throw general; if(mode==3)throw fatal;
+        }
+        ${Object.entries(methods).map(([method, code]) => `static void ${method}(int mode,Boolean nullable) {
+          ${code} trace.append('e'); }`).join('\n')}
+        static String invoke(boolean rebuilt,int mode,boolean nullLock,Boolean nullable) {
+          trace=new StringBuilder(); lock=nullLock?null:new Object();String result="ok";
+          try { if(rebuilt)rebuilt(mode,nullable);else original(mode,nullable); }
+          catch(Throwable error) {result=error==specific?"same-specific":error==general?"same-general":
+            error==fatal?"same-fatal":error.getClass().getName();}
+          if(lock!=null && Thread.holdsLock(lock))throw new AssertionError("monitor retained");
+          return result+":"+trace;
+        }
+        public static void main(String[]args) {
+          for(int mode=0;mode<4;mode++)for(boolean nullLock:new boolean[]{false,true})
+          for(Boolean nullable:new Boolean[]{null,false,true}) {
+            String expected=invoke(false,mode,nullLock,nullable),actual=invoke(true,mode,nullLock,nullable);
+            if(!expected.equals(actual))throw new AssertionError(expected+":"+actual);
+            System.out.println(mode+":"+nullLock+":"+nullable+":"+actual);
+          }
+        }
+      }`;
+      const file = path.join(temporary, `DeadRouting${index}.java`); fs.writeFileSync(file, source);
+      run('javac', ['--release', '8', '-d', temporary, file], temporary);
+      assert.equal(run('java', ['-cp', temporary, `DeadRouting${index}`], temporary).trim().split('\n').length, 24);
+      cases += 24;
+    }
+    assert.equal(cases, 96);
+  } finally { fs.rmSync(temporary, {recursive: true, force: true}); }
 });
 
 function run(command, args, directory) {
