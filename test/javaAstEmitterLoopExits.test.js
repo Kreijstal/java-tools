@@ -8,7 +8,7 @@ const path = require('path');
 const {spawnSync} = require('child_process');
 const {treeToStatements, emitStatements, promoteBooleanStackCarriers, factorCommonBranchTails,
   removeDeadRegionSelectors, removeDeadReceiverSnapshots, factorLabeledBlockReturnTails,
-  simplifyControlFrames, removeFallthroughLabelBreaks, localizePlainBlockLoopBreaks, foldLeadingWhileBreakGuards, foldLabeledBooleanDecisions, foldVoidReturnExits, foldNestedIfGuards, foldLabeledSkipGuards, foldLabeledIfElseExits, foldLabeledExitTrees, foldLabeledGuardTrees} = require('../src/decompiler/javaAstEmitter');
+  simplifyControlFrames, removeFallthroughLabelBreaks, localizePlainBlockLoopBreaks, foldLeadingWhileBreakGuards, foldEffectfulPlainBlockExits, foldLabeledBooleanDecisions, foldVoidReturnExits, foldNestedIfGuards, foldLabeledSkipGuards, foldLabeledIfElseExits, foldLabeledExitTrees, foldLabeledGuardTrees} = require('../src/decompiler/javaAstEmitter');
 const {printTree} = require('../src/decompiler/structurer');
 const {JavaParser} = require('../src/java-frontend/parser');
 const {decompileClassFile, assertNoFallback} = require('../src/decompiler/cfr');
@@ -2736,4 +2736,135 @@ test('leading while break guards match native entry effects, NaNs, cleanup and b
     run('javac', ['--release', '8', '-d', temporary, javaFile], temporary);
     assert.equal(run('java', ['-cp', temporary, 'LeadingLoopGuards'], temporary).trim(), 'leading-loop-native:96768');
   } finally { fs.rmSync(temporary, {recursive: true, force: true}); }
+});
+
+function recoverEffectfulExits(source) {
+  let exits = 0;
+  for (;;) {
+    const next = foldEffectfulPlainBlockExits(source);
+    if (!next.exitsRecovered) break;
+    exits += next.exitsRecovered; source = next.source;
+    for (;;) { const clean = simplifyControlFrames(source); if (clean.source === source) break; source = clean.source; }
+  }
+  return {source, exits};
+}
+
+test('effectful block exits retain prefixes and original arm scopes while supplying the skipped else', () => {
+  const original = 'Exit: { prefix(); if (skip()) { effect(); break Exit; } remainder(); } tail();';
+  const next = foldEffectfulPlainBlockExits(original);
+  assert.equal(next.exitsRecovered, 1);
+  assert.equal(next.source, 'Exit: { prefix(); if (skip()) { effect(); } else { remainder(); } } tail();');
+  assert.equal(foldEffectfulPlainBlockExits(next.source).exitsRecovered, 0);
+  const scoped = `Exit: {
+  prefix();
+  if (skip()) {
+    int local = 1;
+    effect(local);
+    break Exit;
+  }
+  { int local = 2; remainder(local); }
+}
+tail();`;
+  const rebuilt = recoverEffectfulExits(scoped);
+  assert.equal(rebuilt.exits, 1);
+  assert.match(rebuilt.source, /if \(skip\(\)\) \{\n  int local = 1;\n  effect\(local\);\n\} else \{\n  \{ int local = 2; remainder\(local\); \}\n\}/);
+  const chained = 'Exit: { if(a) { first(); break Exit; } if(b) { second(); break Exit; } last(); } tail();';
+  const chain = recoverEffectfulExits(chained); assert.equal(chain.exits, 2); assert.doesNotMatch(chain.source, /break Exit|Exit:/);
+  assert.equal((chain.source.match(/first\(\)/g) || []).length, 1);
+  assert.equal((chain.source.match(/second\(\)/g) || []).length, 1);
+  assert.equal((chain.source.match(/last\(\)/g) || []).length, 1);
+});
+
+test('effectful exits refuse protected continuations, declaration scope changes and ambiguous transfers', () => {
+  for (const source of [
+    'Exit: { if(a) { effect(); break Exit; } int local=0; use(local); } tail();',
+    'Exit: { if(a) { effect(); break Exit; } class Local {} work(); } tail();',
+    'Exit: { if(a) { effect(); break Exit; } else work(); remainder(); } tail();',
+    'Exit: { if(a) { break Exit; } remainder(); } tail();',
+    'Exit: { if(a) { if(b) break Exit; effect(); break Exit; } remainder(); } tail();',
+    'Exit: { try { if(a) { effect(); break Exit; } remainder(); } finally { cleanup(); } } tail();',
+    'Exit: { try { if(a) { effect(); break Exit; } remainder(); } catch(Exception error) { recover(); } } tail();',
+    'Exit: { synchronized(lock) { if(a) { effect(); break Exit; } remainder(); } } tail();',
+    'Exit: { while(more()) { if(a) { effect(); break Exit; } remainder(); } } tail();',
+    'Exit: { switch(value) { case 0: if(a) { effect(); break Exit; } remainder(); } } tail();',
+    'Exit: { { if(a) { effect(); break Exit; } remainder(); } after(); } tail();',
+    'Exit: { if(a) { effect(); break Missing; } remainder(); } tail();',
+    'Exit: { if(a) { effect(); continue Exit; } remainder(); } tail();',
+    'Exit: { if(a) { effect(); break Exit; } continue; } tail();',
+    'Exit: { if(a) { effect(); break Exit; } break; } tail();',
+    'Exit: { if(a) { effect(); break Exit; } work() } tail();',
+    'Exit: { if(a) { effect(); break Exit; } 42; } tail();',
+    'Exit: { if(a) { effect(); break Exit; } // comment\n work(); } tail();',
+    'Exit: { if(a) { effect(); break Exit; } Runnable task=()->work(); task.run(); } tail();',
+    'Exit: { Exit: { if(a) { effect(); break Exit; } remainder(); } } tail();',
+  ]) assert.deepEqual(foldEffectfulPlainBlockExits(source), {source, exitsRecovered: 0}, source);
+});
+
+test('effectful exit reconstruction preserves native effects, failure identity, cleanup and monitor ownership', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'effectful-exits-'));
+  try {
+    const variants = [
+      'Exit: { work(0); if(stop(a,floating)) { work(1); break Exit; } work(2); } work(3);',
+      'Exit: { if(stop(a,floating)) { int local=1; work(local); break Exit; } { int local=2; work(local); } } work(3);',
+      'Exit: { if(stop(a,floating)) { work(1); break Exit; } if(pick(b)) { work(2); break Exit; } work(3); } work(4);',
+      'Exit: { if(pick(b)) { { if(stop(a,floating)) { work(1); break Exit; } work(2); } } else { work(3); } } work(4);',
+      'try { Exit: { if(stop(a,floating)) { work(1); break Exit; } work(2); } work(3); } finally { cleanup(); } work(4);',
+      'Exit: { if(stop(a,floating)) { try { work(1); } finally { cleanup(); } break Exit; } try { work(2); } finally { cleanup(); } } work(3);',
+      'synchronized(lock) { Exit: { if(stop(a,floating)) { work(1); break Exit; } work(2); } work(3); } work(4);',
+      'Exit: { if(stop(a,floating)) { synchronized(lock) { work(1); } break Exit; } synchronized(lock) { work(2); } } work(3);',
+      'Outer: for(int index=0;index<3;index++) { Exit: { if(stop(a,floating)) { work(1); if(mode==7) continue Outer; break Exit; } work(2); } work(3); } work(4);',
+      'Outer: { Exit: { if(stop(a,floating)) { work(1); if(mode==7) break Outer; break Exit; } work(2); } work(3); } work(4);',
+      'Exit: { if(stop(a,floating)) { work(1); if(mode==7) return value; break Exit; } work(2); } work(3);',
+      'Exit: { if(stop(a,floating)) { work(1); if(mode==7) throw checked; break Exit; } work(2); } work(3);',
+      'try { Exit: { if(checkedStop(a,floating)) { work(1); break Exit; } work(2); } work(3); } catch(java.io.IOException error) { trace.append(error==checked); } work(4);',
+      'Exit: { if(a=stop(b,floating)) { work(1); break Exit; } work(2); } work(3);',
+      'Exit: { if(stop(a,floating)||pick(b)) { work(1); break Exit; } work(2); } work(3);',
+      'Exit: { if(floating<0d) { work(1); break Exit; } work(2); } work(3);',
+      'Exit: { if(a) { work(1); break Exit; } work(2); } work(3);',
+      'Exit: { if(stop(a,floating)) { for(int index=0;index<2;index++) { work(1); if(index==0)continue; } break Exit; } work(2); } work(3);',
+      'Exit: { if(stop(a,floating)) { switch(mode%2) { case 0: work(1); break; default: work(2); } break Exit; } work(3); } work(4);',
+      'Exit: { if(stop(a,floating)) { try { work(1); } finally { cleanup(); if(mode==7) return value; } break Exit; } work(2); } work(3);',
+      'Exit: { if(true) { work(1); break Exit; } while(true) { work(2); } } work(3);',
+      'Exit: { if(false) { work(1); break Exit; } work(2); } work(3);',
+      'Exit: { if(stop(a,floating)) { work(1); break Exit; } try { work(2); } finally { cleanup(); } } work(3);',
+      'try { Exit: { if(stop(a,floating)) { work(1); break Exit; } work(2); } } catch(RuntimeException error) { trace.append(error==specific); } work(3);',
+    ];
+    const methods=[];
+    variants.forEach((original,index)=>{
+      const next=recoverEffectfulExits(original); assert.equal(next.exits,index===2?2:1,index);
+      for(const [name,body] of [['original',original],['rebuilt',next.source]])
+        methods.push(`static int ${name}${index}(Boolean a,Boolean b,double floating) throws java.io.IOException { ${body} return value; }`);
+    });
+    const source=`public class EffectfulExits {
+      static int mode,value,ticks,cleanups;static Object lock;static StringBuilder trace;
+      static final RuntimeException specific=new IllegalArgumentException(),general=new IllegalStateException();
+      static final Error fatal=new AssertionError();static final java.io.IOException checked=new java.io.IOException();
+      static boolean stop(Boolean boxed,double floating){trace.append('p').append(lock!=null&&Thread.holdsLock(lock));ticks++;if(mode==1)throw specific;if(mode==2)throw general;return boxed||floating<0d;}
+      static boolean checkedStop(Boolean boxed,double floating)throws java.io.IOException{if(mode==2){trace.append('c');throw checked;}return stop(boxed,floating);}
+      static boolean pick(Boolean boxed){trace.append('b');ticks++;return boxed;}
+      static void work(int index){trace.append('w').append(index).append(lock!=null&&Thread.holdsLock(lock));value+=index+1;if(mode==3)throw specific;if(mode==4)throw fatal;}
+      static void cleanup(){trace.append('f');cleanups++;if(mode==5)throw general;if(mode==6)throw fatal;}
+      ${methods.join('\n')}
+      interface Call {int call()throws java.io.IOException;}
+      static String invoke(Call call,boolean nullLock){lock=nullLock?null:new Object();trace=new StringBuilder();value=0;ticks=0;cleanups=0;String result;
+        try{result="ok:"+call.call();}catch(Throwable error){result=error==specific?"specific":error==general?"general":error==fatal?"fatal":error==checked?"checked":error.getClass().getName();}
+        if(lock!=null&&Thread.holdsLock(lock))throw new AssertionError("monitor retained");return result+":"+value+":"+ticks+":"+cleanups+":"+trace;
+      }
+      public static void main(String[]args){int cases=0;
+        if(!invoke(()->rebuilt0(true,null,Double.NaN),false).equals("ok:7:7:1:0:w0falsepfalsew1falsew3false"))throw new AssertionError("prefix/effect/tail oracle");
+        if(!invoke(()->rebuilt0(false,null,Double.NaN),false).equals("ok:8:8:1:0:w0falsepfalsew2falsew3false"))throw new AssertionError("remainder oracle");
+        if(!invoke(()->rebuilt22(true,null,Double.NaN),false).equals("ok:6:6:1:0:pfalsew1falsew3false"))throw new AssertionError("skipped remainder cleanup oracle");
+        if(!invoke(()->rebuilt22(false,null,Double.NaN),false).equals("ok:7:7:1:1:pfalsew2falsefw3false"))throw new AssertionError("executed remainder cleanup oracle");
+        if(!invoke(()->rebuilt6(true,null,Double.NaN),false).equals("ok:11:11:1:0:ptruew1truew3truew4false"))throw new AssertionError("monitor oracle");
+        mode=3;if(!invoke(()->rebuilt0(true,null,Double.NaN),false).equals("specific:1:0:0:w0false"))throw new AssertionError("prefix failure oracle");
+        for(mode=0;mode<8;mode++)for(Boolean a:new Boolean[]{null,false,true})for(Boolean b:new Boolean[]{null,false,true})
+        for(double floating:new double[]{Double.NEGATIVE_INFINITY,-1,-0d,0d,1,Double.POSITIVE_INFINITY,Double.NaN})for(boolean nullLock:new boolean[]{false,true}){
+          ${variants.map((_,index)=>`{String expected=invoke(()->original${index}(a,b,floating),nullLock),actual=invoke(()->rebuilt${index}(a,b,floating),nullLock);if(!expected.equals(actual))throw new AssertionError(${index}+":"+mode+":"+a+":"+b+":"+floating+":"+nullLock+":"+expected+" != "+actual);cases++;}`).join('\n')}
+        }if(cases!=24192)throw new AssertionError(cases);System.out.println("effectful-exits-native:"+cases);
+      }
+    }`;
+    const file=path.join(temporary,'EffectfulExits.java');fs.writeFileSync(file,source);
+    run('javac',['--release','8','-d',temporary,file],temporary);
+    assert.equal(run('java',['-cp',temporary,'EffectfulExits'],temporary).trim(),'effectful-exits-native:24192');
+  } finally { fs.rmSync(temporary,{recursive:true,force:true}); }
 });

@@ -977,6 +977,134 @@ function localizePlainBlockLoopBreaks(source) {
   return {source: output.slice(2, -2), breaksLocalized: edits.length};
 }
 
+// A conditional arm may do work before exiting a plain block. When normal
+// completion of its containing block also reaches that destination directly,
+// the skipped remainder is its existing else arm. Keep the prefix, predicate,
+// effect-arm braces and remainder bytes; never move declarations into a new
+// scope or cross a loop/switch/try/finally/monitor continuation.
+function foldEffectfulPlainBlockExits(source) {
+  const unchanged = () => ({source, exitsRecovered: 0});
+  const proof = controlCleanupSource(source);
+  if (!proof) return unchanged();
+  const {wrapped, parsed, tokens, starts, closes, children, labelCounts} = proof;
+  const loops = new Set(['WhileStatement', 'ForStatement', 'EnhancedForStatement', 'DoWhileStatement']);
+  const parents = new Map(), targets = new Map();
+  const nondeclaring = new Set(['BlockStatement', 'LabeledStatement', 'IfStatement', ...loops,
+    'SwitchStatement', 'TryStatement', 'SynchronizedStatement', 'ExpressionStatement',
+    'ReturnStatement', 'ThrowStatement', 'BreakStatement', 'ContinueStatement', 'EmptyStatement', 'AssertStatement']);
+  let refused = false;
+  function inspect(node, parent, labels = [], loopDepth = 0, breakDepth = 0) {
+    parents.set(node, parent);
+    if (/ClassDeclaration|MethodDeclaration|ConstructorDeclaration|LambdaExpression|AnonymousClass/.test(node.kind || '')) refused = true;
+    if (['BreakStatement', 'ContinueStatement'].includes(node.kind)) {
+      if (node.label) {
+        const target = labels.slice().reverse().find(frame => frame.label === node.label);
+        if (!target || node.kind === 'ContinueStatement' && !loops.has(target.statement?.kind)) refused = true;
+        else targets.set(node, target);
+      } else if (!(node.kind === 'ContinueStatement' ? loopDepth : breakDepth)) refused = true;
+    }
+    if (node.kind === 'ExpressionStatement') {
+      const expression = node.expression;
+      if (!['AssignmentExpression', 'MethodInvocationExpression', 'NewClassExpression'].includes(expression?.kind)
+          && !(expression?.kind === 'UnaryExpression' && ['++', '--'].includes(expression.operator))) refused = true;
+      let index = starts.get(node.range?.startOffset);
+      if (index === undefined) refused = true;
+      else {
+        while (index < tokens.length && tokens[index].text !== ';' && tokens[index].text !== '}') {
+          if (closes.has(index)) index = closes.get(index);
+          index++;
+        }
+        if (tokens[index]?.text !== ';') refused = true;
+      }
+    }
+    children(node, child => inspect(child, node,
+      node.kind === 'LabeledStatement' ? [...labels, node] : labels,
+      loopDepth + (loops.has(node.kind) ? 1 : 0),
+      breakDepth + (loops.has(node.kind) || node.kind === 'SwitchStatement' ? 1 : 0)));
+  }
+  inspect(parsed, null);
+  if (refused || [...labelCounts.values()].some(count => count !== 1)) return unchanged();
+  function extent(node) {
+    const open = starts.get(node.range?.startOffset), close = closes.get(open);
+    if (node.kind !== 'BlockStatement' || tokens[open]?.text !== '{' || tokens[close]?.text !== '}') return null;
+    if (!node.statements.length ? close !== open + 1
+      : starts.get(node.statements[0].range?.startOffset) !== open + 1
+        || node.statements.some(statement => {
+          const start = starts.get(statement.range?.startOffset); return !(start > open && start < close);
+        })) return null;
+    return {open, close};
+  }
+  function reaches(block, target) {
+    if (target?.statement?.kind !== 'BlockStatement' || !extent(target.statement)) return false;
+    let child = block, parent = parents.get(child);
+    while (parent && parent !== target) {
+      if (parent.kind === 'BlockStatement') {
+        if (!extent(parent) || parent.statements.at(-1) !== child) return false;
+      } else if (parent.kind === 'IfStatement') {
+        if (parent.consequent !== child && parent.alternate !== child) return false;
+      } else if (parent.kind === 'LabeledStatement') {
+        if (parent.statement !== child || child.kind !== 'BlockStatement') return false;
+      } else return false;
+      child = parent; parent = parents.get(parent);
+    }
+    return parent === target && child === target.statement;
+  }
+  function referencesTarget(node, target) {
+    if (targets.get(node) === target) return true;
+    let found = false; children(node, child => { if (referencesTarget(child, target)) found = true; });
+    return found;
+  }
+  function find(node) {
+    const block = extent(node);
+    if (block) for (let index = 0; index < node.statements.length - 1; index++) {
+      const guard = node.statements[index], effect = guard.consequent;
+      if (guard.kind !== 'IfStatement' || guard.alternate || effect?.kind !== 'BlockStatement'
+          || effect.statements.length < 2) continue;
+      const jump = effect.statements.at(-1), target = targets.get(jump);
+      if (jump.kind !== 'BreakStatement' || !jump.label || !reaches(node, target)
+          || effect.statements.slice(0, -1).some(statement => referencesTarget(statement, target))) continue;
+      const remainder = node.statements.slice(index + 1);
+      if (!remainder.every(statement => nondeclaring.has(statement.kind)
+          && !(statement.kind === 'LabeledStatement' && !nondeclaring.has(statement.statement.kind)))) continue;
+      const arm = extent(effect), start = starts.get(guard.range?.startOffset), conditionEnd = closes.get(start + 1);
+      const jumpStart = starts.get(jump.range?.startOffset), restStart = starts.get(remainder[0].range?.startOffset);
+      const labelStart = starts.get(target.range?.startOffset);
+      if (!arm || tokens[start]?.text !== 'if' || tokens[start + 1]?.text !== '('
+          || conditionEnd === undefined || conditionEnd + 1 !== arm.open
+          || tokens[jumpStart]?.text !== 'break' || tokens[jumpStart + 1]?.text !== jump.label
+          || tokens[jumpStart + 2]?.text !== ';' || arm.close !== jumpStart + 3
+          || restStart !== arm.close + 1 || tokens[labelStart]?.text !== target.label
+          || tokens[labelStart + 1]?.text !== ':') continue;
+      // Only this suffix is replaced. Discovery chooses one candidate per
+      // call, so nested suffixes cannot overlap or duplicate one another.
+      const head = wrapped.slice(tokens[start].range.startOffset, tokens[jumpStart].range.startOffset);
+      const gap = wrapped.slice(tokens[jumpStart + 2].range.endOffset, tokens[arm.close].range.startOffset);
+      const rest = wrapped.slice(tokens[arm.close].range.endOffset, tokens[block.close].range.startOffset);
+      const prefix = wrapped.slice(wrapped.lastIndexOf('\n', tokens[start].range.startOffset - 1) + 1,
+        tokens[start].range.startOffset);
+      const multiline = /^[ \t]*$/.test(prefix) && head.includes('\n') && rest.includes('\n');
+      if (multiline) {
+        const effectLines = head.split('\n');
+        if (!effectLines.at(-1).trim() && !gap.trim()) effectLines.pop();
+        const restLines = rest.split('\n');
+        if (!restLines.at(-1).trim()) restLines.pop();
+        const indented = restLines.map(line => line.trim() ? '  ' + line : line).join('\n');
+        return {start: tokens[start].range.startOffset, end: tokens[block.close].range.startOffset,
+          text: effectLines.join('\n') + '\n' + prefix + '} else {' + indented + '\n' + prefix + '}\n'
+            + wrapped.slice(wrapped.lastIndexOf('\n', tokens[block.close].range.startOffset - 1) + 1,
+              tokens[block.close].range.startOffset)};
+      }
+      return {start: tokens[start].range.startOffset, end: tokens[block.close].range.startOffset,
+        text: head + (!gap.trim() && /\s$/.test(head) ? '' : gap) + '} else {' + rest + '} '};
+    }
+    let result; children(node, child => { if (!result) result = find(child); }); return result;
+  }
+  const edit = find(parsed);
+  if (!edit) return unchanged();
+  const output = wrapped.slice(0, edit.start) + edit.text + wrapped.slice(edit.end);
+  return {source: output.slice(2, -2), exitsRecovered: 1};
+}
+
 // A direct first-statement loop exit is the loop's existing entry condition.
 // Keep its expression verbatim under logical negation, so effects, unboxing and
 // NaNs retain their original evaluation. Require a definitely nonconstant
@@ -2747,6 +2875,7 @@ module.exports = {
   removeFallthroughLabelBreaks,
   localizePlainBlockLoopBreaks,
   foldLeadingWhileBreakGuards,
+  foldEffectfulPlainBlockExits,
   foldLabeledBooleanDecisions,
   foldVoidReturnExits,
   foldNestedIfGuards,
