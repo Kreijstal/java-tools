@@ -646,6 +646,75 @@ function specializePathGuards(source, options = {}) {
   return specializeGuards(source, controlCleanupSource(source), options);
 }
 
+// Guard specialization and frame cleanup can expose exits after the ordinary
+// exit passes have already run. Revisit only their existing destination/scope
+// proofs. Do not infer any new value facts or re-run scalar dispatch selection.
+// Every accepted step removes a transfer, transfer label, or label definition;
+// this finite AST measure prevents cycling between equivalent source forms.
+function recoverPostGuardExits(source, {parameterNames = []} = {}) {
+  const original = source;
+  const counts = {voidReturnFrames: 0, fallthroughBreaks: 0, exitTreeFrames: 0,
+    ifElseFrames: 0, guardTreeFrames: 0, effectfulExits: 0,
+    localizedLoopBreaks: 0, leadingLoopGuards: 0,
+    labelsRemoved: 0, jumpsUnlabeled: 0, blocksUnwrapped: 0};
+  const unchanged = () => ({source: original, rewrites: 0, counts});
+  if (typeof source !== 'string' || !Array.isArray(parameterNames)
+      || new Set(parameterNames).size !== parameterNames.length
+      || parameterNames.some(name => typeof name !== 'string' || !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name)))
+    return unchanged();
+  function measure(text) {
+    const proof = controlCleanupSource(text);
+    if (!proof) return null;
+    let weight = 0;
+    function visit(node) {
+      if (node.kind === 'LabeledStatement') weight++;
+      if (node.kind === 'BreakStatement' || node.kind === 'ContinueStatement')
+        weight += node.label ? 2 : 1;
+      proof.children(node, visit);
+    }
+    visit(proof.parsed);
+    return weight;
+  }
+  let weight = measure(source), rewrites = 0;
+  if (weight === null) return unchanged();
+  const passes = [
+    [foldVoidReturnExits, 'frames', 'voidReturnFrames'],
+    [removeFallthroughLabelBreaks, 'breaksRemoved', 'fallthroughBreaks'],
+    [foldLabeledExitTrees, 'framesRemoved', 'exitTreeFrames'],
+    [foldLabeledIfElseExits, 'framesRemoved', 'ifElseFrames'],
+    [foldLabeledGuardTrees, 'framesRemoved', 'guardTreeFrames'],
+    [foldEffectfulPlainBlockExits, 'exitsRecovered', 'effectfulExits'],
+    [localizePlainBlockLoopBreaks, 'breaksLocalized', 'localizedLoopBreaks'],
+    [foldLeadingWhileBreakGuards, 'guardsRecovered', 'leadingLoopGuards']
+  ];
+  for (;;) {
+    let recovered = false;
+    for (const [pass, key, counter] of passes) {
+      const next = pass(source, {parameterNames});
+      if (!next[key] || next.source === source) continue;
+      // A refusal leaves the last proven source intact. It must never retain
+      // a non-progressing candidate or discard earlier completed rewrites.
+      const nextWeight = measure(next.source);
+      if (nextWeight === null || nextWeight >= weight) continue;
+      source = next.source; weight = nextWeight;
+      counts[counter] += next[key]; rewrites++;
+      for (;;) {
+        const cleaned = simplifyControlFrames(source);
+        if (cleaned.source === source) break;
+        const cleanedWeight = measure(cleaned.source);
+        if (cleanedWeight === null || cleanedWeight >= weight) break;
+        source = cleaned.source; weight = cleanedWeight;
+        counts.labelsRemoved += cleaned.labelsRemoved;
+        counts.jumpsUnlabeled += cleaned.jumpsUnlabeled;
+        counts.blocksUnwrapped += cleaned.blocksUnwrapped;
+      }
+      recovered = true;
+      break;
+    }
+    if (!recovered) return {source, rewrites, counts};
+  }
+}
+
 function controlCleanupSource(source) {
   if (/\\u+[0-9a-fA-F]{4}/.test(source)) return null;
   const wrapped = `{\n${source}\n}`;
@@ -3012,6 +3081,7 @@ module.exports = {
   simplifyIdentityReferenceCasts,
   recoverScalarLabelDispatches,
   specializePathGuards,
+  recoverPostGuardExits,
   foldLabeledBooleanDecisions,
   foldVoidReturnExits,
   foldNestedIfGuards,

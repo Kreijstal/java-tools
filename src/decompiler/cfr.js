@@ -16,7 +16,7 @@ const { listRegionSplitCandidates, applyRegionSplit } = require('../passes/regio
 const { jreClassInfo, jreMethodCandidates } = require('../java-frontend/jreMetadata');
 const { JavaParser } = require('../java-frontend/parser');
 const { tokenizeJava } = require('../java-frontend/lexer');
-const { promoteBooleanStackCarriers, factorCommonBranchTails, factorLabeledBlockReturnTails, simplifyControlFrames, removeFallthroughLabelBreaks, localizePlainBlockLoopBreaks, foldLeadingWhileBreakGuards, foldEffectfulPlainBlockExits, simplifyIdentityReferenceCasts, recoverScalarLabelDispatches, specializePathGuards, foldLabeledBooleanDecisions, foldVoidReturnExits, foldNestedIfGuards, foldLabeledSkipGuards, foldLabeledIfElseExits, foldLabeledExitTrees, foldLabeledGuardTrees, removeDeadRegionSelectors, removeDeadReceiverSnapshots } = require('./javaAstEmitter');
+const { promoteBooleanStackCarriers, factorCommonBranchTails, factorLabeledBlockReturnTails, simplifyControlFrames, removeFallthroughLabelBreaks, localizePlainBlockLoopBreaks, foldLeadingWhileBreakGuards, foldEffectfulPlainBlockExits, simplifyIdentityReferenceCasts, recoverScalarLabelDispatches, specializePathGuards, recoverPostGuardExits, foldLabeledBooleanDecisions, foldVoidReturnExits, foldNestedIfGuards, foldLabeledSkipGuards, foldLabeledIfElseExits, foldLabeledExitTrees, foldLabeledGuardTrees, removeDeadRegionSelectors, removeDeadReceiverSnapshots } = require('./javaAstEmitter');
 
 const VERSION = 'CFR-JS 0.4.0';
 const javaStatementParser = new JavaParser();
@@ -1907,6 +1907,11 @@ function shareExistingExitTails(body, parameterNames = []) {
     const simplified = simplifyControlFrames(source);
     if (simplified.source === source) break;
     source = simplified.source;
+  }
+  const postGuardExits = recoverPostGuardExits(source, {parameterNames});
+  if (postGuardExits.rewrites) {
+    source = postGuardExits.source;
+    changed = true;
   }
   if (changed) replaceArrayContents(body, source.split('\n'));
 }
