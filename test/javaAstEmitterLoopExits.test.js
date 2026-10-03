@@ -8,7 +8,7 @@ const path = require('path');
 const {spawnSync} = require('child_process');
 const {treeToStatements, emitStatements, promoteBooleanStackCarriers, factorCommonBranchTails,
   removeDeadRegionSelectors, removeDeadReceiverSnapshots, factorLabeledBlockReturnTails,
-  simplifyControlFrames} = require('../src/decompiler/javaAstEmitter');
+  simplifyControlFrames, foldLabeledBooleanDecisions} = require('../src/decompiler/javaAstEmitter');
 const {printTree} = require('../src/decompiler/structurer');
 const {JavaParser} = require('../src/java-frontend/parser');
 const {decompileClassFile, assertNoFallback} = require('../src/decompiler/cfr');
@@ -1622,4 +1622,104 @@ test('post-cleanup primitive joins require unshadowed proven local types',()=>{
     'while(flag) { '+source+' }',
     'scope: { '+source+' }',
   ]) assert.deepEqual(factorCommonBranchTails(body,{localType:types}),{source:body,branches:0});
+});
+
+
+test('labeled boolean decisions require primitive local scope and unchanged predicate order', () => {
+  const source='boolean value=false; Exit: { prefix(); if(a){ if(b){value=true;break Exit;} } if(c){value=true;break Exit;} value=false; }';
+  const folded=foldLabeledBooleanDecisions(source);
+  assert.deepEqual(folded,{source:'boolean value=false; Exit: { prefix(); value = ((a) && (b)) || (c); }',decisions:1,literalStoresRemoved:2});
+  assert.deepEqual(foldLabeledBooleanDecisions(folded.source),{source:folded.source,decisions:0,literalStoresRemoved:0});
+  const inverse='boolean value=false; Exit: { if(!a){ if(!b){value=false;break Exit;} } value=true; }';
+  assert.equal(foldLabeledBooleanDecisions(inverse).source,'boolean value=false; Exit: { value = (a) || (b); }');
+  assert.equal(foldLabeledBooleanDecisions('boolean value=false; Exit: { if(d<=0){value=false;break Exit;} value=true; }').source,
+    'boolean value=false; Exit: { value = !(d<=0); }');
+  for (const source of [
+    'Boolean value=false; Exit: { if(a){value=true;break Exit;} value=false; }',
+    'int value=0; Exit: { if(a){value=1;break Exit;} value=0; }',
+    '{boolean value=false;} Exit: { if(a){value=true;break Exit;} value=false; }',
+    'Exit: { if(a){value=true;break Exit;} value=false; } boolean value=false;',
+    'boolean value=false; {boolean value=true;} Exit: { if(a){value=true;break Exit;} value=false; }',
+    'boolean value=false; Exit: { if(a){value=true;work();break Exit;} value=false; }',
+    'boolean value=false; Exit: { if(a){value=true;break Other;} value=false; }',
+    'boolean value=false; Exit: { if(a){value=true;return;} value=false; }',
+    'boolean value=false; Exit: { if(a){try {value=true;break Exit;}finally{work();}} value=false; }',
+    'boolean value=false; Exit: { if(a){synchronized(lock){value=true;break Exit;}} value=false; }',
+    'boolean value=false; Exit: { if(a){value=true;break Exit;} value=true; }',
+    'boolean value=false; Exit: { if(a){value=other;break Exit;} value=false; }',
+    'boolean value=false; Exit: { if(a){value=true;break Exit;}else{work();} value=false; }',
+    'boolean value=false; Exit: { if(a){value=true;break Exit;} value=false; } Exit: {work();}',
+    'boolean value=false; Exit: { if(a){value=true;break Exit;} /*scope*/ value=false; }',
+    'boolean value=false; Exit: { if(a){value=true;break Exit;} value=false; } String text="\\u0061";',
+    'boolean value=false; Exit: { if(a){value=true;break Exit;} value=false; } class Nested {}',
+    'boolean value=false; Exit: { if(a){this.value=true;break Exit;} this.value=false; }',
+    'boolean value=false; Exit: { if(a){value=true;break Exit;} value=false; finish(); }',
+  ]) assert.deepEqual(foldLabeledBooleanDecisions(source),{source,decisions:0,literalStoresRemoved:0},source);
+  assert.equal(foldLabeledBooleanDecisions('Exit: { boolean value=false; if(a){value=true;break Exit;} value=false; }').decisions,1);
+  const prefix='boolean value=false; Exit: { if(skip)break Exit; prefix(); if(a){value=true;break Exit;} value=false; }';
+  assert.equal(foldLabeledBooleanDecisions(prefix).source,
+    'boolean value=false; Exit: { if(skip)break Exit; prefix(); value = (a); }');
+  const diagnostic='boolean value=false; int Exit=7; Exit: { print("Exit: break Exit;"); if(a){value=true;break Exit;} value=false; }';
+  assert.match(foldLabeledBooleanDecisions(diagnostic).source,/int Exit=7; Exit: \{ print\("Exit: break Exit;"\); value = \(a\); \}/);
+  const excessive='boolean value=false; Exit: { '+Array.from({length:13},()=> 'if(a){value=true;break Exit;}').join(' ')+' value=false; }';
+  assert.equal(foldLabeledBooleanDecisions(excessive).decisions,0);
+  const longPredicate='boolean value=false; Exit: { if('+Array(130).fill('a').join(' && ')+'){value=true;break Exit;} value=false; }';
+  assert.equal(foldLabeledBooleanDecisions(longPredicate).decisions,0);
+});
+
+test('labeled boolean decisions match native short circuits, partial writes and protected ownership', () => {
+  const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'cfr-boolean-decisions-'));
+  try {
+    const yes='value=true;break Exit;',no='value=false;break Exit;';
+    const p=id=>`p(${id},mask,fail,boxed,d)`;
+    const decisions=[
+      `if(${p(0)}){if(${p(1)}){if(${p(2)}){${yes}}}} value=false;`,
+      `if(!${p(0)}){if(!${p(1)}){if(!${p(2)}){${no}}}} value=true;`,
+      `if(${p(0)}){${yes}} if(${p(1)}){${yes}} if(${p(2)}){${yes}} value=false;`,
+      `if(${p(0)}){if(${p(1)}){${yes}} if(${p(2)}){${yes}}} if(${p(2)}){${yes}} value=false;`,
+      `if(${p(0)}){if(${p(1)}){${no}}} if(${p(2)}){${no}} value=true;`,
+      `if(value=!value){if(${p(0)}){${yes}}} if(${p(1)} && (value=!value)){${yes}} value=false;`,
+      `if(${p(0)}){if(boxed){${yes}}} if(${p(1)}){${yes}} value=false;`,
+      `if(d<=0){if(${p(0)}){${no}}} if(d==0){${no}} value=true;`,
+      `if(${p(0)}){if(!boxed){${no}}} value=true;`,
+      `if(${p(0)}){{if(${p(1)}){${yes}}}} if(${p(2)}){${yes}} value=false;`,
+      `if(${p(0)}){if(${p(1)}){if(${p(2)}){${no}}} if(boxed){${no}}} value=true;`,
+      `if(${p(0)}){${yes}} if(value && ${p(1)}){${yes}} if(d!=d){${yes}} value=false;`,
+    ];
+    const methods=[];
+    for(const [index,decision]of decisions.entries()) {
+      const frame=`Exit: { trace.append("Exit: break Exit;"); Exit++; ${decision} }`;
+      const original=`boolean value=initial; try { ${index%2 ? `synchronized(lock){${frame}}` : frame} }
+        catch(RuntimeException error){if(error instanceof IllegalArgumentException && error!=failure)throw new AssertionError("identity");trace.append(error.getClass().getSimpleName());}
+        finally{trace.append('F').append(value).append(Thread.holdsLock(lock));} return value+":"+calls+":"+Exit+":"+trace;`;
+      const folded=foldLabeledBooleanDecisions(original);
+      assert.equal(folded.decisions,1,index);
+      assert.ok(folded.source.length<original.length,index);
+      const rebuilt=simplifyControlFrames(folded.source).source;
+      for(const [name,body]of [['original',original],['rebuilt',rebuilt]]) methods.push(
+        `static String ${name}${index}(int mask,int fail,Boolean boxed,double d,boolean initial){${body}}`);
+    }
+    const source=`public class BooleanDecisions {
+      static final Object lock=new Object();static final IllegalArgumentException failure=new IllegalArgumentException();
+      static final StringBuilder trace=new StringBuilder();static int calls,Exit;
+      static boolean p(int id,int mask,int fail,Boolean boxed,double d){trace.append(id).append(Thread.holdsLock(lock));if(++calls==fail)throw failure;return (mask & (1<<id))!=0;}
+      static void reset(){calls=0;Exit=7;trace.setLength(0);}
+      ${methods.join('\n')}
+      public static void main(String[] args)throws Exception {
+        int cases=0;Boolean[] boxes={null,Boolean.FALSE,Boolean.TRUE};double[] values={-1,-0.0,7,Double.NaN};
+        for(int variant=0;variant<12;variant++)for(int mask=0;mask<8;mask++)for(int fail=0;fail<6;fail++)
+          for(Boolean boxed:boxes)for(double d:values)for(boolean initial:new boolean[]{false,true}){
+            java.lang.reflect.Method before=BooleanDecisions.class.getDeclaredMethod("original"+variant,int.class,int.class,Boolean.class,double.class,boolean.class);
+            java.lang.reflect.Method after=BooleanDecisions.class.getDeclaredMethod("rebuilt"+variant,int.class,int.class,Boolean.class,double.class,boolean.class);
+            reset();Object expected=before.invoke(null,mask,fail,boxed,d,initial);if(Thread.holdsLock(lock))throw new AssertionError("before lock");
+            reset();Object actual=after.invoke(null,mask,fail,boxed,d,initial);if(Thread.holdsLock(lock))throw new AssertionError("after lock");
+            if(!expected.equals(actual))throw new AssertionError(variant+":"+mask+":"+fail+":"+expected+":"+actual);cases++;
+          }
+        if(cases!=13824)throw new AssertionError(cases);System.out.println("boolean-decision-native:"+cases);
+      }
+    }`;
+    const file=path.join(temporary,'BooleanDecisions.java');fs.writeFileSync(file,source);
+    run('javac',['--release','8','-d',temporary,file],temporary);
+    assert.equal(run('java',['-cp',temporary,'BooleanDecisions'],temporary).trim(),'boolean-decision-native:13824');
+  } finally {fs.rmSync(temporary,{recursive:true,force:true});}
 });

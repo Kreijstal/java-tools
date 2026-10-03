@@ -1256,3 +1256,50 @@ The wider CFR fixture suite passes 33/36: the same three try-with-resources test
 fail on the pinned pre-cleanup baseline, independently of this change. Large
 labeled bodies, whole-game execution and browser/phone performance remain outside
 these structural and controlled native proofs.
+
+
+### Recovering literal boolean decisions from exit blocks
+
+`foldLabeledBooleanDecisions` runs after local-variable scope normalization,
+before redundant control frames disappear. It recognizes a plain labeled block
+whose trailing conditional tree assigns one primitive boolean local a literal
+and breaks to that same block, with the opposite literal as the final fallback.
+The tree can become a short-circuit expression. For example, nested successful
+checks selecting true become `a && b && c`; nested negated checks selecting false
+become `a || b || c`. Sequential successful branches become OR alternatives.
+Mixed AND/OR grouping and left-to-right evaluation order stay explicit.
+
+Each predicate keeps its original bytes and execution order, including calls,
+assignments, nullable unboxing, floating comparisons and failures. Negating a
+decision uses logical negation/De Morgan's law; relational operators are never
+complemented, preserving NaNs. The remaining assignment executes after the same
+predicates and no intermediate leaf store can precede another predicate. Prefix
+statements stay before the expression in the same protected/monitor region.
+
+The target must have one visible primitive boolean declaration in an enclosing
+block before the decision; shadowed, unrelated, boxed, field and unknown targets
+refuse folding. Branch bodies contain only conditionals/plain blocks or an exact
+literal store plus the consumed break. Extra effects, alternate branches,
+protected/monitor crossings, declarations and other exits refuse it. The shared
+complete parser/token proof also refuses comments, Unicode escapes, text blocks,
+unknown syntax and nested executable bodies. At most 12 leaf stores and 256
+predicate tokens can become one expression. Same-operator grouping is flattened
+without changing operand order.
+
+Two focused groups include 13,824 native comparisons across boolean truth tables,
+initial values, nullable boxed conditions, NaNs/signed zero, self-modifying
+predicates, repeated calls, short-circuit failures, partial state, throwable
+identity, surrounding catch/finally and monitor ownership/release. The emitter
+suite passes 42 tests; the optional pass77 whole-corpus AST frame-only checker is
+skipped when no external directories are supplied. Exception-exit tests pass
+eight. That frame-only proof does not assert equivalence of this new boolean
+syntax; the native tests and scope/transfer proof cover the decision rewrite.
+
+The fixed GeoBlox input folds 17 decisions across 12 files, removing 156 lines
+(79,869 to 79,713), including board-clear eligibility, raster dirtiness,
+queue-settled checks, name/host checks and null-guarded calls. All 303 sources
+compile and diagnostics stay byte-identical. All 19,558 declarations and 388
+override rows remain, without local ordinal migrations. The only removed
+references are 17 duplicate local stores; all other ordered binding events match.
+These checks leave whole-game execution, real platform/assets/server traffic and
+browser/phone performance unverified.

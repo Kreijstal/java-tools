@@ -910,6 +910,120 @@ function simplifyControlFrames(source) {
   return {source:result.join('\n').slice(2,-2),labelsRemoved:removedFrames.size,jumpsUnlabeled,blocksUnwrapped};
 }
 
+// A forward exit used only to select a literal boolean is a short-circuit
+// decision. Keep every predicate in its original evaluation order and scope;
+// only the leaf literal stores and their consumed block breaks disappear.
+function foldLabeledBooleanDecisions(source) {
+  const unchanged = () => ({source, decisions: 0, literalStoresRemoved: 0});
+  const proof = controlCleanupSource(source);
+  if (!proof) return unchanged();
+  const {wrapped, parsed, tokens, starts, closes, children, labelCounts} = proof;
+  const parents = new Map(), declarations = new Map(), booleanLocals = new Map(), frames = [];
+  let refused = false;
+  function inspect(node, parent) {
+    parents.set(node, parent);
+    if (/ClassDeclaration|MethodDeclaration|ConstructorDeclaration|LambdaExpression|AnonymousClass/.test(node.kind || '')) refused = true;
+    if (['VariableDeclarator', 'FormalParameter'].includes(node.kind))
+      declarations.set(node.name, (declarations.get(node.name) || 0) + 1);
+    if (node.kind === 'LocalVariableDeclarationStatement' && parent?.kind === 'BlockStatement'
+        && node.variableType?.kind === 'PrimitiveType' && node.variableType.name === 'boolean') {
+      for (const variable of node.declarators)
+        if (!variable.dimensions) booleanLocals.set(variable.name, {node, block: parent});
+    }
+    if (node.kind === 'LabeledStatement' && node.statement?.kind === 'BlockStatement') frames.push(node);
+    children(node, child => inspect(child, node));
+  }
+  inspect(parsed, null);
+  if (refused) return unchanged();
+  function literalAssignment(node) {
+    const expression = node?.kind === 'ExpressionStatement' && node.expression;
+    if (expression?.kind !== 'AssignmentExpression' || expression.operator !== '='
+        || expression.left?.kind !== 'Identifier' || expression.right?.kind !== 'LiteralExpression'
+        || expression.right.literalKind !== 'boolean') return null;
+    const index = starts.get(node.range?.startOffset), name = expression.left.name;
+    const value = expression.right.value;
+    if (tokens[index]?.text !== name || tokens[index + 1]?.text !== '='
+        || tokens[index + 2]?.text !== String(value) || tokens[index + 3]?.text !== ';') return null;
+    return {name, value, index, end: tokens[index + 3].range.endOffset};
+  }
+  function visibleLocal(name, statement) {
+    if (declarations.get(name) !== 1 || !booleanLocals.has(name)) return false;
+    const local = booleanLocals.get(name);
+    if (!(local.node.range?.startOffset < statement.range?.startOffset)) return false;
+    for (let node = parents.get(statement); node; node = parents.get(node)) if (node === local.block) return true;
+    return false;
+  }
+  const edits = [];
+  let literalStoresRemoved = 0;
+  for (const frame of frames) {
+    if (labelCounts.get(frame.label) !== 1) continue;
+    const statements = frame.statement.statements, fallback = literalAssignment(statements.at(-1));
+    if (!fallback) continue;
+    let first = statements.length - 1;
+    while (first && statements[first - 1].kind === 'IfStatement') first--;
+    if (first === statements.length - 1 || !visibleLocal(fallback.name, statements[first])) continue;
+    let stores = 0, predicateTokens = 0;
+    function decision(sequence) {
+      if (sequence.length === 1 && sequence[0]?.kind === 'BlockStatement') return decision(sequence[0].statements);
+      if (sequence.length === 2) {
+        const assignment = literalAssignment(sequence[0]), jump = sequence[1];
+        const index = starts.get(jump?.range?.startOffset);
+        if (assignment?.name === fallback.name && assignment.value === !fallback.value
+            && jump.kind === 'BreakStatement' && jump.label === frame.label
+            && tokens[index]?.text === 'break' && tokens[index + 1]?.text === frame.label
+            && tokens[index + 2]?.text === ';') {
+          stores++;
+          return {kind: 'constant'};
+        }
+      }
+      if (!sequence.length || !sequence.every(node => node.kind === 'IfStatement' && !node.alternate)) return null;
+      const alternatives = [];
+      for (const node of sequence) {
+        const index = starts.get(node.range?.startOffset), close = closes.get(index + 1);
+        if (tokens[index]?.text !== 'if' || tokens[index + 1]?.text !== '(' || close === undefined) return null;
+        predicateTokens += close - index - 2;
+        if (predicateTokens > 256) return null;
+        const text = wrapped.slice(tokens[index + 1].range.endOffset, tokens[close].range.startOffset);
+        const body = node.consequent?.kind === 'BlockStatement' ? node.consequent.statements : [node.consequent];
+        const taken = decision(body);
+        if (!taken || stores > 12) return null;
+        const leaf = {kind: 'predicate', text, condition: node.condition};
+        alternatives.push(taken.kind === 'constant' ? leaf : {kind: 'and', children: [leaf, taken]});
+      }
+      return alternatives.length === 1 ? alternatives[0] : {kind: 'or', children: alternatives};
+    }
+    const tree = decision(statements.slice(first, -1));
+    if (!tree || !stores) continue;
+    function render(node, inverted) {
+      if (node.kind === 'predicate') {
+        // A condition is already a Java boolean context. Removing one leading
+        // logical negation therefore preserves primitive/unboxing behavior.
+        if (inverted && node.condition?.kind === 'UnaryExpression' && node.condition.operator === '!'
+            && node.condition.prefix && /^\s*!/.test(node.text)) return `(${node.text.replace(/^(\s*)!/, '$1')})`;
+        return inverted ? `!(${node.text})` : `(${node.text})`;
+      }
+      const operator = (node.kind === 'and') !== inverted ? ' && ' : ' || ';
+      const operands = [];
+      function collect(child) {
+        if (child.kind === node.kind) child.children.forEach(collect);
+        else operands.push(child);
+      }
+      node.children.forEach(collect);
+      return `(${operands.map(child => render(child, inverted)).join(operator)})`;
+    }
+    let expression = render(tree, fallback.value);
+    if (tree.kind !== 'predicate') expression = expression.slice(1, -1);
+    edits.push({start: statements[first].range.startOffset, end: fallback.end,
+      text: `${fallback.name} = ${expression};`});
+    literalStoresRemoved += stores;
+  }
+  edits.sort((a,b) => a.start - b.start);
+  if (edits.some((edit, index) => index && edits[index - 1].end > edit.start)) return unchanged();
+  let output = wrapped;
+  for (const edit of edits.slice().reverse()) output = output.slice(0,edit.start) + edit.text + output.slice(edit.end);
+  return {source:output.slice(2,-2),decisions:edits.length,literalStoresRemoved};
+}
+
 // Run after stack-carrier cleanup: two copies of the same CFG tail may initially
 // spell the same Boolean argument using different temporary names. Parse the
 // final source for control/scope proofs, while retaining original expression
@@ -1535,6 +1649,7 @@ module.exports = {
   factorCommonBranchTails,
   factorLabeledBlockReturnTails,
   simplifyControlFrames,
+  foldLabeledBooleanDecisions,
   removeDeadRegionSelectors,
   removeDeadReceiverSnapshots,
 };
