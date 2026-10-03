@@ -977,6 +977,129 @@ function localizePlainBlockLoopBreaks(source) {
   return {source: output.slice(2, -2), breaksLocalized: edits.length};
 }
 
+// A cast of a local reference back to its exact declared type adds neither a
+// runtime check nor a different overload type. Prove a unique block-local
+// binding and a bare identifier operand (possibly grouped/identity-cast), then
+// replace only that cast/operand with the same identifier. Do not infer fields,
+// parameters, supertypes, generics, primitive conversions or Object round trips.
+function simplifyIdentityReferenceCasts(source, {retainDiagnostics = false} = {}) {
+  const unchanged = () => ({source, castsRemoved: 0,
+    ...(retainDiagnostics ? {removedCastTypeRanges: []} : {})});
+  const proof = controlCleanupSource(source);
+  if (!proof || typeof retainDiagnostics !== 'boolean') return unchanged();
+  const {wrapped, parsed, tokens, starts, closes, children} = proof;
+  const counts = new Map(), locals = new Map();
+  const primitives = new Set(['boolean', 'byte', 'short', 'char', 'int', 'long', 'float', 'double']);
+  let refused = false;
+  function typeKey(type) {
+    if (type?.annotations?.length) return null;
+    if (type?.kind === 'ClassType' && !type.typeArguments?.length && !type.enclosingType && type.name !== 'var')
+      return (type.packageName ? type.packageName + '.' : '') + type.name;
+    if (type?.kind === 'ArrayType' && Number.isInteger(type.dimensions) && type.dimensions > 0) {
+      const component = type.componentType?.kind === 'PrimitiveType' && primitives.has(type.componentType.name)
+        && !type.componentType.annotations?.length ? type.componentType.name : typeKey(type.componentType);
+      return component && component + '[]'.repeat(type.dimensions);
+    }
+    return null;
+  }
+  function inspect(node, parent) {
+    if (/ClassDeclaration|MethodDeclaration|ConstructorDeclaration|LambdaExpression|AnonymousClass/.test(node.kind || '')) refused = true;
+    if (['VariableDeclarator', 'FormalParameter'].includes(node.kind))
+      counts.set(node.name, (counts.get(node.name) || 0) + 1);
+    if (node.kind === 'ExpressionStatement') {
+      const expression = node.expression;
+      if (!['AssignmentExpression', 'MethodInvocationExpression', 'NewClassExpression'].includes(expression?.kind)
+          && !(expression?.kind === 'UnaryExpression' && ['++', '--'].includes(expression.operator))) refused = true;
+      let end = starts.get(node.range?.startOffset);
+      if (end === undefined) refused = true;
+      else {
+        while (end < tokens.length && tokens[end].text !== ';' && tokens[end].text !== '}') {
+          if (closes.has(end)) end = closes.get(end);
+          end++;
+        }
+        if (tokens[end]?.text !== ';') refused = true;
+      }
+    }
+    if (node.kind === 'LocalVariableDeclarationStatement' && parent?.kind === 'BlockStatement') {
+      let open = starts.get(parent.range?.startOffset);
+      if (open === undefined) {
+        const first = starts.get(parent.statements?.[0]?.range?.startOffset);
+        if (tokens[first - 1]?.text === '{') open = first - 1;
+      }
+      const close = closes.get(open);
+      let end = starts.get(node.range?.startOffset);
+      if (tokens[open]?.text === '{' && tokens[close]?.text === '}' && end !== undefined) {
+        while (end < close && tokens[end].text !== ';') {
+          if (closes.has(end)) end = closes.get(end);
+          end++;
+        }
+        if (tokens[end]?.text !== ';') refused = true;
+        else for (const variable of node.declarators) {
+          const type = !node.annotations?.length && typeKey(node.variableType);
+          locals.set(variable.name, {start: end + 1, end: close,
+            type: type && type + '[]'.repeat(variable.dimensions || 0)});
+        }
+      } else refused = true;
+    }
+    children(node, child => inspect(child, node));
+  }
+  inspect(parsed, null);
+  if (refused) return unchanged();
+  function spelling(open, close) {
+    let index = open + 1;
+    const primitive = primitives.has(tokens[index]?.text);
+    if (!primitive && tokens[index]?.kind !== 'identifier') return null;
+    index++;
+    if (!primitive) while (tokens[index]?.text === '.' && tokens[index + 1]?.kind === 'identifier') index += 2;
+    let dimensions = 0;
+    while (tokens[index]?.text === '[' && tokens[index + 1]?.text === ']') { dimensions++; index += 2; }
+    return index === close && (!primitive || dimensions)
+      ? tokens.slice(open + 1, close).map(token => token.text).join('') : null;
+  }
+  function visible(name, index, type) {
+    const local = locals.get(name);
+    return counts.get(name) === 1 && local?.type === type && index >= local.start && index < local.end;
+  }
+  function atom(index, depth = 0) {
+    if (depth > 128) { refused = true; return null; }
+    if (tokens[index]?.kind === 'identifier') return {index, end: index + 1, casts: []};
+    if (tokens[index]?.text !== '(') return null;
+    const close = closes.get(index);
+    if (close === undefined) return null;
+    const type = spelling(index, close), operand = type && atom(close + 1, depth + 1);
+    if (operand && visible(tokens[operand.index].text, operand.index, type))
+      return {...operand, casts: [{open: index, close, type}, ...operand.casts]};
+    const inner = atom(index + 1, depth + 1);
+    return inner?.end === close ? {...inner, end: close + 1} : null;
+  }
+  const edits = [], removed = [];
+  for (let index = 0; index < tokens.length; index++) {
+    if (tokens[index].text !== '(') continue;
+    const close = closes.get(index), type = close !== undefined && spelling(index, close);
+    if (!type) continue;
+    const operand = atom(close + 1);
+    // A postfix operation belongs to the operand, rather than to the cast.
+    // Its result can have a different type, even when its receiver is a local.
+    if (!operand || ['.', '[', '(', '++', '--', '=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>=', '>>>=']
+      .includes(tokens[operand.end]?.text)) continue;
+    const name = tokens[operand.index].text;
+    if (!visible(name, operand.index, type)) continue;
+    const casts = [{open: index, close, type}, ...operand.casts];
+    const start = tokens[index].range.startOffset, end = tokens[operand.end - 1].range.endOffset;
+    const word = /[\p{ID_Continue}\p{Sc}$]/u;
+    edits.push({start, end, text: (word.test(wrapped[start - 1] || '') ? ' ' : '') + name
+      + (word.test(wrapped[end] || '') ? ' ' : '')});
+    for (const cast of casts) removed.push({start: tokens[cast.open + 1].range.startOffset - 2,
+      end: tokens[cast.close - 1].range.endOffset - 2, type: cast.type, localName: name});
+    index = operand.end - 1;
+  }
+  if (refused || !edits.length) return unchanged();
+  let output = wrapped;
+  for (const edit of edits.slice().reverse()) output = output.slice(0, edit.start) + edit.text + output.slice(edit.end);
+  return {source: output.slice(2, -2), castsRemoved: removed.length,
+    ...(retainDiagnostics ? {removedCastTypeRanges: removed} : {})};
+}
+
 // A conditional arm may do work before exiting a plain block. When normal
 // completion of its containing block also reaches that destination directly,
 // the skipped remainder is its existing else arm. Keep the prefix, predicate,
@@ -2876,6 +2999,7 @@ module.exports = {
   localizePlainBlockLoopBreaks,
   foldLeadingWhileBreakGuards,
   foldEffectfulPlainBlockExits,
+  simplifyIdentityReferenceCasts,
   foldLabeledBooleanDecisions,
   foldVoidReturnExits,
   foldNestedIfGuards,
