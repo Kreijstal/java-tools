@@ -1303,3 +1303,42 @@ override rows remain, without local ordinal migrations. The only removed
 references are 17 duplicate local stores; all other ordered binding events match.
 These checks leave whole-game execution, real platform/assets/server traffic and
 browser/phone performance unverified.
+
+### Recovering void returns from consumed exit blocks
+
+`foldVoidReturnExits` runs after scope normalization and boolean decisions,
+before redundant control-frame cleanup. A break to a plain labeled block
+immediately followed by `return;` becomes a direct void return. No expression
+is evaluated at that destination, and both transfers leave the same protected
+and monitor regions. A finally may override either transfer in the same way.
+Value returns and intervening work are refused; predicates, effects and exception
+regions are not moved. Exact lexical jump destinations and unique labels are
+required, and nested executable bodies or unsupported syntax refuse the method.
+
+A separate three-valued normal-completion proof decides whether the trailing
+return remains reachable after consuming those breaks. Fallthrough keeps it;
+proven abrupt completion removes it; an unknown proof preserves the original
+candidate. The proof resolves loop and label exits, including explicit finally
+bodies that override break/continue. Simple final primitive boolean constants
+require a unique preceding declaration in lexical scope; ordinary runtime
+predicates require evidence rather than guessing about qualified constants.
+Switch completion and unsupported constant expressions remain conservative.
+Resource-header syntax is unsupported by this parser and is left unchanged.
+
+`node test/javaAstEmitterLoopExits.test.js` passes 44 tests, with its optional
+pass77 frame-only corpus check skipped. The two new groups include 46,080 native
+comparisons of all loop forms, explicit resource-close/finally paths, exceptions,
+throwable identity, partial state and monitor ownership/release. Finally return,
+throw, outer break and outer continue override pending transfers in the fixtures.
+`node test/cfrExceptionLoopExits.test.js` passes eight groups. These tests do not
+claim resource-header or whole-game equivalence.
+
+The fixed GeoBlox input consumes 95 jumps in 38 exit blocks across 25 files,
+including menu rendering, tutorial input and sprite rotation. Five unreachable
+trailing returns disappear. Subsequent control-frame cleanup removes their
+unused labels and nondeclaring braces. This removes 81 lines (79,713 to 79,632).
+All 303 sources compile, and their ordered 19,558 declaration and 118,944
+reference identities/spellings plus 388 override rows match the prior corpus.
+Applying only the two documented rules to the previous bodies produces the
+exact token streams of all 303 regenerated files. The frame-only AST proof from
+pass77 remains historical; it is not evidence for replacing breaks with returns.

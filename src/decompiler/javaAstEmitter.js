@@ -1024,6 +1024,191 @@ function foldLabeledBooleanDecisions(source) {
   return {source:output.slice(2,-2),decisions:edits.length,literalStoresRemoved};
 }
 
+// A consumed block break immediately followed by a bare return has no work or
+// value evaluation left at its destination. Both transfers leave the same
+// cleanup regions, even when a finally overrides them. Completion is separate:
+// keep the trailing return if the block can fall through, remove it if it
+// cannot, and retain the original frame when that proof is unknown.
+function foldVoidReturnExits(source) {
+  const unchanged = () => ({source, frames: 0, jumpsReturned: 0, tailsRemoved: 0});
+  const proof = controlCleanupSource(source);
+  if (!proof) return unchanged();
+  const {wrapped, parsed, tokens, starts, closes, children, labelCounts} = proof;
+  const loops = new Set(['WhileStatement', 'ForStatement', 'EnhancedForStatement', 'DoWhileStatement']);
+  const parents = new Map(), references = new Map(), entryCleanup = new Map(), blocks = [];
+  const names = new Map(), locals = new Map();
+  const expressionStarts = new Map();
+  let refused = false;
+  function walk(node, parent, labels = [], loopStack = [], breakStack = [], cleanup = []) {
+    parents.set(node, parent);
+    if (/ClassDeclaration|MethodDeclaration|ConstructorDeclaration|LambdaExpression|AnonymousClass/.test(node.kind || '')) {
+      refused = true;return;
+    }
+    if (['VariableDeclarator','FormalParameter'].includes(node.kind)) names.set(node.name,(names.get(node.name)||0)+1);
+    if (node.condition && ['IfStatement','WhileStatement','ForStatement'].includes(node.kind)) {
+      const start=starts.get(node.range?.startOffset),open=start+1,close=closes.get(open);
+      if(tokens[open]?.text==='('&&close!==undefined) {
+        let first=open+1;
+        if(node.kind==='ForStatement') {
+          const separators=[];
+          for(let token=first;token<close;token++) {
+            if(['(','[','{'].includes(tokens[token].text)){token=closes.get(token);continue;}
+            if(tokens[token].text===';')separators.push(token);
+          }
+          first=separators.length===2 ? separators[0]+1 : close;
+        }
+        if(first<close)expressionStarts.set(node.condition,tokens[first].range.startOffset);
+      }
+    }
+    if (node.kind === 'LocalVariableDeclarationStatement')
+      for (const variable of node.declarators) locals.set(variable.name,{node,scope:parent,variable,
+        position:node.range?.startOffset ?? (parent?.kind==='ForStatement'
+          ? tokens[starts.get(parent.range?.startOffset)+2]?.range.startOffset : undefined)});
+    if (node.kind === 'BlockStatement') blocks.push(node);
+    if (node.kind === 'LabeledStatement' || loops.has(node.kind) || node.kind === 'SwitchStatement') entryCleanup.set(node,cleanup);
+    if (['BreakStatement','ContinueStatement'].includes(node.kind)) {
+      let target;
+      if (node.label) {
+        const label=labels.slice().reverse().find(frame=>frame.label===node.label);
+        if (!label) {refused=true;return;}
+        target=node.kind==='ContinueStatement' ? label.statement : label;
+        if (node.kind==='ContinueStatement' && !loops.has(target.kind)) {refused=true;return;}
+      } else target=node.kind==='ContinueStatement' ? loopStack.at(-1) : breakStack.at(-1);
+      if (!target) {refused=true;return;}
+      const targets=[target];
+      if (node.kind==='BreakStatement' && target.kind==='LabeledStatement'
+          && (loops.has(target.statement.kind)||target.statement.kind==='SwitchStatement')) targets.push(target.statement);
+      for (const destination of targets) {
+        if (!references.has(destination)) references.set(destination,[]);
+        references.get(destination).push({node,cleanup:cleanup.filter(owner=>!(entryCleanup.get(destination)||[]).includes(owner))});
+      }
+    }
+    const nestedLabels=node.kind==='LabeledStatement' ? [...labels,node] : labels;
+    const nestedLoops=loops.has(node.kind) ? [...loopStack,node] : loopStack;
+    const nestedBreaks=loops.has(node.kind)||node.kind==='SwitchStatement' ? [...breakStack,node] : breakStack;
+    children(node,child=>walk(child,node,nestedLabels,nestedLoops,nestedBreaks,
+      node.kind==='TryStatement' && node.finallyBlock && child!==node.finallyBlock ? [...cleanup,node] : cleanup));
+  }
+  walk(parsed,null);
+  if (refused) return unchanged();
+  const either=(a,b)=>a===true||b===true ? true : a===false&&b===false ? false : null;
+  const both=(a,b)=>a===false||b===false ? false : a===true&&b===true ? true : null;
+  function visible(name, expression) {
+    const local=locals.get(name);
+    if (names.get(name)!==1 || !local || !['BlockStatement','ForStatement'].includes(local.scope?.kind)) return null;
+    let position;
+    for(let node=expression;node;node=parents.get(node)) {
+      if(expressionStarts.has(node)){position=expressionStarts.get(node);break;}
+      if(node.range){position=node.range.startOffset;break;}
+    }
+    if(!(local.position<position))return null;
+    for (let parent=parents.get(expression);parent;parent=parents.get(parent)) if (parent===local.scope) return local;
+    return null;
+  }
+  function constant(node,seen=new Set()) {
+    if (!node) return null;
+    if (node.kind==='LiteralExpression'&&node.literalKind==='boolean') return node.value;
+    if (node.kind==='ParenthesizedExpression') return constant(node.expression,seen);
+    if (node.kind==='UnaryExpression'&&node.operator==='!') {
+      const value=constant(node.operand,seen);return value===null ? null : !value;
+    }
+    if (node.kind==='Identifier'&&!seen.has(node.name)) {
+      const local=visible(node.name,node);
+      if (local?.node.variableType?.kind==='PrimitiveType'&&local.node.variableType.name==='boolean'
+          && local.node.modifiers.some(modifier=>modifier.name==='final')&&!local.variable.dimensions)
+        return constant(local.variable.initializer,new Set([...seen,node.name]));
+    }
+    return null;
+  }
+  function runtimePredicate(node,identifiers=true) {
+    if (!node) return false;
+    if (['MethodInvocationExpression','AssignmentExpression','ArrayAccessExpression','InstanceOfExpression',
+      'NewClassExpression','NewArrayExpression'].includes(node.kind)) return true;
+    if (node.kind==='UnaryExpression'&&['++','--'].includes(node.operator)) return true;
+    if (node.kind==='Identifier'&&identifiers) {
+      const local=visible(node.name,node);
+      if (local&&!local.node.modifiers.some(modifier=>modifier.name==='final')) return true;
+    }
+    // Qualified constant fields may use a receiver spelling also owned by a
+    // local. Receiver identifiers alone do not establish a runtime predicate.
+    const nestedIdentifiers=identifiers&&node.kind!=='FieldAccessExpression';
+    let result=false;children(node,child=>{result=runtimePredicate(child,nestedIdentifiers)||result;});return result;
+  }
+  const completion=new Map();
+  function escaping(node,kind) {
+    let result=false;
+    for (const reference of references.get(node)||[]) if (reference.node.kind===kind) {
+      let finishes=true;
+      for (const owner of reference.cleanup) finishes=both(finishes,complete(owner.finallyBlock));
+      result=either(result,finishes);
+    }
+    return result;
+  }
+  function complete(node) {
+    if (!node) return true;
+    if (completion.has(node)) return completion.get(node);
+    completion.set(node,null);
+    let result=null;
+    switch(node.kind) {
+      case 'ExpressionStatement': case 'LocalVariableDeclarationStatement': case 'EmptyStatement': case 'AssertStatement': result=true;break;
+      case 'BreakStatement': case 'ContinueStatement': case 'ReturnStatement': case 'ThrowStatement': result=false;break;
+      case 'BlockStatement':
+        result=true;for(const statement of node.statements)result=both(result,complete(statement));break;
+      case 'IfStatement':result=either(complete(node.consequent),complete(node.alternate));break;
+      case 'LabeledStatement':result=either(complete(node.statement),escaping(node,'BreakStatement'));break;
+      case 'SynchronizedStatement':result=complete(node.body);break;
+      case 'TryStatement':
+        result=complete(node.block);for(const handler of node.catches||[])result=either(result,complete(handler.body));
+        if(node.finallyBlock)result=both(result,complete(node.finallyBlock));break;
+      case 'EnhancedForStatement':result=true;break;
+      case 'WhileStatement': case 'ForStatement': case 'DoWhileStatement': {
+        const value=node.kind==='ForStatement'&&!node.condition ? true : constant(node.condition);
+        const predicate=value===true ? false : value===false||runtimePredicate(node.condition) ? true : null;
+        const reachesTest=node.kind==='DoWhileStatement' ? either(complete(node.body),escaping(node,'ContinueStatement')) : true;
+        result=either(escaping(node,'BreakStatement'),both(reachesTest,predicate));break;
+      }
+      // Switch completion and unknown constant expressions need a stronger
+      // proof; they cannot force removal or retention of an unreachable tail.
+      default:break;
+    }
+    completion.set(node,result);return result;
+  }
+  const edits=[];
+  let frames=0,jumpsReturned=0,tailsRemoved=0;
+  for(const block of blocks)for(let index=0;index+1<block.statements.length;index++) {
+    const frame=block.statements[index],tail=block.statements[index+1];
+    if(frame.kind!=='LabeledStatement'||frame.statement.kind!=='BlockStatement'||labelCounts.get(frame.label)!==1
+        ||tail.kind!=='ReturnStatement'||tail.expression)continue;
+    const tailStart=starts.get(tail.range?.startOffset);
+    if(tokens[tailStart]?.text!=='return'||tokens[tailStart+1]?.text!==';')continue;
+    const jumps=references.get(frame)||[];
+    if(!jumps.length||jumps.some(reference=>reference.node.kind!=='BreakStatement'))continue;
+    const normal=complete(frame.statement);
+    if(normal===null)continue;
+    const changes=[];
+    for(const reference of jumps) {
+      const start=starts.get(reference.node.range?.startOffset);
+      if(tokens[start]?.text!=='break'||tokens[start+1]?.text!==frame.label||tokens[start+2]?.text!==';') {changes.length=0;break;}
+      changes.push({start:tokens[start].range.startOffset,end:tokens[start+2].range.endOffset,text:'return;'});
+    }
+    if(changes.length!==jumps.length)continue;
+    edits.push(...changes);frames++;jumpsReturned+=changes.length;
+    if(!normal) {
+      let start=tokens[tailStart].range.startOffset,end=tokens[tailStart+1].range.endOffset;
+      const beginning=wrapped.lastIndexOf('\n',start-1)+1,ending=wrapped.indexOf('\n',end);
+      if(ending>=0&&ending<wrapped.length-2&&!wrapped.slice(beginning,start).trim()&&!wrapped.slice(end,ending).trim()) {
+        start=beginning;end=ending+1;
+      }
+      edits.push({start,end,text:''});tailsRemoved++;
+    }
+  }
+  edits.sort((a,b)=>a.start-b.start);
+  if(edits.some((edit,index)=>index&&edits[index-1].end>edit.start))return unchanged();
+  let output=wrapped;
+  for(const edit of edits.slice().reverse())output=output.slice(0,edit.start)+edit.text+output.slice(edit.end);
+  return {source:output.slice(2,-2),frames,jumpsReturned,tailsRemoved};
+}
+
 // Run after stack-carrier cleanup: two copies of the same CFG tail may initially
 // spell the same Boolean argument using different temporary names. Parse the
 // final source for control/scope proofs, while retaining original expression
@@ -1650,6 +1835,7 @@ module.exports = {
   factorLabeledBlockReturnTails,
   simplifyControlFrames,
   foldLabeledBooleanDecisions,
+  foldVoidReturnExits,
   removeDeadRegionSelectors,
   removeDeadReceiverSnapshots,
 };

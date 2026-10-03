@@ -8,7 +8,7 @@ const path = require('path');
 const {spawnSync} = require('child_process');
 const {treeToStatements, emitStatements, promoteBooleanStackCarriers, factorCommonBranchTails,
   removeDeadRegionSelectors, removeDeadReceiverSnapshots, factorLabeledBlockReturnTails,
-  simplifyControlFrames, foldLabeledBooleanDecisions} = require('../src/decompiler/javaAstEmitter');
+  simplifyControlFrames, foldLabeledBooleanDecisions, foldVoidReturnExits} = require('../src/decompiler/javaAstEmitter');
 const {printTree} = require('../src/decompiler/structurer');
 const {JavaParser} = require('../src/java-frontend/parser');
 const {decompileClassFile, assertNoFallback} = require('../src/decompiler/cfr');
@@ -1721,5 +1721,117 @@ test('labeled boolean decisions match native short circuits, partial writes and 
     const file=path.join(temporary,'BooleanDecisions.java');fs.writeFileSync(file,source);
     run('javac',['--release','8','-d',temporary,file],temporary);
     assert.equal(run('java',['-cp',temporary,'BooleanDecisions'],temporary).trim(),'boolean-decision-native:13824');
+  } finally {fs.rmSync(temporary,{recursive:true,force:true});}
+});
+
+
+test('void exit recovery preserves exact destinations and proves trailing-return reachability', () => {
+  const source='Exit: { if(stop)break Exit; work(); } return;';
+  const result=foldVoidReturnExits(source);
+  assert.deepEqual(result,{source:'Exit: { if(stop)return; work(); } return;',frames:1,jumpsReturned:1,tailsRemoved:0});
+  assert.deepEqual(foldVoidReturnExits(result.source),{source:result.source,frames:0,jumpsReturned:0,tailsRemoved:0});
+  for(const loop of ['while(true)','for(;;)','do']) {
+    const body=loop==='do' ? 'do { if(stop)break Exit; work(); } while(true);' : `${loop} { if(stop)break Exit; work(); }`;
+    const folded=foldVoidReturnExits(`Exit: { ${body} } return;`);
+    assert.equal(folded.frames,1,loop);assert.equal(folded.tailsRemoved,1,loop);
+    assert.equal((folded.source.match(/return;/g)||[]).length,1,loop);
+  }
+  const localFor=foldVoidReturnExits('Exit: { for(boolean flag=true;flag;flag=false){if(stop)break Exit;} } return;');
+  assert.equal(localFor.frames,1);assert.equal(localFor.tailsRemoved,0);
+  const constantFor=foldVoidReturnExits('Exit: { for(final boolean flag=true;flag;){if(stop)break Exit;} } return;');
+  assert.equal(constantFor.frames,1);assert.equal(constantFor.tailsRemoved,1);
+  const constant=foldVoidReturnExits('final boolean forever=true; Exit: { while(forever){if(stop)break Exit;} } return;');
+  assert.equal(constant.frames,1);assert.equal(constant.tailsRemoved,1);
+  const conditional=foldVoidReturnExits('Exit: { if(stop)break Exit; else return; } return;');
+  assert.equal(conditional.tailsRemoved,1);
+  const protectedExit=foldVoidReturnExits('Exit: { try { synchronized(lock){if(stop)break Exit;work();} }finally{cleanup();} } return;');
+  assert.equal(protectedExit.frames,1);assert.equal(protectedExit.tailsRemoved,0);assert.match(protectedExit.source,/synchronized\(lock\)\{if\(stop\)return;work\(\);\}/);
+  const ownBreak=foldVoidReturnExits('Exit: { Loop: while(true){try{if(stop)break Exit;break Loop;}finally{cleanup();}} } return;');
+  assert.equal(ownBreak.frames,1);assert.equal(ownBreak.tailsRemoved,0);assert.match(ownBreak.source,/break Loop;/);
+  const overriddenBreak=foldVoidReturnExits('Exit: { while(true){try{if(stop)break Exit;break;}finally{if(mode)break Exit;else return;}} } return;');
+  assert.equal(overriddenBreak.frames,1);assert.equal(overriddenBreak.tailsRemoved,1);
+  const scoped='Exit: { boolean saved=true; if(stop)break Exit; work(saved); } return;';
+  assert.match(simplifyControlFrames(foldVoidReturnExits(scoped).source).source,/\{ boolean saved=true;/);
+  const diagnostic='int Exit=7; Exit: { print("Exit: break Exit;"); if(stop)break Exit; work(Exit); } return;';
+  assert.equal(foldVoidReturnExits(diagnostic).source,'int Exit=7; Exit: { print("Exit: break Exit;"); if(stop)return; work(Exit); } return;');
+  for(const source of [
+    'Exit: { if(stop)break Exit; work(); } return value;',
+    'Exit: { if(stop)break Exit; work(); } return finish();',
+    'Exit: { if(stop)break Exit; work(); } work(); return;',
+    'Exit: while(true){if(stop)break Exit;} return;',
+    'Exit: { if(stop)continue Exit; work(); } return;',
+    'Exit: { if(stop)break Missing; work(); } return;',
+    'Exit: { if(stop)break Exit; work(); } return; Exit: {finish();}',
+    'Exit: { if(stop)break Exit; /*preserve*/ work(); } return;',
+    'Exit: { if(stop)break Exit; work(); } return; class Nested {}',
+    'Exit: { if(stop)break Exit; work(); } return; String text="\\u0061";',
+    'Exit: { while(flag){if(stop)break Exit;} } return;',
+    'Exit: { while(flag){if(stop)break Exit;} final boolean flag=true; } return;',
+    'boolean owner=false; Exit: { while(owner.CONSTANT){if(stop)break Exit;} } return;',
+    'Exit: { switch(value){default:if(stop)break Exit;work();} } return;',
+    'Exit: { try(Resource resource=new Resource()){if(stop)break Exit;work();} } return;',
+  ])assert.deepEqual(foldVoidReturnExits(source),{source,frames:0,jumpsReturned:0,tailsRemoved:0},source);
+});
+
+test('void exit recovery matches native cleanup overriding, failure identity and all loop forms', () => {
+  const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'cfr-void-return-exits-'));
+  try {
+    const bodies=[
+      'if(mode==0)break Exit;touch(1);',
+      'if(mode==0){break Exit;}else{touch(1);return;}',
+      'int i=0;while(true){touch(i);if(i++>=stop)break Exit;}',
+      'int i=0;for(;;){touch(i);if(i++>=stop)break Exit;}',
+      'for(int i=0;i<4;i++){touch(i);if(i==stop)break Exit;}',
+      'int i=0;do{touch(i);if(i++>=stop)break Exit;continue;}while(true);',
+      'for(int i:new int[]{0,1,2}){touch(i);if(i==stop)break Exit;}',
+      'Inner:{if(mode==0)break Inner;touch(1);}if(gate)break Exit;touch(2);',
+      'try{touch(0);if(gate)break Exit;touch(1);}finally{touch(2);}',
+      'synchronized(lock){touch(0);if(gate)break Exit;touch(1);}',
+      'try{synchronized(lock){touch(0);if(gate)break Exit;touch(1);}}catch(IllegalArgumentException error){trace.append(error==failure);touch(3);}finally{touch(2);}',
+      'try{touch(0);throw failure;}finally{touch(2);if(gate)break Exit;}',
+      'try{try{touch(0);if(gate)break Exit;touch(1);}finally{touch(2);if(cleanupMode==1)throw closeFailure;}}catch(RuntimeException error){trace.append(error==failure?"I":"C");touch(3);}',
+      'try{touch(0);if(gate)break Exit;touch(1);}finally{touch(2);if(cleanupMode==2&&j==0)continue;}',
+      'Resource resource=new Resource();try{touch(0);if(gate)break Exit;touch(1);}finally{resource.close();}',
+      'try{touch(0);if(gate)break Exit;touch(1);}finally{touch(2);if(cleanupMode==2)break Outer;}',
+    ];
+    const methods=[];
+    for(const [index,body]of bodies.entries()) {
+      let contents=`trace.append("Exit: break Exit;");Exit++;Exit:{${body}}return;`;
+      if(index===13)contents=`for(int j=0;j<2;j++){${contents}}touch(9);`;
+      if(index===15)contents=`Outer:for(int j=0;j<2;j++){${contents}}touch(9);`;
+      const original=`try{${contents}}finally{touch(11);}`;
+      const folded=foldVoidReturnExits(original);
+      assert.equal(folded.frames,1,index);assert.ok(folded.jumpsReturned>=1,index);
+      assert.deepEqual(foldVoidReturnExits(folded.source),{source:folded.source,frames:0,jumpsReturned:0,tailsRemoved:0},index);
+      const rebuilt=simplifyControlFrames(folded.source).source;
+      for(const [name,source]of [['original',original],['rebuilt',rebuilt]])methods.push(`static void ${name}${index}(){${source}}`);
+    }
+    const source=`public class VoidReturnExits {
+      static final Object lock=new Object();static final StringBuilder trace=new StringBuilder();
+      static final IllegalArgumentException failure=new IllegalArgumentException();static final AssertionError fatal=new AssertionError();
+      static final IllegalStateException closeFailure=new IllegalStateException();static int calls,state,Exit,mode,stop,cleanupMode,failureKind,failAt;static boolean gate;
+      static void touch(int tag){trace.append(tag).append(':').append(Thread.holdsLock(lock)).append(',');state=state*17+tag;
+        if(++calls==failAt){if(failureKind==0)throw failure;if(failureKind==1)throw fatal;throw closeFailure;}}
+      static class Resource implements AutoCloseable {Resource(){touch(4);}public void close(){touch(5);if(cleanupMode==3)throw closeFailure;}}
+      static String invoke(String method)throws Exception {
+        calls=0;state=0;Exit=7;trace.setLength(0);String outcome="ok";
+        try{VoidReturnExits.class.getDeclaredMethod(method).invoke(null);}catch(java.lang.reflect.InvocationTargetException wrapper){
+          Throwable error=wrapper.getCause();if(error==failure)outcome="failure";else if(error==fatal)outcome="fatal";else if(error==closeFailure)outcome="close";else throw new AssertionError(error);}
+        if(Thread.holdsLock(lock))throw new AssertionError("monitor retained");return outcome+":"+calls+":"+state+":"+Exit+":"+trace;
+      }
+      ${methods.join('\n')}
+      public static void main(String[] args)throws Exception {
+        int cases=0;
+        for(int variant=0;variant<16;variant++)for(mode=0;mode<5;mode++)for(stop=0;stop<4;stop++)for(cleanupMode=0;cleanupMode<4;cleanupMode++)
+          for(failureKind=0;failureKind<3;failureKind++)for(failAt=0;failAt<6;failAt++)for(boolean flag:new boolean[]{false,true}){
+            gate=flag;String expected=invoke("original"+variant),actual=invoke("rebuilt"+variant);
+            if(!expected.equals(actual))throw new AssertionError(variant+":"+mode+":"+stop+":"+cleanupMode+":"+failureKind+":"+failAt+":"+gate+":"+expected+":"+actual);cases++;
+          }
+        if(cases!=46080)throw new AssertionError(cases);System.out.println("void-return-native:"+cases);
+      }
+    }`;
+    const file=path.join(temporary,'VoidReturnExits.java');fs.writeFileSync(file,source);
+    run('javac',['--release','8','-d',temporary,file],temporary);
+    assert.equal(run('java',['-cp',temporary,'VoidReturnExits'],temporary).trim(),'void-return-native:46080');
   } finally {fs.rmSync(temporary,{recursive:true,force:true});}
 });

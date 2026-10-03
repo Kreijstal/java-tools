@@ -15,7 +15,7 @@ const { listRegionSplitCandidates, applyRegionSplit } = require('../passes/regio
 const { jreClassInfo, jreMethodCandidates } = require('../java-frontend/jreMetadata');
 const { JavaParser } = require('../java-frontend/parser');
 const { tokenizeJava } = require('../java-frontend/lexer');
-const { promoteBooleanStackCarriers, factorCommonBranchTails, factorLabeledBlockReturnTails, simplifyControlFrames, foldLabeledBooleanDecisions, removeDeadRegionSelectors, removeDeadReceiverSnapshots } = require('./javaAstEmitter');
+const { promoteBooleanStackCarriers, factorCommonBranchTails, factorLabeledBlockReturnTails, simplifyControlFrames, foldLabeledBooleanDecisions, foldVoidReturnExits, removeDeadRegionSelectors, removeDeadReceiverSnapshots } = require('./javaAstEmitter');
 
 const VERSION = 'CFR-JS 0.4.0';
 const javaStatementParser = new JavaParser();
@@ -1755,6 +1755,12 @@ function shareExistingExitTails(body) {
     const decisions = foldLabeledBooleanDecisions(source);
     if (!decisions.decisions) break;
     source = decisions.source;
+    changed = true;
+  }
+  for (;;) {
+    const exits = foldVoidReturnExits(source);
+    if (!exits.frames) break;
+    source = exits.source;
     changed = true;
   }
   for (;;) {
