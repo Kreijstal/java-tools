@@ -7,7 +7,8 @@ const os = require('os');
 const path = require('path');
 const {spawnSync} = require('child_process');
 const {treeToStatements, emitStatements, promoteBooleanStackCarriers, factorCommonBranchTails,
-  removeDeadRegionSelectors, removeDeadReceiverSnapshots, factorLabeledBlockReturnTails} = require('../src/decompiler/javaAstEmitter');
+  removeDeadRegionSelectors, removeDeadReceiverSnapshots, factorLabeledBlockReturnTails,
+  simplifyControlFrames} = require('../src/decompiler/javaAstEmitter');
 const {printTree} = require('../src/decompiler/structurer');
 const {JavaParser} = require('../src/java-frontend/parser');
 const {decompileClassFile, assertNoFallback} = require('../src/decompiler/cfr');
@@ -380,6 +381,218 @@ test('existing exit-block cleanup matches native loop effects, failures and moni
     const file=path.join(temporary,'ExistingExitTails.java');fs.writeFileSync(file,source);
     run('javac',['--release','8','-d',temporary,file],temporary);
     assert.equal(run('java',['-cp',temporary,'ExistingExitTails'],temporary).trim().split('\n').length,2048);
+  } finally {fs.rmSync(temporary,{recursive:true,force:true});}
+});
+
+test('control frames require exact Java jump destinations and preserve declaration scopes', () => {
+  const simple='Loop: while (again) { if (stop) break Loop; continue Loop; }';
+  assert.deepEqual(simplifyControlFrames(simple), {source:'while (again) { if (stop) break; continue; }',
+    labelsRemoved:1,jumpsUnlabeled:2,blocksUnwrapped:0});
+  const outer='Outer: while (again) { while (more) { if (stop) break Outer; continue Outer; } }';
+  assert.deepEqual(simplifyControlFrames(outer), {source:outer,labelsRemoved:0,jumpsUnlabeled:0,blocksUnwrapped:0});
+  const switching='Outer: while (again) { switch (kind) { case 1: if (stop) break Outer; continue Outer; default: break; } }';
+  const switched=simplifyControlFrames(switching);
+  assert.equal(switched.source,'Outer: while (again) { switch (kind) { case 1: if (stop) break Outer; continue; default: break; } }');
+  assert.equal(switched.labelsRemoved,0);assert.equal(switched.jumpsUnlabeled,1);
+  const scoped=simplifyControlFrames('Unused: { int value=7; work(value); } work(value);');
+  assert.equal(scoped.source,'{ int value=7; work(value); } work(value);');
+  assert.equal(scoped.blocksUnwrapped,0);
+  assert.equal(simplifyControlFrames('Unused: {\n  {\n    work();\n  }\n}\nfinish();').source,'work();\nfinish();');
+  const protectedSource='Loop: while (again) { try { synchronized (lock) { if (stop) break Loop; continue Loop; } } finally { cleanup(); } }';
+  assert.equal(simplifyControlFrames(protectedSource).source,'while (again) { try { synchronized (lock) { if (stop) break; continue; } } finally { cleanup(); } }');
+  const diagnostic='int Loop=7; Loop: while (again) { print("Loop: break Loop;"); Loop++; break Loop; }';
+  assert.equal(simplifyControlFrames(diagnostic).source,'int Loop=7; while (again) { print("Loop: break Loop;"); Loop++; break; }');
+  for(const source of [
+    'Loop: while (again) { /* retained */ break Loop; }',
+    'Loop: while (again) { print("\\u0061"); break Loop; }',
+    'Loop: while (again) { break Missing; }',
+    'Left: { Loop: while (again) { break Loop; } } Right: { Loop: while (more) { break Loop; } }',
+    'Loop: while (again) { class Local { void run() { while (more) { break; } } } break Loop; }',
+  ]) {
+    const result=simplifyControlFrames(source);
+    if(source.startsWith('Left:')) {
+      assert.match(result.source,/Loop: while \(again\) \{ break Loop;/);
+      assert.match(result.source,/Loop: while \(more\) \{ break Loop;/);
+    } else assert.deepEqual(result,{source,labelsRemoved:0,jumpsUnlabeled:0,blocksUnwrapped:0});
+  }
+});
+
+test('control-frame simplification matches native nested loops, scopes and protected transfers', () => {
+  const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'cfr-control-frames-'));
+  try {
+    const finish='finish(x,trace); return done(trace);';
+    const variants=[
+      `Loop: while (counter < 5) { counter++; if (counter == stop) break Loop; if (flag) continue Loop; before(x,trace); } ${finish}`,
+      `Outer: while (counter < 5) { counter++; Inner: for (int index=0;index<3;index++) { trace.append(index); if (counter == stop) break Outer; if (flag) continue Outer; continue Inner; } } ${finish}`,
+      `Outer: while (counter < 5) { counter++; switch (counter % 3) { case 0: if (counter == stop) break Outer; if (flag) continue Outer; break; default: before(x,trace); break; } } ${finish}`,
+      `Loop: while (counter < 5) { try { synchronized (lock) { trace.append(Thread.holdsLock(lock)?'l':'u'); counter++; if (counter == stop) break Loop; if (flag) continue Loop; before(x,trace); } } finally { trace.append(Thread.holdsLock(lock)?'!':'z'); } } ${finish}`,
+      `Loop: while (counter < 5) { counter++; Branch: switch (counter % 3) { case 0: if (flag) break Branch; before(x,trace); break Branch; default: if (counter == stop) break Loop; break Branch; } } ${finish}`,
+      `Loop: do { counter++; if (counter == stop) break Loop; if (flag) continue Loop; before(x,trace); } while (counter < 5); ${finish}`,
+      `Loop: for (int index=0;index<5;index++) { counter++; if (index == stop) break Loop; if (flag) continue Loop; before(x,trace); } ${finish}`,
+      `Loop: for (int entry : new int[]{0,1,2,3,4}) { counter++; if (entry == stop) break Loop; if (flag) continue Loop; before(x,trace); } ${finish}`,
+      `Unused: { double value=x; { finish(value,trace); } } trace.append(value); return done(trace);`,
+      `Unused: { for (int value=0;value<3;value++) { counter++; trace.append(value); } } trace.append(value); ${finish}`,
+      `try { Unused: { { before(x,trace); } } ${finish} } catch (IndexOutOfBoundsException failure) { trace.append('c'); return done(trace); } finally { trace.append('z'); counter++; }`,
+      `Exit: { Loop: while (counter < 5) { counter++; if (counter == stop) break Exit; if (flag) continue Loop; before(x,trace); } trace.append('e'); } ${finish}`,
+      `Unused: { if (flag) { before(x,trace); return done(trace); } } ${finish}`,
+      `if (flag) { Unused: { trace.append('t'); throw sentinel; } } ${finish}`,
+      `Loop: while (counter < 5) { counter++; Loop++; trace.append("Loop: continue Loop;"); if (flag) continue Loop; before(x,trace); } ${finish}`,
+      `if (flag) Unused: { { before(x,trace); } finish(x,trace); } else Other: { trace.append('a'); } return done(trace);`,
+    ];
+    const methods=[];
+    variants.forEach((original,index)=>{
+      let body=original,changes=0;
+      for(;;) {
+        const next=simplifyControlFrames(body),count=next.labelsRemoved+next.jumpsUnlabeled+next.blocksUnwrapped;
+        if(!count)break;
+        assert.ok(next.source.length<body.length,'cleanup must remove source, not add routing');
+        body=next.source;changes+=count;
+      }
+      assert.ok(changes>0,original);
+      for(const[label,source]of[['original',original],['rebuilt',body]])
+        methods.push(`static String ${label}${index}(boolean flag,int stop,double x,Object lock) {
+          StringBuilder trace=new StringBuilder(); try { ${source} }
+          catch (RuntimeException failure) { return failure.getClass().getName()+":"+trace+":"+(failure == sentinel); }
+        }`);
+    });
+    const source=`public class ControlFrames {
+      static int mode,counter,Loop; static double value=3;
+      static final IllegalStateException sentinel=new IllegalStateException();
+      static void before(double x,StringBuilder trace) { trace.append('b'); if (mode == 1 && x == 7) throw new IndexOutOfBoundsException(); }
+      static void finish(double x,StringBuilder trace) { trace.append('f'); if (mode == 2 && Double.isNaN(x)) throw new IllegalArgumentException(); trace.append(Double.doubleToRawLongBits(x)); }
+      static String done(StringBuilder trace) { trace.append('d'); if (mode == 3) throw sentinel; return trace.toString(); }
+      ${methods.join('\n')}
+      public static void main(String[] args) {
+        Object lock=new Object();
+        for (mode=0;mode<4;mode++) for (boolean flag:new boolean[]{false,true})
+          for (int stop:new int[]{0,2,4,7}) for (double x:new double[]{-1,-0d,7,Double.NaN}) {
+            ${variants.map((_,index)=>`{
+              counter=0; Loop=3; String expected=original${index}(flag,stop,x,lock); int expectedCounter=counter,expectedLoop=Loop;
+              counter=0; Loop=3; String actual=rebuilt${index}(flag,stop,x,lock);
+              if (!expected.equals(actual) || counter != expectedCounter || Loop != expectedLoop || Thread.holdsLock(lock))
+                throw new AssertionError(${index}+":"+mode+":"+flag+":"+stop+":"+x+":"+expected+":"+actual+":"+expectedCounter+":"+counter);
+              System.out.println(${index}+":"+mode+":"+flag+":"+stop+":"+x+":"+actual+":"+counter+":"+Loop);
+            }`).join('\n')}
+          }
+      }
+    }`;
+    const file=path.join(temporary,'ControlFrames.java');fs.writeFileSync(file,source);
+    run('javac',['--release','8','-d',temporary,file],temporary);
+    assert.equal(run('java',['-cp',temporary,'ControlFrames'],temporary).trim().split('\n').length,2048);
+  } finally {fs.rmSync(temporary,{recursive:true,force:true});}
+});
+
+test('control-frame corpus preserves Java AST events and resolved transfer destinations', (t) => {
+  const before=process.env.CFR_CONTROL_FRAMES_BEFORE,after=process.env.CFR_CONTROL_FRAMES_AFTER;
+  if(!before&&!after){t.skip('supply original and regenerated Java corpora for the publication check');return;}
+  assert.ok(before&&after,'both corpus directories are required');
+  const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'cfr-control-frame-corpus-'));
+  try {
+    const source=`import java.nio.file.*; import java.util.*; import javax.tools.*;
+      import com.sun.source.tree.*; import com.sun.source.util.*;
+      public class ControlFrameCorpus extends TreeScanner<Void,Void> {
+        final StringBuilder events=new StringBuilder();
+        final IdentityHashMap<Tree,Integer> targets=new IdentityHashMap<>();
+        final ArrayList<Tree> loops=new ArrayList<>(),breakables=new ArrayList<>();
+        final ArrayList<LabeledStatementTree> labels=new ArrayList<>();
+        int ordinal,jumps;
+        static boolean loop(Tree.Kind kind){return kind==Tree.Kind.WHILE_LOOP||kind==Tree.Kind.FOR_LOOP||kind==Tree.Kind.ENHANCED_FOR_LOOP||kind==Tree.Kind.DO_WHILE_LOOP;}
+        public Void scan(Tree node,Void ignored) {
+          if(node==null)return null;
+          Tree.Kind kind=node.getKind();
+          if(kind==Tree.Kind.LABELED_STATEMENT)return visitLabeledStatement((LabeledStatementTree)node,ignored);
+          if(kind==Tree.Kind.BREAK||kind==Tree.Kind.CONTINUE) {
+            String label=kind==Tree.Kind.BREAK?string(((BreakTree)node).getLabel()):string(((ContinueTree)node).getLabel());
+            Tree target=null;
+            if(label.isEmpty()) {
+              ArrayList<Tree> stack=kind==Tree.Kind.CONTINUE?loops:breakables;
+              if(!stack.isEmpty())target=stack.get(stack.size()-1);
+            } else for(int i=labels.size()-1;i>=0;i--)if(labels.get(i).getLabel().contentEquals(label)){target=labels.get(i).getStatement();break;}
+            if(target==null)throw new AssertionError("unbound transfer "+node);
+            events.append(kind).append(':');
+            if(targets.containsKey(target))events.append(target.getKind()).append('#').append(targets.get(target));
+            else {
+              String targetLabel="";
+              for(int i=labels.size()-1;i>=0;i--)if(labels.get(i).getStatement()==target){targetLabel=labels.get(i).getLabel().toString();break;}
+              if(targetLabel.isEmpty())throw new AssertionError("unidentified labeled destination");
+              events.append(target.getKind()).append(':').append(targetLabel);
+            }
+            events.append('\\n');jumps++;return null;
+          }
+          if(kind!=Tree.Kind.BLOCK) {
+            events.append(kind);
+            if(node instanceof IdentifierTree)events.append(':').append(((IdentifierTree)node).getName());
+            if(node instanceof MemberSelectTree)events.append(':').append(((MemberSelectTree)node).getIdentifier());
+            if(node instanceof LiteralTree)events.append(':').append(node.toString());
+            if(node instanceof VariableTree)events.append(':').append(((VariableTree)node).getName());
+            if(node instanceof MethodTree)events.append(':').append(((MethodTree)node).getName());
+            if(node instanceof ClassTree)events.append(':').append(((ClassTree)node).getSimpleName());
+            if(node instanceof ModifiersTree)events.append(':').append(((ModifiersTree)node).getFlags());
+            events.append('\\n');
+          }
+          boolean isLoop=loop(kind),breakable=isLoop||kind==Tree.Kind.SWITCH;
+          if(breakable){targets.put(node,ordinal++);breakables.add(node);}
+          if(isLoop)loops.add(node);
+          Void result=super.scan(node,ignored);
+          if(isLoop)loops.remove(loops.size()-1);
+          if(breakable)breakables.remove(breakables.size()-1);
+          return result;
+        }
+        public Void visitLabeledStatement(LabeledStatementTree node,Void ignored){labels.add(node);scan(node.getStatement(),ignored);labels.remove(labels.size()-1);return null;}
+        public Void visitMethod(MethodTree node,Void ignored) {
+          ArrayList<Tree> oldLoops=new ArrayList<>(loops),oldBreakables=new ArrayList<>(breakables);
+          ArrayList<LabeledStatementTree> oldLabels=new ArrayList<>(labels);
+          loops.clear();breakables.clear();labels.clear();
+          Void result=super.visitMethod(node,ignored);
+          loops.addAll(oldLoops);breakables.addAll(oldBreakables);labels.addAll(oldLabels);return result;
+        }
+        static String string(Object value){return value==null?"":value.toString();}
+        static ControlFrameCorpus read(Path file)throws Exception {
+          JavaCompiler compiler=ToolProvider.getSystemJavaCompiler();
+          DiagnosticCollector<JavaFileObject> diagnostics=new DiagnosticCollector<>();
+          try(StandardJavaFileManager manager=compiler.getStandardFileManager(diagnostics,null,null)) {
+            JavacTask task=(JavacTask)compiler.getTask(null,manager,diagnostics,Arrays.asList("--release","8","-proc:none"),null,manager.getJavaFileObjects(file.toFile()));
+            ControlFrameCorpus result=new ControlFrameCorpus();for(CompilationUnitTree unit:task.parse())result.scan(unit,null);
+            for(Diagnostic<?> diagnostic:diagnostics.getDiagnostics())if(diagnostic.getKind()==Diagnostic.Kind.ERROR)throw new AssertionError(diagnostic);
+            return result;
+          }
+        }
+        static ArrayList<String> inventory(Path root)throws Exception {
+          ArrayList<String> files=new ArrayList<>();
+          try(java.util.stream.Stream<Path> stream=Files.walk(root)){stream.filter(p->p.toString().endsWith(".java")).forEach(p->files.add(root.relativize(p).toString()));}
+          Collections.sort(files);return files;
+        }
+        public static void main(String[] args)throws Exception {
+          Path before=Paths.get(args[0]),after=Paths.get(args[1]);ArrayList<String> files=inventory(before);
+          if(!files.equals(inventory(after)))throw new AssertionError("corpus inventories differ");
+          int jumps=0,loops=0;
+          for(String file:files) {
+            ControlFrameCorpus expected=read(before.resolve(file)),actual=read(after.resolve(file));
+            String left=expected.events.toString(),right=actual.events.toString();
+            if(!left.equals(right)) {
+              String[] a=left.split("\\n"),b=right.split("\\n");int index=0;while(index<Math.min(a.length,b.length)&&a[index].equals(b[index]))index++;
+              throw new AssertionError(file+":"+index+":"+(index<a.length?a[index]:"end")+":"+(index<b.length?b[index]:"end"));
+            }
+            jumps+=actual.jumps;loops+=actual.ordinal;
+          }
+          System.out.println("control-frame-corpus:"+files.size()+":"+loops+":"+jumps);
+        }
+      }`;
+    const file=path.join(temporary,'ControlFrameCorpus.java');fs.writeFileSync(file,source);
+    // The checker uses this JDK's compiler API; the inspected sources still
+    // parse under Java 8 and their separate full compile also uses --release 8.
+    run('javac',['-d',temporary,file],temporary);
+    // Parsing the full corpus can exceed the small native-fixture timeout.
+    const output=path.join(temporary,'corpus-output'),error=path.join(temporary,'corpus-error');
+    const fds=[output,error].map(file=>fs.openSync(file,'w'));
+    try {
+      const result=spawnSync('java',['-Xmx1024m','-cp',temporary,'ControlFrameCorpus',before,after],{
+        stdio:['ignore',...fds],timeout:120000,env:{...process.env,JAVA_TOOL_OPTIONS:'-XX:-UsePerfData'}});
+      if(result.error)throw result.error;
+      assert.equal(result.status,0,fs.readFileSync(error,'utf8'));
+      assert.match(fs.readFileSync(output,'utf8'),/^control-frame-corpus:\d+:\d+:\d+\n$/);
+      console.log(fs.readFileSync(output,'utf8').trim());
+    } finally {fds.forEach(fd=>fs.closeSync(fd));}
   } finally {fs.rmSync(temporary,{recursive:true,force:true});}
 });
 

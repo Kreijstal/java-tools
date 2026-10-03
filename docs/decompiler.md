@@ -1213,3 +1213,46 @@ remain intact in the negative cases. The fixed GeoBlox corpus removes one
 13-line duplicate publication tail from the Bzip2 run emitter; its other 302
 files and diagnostics remain unchanged. The large loop/label structure is
 still present, and broader reconstruction requires separate proofs.
+
+
+### Removing redundant control frames
+
+After scope normalization and existing exit-tail sharing, `simplifyControlFrames`
+resolves every labeled break/continue against the lexical Java AST. A jump loses
+its label only when an ordinary break or continue reaches the exact same nearest
+loop or switch. Outer-loop exits through another loop/switch keep their labels;
+labels with remaining references remain. No CFG edge is inferred or introduced.
+
+Unused labels can disappear. A plain block can lose its braces only when it is
+a direct statement in another block and none of its direct statements declares
+a variable or class. Loop, conditional, try/catch/finally and monitor bodies keep
+their braces and ownership. For-header/catch declarations keep their construct
+scopes. Protected transfers may lose an unnecessary label, but their statements,
+regions and destinations do not move. Literal/member names and all other tokens
+are unchanged; removed multiline frames are dedented. Complete parsing, exact
+token ranges and unique label names are required. Comments, Unicode escapes,
+text blocks, unknown syntax, unbound labels and nested executable bodies refuse
+cleanup. The pass repeats only while deleting source, reaching a fixed point.
+
+The emitter tests include two new groups and 2,048 native comparisons covering
+nested loops, switches, all loop forms, shadowing, side effects, protected/monitor
+exits, failure/throwable identity and lock release. The optional whole-corpus
+check uses JDK Java ASTs independently of the JavaScript parser:
+
+```sh
+CFR_CONTROL_FRAMES_BEFORE=PREVIOUS_JAVA CFR_CONTROL_FRAMES_AFTER=FRESH_JAVA \
+  node test/javaAstEmitterLoopExits.test.js
+```
+
+Both directories must contain exactly the same Java file inventory. The checker
+compares ordered AST events, expression tokens and resolved transfer destinations,
+omitting only block/label frames. For GeoBlox all 303 files match, including
+1,129 loop/switch destinations and 1,762 jump statements. All 19,558 declarations,
+118,961 reference identities/spellings/order and 388 override rows also match.
+The regenerated corpus changes 153 files and removes 588 lines (80,457 to 79,869);
+diagnostics remain byte-identical and all sources compile. The full emitter suite
+passes 41 groups with the corpus check enabled; exception-exit tests pass eight.
+The wider CFR fixture suite passes 33/36: the same three try-with-resources tests
+fail on the pinned pre-cleanup baseline, independently of this change. Large
+labeled bodies, whole-game execution and browser/phone performance remain outside
+these structural and controlled native proofs.

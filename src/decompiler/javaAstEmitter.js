@@ -636,31 +636,25 @@ function removeDeadReceiverSnapshots(source, declarations, carrierNames) {
     declarations: declarations.filter(declaration => !removed.some(name => declaration === candidates.get(name).declaration))};
 }
 
-// A structurer-owned plain exit block already provides a destination for a
-// common return/throw tail. Reuse it rather than introducing another frame.
-// Nested loops and plain labels can be exited by that break, but a try/catch,
-// finally or monitor between the clone and its destination must stay opaque:
-// moving even identical cleanup across it could change exception coverage or
-// monitor ownership. Keep the original tail and all surrounding source bytes.
-function factorLabeledBlockReturnTails(source) {
-  const unchanged = () => ({source, branches: 0});
-  if (/\\u+[0-9a-fA-F]{4}/.test(source)) return unchanged();
+function controlCleanupSource(source) {
+  if (/\\u+[0-9a-fA-F]{4}/.test(source)) return null;
   const wrapped = `{\n${source}\n}`;
   let parsed, tokens;
   try {
     parsed = statementParser.parseStatement(wrapped, {requireComplete: true});
     const lexed = tokenizeJava(wrapped);
-    if (lexed.diagnostics.length) return unchanged();
+    if (lexed.diagnostics.length) return null;
     tokens = lexed.tokens.filter(token => !['whitespace', 'eof'].includes(token.kind));
     // The lexer skips trivia. Refuse comment delimiters only in gaps between
     // tokens; delimiters inside quoted literals retain their literal meaning.
     let previousEnd = 0;
     for (const token of tokens) {
-      if (/\/\/|\/\*/.test(wrapped.slice(previousEnd, token.range.startOffset))) return unchanged();
+      if (/\/\/|\/\*/.test(wrapped.slice(previousEnd, token.range.startOffset))) return null;
       previousEnd = token.range.endOffset;
     }
-    if (/\/\/|\/\*/.test(wrapped.slice(previousEnd))) return unchanged();
-  } catch (_) { return unchanged(); }
+    if (/\/\/|\/\*/.test(wrapped.slice(previousEnd))) return null;
+    if (tokens.some(token => token.text.startsWith('"""'))) return null;
+  } catch (_) { return null; }
   const starts = new Map(tokens.map((token, index) => [token.range.startOffset, index]));
   const closes = new Map(), stack = [];
   for (let index = 0; index < tokens.length; index++) {
@@ -668,11 +662,11 @@ function factorLabeledBlockReturnTails(source) {
     if (['(', '[', '{'].includes(text)) stack.push(index);
     else if ([')', ']', '}'].includes(text)) {
       const open = stack.pop();
-      if (open === undefined || '([{'.indexOf(tokens[open].text) !== ')]}'.indexOf(text)) return unchanged();
+      if (open === undefined || '([{'.indexOf(tokens[open].text) !== ')]}'.indexOf(text)) return null;
       closes.set(open, index);
     }
   }
-  if (stack.length) return unchanged();
+  if (stack.length) return null;
   const labelCounts = new Map();
   let unknown = false;
   function children(node, visit) {
@@ -688,7 +682,20 @@ function factorLabeledBlockReturnTails(source) {
     children(node, inspect);
   }
   inspect(parsed);
-  if (unknown) return unchanged();
+  return unknown ? null : {wrapped, parsed, tokens, starts, closes, children, labelCounts};
+}
+
+// A structurer-owned plain exit block already provides a destination for a
+// common return/throw tail. Reuse it rather than introducing another frame.
+// Nested loops and plain labels can be exited by that break, but a try/catch,
+// finally or monitor between the clone and its destination must stay opaque:
+// moving even identical cleanup across it could change exception coverage or
+// monitor ownership. Keep the original tail and all surrounding source bytes.
+function factorLabeledBlockReturnTails(source) {
+  const unchanged = () => ({source, branches: 0});
+  const proof = controlCleanupSource(source);
+  if (!proof) return unchanged();
+  const {wrapped, parsed, tokens, starts, closes, children, labelCounts} = proof;
   function spans(node) {
     let open = starts.get(node.range?.startOffset);
     // Some parser-owned try/catch/monitor blocks lack their own range. Their
@@ -778,6 +785,129 @@ function factorLabeledBlockReturnTails(source) {
     for (const edit of edits.slice().reverse()) output = output.slice(0, edit.start) + edit.text + output.slice(edit.end);
     return {source: output.slice(2, -2), branches: edits.length};
   } catch (_) { return unchanged(); }
+}
+
+// Simplify Java's existing transfer destinations, never infer new CFG edges.
+// A labeled loop jump can lose its label only when the corresponding unlabeled
+// jump would bind to the exact same AST loop/switch. Plain frames may disappear
+// only if no jump needs them and no declaration gains a larger lexical scope.
+function simplifyControlFrames(source) {
+  const unchanged = () => ({source, labelsRemoved: 0, jumpsUnlabeled: 0, blocksUnwrapped: 0});
+  const proof = controlCleanupSource(source);
+  if (!proof) return unchanged();
+  const {wrapped, parsed, tokens, starts, closes, children, labelCounts} = proof;
+  const loops = new Set(['WhileStatement', 'ForStatement', 'EnhancedForStatement', 'DoWhileStatement']);
+  const nondeclaring = new Set(['BlockStatement', 'LabeledStatement', 'IfStatement',
+    ...loops, 'SwitchStatement', 'TryStatement', 'SynchronizedStatement', 'ExpressionStatement',
+    'ReturnStatement', 'ThrowStatement', 'BreakStatement', 'ContinueStatement', 'EmptyStatement', 'AssertStatement']);
+  const parents = new Map(), frames = new Map(), edits = [], removedFrames = new Set();
+  const blocks = [];
+  let refused = false, jumpsUnlabeled = 0, blocksUnwrapped = 0;
+  function walk(node, parent, labels = [], loopStack = [], breakStack = []) {
+    parents.set(node, parent);
+    // A nested Java executable body has its own transfer namespace. Keep such
+    // methods intact rather than accidentally treating its loops as enclosing.
+    if (/ClassDeclaration|MethodDeclaration|ConstructorDeclaration|LambdaExpression|AnonymousClass/.test(node.kind || '')) {
+      refused = true;
+      return;
+    }
+    if (node.kind === 'BlockStatement') blocks.push(node);
+    if (node.kind === 'LabeledStatement') {
+      const frame = {node, target: node.statement, references: []};
+      frames.set(node, frame);
+      children(node, child => walk(child, node, [...labels, frame], loopStack, breakStack));
+      return;
+    }
+    if (['BreakStatement', 'ContinueStatement'].includes(node.kind) && node.label) {
+      const frame = labels.slice().reverse().find(item => item.node.label === node.label);
+      if (!frame) {refused = true;return;}
+      const nearest = node.kind === 'ContinueStatement' ? loopStack.at(-1) : breakStack.at(-1);
+      const same = (loops.has(frame.target.kind) || node.kind === 'BreakStatement' && frame.target.kind === 'SwitchStatement')
+        && nearest === frame.target && labelCounts.get(node.label) === 1;
+      frame.references.push({node, same});
+      if (same) {
+        const index = starts.get(node.range?.startOffset);
+        const keyword = node.kind === 'BreakStatement' ? 'break' : 'continue';
+        if (tokens[index]?.text !== keyword || tokens[index + 1]?.text !== node.label || tokens[index + 2]?.text !== ';') {
+          refused = true;return;
+        }
+        const start = tokens[index].range.endOffset, end = tokens[index + 2].range.startOffset;
+        // Keep unusual line layout intact. Ordinary generated jumps become
+        // `break;`/`continue;`; both forms retain the same exception/lock exits.
+        const text = wrapped.slice(start, end).replace(node.label, '');
+        edits.push(!text.trim() && !text.includes('\n') ? {start, end}
+          : {start:tokens[index + 1].range.startOffset, end:tokens[index + 1].range.endOffset});
+        jumpsUnlabeled++;
+      }
+    }
+    const nestedLoops = loops.has(node.kind) ? [...loopStack, node] : loopStack;
+    const nestedBreaks = loops.has(node.kind) || node.kind === 'SwitchStatement' ? [...breakStack, node] : breakStack;
+    children(node, child => walk(child, node, labels, nestedLoops, nestedBreaks));
+  }
+  walk(parsed, null);
+  if (refused) return unchanged();
+  for (const frame of frames.values()) {
+    if (labelCounts.get(frame.node.label) !== 1 || frame.references.some(reference => !reference.same)) continue;
+    const index = starts.get(frame.node.range?.startOffset);
+    if (tokens[index]?.text !== frame.node.label || tokens[index + 1]?.text !== ':') return unchanged();
+    let end = tokens[index + 1].range.endOffset;
+    while (wrapped[end] === ' ' || wrapped[end] === '\t') end++;
+    edits.push({start:tokens[index].range.startOffset, end});
+    removedFrames.add(frame.node);
+  }
+  const lines = wrapped.split('\n'), lineStarts = [];
+  let offset = 0;
+  for (const line of lines) {lineStarts.push(offset);offset += line.length + 1;}
+  const lineAt = position => {
+    let lower = 0, upper = lineStarts.length;
+    while (lower + 1 < upper) {
+      const middle = (lower + upper) >>> 1;
+      if (lineStarts[middle] <= position) lower = middle;
+      else upper = middle;
+    }
+    return lower;
+  };
+  const dedent = new Array(lines.length).fill(0);
+  for (const node of blocks) {
+    const parent = parents.get(node);
+    const direct = parent?.kind === 'BlockStatement' || parent?.kind === 'LabeledStatement'
+      && removedFrames.has(parent) && parents.get(parent)?.kind === 'BlockStatement';
+    if (!direct || !node.statements.every(statement => nondeclaring.has(statement.kind)
+        && !(statement.kind === 'LabeledStatement' && !nondeclaring.has(statement.statement.kind)))) continue;
+    const open = starts.get(node.range?.startOffset), close = closes.get(open);
+    if (tokens[open]?.text !== '{' || tokens[close]?.text !== '}') continue;
+    edits.push({start:tokens[open].range.startOffset,end:tokens[open].range.endOffset},
+      {start:tokens[close].range.startOffset,end:tokens[close].range.endOffset});
+    blocksUnwrapped++;
+    const first = lineAt(tokens[open].range.startOffset), last = lineAt(tokens[close].range.startOffset);
+    if (first === last || wrapped.slice(tokens[open].range.endOffset, lineStarts[first] + lines[first].length).trim()
+        || wrapped.slice(lineStarts[last], tokens[close].range.startOffset).trim()
+        || wrapped.slice(tokens[close].range.endOffset, lineStarts[last] + lines[last].length).trim()) continue;
+    const indent = /^[ \t]*/.exec(lines[first])[0].length;
+    const interior = lines.slice(first + 1, last).filter(line => line.trim());
+    const width = interior.length ? Math.max(0, Math.min(...interior.map(line => /^[ \t]*/.exec(line)[0].length)) - indent) : 0;
+    for (let line = first + 1; line < last; line++) dedent[line] += width;
+  }
+  if (!edits.length) return unchanged();
+  edits.sort((a,b) => a.start - b.start);
+  if (edits.some((edit, index) => index && edits[index - 1].end > edit.start)) return unchanged();
+  const byLine = new Map();
+  for (const edit of edits) {
+    const line = lineAt(edit.start);
+    if (lineAt(edit.end - 1) !== line) return unchanged();
+    if (!byLine.has(line)) byLine.set(line, []);
+    byLine.get(line).push(edit);
+  }
+  const result = [];
+  for (let index = 0; index < lines.length; index++) {
+    let line = lines[index];
+    for (const edit of (byLine.get(index) || []).slice().reverse())
+      line = line.slice(0, edit.start - lineStarts[index]) + line.slice(edit.end - lineStarts[index]);
+    if (byLine.has(index) && !line.trim() && lines[index].trim()) continue;
+    if (dedent[index]) line = line.slice(Math.min(dedent[index], /^[ \t]*/.exec(line)[0].length));
+    result.push(line);
+  }
+  return {source:result.join('\n').slice(2,-2),labelsRemoved:removedFrames.size,jumpsUnlabeled,blocksUnwrapped};
 }
 
 // Run after stack-carrier cleanup: two copies of the same CFG tail may initially
@@ -1404,6 +1534,7 @@ module.exports = {
   promoteBooleanStackCarriers,
   factorCommonBranchTails,
   factorLabeledBlockReturnTails,
+  simplifyControlFrames,
   removeDeadRegionSelectors,
   removeDeadReceiverSnapshots,
 };
