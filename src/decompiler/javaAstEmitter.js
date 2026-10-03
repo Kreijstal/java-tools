@@ -9,6 +9,7 @@ const {
 const { JavaParser } = require('../java-frontend/parser');
 const { tokenizeJava } = require('../java-frontend/lexer');
 const { recoverScalarLabelDispatches: recoverScalarDispatch } = require('./scalarDispatchRecovery');
+const { specializePathGuards: specializeGuards } = require('./pathGuardRecovery');
 
 const rawExpression = (source) => createNode('UnsupportedExpression', { source: String(source) });
 const rawStatement = (source) => createNode('UnsupportedStatement', { source: String(source) });
@@ -639,6 +640,10 @@ function removeDeadReceiverSnapshots(source, declarations, carrierNames) {
 
 function recoverScalarLabelDispatches(source, options = {}) {
   return recoverScalarDispatch(source, controlCleanupSource(source), options);
+}
+
+function specializePathGuards(source, options = {}) {
+  return specializeGuards(source, controlCleanupSource(source), options);
 }
 
 function controlCleanupSource(source) {
@@ -3006,6 +3011,7 @@ module.exports = {
   foldEffectfulPlainBlockExits,
   simplifyIdentityReferenceCasts,
   recoverScalarLabelDispatches,
+  specializePathGuards,
   foldLabeledBooleanDecisions,
   foldVoidReturnExits,
   foldNestedIfGuards,

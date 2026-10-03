@@ -16,7 +16,7 @@ const { listRegionSplitCandidates, applyRegionSplit } = require('../passes/regio
 const { jreClassInfo, jreMethodCandidates } = require('../java-frontend/jreMetadata');
 const { JavaParser } = require('../java-frontend/parser');
 const { tokenizeJava } = require('../java-frontend/lexer');
-const { promoteBooleanStackCarriers, factorCommonBranchTails, factorLabeledBlockReturnTails, simplifyControlFrames, removeFallthroughLabelBreaks, localizePlainBlockLoopBreaks, foldLeadingWhileBreakGuards, foldEffectfulPlainBlockExits, simplifyIdentityReferenceCasts, recoverScalarLabelDispatches, foldLabeledBooleanDecisions, foldVoidReturnExits, foldNestedIfGuards, foldLabeledSkipGuards, foldLabeledIfElseExits, foldLabeledExitTrees, foldLabeledGuardTrees, removeDeadRegionSelectors, removeDeadReceiverSnapshots } = require('./javaAstEmitter');
+const { promoteBooleanStackCarriers, factorCommonBranchTails, factorLabeledBlockReturnTails, simplifyControlFrames, removeFallthroughLabelBreaks, localizePlainBlockLoopBreaks, foldLeadingWhileBreakGuards, foldEffectfulPlainBlockExits, simplifyIdentityReferenceCasts, recoverScalarLabelDispatches, specializePathGuards, foldLabeledBooleanDecisions, foldVoidReturnExits, foldNestedIfGuards, foldLabeledSkipGuards, foldLabeledIfElseExits, foldLabeledExitTrees, foldLabeledGuardTrees, removeDeadRegionSelectors, removeDeadReceiverSnapshots } = require('./javaAstEmitter');
 
 const VERSION = 'CFR-JS 0.4.0';
 const javaStatementParser = new JavaParser();
@@ -1891,6 +1891,22 @@ function shareExistingExitTails(body, parameterNames = []) {
       if (simplified.source === source) break;
       source = simplified.source;
     }
+  }
+  // Path facts apply only to captured local values. Complete all proven guard
+  // rewrites before removing now-unused frames, so no field value is presumed
+  // stable and no existing predicate-folding pass is re-run here.
+  let pathGuardsChanged = false;
+  for (;;) {
+    const guards = specializePathGuards(source, {parameterNames});
+    if (!guards.guardsSpecialized) break;
+    source = guards.source;
+    changed = true;
+    pathGuardsChanged = true;
+  }
+  if (pathGuardsChanged) for (;;) {
+    const simplified = simplifyControlFrames(source);
+    if (simplified.source === source) break;
+    source = simplified.source;
   }
   if (changed) replaceArrayContents(body, source.split('\n'));
 }
