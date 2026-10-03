@@ -1269,7 +1269,7 @@ checks selecting true become `a && b && c`; nested negated checks selecting fals
 become `a || b || c`. Sequential successful branches become OR alternatives.
 Mixed AND/OR grouping and left-to-right evaluation order stay explicit.
 
-Each predicate keeps its original bytes and execution order, including calls,
+Predicate operands keep their original bytes and execution order, including calls,
 assignments, nullable unboxing, floating comparisons and failures. Negating a
 decision uses logical negation/De Morgan's law; relational operators are never
 complemented, preserving NaNs. The remaining assignment executes after the same
