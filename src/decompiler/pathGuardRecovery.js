@@ -489,6 +489,17 @@ function specializePathGuards(source, proof, {
         end: tokens[after - 1].range.endOffset,
         text
       };
+      if (!selected && !text) {
+        // Delete a whole vacant statement line when possible. Retain the
+        // wrapper's final newline, which belongs to the parser, not the source.
+        const lineStart = wrapped.lastIndexOf('\n', edit.start - 1) + 1;
+        const lineEnd = wrapped.indexOf('\n', edit.end);
+        if (lineEnd >= 0 && !wrapped.slice(lineStart, edit.start).trim()
+            && !wrapped.slice(edit.end, lineEnd).trim()) {
+          edit.start = lineStart;
+          edit.end = Math.min(lineEnd + 1, wrapped.length - 2);
+        }
+      }
       edits.push(edit);
       edits.sort((a, b) => a.start - b.start);
       if (edits.some((e, i) => i && edits[i - 1].end > e.start)) continue;

@@ -81,6 +81,10 @@ test('path guards use preceding local comparisons and keep their selected scope'
  ]){const next=fold(source);assert.equal(next.guardsSpecialized,1,source);assert.ok(!Object.hasOwn(next,'diagnostics'));}
  const next=fold('int guard=mode;if(guard!=0)return;if(guard==0)return;step("unreachable");');
  assert.ok(!next.source.includes('unreachable'));assert.ok(next.source.endsWith('}'),'wrapper suffix survives method-tail pruning');
+ const multiline='int guard=mode;\nif(guard==0){\n  if(guard!=0){\n    step("unreachable");\n  }\n  step("yes");\n}\n';
+ const vacant=fold(multiline);assert.equal(vacant.guardsSpecialized,1);
+ assert.ok(!/^[ \t]+$/m.test(vacant.source),'deleting a guard leaves no whitespace-only line');
+ assert.ok(!vacant.source.includes('unreachable'));
 });
 
 test('unproven writes, field/boxed types, declaration loss and checked catches refuse simplification',()=>{
