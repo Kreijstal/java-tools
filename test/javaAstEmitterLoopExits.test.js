@@ -8,7 +8,7 @@ const path = require('path');
 const {spawnSync} = require('child_process');
 const {treeToStatements, emitStatements, promoteBooleanStackCarriers, factorCommonBranchTails,
   removeDeadRegionSelectors, removeDeadReceiverSnapshots, factorLabeledBlockReturnTails,
-  simplifyControlFrames, foldLabeledBooleanDecisions, foldVoidReturnExits, foldNestedIfGuards} = require('../src/decompiler/javaAstEmitter');
+  simplifyControlFrames, foldLabeledBooleanDecisions, foldVoidReturnExits, foldNestedIfGuards, foldLabeledSkipGuards} = require('../src/decompiler/javaAstEmitter');
 const {printTree} = require('../src/decompiler/structurer');
 const {JavaParser} = require('../src/java-frontend/parser');
 const {decompileClassFile, assertNoFallback} = require('../src/decompiler/cfr');
@@ -1917,4 +1917,98 @@ test('nested if guards match native short circuits, unboxing, scopes and cleanup
     run('javac',['--release','8','-d',temporary,file],temporary);
     assert.equal(run('java',['-cp',temporary,'NestedGuards'],temporary).trim(),'nested-guard-native:17280');
   } finally {fs.rmSync(temporary,{recursive:true,force:true});}
+});
+
+
+test('leading labeled skip guards retain predicate bytes, remainder scope and refuse other exits',()=>{
+  const source='Exit: { if (first()) { break Exit; } if (second()) { break Exit; } int value=next(); use(value); }';
+  const result=foldLabeledSkipGuards(source);
+  assert.deepEqual(result,{source:'if (!(first()) && !(second())) { int value=next(); use(value); }',framesRemoved:1,guardJumpsRemoved:2});
+  assert.deepEqual(foldLabeledSkipGuards(result.source),{source:result.source,framesRemoved:0,guardJumpsRemoved:0});
+  const formatted='  Exit: {\n    if (left()) {\n      break Exit;\n    }\n    if (right()) {\n      break Exit;\n    }\n    int value = 7;\n    use(value);\n  }';
+  assert.equal(foldLabeledSkipGuards(formatted).source,'  if (!(left()) &&\n      !(right())) {\n    int value = 7;\n    use(value);\n  }');
+  assert.equal(foldLabeledSkipGuards('try { Exit: { if (pick()) { break Exit; } work(); } } finally { cleanup(); }').framesRemoved,1);
+  assert.equal(foldLabeledSkipGuards('Exit: { if (pick()) { break Exit; } synchronized(lock) { work(); } }').framesRemoved,1);
+  assert.equal(foldLabeledSkipGuards('Loop: while(again()) { Exit: { if (pick()) { break Exit; } continue Loop; } tail(); }').framesRemoved,1);
+  const guards=count=>Array.from({length:count},(_,i)=>'if (pick'+i+'()) { break Exit; }').join(' ');
+  for(const source of [
+    'Exit: { if (pick()) { break Exit; } }',
+    'Exit: { before(); if (pick()) { break Exit; } work(); }',
+    'Exit: { if (pick()) { before(); break Exit; } work(); }',
+    'Exit: { if (pick()) { break Exit; } else { other(); } work(); }',
+    'Exit: { if (pick()) break Exit; work(); }',
+    'Exit: { if (pick()) { break Other; } work(); }',
+    'Exit: { if (pick()) { break Exit; } work(); } break Missing;',
+    'Exit: { if (pick()) { break Exit; } if (other()) { break Exit; } else { work(); } }',
+    'Exit: { if (pick()) { break Exit; } try { if(other()) break Exit; work(); } finally { cleanup(); } }',
+    'Exit: { try { if(pick()) { break Exit; } } finally { cleanup(); } work(); }',
+    'Exit: while(true) { if(pick()) { break Exit; } work(); }',
+    'Exit: { if(pick()) { break Exit; } work(); } Exit: { use(); }',
+    'Exit: { if(pick()) { break Exit; } class Inner {} work(); }',
+    'Exit: { if(pick()) { break Exit; } Runnable run=()->work(); }',
+    'Exit: { if(pick()) { break Exit; } // keep\n work(); }',
+    'Exit: { if(pick()) { break Exit; } /* keep */ work(); }',
+    'Exit: { if(pick()) { break Exit; } raw; }',
+    'Exit: { if(pick()) { break Exit; } work() }',
+    'Exit: { if(pick()) { break Exit; } work(); } }',
+    'Exit: { if(pick()) { break Exit; } \\u0061(); }',
+    'Exit: { '+guards(17)+' work(); }',
+    'Exit: { if ('+'pick() && '.repeat(130)+'last()) { break Exit; } work(); }',
+  ])assert.deepEqual(foldLabeledSkipGuards(source),{source,framesRemoved:0,guardJumpsRemoved:0},source);
+});
+
+test('labeled skip guards match native short circuits, scopes, ancestor transfers and cleanup',()=>{
+  const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'cfr-skip-guards-native-'));
+  try {
+    const variants=[
+      'Exit: { if (pick(0,boxed)) { break Exit; } work(); } tail();',
+      'Exit: { if (pick(0,boxed)) { break Exit; } if (pick(1,boxed)) { break Exit; } work(); } tail();',
+      'Exit: { if (floating < 0d) { break Exit; } if (pick(0,boxed)) { break Exit; } work(); } tail();',
+      'Exit: { if (pick(0,boxed)) { break Exit; } int local=++value; trace.append(local); work(); } { int local=7; trace.append(local); } tail();',
+      'try { Exit: { if (pick(0,boxed)) { break Exit; } work(); } tail(); } finally { cleanup(); }',
+      'synchronized(lock) { Exit: { if (pick(0,boxed)) { break Exit; } work(); } trace.append(Thread.holdsLock(lock)); } tail();',
+      'Exit: { if (pick(0,boxed)) { break Exit; } try { work(); } catch(IllegalArgumentException error) { trace.append(error==specific); } finally { cleanup(); } } tail();',
+      'Outer: for(int index=0;index<3;index++) { Exit: { if(pick(0,boxed)) { break Exit; } work(); if(value<2) continue Outer; if(value>3) break Outer; } tail(); }',
+      'switch(mode%3) { case 0: Exit: { if(pick(0,boxed)) { break Exit; } work(); break; } tail(); break; default: work(); } tail();',
+      'Exit: { if(pick(0,boxed)) { break Exit; } work(); return value; } tail(); return -1;',
+      'Exit: { if(pick(0,boxed)) { break Exit; } synchronized(lock) { work(); } } tail();',
+      'Exit: { if(pick(0,boxed)) { break Exit; } while(value<3) { work(); if(value>1) break; } } tail();',
+    ];
+    const methods=[];
+    variants.forEach((original,index)=>{
+      const folded=foldLabeledSkipGuards(original);assert.equal(folded.framesRemoved,1,index);
+      for(const [name,body] of [['original',original],['rebuilt',folded.source]])
+        methods.push('static int '+name+index+'(Boolean boxed,double floating) { '+body+(index===9?'':' return value;')+' }');
+    });
+    const source=`public class SkipGuards {
+      static int mode,value,seen;static Object lock;static StringBuilder trace;
+      static final RuntimeException specific=new IllegalArgumentException(),general=new IllegalStateException();
+      static final Error fatal=new AssertionError();
+      static boolean pick(int index,Boolean boxed) { trace.append('p').append(index);if(mode==1&&index==0)throw specific;if(mode==2&&index==1)throw general;return index==0?boxed:mode%2==0; }
+      static void work() {trace.append('w').append(lock!=null&&Thread.holdsLock(lock));value++;if(mode==3)throw general;if(mode==4)throw fatal;}
+      static void cleanup() {trace.append('f');seen=value;if(mode==5)throw general;if(mode==6)throw fatal;}
+      static void tail() {trace.append('t');value+=2;}
+      ${methods.join('\n')}
+      interface Call {int call();}
+      static String invoke(Call call,boolean nullLock) {
+        lock=nullLock?null:new Object();trace=new StringBuilder();value=0;seen=-1;String result;
+        try {result="ok:"+call.call();}catch(Throwable error){result=error==specific?"specific":error==general?"general":error==fatal?"fatal":error.getClass().getName();}
+        if(lock!=null&&Thread.holdsLock(lock))throw new AssertionError("monitor retained");
+        return result+":"+value+":"+seen+":"+trace;
+      }
+      public static void main(String[]args) {
+        int cases=0;
+        for(mode=0;mode<8;mode++)for(Boolean boxed:new Boolean[]{null,false,true})
+        for(double floating:new double[]{Double.NEGATIVE_INFINITY,-1,-0d,0d,1,Double.POSITIVE_INFINITY,Double.NaN})
+        for(boolean nullLock:new boolean[]{false,true}) {
+          ${variants.map((_,index)=>`{String expected=invoke(()->original${index}(boxed,floating),nullLock),actual=invoke(()->rebuilt${index}(boxed,floating),nullLock);
+            if(!expected.equals(actual))throw new AssertionError(${index}+":"+mode+":"+boxed+":"+floating+":"+nullLock+":"+expected+" != "+actual);cases++;}`).join('\n')}
+        }
+        if(cases!=4032)throw new AssertionError(cases);System.out.println("skip-guard-native:"+cases);
+      }
+    }`;
+    const javaFile=path.join(temporary,'SkipGuards.java');fs.writeFileSync(javaFile,source);
+    run('javac',['--release','8','-d',temporary,javaFile],temporary);
+    assert.equal(run('java',['-cp',temporary,'SkipGuards'],temporary).trim(),'skip-guard-native:4032');
+  }finally{fs.rmSync(temporary,{recursive:true,force:true});}
 });

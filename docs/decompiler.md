@@ -1406,3 +1406,40 @@ static calls through stack carriers; arbitrary direct int expressions,
 external methods, virtual dispatch, constructors and boolean encodings remain
 outside its proof. The original and generated bodies currently coexist, which
 adds source size rather than simplifying this particular method.
+
+### Reconstructing labeled skip guards
+
+`foldLabeledSkipGuards` recognizes a plain labeled block whose initial statements
+are braced `if` guards containing only `break` to that block. Every reference to
+the unique label must be one of those leading guards. The remainder must be
+nonempty. The block becomes an ordinary `if` over the short-circuit conjunction
+of negated original predicates; its remainder keeps the original block scope.
+Negation uses `!` rather than guessing an opposite floating comparison, preserving
+NaNs, unboxing and predicate effects. Nested guard folding runs first and again
+when a new ordinary guard exposes another chain.
+
+An alternate, work before a guard, work inside its break arm, a remaining exit to
+the same label, a loop/switch label or duplicate/unbound label refuses the rewrite.
+Comments, Unicode escapes, nested executable bodies, unsupported/malformed
+statements and unknown lexical extents also refuse it. The leading guard chain
+has budgets of 16 predicates and 512 tokens. No declaration, call or protected
+boundary moves; try/finally and monitors may enclose the entire decision or
+remain intact in its remainder. Ancestor and unlabeled loop/switch transfers
+retain their destinations.
+
+`NODE_PATH=/path/to/dependencies JAVA_TOOL_OPTIONS=-XX:-UsePerfData node test/javaAstEmitterLoopExits.test.js`
+passes 48 tests with one optional historical pass77 corpus check skipped.
+Two new groups include 4,032 native comparisons covering ordered/throwing
+predicates, nullable booleans, NaNs, declaration scopes, partial effects, ancestor
+jumps, switch/loop breaks, early returns, finally effects observed after invocation
+and monitor ownership/release. Exception exits retain eight passing groups, and
+full-integer argument regression retains two passing groups.
+
+The fixed GeoBlox corpus removes 57 exit-block labels and 66 guard breaks across
+25 files, reducing 78,886 lines to 78,689. The main session updater loses five
+labels and shrinks from 660 to 643 lines. All 303 sources compile. Independent
+JDK body positions plus the documented skip/nested-guard transforms reproduce
+all 303 token streams; ordered 19,591 declarations, 119,181 references and 388
+override rows remain unchanged. The 21 spans of at least 300 lines (15 with
+labels) remain; some spans include nested helpers. This improves individual
+control decisions without claiming that the remaining large bodies are solved.

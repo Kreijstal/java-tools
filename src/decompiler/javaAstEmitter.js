@@ -1113,6 +1113,101 @@ function foldNestedIfGuards(source) {
   return {source: output.slice(2,-2), guardsFolded: edits.length, conditionsMerged};
 }
 
+// A plain labeled block can encode a sequence of skip guards. When every
+// reference to its unique label is exactly one of those leading bare breaks,
+// negate their original predicates and retain the remainder's block scope.
+// No declaration, effect or protected boundary moves across the new guard.
+function foldLabeledSkipGuards(source) {
+  const unchanged = () => ({source, framesRemoved: 0, guardJumpsRemoved: 0});
+  const proof = controlCleanupSource(source);
+  if (!proof) return unchanged();
+  const {wrapped, parsed, tokens, starts, closes, children, labelCounts} = proof;
+  const references = new Map();
+  let refused = false;
+  function inspect(node,labels=[]) {
+    if (/ClassDeclaration|MethodDeclaration|ConstructorDeclaration|LambdaExpression|AnonymousClass/.test(node.kind || '')) refused = true;
+    if (['BreakStatement','ContinueStatement'].includes(node.kind) && node.label) {
+      const target=labels.slice().reverse().find(frame=>frame.label===node.label);
+      if (!target || node.kind==='ContinueStatement' && !['WhileStatement','ForStatement','EnhancedForStatement','DoWhileStatement'].includes(target.statement?.kind)) refused=true;
+      if (!references.has(node.label)) references.set(node.label,[]);
+      references.get(node.label).push(node);
+    }
+    if (node.kind === 'ExpressionStatement') {
+      const expression = node.expression;
+      if (!['AssignmentExpression','MethodInvocationExpression','NewClassExpression'].includes(expression?.kind)
+          && !(expression?.kind === 'UnaryExpression' && ['++','--'].includes(expression.operator))) refused = true;
+      let index = starts.get(node.range?.startOffset);
+      if (index === undefined) refused = true;
+      else {
+        while (index < tokens.length && tokens[index].text !== ';' && tokens[index].text !== '}') {
+          if (closes.has(index)) index = closes.get(index);
+          index++;
+        }
+        if (tokens[index]?.text !== ';') refused = true;
+      }
+    }
+    children(node,child=>inspect(child,node.kind==='LabeledStatement'?[...labels,node]:labels));
+  }
+  inspect(parsed);
+  if (refused) return unchanged();
+  function guard(node,label) {
+    const start = starts.get(node.range?.startOffset), close = closes.get(start+1);
+    const statements = node.consequent?.statements;
+    if (node.kind !== 'IfStatement' || node.alternate || node.consequent?.kind !== 'BlockStatement'
+        || tokens[start]?.text !== 'if' || tokens[start+1]?.text !== '(' || close === undefined
+        || tokens[close+1]?.text !== '{' || statements?.length !== 1
+        || statements[0].kind !== 'BreakStatement' || statements[0].label !== label) return null;
+    const bodyEnd = closes.get(close+1);
+    if (bodyEnd !== close+5 || tokens[close+2]?.text !== 'break'
+        || tokens[close+3]?.text !== label || tokens[close+4]?.text !== ';') return null;
+    return {node,jump:statements[0],start,end:bodyEnd,
+      text:wrapped.slice(tokens[start+1].range.endOffset,tokens[close].range.startOffset),
+      weight:close-start-2};
+  }
+  const edits = [];
+  let guardJumpsRemoved = 0;
+  function find(node) {
+    if (node.kind === 'LabeledStatement' && node.statement?.kind === 'BlockStatement'
+        && labelCounts.get(node.label) === 1) {
+      const start = starts.get(node.range?.startOffset), open = start+2, end = closes.get(open);
+      if (tokens[start]?.text !== node.label || tokens[start+1]?.text !== ':'
+          || tokens[open]?.text !== '{' || tokens[end]?.text !== '}') return;
+      const statements = node.statement.statements, guards = [];
+      for (const statement of statements) {
+        const part = guard(statement,node.label);
+        if (!part) break;
+        guards.push(part);
+      }
+      if (guards.length && guards.length < statements.length
+          && references.get(node.label)?.length === guards.length
+          && references.get(node.label).every(reference => guards.some(part => part.jump === reference))) {
+        if (guards.length > 16 || guards.reduce((sum,part)=>sum+part.weight,0) > 512) return;
+        const rest = starts.get(statements[guards.length].range?.startOffset);
+        if (guards[0].start !== open+1 || rest !== guards.at(-1).end+1
+            || guards.some((part,index)=>index && part.start !== guards[index-1].end+1)) return;
+        const prefix = wrapped.slice(wrapped.lastIndexOf('\n',tokens[start].range.startOffset-1)+1,tokens[start].range.startOffset);
+        const indent = /^[ \t]*$/.test(prefix) ? prefix : null;
+        const multiline=wrapped.slice(tokens[start].range.startOffset,tokens[guards.at(-1).end].range.endOffset).includes('\n');
+        const separator = indent === null || !multiline ? ' && ' : ' &&\n'+indent+'    ';
+        const predicate = guards.map(part=>'!('+part.text+')').join(separator);
+        const restBytes = wrapped.slice(tokens[guards.at(-1).end].range.endOffset,tokens[end].range.endOffset);
+        edits.push({start:tokens[start].range.startOffset,end:tokens[end].range.endOffset,
+          text:'if ('+predicate+') {'+restBytes});
+        guardJumpsRemoved += guards.length;
+        return;
+      }
+    }
+    children(node,find);
+  }
+  find(parsed);
+  if (!edits.length) return unchanged();
+  edits.sort((a,b)=>a.start-b.start);
+  if (edits.some((edit,index)=>index && edits[index-1].end>edit.start)) return unchanged();
+  let output = wrapped;
+  for (const edit of edits.slice().reverse()) output = output.slice(0,edit.start)+edit.text+output.slice(edit.end);
+  return {source:output.slice(2,-2),framesRemoved:edits.length,guardJumpsRemoved};
+}
+
 // A consumed block break immediately followed by a bare return has no work or
 // value evaluation left at its destination. Both transfers leave the same
 // cleanup regions, even when a finally overrides them. Completion is separate:
@@ -1926,6 +2021,7 @@ module.exports = {
   foldLabeledBooleanDecisions,
   foldVoidReturnExits,
   foldNestedIfGuards,
+  foldLabeledSkipGuards,
   removeDeadRegionSelectors,
   removeDeadReceiverSnapshots,
 };

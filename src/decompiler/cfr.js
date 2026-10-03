@@ -16,7 +16,7 @@ const { listRegionSplitCandidates, applyRegionSplit } = require('../passes/regio
 const { jreClassInfo, jreMethodCandidates } = require('../java-frontend/jreMetadata');
 const { JavaParser } = require('../java-frontend/parser');
 const { tokenizeJava } = require('../java-frontend/lexer');
-const { promoteBooleanStackCarriers, factorCommonBranchTails, factorLabeledBlockReturnTails, simplifyControlFrames, foldLabeledBooleanDecisions, foldVoidReturnExits, foldNestedIfGuards, removeDeadRegionSelectors, removeDeadReceiverSnapshots } = require('./javaAstEmitter');
+const { promoteBooleanStackCarriers, factorCommonBranchTails, factorLabeledBlockReturnTails, simplifyControlFrames, foldLabeledBooleanDecisions, foldVoidReturnExits, foldNestedIfGuards, foldLabeledSkipGuards, removeDeadRegionSelectors, removeDeadReceiverSnapshots } = require('./javaAstEmitter');
 
 const VERSION = 'CFR-JS 0.4.0';
 const javaStatementParser = new JavaParser();
@@ -1790,6 +1790,17 @@ function shareExistingExitTails(body) {
     if (!guards.guardsFolded) break;
     source = guards.source;
     changed = true;
+  }
+  for (;;) {
+    const skips = foldLabeledSkipGuards(source);
+    if (!skips.framesRemoved) break;
+    source = skips.source;
+    changed = true;
+    for (;;) {
+      const guards = foldNestedIfGuards(source);
+      if (!guards.guardsFolded) break;
+      source = guards.source;
+    }
   }
   if (changed) replaceArrayContents(body, source.split('\n'));
 }
