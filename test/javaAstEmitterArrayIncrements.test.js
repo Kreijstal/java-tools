@@ -62,6 +62,28 @@ test('fields, effects, incomplete bindings and escaping captures keep original s
     assert.equal(recover(captures + forward, {parameters: params}).source, captures + forward);
 });
 
+test('single reads fold only at the first evaluation of a one-shot consumer', () => {
+  const capture = 'int incrementValue$0=0;incrementValue$0=s;s++;';
+  const params = [{name: 'src', type: 'int[]'}, {name: 's', type: 'int'}, {name: 'd', type: 'int'}];
+  for (const consumer of ['return src[incrementValue$0];', 'd=src[incrementValue$0];',
+    'int value=src[incrementValue$0];', 'if(src[incrementValue$0]==observe(s)){use(d);}',
+    'if(src[incrementValue$0]<s){use(d);}']) {
+    const next = recover(capture + consumer, {parameters: params});
+    assert.equal(next.capturesFolded, 1, consumer);
+    assert.equal(next.readCapturesFolded, 1, consumer);
+    assert.equal(next.source, consumer.replace('incrementValue$0', 's++'));
+    assert.equal(recover(next.source, {parameters: params}).capturesFolded, 0);
+  }
+  for (const consumer of ['while(src[incrementValue$0]!=0){s++;}',
+    'for(;src[incrementValue$0]!=0;){s++;}', 'if(s<src[incrementValue$0]){use(d);}',
+    'if(ready()&&src[incrementValue$0]!=0){use(d);}', 'use(src[incrementValue$0]);',
+    'd+=src[incrementValue$0];', 'Holder.value=src[incrementValue$0];',
+    'return Holder.src[incrementValue$0];', 'return getSource()[incrementValue$0];',
+    'if(src[incrementValue$0]!=0){use(incrementValue$0);}',
+    'try{return src[incrementValue$0];}finally{cleanup();}'])
+    assert.equal(recover(capture + consumer, {parameters: params}).source, capture + consumer, consumer);
+});
+
 function temporary(fn) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'array-increments-native-'));
   function run(command, args) {
@@ -131,10 +153,77 @@ test('native array exceptions, partial writes, overlap, overflow and cleanup ret
   });
 });
 
+test('native single reads preserve results, counters, short circuiting, unboxing and cleanup', () => {
+  const read = 'incrementValue$0=s;s++;';
+  const variants = [
+    read + 'return src[incrementValue$0];',
+    read + 'if(src[incrementValue$0]==0)d++;return d;',
+    read + 'int value=src[incrementValue$0];return value;',
+    read + 'd=src[incrementValue$0];return d;',
+    read + 's=src[incrementValue$0];return s;',
+    read.replace('s++;', 's--;') + 'return src[incrementValue$0];',
+    'synchronized(lock){' + read + 'return src[incrementValue$0];}',
+    'for(int round=0;round<3;round++){int incrementValue$2=s;s++;int value=src[incrementValue$2];d^=value;}return d;',
+    read + 'if(src[incrementValue$0]<observe(s))d+=7;return d;',
+    read + 'if(flags[incrementValue$0])d++;return d;',
+    read + 'if(flags[incrementValue$0]&&mark(s))d++;return d;',
+    read + 'if(boxed[incrementValue$0]&&mark(s))d++;return d;',
+    read + 'boolean value=boxed[incrementValue$0];return value?1:0;',
+    read + 'boolean value=flags[incrementValue$0];return value?1:0;',
+  ];
+  const params = [{name: 'src', type: 'int[]'}, {name: 'flags', type: 'boolean[]'},
+    {name: 'boxed', type: 'Boolean[]'}, {name: 's', type: 'int'}, {name: 'd', type: 'int'}];
+  temporary((directory, run) => {
+    const methods = [];
+    variants.forEach((body, index) => {
+      const source = (index === 7 ? '' : 'int incrementValue$0=0;') + 'try{' + body
+        + '}finally{trace=s+":"+d;cleanups++;}';
+      const next = recover(source, {parameters: params});
+      assert.equal(next.capturesFolded, 1, body);
+      assert.equal(next.readCapturesFolded, 1, body);
+      for (const [name, text] of [['original', source], ['rebuilt', next.source]])
+        methods.push(`static int ${name}${index}(int[] src,boolean[] flags,Boolean[] boxed,int s,int d){${text}}`);
+    });
+    const java = `public class ArrayReadTrace {
+      static final Object lock=new Object();static String trace;static int cleanups,effects,observed;
+      static int observe(int s){effects++;observed=s;return s+4;}
+      static boolean mark(int s){effects++;observed=s;return s>0;}
+      ${methods.join('\n')}
+      static String run(boolean rebuilt,int v,int mode,int length,int s,int d){
+        int[] src=mode==0?null:new int[length];boolean[] flags=mode==0?null:new boolean[length];Boolean[] boxed=mode==0?null:new Boolean[length];
+        if(src!=null)for(int i=0;i<length;i++){src[i]=i%3-1;flags[i]=i%2==0;boxed[i]=mode==2?null:Boolean.valueOf(flags[i]);}
+        trace="";cleanups=effects=observed=0;String outcome="";
+        try{int value=0;switch(v){${variants.map((_,i)=>`case ${i}:value=rebuilt?rebuilt${i}(src,flags,boxed,s,d):original${i}(src,flags,boxed,s,d);break;`).join('')}}outcome="value="+value;}
+        catch(RuntimeException e){outcome=e.getClass().getSimpleName();}
+        return outcome+":"+cleanups+":"+trace+":"+effects+":"+observed;
+      }
+      static void check(String actual,String expected){if(!actual.equals(expected))throw new AssertionError(actual+" != "+expected);}
+      public static void main(String[] args){int cases=0;int[] indices={-1,0,1,3,7,8,Integer.MIN_VALUE,Integer.MAX_VALUE};
+        for(int v=0;v<${variants.length};v++)for(int mode=0;mode<3;mode++)for(int length=0;length<9;length++)for(int s:indices)for(int d:new int[]{-1,0,1,Integer.MAX_VALUE}){
+          String a=run(false,v,mode,length,s,d),b=run(true,v,mode,length,s,d);if(!a.equals(b))throw new AssertionError(v+":"+mode+":"+length+":"+s+":"+d+":"+a+" != "+b);cases++;
+        }
+        check(run(true,0,0,0,Integer.MAX_VALUE,5),"NullPointerException:1:-2147483648:5:0:0");
+        check(run(true,0,1,0,0,5),"ArrayIndexOutOfBoundsException:1:1:5:0:0");
+        check(run(true,1,1,3,1,5),"value=6:1:2:6:0:0");
+        check(run(true,4,1,3,0,5),"value=-1:1:-1:5:0:0");
+        check(run(true,8,1,3,0,5),"value=12:1:1:12:1:1");
+        check(run(true,10,1,3,1,5),"value=5:1:2:5:0:0");
+        check(run(true,11,2,3,0,5),"NullPointerException:1:1:5:0:0");
+        String monitored=run(true,6,0,0,0,5);if(Thread.holdsLock(lock))throw new AssertionError("monitor retained");
+        check(monitored,"NullPointerException:1:1:5:0:0");
+        System.out.println("native-array-reads:"+cases+":oracles:8");
+      }
+    }`;
+    const file = path.join(directory, 'ArrayReadTrace.java');fs.writeFileSync(file, java);
+    run('javac', ['--release', '8', file]);
+    assert.equal(run('java', ['-cp', directory, 'ArrayReadTrace']).trim(), 'native-array-reads:12096:oracles:8');
+  });
+});
+
 test('owned decompiler emits post-increment array stores and compiles its output', () => {
   temporary((directory, run) => {
     const file = path.join(directory, 'ArrayIncrementFixture.java');
-    fs.writeFileSync(file, 'public class ArrayIncrementFixture {public static void copy(int[] a,int x,int[] b,int y){b[y++]=a[x++];} public static void clear(int[] b,int i){b[i++]=0;} public static void reverse(Object[] a,int x,Object[] b,int y){b[y--]=a[x--];}}');
+    fs.writeFileSync(file, 'public class ArrayIncrementFixture {public static void copy(int[] a,int x,int[] b,int y){b[y++]=a[x++];} public static void clear(int[] b,int i){b[i++]=0;} public static void reverse(Object[] a,int x,Object[] b,int y){b[y--]=a[x--];} public static int read(int[] a,int i){return a[i++];} public static boolean test(byte[] a,int i){if(a[i++]!=0)return true;return false;}}');
     run('javac', ['--release', '8', file]);
     const source = decompileClassFile(path.join(directory, 'ArrayIncrementFixture.class'));
     assert.equal(typeof source, 'string');
@@ -142,6 +231,8 @@ test('owned decompiler emits post-increment array stores and compiles its output
     assert.match(source, /\[param3\+\+\] = param0\[param1\+\+\]/);
     assert.match(source, /\[param1\+\+\] = 0/);
     assert.match(source, /\[param3--\] = param0\[param1--\]/);
+    assert.match(source, /return param0\[param1\+\+\]/);
+    assert.match(source, /if \(param0\[param1\+\+\] != 0\)/);
     fs.writeFileSync(file, source);
     run('javac', ['--release', '8', file]);
   });

@@ -4,8 +4,10 @@
 // bound locals. Java evaluates an array-assignment target's reference/index,
 // then its RHS, and only then checks the target for null/bounds/store failures.
 // Thus both counters still advance before a failing source read or target store.
-// Calls, fields, compound stores, intervening work and escaping captures refuse
-// recovery. No statement moves across a block, handler or monitor boundary.
+// A single read can also be the first evaluation in a return, local assignment
+// or if condition. Later condition evaluations retain their original order.
+// Array fields/calls, compound stores, intervening work and escaping captures
+// refuse recovery. No statement moves across a block, handler or monitor boundary.
 function recoverArrayIndexIncrements(source, proof, {parameters = []} = {}) {
   const unchanged = () => ({source, capturesFolded: 0});
   if (!proof || !Array.isArray(parameters)) return unchanged();
@@ -84,6 +86,38 @@ function recoverArrayIndexIncrements(source, proof, {parameters = []} = {}) {
     return node?.kind === 'ArrayAccessExpression' && node.array?.kind === 'Identifier'
       && array(node.array.name, site) && node.index?.kind === 'Identifier' && node.index.name === name;
   }
+  function readUse(node, first) {
+    if (!node) return null;
+    const site = node.range.startOffset;
+    let read, prefix;
+    if (node.kind === 'ReturnStatement') {
+      read = node.expression;
+      prefix = ['return'];
+    } else if (node.kind === 'IfStatement') {
+      const condition = node.condition;
+      read = condition?.kind === 'BinaryExpression'
+        && ['==', '!=', '<', '<=', '>', '>=', '&&', '||'].includes(condition.operator)
+        ? condition.left : condition;
+      prefix = ['if', '('];
+    } else if (node.kind === 'ExpressionStatement') {
+      const e = node.expression;
+      if (e?.kind !== 'AssignmentExpression' || e.operator !== '='
+          || e.left?.kind !== 'Identifier' || !integer(e.left.name, site)) return null;
+      read = e.right;
+      prefix = [e.left.name, '='];
+    } else if (node.kind === 'LocalVariableDeclarationStatement'
+        && node.declarators.length === 1 && !node.modifiers.length && !node.annotations.length
+        && node.variableType.kind === 'PrimitiveType' && !node.declarators[0].dimensions) {
+      const d = node.declarators[0];
+      if (counts.get(d.name) !== 1) return null;
+      read = d.initializer;
+      prefix = [node.variableType.name, d.name, '='];
+    } else return null;
+    if (!arrayAccess(read, first.name, site)) return null;
+    const at = starts.get(site);
+    if (!texts(at, [...prefix, read.array.name, '[', first.name, ']'])) return null;
+    return at + prefix.length + 2;
+  }
   const groups = [];
   function walk(node) {
     if (node.kind === 'BlockStatement') {
@@ -91,6 +125,12 @@ function recoverArrayIndexIncrements(source, proof, {parameters = []} = {}) {
       for (let n = 0; n + 2 < items.length; n++) {
         const first = capture(items[n], items[n + 1]);
         if (!first) continue;
+        const read = readUse(items[n + 2], first);
+        if (read !== null) {
+          groups.push({captures: [first], uses: [read], read: true});
+          n += 2;
+          continue;
+        }
         let second = capture(items[n + 2], items[n + 3]);
         const end = items[n + (second ? 4 : 2)], e = end?.expression;
         if (end?.kind !== 'ExpressionStatement' || e?.kind !== 'AssignmentExpression' || e.operator !== '='
@@ -153,7 +193,8 @@ function recoverArrayIndexIncrements(source, proof, {parameters = []} = {}) {
   if (refused || edits.some((edit, i) => i && edits[i - 1].end > edit.start)) return unchanged();
   let output = wrapped;
   for (const edit of edits.reverse()) output = output.slice(0, edit.start) + edit.text + output.slice(edit.end);
-  return {source: output.slice(2, -2), capturesFolded: removed.size};
+  return {source: output.slice(2, -2), capturesFolded: removed.size,
+    readCapturesFolded: accepted.filter(group => group.read).length};
 }
 
 module.exports = {recoverArrayIndexIncrements};
