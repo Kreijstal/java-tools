@@ -8,7 +8,7 @@ const path = require('path');
 const {spawnSync} = require('child_process');
 const {treeToStatements, emitStatements, promoteBooleanStackCarriers, factorCommonBranchTails,
   removeDeadRegionSelectors, removeDeadReceiverSnapshots, factorLabeledBlockReturnTails,
-  simplifyControlFrames, removeFallthroughLabelBreaks, foldLabeledBooleanDecisions, foldVoidReturnExits, foldNestedIfGuards, foldLabeledSkipGuards, foldLabeledIfElseExits, foldLabeledExitTrees, foldLabeledGuardTrees} = require('../src/decompiler/javaAstEmitter');
+  simplifyControlFrames, removeFallthroughLabelBreaks, localizePlainBlockLoopBreaks, foldLabeledBooleanDecisions, foldVoidReturnExits, foldNestedIfGuards, foldLabeledSkipGuards, foldLabeledIfElseExits, foldLabeledExitTrees, foldLabeledGuardTrees} = require('../src/decompiler/javaAstEmitter');
 const {printTree} = require('../src/decompiler/structurer');
 const {JavaParser} = require('../src/java-frontend/parser');
 const {decompileClassFile, assertNoFallback} = require('../src/decompiler/cfr');
@@ -2417,4 +2417,144 @@ test('pure guard trees match native short-circuit order, protected effects and t
     run('javac',['--release','8','-d',temporary,javaFile],temporary);
     assert.equal(run('java',['-cp',temporary,'GuardTrees'],temporary).trim(),'guard-tree-native:16128');
   }finally{fs.rmSync(temporary,{recursive:true,force:true});}
+});
+
+test('terminal plain-block loop breaks localize only an empty continuation to their nearest loop', () => {
+  for (const source of [
+    'Exit: { while (true) { if (done()) break Exit; work(); } }',
+    'Exit: { prefix(); if (ready()) { while (true) { if (done()) { break Exit; } work(); } } }',
+    'Exit: { if (ready()) work(); else { for (int index=0; index<3; index++) { break Exit; } } }',
+    'Exit: { do { break Exit; } while (ready()); }',
+    'Exit: { for (int item : items) { if (item>0) break Exit; } }',
+    'Exit: { Other: { while (true) { break Exit; } } }',
+    'Exit: { while (true) { try { break Exit; } finally { cleanup(); } } }',
+    'Exit: { while (true) { try { work(); } catch (Exception error) { break Exit; } break; } }',
+    'Exit: { while (true) { synchronized (lock) { break Exit; } } }',
+    'try { Exit: { while (true) { break Exit; } } } finally { cleanup(); }',
+    'synchronized (lock) { Exit: { while (true) { break Exit; } } }',
+    'switch (kind) { case 0: Exit: { while (true) { break Exit; } } break; default: work(); }',
+    'Outer: for (int index=0; index<3; index++) { Exit: { while (ready()) { if (done()) break Exit; continue Outer; } } work(); }',
+    'Exit: { int local=make(); while (true) { break Exit; } } { int local=7; use(local); }',
+    'Exit: { if (ready()) break Exit; while (true) { break Exit; } }',
+  ]) {
+    const next = localizePlainBlockLoopBreaks(source);
+    assert.equal(next.breaksLocalized, 1, source);
+    assert.equal(next.source, source.replace(/break Exit;(?!.*break Exit;)/s, 'break;'), source);
+    assert.deepEqual(localizePlainBlockLoopBreaks(next.source), {source: next.source, breaksLocalized: 0});
+  }
+  const scoped = simplifyControlFrames(localizePlainBlockLoopBreaks(
+    'Exit: { int local=make(); while (true) { break Exit; } } { int local=7; use(local); }').source);
+  assert.equal(scoped.labelsRemoved, 1);
+  assert.equal(scoped.blocksUnwrapped, 0, 'declaration scope remains');
+  const shared = simplifyControlFrames(localizePlainBlockLoopBreaks(
+    'Exit: { if (ready()) break Exit; while (true) { break Exit; } }').source);
+  assert.equal(shared.labelsRemoved, 0, 'another reference still needs the plain label');
+});
+
+test('terminal plain-block loop breaks refuse intervening work, protected regions and different break targets', () => {
+  for (const source of [
+    'Exit: { while (true) { break Exit; } work(); }',
+    'Exit: { while (true) { break Exit; } int local=make(); }',
+    'Exit: { while (true) { break Exit; } ; }',
+    'Exit: { if (ready()) { while (true) { break Exit; } work(); } }',
+    'Exit: { try { while (true) { break Exit; } } finally { cleanup(); } }',
+    'Exit: { try { while (true) { break Exit; } } catch (Exception error) { work(); } }',
+    'Exit: { synchronized (lock) { while (true) { break Exit; } } }',
+    'Exit: { while (ready()) { while (true) { break Exit; } } }',
+    'Exit: { while (true) { switch (kind) { case 0: break Exit; default: work(); } } }',
+    'Exit: { switch (kind) { case 0: while (true) { break Exit; } default: work(); } }',
+    'Exit: { Inner: while (true) { break Inner; } }',
+    'Exit: { if (ready()) { break Exit; } }',
+    'Exit: { while (true) { break Missing; } }',
+    'Exit: { while (true) { continue Exit; } }',
+    'Exit: { while (true) { break Exit; } } break;',
+    'Exit: { while (true) { break Exit; } } Exit: { work(); }',
+    'Exit: { while (true) { break Exit; } } Runnable task=()->work();',
+    'Exit: { while (true) { break Exit; } } class Local { void run() { work(); } }',
+    'Exit: { while (true) { break Exit; } } // comment',
+    'Exit: { while (true) { break Exit; } } /* comment */',
+    'Exit: { while (true) { break Exit; } } String text="\\u0061";',
+    'Exit: { while (true) { break Exit; } } raw;',
+    'Exit: { while (true) { break Exit; } } work()',
+    'Exit: { while (true) { break Exit; } } }',
+  ]) assert.deepEqual(localizePlainBlockLoopBreaks(source), {source, breaksLocalized: 0}, source);
+});
+
+test('terminal plain-block loop breaks match native loop updates, scopes, cleanup and monitor exits', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-terminal-loop-native-'));
+  try {
+    const variants = [
+      'Exit: { while(step()) { if(pick(a)) break Exit; work(0); } } work(1);',
+      'Exit: { for(int index=0;step();update()) { if(pick(a)) break Exit; work(0); } } work(1);',
+      'Exit: { do { if(pick(a)) break Exit; work(0); } while(step()); } work(1);',
+      'Exit: { for(int item:new int[]{0,1,2}) { trace.append(item); if(pick(a)) break Exit; work(0); } } work(1);',
+      'Exit: { work(1); if(pick(b)) { while(step()) { if(pick(a)) break Exit; work(0); } } } work(1);',
+      'Exit: { if(pick(b)) work(1); else { while(step()) { if(pick(a)) break Exit; work(0); } } } work(1);',
+      'Exit: { Other: { while(step()) { if(pick(a)) break Exit; work(0); } } } work(1);',
+      'Exit: { int local=++value; while(step()) { trace.append(local); if(pick(a)) break Exit; work(0); } } { int local=7; trace.append(local); } work(1);',
+      'try { Exit: { while(step()) { if(pick(a)) break Exit; work(0); } } } finally { cleanup(); } work(1);',
+      'Exit: { while(step()) { try { if(pick(a)) break Exit; work(0); } finally { cleanup(); } } } work(1);',
+      'Exit: { while(step()) { try { work(0); } catch(IllegalArgumentException error) { trace.append(error==specific); if(pick(a)) break Exit; } } } work(1);',
+      'synchronized(lock) { Exit: { while(step()) { if(pick(a)) break Exit; work(0); } } trace.append(Thread.holdsLock(lock)); } work(1);',
+      'Exit: { while(step()) { synchronized(lock) { if(pick(a)) break Exit; work(0); } } } work(1);',
+      'Outer: for(int index=0;index<3;index++) { Exit: { while(step()) { if(pick(a)) break Exit; if(mode==7) continue Outer; work(0); } } work(1); }',
+      'switch(mode%3) { case 0: Exit: { while(step()) { if(pick(a)) break Exit; work(0); } } break; default: work(0); } work(1);',
+      'Exit: { if(mode==7) break Exit; while(step()) { if(pick(a)) break Exit; work(0); } } work(1);',
+      'Exit: { while(step()) { try { if(pick(a)) break Exit; work(0); } finally { cleanup(); if(mode==7) break Exit; } } } work(1);',
+      'Outer: for(int index=0;index<3;index++) { Exit: { while(step()) { try { if(pick(a)) break Exit; work(0); } finally { cleanup(); if(mode==7) continue Outer; } } } work(1); }',
+      'try { Exit: { while(step()) { if(pick(a)) break Exit; work(0); } } } catch(IllegalArgumentException error) { trace.append(error==specific); } work(1);',
+      'Exit: { try { work(1); } finally { cleanup(); } while(step()) { if(pick(a)) break Exit; work(0); } } work(1);',
+    ];
+    const methods = [];
+    variants.forEach((original, index) => {
+      let rebuilt = original, localized = 0;
+      for (;;) {
+        const next = localizePlainBlockLoopBreaks(rebuilt);
+        if (!next.breaksLocalized) break;
+        rebuilt = next.source; localized += next.breaksLocalized;
+        for (;;) {
+          const cleaned = simplifyControlFrames(rebuilt);
+          if (!cleaned.labelsRemoved && !cleaned.jumpsUnlabeled && !cleaned.blocksUnwrapped) break;
+          rebuilt = cleaned.source;
+        }
+      }
+      assert.equal(localized, index === 16 ? 2 : 1, index);
+      for (const [name, body] of [['original', original], ['rebuilt', rebuilt]])
+        methods.push('static int '+name+index+'(Boolean a,Boolean b) { '+body+' return value; }');
+    });
+    const source = `public class TerminalLoopBreaks {
+      static int mode,value,seen,updates,limit;static Object lock;static StringBuilder trace;
+      static final RuntimeException specific=new IllegalArgumentException(),general=new IllegalStateException();
+      static final Error fatal=new AssertionError();
+      static boolean step(){trace.append('s');return ++seen<=limit;}
+      static void update(){trace.append('u');updates++;}
+      static boolean pick(Boolean boxed){trace.append('p');if(mode==1)throw specific;if(mode==2)throw general;return boxed;}
+      static void work(int index){trace.append('w').append(index).append(lock!=null&&Thread.holdsLock(lock));value+=index+1;if(mode==3)throw specific;if(mode==4)throw fatal;}
+      static void cleanup(){trace.append('f');if(mode==5)throw general;if(mode==6)throw fatal;}
+      ${methods.join('\n')}
+      interface Call {int call();}
+      static String invoke(Call call,boolean nullLock){
+        lock=nullLock?null:new Object();trace=new StringBuilder();value=0;seen=0;updates=0;String result;
+        try{result="ok:"+call.call();}catch(Throwable error){result=error==specific?"specific":error==general?"general":error==fatal?"fatal":error.getClass().getName();}
+        if(lock!=null&&Thread.holdsLock(lock))throw new AssertionError("monitor retained");
+        return result+":"+value+":"+seen+":"+updates+":"+trace;
+      }
+      public static void main(String[]args){int cases=0;limit=2;
+        if(!invoke(()->rebuilt0(true,null),false).equals("ok:2:2:1:0:spw1false"))throw new AssertionError("while exit oracle");
+        if(!invoke(()->rebuilt1(true,null),false).equals("ok:2:2:1:0:spw1false"))throw new AssertionError("for update skipped oracle");
+        if(!invoke(()->rebuilt2(true,null),false).equals("ok:2:2:0:0:pw1false"))throw new AssertionError("do condition skipped oracle");
+        if(!invoke(()->rebuilt3(true,null),false).equals("ok:2:2:0:0:0pw1false"))throw new AssertionError("enhanced exit oracle");
+        if(!invoke(()->rebuilt1(false,null),false).equals("ok:4:4:3:2:spw0falseuspw0falseusw1false"))throw new AssertionError("for normal update oracle");
+        for(mode=0;mode<8;mode++)for(Boolean a:new Boolean[]{null,false,true})for(Boolean b:new Boolean[]{null,false,true})
+        for(int inputLimit:new int[]{0,1,2,4})for(boolean nullLock:new boolean[]{false,true}){limit=inputLimit;
+          ${variants.map((_, index) => `{String expected=invoke(()->original${index}(a,b),nullLock),actual=invoke(()->rebuilt${index}(a,b),nullLock);
+            if(!expected.equals(actual))throw new AssertionError(${index}+":"+mode+":"+a+":"+b+":"+limit+":"+nullLock+":"+expected+" != "+actual);cases++;}`).join('\n')}
+        }
+        if(cases!=11520)throw new AssertionError(cases);System.out.println("terminal-loop-native:"+cases);
+      }
+    }`;
+    const javaFile = path.join(temporary, 'TerminalLoopBreaks.java'); fs.writeFileSync(javaFile, source);
+    run('javac', ['--release', '8', '-d', temporary, javaFile], temporary);
+    assert.equal(run('java', ['-cp', temporary, 'TerminalLoopBreaks'], temporary).trim(), 'terminal-loop-native:11520');
+  } finally { fs.rmSync(temporary, {recursive: true, force: true}); }
 });

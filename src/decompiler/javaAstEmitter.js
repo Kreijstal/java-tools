@@ -886,6 +886,97 @@ function removeFallthroughLabelBreaks(source) {
   return {source: output.slice(2, -2), breaksRemoved: edits.length};
 }
 
+// Exiting the nearest loop also reaches an enclosing plain label when the
+// entire continuation after that loop is empty. Change only the break's target
+// spelling. Inner cleanup still executes on the same abrupt exit; cleanup,
+// switches, other loops and work between the loop and label refuse the proof.
+function localizePlainBlockLoopBreaks(source) {
+  const unchanged = () => ({source, breaksLocalized: 0});
+  const proof = controlCleanupSource(source);
+  if (!proof) return unchanged();
+  const {wrapped, parsed, tokens, starts, closes, children, labelCounts} = proof;
+  const loops = new Set(['WhileStatement', 'ForStatement', 'EnhancedForStatement', 'DoWhileStatement']);
+  const parents = new Map(), targets = new Map(), nearest = new Map(), jumps = [];
+  let refused = false;
+  function inspect(node, parent, labels = [], loopDepth = 0, breakStack = []) {
+    parents.set(node, parent);
+    if (/ClassDeclaration|MethodDeclaration|ConstructorDeclaration|LambdaExpression|AnonymousClass/.test(node.kind || '')) refused = true;
+    if (['BreakStatement', 'ContinueStatement'].includes(node.kind)) {
+      if (node.label) {
+        const target = labels.slice().reverse().find(frame => frame.label === node.label);
+        if (!target || node.kind === 'ContinueStatement' && !loops.has(target.statement?.kind)) refused = true;
+        else targets.set(node, target);
+        if (node.kind === 'BreakStatement') {
+          jumps.push(node);
+          nearest.set(node, breakStack.at(-1));
+        }
+      } else if (!(node.kind === 'ContinueStatement' ? loopDepth : breakStack.length)) refused = true;
+    }
+    if (node.kind === 'ExpressionStatement') {
+      const expression = node.expression;
+      if (!['AssignmentExpression', 'MethodInvocationExpression', 'NewClassExpression'].includes(expression?.kind)
+          && !(expression?.kind === 'UnaryExpression' && ['++', '--'].includes(expression.operator))) refused = true;
+      let index = starts.get(node.range?.startOffset);
+      if (index === undefined) refused = true;
+      else {
+        while (index < tokens.length && tokens[index].text !== ';' && tokens[index].text !== '}') {
+          if (closes.has(index)) index = closes.get(index);
+          index++;
+        }
+        if (tokens[index]?.text !== ';') refused = true;
+      }
+    }
+    children(node, child => inspect(child, node,
+      node.kind === 'LabeledStatement' ? [...labels, node] : labels,
+      loopDepth + (loops.has(node.kind) ? 1 : 0),
+      loops.has(node.kind) || node.kind === 'SwitchStatement' ? [...breakStack, node] : breakStack));
+  }
+  inspect(parsed, null);
+  if (refused || [...labelCounts.values()].some(count => count !== 1)) return unchanged();
+  function blockExtent(node) {
+    const open = starts.get(node.range?.startOffset), close = closes.get(open);
+    return tokens[open]?.text === '{' && tokens[close]?.text === '}'
+      && (!node.statements.length ? close === open + 1
+        : starts.get(node.statements[0].range?.startOffset) === open + 1
+          && node.statements.every(statement => {
+            const start = starts.get(statement.range?.startOffset);
+            return start > open && start < close;
+          }));
+  }
+  const edits = [];
+  for (const jump of jumps) {
+    const target = targets.get(jump), loop = nearest.get(jump);
+    if (!loops.has(loop?.kind) || target?.statement?.kind !== 'BlockStatement' || !blockExtent(target.statement)) continue;
+    const labelStart = starts.get(target.range?.startOffset);
+    if (tokens[labelStart]?.text !== target.label || tokens[labelStart + 1]?.text !== ':') continue;
+    let child = loop, parent = parents.get(child), terminal = true;
+    while (parent && parent !== target) {
+      if (parent.kind === 'BlockStatement') {
+        if (!blockExtent(parent) || parent.statements.at(-1) !== child) { terminal = false; break; }
+      } else if (parent.kind === 'IfStatement') {
+        if (parent.consequent !== child && parent.alternate !== child) { terminal = false; break; }
+      } else if (parent.kind === 'LabeledStatement') {
+        if (parent.statement !== child || child.kind !== 'BlockStatement') { terminal = false; break; }
+      } else {
+        terminal = false; break;
+      }
+      child = parent;
+      parent = parents.get(parent);
+    }
+    if (!terminal || parent !== target || child !== target.statement) continue;
+    const index = starts.get(jump.range?.startOffset);
+    if (tokens[index]?.text !== 'break' || tokens[index + 1]?.text !== jump.label
+        || tokens[index + 2]?.text !== ';') return unchanged();
+    edits.push({start: tokens[index].range.startOffset, end: tokens[index + 2].range.endOffset, text: 'break;'});
+  }
+  if (!edits.length) return unchanged();
+  edits.sort((a, b) => a.start - b.start);
+  if (edits.some((edit, index) => index && edits[index - 1].end > edit.start)) return unchanged();
+  let output = wrapped;
+  for (const edit of edits.slice().reverse()) output = output.slice(0, edit.start) + edit.text + output.slice(edit.end);
+  return {source: output.slice(2, -2), breaksLocalized: edits.length};
+}
+
 // Simplify Java's existing transfer destinations, never infer new CFG edges.
 // A labeled loop jump can lose its label only when the corresponding unlabeled
 // jump would bind to the exact same AST loop/switch. Plain frames may disappear
@@ -2523,6 +2614,7 @@ module.exports = {
   factorLabeledBlockReturnTails,
   simplifyControlFrames,
   removeFallthroughLabelBreaks,
+  localizePlainBlockLoopBreaks,
   foldLabeledBooleanDecisions,
   foldVoidReturnExits,
   foldNestedIfGuards,
