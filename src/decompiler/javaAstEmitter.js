@@ -636,6 +636,150 @@ function removeDeadReceiverSnapshots(source, declarations, carrierNames) {
     declarations: declarations.filter(declaration => !removed.some(name => declaration === candidates.get(name).declaration))};
 }
 
+// A structurer-owned plain exit block already provides a destination for a
+// common return/throw tail. Reuse it rather than introducing another frame.
+// Nested loops and plain labels can be exited by that break, but a try/catch,
+// finally or monitor between the clone and its destination must stay opaque:
+// moving even identical cleanup across it could change exception coverage or
+// monitor ownership. Keep the original tail and all surrounding source bytes.
+function factorLabeledBlockReturnTails(source) {
+  const unchanged = () => ({source, branches: 0});
+  if (/\\u+[0-9a-fA-F]{4}/.test(source)) return unchanged();
+  const wrapped = `{\n${source}\n}`;
+  let parsed, tokens;
+  try {
+    parsed = statementParser.parseStatement(wrapped, {requireComplete: true});
+    const lexed = tokenizeJava(wrapped);
+    if (lexed.diagnostics.length) return unchanged();
+    tokens = lexed.tokens.filter(token => !['whitespace', 'eof'].includes(token.kind));
+    // The lexer skips trivia. Refuse comment delimiters only in gaps between
+    // tokens; delimiters inside quoted literals retain their literal meaning.
+    let previousEnd = 0;
+    for (const token of tokens) {
+      if (/\/\/|\/\*/.test(wrapped.slice(previousEnd, token.range.startOffset))) return unchanged();
+      previousEnd = token.range.endOffset;
+    }
+    if (/\/\/|\/\*/.test(wrapped.slice(previousEnd))) return unchanged();
+  } catch (_) { return unchanged(); }
+  const starts = new Map(tokens.map((token, index) => [token.range.startOffset, index]));
+  const closes = new Map(), stack = [];
+  for (let index = 0; index < tokens.length; index++) {
+    const text = tokens[index].text;
+    if (['(', '[', '{'].includes(text)) stack.push(index);
+    else if ([')', ']', '}'].includes(text)) {
+      const open = stack.pop();
+      if (open === undefined || '([{'.indexOf(tokens[open].text) !== ')]}'.indexOf(text)) return unchanged();
+      closes.set(open, index);
+    }
+  }
+  if (stack.length) return unchanged();
+  const labelCounts = new Map();
+  let unknown = false;
+  function children(node, visit) {
+    for (const [key, child] of Object.entries(node)) {
+      if (['range', 'meta', 'tokens', 'kind'].includes(key)) continue;
+      if (Array.isArray(child)) child.forEach(value => value && typeof value === 'object' && visit(value));
+      else if (child && typeof child === 'object') visit(child);
+    }
+  }
+  function inspect(node) {
+    if (node.kind?.startsWith('Unsupported')) unknown = true;
+    if (node.kind === 'LabeledStatement') labelCounts.set(node.label, (labelCounts.get(node.label) || 0) + 1);
+    children(node, inspect);
+  }
+  inspect(parsed);
+  if (unknown) return unchanged();
+  function spans(node) {
+    let open = starts.get(node.range?.startOffset);
+    // Some parser-owned try/catch/monitor blocks lack their own range. Their
+    // first statement and the immediately preceding opening brace still prove
+    // the complete lexical extent. Empty/unlocated bodies offer no candidates.
+    if (open === undefined) {
+      const first = starts.get(node.statements?.[0]?.range?.startOffset);
+      if (first !== undefined && tokens[first - 1]?.text === '{') open = first - 1;
+    }
+    const close = closes.get(open);
+    if (node.kind !== 'BlockStatement' || tokens[open]?.text !== '{' || tokens[close]?.text !== '}')
+      return [];
+    return node.statements.map((statement, index) => {
+      const first = starts.get(statement.range?.startOffset);
+      const after = index + 1 < node.statements.length
+        ? starts.get(node.statements[index + 1].range?.startOffset) : close;
+      if (first === undefined || after === undefined || first >= after) throw new Error('unproven statement extent');
+      return {statement, first, after, spelling: JSON.stringify(tokens.slice(first, after).map(token => token.text))};
+    });
+  }
+  function safeTail(node) {
+    const forbidden = new Set(['TryStatement', 'SynchronizedStatement', 'LabeledStatement',
+      'WhileStatement', 'ForStatement', 'EnhancedForStatement', 'DoWhileStatement', 'SwitchStatement',
+      'BreakStatement', 'ContinueStatement', 'VariableDeclarator', 'LocalVariableDeclarationStatement']);
+    if (forbidden.has(node.kind)) return false;
+    let safe = true;
+    children(node, child => { if (!safeTail(child)) safe = false; });
+    return safe;
+  }
+  // These are exactly the transparent paths to a clone. Discovery may inspect
+  // protected bodies for a wholly internal candidate, but replacement never
+  // crosses their boundary, even when their source tails happen to match.
+  const transparent = new Set(['BlockStatement', 'IfStatement', 'WhileStatement',
+    'ForStatement', 'EnhancedForStatement', 'DoWhileStatement', 'LabeledStatement']);
+  function find(node) {
+    if (node.kind === 'BlockStatement') {
+      const items = spans(node);
+      const terminal = items.at(-1)?.statement;
+      if (['ReturnStatement', 'ThrowStatement'].includes(terminal?.kind)) {
+        for (let index = 0; index < items.length - 2; index++) {
+          const exit = items[index].statement;
+          if (exit.kind !== 'LabeledStatement' || exit.statement?.kind !== 'BlockStatement'
+              || labelCounts.get(exit.label) !== 1) continue;
+          const tail = items.slice(index + 1);
+          if (!tail.every(item => safeTail(item.statement))) continue;
+          // Only declarations inside the exit block can change a tail name's
+          // binding relative to the following copy. Method locals declared
+          // before that block remain in the same enclosing scope on both paths.
+          // Reject all inner shadows instead of guessing their exact lifetime.
+          const declaredNames = new Set();
+          function declarations(child) {
+            if (['VariableDeclarator', 'FormalParameter'].includes(child.kind)) declaredNames.add(child.name);
+            children(child, declarations);
+          }
+          declarations(exit.statement);
+          if (tokens.slice(tail[0].first, tail.at(-1).after).some(token =>
+              token.kind === 'identifier' && declaredNames.has(token.text))) continue;
+          const edits = [];
+          function replace(child) {
+            if (!transparent.has(child.kind)) return;
+            if (child.kind === 'BlockStatement') {
+              const body = spans(child), suffix = body.slice(-tail.length);
+              if (body.length >= tail.length && suffix.every((item, ordinal) => item.spelling === tail[ordinal].spelling)) {
+                const first = tokens[suffix[0].first], last = tokens[suffix.at(-1).after - 1];
+                if (last.text !== ';') throw new Error('unproven terminal extent');
+                edits.push({start: first.range.startOffset, end: last.range.endOffset, text: `break ${exit.label};`});
+                return;
+              }
+            }
+            children(child, replace);
+          }
+          replace(exit.statement);
+          if (edits.length) return edits;
+        }
+      }
+    }
+    let result;
+    children(node, child => { if (!result) result = find(child); });
+    return result;
+  }
+  try {
+    const edits = find(parsed);
+    if (!edits?.length) return unchanged();
+    edits.sort((a,b) => a.start - b.start);
+    if (edits.some((edit, index) => index && edits[index - 1].end > edit.start)) return unchanged();
+    let output = wrapped;
+    for (const edit of edits.slice().reverse()) output = output.slice(0, edit.start) + edit.text + output.slice(edit.end);
+    return {source: output.slice(2, -2), branches: edits.length};
+  } catch (_) { return unchanged(); }
+}
+
 // Run after stack-carrier cleanup: two copies of the same CFG tail may initially
 // spell the same Boolean argument using different temporary names. Parse the
 // final source for control/scope proofs, while retaining original expression
@@ -1259,6 +1403,7 @@ module.exports = {
   treeToStatements, emitStatements, rawExpression, rawStatement, hasUnreachableStatement,
   promoteBooleanStackCarriers,
   factorCommonBranchTails,
+  factorLabeledBlockReturnTails,
   removeDeadRegionSelectors,
   removeDeadReceiverSnapshots,
 };

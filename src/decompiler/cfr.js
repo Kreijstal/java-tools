@@ -15,7 +15,7 @@ const { listRegionSplitCandidates, applyRegionSplit } = require('../passes/regio
 const { jreClassInfo, jreMethodCandidates } = require('../java-frontend/jreMetadata');
 const { JavaParser } = require('../java-frontend/parser');
 const { tokenizeJava } = require('../java-frontend/lexer');
-const { promoteBooleanStackCarriers, factorCommonBranchTails, removeDeadRegionSelectors, removeDeadReceiverSnapshots } = require('./javaAstEmitter');
+const { promoteBooleanStackCarriers, factorCommonBranchTails, factorLabeledBlockReturnTails, removeDeadRegionSelectors, removeDeadReceiverSnapshots } = require('./javaAstEmitter');
 
 const VERSION = 'CFR-JS 0.4.0';
 const javaStatementParser = new JavaParser();
@@ -1293,6 +1293,7 @@ function formatMethod(cls, method, options = {}) {
     replaceArrayContents(body, normalizedBody);
     ensureMissingSyntheticDeclarations(body);
     widenExceptionLocalsUsedByInstanceof(body, options.exceptionModel);
+    shareExistingExitTails(body);
   }
   const needsUncheckedExceptionBoundary = methodThrowsTypes(method).length === 0
     && methodCallsUncaughtCheckedException(code, method, options.exceptionModel);
@@ -1699,6 +1700,7 @@ function formatStaticInitializer(code, localState, cls, options = {}) {
   const missingDeclarations = localState.missingDeclarations(body);
   if (missingDeclarations.length) body.unshift(...missingDeclarations);
   replaceArrayContents(body, normalizeSyntheticVariableScopes(body));
+  shareExistingExitTails(body);
   assertNoFallback(body, { className: cls.className, methodName: '<clinit>', descriptor: '()V' });
   if (!body.length) return formatBlock('static', body);
 
@@ -1736,6 +1738,20 @@ function formatStaticInitializer(code, localState, cls, options = {}) {
   let helperName = '$cfr$clinit';
   while (methodNames.has(helperName)) helperName += '$';
   return `${formatBlock('static', [`${helperName}();`])}\n\n${formatBlock(`private static void ${helperName}()`, body)}`;
+}
+
+function shareExistingExitTails(body) {
+  // Normalize escaping JVM locals first: otherwise one cleanup copy may still
+  // declare a slot that the following copy assigns. Exact matching must use
+  // their final source identities, never discard an apparent inline shadow.
+  let source = body.join('\n'), changed = false;
+  for (;;) {
+    const shared = factorLabeledBlockReturnTails(source);
+    if (!shared.branches) break;
+    source = shared.source;
+    changed = true;
+  }
+  if (changed) replaceArrayContents(body, source.split('\n'));
 }
 
 function formatBlock(header, body) {

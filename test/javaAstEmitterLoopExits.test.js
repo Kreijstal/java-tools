@@ -7,7 +7,7 @@ const os = require('os');
 const path = require('path');
 const {spawnSync} = require('child_process');
 const {treeToStatements, emitStatements, promoteBooleanStackCarriers, factorCommonBranchTails,
-  removeDeadRegionSelectors, removeDeadReceiverSnapshots} = require('../src/decompiler/javaAstEmitter');
+  removeDeadRegionSelectors, removeDeadReceiverSnapshots, factorLabeledBlockReturnTails} = require('../src/decompiler/javaAstEmitter');
 const {printTree} = require('../src/decompiler/structurer');
 const {JavaParser} = require('../src/java-frontend/parser');
 const {decompileClassFile, assertNoFallback} = require('../src/decompiler/cfr');
@@ -288,6 +288,100 @@ function run(command, args, directory) {
     return fs.readFileSync(files[0], 'utf8');
   } finally { fds.forEach(fd => fs.closeSync(fd)); }
 }
+
+test('existing exit blocks share terminal clones across loops without crossing protected scopes', () => {
+  const source = 'Exit: { while (again) { if (stop) { publish(); return; } step(); } } publish(); return;';
+  const factored = factorLabeledBlockReturnTails(source);
+  assert.equal(factored.branches, 1);
+  assert.equal(factored.source, 'Exit: { while (again) { if (stop) { break Exit; } step(); } } publish(); return;');
+  assert.deepEqual(factorLabeledBlockReturnTails(factored.source), {source:factored.source,branches:0});
+  for (const source of [
+    'Exit: { try { publish(); return; } finally { cleanup(); } } publish(); return;',
+    'Exit: { try { publish(); return; } catch (RuntimeException error) { recover(); } } publish(); return;',
+    'Exit: { synchronized (lock) { publish(); return; } } publish(); return;',
+    'Exit: { if (stop) { int value=1; publish(value); return value; } } publish(value); return value;',
+    'Exit: { if (stop) { int value=1; publish(); return; } } int value=1; publish(); return;',
+    'Exit: { if (stop) { publish(); return other(); } } publish(); return done();',
+    'Exit: { if (stop) { other(); return done(); } } publish(); return done();',
+    'Exit: { if (stop) { return; } } return;',
+    'Exit: while (again) { if (stop) { publish(); return; } } publish(); return;',
+    'Exit: { if (stop) { publish(); /* retained */ return; } } publish(); return;',
+    'Exit: { if (stop) { publish("\\u0061"); return; } } publish("\\u0061"); return;',
+  ]) assert.deepEqual(factorLabeledBlockReturnTails(source), {source,branches:0},source);
+  const protectedInside = 'try { Exit: { while (again) { if (stop) { publish(); return; } step(); } } publish(); return; } catch (RuntimeException error) { recover(); }';
+  const inside = factorLabeledBlockReturnTails(protectedInside);
+  assert.equal(inside.branches, 1);
+  assert.match(inside.source, /try \{ Exit: \{ while/);
+  assert.match(inside.source, /break Exit;/);
+  const multiple = 'Exit: { Left: while (a) { if (stop) { publish(); return; } break Left; } Right: { if (stop) { publish(); return; } } } publish(); return;';
+  assert.equal(factorLabeledBlockReturnTails(multiple).branches, 2);
+  const enclosingLocal = 'int value=7; Exit: { while (again) { if (stop) { publish(value); return value; } step(); } } publish(value); return value;';
+  assert.equal(factorLabeledBlockReturnTails(enclosingLocal).branches, 1);
+});
+
+test('existing exit-block cleanup matches native loop effects, failures and monitor ownership', () => {
+  const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'cfr-existing-exit-tails-'));
+  try {
+    const tail='finish(x,trace); return done(trace);';
+    const variants=[
+      `Exit: { if (flag) { ${tail} } before(x,trace); } ${tail}`,
+      `Exit: { while (counter < 5) { trace.append('w'); if (counter++ == stop) { ${tail} } if (flag) continue; before(x,trace); } } ${tail}`,
+      `Exit: { for (int index=0;index<5;index++) { counter++; if (index == stop) { ${tail} } if (flag) continue; before(x,trace); } } ${tail}`,
+      `Exit: { do { trace.append('o'); if (counter++ == stop) { ${tail} } if (flag) break; before(x,trace); } while (counter < 5); } ${tail}`,
+      `Exit: { for (int entry : new int[]{0,1,2,3,4}) { counter++; if (entry == stop) { ${tail} } before(x,trace); } } ${tail}`,
+      `Exit: { Inner: { for (int index=0;index<5;index++) { counter++; if (flag && index == stop) { ${tail} } if (index == 3) break Inner; before(x,trace); } } trace.append('b'); } ${tail}`,
+      'synchronized (lock) { Exit: { while (counter < 5) { if (counter++ == stop) { locked(x,lock,trace); return done(trace); } before(x,trace); } } locked(x,lock,trace); return done(trace); }',
+      `try { Exit: { while (counter < 5) { if (counter++ == stop) { ${tail} } before(x,trace); } } ${tail} } catch (IllegalArgumentException failure) { trace.append('c'); return done(trace); } finally { trace.append('z'); counter++; }`,
+      `Exit: { while (counter < 5) { if (counter++ == stop) { try { ${tail} } finally { trace.append('z'); counter++; } } before(x,trace); } } ${tail}`,
+      'Exit: { while (counter < 5) { if (counter++ == stop) { synchronized (lock) { locked(x,lock,trace); return done(trace); } } before(x,trace); } } locked(x,lock,trace); return done(trace);',
+      `Exit: { while (counter < 5) { if (counter++ == stop) { if (flag) { try { ${tail} } finally { trace.append('z'); } } ${tail} } before(x,trace); } } ${tail}`,
+      "Exit: { while (counter < 5) { if (counter++ == stop) { trace.append('f'); throw sentinel; } before(x,trace); } } trace.append('f'); throw sentinel;",
+      'Exit: { if (flag) { double value=x; finish(value,trace); return done(trace); } before(x,trace); } finish(value,trace); return done(trace);',
+      `Exit: { if (flag) { ${tail} } ${'counter += 0; '.repeat(150)} before(x,trace); } ${tail}`,
+      `Exit: { while (counter < 5) { if (counter++ == stop) { finish(x,trace); return other(trace); } before(x,trace); } } ${tail}`,
+      `int saved=stop; Exit: { while (counter < 5) { if (counter++ == stop) { trace.append(saved); ${tail} } before(x,trace); } } trace.append(saved); ${tail}`,
+    ];
+    const methods=[];
+    variants.forEach((original,index)=>{
+      const result=factorLabeledBlockReturnTails(original);
+      if ([8,9,12,14].includes(index)) assert.equal(result.branches,0,original);
+      else assert.ok(result.branches > 0,original);
+      assert.doesNotMatch(result.source, /sharedTailExit_/);
+      assert.deepEqual(factorLabeledBlockReturnTails(result.source), {source:result.source,branches:0});
+      for (const [label,body] of [['original',original],['rebuilt',result.source]])
+        methods.push(`static String ${label}${index}(boolean flag,int stop,double x,Object lock) {
+          StringBuilder trace=new StringBuilder(); try { ${body} }
+          catch (RuntimeException failure) { return failure.getClass().getName()+":"+trace+":"+(failure == sentinel); }
+        }`);
+    });
+    const source=`public class ExistingExitTails {
+      static int mode,counter; static double value=3;
+      static final IllegalStateException sentinel=new IllegalStateException();
+      static void before(double x,StringBuilder trace) { trace.append('b'); if (mode == 1 && x == 7) throw new IndexOutOfBoundsException(); }
+      static void finish(double x,StringBuilder trace) { trace.append('f'); if (mode == 2 && Double.isNaN(x)) throw new IllegalArgumentException(); trace.append(Double.doubleToRawLongBits(x)); }
+      static void locked(double x,Object lock,StringBuilder trace) { trace.append(Thread.holdsLock(lock)?'l':'u'); finish(x,trace); }
+      static String done(StringBuilder trace) { trace.append('d'); if (mode == 3) throw sentinel; return trace.toString(); }
+      static String other(StringBuilder trace) { trace.append('!'); return done(trace); }
+      ${methods.join('\n')}
+      public static void main(String[] args) {
+        Object lock=new Object();
+        for (mode=0;mode<4;mode++) for (boolean flag:new boolean[]{false,true})
+          for (int stop:new int[]{0,2,4,7}) for (double x:new double[]{-1,-0d,7,Double.NaN}) {
+            ${variants.map((_,index)=>`{
+              counter=0; String expected=original${index}(flag,stop,x,lock); int expectedCounter=counter;
+              counter=0; String actual=rebuilt${index}(flag,stop,x,lock);
+              if (!expected.equals(actual) || counter != expectedCounter || Thread.holdsLock(lock))
+                throw new AssertionError(${index}+":"+mode+":"+flag+":"+stop+":"+x+":"+expected+":"+actual+":"+expectedCounter+":"+counter);
+              System.out.println(${index}+":"+mode+":"+flag+":"+stop+":"+x+":"+actual+":"+counter);
+            }`).join('\n')}
+          }
+      }
+    }`;
+    const file=path.join(temporary,'ExistingExitTails.java');fs.writeFileSync(file,source);
+    run('javac',['--release','8','-d',temporary,file],temporary);
+    assert.equal(run('java',['-cp',temporary,'ExistingExitTails'],temporary).trim().split('\n').length,2048);
+  } finally {fs.rmSync(temporary,{recursive:true,force:true});}
+});
 
 test('emitted nested-loop and protected exits match native Java effect order', () => {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-emitter-loop-exits-'));

@@ -1183,3 +1183,33 @@ loop recovered as a for loop. All 19,558 declarations and 388 override
 relationships remain; declaration reordering requires 14 guarded naming-map
 ordinal migrations. Native fixtures and source reconstruction do not establish
 whole-game equivalence or browser/phone performance.
+
+### Sharing return cleanup through an existing exit block
+
+After local-variable scope normalization, `factorLabeledBlockReturnTails`
+matches a plain labeled block followed by a return/throw tail. An identical
+terminal copy inside that block can become a break to its existing label.
+This shares the cleanup without adding another labeled frame, helper method
+or dispatcher. Conditions, preceding effects, local declarations, the final
+tail and all other source bytes remain at their original locations.
+
+Replacement can traverse nested loops, ordinary blocks, conditionals and
+labels. It never crosses try/catch/finally, synchronized or switch bodies.
+Discovery can operate wholly inside a protected region or monitor; both copies
+must stay in that same region. Exact token spelling, complete parsed extents,
+unique label identity and absence of inner declarations shadowing tail names
+are required. Tail declarations, protected/control constructs, unsupported
+syntax, Unicode escapes and embedded comments refuse the transformation.
+Declarations before the exit block remain in the same enclosing scope and
+are supported. Running before normalization would mistake an escaping JVM
+local's temporary inline declaration for a different identity, so the pass
+runs only after the existing scope reconstruction.
+
+The emitter tests add refusal checks and 2,048 native comparisons across while,
+for, enhanced-for and do loops, early exits/continues, nested labels, surrounding
+protected/monitor regions, side effects, signed zero/NaN, failure ordering,
+throwable identity, shadows and enclosing locals. Protected/monitor crossings
+remain intact in the negative cases. The fixed GeoBlox corpus removes one
+13-line duplicate publication tail from the Bzip2 run emitter; its other 302
+files and diagnostics remain unchanged. The large loop/label structure is
+still present, and broader reconstruction requires separate proofs.
