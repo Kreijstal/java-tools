@@ -88,6 +88,7 @@ function collectDiagnostics(outputs) {
   const files = [];
   const obfuscationGuards = [];
   const structuredPartitions = [];
+  const intArgumentBridges = [];
   const totals = { stackUnderflow: 0, rawControlFlow: 0, placeholders: 0, stateMachineFallback: 0 };
   for (const { name, source, diagnostics = [] } of outputs) {
     const stateMachineFallbacks = diagnostics.filter((item) => item && item.kind === 'stateMachineFallback');
@@ -96,6 +97,9 @@ function collectDiagnostics(outputs) {
     }
     for (const partition of diagnostics.filter((item) => item && item.kind === 'structuredMethodPartition')) {
       structuredPartitions.push({name, ...partition});
+    }
+    for (const bridge of diagnostics.filter(item => item && item.kind === 'intArgumentBridge')) {
+      intArgumentBridges.push({name,...bridge});
     }
     const counts = {
       stackUnderflow: (source.match(/stack-underflow/g) || []).length,
@@ -121,6 +125,7 @@ function collectDiagnostics(outputs) {
     files,
     obfuscationGuards,
     structuredPartitions,
+    ...(intArgumentBridges.length ? {intArgumentBridges} : {}),
   };
 }
 

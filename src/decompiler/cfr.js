@@ -2,6 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const JSZip = require('jszip');
 const { getAST } = require('jvm_parser');
 const { convertJson } = require('../parsing/convert_tree');
@@ -318,9 +319,17 @@ function decompileAstRoot(astRoot, options = {}) {
   // class so a call into any sibling resolves).
   const exceptionModel = options.exceptionModel || buildExceptionModel(astRoot.classes || []);
   const scopedOptions = { ...options, exceptionModel };
-  return (astRoot.classes || [])
-    .map((cls) => decompileClassAst(cls, scopedOptions))
-    .join('\n\n');
+  if (options.exceptionModel) return (astRoot.classes || [])
+    .map(cls => decompileClassAst(cls,scopedOptions)).join('\n\n');
+  const parsed = (astRoot.classes || []).map(cls => ({name:cls.className+'.class',astRoot:{classes:[cls]}}));
+  const outputs = parsed.map(entry => {
+    const diagnostics = [];
+    return {name:entry.name.replace(/\.class$/,'.java'), diagnostics,
+      source:decompileClassAst(entry.astRoot.classes[0],{...scopedOptions,diagnostics})};
+  });
+  finalizeIntArgumentBridges(outputs,parsed,scopedOptions,exceptionModel);
+  if (Array.isArray(options.diagnostics)) options.diagnostics.push(...outputs.flatMap(output => output.diagnostics));
+  return outputs.map(output => output.source).join('\n\n');
 }
 
 function detectObfuscationGuards(cls) {
@@ -400,6 +409,7 @@ async function decompilePath(inputPath, options = {}) {
         console.error(`[cfr-class-done] ${Date.now() - started}ms ${file}`);
       }
     }
+    finalizeIntArgumentBridges(outputs,parsed,{...options,inputBaseDir:inputPath},exceptionModel);
     outputs.failures = failures;
     return outputs;
   }
@@ -416,7 +426,7 @@ async function decompilePath(inputPath, options = {}) {
       parsed.push({ name, astRoot: convertParsedClass(result) });
     }
     const exceptionModel = buildExceptionModel(parsed.flatMap((entry) => entry.astRoot.classes || []));
-    return parsed.filter(({ astRoot }) =>
+    const outputs = parsed.filter(({ astRoot }) =>
       !isEnumConstantBodyClass((astRoot.classes || [])[0], exceptionModel)).map(({ name, astRoot }) => {
       const diagnostics = [];
       return {
@@ -425,6 +435,8 @@ async function decompilePath(inputPath, options = {}) {
         diagnostics,
       };
     });
+    finalizeIntArgumentBridges(outputs,parsed,options,exceptionModel);
+    return outputs;
   }
 
   if (!inputPath.toLowerCase().endsWith('.class')) {
@@ -534,6 +546,8 @@ function decompileClassAst(cls, options = {}) {
     methodText.split('\n').forEach((line) => out.push(`    ${line}`.replace(/\s+$/g, '')));
     if (index < methods.length - 1) out.push('');
   });
+
+  appendIntArgumentBridges(out,cls,renderOptions);
 
   if (renderOptions.requiresSneakyThrow) {
     if (methods.length) out.push('');
@@ -1431,7 +1445,9 @@ function buildExceptionModel(classes) {
       );
     }
   }
-  return { methodThrows, superOf, interfacesOf, classInfo, sourceNameToInternal, instantiatedTypes };
+  return { methodThrows, superOf, interfacesOf, classInfo, sourceNameToInternal, instantiatedTypes,
+    intArgumentBridges: new Map(), emittedIntArgumentBridges: new Set(),
+    staticCallOwners: new Map(), intArgumentBridgeDirtyOwners: new Set() };
 }
 
 function hasUnimplementedAbstractMethods(cls, model) {
@@ -5626,13 +5642,93 @@ function emitStaticCall(lines, stack, arg, currentInternalClassName, localState)
   const descriptor = parseDescriptor(ref.descriptor);
   const args = popArgs(stack, descriptor.params.length);
   const owner = sourceOwnerType(ref.owner, localState);
-  const renderedArgs = formatCallArguments(ref, descriptor, args, localState && localState.exceptionModel);
-  const call = `${owner}.${sourceMethodName(ref.name)}(${renderedArgs.join(', ')})`;
+  const model = localState && localState.exceptionModel;
+  const bridge = intArgumentBridgeForCall(ref, descriptor, args, model, currentInternalClassName);
+  const renderedArgs = formatCallArguments(ref, bridge ? parseDescriptor(bridge.descriptor) : descriptor, args, model);
+  const call = `${owner}.${bridge ? bridge.name : sourceMethodName(ref.name)}(${renderedArgs.join(', ')})`;
   const returnType = simplifyType(descriptor.returnType);
   if (returnType === 'void') {
     lines.push(`${call};`);
   } else {
     stack.push(expr(call, returnType, 100, { statementExpression: true }));
+  }
+}
+
+// A JVM byte/short/char argument is an int slot: invocation does not execute
+// i2b/i2s/i2c. An obfuscated branch can forward a full-width stack carrier into
+// such a parameter. A source cast would change the value. Keep the original
+// signature, and emit a deterministic int-parameter body for these owned static
+// targets. No virtual dispatch, external declaration or constructor is changed.
+function intArgumentBridgeForCall(ref, descriptor, args, model, callerOwner) {
+  if (!model || !model.intArgumentBridges) return null;
+  const key = `${ref.owner}#${ref.name}#${ref.descriptor}`;
+  if (callerOwner) {
+    if (!model.staticCallOwners.has(key)) model.staticCallOwners.set(key,new Set());
+    model.staticCallOwners.get(key).add(callerOwner);
+  }
+  if (model.intArgumentBridges.has(key)) return model.intArgumentBridges.get(key);
+  const narrow = new Set(['byte', 'short', 'char']);
+  if (!descriptor.params.some((type, index) => narrow.has(type)
+      && args[index] && args[index].type === 'int'
+      && /^stackIn_\d+_\d+$/.test(args[index].code))) return null;
+  const cls = model.classInfo.get(ref.owner);
+  const method = cls && (cls.items || []).map(item => item.method).find(candidate =>
+    candidate && candidate.name === ref.name && candidate.descriptor === ref.descriptor);
+  if (!method || !(method.flags || []).includes('static') || !getCode(method)
+      || (method.flags || []).some(flag => ['native','abstract'].includes(flag))
+      || (cls.flags || []).some(flag => ['interface','enum'].includes(flag))) return null;
+  const suffix = crypto.createHash('sha256').update(ref.name + ref.descriptor).digest('hex').slice(0,12);
+  let name = `$cfr$intArgs$${sourceMethodName(ref.name)}$${suffix}`;
+  const names = new Set((cls.items || []).filter(item => item.method).map(item => sourceMethodName(item.method.name)));
+  while (names.has(name)) name += '$';
+  // Replace primitive parameter descriptors only; array/reference types and
+  // the return descriptor must remain byte-for-byte unchanged.
+  const boundary = ref.descriptor.indexOf(')');
+  const parameterDescriptor = ref.descriptor.slice(1,boundary).replace(/\[*L[^;]+;|\[*[ZBCSIJFD]/g, token =>
+    /^[BSC]$/.test(token) ? 'I' : token);
+  const bridge = {key, owner: ref.owner, name, descriptor: '(' + parameterDescriptor + ref.descriptor.slice(boundary), method};
+  model.intArgumentBridges.set(key,bridge);
+  for (const owner of model.staticCallOwners.get(key) || []) model.intArgumentBridgeDirtyOwners.add(owner);
+  model.intArgumentBridgeDirtyOwners.add(ref.owner);
+  return bridge;
+}
+
+function appendIntArgumentBridges(out, cls, options) {
+  const model = options.exceptionModel;
+  if (!model || !model.intArgumentBridges) return;
+  // Rendering a body can discover another owned target. Iterate to a fixed
+  // point within this class; cross-class discovery is finalized by the driver.
+  const rendered = new Set();
+  for (const [key, bridge] of model.intArgumentBridges) {
+    if (bridge.owner !== cls.className || rendered.has(key)) continue;
+    rendered.add(key);
+    const method = {...bridge.method, name: bridge.name, descriptor: bridge.descriptor,
+      flags: (bridge.method.flags || []).filter(flag => !['bridge','synthetic','varargs'].includes(flag))};
+    out.push('', '    /* Full JVM integer arguments; original narrow signature preserved. */');
+    formatMethod(cls,method,options).split('\n').forEach(line => out.push('    ' + line.replace(/\s+$/g,'')));
+    model.emittedIntArgumentBridges.add(key);
+    if (Array.isArray(options.diagnostics)) options.diagnostics.push({kind:'intArgumentBridge',
+      className:cls.className, methodName:bridge.method.name, descriptor:bridge.method.descriptor,
+      sourceMethodName:bridge.name, sourceDescriptor:bridge.descriptor});
+  }
+}
+
+function finalizeIntArgumentBridges(outputs, parsed, options, model) {
+  const byOwner = new Map(parsed.map(entry => [(entry.astRoot.classes || [])[0]?.className,entry]));
+  for (;;) {
+    const pending = [...model.intArgumentBridges.values()].filter(bridge => !model.emittedIntArgumentBridges.has(bridge.key));
+    const owners = [...new Set([...pending.map(bridge => bridge.owner),...model.intArgumentBridgeDirtyOwners])];
+    if (!owners.length) return;
+    for (const owner of owners) {
+      model.intArgumentBridgeDirtyOwners.delete(owner);
+      const entry = byOwner.get(owner);
+      const output = entry && outputs.find(item => item.name === (entry.name
+        ? entry.name.replace(/\.class$/i,'.java') : javaOutputName(entry.file,options.inputBaseDir)));
+      if (!entry || !output) throw new Error('Cannot emit int argument bridge for ' + owner);
+      const diagnostics = [];
+      output.source = decompileAstRoot(entry.astRoot,{...options, exceptionModel:model, diagnostics});
+      output.diagnostics = diagnostics;
+    }
   }
 }
 
@@ -10567,5 +10663,6 @@ module.exports = {
     rewriteWhileLoopsAsFor,
     rewriteWhileAsFor,
     printCfgStateMachine,
+    intArgumentBridgeForCall,
   },
 };

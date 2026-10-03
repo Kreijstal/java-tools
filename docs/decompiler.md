@@ -1377,3 +1377,32 @@ All 303 files compile. Ordered declaration/reference/override identities remain
 19,558/118,944/388, with no local ordinal migrations; diagnostics are unchanged.
 Real assets, whole-game execution and browser/phone performance are not proved
 by this structural comparison.
+
+
+### Full integer arguments to narrow static parameters
+
+The JVM uses integer slots for byte, short and char parameters. An invocation
+performs no implicit `i2b`, `i2s` or `i2c`. In GeoBlox, a nonzero control flag
+forwards a depth comparison operand through a stack carrier into the face
+collector's byte guard. The value -8170 must remain -8170; a Java byte cast
+changes it to 22 and incorrectly skips sprite-reference cleanup.
+
+For an owned static target reached with an int-typed `stackIn` carrier at a
+narrow parameter, the renderer adds a deterministic `$cfr$intArgs$...` entry
+point with int parameters. The original method/signature remains. The added
+body uses the same bytecode with full-width parameter locals; array/reference
+parameters and the return descriptor are preserved. Calls to a selected target
+use the new entry point. Earlier callers and owners are rendered again when a
+later class discovers the need, so directory/JAR traversal order cannot leave
+an unresolved helper. Names use a descriptor hash and avoid existing names.
+Diagnostics list the original and generated identities.
+
+The native regression compares 201 invocation results through directory, JAR
+and multi-class AST exports, including -8170, byte/short/char limits, integer
+extremes and canonical original-signature calls. Separate checks cover name
+collisions, arrays/references and refusal for unavailable, nonstatic,
+native/abstract and interface/enum targets. This is a correction for owned
+static calls through stack carriers; arbitrary direct int expressions,
+external methods, virtual dispatch, constructors and boolean encodings remain
+outside its proof. The original and generated bodies currently coexist, which
+adds source size rather than simplifying this particular method.
