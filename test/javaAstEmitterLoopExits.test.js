@@ -8,7 +8,7 @@ const path = require('path');
 const {spawnSync} = require('child_process');
 const {treeToStatements, emitStatements, promoteBooleanStackCarriers, factorCommonBranchTails,
   removeDeadRegionSelectors, removeDeadReceiverSnapshots, factorLabeledBlockReturnTails,
-  simplifyControlFrames, foldLabeledBooleanDecisions, foldVoidReturnExits} = require('../src/decompiler/javaAstEmitter');
+  simplifyControlFrames, foldLabeledBooleanDecisions, foldVoidReturnExits, foldNestedIfGuards} = require('../src/decompiler/javaAstEmitter');
 const {printTree} = require('../src/decompiler/structurer');
 const {JavaParser} = require('../src/java-frontend/parser');
 const {decompileClassFile, assertNoFallback} = require('../src/decompiler/cfr');
@@ -1833,5 +1833,88 @@ test('void exit recovery matches native cleanup overriding, failure identity and
     const file=path.join(temporary,'VoidReturnExits.java');fs.writeFileSync(file,source);
     run('javac',['--release','8','-d',temporary,file],temporary);
     assert.equal(run('java',['-cp',temporary,'VoidReturnExits'],temporary).trim(),'void-return-native:46080');
+  } finally {fs.rmSync(temporary,{recursive:true,force:true});}
+});
+
+
+test('nested if guards preserve predicate bytes and innermost declaration scopes', () => {
+  const source='if(first()){ if(second()){ if(third()){ int local=1; use(local); } } }';
+  const result=foldNestedIfGuards(source);
+  assert.deepEqual(result,{source:'if ((first()) && (second()) && (third())) { int local=1; use(local); }',guardsFolded:1,conditionsMerged:2});
+  assert.deepEqual(foldNestedIfGuards(result.source),{source:result.source,guardsFolded:0,conditionsMerged:0});
+  const protectedSource='try { synchronized(lock) { if(a){if(b){try { work(); } finally { clean(); }}} } } catch(RuntimeException error){recover();}';
+  assert.equal(foldNestedIfGuards(protectedSource).guardsFolded,1);
+  const scope='if(a){ if(b){ int value=1; use(value); } } int value=2; use(value);';
+  assert.equal(foldNestedIfGuards(scope).source,'if ((a) && (b)) { int value=1; use(value); } int value=2; use(value);');
+  const formatted='if (a) {\n  if (b) {\n    work();\n  }\n}';
+  assert.equal(foldNestedIfGuards(formatted).source,'if ((a) &&\n    (b)) {\n  work();\n}');
+  for (const source of [
+    'if(a){if(b){work();}else{other();}}',
+    'if(a){if(b){work();}}else{other();}',
+    'if(a){prefix();if(b){work();}}',
+    'if(a){int value=1;if(b){use(value);}}',
+    'if(a){Scope:{if(b){break Scope;}}}',
+    'if(a){try{if(b){work();}}finally{clean();}}',
+    'if(a){synchronized(lock){if(b){work();}}}',
+    'if(a){/*keep*/if(b){work();}}',
+    'if(a){if(b){work();}} //keep',
+    'if(a){if(b){work();}} trailing',
+    'if(a){if(b){work()}}',
+    'if(a){if(b){Runnable r=()->work();}}',
+    'if(a){if(b){Object r=new Object(){void run(){work();}};}}',
+    'if(a) if(b) work();',
+    'if(a){if(b){work();}}\\u000a',
+    Array.from({length:17},()=> 'if(a){').join('')+'work();'+'}'.repeat(17),
+    'if('+Array(520).fill('a').join('&&')+'){if(b){work();}}',
+  ]) assert.deepEqual(foldNestedIfGuards(source),{source,guardsFolded:0,conditionsMerged:0},source);
+});
+
+test('nested if guards match native short circuits, unboxing, scopes and cleanup ownership', () => {
+  const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'cfr-nested-guards-native-'));
+  try {
+    const p=id=>`p(${id},mask,fail)`;
+    const chains=[
+      `if(${p(0)}){if(${p(1)}){if(${p(2)}){value++;trace.append('B');}}}`,
+      `if(boxed){if(${p(0)}){if(d!=d){value++;}}}`,
+      `if(!${p(0)}){if(d<=0){if(!boxed){value+=3;}}}`,
+      `if(${p(0)}){if(${p(1)} || ${p(2)}){int local=value+7;value=local;}} int local=13;value+=local;`,
+      `if(${p(0)}){if(${p(1)}){throw failure;}}`,
+      `if(${p(0)}){if(${p(1)}){return "early:"+value+":"+trace;}}`,
+      `if(${p(0)}){if(${p(1)}){try{value=24/(mask-2);}finally{trace.append('I').append(Thread.holdsLock(lock));}}}`,
+      `if((value+=3)>0){if(${p(0)}){if((value+=5)>2){trace.append('V').append(value);}}}`,
+      `if(true){if(true){final int local=5;value=local;}}`,
+      `if(${p(0)}){if(${p(1)}){if(boxed){trace.append('b');}else{trace.append('n');}}}`,
+      `if(${p(0)}){if(${p(1)}){synchronized(lock){trace.append('L').append(Thread.holdsLock(lock));value++;}}}`,
+      `if(${p(0)}){if(${p(1)}){for(int i=0;i<3;i++){if(i==1)continue;value+=i;}}}`,
+    ];
+    const methods=[];
+    for(const [index,chain]of chains.entries()) {
+      const original=`int value=initial;try { ${index%2?`synchronized(lock){${chain}}`:chain} }
+        catch(RuntimeException error){if(error instanceof IllegalArgumentException && error!=failure)throw new AssertionError("identity");trace.append(error.getClass().getSimpleName()).append(value).append(Thread.holdsLock(lock));}
+        finally{trace.append('F').append(value).append(Thread.holdsLock(lock));} return value+":"+calls+":"+trace;`;
+      const result=foldNestedIfGuards(original);assert.equal(result.guardsFolded,1,index);
+      for(const [name,body]of [['original',original],['rebuilt',result.source]]) methods.push(`static String ${name}${index}(int mask,int fail,Boolean boxed,double d,int initial){${body}}`);
+    }
+    const source=`public class NestedGuards {
+      static final Object lock=new Object();static final IllegalArgumentException failure=new IllegalArgumentException();
+      static final StringBuilder trace=new StringBuilder();static int calls;
+      static boolean p(int id,int mask,int fail){trace.append(id).append(Thread.holdsLock(lock));if(++calls==fail)throw failure;return (mask&(1<<id))!=0;}
+      static void reset(){calls=0;trace.setLength(0);}
+      ${methods.join('\n')}
+      public static void main(String[] args)throws Exception {
+        int cases=0;for(int variant=0;variant<12;variant++)for(int mask=0;mask<8;mask++)for(int fail=0;fail<5;fail++)
+        for(Boolean boxed:new Boolean[]{null,Boolean.FALSE,Boolean.TRUE})for(double d:new double[]{-1,-0.0,7,Double.NaN})for(int initial:new int[]{-7,0,9}){
+          java.lang.reflect.Method before=NestedGuards.class.getDeclaredMethod("original"+variant,int.class,int.class,Boolean.class,double.class,int.class);
+          java.lang.reflect.Method after=NestedGuards.class.getDeclaredMethod("rebuilt"+variant,int.class,int.class,Boolean.class,double.class,int.class);
+          reset();Object expected=before.invoke(null,mask,fail,boxed,d,initial)+":"+calls+":"+trace;if(Thread.holdsLock(lock))throw new AssertionError("before lock");
+          reset();Object actual=after.invoke(null,mask,fail,boxed,d,initial)+":"+calls+":"+trace;if(Thread.holdsLock(lock))throw new AssertionError("after lock");
+          if(!expected.equals(actual))throw new AssertionError(variant+":"+mask+":"+fail+":"+expected+":"+actual);cases++;
+        }
+        if(cases!=17280)throw new AssertionError(cases);System.out.println("nested-guard-native:"+cases);
+      }
+    }`;
+    const file=path.join(temporary,'NestedGuards.java');fs.writeFileSync(file,source);
+    run('javac',['--release','8','-d',temporary,file],temporary);
+    assert.equal(run('java',['-cp',temporary,'NestedGuards'],temporary).trim(),'nested-guard-native:17280');
   } finally {fs.rmSync(temporary,{recursive:true,force:true});}
 });

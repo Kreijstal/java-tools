@@ -1342,3 +1342,38 @@ reference identities/spellings plus 388 override rows match the prior corpus.
 Applying only the two documented rules to the previous bodies produces the
 exact token streams of all 303 regenerated files. The frame-only AST proof from
 pass77 remains historical; it is not evidence for replacing breaks with returns.
+
+### Folding nested braced guards
+
+`foldNestedIfGuards` runs after control-frame cleanup. A braced `if` whose body
+contains only another braced `if`, with no alternate on either statement,
+becomes a left-to-right short-circuit `&&` guard. Conditions keep their original
+bytes and parentheses; the innermost body block retains its declarations and
+scope. No expression, effect, try/finally or monitor crosses a protected boundary.
+The renderer dedents only whitespace and wraps ordinary multiline guards.
+
+An alternate, intervening statement/declaration, label or protected wrapper
+stops a chain. Comments, Unicode escapes, nested executable bodies, unsupported
+syntax and invalid statement expressions refuse reconstruction. Operand and
+predicate budgets are 16 conditions and 512 tokens; an oversized chain remains
+intact rather than folding its suffix. The parser and matching lexical braces
+must prove every header and block extent.
+
+`NODE_PATH=/path/to/dependencies node test/javaAstEmitterLoopExits.test.js`
+passes 46 tests; the optional pass77 frame-only corpus check remains skipped.
+The two new groups include 17,280 native comparisons of short-circuit calls,
+nullable unboxing, floating/NaN conditions, primitive/partial stores, throwing
+operands, early returns, body declaration scopes, catch/finally effects and
+monitor ownership/release. Final state is compared after invocation, including
+finally effects on early-return paths. The exception-loop suite passes eight
+groups.
+
+The fixed GeoBlox corpus folds 710 guard chains, merging 913 nested conditions
+across 131 files. It removes 913 lines (79,632 to 78,719), including the nine
+optional-array null checks in mesh projection. Independent JDK source positions
+locate method and initializer bodies; applying only guard folding and retained
+frame cleanup to the prior corpus reproduces all 303 regenerated token streams.
+All 303 files compile. Ordered declaration/reference/override identities remain
+19,558/118,944/388, with no local ordinal migrations; diagnostics are unchanged.
+Real assets, whole-game execution and browser/phone performance are not proved
+by this structural comparison.

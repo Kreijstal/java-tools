@@ -1024,6 +1024,95 @@ function foldLabeledBooleanDecisions(source) {
   return {source:output.slice(2,-2),decisions:edits.length,literalStoresRemoved};
 }
 
+// A declaration-free chain of braced ifs with no alternate performs exactly
+// the same left-to-right short circuit as &&. Keep the innermost block and all
+// predicate bytes: no expression, declaration or protected boundary moves.
+function foldNestedIfGuards(source) {
+  const unchanged = () => ({source, guardsFolded: 0, conditionsMerged: 0});
+  const proof = controlCleanupSource(source);
+  if (!proof) return unchanged();
+  const {wrapped, parsed, tokens, starts, closes, children} = proof;
+  let refused = false;
+  function inspect(node) {
+    if (/ClassDeclaration|MethodDeclaration|ConstructorDeclaration|LambdaExpression|AnonymousClass/.test(node.kind || '')) refused = true;
+    if (node.kind === 'ExpressionStatement') {
+      const expression = node.expression;
+      if (!['AssignmentExpression', 'MethodInvocationExpression', 'NewClassExpression'].includes(expression?.kind)
+          && !(expression?.kind === 'UnaryExpression' && ['++','--'].includes(expression.operator))) refused = true;
+      let index = starts.get(node.range?.startOffset);
+      if (index === undefined) refused = true;
+      else {
+        while (index < tokens.length && tokens[index].text !== ';' && tokens[index].text !== '}') {
+          if (closes.has(index)) index = closes.get(index);
+          index++;
+        }
+        if (tokens[index]?.text !== ';') refused = true;
+      }
+    }
+    children(node, inspect);
+  }
+  inspect(parsed);
+  if (refused) return unchanged();
+  function header(node) {
+    const start = starts.get(node.range?.startOffset), close = closes.get(start + 1);
+    if (node.kind !== 'IfStatement' || node.alternate || node.consequent?.kind !== 'BlockStatement'
+        || tokens[start]?.text !== 'if' || tokens[start + 1]?.text !== '(' || close === undefined
+        || tokens[close + 1]?.text !== '{' || closes.get(close + 1) === undefined) return null;
+    return {node, start, close, open: close + 1, end: closes.get(close + 1),
+      text: wrapped.slice(tokens[start + 1].range.endOffset, tokens[close].range.startOffset),
+      weight: close - start - 2};
+  }
+  function indentation(position) {
+    const start = wrapped.lastIndexOf('\n', position - 1) + 1;
+    const prefix = wrapped.slice(start, position);
+    return /^[ \t]*$/.test(prefix) ? prefix : null;
+  }
+  const edits = [];
+  let conditionsMerged = 0;
+  function find(node) {
+    const first = header(node);
+    if (first) {
+      const chain = [first];
+      for (;;) {
+        const statements = chain.at(-1).node.consequent.statements;
+        if (statements.length !== 1) break;
+        const next = header(statements[0]);
+        if (!next) break;
+        chain.push(next);
+      }
+      if (chain.length > 1) {
+        // Oversized chains remain intact; do not fold a suffix merely to get
+        // around the predicate/operand budget.
+        if (chain.length > 16 || chain.reduce((sum, part) => sum + part.weight, 0) > 512) return;
+        const last = chain.at(-1), start = tokens[first.start].range.startOffset;
+        const outerIndent = indentation(start), innerIndent = indentation(tokens[last.start].range.startOffset);
+        const separator = outerIndent === null || innerIndent === null ? ' && ' : ` &&\n${outerIndent}    `;
+        const predicate = chain.map(part => `(${part.text})`).join(separator);
+        let body = wrapped.slice(tokens[last.open].range.startOffset, tokens[last.end].range.endOffset);
+        // Whitespace-only dedenting is independent of semantic reconstruction.
+        // Preserve compact/unusual layouts and the bytes of every Java token.
+        if (outerIndent !== null && innerIndent !== null && innerIndent.startsWith(outerIndent)) {
+          const excess = innerIndent.length - outerIndent.length;
+          const lines = body.split('\n');
+          body = lines.map((line, index) => index && /^[ \t]*$/.test(line.slice(0, excess))
+            && line.length >= excess ? line.slice(excess) : line).join('\n');
+        }
+        edits.push({start, end: tokens[first.end].range.endOffset, text: `if (${predicate}) ${body}`});
+        conditionsMerged += chain.length - 1;
+        return;
+      }
+    }
+    children(node, find);
+  }
+  find(parsed);
+  if (!edits.length) return unchanged();
+  edits.sort((a,b) => a.start - b.start);
+  if (edits.some((edit,index) => index && edits[index-1].end > edit.start)) return unchanged();
+  let output = wrapped;
+  for (const edit of edits.slice().reverse()) output = output.slice(0, edit.start) + edit.text + output.slice(edit.end);
+  return {source: output.slice(2,-2), guardsFolded: edits.length, conditionsMerged};
+}
+
 // A consumed block break immediately followed by a bare return has no work or
 // value evaluation left at its destination. Both transfers leave the same
 // cleanup regions, even when a finally overrides them. Completion is separate:
@@ -1836,6 +1925,7 @@ module.exports = {
   simplifyControlFrames,
   foldLabeledBooleanDecisions,
   foldVoidReturnExits,
+  foldNestedIfGuards,
   removeDeadRegionSelectors,
   removeDeadReceiverSnapshots,
 };
