@@ -1515,3 +1515,45 @@ block labels; board reconciliation shrinks 504 to 502 lines and 17 to 16 labels.
 The instrument-patch constructor now has no labels and 466 lines. There remain
 21 large method spans, 12 with block labels. Complete gameplay/assets and
 browser/phone acceptance remain unverified.
+
+### Recovering ordered multi-exit decisions
+
+`foldLabeledExitTrees` extends conditional-alternative reconstruction to multiple
+breaks to one unique plain block. Each selected braced arm must end in a direct
+break to that destination. Its remaining sequence becomes an alternate; nested
+selected arms use the same proof. Every destination reference must be consumed
+before removing its label. Effects between decisions stay inside the fallback
+that originally reached them. A pure fallback conditional becomes `else if`
+only when no prefix work/declaration needs a surrounding block.
+
+Bare-break arms become logical-negation guards when a fallback remains. A live
+predicate with no remaining effects still executes in an empty conditional arm.
+Original predicate bytes/order, scopes, early returns and ancestor transfers
+remain; no work/predicate is duplicated and no local is added. Target breaks in
+intermediate loops, switches or protected wrappers refuse reconstruction.
+Existing alternates carrying target exits, unsupported syntax, comments, Unicode
+escapes, nested executables, invalid transfers and unknown extents also refuse it.
+Budgets are 16 recovered choices, depth 16 and 32 target references per frame;
+an oversized tree stays intact. Enclosing and branch-local protected regions
+remain intact rather than being moved across the new alternatives.
+
+`NODE_PATH=/path/to/dependencies JAVA_TOOL_OPTIONS=-XX:-UsePerfData node test/javaAstEmitterLoopExits.test.js`
+passes 54 groups with one optional historical corpus check skipped. Two new
+groups include 16,128 native comparisons plus first/second/fallback oracles.
+Fixtures cover short-circuit/unboxing failures, ordered predicate/work traces,
+NaNs, interleaved effects, scopes, nested destinations, ancestor break/continue,
+returns, finally state after invocation and monitor ownership/release. Exception
+and integer-argument regressions retain eight and two passing groups.
+
+The fixed GeoBlox corpus reconstructs 27 frames, 75 breaks and 75 choices
+(18 ordinary guards), unwraps 27 scope-safe blocks and removes 126 lines across
+24 files (78,296 to 78,170). The compact music controller decoder becomes an
+ordered alternative chain, reducing its constructor 541 to 519 lines with no
+block labels. Bzip2 block decoding also loses its last block label, shrinking
+388 to 385 lines. Gameplay rendering falls 390 to 385 lines and 20 to 19 labels;
+menu action handling falls 335 to 325 lines and 20 to 18 labels. Independent JDK
+body positions plus only these documented rules reproduce all 303 token streams.
+Raw sources compile; ordered 19,591 declarations/119,181 references/388 override
+rows and diagnostics remain unchanged. There remain 21 large method spans,
+10 with block labels. Larger reconstructions and whole-game/browser/phone
+acceptance remain unfinished or unverified.

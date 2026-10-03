@@ -8,7 +8,7 @@ const path = require('path');
 const {spawnSync} = require('child_process');
 const {treeToStatements, emitStatements, promoteBooleanStackCarriers, factorCommonBranchTails,
   removeDeadRegionSelectors, removeDeadReceiverSnapshots, factorLabeledBlockReturnTails,
-  simplifyControlFrames, removeFallthroughLabelBreaks, foldLabeledBooleanDecisions, foldVoidReturnExits, foldNestedIfGuards, foldLabeledSkipGuards, foldLabeledIfElseExits} = require('../src/decompiler/javaAstEmitter');
+  simplifyControlFrames, removeFallthroughLabelBreaks, foldLabeledBooleanDecisions, foldVoidReturnExits, foldNestedIfGuards, foldLabeledSkipGuards, foldLabeledIfElseExits, foldLabeledExitTrees} = require('../src/decompiler/javaAstEmitter');
 const {printTree} = require('../src/decompiler/structurer');
 const {JavaParser} = require('../src/java-frontend/parser');
 const {decompileClassFile, assertNoFallback} = require('../src/decompiler/cfr');
@@ -2208,5 +2208,106 @@ test('labeled if/else exits match native branch selection, scopes, transfers and
     const javaFile=path.join(temporary,'IfElseExits.java');fs.writeFileSync(javaFile,source);
     run('javac',['--release','8','-d',temporary,javaFile],temporary);
     assert.equal(run('java',['-cp',temporary,'IfElseExits'],temporary).trim(),'if-else-exit-native:6720');
+  }finally{fs.rmSync(temporary,{recursive:true,force:true});}
+});
+
+test('ordered exit trees require every destination reference and preserve scopes and predicate bytes',()=>{
+  const plain='Exit: { if(a()) { work(); break Exit; } if(b()) { other(); break Exit; } tail(); }';
+  assert.deepEqual(foldLabeledExitTrees(plain),{source:'{ if(a()) { work(); } else if(b()) { other(); } else { tail(); }}',framesRemoved:1,jumpsRemoved:2,choicesRecovered:2,guardsRecovered:0});
+  const guard=foldLabeledExitTrees('Exit: { int local=1; if(a()) { break Exit; } if(b()) { break Exit; } tail(); }');
+  assert.equal(guard.guardsRecovered,2);assert.match(guard.source,/if \(!\(a\(\)\)\)/);
+  assert.match(simplifyControlFrames(guard.source).source,/^\{/);
+  const nested=foldLabeledExitTrees('Exit: { if(a()) { if(b()) { work(); break Exit; } other(); break Exit; } tail(); }');
+  assert.equal(nested.jumpsRemoved,2);assert.match(nested.source,/if\(b\(\)\) \{ work\(\); \} else \{ other\(\); \}/);
+  const livePredicate=foldLabeledExitTrees('Exit: { if(a()) { if(b()) { break Exit; } break Exit; } tail(); }');
+  assert.match(livePredicate.source,/if\(b\(\)\) \{\s*\}/);
+  const longChain=n=>'Exit: { '+Array.from({length:n},(_,i)=>'if(p'+i+'()) { work(); break Exit; }').join(' ')+' tail(); }';
+  assert.equal(foldLabeledExitTrees(longChain(16)).choicesRecovered,16);
+  for(const source of [longChain(17),
+    'Exit: { if(a()) { work(); break Exit; } tail(); }',
+    'Exit: { if(a()) { work(); break Exit; } else { other(); } if(b()) { break Exit; } tail(); }',
+    'Exit: { if(a()) { if(b()) { break Exit; } } if(b()) { break Exit; } tail(); }',
+    'Exit: { if(a()) { break Exit; work(); } if(b()) { break Exit; } tail(); }',
+    'Exit: { if(a()) { try { break Exit; } finally { work(); } break Exit; } tail(); }',
+    'Exit: { if(a()) { synchronized(lock) { break Exit; } break Exit; } tail(); }',
+    'Exit: { while(a()) { break Exit; } if(b()) { break Exit; } tail(); }',
+    'Exit: { switch(value) { case 0: break Exit; } if(b()) { break Exit; } tail(); }',
+    'Exit: { if(a()) break Exit; if(b()) { break Exit; } tail(); }',
+    'Exit: { if(a()) { continue Exit; } if(b()) { break Exit; } tail(); }',
+    'Exit: { continue; if(a()) { break Exit; } if(b()) { break Exit; } tail(); }',
+    'Exit: { break Other; if(a()) { break Exit; } if(b()) { break Exit; } tail(); }',
+    'Exit: { if(a()) { break Exit; } if(b()) { break Exit; } tail(); } Exit: { work(); }',
+    'Exit: { class Local { void run() {} } if(a()) { break Exit; } if(b()) { break Exit; } tail(); }',
+    'Exit: { Runnable r=()->work(); if(a()) { break Exit; } if(b()) { break Exit; } tail(); }',
+    'Exit: { /*keep*/ if(a()) { break Exit; } if(b()) { break Exit; } tail(); }',
+    'Exit: { \\u0061(); if(a()) { break Exit; } if(b()) { break Exit; } tail(); }',
+    'Exit: { raw; if(a()) { break Exit; } if(b()) { break Exit; } tail(); }',
+    'Exit: { if(a()) { break Exit; } if(b()) { break Exit; } tail() }',
+    'Exit: { if(a()) { break Exit; } if(b()) { break Exit; } tail(); } }',
+  ])assert.deepEqual(foldLabeledExitTrees(source),{source,framesRemoved:0,jumpsRemoved:0,choicesRecovered:0,guardsRecovered:0},source);
+});
+
+test('ordered exit trees match native predicate ordering, exclusive effects, scopes and cleanup',()=>{
+  const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'cfr-exit-tree-native-'));
+  try {
+    const chain='if(pick(0,a)) { work(0); break Exit; } if(pick(1,b)) { work(1); break Exit; } work(2);';
+    const variants=[
+      'Exit: { '+chain+' }',
+      'Exit: { if(pick(0,a)) { if(pick(1,b)) { work(0); break Exit; } work(1); break Exit; } work(2); }',
+      'Exit: { work(3); if(pick(0,a)) { work(0); break Exit; } work(4); if(pick(1,b)) { work(1); break Exit; } work(2); }',
+      'Exit: { int local=++value; if(pick(0,a)) { trace.append(local); break Exit; } if(pick(1,b)) { int other=7; trace.append(other); break Exit; } trace.append(local); work(2); }',
+      'Exit: { if(pick(0,a)) { break Exit; } if(pick(1,b)) { break Exit; } work(2); }',
+      'Exit: { if(pick(0,a)) { if(pick(1,b)) { break Exit; } break Exit; } work(2); }',
+      'try { Exit: { '+chain+' } } finally { cleanup(); }',
+      'synchronized(lock) { Exit: { '+chain+' } trace.append(Thread.holdsLock(lock)); }',
+      'Exit: { if(pick(0,a)) { try { work(0); } finally { cleanup(); } break Exit; } if(pick(1,b)) { work(1); break Exit; } work(2); }',
+      'Exit: { if(pick(0,a)) { work(0); break Exit; } if(pick(1,b)) { work(1); break Exit; } try { work(2); } finally { cleanup(); } }',
+      'Outer: for(int index=0;index<3;index++) { Exit: { if(pick(0,a)) { if(mode==7) continue Outer; work(0); break Exit; } if(pick(1,b)) { work(1); break Exit; } work(2); } }',
+      'switch(mode%3) { case 0: Exit: { '+chain+' } break; default: work(3); }',
+      'Outer: { Exit: { if(pick(0,a)) { if(mode==7) break Outer; work(0); break Exit; } if(pick(1,b)) { if(mode==7) return value; work(1); break Exit; } work(2); } work(3); }',
+      'Exit: { if(floating<0d) { work(0); break Exit; } if(pick(0,a)) { if(pick(1,b)) { work(1); break Exit; } work(2); break Exit; } work(3); }',
+      'Exit: { if(pick(0,a)) { if(mode==7) { work(3); } else { work(4); } break Exit; } if(pick(1,b)) { work(1); break Exit; } work(2); }',
+      'Exit: { if(pick(0,a)) { Inner: { if(pick(1,b)) { work(0); break Inner; } if(mode==7) { work(1); break Inner; } work(2); } break Exit; } if(pick(1,b)) { work(3); break Exit; } work(4); }',
+    ];
+    const methods=[];
+    variants.forEach((original,index)=>{
+      let rebuilt=original,frames=0;
+      for(;;){const next=foldLabeledExitTrees(rebuilt);if(!next.framesRemoved)break;rebuilt=next.source;frames+=next.framesRemoved;
+        for(;;){const cleaned=simplifyControlFrames(rebuilt);if(!cleaned.labelsRemoved&&!cleaned.jumpsUnlabeled&&!cleaned.blocksUnwrapped)break;rebuilt=cleaned.source;}
+      }
+      assert.ok(frames>0,index);
+      for(const [name,body]of[['original',original],['rebuilt',rebuilt]])methods.push('static int '+name+index+'(Boolean a,Boolean b,double floating) { '+body+' return value; }');
+    });
+    const source=`public class ExitTrees {
+      static int mode,value,seen;static Object lock;static StringBuilder trace;
+      static final RuntimeException specific=new IllegalArgumentException(),general=new IllegalStateException();
+      static final Error fatal=new AssertionError();
+      static boolean pick(int index,Boolean boxed){trace.append('p').append(index);if(mode==1&&index==0)throw specific;if(mode==2&&index==1)throw general;return boxed;}
+      static void work(int index){trace.append('w').append(index).append(lock!=null&&Thread.holdsLock(lock));value+=index+1;if(mode==3)throw general;if(mode==4)throw fatal;}
+      static void cleanup(){trace.append('f');seen=value;if(mode==5)throw general;if(mode==6)throw fatal;}
+      ${methods.join('\n')}
+      interface Call {int call();}
+      static String invoke(Call call,boolean nullLock){
+        lock=nullLock?null:new Object();trace=new StringBuilder();value=0;seen=-1;String result;
+        try{result="ok:"+call.call();}catch(Throwable error){result=error==specific?"specific":error==general?"general":error==fatal?"fatal":error.getClass().getName();}
+        if(lock!=null&&Thread.holdsLock(lock))throw new AssertionError("monitor retained");
+        return result+":"+value+":"+seen+":"+trace;
+      }
+      public static void main(String[]args){int cases=0;
+        if(!invoke(()->rebuilt0(true,null,0),false).equals("ok:1:1:-1:p0w0false"))throw new AssertionError("first selection oracle");
+        if(!invoke(()->rebuilt0(false,true,0),false).equals("ok:2:2:-1:p0p1w1false"))throw new AssertionError("second selection oracle");
+        if(!invoke(()->rebuilt0(false,false,0),false).equals("ok:3:3:-1:p0p1w2false"))throw new AssertionError("fallback oracle");
+        for(mode=0;mode<8;mode++)for(Boolean a:new Boolean[]{null,false,true})for(Boolean b:new Boolean[]{null,false,true})
+        for(double floating:new double[]{Double.NEGATIVE_INFINITY,-1,-0d,0d,1,Double.POSITIVE_INFINITY,Double.NaN})
+        for(boolean nullLock:new boolean[]{false,true}){
+          ${variants.map((_,index)=>`{String expected=invoke(()->original${index}(a,b,floating),nullLock),actual=invoke(()->rebuilt${index}(a,b,floating),nullLock);
+            if(!expected.equals(actual))throw new AssertionError(${index}+":"+mode+":"+a+":"+b+":"+floating+":"+nullLock+":"+expected+" != "+actual);cases++;}`).join('\n')}
+        }
+        if(cases!=16128)throw new AssertionError(cases);System.out.println("exit-tree-native:"+cases);
+      }
+    }`;
+    const javaFile=path.join(temporary,'ExitTrees.java');fs.writeFileSync(javaFile,source);
+    run('javac',['--release','8','-d',temporary,javaFile],temporary);
+    assert.equal(run('java',['-cp',temporary,'ExitTrees'],temporary).trim(),'exit-tree-native:16128');
   }finally{fs.rmSync(temporary,{recursive:true,force:true});}
 });
