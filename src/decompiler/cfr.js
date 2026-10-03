@@ -10,6 +10,7 @@ const {
   buildCfgFromCode, printTree, structuredStatements, emitStatements, hasUnreachableStatement,
 } = require('./structurer');
 const { structureMethod } = require('./exceptionStructurer');
+const { mergeDuplicateLoopIncrementTails } = require('./loopTailMerge');
 const { listRegionSplitCandidates, applyRegionSplit } = require('../passes/regionSplit');
 const { jreClassInfo, jreMethodCandidates } = require('../java-frontend/jreMetadata');
 const { JavaParser } = require('../java-frontend/parser');
@@ -1877,7 +1878,15 @@ function decompileCode(code, method, cls, localState, options = {}) {
     const instruction = getInstructionFromItem(item);
     return instruction && (instruction.op === 'jsr' || instruction.op === 'jsr_w' || instruction.op === 'ret');
   });
-  if (!hasLegacyJsr) nopNormallyUnreachableBlocks(code);
+  if (!hasLegacyJsr) {
+    // Tail-duplicated loop latches (`iinc; goto head` copied into every
+    // predecessor) structure as a loop with one increment per arm. Re-share
+    // them first so both the range recognizer and the CFG structurer see the
+    // single latch the source had. Pure tail merge; see loopTailMerge.js.
+    // CFR_JS_DISABLE_LOOP_TAIL_MERGE=1 keeps the duplicated shape for A/B runs.
+    if (process.env.CFR_JS_DISABLE_LOOP_TAIL_MERGE !== '1') mergeDuplicateLoopIncrementTails(code);
+    nopNormallyUnreachableBlocks(code);
+  }
   const codeItemsForSelection = code.codeItems || [];
   if (hasLegacyJsr) {
     const legacyJsr = decompileLegacyJsrStateMachine(code, method, cls, localState);

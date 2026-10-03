@@ -56,6 +56,7 @@ const {
   getOp, parseMethodDescriptor, liveExceptionRanges, MATH_INTRINSICS,
 } = require('./wasmShared');
 const { collectRefdLabels } = require('../decompiler/structurer');
+const { getStackEffect } = require('../analysis/opgraph/stackEffects');
 
 const SHORT_LOCAL = /^([ilfda])(load|store)_([0-3])$/;
 const LONG_LOCAL = /^([ilfda])(load|store)$/;
@@ -94,10 +95,80 @@ function supportedCalleeOp(op, ins) {
   return false;
 }
 
+function iincOf(ins) {
+  if (!ins || typeof ins !== 'object') return null;
+  const slot = ins.varnum !== undefined ? ins.varnum
+    : Array.isArray(ins.arg) ? ins.arg[0] : ins.arg;
+  const by = ins.incr !== undefined ? ins.incr
+    : Array.isArray(ins.arg) ? ins.arg[1] : undefined;
+  return { slot: Number(slot), by: Number(by) };
+}
+
+function intLoadSlot(ins, op) {
+  let m;
+  if ((m = SHORT_LOCAL.exec(op))) return m[1] === 'i' && m[2] === 'load' ? Number(m[3]) : null;
+  if ((m = LONG_LOCAL.exec(op)) && m[1] === 'i' && m[2] === 'load' && ins && typeof ins === 'object') {
+    return Number(ins.arg);
+  }
+  return null;
+}
+
+// A spliced loop runs without the caller's fuel check (no caller pc to exit
+// at), so it is admitted only when it provably terminates. The shape javac
+// emits for `for (int s = -n; s < 0; s++)` and `for (; s < b; s++)`:
+//
+//   t:   iload s; ifge|ifgt X            (or iload s; iload b; if_icmpge|gt X)
+//        ... body: forward branches only, nothing branches to t or to i ...
+//   i-1: iinc s, c (c > 0)
+//   i:   goto t
+//
+// Every iteration passes the iinc (the goto is reached only by falling
+// through it), nothing else writes s, and the header exits once s reaches 0
+// (or the invariant b, stepping by 1 so it cannot jump over it): a counter
+// that starts below the bound reaches it without wrapping.
+function countedBackEdge(items, labels, i, t) {
+  const back = items[i].instruction;
+  if (getOp(back) !== 'goto' || i < 1) return false;
+  const inc = iincOf(items[i - 1].instruction);
+  if (getOp(items[i - 1].instruction) !== 'iinc' || !inc ||
+      !Number.isInteger(inc.slot) || !(inc.by > 0)) return false;
+  const s = inc.slot;
+  const head = items[t] && items[t].instruction;
+  if (intLoadSlot(head, getOp(head)) !== s) return false;
+  let exitAt = t + 1;
+  let bound = null;
+  const second = items[t + 1] && items[t + 1].instruction;
+  const secondOp = getOp(second);
+  if (secondOp === 'ifge' || secondOp === 'ifgt') {
+    exitAt = t + 1;
+  } else {
+    bound = intLoadSlot(second, secondOp);
+    const cmp = items[t + 2] && getOp(items[t + 2].instruction);
+    if (bound === null || bound === s || inc.by !== 1 ||
+        !(cmp === 'if_icmpge' || cmp === 'if_icmpgt')) return false;
+    exitAt = t + 2;
+  }
+  const exitTarget = labels.get(items[exitAt].instruction.arg);
+  if (exitTarget === undefined || exitTarget <= i) return false;
+  for (let k = t; k <= i; k += 1) {
+    const ins = items[k].instruction;
+    const op = getOp(ins);
+    const stored = storedSlot(ins, op);
+    if (k !== i - 1 && (stored === s || (bound !== null && stored === bound))) return false;
+    if (BRANCH_OP.test(op) && k !== i) {
+      const target = labels.get(ins.arg);
+      if (target === undefined || target === t || target === i || target < t) return false;
+    }
+  }
+  return true;
+}
+
 // Walks the callee's normal flow from item 0. Returns the reachable item set,
 // or null if the callee has a loop, an unknown branch target, or any
 // reachable op the structured backend cannot emit. Instance invokes are
-// admitted only when the caller may recursively splice them.
+// admitted only when the caller may recursively splice them; with
+// opts.countedLoops a provably terminating counted loop is admitted, and
+// with opts.staticCalls an invokestatic the caller splices in turn.
 function analyzeCallee(code, maxItems, opts = {}) {
   const items = code.codeItems;
   if (!items || items.length > maxItems) return null;
@@ -116,14 +187,21 @@ function analyzeCallee(code, maxItems, opts = {}) {
     if (RETURN_OP.test(op)) continue;
     if (BRANCH_OP.test(op)) {
       const target = labels.get(ins.arg);
-      // backward edges would loop without a fuel check inside the caller
-      if (target === undefined || target <= i) return null;
+      if (target === undefined) return null;
+      // backward edges would loop without a fuel check inside the caller,
+      // unless the loop provably terminates (countedBackEdge)
+      if (target <= i && !(opts.countedLoops &&
+          countedBackEdge(items, labels, i, target))) return null;
       work.push(target);
       if (op !== 'goto') work.push(i + 1);
       continue;
     }
     if (INSTANCE_INVOKE.test(op)) {
       if (!opts.instanceCalls) return null;
+      work.push(i + 1);
+      continue;
+    }
+    if (op === 'invokestatic' && opts.staticCalls && !supportedCalleeOp(op, ins)) {
       work.push(i + 1);
       continue;
     }
@@ -195,6 +273,9 @@ function planStaticInline(ctx, ins, base, maxItems) {
   const methodAst = clsAst.items.filter((x) => x.type === 'method').map((x) => x.method)
     .find((mm) => mm.name === name && mm.descriptor === descriptor);
   if (!methodAst || !(methodAst.flags || []).includes('static')) return null;
+  // ACC_SYNCHRONIZED has no explicit monitor bytecodes to splice. Keep the
+  // call boundary so the frame-based linker/interpreter owns its class lock.
+  if ((methodAst.flags || []).includes('synchronized')) return null;
   const codeAttr = methodAst.attributes && methodAst.attributes.find((a) => a.type === 'code');
   if (!codeAttr) return null;
   // Splicing foreign code must not bypass an observable class initializer —
@@ -239,14 +320,33 @@ function planStaticInline(ctx, ins, base, maxItems) {
 // stubs are elided when the dispatch pick is decidable from the caller
 // class, keeping the module fully compiled — the site still records a
 // specSite so entry revalidation catches later-loaded overriders.
+// Trace the receiver backwards through straight-line argument evaluation.
+// Slot counts include category-2 values. A join, call, or stack shuffle makes
+// the origin ambiguous, so keep the ordinary guard in those cases.
+function receiverIsThis(items, index, targeted) {
+  const call = items[index];
+  const isTargeted = item => item.labelDef && targeted.has(item.labelDef.slice(0, -1));
+  if (isTargeted(call)) return false;
+  const {params} = parseMethodDescriptor(call.instruction.arg[2][1]);
+  let above = paramSlotsOf(params, 0).end;
+  for (let i = index - 1; i >= 0; i--) {
+    const item = items[i], ins = item.instruction, op = getOp(ins);
+    if (above === 0 && (op === 'aload_0' ||
+        op === 'aload' && String(ins.arg) === '0')) return true;
+    if (!op || isTargeted(item) || BRANCH_OP.test(op) ||
+        /^(invoke|.*switch$|.*return$|athrow$|jsr|ret$)/.test(op)) return false;
+    const effect = getStackEffect(op, ins);
+    if (!effect || effect.special || effect.pushSlots > above) return false;
+    above += effect.popSlots - effect.pushSlots;
+  }
+  return false;
+}
+
 function planInstanceSite(ctx, ins, op, callerClassName, alloc, depth, recvIsThis) {
   if (!Array.isArray(ins.arg)) return null;
   const [, owner, [name, descriptor]] = ins.arg;
   if (name === '<init>' || name === '<clinit>') return null;
   const { params } = parseMethodDescriptor(descriptor);
-  // With arguments on the stack the aload_0 before the invoke is the last
-  // argument, not the receiver.
-  if (params.length) recvIsThis = false;
   let impls;
   let guards = null; // instanceof classes aligned with impls; null = ifnonnull only
   let elide = false;
@@ -376,6 +476,56 @@ function planInstanceSite(ctx, ins, op, callerClassName, alloc, depth, recvIsThi
   };
 }
 
+// Deep inlining: a static call inside a spliced instance body (Geoblox's
+// sprite draw calling its blit). Statically bound, so no guard and no deopt
+// stub; its locals sit above every slot allocated so far. The callee itself
+// must be a leaf (no calls) whose loops are proven counted.
+function planInteriorStatic(ctx, ins, alloc) {
+  if (!Array.isArray(ins.arg)) return null;
+  const [, className, [name, descriptor]] = ins.arg;
+  const cd = ctx.jvm.classes[className];
+  const clsAst = cd && cd.ast && cd.ast.classes[0];
+  if (!clsAst) return null;
+  const methodAst = clsAst.items.filter((x) => x.type === 'method').map((x) => x.method)
+    .find((mm) => mm.name === name && mm.descriptor === descriptor);
+  const flags = (methodAst && methodAst.flags) || [];
+  if (!methodAst || !flags.includes('static') || flags.includes('synchronized') ||
+      flags.includes('native')) return null;
+  const hasClinit = clsAst.items.filter((x) => x.type === 'method')
+    .some((x) => x.method.name === '<clinit>');
+  if (hasClinit && ctx.jvm.classInitializationState.get(className) !== 'INITIALIZED') return null;
+  const codeAttr = methodAst.attributes && methodAst.attributes.find((a) => a.type === 'code');
+  if (!codeAttr) return null;
+  const code = codeAttr.code;
+  const labelIndex = new Map();
+  code.codeItems.forEach((it, idx) => { if (it.labelDef) labelIndex.set(it.labelDef.slice(0, -1), idx); });
+  if (liveExceptionRanges(ctx.jvm, code, labelIndex).length) return null;
+  const reachable = analyzeCallee(code, ctx.maxCalleeItems, { countedLoops: true });
+  if (!reachable) return null;
+  let heapWrite = false;
+  for (const idx of reachable) {
+    const it = code.codeItems[idx];
+    const op = getOp(it.instruction);
+    if (CAST_OK.test(op)) return null;
+    if (HEAP_WRITE.test(op)) heapWrite = true;
+  }
+  const { params } = parseMethodDescriptor(descriptor);
+  const { slots } = paramSlotsOf(params, 0);
+  const base = alloc.next;
+  alloc.next = base + (Number(code.localsSize) || paramSlotsOf(params, 0).end);
+  const prefix = `IN${ctx.k++}_`;
+  const items = [];
+  for (let i = params.length - 1; i >= 0; i -= 1) {
+    items.push({ instruction: { op: STORE_OP[params[i]] || 'astore', arg: String(base + slots[i]) } });
+  }
+  code.codeItems.forEach((item, idx) => items.push({
+    labelDef: item.labelDef ? prefix + item.labelDef : undefined,
+    instruction: renumberInstruction(item, base, prefix, reachable.has(idx), `${prefix}RET`),
+  }));
+  items.push({ labelDef: `${prefix}RET:`, instruction: 'nop' });
+  return { items, hasHeapWrite: heapWrite };
+}
+
 function buildCalleeBody(ctx, impl, alloc, retLabel, depth) {
   const { className, method } = impl;
   const flags = method.flags || [];
@@ -393,6 +543,8 @@ function buildCalleeBody(ctx, impl, alloc, retLabel, depth) {
   if (liveExceptionRanges(ctx.jvm, code, labelIndex).length) return null;
   const reachable = analyzeCallee(code, ctx.maxCalleeItems, {
     instanceCalls: depth + 1 < ctx.maxDepth,
+    countedLoops: ctx.deepInline,
+    staticCalls: ctx.deepInline && depth + 1 < ctx.maxDepth,
   });
   if (!reachable) return null;
 
@@ -421,8 +573,8 @@ function buildCalleeBody(ctx, impl, alloc, retLabel, depth) {
 
   // Interior receiver-is-this detection mirrors inlineCalls: the callee is an
   // instance method, so its slot 0 holds its own `this` unless something
-  // stores over it. A zero-arg interior invoke directly following aload_0 at
-  // an untargeted item then has this body's receiver as its receiver — and
+  // stores over it. A straight-line argument sequence traced back to aload_0
+  // then proves this body's receiver is the call's receiver — and
   // the branch guard (or outer elision) already bounds that receiver's
   // runtime class by `className`, so planInstanceSite can elide its guard.
   const calleeThisStable = !items.some((it) => {
@@ -447,11 +599,8 @@ function buildCalleeBody(ctx, impl, alloc, retLabel, depth) {
     const op = getOp(item.instruction);
     const lbl = item.labelDef ? prefix + item.labelDef : undefined;
     if (reachable.has(idx) && INSTANCE_INVOKE.test(op)) {
-      const prevOp = idx > 0 ? getOp(items[idx - 1].instruction) : null;
       const interiorRecvIsThis = calleeThisStable &&
-        !(item.labelDef && targeted.has(item.labelDef.slice(0, -1))) &&
-        (prevOp === 'aload_0' ||
-          (prevOp === 'aload' && String(items[idx - 1].instruction.arg) === '0'));
+        receiverIsThis(items, idx, targeted);
       const site = planInstanceSite(ctx, item.instruction, op, className, alloc,
         depth + 1, interiorRecvIsThis);
       if (!site) return null;
@@ -462,6 +611,15 @@ function buildCalleeBody(ctx, impl, alloc, retLabel, depth) {
       if (heapWrite && !site.elided) return null;
       site.items.forEach((s, si) => out.push(si === 0 && lbl ? { ...s, labelDef: lbl } : s));
       out.push({ labelDef: `${site.prefix}RET:`, instruction: 'nop' });
+      if (site.hasHeapWrite) heapWrite = true;
+      continue;
+    }
+    if (reachable.has(idx) && op === 'invokestatic' && ctx.deepInline &&
+        !supportedCalleeOp(op, item.instruction)) {
+      const site = planInteriorStatic(ctx, item.instruction, alloc);
+      if (!site) return null;
+      out.push({ labelDef: lbl, instruction: 'nop' });
+      for (const s of site.items) out.push(s);
       if (site.hasHeapWrite) heapWrite = true;
       continue;
     }
@@ -493,6 +651,9 @@ function inlineCalls(jvm, codeAttr, options = {}) {
     specSites: [],
     guardSites: [],
     elidedThisGuards: 0,
+    // Deep inlining (opt-in): splice static calls inside instance callees
+    // and provably counted loops (planInteriorStatic, countedBackEdge).
+    deepInline: options.deepInline === true,
   };
   // Slot 0 holds `this` for the whole method only when nothing ever stores
   // over it (javac never does; obfuscated code may).
@@ -511,15 +672,30 @@ function inlineCalls(jvm, codeAttr, options = {}) {
       if (typeof l === 'string') targetedLabels.add(l.endsWith(':') ? l.slice(0, -1) : l);
     }
   }
-  const isTargeted = (it) => !!it.labelDef &&
-    targetedLabels.has(it.labelDef.slice(0, -1));
   let budget = options.budget || 512;
   const labelIndex = new Map();
   items.forEach((it, i) => { if (it.labelDef) labelIndex.set(it.labelDef.slice(0, -1), i); });
   const liveRanges = liveExceptionRanges(jvm, codeAttr.code, labelIndex);
-  const inRange = (i) => liveRanges.some(([s, e]) => i >= s && i < e);
+  // A site inside a live handler range may be spliced when the backend
+  // dispatches guest exceptions in Wasm (options.ehLiveRanges): a throw
+  // inside the spliced callee is the caller's throw at the call site, the
+  // pc ehOrigIdx names for every spliced item.
+  const inRange = (i) => !options.ehLiveRanges &&
+    liveRanges.some(([s, e]) => i >= s && i < e);
+  // Caller loops by bytecode back edge: a spliced site inside one runs its
+  // callee body per iteration instead of a call (reported as loopSites).
+  const loopRanges = [];
+  items.forEach((it, i) => {
+    const op = getOp(it.instruction);
+    if (!BRANCH_OP.test(op || '')) return;
+    const target = labelIndex.get(it.instruction.arg);
+    if (target !== undefined && target <= i) loopRanges.push([target, i]);
+  });
+  const inLoop = (i) => loopRanges.some(([s, e]) => i >= s && i <= e);
+  let loopSites = 0;
   const out = [];
   const origIdx = [];
+  const ehOrigIdx = [];
   const deoptStubs = new Map();
   const alloc = { next: Number(codeAttr.code.localsSize) || 0 };
   let inlined = 0;
@@ -528,66 +704,77 @@ function inlineCalls(jvm, codeAttr, options = {}) {
     const op = getOp(item.instruction);
     if (op === 'invokestatic' && budget > 0 && !inRange(i)) {
       const plan = planStaticInline(ctx, item.instruction, alloc.next, ctx.maxCalleeItems);
-      if (plan && plan.stores.length + plan.body.length + 1 <= budget) {
+      const entryMarker = plan && !plan.stores.length && item.labelDef;
+      const planCost = plan && plan.stores.length + plan.body.length + 1 + (entryMarker ? 1 : 0);
+      if (plan && planCost <= budget) {
         plan.stores.forEach((s, si) => {
           out.push(si === 0 && item.labelDef ? { ...s, labelDef: item.labelDef } : s);
           origIdx.push(si === 0 ? i : -1);
+          ehOrigIdx.push(i);
         });
-        if (!plan.stores.length && item.labelDef) {
+        if (entryMarker) {
           // keep branch targets pointing at the (zero-arg) call site valid
           out.push({ labelDef: item.labelDef, instruction: 'nop' });
           origIdx.push(i);
+          ehOrigIdx.push(i);
         }
-        for (const b of plan.body) { out.push(b); origIdx.push(-1); }
+        for (const b of plan.body) { out.push(b); origIdx.push(-1); ehOrigIdx.push(i); }
         out.push({ labelDef: `${plan.prefix}RET:`, instruction: 'nop' });
         origIdx.push(i + 1 < items.length ? i + 1 : -1);
+        ehOrigIdx.push(i + 1 < items.length ? i + 1 : i);
         alloc.next += plan.localsSize;
-        budget -= plan.stores.length + plan.body.length + 1;
+        budget -= planCost;
         inlined += 1;
+        if (inLoop(i)) loopSites += 1;
         continue;
       }
     } else if (ctx.hierarchy && INSTANCE_INVOKE.test(op) && budget > 0 && !inRange(i)) {
-      // Receiver is provably `this` when the invoke (not itself a branch
-      // target — a jump landing here could bring a different stack) directly
-      // follows aload_0. Zero-arg is enforced inside planInstanceSite.
-      const prevOp = i > 0 ? getOp(items[i - 1].instruction) : null;
-      const recvIsThis = thisSlotStable && !isTargeted(item) &&
-        (prevOp === 'aload_0' ||
-          (prevOp === 'aload' && String(items[i - 1].instruction.arg) === '0'));
+      const recvIsThis = thisSlotStable &&
+        receiverIsThis(items, i, targetedLabels);
       const site = planInstanceSite(
         ctx, item.instruction, op, options.callerClassName, alloc, 0, recvIsThis);
-      if (site && site.items.length + 1 <= budget) {
+      const siteCost = site && site.items.length + 1 +
+        (site.deadReceiverSlot !== undefined ? 2 : 0);
+      if (site && siteCost <= budget) {
         site.items.forEach((s, si) => {
           out.push(si === 0 && item.labelDef ? { ...s, labelDef: item.labelDef } : s);
           origIdx.push(si === 0 ? i : -1);
+          ehOrigIdx.push(i);
           if (s.deoptMark) {
             deoptStubs.set(out.length - 1, { resumeIdx: i, valueSlots: site.valueSlots });
           }
         });
         out.push({ labelDef: `${site.prefix}RET:`, instruction: 'nop' });
         origIdx.push(i + 1 < items.length ? i + 1 : -1);
+        ehOrigIdx.push(i + 1 < items.length ? i + 1 : i);
         budget -= site.items.length + 1;
         if (site.deadReceiverSlot !== undefined) {
           // See deadReceiverSlot: kill the slot on the continuation so the
           // receiver does not survive a loop back edge in a phi.
           out.push({ instruction: 'aconst_null' });
           origIdx.push(-1);
+          ehOrigIdx.push(i);
           out.push({ instruction: { op: 'astore', arg: String(site.deadReceiverSlot) } });
           origIdx.push(-1);
+          ehOrigIdx.push(i);
           budget -= 2;
         }
         inlined += 1;
+        if (inLoop(i)) loopSites += 1;
         continue;
       }
     }
     out.push(item);
     origIdx.push(i);
+    ehOrigIdx.push(i);
   }
   if (!inlined) return null;
   return {
     items: out,
     origIdx,
+    ehOrigIdx,
     inlined,
+    loopSites,
     deoptStubs,
     speculations: ctx.speculations,
     specSites: ctx.specSites,

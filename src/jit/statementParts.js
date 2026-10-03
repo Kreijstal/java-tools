@@ -141,7 +141,7 @@ function partsAmbientNames(parts, builtSkeleton = null) {
   return found;
 }
 
-const BODY_HELPER_NAME_PREFIXES = ["ssaMaterialize"];
+const BODY_HELPER_NAME_PREFIXES = ["ssaMaterialize", "ssaSlowInvoke", "ssaColdCall"];
 
 function partsBodyHelperNames(parts) {
   const skeleton = partsSkeleton(parts);
@@ -206,13 +206,16 @@ function skeletonCodeMask(skeleton) {
 }
 
 function skeletonKeywordPositions(skeleton, keyword, mask = null) {
-  const codeMask = mask || skeletonCodeMask(skeleton);
+  // Most statements contain none of the keywords queried by relocation and
+  // control-flow checks. Scan literals/comments only after finding a whole
+  // word candidate; a miss needs neither a mask nor a pass over every char.
+  let codeMask = mask;
   const positions = [];
   let position = skeleton.indexOf(keyword);
   while (position >= 0) {
-    if (codeMask[position] &&
-        !isPartsWordCharacter(skeleton[position - 1]) &&
-        !isPartsWordCharacter(skeleton[position + keyword.length])) {
+    if (!isPartsWordCharacter(skeleton[position - 1]) &&
+        !isPartsWordCharacter(skeleton[position + keyword.length]) &&
+        (codeMask || (codeMask = skeletonCodeMask(skeleton)))[position]) {
       positions.push(position);
     }
     position = skeleton.indexOf(keyword, position + 1);

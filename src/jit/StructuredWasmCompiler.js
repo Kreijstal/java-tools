@@ -8,10 +8,10 @@
 // returns the header's item index, exactly matching the dispatcher tier's
 // resume protocol. The produced meta is byte-compatible with WasmJit's
 // linking contract (externalEntry={0}, run(slots.., blk(ignored), fuel)->i32,
-// -1 = returned via box.ret).
+// -1 = returned via takeWasmReturnValue(meta)).
 //
 // Coverage mirrors the dispatcher's per-block demotion: blocks whose body or
-// terminator uses an op this backend cannot emit (monitors, string/class
+// terminator uses an op this backend cannot emit (class
 // constants, virtual invokes, `new` of a not-yet-initialized class), become
 // exit stubs — spill the block's reaching slot defs + entry
 // stack and return its item index; the interpreter (and the dispatcher OSR
@@ -28,19 +28,19 @@ const { buildSsa } = require('../analysis/opgraph/ssa');
 const {
   T, OP, TRUNC_SAT, uleb, sleb, f32bytes, f64bytes,
   emitTryTableCatchAll, supportsWasmTryTable,
-  wasmProfilerName, parseMethodDescriptor, descToWasm,
+  wasmProfilerName, parseMethodDescriptor, descToWasm, getOp,
   BRANCH_COND, BRANCH_ZERO, ICONST, BIN_OPS, ARRAY_LOAD, ARRAY_STORE,
   arrayLoadImportName,
-  Unsupported, blockedNames, NestedDeopt, isGuestThrow, sig, assembleModule,
+  Unsupported, blockedNames, NestedDeopt, isGuestThrow, ehRecordingImport, sig, assembleModule,
   liveExceptionRanges,
-  maxImpls, NPE, AIOOBE, sealedNeverExits, callWasmRun,
-  directInstanceLinkCalleeEligible, identityInstanceParams,
+  maxImpls, recordNestedDeopt, NPE, AIOOBE, sealedNeverExits, callWasmRun, takeWasmReturnValue,
+  directInstanceLinkCalleeEligible, identityInstanceParams, hasOnlyLeafInitializationExits,
 } = require('./wasmShared');
 const WasmLinker = require('./WasmLinker');
 const monoArray = require('./monoArray');
 const {
-  addRuntimeImports, pushImportFor, addArrayImports, addFieldImport, addMathImport,
-  addSystemImport, addNewArrayImport, addANewArrayImport, addNewImport,
+  addStringConstantImport, addStringCallImport, addRuntimeImports, pushImportFor, addArrayImports, addFieldImport, addMathImport,
+  addSystemImport, addArraysImport, addNewArrayImport, addANewArrayImport, addNewImport,
 } = require('./wasmRuntimeImports');
 const { inlineCalls, GUARD_OWNER } = require('./wasmInline');
 const { runtimeClassName } = require('../instructions/object');
@@ -138,11 +138,12 @@ const CONVERT = {
 const LINKED_CALL_ABI_VERSION = 1;
 
 class StructuredWasmCompiler {
-  constructor(jvm, method, className, wasmJit) {
+  constructor(jvm, method, className, wasmJit, options = {}) {
     this.jvm = jvm;
     this.method = method;
     this.className = className;
     this.wasmJit = wasmJit;
+    this.preferCompleteCallee = options.asCallee === true;
     this.importFns = [];
     // Typed symbolic dependencies of this artifact, one per linked call site.
     // See docs/phase1-linked-call-abi.md. This backend carries its own copy of
@@ -211,16 +212,7 @@ class StructuredWasmCompiler {
       };
     }
     if (this.ehMethod) {
-      const box = this.box;
-      wrapped = (...args) => {
-        try {
-          return fn(...args);
-        } catch (e) {
-          box.lastThrown = e;
-          box.pendingException = isGuestThrow(e) ? e : null;
-          throw e;
-        }
-      };
+      wrapped = ehRecordingImport(fn, params.length, this.box);
     }
     this.importDecls.push({ name, params, results });
     this.importFns.push(wrapped);
@@ -248,26 +240,64 @@ class StructuredWasmCompiler {
   }
 
   translateWith(inline) {
+    try {
+      return this.translateBody(inline);
+    } finally {
+      if (this.jvm.jit?.retainCompilerDiagnostics === false) {
+        // Import callbacks can retain this compiler for runtime call/exception
+        // handling. None of those paths uses the SSA graph or emission maps.
+        // Leave execution state (box, method, JVM, links) and returned metadata
+        // intact; dropping these roots also covers refused translations.
+        for (const key of [
+          'fn', 'cfg', 'items', 'originalItems', 'localOf', 'arrayCaches',
+          'fieldCaches', 'castCaches', 'objCaches', 'linkSlotByNode',
+          'deoptableSites', 'linkSlotSites', 'fusedGuardOfLoad',
+          'fusedGuardArms', 'fusedFieldReads', 'rematLoads', 'inlinedInitializationGuards',
+          'labelIndex', 'origIdx', 'deoptStubs', 'deoptBlocks', 'declared',
+          'frames', 'guardSites', 'liveRanges', 'demoteBlockersByBlock',
+          'importDecls', 'importFns', 'importIndexByName', 'sigTypes', 'sigTypeIndex',
+          'stringConstantImports',
+        ]) {
+          // Clear roots without changing the runtime import receiver's shape.
+          if (Object.hasOwn(this, key)) this[key] = undefined;
+        }
+      }
+    }
+  }
+
+  translateBody(inline) {
     const codeAttr = this.method.attributes.find((a) => a.type === 'code');
     if (!codeAttr) throw new Unsupported('no code');
     let items = codeAttr.code.codeItems;
     const table = codeAttr.code.exceptionTable || [];
     this.origIdx = null;
+    this.ehOrigIdx = null;
     this.deoptStubs = null;
+    // Slots at or above this belong to spliced callees (wasmInline renumbers
+    // them above the caller's frame): never spilled into the caller's Frame.
+    this.callerLocals = Number(codeAttr.code.localsSize) || 0;
     let inlinedCalls = 0;
     let speculations = 0;
     let specSites = null;
     let elidedThisGuards = 0;
     if (inline) {
       const instanceInline = process.env.JVM_WASM_INSTANCE_INLINE !== '0';
+      const deepInline = this.wasmJit?.deepInline === true;
       const expanded = inlineCalls(this.jvm, codeAttr, {
+        maxCalleeItems: this.wasmJit?.maxInlineCalleeItems,
+        budget: this.wasmJit?.inlineBudget,
         hierarchy: instanceInline && this.wasmJit ? this.wasmJit.hierarchy : null,
         callerClassName: this.className,
         callerIsStatic: (this.method.flags || []).includes('static'),
+        deepInline,
+        // Sites in live handler ranges need Wasm-side exception dispatch.
+        ehLiveRanges: deepInline && process.env.JVM_WASM_EH !== '0' &&
+          supportsWasmTryTable(),
       });
       if (expanded) {
         items = expanded.items;
         this.origIdx = expanded.origIdx;
+        this.ehOrigIdx = expanded.ehOrigIdx || null;
         this.deoptStubs = expanded.deoptStubs;
         this.didInline = true;
         this.guardSites = expanded.guardSites || [];
@@ -432,6 +462,7 @@ class StructuredWasmCompiler {
     // Unsupported demotes just that block to an exit stub instead of
     // rejecting the method.
     const treeBlocks = collectTreeBlocks(structured.tree);
+    this.inlinedInitializationGuards = new Set();
     this.demoted = new Map();
     this.demoteBlockers = new Set();
     this.demoteBlockersByBlock = new Map();
@@ -498,10 +529,32 @@ class StructuredWasmCompiler {
     if (entryBlock.phis.length && entryBlock.predIds[0] === 'entry') {
       this.emitParallelPhiCopies(body, entryBlock, 0);
     }
+    // Spliced blocks have no interpreter resume PC. Check their static
+    // dependencies before any guest effects instead: a cold token returns to
+    // the original entry, where interpretation preserves initialization order.
+    // This only tests readiness; it never runs a class initializer early.
+    for (const idx of this.inlinedInitializationGuards) {
+      body.push(OP.call, ...uleb(idx), OP.i32_eqz, OP.if, 0x40);
+      this.emitSpillResume(cfg.entry, body);
+      body.push(OP.end);
+    }
     this.frames = [];
+    const treeStart = body.length;
     this.lowerNode(structured.tree, body, { curBlock: cfg.entry });
     body.push(OP.unreachable);
+    const parameterHeapSpecializationBytes =
+      this.emitParameterHeapVersion(structured, body, treeStart);
     body.push(OP.end); // function
+
+    // SSA parameters are never redefined, including across loop backedges.
+    // Their nonthrowing base/length queries can run once at entry instead of
+    // testing a filled flag for every pixel. Keep null checks at the actual
+    // guest access: an unused null parameter must still be legal.
+    const arrayEntry = [];
+    for (const cache of this.arrayCaches.values()) {
+      if (cache.parameter) arrayEntry.push(...this.arrayCacheFill(cache));
+    }
+    body.unshift(...arrayEntry);
 
     const bytes = assembleModule({
       importDecls: this.importDecls,
@@ -558,11 +611,18 @@ class StructuredWasmCompiler {
     // retain fullyCompiled=false/usedEh and the existing canonical-frame EH
     // protocol; this must not authorize raw links to handler-bearing bodies.
     const preferCompleteNormalFlow = this.wasmJit.normalFlowPreparedUpgradesEnabled;
-    const preferCompleteSynchronized = this.wasmJit.synchronizedInstanceLinksEnabled &&
-      (this.method.flags || []).includes('synchronized');
+    // Required callees need the same opportunity regardless of return type:
+    // a guard-only void helper otherwise strands an array-returning caller.
+    // A required callee may use complete normal flow while retaining its
+    // exception table and deoptable-call metadata; static-call admission
+    // already supports that shape through the canonical partial-call path.
+    const methodFlags = this.method.flags || [];
+    const preferCompleteSynchronized = methodFlags.includes('synchronized') &&
+      (methodFlags.includes('static') ? this.wasmJit.synchronizedStaticLinksEnabled
+        : this.wasmJit.synchronizedInstanceLinksEnabled);
     if (inline && !normalFlowFullyCompiled && this.demoted.size === 0 &&
         ('L['.includes(parseMethodDescriptor(this.method.descriptor).ret) ||
-         preferCompleteSynchronized || preferCompleteNormalFlow)) {
+         preferCompleteSynchronized || preferCompleteNormalFlow || this.preferCompleteCallee)) {
       let plain = null;
       const plainCompiler = new StructuredWasmCompiler(this.jvm, this.method, this.className, this.wasmJit);
       try {
@@ -572,7 +632,8 @@ class StructuredWasmCompiler {
         if (!(err instanceof Unsupported)) throw err;
       }
       if (plain && (plain.fullyCompiled ||
-          preferCompleteNormalFlow && plain.normalFlowFullyCompiled)) {
+          (preferCompleteNormalFlow || this.preferCompleteCallee) &&
+            plain.normalFlowFullyCompiled)) {
         this.releaseLinkSlots();
         return plain;
       }
@@ -601,6 +662,10 @@ class StructuredWasmCompiler {
       blockCount: cfg.n,
       fullyCompiled: normalFlowFullyCompiled && table.length === 0,
       normalFlowFullyCompiled,
+      // Every normal-flow block compiled; the only exits are inlined
+      // guard-miss stubs (rare receivers, resumed at the original call pc).
+      guardOnlyNormalFlowGaps: !normalFlowFullyCompiled &&
+        this.demoted.size === 0 && this.deoptBlocks.size > 0,
       // Modules with EH catch sites return -3 (exception pending) and must
       // never be linked as nested/partial callees: their spill imports write
       // the top frame, and a partial-link resume would re-execute the
@@ -610,6 +675,13 @@ class StructuredWasmCompiler {
       // callers must nest this module with a real scratch frame, never the
       // junk sink (same contract as the dispatcher tier's deoptable calls).
       deoptableCalls: this.deoptableSites.size + (this.staticInitializationGuards?.size || 0),
+      // A leaf cannot run guest/native callbacks that invalidate an initialized
+      // class during its synchronous invocation. Its only exits can therefore
+      // be excluded by checking the live tokens before a frame-free call.
+      initializationGuardLeaf: !items.some(item =>
+        getOp(item.instruction)?.startsWith('invoke')),
+      initializationGuardTokens: [...(this.staticInitializationGuards || [])]
+        .map(name => this.jvm.getClassInitializationToken(name)),
       slotSites: this.linkSlotSites.size,
       directLinks: this.directLinks || 0,
       directStaticLinks: this.directStaticLinks || 0,
@@ -639,9 +711,50 @@ class StructuredWasmCompiler {
       inlineSpecSites: specSites || [],
       specEpoch: this.jvm.classEpoch || 0,
       deoptStubCount: this.deoptBlocks.size,
+      heapCopyArrayCount: [...this.arrayCaches.values()].filter(cache => cache.copyKind !== undefined).length,
       arrayCacheCount: this.arrayCaches.size,
+      parameterArrayCacheCount: [...this.arrayCaches.values()]
+        .filter((cache) => cache.parameter).length,
+      parameterHeapSpecializationBytes,
       importStats: this.importStats || null,
     };
+  }
+
+  // A bounded second version moves representation selection out of pixel
+  // loops. Only immutable parameter caches qualify. The original body remains
+  // the fallback for null/plain arrays, including unused null arguments.
+  emitParameterHeapVersion(structured, body, treeStart) {
+    const cfg = this.cfg;
+    const versionBudget = this.wasmJit.parameterHeapSpecializationMaxBytes;
+    let parameterHeapSpecializationBytes = 0;
+    const parameterCaches = [...this.arrayCaches.values()];
+    if (versionBudget > 0 && body.length - treeStart + 16 * parameterCaches.length <= versionBudget &&
+        parameterCaches.length > 0 && parameterCaches.every(cache => cache.parameter) &&
+        structured.loopHeaders.size > 0 && this.demoted.size === 0 &&
+        this.deoptBlocks.size === 0 && this.liveRanges.length === 0 &&
+        this.fieldCaches.size === 0 && this.objCaches.size === 0 && !this.usedLinkTable) {
+      const specialized = [];
+      this.parameterHeapAccess = true;
+      this.frames = [];
+      try {
+        this.lowerNode(structured.tree, specialized, { curBlock: cfg.entry });
+        specialized.push(OP.unreachable);
+      } finally {
+        this.parameterHeapAccess = false;
+      }
+      const guard = [];
+      for (const [index, cache] of parameterCaches.entries()) {
+        guard.push(OP.local_get, ...uleb(cache.base), OP.i32_const, ...sleb(0), OP.i32_ge_s);
+        if (index > 0) guard.push(OP.i32_and);
+      }
+      const extraBytes = guard.length + specialized.length + 5;
+      if (extraBytes <= versionBudget) {
+        const generic = body.splice(treeStart);
+        body.push(...guard, OP.if, 0x40, ...specialized, OP.else, ...generic, OP.end, OP.unreachable);
+        parameterHeapSpecializationBytes = extraBytes;
+      }
+    }
+    return parameterHeapSpecializationBytes;
   }
 
   // Validates a block's terminator lowering without emitting into the real
@@ -696,7 +809,11 @@ class StructuredWasmCompiler {
         const header = headerOfLabel(node.label);
         out.push(OP.loop, 0x40);
         this.frames.push({ label: node.label });
-        this.emitFuelCheck(header, out);
+        // A loop spliced from a callee has no caller pc to exit at; the
+        // inliner admits only provably counted loops there (countedBackEdge).
+        if (!(this.origIdx && this.origIdx[this.cfg.blocks[header].insns[0]] === -1)) {
+          this.emitFuelCheck(header, out);
+        }
         this.lowerNode(node.body, out, env);
         this.frames.pop();
         out.push(OP.end);
@@ -840,7 +957,8 @@ class StructuredWasmCompiler {
     const blockById = new Map(fn.blocks.map((b) => [b.id, b]));
     for (const block of fn.blocks) {
       for (const load of block.body) {
-        if (load.op !== 'aaload' || load.kind !== 'A' || !load.uses.length) continue;
+        if (load.op !== 'aaload' || load.kind !== 'A' || !load.uses.length ||
+            this.elementCacheIndex(load) !== null) continue;
         let guard = null;
         const fields = new Set();
         let ok = true;
@@ -1071,11 +1189,11 @@ class StructuredWasmCompiler {
       const value = term.args[0];
       const t = KIND_T[value.kind];
       if (t === undefined) throw new Unsupported('return kind');
-      // Value leaves twice: through the exported retv global (index 0) for
-      // direct wasm->wasm callers, and through the ret_* import for JS
-      // entries (an import call is cheaper than a JS-side Global.value read).
+      // Numeric values also use the cheaper ret_* import for JS entries.
+      // References use only retv, consumed/cleared by both JS and runv callers;
+      // copying them into box.ret would retain the last returned object.
       out.push(...this.useOf(value), OP.global_set, ...uleb(0));
-      out.push(OP.global_get, ...uleb(0), OP.call,
+      if (t !== T.ref) out.push(OP.global_get, ...uleb(0), OP.call,
         ...uleb(this.importIndexByName.get(`ret_${sig(t)}`)));
     }
     out.push(OP.i32_const, ...sleb(-1), OP.return);
@@ -1090,12 +1208,20 @@ class StructuredWasmCompiler {
         if (call.initializationIdx != null) initializationGuards.add(call.initializationIdx);
         continue;
       }
+      if (node.op === 'invokestatic') {
+        const call = addArraysImport(this, this.jvm, {arg: node.imm});
+        if (call?.initializationIdx != null) initializationGuards.add(call.initializationIdx);
+      }
       if (node.op !== 'getstatic' && node.op !== 'putstatic') continue;
       const field = addFieldImport(this, this.jvm, {arg: node.imm}, true,
         node.op === 'getstatic');
       if (field.initializationIdx != null) initializationGuards.add(field.initializationIdx);
     }
     for (const idx of initializationGuards) {
+      if (this.origIdx && this.origIdx[this.cfg.blocks[blockId].insns[0]] === -1) {
+        this.inlinedInitializationGuards.add(idx);
+        continue;
+      }
       out.push(OP.call, ...uleb(idx), OP.i32_eqz, OP.if, 0x40);
       this.emitSpillResume(blockId, out);
       out.push(OP.end);
@@ -1125,7 +1251,9 @@ class StructuredWasmCompiler {
   }
 
   ehSiteFor(itemIdx) {
-    const orig = this.origIdx ? this.origIdx[itemIdx] : itemIdx;
+    let orig = this.origIdx ? this.origIdx[itemIdx] : itemIdx;
+    // A throw inside a spliced callee is the caller's throw at the call.
+    if ((orig === undefined || orig < 0) && this.ehOrigIdx) orig = this.ehOrigIdx[itemIdx];
     if (orig === undefined || orig < 0) throw new Unsupported('eh site inside inlined code');
     const item = this.originalItems[orig];
     const label = item && item.labelDef;
@@ -1143,6 +1271,8 @@ class StructuredWasmCompiler {
     for (const [slot, value] of slotState || []) {
       const t = KIND_T[value.kind];
       if (t === undefined || value.op === 'undef') continue; // dead or conflicted
+      // spliced callee locals do not exist in the caller's Frame
+      if (this.ehOrigIdx && slot >= this.callerLocals) continue;
       spills.push({ slot, value, t });
     }
     const slots = spills.map((s) => s.slot);
@@ -1238,6 +1368,22 @@ class StructuredWasmCompiler {
     // arrays
     if (ARRAY_LOAD[op] !== undefined) {
       const t = ARRAY_LOAD[op];
+      const elementIndex = this.elementCacheIndex(node);
+      if (elementIndex !== null) {
+        // One cached element of an invariant reference array: a hit hands
+        // back the same reference without touching its dependents (the
+        // receiver's field, guard and array caches), exactly as a static or
+        // field cache hit does. Killed by aastore and by every call.
+        const entry = this.fieldCacheFor(`e|${node.args[0].id}|${elementIndex}`,
+          T.ref, 'aastore', 'e', null);
+        entry.readerIds.add(node.id);
+        const onMiss = [];
+        for (const id of entry.readerIds) onMiss.push(...this.cacheKillsFor(id));
+        out.push(...this.cachedReadSeq(entry, [...use(0), ...use(1), OP.call,
+          ...uleb(this.importIndexByName.get(arrayLoadImportName(this, op, t)))], onMiss));
+        out.push(OP.local_set, ...uleb(this.mustLocal(node)));
+        return;
+      }
       if (this.rematLoads.has(node)) {
         // The element is recomputed inside each consumer, so nothing is loaded
         // here — but caches keyed on this value still describe the PREVIOUS
@@ -1263,6 +1409,7 @@ class StructuredWasmCompiler {
         ? `aset_${op}` : `aset_${sig(t)}`;
       out.push(...use(0), ...use(1), ...use(2), OP.call,
         ...uleb(this.importIndexByName.get(storeImport)));
+      if (op === 'aastore') out.push(...this.killSeqWhere((entry) => entry.kind === 'e'));
       return finish();
     }
     if (op === 'arraylength') {
@@ -1276,10 +1423,7 @@ class StructuredWasmCompiler {
         const c = this.arrayCacheFor(node.args[0]);
         const arr = this.useOf(node.args[0]);
         out.push(
-          OP.local_get, ...uleb(c.filled), OP.i32_eqz, OP.if, 0x40,
-          ...arr, OP.call, ...uleb(this.abaseIdx), OP.local_set, ...uleb(c.base),
-          ...arr, OP.call, ...uleb(this.alen0Idx), OP.local_set, ...uleb(c.len),
-          OP.i32_const, ...sleb(1), OP.local_set, ...uleb(c.filled), OP.end,
+          ...this.lazyArrayCacheFill(c),
           OP.local_get, ...uleb(c.base), OP.i32_const, ...sleb(0), OP.i32_ge_s,
           OP.if, T.i32,
           OP.local_get, ...uleb(c.len),
@@ -1389,6 +1533,33 @@ class StructuredWasmCompiler {
       return finish();
     }
 
+    // Explicit monitors use the same lock ownership as the interpreter. A
+    // contended entry has no guest effects and resumes AT the instruction
+    // with its original operand stack. Mark both sites deoptable so nested
+    // callers provide a real spill frame and cannot take a raw never-exits
+    // link. Exception handlers retain responsibility for releasing locks.
+    if (op === 'monitorenter' || op === 'monitorexit') {
+      const site = this.ehSiteFor(node.itemIdx);
+      const unders = node.stackUnder;
+      if (!unders || unders.some(v => KIND_T[v.kind] === undefined)) {
+        throw new Unsupported('unkinded monitor under');
+      }
+      this.deoptableSites.add(node.itemIdx);
+      const idx = this.addImport(op, [T.ref], [T.i32], monitor => {
+        const thread = this.wasmJit.activeThread;
+        if (!thread) return 0;
+        if (op === 'monitorenter') {
+          return this.jvm.jit.monitorEnter(monitor, thread) ? 1 : 0;
+        }
+        this.jvm.jit.monitorExit(monitor, thread);
+        return 1;
+      });
+      out.push(...use(0), OP.call, ...uleb(idx), OP.i32_eqz, OP.if, 0x40);
+      this.emitCallExitStub(node, site, unders, true, out);
+      out.push(OP.end);
+      return;
+    }
+
     // calls: Math/System intrinsics, direct binding to compiled wasm
     // callees, and devirtualized instance calls through a closed-world
     // dispatch map. Sites whose callee can hand the call back (deoptable)
@@ -1399,6 +1570,14 @@ class StructuredWasmCompiler {
         const remat = this.rematLoads.get(node.args[0]);
         out.push(...this.useOf(remat.array), ...this.useOf(remat.index));
         out.push(OP.call, ...uleb(this.guardIndexAtImport(siteIndex)));
+      } else if (this.wasmJit.deepInline && this.wasmJit.fieldCacheEnabled !== false) {
+        // A receiver's dispatch arm never changes: cache it per receiver
+        // value, killed when that value is redefined (cacheKillsFor).
+        const receiver = node.args[0];
+        const entry = this.fieldCacheFor(`g|${receiver.id}|${siteIndex}`, T.i32, '',
+          'g', receiver.id);
+        out.push(...this.cachedReadSeq(entry,
+          [...use(0), OP.call, ...uleb(this.guardIndexImport(siteIndex))]));
       } else {
         out.push(...use(0));
         out.push(OP.call, ...uleb(this.guardIndexImport(siteIndex)));
@@ -1419,6 +1598,11 @@ class StructuredWasmCompiler {
       const call = op === 'invokestatic'
         ? this.staticCallImport(node)
         : this.instanceCallImport(node, op);
+      if (this.heap && this.wasmJit.heapBulkCopy && call.builtinArrayCopy) {
+        require('./WasmArrayCopy').emitHeapCopy(this, node, call, out);
+        out.push(...this.callFieldCacheKills(call));
+        return;
+      }
       let site = null;
       let unders = null;
       if (call.deoptable) {
@@ -1457,6 +1641,9 @@ class StructuredWasmCompiler {
             out.push(OP.global_get, ...uleb(dl.specokIdx), OP.i32_and);
           }
         }
+        if (dl.initializationGuardIdx !== undefined) {
+          out.push(OP.call, ...uleb(dl.initializationGuardIdx), OP.i32_and);
+        }
         out.push(OP.if, 0x40);
         for (const local of argScr) out.push(OP.local_get, ...uleb(local));
         out.push(OP.call, ...uleb(dl.directIdx));
@@ -1471,10 +1658,7 @@ class StructuredWasmCompiler {
         // never-exits fallback import has no flag to check.
         if (call.deoptable) this.emitCallDeoptCheck(node, site, unders, out);
         out.push(OP.end);
-        if (call.writes === null) out.push(...this.killSeqWhere(() => true));
-        else if (call.writes && call.writes.size) {
-          out.push(...this.killSeqWhere((entry) => call.writes.has(entry.killKey)));
-        }
+        out.push(...this.callFieldCacheKills(call));
         if (node.kind !== 'V') out.push(...this.cacheKillsFor(node.id));
         return;
       }
@@ -1499,10 +1683,7 @@ class StructuredWasmCompiler {
       // kill only the caches the callee may transitively write (math/time
       // intrinsics carry no summary and write nothing); an unknowable
       // callee (null summary) may put any field or static
-      if (call.writes === null) out.push(...this.killSeqWhere(() => true));
-      else if (call.writes && call.writes.size) {
-        out.push(...this.killSeqWhere((entry) => call.writes.has(entry.killKey)));
-      }
+      out.push(...this.callFieldCacheKills(call));
       if (node.kind !== 'V') {
         if (!call.direct) out.push(OP.local_set, ...uleb(this.mustLocal(node)));
         out.push(...this.cacheKillsFor(node.id));
@@ -1556,6 +1737,24 @@ class StructuredWasmCompiler {
     throw new Unsupported(`op ${op}`);
   }
 
+  // Constant index of an `aaload` whose array is a never-reassigned method
+  // parameter (one SSA value for the whole body), or null. Deep inlining
+  // only: the painter reloads its sprite from a parameter array per pixel.
+  elementCacheIndex(node) {
+    if (!this.wasmJit.deepInline || this.wasmJit.fieldCacheEnabled === false ||
+        process.env.JVM_WASM_ELEMENT_CACHE === '0') return null;
+    if (!node || node.op !== 'aaload' || !this.fn || !this.fn.params.includes(node.args[0])) {
+      return null;
+    }
+    const index = node.args[1];
+    if (!index) return null;
+    if (ICONST[index.op] !== undefined) return ICONST[index.op];
+    if ((index.op === 'bipush' || index.op === 'sipush') && Number.isInteger(Number(index.imm))) {
+      return Number(index.imm);
+    }
+    return null;
+  }
+
   // base/len/filled locals for the array behind an SSA value; never killed
   // (array identity, base, and length are immutable for the whole run)
   arrayCacheFor(arrValue) {
@@ -1565,12 +1764,33 @@ class StructuredWasmCompiler {
       this.declared.push(T.i32);
       const len = this.nextLocal++;
       this.declared.push(T.i32);
-      const filled = this.nextLocal++;
-      this.declared.push(T.i32);
-      entry = { base, len, filled };
+      const parameter = this.fn.params.includes(arrValue);
+      const filled = parameter ? null : this.nextLocal++;
+      if (!parameter) this.declared.push(T.i32);
+      entry = { base, len, filled, parameter, value: arrValue };
       this.arrayCaches.set(arrValue.id, entry);
     }
     return entry;
+  }
+
+  arrayCacheFill(cache) {
+    const arr = this.useOf(cache.value);
+    return [
+      ...arr, OP.call, ...uleb(this.abaseIdx), OP.local_set, ...uleb(cache.base),
+      ...arr, OP.call, ...uleb(this.alen0Idx), OP.local_set, ...uleb(cache.len),
+      ...(cache.copyKind === undefined ? [] : [
+        ...arr, OP.call, ...uleb(this.copyKindIdx), OP.local_set, ...uleb(cache.copyKind),
+      ]),
+    ];
+  }
+
+  lazyArrayCacheFill(cache) {
+    if (cache.parameter) return [];
+    return [
+      OP.local_get, ...uleb(cache.filled), OP.i32_eqz, OP.if, 0x40,
+      ...this.arrayCacheFill(cache),
+      OP.i32_const, ...sleb(1), OP.local_set, ...uleb(cache.filled), OP.end,
+    ];
   }
 
   heapImports() {
@@ -1623,12 +1843,12 @@ class StructuredWasmCompiler {
         ...uleb(this.importIndexByName.get(
           arrayLoadImportName(this, node.op, importT)))];
     const heapOp = [OP[acc.op], ...uleb(acc.shift), ...uleb(0)];
+    if (this.parameterHeapAccess && c.parameter) {
+      return [...bounds, ...addr, ...(storeSeq || []), ...heapOp];
+    }
     return [
       // fill once per run: base (-1 for null/non-heap) and length
-      OP.local_get, ...uleb(c.filled), OP.i32_eqz, OP.if, 0x40,
-      ...arr, OP.call, ...uleb(this.abaseIdx), OP.local_set, ...uleb(c.base),
-      ...arr, OP.call, ...uleb(this.alen0Idx), OP.local_set, ...uleb(c.len),
-      OP.i32_const, ...sleb(1), OP.local_set, ...uleb(c.filled), OP.end,
+      ...this.lazyArrayCacheFill(c),
       OP.local_get, ...uleb(c.base), OP.i32_const, ...sleb(0), OP.i32_ge_s,
       OP.if, storeSeq ? 0x40 : acc.t,
       ...bounds, ...addr, ...(storeSeq || []), ...heapOp,
@@ -1717,7 +1937,7 @@ class StructuredWasmCompiler {
   cacheKillsFor(id) {
     const seq = [];
     const arr = this.arrayCaches.get(id);
-    if (arr) seq.push(OP.i32_const, ...sleb(0), OP.local_set, ...uleb(arr.filled));
+    if (arr && !arr.parameter) seq.push(OP.i32_const, ...sleb(0), OP.local_set, ...uleb(arr.filled));
     for (const e of this.fieldCaches.values()) {
       if (e.recvId === id) {
         seq.push(OP.i32_const, ...sleb(0), OP.local_set, ...uleb(e.filledLocal));
@@ -1731,6 +1951,19 @@ class StructuredWasmCompiler {
     const obj = this.objCaches.get(id);
     if (obj) seq.push(OP.i32_const, ...sleb(0), OP.local_set, ...uleb(obj.filled));
     return seq;
+  }
+
+  callFieldCacheKills(call) {
+    if (call.writes === null) return this.killSeqWhere(() => true);
+    // Callee writes are summarized for fields only: any call may store into
+    // a reference array, so cached elements never survive one.
+    if (call.writes?.size) {
+      return this.killSeqWhere(entry => entry.kind === 'e' || call.writes.has(entry.killKey));
+    }
+    const elementKills = this.killSeqWhere(entry => entry.kind === 'e');
+    if (elementKills.length) return elementKills;
+    return call.writes?.size
+      ? this.killSeqWhere(entry => call.writes.has(entry.killKey)) : [];
   }
 
   killSeqWhere(predicate) {
@@ -1920,6 +2153,8 @@ class StructuredWasmCompiler {
     const [, className, [name, descriptor]] = node.imm;
     if (className === 'java/lang/Math') return addMathImport(this, { arg: node.imm });
     if (className === 'java/lang/System') return addSystemImport(this, this.jvm, { arg: node.imm });
+    const fill = addArraysImport(this, this.jvm, {arg: node.imm});
+    if (fill) return fill;
     const writes = this.wasmJit
       ? this.wasmJit.staticWriteSummary(className, name, descriptor)
       : null;
@@ -1928,7 +2163,7 @@ class StructuredWasmCompiler {
       throw new Unsupported(`invoke ${className}.${name} unsupported descriptor`);
     }
     const calleeSt = this.wasmJit &&
-      this.wasmJit.findReadyStatic(className, name, descriptor, true);
+      this.wasmJit.findReadyStatic(className, name, descriptor, true, false, true);
     const linked = calleeSt && (calleeSt.callee || calleeSt);
     // A ready callee whose only exits are its own late-bound slot sites is a
     // member of a recursive group the linker has not sealed yet (it may be
@@ -1957,7 +2192,7 @@ class StructuredWasmCompiler {
     // install a caller that exits Wasm on every invocation.
     const klass = linked ? 'compatible'
       : (this.wasmJit
-        ? this.wasmJit.staticLinkClassification(className, name, descriptor)
+        ? this.wasmJit.staticLinkClassification(className, name, descriptor, true)
         : 'incompatible');
     // `lateBound` is set below, only on the path that actually emits an
     // lcall_ trampoline. A binding is recorded for every static call site,
@@ -1968,6 +2203,7 @@ class StructuredWasmCompiler {
       kind: 'static', className, name, descriptor, key,
       params: wParams.slice(), results: results.slice(),
       pending: !linked, classification: klass, lateBound: false,
+      synchronizedStaticProtocol: this.wasmJit.synchronizedStaticLinksEnabled,
     };
     this.linkBindings.push(binding);
     if (!linked && klass === 'incompatible') {
@@ -2005,7 +2241,7 @@ class StructuredWasmCompiler {
         // deopt on every call until some unrelated compile moved the epoch.
         if (bound === null || boundEpoch !== this.wasmJit.compileEpoch ||
             !(bound.callee || bound).meta) {
-          bound = this.wasmJit.findReadyStatic(className, name, descriptor, true, true);
+          bound = this.wasmJit.findReadyStatic(className, name, descriptor, true, true, true);
           boundEpoch = this.wasmJit.compileEpoch;
           // The binding is the linker's record of this dependency; keeping it
           // current is what makes `pending` mean "still unresolved" to anyone
@@ -2061,7 +2297,7 @@ class StructuredWasmCompiler {
     // on the path. EH callers keep the bridge (their import wrapper records
     // thrown exceptions for catch_all classification); non-identity slot
     // mappings keep the bridge (the JS closure reorders/pads arguments).
-    if (this.wasmJit.directStaticLinkEnabled && !this.ehMethod &&
+    if (this.wasmJit.directStaticLinkEnabled && !this.ehMethod && !calleeSt.synchronized &&
         linked.meta.fullyCompiled && !linked.meta.boxedCount &&
         (!linked.meta.deoptableCalls || sealedNeverExits(linked.meta)) &&
         !linked.meta.usedEh && linked.meta.runv) {
@@ -2088,7 +2324,7 @@ class StructuredWasmCompiler {
         };
       }
     }
-    if (linked.meta.fullyCompiled && !linked.meta.boxedCount &&
+    if (!calleeSt.synchronized && linked.meta.fullyCompiled && !linked.meta.boxedCount &&
         (!linked.meta.deoptableCalls || sealedNeverExits(linked.meta)) &&
         !linked.meta.usedEh) {
       // Never-exits fast path: no scratch frame, no flag check. A later
@@ -2124,7 +2360,7 @@ class StructuredWasmCompiler {
           meta.box.frame = savedFrame;
         }
         if (status !== -1) throw new Error(`wasmjit: nested callee ${key} exited at ${status}`);
-        return meta.box.ret;
+        return takeWasmReturnValue(meta);
       };
       return {
         idx: this.addImport(`call_${key}`.replace(/[^\w]/g, '_'), wParams, results, fn),
@@ -2152,6 +2388,8 @@ class StructuredWasmCompiler {
   // interpreter re-execute the invoke with full dynamic dispatch. Targets
   // that can exit run under the scratch-frame protocol.
   instanceCallImport(node, op) {
+    const stringCall = addStringCallImport(this, this.jvm, {arg: node.imm}, op);
+    if (stringCall) return stringCall;
     const [, owner, [name, descriptor]] = node.imm;
     // invokespecial <init> is statically bound to exactly the named owner's
     // constructor; it is linkable when that constructor compiles fully, so
@@ -2214,12 +2452,9 @@ class StructuredWasmCompiler {
       const resolved = hierarchy.resolveDispatch(owner, name, descriptor);
       resolvedCone = resolved;
       if (!resolved) throw new Unsupported(`invoke ${owner}.${name} unresolved`);
-      // A wide cone builds a wide dispatch map, so the site is refused — and
-      // because a refused site demotes its block, a megamorphic call in a loop
-      // body keeps the whole method off this tier. Measured on a 6-implementor
-      // interface: 309 ns/call refused against 96 ns/call admitted at 16. The
-      // default stays at 4 until that is validated on a whole game boot.
-      if (resolved.impls.size > maxImpls()) {
+      // Bound the dispatch cone per runtime; embedders may raise the default
+      // for measured call chains without changing unrelated JVM instances.
+      if (resolved.impls.size > maxImpls(this.wasmJit.maxInstanceImplementations)) {
         throw new Unsupported(`invoke ${owner}.${name} megamorphic`);
       }
       // Impls that cannot be linked (never-compiling entry, EH module,
@@ -2348,7 +2583,7 @@ class StructuredWasmCompiler {
       // class loaded later misses it into the generic path -- so
       // invokespecial, whose only guard is non-null, keeps the bridge.
       const eligible = directInstanceLinkCalleeEligible(
-        st, !!direct, (target) => this.wasmJit.revalidateNestedCallee(target));
+        st, !!direct, (target) => this.wasmJit.revalidateNestedCallee(target), true);
       const identity = eligible && identityInstanceParams(calleeMeta, params);
       if (identity) {
         const directIdx = this.addImport(
@@ -2384,8 +2619,20 @@ class StructuredWasmCompiler {
                 directClasses.has(runtimeClassName(r))) ? 1 : 0);
           }
         }
+        let initializationGuardIdx;
+        if (hasOnlyLeafInitializationExits(calleeMeta)) {
+          const tokens = calleeMeta.initializationGuardTokens;
+          initializationGuardIdx = this.addImport(
+            `dready_${key}`.replace(/[^\w]/g, '_'), [], [T.i32],
+            () => {
+              for (let i = 0; i < tokens.length; i++) {
+                if (!tokens[i].initialized) return 0;
+              }
+              return 1;
+            });
+        }
         directLink = {
-          directIdx, guardIdx, specMono,
+          directIdx, guardIdx, specMono, initializationGuardIdx,
           specokIdx:
             parseMethodDescriptor(this.method.descriptor).ret === 'V' ? 0 : 1,
           argTypes: wParams,
@@ -2435,94 +2682,102 @@ class StructuredWasmCompiler {
     // dispatches inside it below.
     const partial = !meta.fullyCompiled || meta.boxedCount > 0 ||
       meta.deoptableCalls > 0 || meta.usedEh || calleeSt.synchronized;
-    const full = new Array(meta.paramSlots.length + 2);
-    for (let i = 0; i < meta.paramSlots.length; i += 1) {
-      const p = meta.paramSlots[i];
-      const pos = argPosBySlot.get(p.slot);
-      if (pos !== undefined) full[i] = javaArgs[pos];
-      else full[i] = p.t === T.i64 ? 0n : (p.t === T.ref ? null : 0);
-    }
-    full[meta.paramSlots.length] = 0;
-    full[meta.paramSlots.length + 1] = 100_000_000;
-    const savedFrame = meta.box.frame;
-    let frame;
-    if (partial) {
-      calleeSt.nestedCalls = (calleeSt.nestedCalls || 0) + 1;
-      const scratch = scratchFrames.get(calleeSt);
-      if (scratch && !scratch.inUse) {
-        frame = scratch;
-        frame.pc = 0;
-      } else {
-        frame = new Frame(calleeSt.method);
-        frame.className = frameClassName;
-        if (!scratch) scratchFrames.set(calleeSt, frame);
-      }
-      frame.inUse = true;
-    } else {
-      frame = { locals: [] }; // junk sink; this callee never exits
-    }
-    meta.box.frame = frame;
-    meta.box.ret = undefined;
-    let status;
+    const buffers = this.wasmJit.nestedArgumentBuffers;
+    const argumentBuffer = buffers ? buffers.acquire(meta, meta.paramSlots.length + 2) : null;
     try {
-      status = calleeSt.synchronized
-        ? this.wasmJit.runSynchronizedInstance(calleeMod, frame, full,
-          javaArgs, argPosBySlot)
-        : callWasmRun(calleeMod.run, full);
-    } catch (err) {
-      if (partial && err instanceof NestedDeopt) {
-        if (this.wasmJit.debug) {
-          console.error(`[wasmjit] nested callee ${calleeSt.key} unwound through a nested deopt`
-            + ` (${err.frames.map((f) => `${f.className || '?'}.${f.method && f.method.name}@${f.pc}`).join(' <- ') || 'no frames'})`);
+      const full = argumentBuffer ? argumentBuffer.values
+        : new Array(meta.paramSlots.length + 2);
+      for (let i = 0; i < meta.paramSlots.length; i += 1) {
+        const p = meta.paramSlots[i];
+        const pos = argPosBySlot.get(p.slot);
+        if (pos !== undefined) full[i] = javaArgs[pos];
+        else full[i] = p.t === T.i64 ? 0n : (p.t === T.ref ? null : 0);
+      }
+      full[meta.paramSlots.length] = 0;
+      full[meta.paramSlots.length + 1] = 100_000_000;
+      const savedFrame = meta.box.frame;
+      let frame;
+      if (partial) {
+        calleeSt.nestedCalls = (calleeSt.nestedCalls || 0) + 1;
+        const scratch = scratchFrames.get(calleeSt);
+        if (scratch && !scratch.inUse) {
+          frame = scratch;
+          frame.pc = 0;
+        } else {
+          frame = new Frame(calleeSt.method);
+          frame.className = frameClassName;
+          if (!scratch) scratchFrames.set(calleeSt, frame);
         }
-        err.frames.push(frame);
-        if (frame === scratchFrames.get(calleeSt)) scratchFrames.delete(calleeSt);
-        box.pendingFrames = err.frames;
-        box.deoptFlag = 2;
-        return dummy;
+        frame.inUse = true;
+      } else {
+        frame = { locals: [] }; // junk sink; this callee never exits
       }
-      throw err;
-    } finally {
-      if (partial) frame.inUse = false;
-      meta.box.frame = savedFrame;
-    }
-    if (status === -3) {
-      // The callee caught a guest exception in wasm: its spill import
-      // already wrote the throw-point locals into `frame` (its scratch).
-      // Dispatch inside the callee's own table; a handler match parks the
-      // frame positioned at the handler, no match propagates the exception
-      // to this module's wrap (EH catch or plain unwind).
-      const exn = meta.box.pendingException;
-      meta.box.pendingException = null;
-      if (this.jvm.dispatchExceptionInFrame(frame, exn, meta.box.throwPc)) {
-        if (frame === scratchFrames.get(calleeSt)) scratchFrames.delete(calleeSt);
-        box.pendingFrames = [frame];
-        box.deoptFlag = 2;
-        return dummy;
+      meta.box.frame = frame;
+      meta.box.ret = undefined;
+      let status;
+      try {
+        status = calleeSt.synchronized
+          ? this.wasmJit.runSynchronizedMethod(calleeMod, frame, full,
+            javaArgs, argPosBySlot)
+          : callWasmRun(calleeMod.run, full);
+      } catch (err) {
+        if (partial && err instanceof NestedDeopt) {
+          recordNestedDeopt(calleeSt);
+          if (this.wasmJit.debug) {
+            console.error(`[wasmjit] nested callee ${calleeSt.key} unwound through a nested deopt`
+              + ` (${err.frames.map((f) => `${f.className || '?'}.${f.method && f.method.name}@${f.pc}`).join(' <- ') || 'no frames'})`);
+          }
+          err.frames.push(frame);
+          if (frame === scratchFrames.get(calleeSt)) scratchFrames.delete(calleeSt);
+          box.pendingFrames = err.frames;
+          box.deoptFlag = 2;
+          return dummy;
+        }
+        throw err;
+      } finally {
+        if (partial) frame.inUse = false;
+        meta.box.frame = savedFrame;
       }
-      if (calleeSt.synchronized) this.jvm.exitFrameMonitor(frame);
-      throw exn;
-    }
-    if (status !== -1) {
-      if (!partial) throw new Error(`wasmjit: nested callee exited at ${status}`);
-      if (this.wasmJit.debug) {
+      if (status === -3) {
+        // The callee caught a guest exception in wasm: its spill import
+        // already wrote the throw-point locals into `frame` (its scratch).
+        // Dispatch inside the callee's own table; a handler match parks the
+        // frame positioned at the handler, no match propagates the exception
+        // to this module's wrap (EH catch or plain unwind).
+        const exn = meta.box.pendingException;
+        meta.box.pendingException = null;
+        if (this.jvm.dispatchExceptionInFrame(frame, exn, meta.box.throwPc)) {
+          if (frame === scratchFrames.get(calleeSt)) scratchFrames.delete(calleeSt);
+          box.pendingFrames = [frame];
+          box.deoptFlag = 2;
+          return dummy;
+        }
+        if (calleeSt.synchronized) this.jvm.exitFrameMonitor(frame);
+        throw exn;
+      }
+      if (status !== -1) {
+        if (!partial) throw new Error(`wasmjit: nested callee exited at ${status}`);
+        if (this.wasmJit.debug) {
+          const deeper = meta.box.pendingFrames;
+          console.error(`[wasmjit] nested callee ${calleeSt.key} exited at pc ${status}`
+            + ` (${(meta.demoteReasons && meta.demoteReasons.get(meta.blockOfItem
+              ? meta.blockOfItem.get(status) : undefined)) || 'no demote reason'}`
+            + `${deeper ? `; parked ${deeper.map((f) => `${f.className || '?'}.${f.method && f.method.name}@${f.pc}`).join(' <- ')}` : ''})`);
+        }
+        frame.pc = status;
+        if (frame === scratchFrames.get(calleeSt)) scratchFrames.delete(calleeSt);
+        // the callee's own call-site deopt may have parked deeper frames
         const deeper = meta.box.pendingFrames;
-        console.error(`[wasmjit] nested callee ${calleeSt.key} exited at pc ${status}`
-          + ` (${(meta.demoteReasons && meta.demoteReasons.get(meta.blockOfItem
-            ? meta.blockOfItem.get(status) : undefined)) || 'no demote reason'}`
-          + `${deeper ? `; parked ${deeper.map((f) => `${f.className || '?'}.${f.method && f.method.name}@${f.pc}`).join(' <- ')}` : ''})`);
+        meta.box.pendingFrames = null;
+        box.pendingFrames = deeper ? [...deeper, frame] : [frame];
+        box.deoptFlag = 2;
+        recordNestedDeopt(calleeSt);
+        return dummy;
       }
-      frame.pc = status;
-      if (frame === scratchFrames.get(calleeSt)) scratchFrames.delete(calleeSt);
-      // the callee's own call-site deopt may have parked deeper frames
-      const deeper = meta.box.pendingFrames;
-      meta.box.pendingFrames = null;
-      box.pendingFrames = deeper ? [...deeper, frame] : [frame];
-      box.deoptFlag = 2;
-      calleeSt.nestedDeopts = (calleeSt.nestedDeopts || 0) + 1;
-      return dummy;
+      return takeWasmReturnValue(meta);
+    } finally {
+      if (argumentBuffer) buffers.release(argumentBuffer);
     }
-    return meta.box.ret;
   }
 
   // Wasm-side check right after a deoptable call: read-and-clear the box
@@ -2601,6 +2856,9 @@ class StructuredWasmCompiler {
         if (arg.type === 'Double') return [OP.f64_const, ...f64bytes(Number(arg.value))];
       }
       throw new Unsupported(`ldc2_w ${JSON.stringify(arg)}`);
+    }
+    if (typeof arg === 'string') {
+      return [OP.call, ...uleb(addStringConstantImport(this, this.jvm, arg, op))];
     }
     if (typeof arg === 'number') return [OP.i32_const, ...sleb(arg)];
     if (arg && typeof arg === 'object' && !Array.isArray(arg)) {

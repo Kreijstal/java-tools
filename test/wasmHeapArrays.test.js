@@ -55,7 +55,8 @@ async function makeHarness(t, className, source) {
     JVM_WASM_HEAP_MB: '16',
   });
   const classpath = compileJavaFixture(t, className, source);
-  const jvm = new JVM({ classpath, jit: { warmupThreshold: 100 } });
+  const jvm = new JVM({ classpath, jit: { warmupThreshold: 100,
+    wasm: {parameterHeapSpecializationMaxBytes: 32768} } });
   await jvm.loadClassByName(className);
   jvm.classInitializationState.set(className, 'INITIALIZED');
   const thread = {
@@ -127,6 +128,14 @@ public class HeapArr {
     }
     out[0] = s;
   }
+  public static void switchArray(int[] out, int[] a, int[] b, int n) {
+    int sum = 0;
+    for (int i = 0; i < n; i++) {
+      sum += a[0];
+      int[] tmp = a; a = b; b = tmp;
+    }
+    out[0] = sum;
+  }
   public static void chainSum(int[] out, Node h, int n) {
     int s = 0;
     for (int i = 0; i < n; i++) { s += h.v; h = h.next; }
@@ -152,6 +161,9 @@ test('heap int[] reads: raw loads match, base/len cache present', async (t) => {
   const meta = metaOf(jvm, 'HeapArr.sumInt([II)I');
   t.ok(meta && meta.structured, 'sumInt compiled by the structured backend');
   t.ok(meta.arrayCacheCount >= 1, 'array base/len cache registered');
+  t.equal(meta.parameterArrayCacheCount, 1, 'unchanged array parameter initialized at entry');
+  t.ok(meta.parameterHeapSpecializationBytes > 0 && meta.parameterHeapSpecializationBytes <= 32768,
+    'bounded heap parameter version emitted');
   t.end();
 });
 
@@ -188,10 +200,19 @@ test('out-of-bounds and null throw the guest exceptions', async (t) => {
   out.type = '[I';
   await invoke(jvm, thread, 'HeapArr', 'oobCatch', '([I[II)V', [out, a, N]);
   t.ok(metaOf(jvm, 'HeapArr.sumInt([II)I'), 'sumInt is compiled before the failure runs');
+  const state = jvm.jit.wasmJit.compiled.find(s => s.key === 'HeapArr.sumInt([II)I');
+  let runs = state.runs;
   await invoke(jvm, thread, 'HeapArr', 'oobCatch', '([I[II)V', [out, a, N + 5]);
   t.equal(out[0], -7, 'past-end read surfaces AIOOBE through the bounds check');
+  t.ok(state.runs > runs, 'bounds failure entered compiled code');
+  runs = state.runs;
+  await invoke(jvm, thread, 'HeapArr', 'nullCatch', '([II)V', [out, 0]);
+  t.equal(out[0], 0, 'unused null parameter does not throw at eager cache initialization');
+  t.ok(state.runs > runs, 'unused null executes the compiled fallback');
+  runs = state.runs;
   await invoke(jvm, thread, 'HeapArr', 'nullCatch', '([II)V', [out, N]);
   t.equal(out[0], -3, 'null array surfaces NPE through the import fallback');
+  t.ok(state.runs > runs, 'null access entered compiled code');
   t.end();
 });
 
@@ -269,11 +290,11 @@ test('narrow and wide element types keep Java coercion semantics', async (t) => 
 test('compiled newarray allocates heap-backed views', async (t) => {
   const { jvm, thread } = await makeHarness(t, 'HeapAlloc', `
 public class HeapAlloc {
-  public static int drive(Object[] out, int n) {
+  public static int drive(Object[] out, int n, int length) {
     int sum = 0;
     int[] keep = null;
     for (int i = 0; i < n; i++) {
-      int[] a = new int[8];
+      int[] a = new int[length];
       a[i & 7] = i;
       sum += a[i & 7];
       keep = a;
@@ -281,19 +302,55 @@ public class HeapAlloc {
     out[0] = keep;
     return sum;
   }
+  public static void caught(int[] errors, Object[] out, int n, int length) {
+    try { drive(out, n, length); errors[0] = 1; }
+    catch (NegativeArraySizeException e) { errors[0] = -7; }
+    catch (ArrayIndexOutOfBoundsException e) { errors[0] = -9; }
+  }
 }
 `);
   const out = [null];
   out.type = '[Ljava/lang/Object;';
   const n = 2000;
-  await invoke(jvm, thread, 'HeapAlloc', 'drive', '([Ljava/lang/Object;I)I', [out, n]);
-  const meta = metaOf(jvm, 'HeapAlloc.drive([Ljava/lang/Object;I)I');
+  const descriptor = '([Ljava/lang/Object;II)I';
+  await invoke(jvm, thread, 'HeapAlloc', 'drive', descriptor, [out, n, 8]);
+  const meta = metaOf(jvm, 'HeapAlloc.drive' + descriptor);
   t.ok(meta && meta.structured, 'drive compiled by the structured backend');
   t.equal(meta.demoteReasons.size, 0, 'no demoted blocks');
   const kept = out[0];
   t.ok(ArrayBuffer.isView(kept), 'compiled newarray produced a TypedArray view');
   t.ok(kept.wasmBase !== undefined, 'view is heap-backed (wasmBase set)');
   t.equal(kept[(n - 1) & 7], n - 1, 'last allocation holds its stored element');
+  const state = jvm.jit.wasmJit.compiled.find(s => s.key === 'HeapAlloc.drive' + descriptor);
+  let runs = state.runs;
+  await invoke(jvm, thread, 'HeapAlloc', 'drive', descriptor, [out, 17, 9]);
+  t.ok(state.runs > runs, 'changed-length invocation executes Wasm');
+  t.notEqual(out[0], kept, 'subsequent invocation allocates fresh output');
+  t.equal(out[0].length, 9, 'subsequent invocation refreshes the cached length');
+  t.equal(out[0][0], 16, 'loop allocations refresh the cached base');
+  const last = out[0];
+  const errors = Object.assign([0], {type: '[I'});
+  for (const [length, expected] of [[-1, -7], [0, -9]]) {
+    runs = state.runs;
+    await invoke(jvm, thread, 'HeapAlloc', 'caught', '([I[Ljava/lang/Object;II)V',
+      [errors, out, 1, length]);
+    t.ok(state.runs > runs, 'exceptional invocation executes Wasm');
+    t.equal(errors[0], expected, 'allocation/bounds exception remains catchable');
+    t.equal(out[0], last, 'failed invocation does not publish its output');
+  }
+  // Exercise the supported non-heap representation with the SAME compiled
+  // method, so the eager cache must choose the import fallback on each newarr.
+  const allocate = jvm.wasmHeap.alloc;
+  jvm.wasmHeap.alloc = (type, length) => new Array(length).fill(0);
+  try {
+    runs = state.runs;
+    await invoke(jvm, thread, 'HeapAlloc', 'drive', descriptor, [out, 17, 8]);
+    t.ok(state.runs > runs, 'plain-allocation invocation executes Wasm');
+    t.ok(Array.isArray(out[0]), 'allocation may return plain array storage');
+    t.equal(out[0][0], 16, 'compiled accesses use the plain-array fallback');
+  } finally {
+    jvm.wasmHeap.alloc = allocate;
+  }
   t.end();
 });
 
@@ -338,5 +395,72 @@ public class HeapGrow {
   const meta = metaOf(jvm, 'HeapGrow.run(I)I');
   t.ok(meta && meta.structured, 'run compiled by the structured backend');
   t.equal(meta.demoteReasons.size, 0, 'allocation blocks compiled, no demotions');
+  t.end();
+});
+
+
+test('reassigned array parameters keep per-iteration caches and refresh each invocation', async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'HeapArr', SOURCE);
+  const a = jvm.wasmHeap.alloc('[I', 1);
+  const b = jvm.wasmHeap.alloc('[I', 1);
+  a.type = b.type = '[I';
+  a[0] = 3; b[0] = 19;
+  const out = Object.assign([0], { type: '[I' });
+  for (let i = 0; i < 150; i++) {
+    await invoke(jvm, thread, 'HeapArr', 'switchArray', '([I[I[II)V', [out, a, b, 501]);
+  }
+  t.ok(metaOf(jvm, 'HeapArr.switchArray([I[I[II)V')?.structured, 'switchArray uses structured Wasm');
+  t.equal(out[0], 5503, 'loop-carried receiver changes preserve alternating values');
+  await invoke(jvm, thread, 'HeapArr', 'switchArray', '([I[I[II)V', [out, b, a, 501]);
+  t.equal(out[0], 5519, 'a new invocation uses its new parameter values');
+  const plain = Object.assign([7], { type: '[I' });
+  await invoke(jvm, thread, 'HeapArr', 'switchArray', '([I[I[II)V', [out, plain, a, 501]);
+  t.equal(out[0], 2507, 'loop switches between plain and heap array storage');
+  t.end();
+});
+
+
+test('heap parameter specialization respects its code-growth budget', async t => {
+  const {jvm, thread} = await makeHarness(t, 'HeapArr', SOURCE);
+  jvm.jit.wasmJit.parameterHeapSpecializationMaxBytes = 1;
+  const a = jvm.wasmHeap.alloc('[I', N);
+  a.type = '[I';
+  const out = [0]; out.type = '[I';
+  await invoke(jvm, thread, 'HeapArr', 'oobCatch', '([I[II)V', [out, a, N]);
+  const meta = metaOf(jvm, 'HeapArr.sumInt([II)I');
+  t.ok(meta?.structured, 'budget exhaustion retains the ordinary structured body');
+  t.equal(meta?.parameterHeapSpecializationBytes, 0, 'no second version exceeds the budget');
+  t.equal(out[0], 0, 'ordinary body preserves results');
+  t.throws(() => new JVM({jit: {wasm: {parameterHeapSpecializationMaxBytes: -1}}}),
+    /nonnegative safe integer/, 'negative budgets are rejected');
+  t.end();
+});
+
+test('heap parameter version preserves mixed backing and aliasing', async t => {
+  const {jvm, thread} = await makeHarness(t, 'HeapPair', `
+public class HeapPair {
+  public static void mix(int[] a, int[] b, int n) {
+    for (int i = 0; i < n; i++) a[i] = b[i] + 1;
+  }
+}`);
+  const a = jvm.wasmHeap.alloc('[I', N), b = jvm.wasmHeap.alloc('[I', N);
+  a.type = b.type = '[I'; b.fill(4);
+  const run = (left, right, n = N) => invoke(jvm, thread, 'HeapPair', 'mix', '([I[II)V', [left, right, n]);
+  await run(a, b);
+  const state = jvm.jit.wasmJit.compiled.find(s => s.key === 'HeapPair.mix([I[II)V');
+  t.ok(state?.meta?.parameterHeapSpecializationBytes > 0, 'multi-array loop has a guarded heap version');
+  let runs = state.runs;
+  await run(a, a);
+  t.ok(state.runs > runs, 'aliased arrays execute compiled code');
+  t.ok(Array.from(a).every(value => value === 6), 'same-array reads and writes retain order');
+  const plain = new Array(N).fill(8); plain.type = '[I';
+  runs = state.runs;
+  await run(a, plain);
+  t.ok(state.runs > runs, 'mixed heap/plain arrays execute compiled fallback');
+  t.ok(Array.from(a).every(value => value === 9), 'mixed backing produces exact values');
+  runs = state.runs;
+  await run(a, null, 0);
+  t.ok(state.runs > runs, 'unused null executes compiled fallback');
+  t.ok(Array.from(a).every(value => value === 9), 'unused null leaves output intact');
   t.end();
 });

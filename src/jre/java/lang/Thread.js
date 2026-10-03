@@ -128,6 +128,11 @@ module.exports = {
         callStack: new CallStack(),
         status: 'runnable',
         javaThread: threadObject,
+        // A terminated thread has an empty call stack, so a thread dump can no
+        // longer say what it was. Record the entry point at start(), which is
+        // the only moment it is known, so "thread 3 is dead" can be read as
+        // "the socket writer is dead".
+        entry: (target && target.type) || null,
       };
       threadObject.nativeThread = newThread;
       if (threadObject.threadGroup) {

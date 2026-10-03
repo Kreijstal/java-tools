@@ -18,7 +18,7 @@ test(`cold Wasm static accesses preserve initialization (structured=${structured
   execFileSync('javac', ['-g', '-d', outputDir,
     path.resolve(__dirname, '../sources/ColdPreparedInherited.java')]);
   const jvm = new JVM({classpath: outputDir, wasmFields: true, jit: {
-    compileWorker: false, wasmStructured: structured,
+    compileWorker: false, wasmStructured: structured, retainCompilerDiagnostics: false,
   }});
   await jvm.preloadClasspathClasses();
   const owner = jvm.classes.ColdPreparedArray;
@@ -55,6 +55,17 @@ test(`cold Wasm static accesses preserve initialization (structured=${structured
   t.equal(result.returned, true, 'the same module completes after initialization');
   t.deepEqual(Array.from(owner.staticFields.get('values:[I')), [7, 8, 9],
     'compiled static writes and array stores produce exact results');
+
+  const sentinel = [11, 12, 13];
+  owner.staticFields.set('values:[I', sentinel);
+  jvm.classInitializationState.set('ColdPreparedArray', 'ERRONEOUS');
+  const reset = makeFrame();
+  thread.callStack.items.length = 0; thread.callStack.push(reset);
+  wasm.execute(reset, thread, state, 0);
+  t.equal(reset.pc, 0, 'already compiled module observes readiness reset');
+  t.equal(owner.staticFields.get('values:[I'), sentinel,
+    'reset guard exits before replacing an existing static value');
+  jvm.classInitializationState.set('ColdPreparedArray', 'INITIALIZED');
 
   // A value selected in predecessor blocks must survive the cold-owner exit.
   // The referenced subclass is not the class that declares the static field.

@@ -1,6 +1,172 @@
 # Runtime options
 
-Every option is an environment variable read at the point of use. This page is
+## Preparation policy
+
+`jit.preparationPolicy` accepts `priorityMethods` (exact
+`Class.method(descriptor)` identities) and `maxMethods`. The launcher owns
+profile selection and source/patch identity checks. The JVM applies the ordered
+list and limit without game-specific knowledge.
+
+`wasmLoopsOnly` defaults to `true`. Set it to `false` to include selected
+methods without loops in Wasm preparation, using the callee compilation
+protocol. This lets a measured dependency list prepare small helpers that keep
+a caller's loop in Wasm. It does not expand `maxMethods`, override the initial
+`loopsOnly` selection or `wasmPreparedUpgradesOnly` restriction, or enable the
+Wasm tier when disabled. Complete coverage and runtime tier selection remain
+separate; benchmark the resulting execution before adopting a policy.
+
+The same policy can be passed as `preparationPolicy` to
+`precompileInitializedClasses` to override the constructor policy for one pass.
+
+With structured SSA and `jit.structuredUnsafeConstructorCallers` enabled,
+effectful preparation may verify callers containing unproven constructor
+calls without requiring the runtime array-loop shape. Such callers must pass
+the structured continuation checks; they cannot fall back to a baseline entry
+that could replay allocation. Their eligibility survives preparation. If a
+later preparation round proves the constructor synchronous, previously failed
+callers may retry the ordinary tiers. The constructor itself retains its
+existing admission checks.
+
+## Compiler diagnostic retention
+
+`jit.retainCompilerDiagnostics` defaults to `true`. Setting it to `false`
+releases diagnostic and emission-analysis references after compilation,
+including failed translations. Both Wasm backends release label/index maps,
+local/stack plans, and duplicate import-emission tables. Runtime imports keep
+the execution state and metadata needed for linking, exceptions, and resume.
+Cleanup clears references without mutating shared metadata objects or changing
+the callback receiver's property layout. This does not remove method bytecode
+needed by interpretation and deoptimization.
+
+## Compact call recovery
+
+`jit.structuredCompactRestoringValueCalls` defaults to `true`. Eligible
+structured positional bodies share recovery code for value-returning calls
+instead of repeating suspension/deoptimization handling at every call site.
+Successful calls remain inline; recovery snapshots are created only on a cold
+exit. The optimization requires capture-free frame restoration and compatible
+local snapshots. Set it to `false` to compare the original expanded code.
+It does not change bytecode PCs, returned values, exception handling or the
+supported execution fallbacks.
+
+## Field-read cache size limit
+
+`jit.structuredFieldReadCacheMaxCodeItems` is an optional nonnegative safe
+integer. Structured methods exceeding that many code items use ordinary
+field reads instead of generated field-cache probes. Zero disables those
+caches; omitted or invalid values retain the existing unlimited policy.
+The count uses the compiler's complete method item list, including cold paths.
+
+This provides a way to reduce generated code in large methods. Removing
+caches can also increase repeated field loads, so compare heap and frame time
+with the original policy before selecting a limit in a preparation profile.
+
+## Wasm instance dispatch
+
+`jit.wasm.maxInstanceImplementations` sets the maximum number of distinct
+implementations admitted at a virtual/interface call site by either Wasm
+compiler. It must be a positive safe integer. An explicit value applies only
+to that JVM and overrides `JVM_WASM_MAX_IMPLS`; otherwise the environment
+setting or the default of four applies. Wider hierarchies retain their normal
+execution fallback. Raising the bound can avoid repeated interpreter exits in
+measured call chains, but increases preparation work and dispatch metadata;
+validate startup, memory and frame time before adopting a higher value.
+
+## Prepared Wasm method selection
+
+`jit.preparedWasmMethods` is an optional array of exact method identities such
+as `Owner.kernel([I)V`. It selects only prepared loops whose existing Wasm
+module has complete coverage and has not triggered exit-storm protection.
+Other methods retain their normal tier preference. With Wasm preparation
+enabled, selected loops also qualify for the otherwise oversized-only or
+fallback-only preparation pass. Preparation republishes ready selections so
+existing JavaScript call sites enter the primary Wasm body at method entry.
+Cold, partial and withdrawn modules retain the supported execution fallback.
+The default is an empty list. Embedders should choose identities from measured
+profiles tied to their source and patch versions; selection alone is not
+evidence of faster execution.
+
+`jit.preparedPartialWasmMethods` is a separate opt-in list of exact identities
+for measured prepared loops whose cold branches may leave Wasm. It defaults to
+empty. These methods participate in the selected preparation pass and may
+replace prepared JavaScript only while their primary Wasm entry is installed
+and exit-storm protection allows it. Cold, withdrawn, constructor, and
+non-loop methods are not promoted. Coverage and linked-call metadata are never
+relabeled; canonical continuations retain effects, operands, and exceptions.
+This option does not prepare missing dependencies or disable runtime compilation.
+Embedders must bound preparation before animation and validate frame timing and
+memory before adopting a selection. The complete-only `preparedWasmMethods`
+contract is unchanged.
+
+`preparationPolicy.wasmRootMethods` optionally filters the automatic Wasm roots
+considered during preparation. Omit it to retain the default candidates; an empty
+array suppresses automatic roots. The list uses exact method identities and does
+not change JavaScript preparation, execution-tier selection, or the ordinary Wasm
+eligibility checks. Explicit `wasmCalleeMethods` are independent of this filter,
+and compiling an admitted root can still compile transitive callees. This is a
+preparation filter, not a total generated-code or compilation-time budget. Validate
+any restricted profile for late compilation and fallback performance.
+
+`preparationPolicy.wasmCalleeMethods` optionally names exact non-loop helpers
+that a measured Wasm caller needs. The existing preparation pass compiles these
+as callees even with loop-only, selected-upgrade-only, or fallback-only filters.
+The overall method limit, class eligibility, interpreter exclusions, and
+compilation budgets still apply. Unlisted helpers are unchanged. This prepares
+artifacts without promoting those helpers as root entries or enabling recursive
+on-demand compilation. Use the ordinary bounded settle pass to link dependencies;
+this list does not promise a transitive dependency closure.
+
+## Heap parameter specialization
+
+`jit.wasm.parameterHeapSpecializationMaxBytes` defaults to `0` (disabled).
+A positive integer permits a second, guarded version of eligible structured
+Wasm loops, bounded by that many additional instruction-body bytes per method.
+The guard selects the heap-only version when every cached array parameter is
+heap-backed. Bounds checks remain; null, plain, or mixed arrays use the original
+body. Unused null parameters remain legal.
+
+Eligibility requires immutable parameter caches and excludes partial bodies,
+live handlers, field/object caches, and linked calls. The limit covers added
+body instructions, not total module size, total heap, or the separate generated
+JavaScript source/transport budget. `parameterHeapSpecializationBytes` reports
+actual added body bytes in Wasm metadata. Invalid limits throw.
+
+This option remains experimental. GeoBlox diagnostics show lower raster-kernel
+cost per call, but do not establish the required frame-rate floor. Benchmark
+end-to-end behavior before enabling it in a launcher policy.
+
+## Wasm inlining limits
+
+`jit.wasm.maxInlineCalleeItems` limits the complete bytecode item count of
+each inlined callee (default 96). `jit.wasm.inlineBudget` limits the total
+inserted items per compiled caller (default 512), including receiver-slot
+cleanup. Both must be positive safe integers and apply only to that JVM.
+Exhausting either limit leaves the existing linked-call or interpreter path
+available. These limits do not bypass control-flow, exception, dispatch or
+deoptimization checks. Larger values can reduce repeated call overhead but
+increase generated code and preparation work; measure memory and frame time
+before adopting them in a preparation profile.
+
+## Compile-worker grant recovery
+
+Worker requests normally reserve 64 IDs per transport table, scaling to 128,
+256 or 512 for methods exceeding 256, 512 or 1,024 bytecode instructions.
+An explicit `compileWorkerGrantStride` (or `JVM_JIT_COMPILE_WORKER_STRIDE`)
+keeps a fixed initial grant instead. A result that
+outgrows its grant reports the allocations it needed, without transferring the
+rejected body. The client retries once with those per-table requirements, up to
+4,096 IDs per table, starting above the worker's previous allocations. Other
+requests keep the normal grant. The retry reuses the vacated in-flight slot and
+does not grow the waiting queue or compile on the rendering thread.
+
+`compileWorker.stats.grantRetried` counts these attempts. A repeated overflow,
+invalid requirement, or requirement above the cap retains the supported fallback
+and appears as a `grant-overflow` refusal. Performance must still be measured;
+successful installation alone does not establish a frame-rate improvement.
+
+## Environment inventory
+
+The options below are environment variables read at the point of use. This is
 the inventory the code did not previously have: what exists, who reads it, and
 which options cross module boundaries.
 
@@ -11,9 +177,9 @@ not a consumer. "Also read outside `src/`" means tests, `scripts/` or `tools/` r
 the same name — those readers are usually the ones that *set* it for a child
 process.
 
-Totals: **202 options read from `src/`, across 15 files.** 172 of them are also
+Totals: **205 options read from `src/`, across 15 files.** 172 of them are also
 referenced outside `src/`. Only **9 are read from more than one `src/` file**;
-the other 193 have exactly one consumer each.
+the other 194 have exactly one consumer each.
 
 ## Options with more than one consumer
 
@@ -119,6 +285,7 @@ in tests, and nothing outside this repository is expected to set them.
 | `JVM_DISABLE_STRUCTURED_CONTINUATIONS` | jit/JvmSsaBlockRenderer.js | yes |
 | `JVM_DISABLE_STRUCTURED_DEFERRED_CALL_MATERIALIZATION` | jit/JvmSsaBlockRenderer.js | yes |
 | `JVM_DISABLE_STRUCTURED_DIRECT_ENTRY_STATIC_LINKING` | jit/JvmSsaBlockRenderer.js | yes |
+| `JVM_DISABLE_PREPARED_CONSTRUCTORS` | jit/JitCompiler.js | no |
 | `JVM_DISABLE_STRUCTURED_DISPATCH_ISLANDS` | jit/JvmSsaBlockRenderer.js | yes |
 | `JVM_DISABLE_STRUCTURED_INLINE_ARRAY_STORES` | jit/JvmSsaBlockRenderer.js | yes |
 | `JVM_DISABLE_STRUCTURED_LAZY_STATIC_TARGETS` | jit/JvmSsaBlockRenderer.js | yes |
@@ -165,6 +332,7 @@ in tests, and nothing outside this repository is expected to set them.
 | `JVM_HOT_LOOP_CONSTRUCTORS` | jit/JitCompiler.js | yes |
 | `JVM_INTERPRETER_BURST` | core/jvm.js | yes |
 | `JVM_JIT_ASSERT_NO_POST_MAIN_SYNC_COMPILE` | jit/JitCompiler.js | yes |
+| `JVM_JIT_ASYNC_CALL_CENSUS` | jit/JitCompiler.js | no |
 | `JVM_JIT_DENY` | jit/JitCompiler.js | yes |
 | `JVM_JIT_EXPERIMENTAL_CONTROL_FLOW` | jit/JitCompiler.js | yes |
 | `JVM_JIT_HOTNESS` | jit/JitCompiler.js | no |
@@ -177,6 +345,8 @@ in tests, and nothing outside this repository is expected to set them.
 | `JVM_JIT_REFUSE_POST_MAIN_WASM` | jit/WasmJit.js | no |
 | `JVM_JIT_RESULT_CENSUS` | jit/JitCompiler.js | no |
 | `JVM_JIT_SHADOW_COMPILE_REPORT` | jit/ShadowCompiler.js | no |
+| `JVM_JIT_COMPILE_PHASE_TIMING` | jit/JitCompiler.js | no |
+| `JVM_JIT_POST_MAIN_COMPILE_BUDGET_MS` | jit/JitCompiler.js | no |
 | `JVM_JIT_TRACE_POST_MAIN_SYNC_COMPILE` | jit/JitCompiler.js | yes |
 | `JVM_JIT_VERIFY_FREE_NAMES` | jit/JitCompiler.js | no |
 | `JVM_JIT_VERIFY_GENERATED` | jit/JvmSsaBlockRenderer.js | yes |
@@ -258,3 +428,81 @@ in tests, and nothing outside this repository is expected to set them.
 | `JVM_WASM_TRACE_ARRAYS_TO` | jit/wasmRuntimeImports.js | yes |
 | `JVM_WASM_TRACE_COMPILE_ERRORS` | jit/WasmJit.js | no |
 | `JVM_WASM_TRACE_RESUME` | jit/WasmJit.js | yes |
+
+`jit.wasm.refusePostMainCompiles` is an optional boolean (default false, or
+`JVM_JIT_REFUSE_POST_MAIN_WASM=1` when omitted). After guest startup it refuses
+all Wasm compilation entry paths, including callee links and recompilation.
+Prepared modules remain usable; missing modules use existing execution fallbacks.
+Preparation must supply the working set before enabling this policy: refusal alone
+does not guarantee frame performance. The Wasm census reports `executionOnly`
+only when this enforcement is enabled, not for a warmup-only freeze.
+
+
+`jit.structuredExplicitFrameSpills` defaults to `false` (experimental). Framed
+continuation and adaptive bodies pass local values and a captured slot layout
+to shared materialization helpers instead of creating nested spill functions
+on every entry. Cold call suspension retains the existing completion protocol.
+This option preserves frame locals, operands and resume PCs and is disabled
+when hot call graph regions are enabled. It does not eliminate unrelated
+closures or change restoring-body selection. Validate generated-code size,
+allocation cost and sustained playback before enabling it for a workload.
+
+`jit.structuredSharedFieldAccess` defaults to `false` (experimental). For
+instance fields with known dense slots, generated reads and writes call shared
+storage helpers instead of repeating dense/named/fallback branches. Receiver
+guards, exception materialization, cache invalidation, and compile-time layout
+constants are preserved. This reduces generated code but adds helper calls;
+validate both code size and constrained gameplay before enabling it.
+
+`jit.structuredSharedFieldAccessMinCodeItems` optionally restricts that experiment
+to methods with at least this many code items. Nonnegative safe integers are
+accepted; omitted or invalid values use zero (all sizes). The threshold includes
+its boundary and has no effect unless shared field access is enabled.
+
+`jit.fuseStructuredResumeDispatch` defaults to `false` (experimental). Canonical
+ordinary adaptive methods with a baseline resume companion combine fresh-entry
+selection into one dispatcher. Stored continuations still use the original
+validation and completion wrapper. Worker installation rebuilds the same
+dispatcher; `profileResumeDispatch` retains the diagnostic routing and counters.
+This changes dispatch overhead only and requires constrained performance testing.
+
+`jit.structuredSharedFramedMaterializer` defaults to `false` (experimental).
+Framed continuation/adaptive entries with multiple materialization arities share
+one helper closure. The spill callback and all frame locals, operand order and
+resume PCs are preserved. A rest-operand array is allocated only when the helper
+is called. Direct/restoring expansion is unchanged. Validate allocation churn
+and constrained gameplay before enabling this option.
+
+`jit.wasm.reuseNestedArguments` defaults to `false` (experimental). Structured
+Wasm-to-JavaScript trampolines reuse one argument buffer per live callee module.
+Recursive entries use temporary buffers; every exit clears all argument slots.
+Module metadata keys are weak, so obsolete modules are not retained by the pool.
+This does not reuse live or suspended guest frames. Measure allocation churn
+and gameplay before enabling it.
+
+`jit.wasm.heapBulkCopy` defaults to `false` (experimental). Structured Wasm
+methods use `memory.copy` for the built-in System.arraycopy when source and
+destination are matching primitive views in the current JVM linear heap.
+Per-array representation checks share existing SSA cache invalidation. Unsigned
+range checks avoid integer-overflow bypasses; null, invalid, mixed-type, and
+non-heap cases use the native path. Replacing the native or its positional body
+before compilation disables this optimization. Class initialization guards and
+exception dispatch remain active. Measure generated code and constrained gameplay
+before enabling it.
+
+`jit.wasmSynchronizedStaticLinks` defaults to `false` (experimental). Structured
+Wasm callers can link synchronized static bytecode methods using a real callee
+frame and the declaring class's monitor. Contention parks the child before its
+first effect; partial/handler continuations retain ownership until retirement.
+Raw links and table sealing remain forbidden for synchronized targets. Legacy
+dispatcher callers retain the existing refusal. Static synchronized bodies are
+never inlined without their implied monitor, regardless of this option.
+
+`jit.wasm.preferCompleteInstanceCallees` defaults to `false` (experimental).
+Instance bridges can prefer a complete structured body with guard-elided inline
+calls over a partial dispatcher. Existing per-call class-world revalidation
+remains mandatory; guarded-inline bodies are still refused, static callee
+selection is unchanged, and synchronized calls retain their monitor protocol.
+This can remove interpreter exits but expand nested execution and increase frame
+latency. The GeoBlox audio experiment failed constrained gameplay, so keep the
+option disabled in release profiles until frame performance passes.

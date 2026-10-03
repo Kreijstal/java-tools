@@ -182,3 +182,33 @@ test('Wasm field imports resolve dense slots for classes loaded after compile', 
     'late setter writes the resolved runtime numeric slot');
   t.end();
 });
+
+test('structured field accesses without compiled dense slots use runtime storage', (t) => {
+  const jvm = denseJvm({jit: {compileWorker: false, warmupThreshold: 0,
+    structuredSsa: true, preferWholeMethodJs: true}});
+  const ref = ['Field', 'DenseBase', ['value', 'I']];
+  const method = {className: 'DenseChild', name: 'bump', descriptor: '()I', flags: [],
+    attributes: [{type: 'code', code: {localsSize: '1', stackSize: '3', exceptionTable: [],
+      codeItems: ['aload_0', 'aload_0', {op: 'getfield', arg: ref}, 'iconst_1', 'iadd',
+        {op: 'putfield', arg: ref}, 'aload_0', {op: 'getfield', arg: ref}, 'ireturn']
+        .map((instruction, index) => ({labelDef: `L${index}:`, instruction})),
+    }}]};
+  jvm.classes.DenseChild.ast.classes[0].items.push({type: 'method', method});
+  const object = {type: 'DenseChild', fields: newFields(jvm, 'DenseChild')};
+  writeField(object.fields, 'DenseBase.value', 9);
+  // A site may lack a dense slot when its hierarchy was incomplete at compile
+  // time. The generic body must still handle a dense receiver at execution.
+  const register = jvm.jit.registerFieldSite.bind(jvm.jit);
+  jvm.jit.registerFieldSite = (...args) => {
+    const id = register(...args); jvm.jit.fieldSites[id].denseSlot = null; return id;
+  };
+  const generated = jvm.jit.getGeneratedFunction(method, {allowEffectfulCalls: true});
+  t.ok(generated?.jvmStructuredSsa, 'the structured tier compiled the fixture');
+  const frame = new Frame(method); frame.className = 'DenseChild'; frame.locals[0] = object;
+  const callStack = new Stack(); callStack.push(frame);
+  const result = generated(frame, {id: 0, status: 'runnable', callStack}, jvm.jit, false);
+  t.equal(result.value, 10, 'the eager read uses the runtime dense slot');
+  t.equal(readField(object.fields, 'DenseBase.value'), 10, 'the write updates that same slot');
+  t.notOk(Object.hasOwn(object.fields, 'DenseBase.value'), 'no shadow sparse field is created');
+  t.end();
+});

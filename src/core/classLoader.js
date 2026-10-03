@@ -1,6 +1,19 @@
 const { getAST } = require('jvm_parser'); 
 const { convertJson } = require('../parsing/convert_tree');
 const NodeFileProvider = require('../io/NodeFileProvider');
+const { ClassDataStrings } = require('./ClassDataStrings');
+
+const classDataStrings = new ClassDataStrings();
+
+// Keep every loading API on the same conversion and annotation path. Sharing
+// primitive strings releases duplicate parser values without rooting ASTs.
+function parseClassData(bytes) {
+  const parsed = getAST(bytes);
+  const annotations = parseAnnotationsFromAst(parsed);
+  const ast = convertJson(parsed.ast, parsed.constantPool);
+  enhanceAstWithAnnotations(ast, annotations);
+  return classDataStrings.share({ ast, constantPool: parsed.constantPool });
+}
 
 // Global FileProvider instance - can be overridden for different environments
 let globalFileProvider = null;
@@ -36,8 +49,8 @@ function parseAnnotationsFromAst(ast) {
   
   const result = {
     classAnnotations: [],
-    fieldAnnotations: {},
-    methodAnnotations: {}
+    fieldAnnotations: Object.create(null),
+    methodAnnotations: Object.create(null)
   };
   
   // Helper function to resolve string from constant pool
@@ -312,7 +325,7 @@ function enhanceAstWithAnnotations(convertedAst, annotations) {
   convertedAst.classes[0].items.forEach(item => {
     if (item.type === 'field' && item.field) {
       const fieldName = item.field.name;
-      if (annotations.fieldAnnotations[fieldName]) {
+      if (Object.prototype.hasOwnProperty.call(annotations.fieldAnnotations, fieldName)) {
         item.field.annotations = annotations.fieldAnnotations[fieldName];
       }
     }
@@ -324,7 +337,7 @@ function enhanceAstWithAnnotations(convertedAst, annotations) {
   convertedAst.classes[0].items.forEach(item => {
     if (item.type === 'method' && item.method) {
       const methodName = item.method.name;
-      if (annotations.methodAnnotations[methodName]) {
+      if (Object.prototype.hasOwnProperty.call(annotations.methodAnnotations, methodName)) {
         item.method.annotations = annotations.methodAnnotations[methodName];
       }
     }
@@ -346,19 +359,9 @@ async function loadClass(className, classPath) {
       // Read the class file content
       const classFileContent = await fileProvider.readFile(classFilePath);
 
-      // Generate the AST
-      const ast = getAST(classFileContent);
-      
-      // Parse annotations from the new AST structure
-      const annotations = parseAnnotationsFromAst(ast);
+      const parsed = parseClassData(classFileContent);
 
-      // Convert the AST
-      const convertedAst = convertJson(ast.ast, ast.constantPool);
-      
-      // Add annotation data to the converted AST
-      enhanceAstWithAnnotations(convertedAst, annotations);
-
-      return convertedAst;
+      return parsed.ast;
     }
   }
 
@@ -379,20 +382,10 @@ async function loadClassByPath(classFilePath, options = {}) {
   // Read the class file content
   const classFileContent = await fileProvider.readFile(classFilePath);
 
-  // Generate the AST
-  const ast = getAST(classFileContent);
-  
-  // Parse annotations from the new AST structure
-  const annotations = parseAnnotationsFromAst(ast);
-
-  // Convert the AST
-  const convertedAst = convertJson(ast.ast, ast.constantPool);
-  
-  // Add annotation data to the converted AST
-  enhanceAstWithAnnotations(convertedAst, annotations);
+  const parsed = parseClassData(classFileContent);
 
   // Return the same structure as the sync version
-  return { ast: convertedAst, constantPool: ast.constantPool };
+  return parsed;
 }
 
 // Synchronous versions for backwards compatibility with existing Node.js code
@@ -410,19 +403,9 @@ function loadClassByPathSync(classFilePath, options = {}) {
     // Read the class file content
     const classFileContent = fileProvider.readFileSync(classFilePath);
 
-    // Generate the AST
-    const ast = getAST(classFileContent);
-    
-    // Parse annotations from the new AST structure
-    const annotations = parseAnnotationsFromAst(ast);
+    const parsed = parseClassData(classFileContent);
 
-    // Convert the AST
-    const convertedAst = convertJson(ast.ast, ast.constantPool);
-    
-    // Add annotation data to the converted AST
-    enhanceAstWithAnnotations(convertedAst, annotations);
-
-    return convertedAst;
+    return parsed.ast;
   } else {
     throw new Error('Synchronous file operations not supported by current FileProvider');
   }

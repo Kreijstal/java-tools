@@ -31,10 +31,19 @@ module.exports = {
       // Java byte arrays contain signed values (-128..127), while crc-32
       // expects octets. Passing the signed JS array through directly changes
       // every byte with its high bit set and produces a different checksum.
-      const slicedB = Uint8Array.from(
-        byteArray.slice(off, off + len),
-        (value) => value & 0xff,
-      );
+      // A byte view has exactly the required bits already. Reinterpret signed
+      // storage as unsigned without copying it; crc32.buf only reads its input.
+      // Preserve slice range semantics and the existing ordinary-array path.
+      let slicedB;
+      if (ArrayBuffer.isView(byteArray) && byteArray.BYTES_PER_ELEMENT === 1) {
+        const range = byteArray.subarray(off, off + len);
+        slicedB = new Uint8Array(range.buffer, range.byteOffset, range.byteLength);
+      } else {
+        slicedB = Uint8Array.from(
+          byteArray.slice(off, off + len),
+          (value) => value & 0xff,
+        );
+      }
       let crc = obj['java/util/zip/CRC32/crc'];
       crc = crc32.buf(slicedB, crc);
       obj['java/util/zip/CRC32/crc'] = crc;

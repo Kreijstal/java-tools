@@ -16,7 +16,7 @@ for (const structured of [false, true]) {
   execFileSync('javac', ['-g', '-d', directory,
     path.resolve(__dirname, '../sources/WasmBulkCopy.java')]);
   const jvm = new JVM({classpath:directory, wasmHeap:true,
-    jit:{compileWorker:false, wasmStructured:structured}});
+    jit:{compileWorker:false, wasmStructured:structured, wasm:{heapBulkCopy:true}}});
   await jvm.preloadClasspathClasses();
   const wasm = jvm.jit.wasmJit;
   const method = await jvm.findMethodInHierarchy('WasmBulkCopy', 'copy', '([II[III)I');
@@ -31,7 +31,9 @@ for (const structured of [false, true]) {
     const frame = new Frame(m);frame.className='WasmBulkCopy';
     args.forEach((v,i) => frame.locals[i]=v);
     const thread={status:'runnable',callStack:new Stack()};thread.callStack.push(frame);
+    const previousFrame=s.meta.box.frame;
     const result=wasm.execute(frame,thread,s,0);
+    t.equal(s.meta.box.frame,previousFrame,'installed imports release the invocation frame');
     return {result,frame,thread,value:s.meta.box.ret};
   };
   const target = new Int32Array([0,0,0,0]);
@@ -44,6 +46,16 @@ for (const structured of [false, true]) {
   t.equal(warm.result.returned,true,'the same prepared module now returns');
   t.equal(warm.value,7,'the compiled loop observes the copied values');
   t.deepEqual(Array.from(target),[0,3,4,0],'destination is exact');
+  const throwing = new Frame(method); throwing.className='WasmBulkCopy';
+  throwing.locals.splice(0,5,null,0,target,0,1);
+  const throwingThread={status:'runnable',callStack:new Stack()};
+  throwingThread.callStack.push(throwing);
+  const savedFrame=state.meta.box.frame;
+  t.throws(()=>wasm.execute(throwing,throwingThread,state,0),
+    error=>error.type==='java/lang/NullPointerException',
+    'native exception still escapes to the guest dispatcher');
+  t.equal(state.meta.box.frame,savedFrame,'throwing imports release the invocation frame');
+  t.equal(throwingThread.callStack.peek(),throwing,'the guest dispatcher retains the throwing frame');
   jvm.classInitializationState.set('WasmBulkCopy','INITIALIZED');
   const drive=await jvm.findMethodInHierarchy('WasmBulkCopy','drive','([I[II)I');
   const driveState=wasm.methodState({method:drive});

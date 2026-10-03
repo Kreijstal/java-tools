@@ -54,10 +54,20 @@ function prepare(jit, spec) {
   }
   const args = starts.map((at, i) => region.slice(at,
     (i + 1 < starts.length ? starts[i + 1] - tokens[i + 1].length : rawEnd) - 2));
-  const assignmentStart = region.lastIndexOf('try { ' + lower.resultName + ' = ', rawStart);
-  const catchStart = region.indexOf('} catch (' + lower.fastCall.caught + ') {', rawEnd);
-  if (assignmentStart < 0 || catchStart < 0) throw Error('canonical call assignment absent');
-  const originalAssignment = region.slice(assignmentStart + 'try { '.length, catchStart);
+  // A site whose fast and canonical invokes share one handler carries the
+  // fast assignment as its own statement inside that handler's `try`.
+  const ownTry = region.lastIndexOf('try { ' + lower.resultName + ' = ', rawStart);
+  const assignmentStart = ownTry >= 0 ? ownTry
+    : region.lastIndexOf(lower.resultName + ' = ', rawStart);
+  const catchStart = ownTry >= 0
+    ? region.indexOf('} catch (' + lower.fastCall.caught + ') {', rawEnd)
+    : region.indexOf(';', rawEnd) + 1;
+  if (assignmentStart < 0 || catchStart <= 0 ||
+      region.indexOf('} catch (' + lower.fastCall.caught + ') {', rawEnd) < 0) {
+    throw Error('canonical call assignment absent');
+  }
+  const originalAssignment = region.slice(
+    assignmentStart + (ownTry >= 0 ? 'try { '.length : 0), catchStart);
   const invoke = site.identifiers.invoke;
   if (!invoke) throw Error('missing bound invoker');
   const namespace = 'singleSite' + site.pc + '_';
@@ -71,7 +81,7 @@ function prepare(jit, spec) {
   // restoration remains at exactly the original caller invoke PC.
   const nullGuards = spec.simplify ? parseDescriptor(callee.descriptor).params
     .flatMap((type,i)=>type.endsWith('[]') ? ['(' + args[i] + ') != null'] : []) : [];
-  const replacement = 'try {\nif (' + invoke + '.jvmInlineRestoringBody && ' +
+  const replacement = (ownTry >= 0 ? 'try {\n' : '') + 'if (' + invoke + '.jvmInlineRestoringBody && ' +
     invoke + '.jvmInlineRestoringBody === helpers.singleSiteInlineTargetBody' +
     nullGuards.map(g=>' && '+g).join('') + ') {\nconst ' + namespace + 'plan = ' +
     invoke + '.jvmInlineRestoringPlan;\n' +

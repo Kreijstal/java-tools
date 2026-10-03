@@ -368,7 +368,9 @@ function simulateBlock(context) {
           node.slotState = new Map(locals);
           // A call-site deopt resumes the interpreter AT or AFTER the invoke,
           // which needs the operand stack beneath the call's arguments too.
-          if (op.startsWith('invoke')) node.stackUnder = stack.slice();
+          if (op.startsWith('invoke') || op === 'monitorenter' || op === 'monitorexit') {
+            node.stackUnder = stack.slice();
+          }
         }
         block.body.push(node);
       }

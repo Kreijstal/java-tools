@@ -1,4 +1,5 @@
 'use strict';
+const {bindStaticFieldAccessors} = require('./staticFieldAccessors');
 
 // WASM tier for hot numeric methods.
 //
@@ -67,9 +68,9 @@ const {
   denseSlotFor, readField, writeField,
 } = require('../core/objectModel');
 const {
-  addMathImport, addSystemImport, addNewArrayImport, addANewArrayImport,
+  addMathImport, addSystemImport, addArraysImport, addNewArrayImport, addANewArrayImport,
   addNewImport, addTypedArrayStoreImports, arrayTracer,
-  addI32ArrayLoadImports,
+  addI32ArrayLoadImports, addStringConstantImport, addStringCallImport,
 } = require('./wasmRuntimeImports');
 const { ClassHierarchy } = require('../analysis/closedWorld/classHierarchy');
 const { revalidateSpeculations } = require('./wasmInline');
@@ -86,13 +87,13 @@ const {
   arrayLoadImportName,
   Unsupported,
   blockedNames,
-  callWasmRun,
+  callWasmRun, takeWasmReturnValue,
   NestedDeopt,
-  isGuestThrow,
+  isGuestThrow, ehRecordingImport,
   FUEL,
   isNoOpExceptionHandler, liveExceptionRanges, supportsWasmTryTable,
   retvGlobalEntry, runvWrapperBody, specokGlobalEntry,
-  maxImpls,
+  maxImpls, recordNestedDeopt,
   hasUncheckedSpeculation, directInstanceLinkCalleeEligible,
   identityInstanceParams,
 } = require('./wasmShared');
@@ -123,6 +124,8 @@ const DEFERRABLE_DEMOTE =
 // call: the gate was skipped 548 times while its blocker signature had already
 // moved.
 const UNSERVICEABLE_DEMOTE = /callee not ready|unresolved static/;
+
+const switchTargetLabels = require("./switchTargetLabels");
 
 const EMPTY_WRITE_SET = new Set();
 
@@ -206,16 +209,7 @@ class MethodTranslator {
       // EH protocol (mirrors the structured tier): record what an import
       // threw so the catch_all arm — which cannot inspect the exception —
       // can tell guest exceptions from host errors.
-      const box = this.box;
-      wrapped = (...args) => {
-        try {
-          return fn(...args);
-        } catch (e) {
-          box.lastThrown = e;
-          box.pendingException = isGuestThrow(e) ? e : null;
-          throw e;
-        }
-      };
+      wrapped = ehRecordingImport(fn, params.length, this.box);
     }
     this.importDecls.push({ name, params, results });
     this.importFns.push(wrapped);
@@ -461,23 +455,17 @@ class MethodTranslator {
         const token = jvm.getClassInitializationToken(currentClassName);
         initializationIdx = this.addImport(
           `static_ready_${currentClassName}`.replace(/[^\w]/g, '_'), [], [T.i32],
-          () => token.initialized ? 1 : 0);
+          token.wasmReadinessGuard?.() || (() => token.initialized ? 1 : 0));
         (this.staticInitializationGuards ||= new Set()).add(currentClassName);
       }
-      const getStatic = t === T.i32
-        ? () => {
-          const value = container.get(key);
-          return typeof value === 'boolean' ? (value ? 1 : 0) : value;
-        }
-        : t === T.ref ? () => container.get(key)
-          : () => toWasmValue(t, container.get(key));
+      const access = bindStaticFieldAccessors(container, key, t);
       return {
         t,
         name,
         initializationIdx,
         idx: isGet
-          ? this.addImport(name, [], [t], getStatic)
-          : this.addImport(name, [t], [], (v) => container.set(key, v)),
+          ? this.addImport(name, [], [t], access.get)
+          : this.addImport(name, [t], [], access.set),
       };
     }
     const name = `${isGet ? 'gf' : 'pf'}_${className}_${fieldName}`.replace(/[^\w]/g, '_');
@@ -708,6 +696,17 @@ class MethodTranslator {
     const pinned = { run: (calleeSt.callee || calleeSt).run, meta: calleeMeta };
     const fn = (...all) => {
       const args = underCount ? all.slice(underCount) : all;
+      if (partial && calleeSt.linkVetoed) {
+        // This import outlives callee selection. Resume a fresh canonical
+        // callee at entry instead of repeatedly executing its failing island.
+        // The caller's locals were spilled before the partial static call.
+        const frame = new Frame(calleeSt.method);
+        frame.className = className;
+        for (const [slot, pos] of argPosBySlot) frame.locals[slot] = args[pos];
+        callerBox.frame.pc = resumePc;
+        for (let i = 0; i < underCount; i++) callerBox.frame.stack.push(all[i]);
+        throw new NestedDeopt([frame]);
+      }
       const current = calleeSt.callee || calleeSt;
       // A dependency-world recompile resets the callee state (meta/run/callee
       // all null) while this closure is still reachable from a running caller
@@ -754,6 +753,7 @@ class MethodTranslator {
         status = callWasmRun(calleeMod.run, full);
       } catch (err) {
         if (partial && err instanceof NestedDeopt) {
+          recordNestedDeopt(calleeSt);
           // the deeper site set frame.pc through its own callerBox
           err.frames.push(frame);
           if (frame === scratchFrame) scratchFrame = null;
@@ -771,18 +771,14 @@ class MethodTranslator {
         if (frame === scratchFrame) scratchFrame = null; // donated to the call stack
         callerBox.frame.pc = resumePc;
         for (let i = 0; i < underCount; i++) callerBox.frame.stack.push(all[i]);
-        calleeSt.nestedDeopts = (calleeSt.nestedDeopts || 0) + 1;
-        if (calleeSt.nestedDeopts > 256 &&
-            calleeSt.nestedDeopts * 4 > calleeSt.nestedCalls) {
-          calleeSt.linkVetoed = true;
-        }
+        recordNestedDeopt(calleeSt);
         // a structured callee's own call-site deopt parks deeper frames on
         // its box; they sit below the callee frame, innermost first
         const deeper = meta.box.pendingFrames;
         meta.box.pendingFrames = null;
         throw new NestedDeopt(deeper ? [...deeper, frame] : [frame]);
       }
-      return meta.box.ret;
+      return takeWasmReturnValue(meta);
     };
     // partial sites need a distinct import per call site: the resume pc is
     // baked into the closure
@@ -813,6 +809,8 @@ class MethodTranslator {
   // handler ranges. Any target may deopt (partial) or miss, so the caller
   // spills its typed slots before every instance call.
   compiledInstanceCallee(ins, itemIndex, underTypes, op) {
+    const stringCall = addStringCallImport(this, this.jvm, ins, op);
+    if (stringCall) return stringCall;
     const [, owner, [name, descriptor]] = ins.arg;
     // invokespecial <init> is statically bound to exactly the named owner's
     // constructor; it is linkable when that constructor compiles fully, so
@@ -876,7 +874,7 @@ class MethodTranslator {
       resolvedCone = resolved;
       if (!resolved) throw new Unsupported(`invoke ${owner}.${name} unresolved`, owner);
       // See the note on this limit in StructuredWasmCompiler.
-      if (resolved.impls.size > maxImpls()) {
+      if (resolved.impls.size > maxImpls(this.wasmJit.maxInstanceImplementations)) {
         throw new Unsupported(`invoke ${owner}.${name} megamorphic`);
       }
       // Impls that cannot be linked (never-compiling entry, EH module,
@@ -1024,6 +1022,7 @@ class MethodTranslator {
         status = callWasmRun(calleeMod.run, full);
       } catch (err) {
         if (partial && err instanceof NestedDeopt) {
+          recordNestedDeopt(calleeSt);
           if (stats) stats.deopts += 1;
           if (this.wasmJit && this.wasmJit.debug) {
             console.error(`[wasmjit] nested callee ${key} unwound through a nested deopt`
@@ -1071,18 +1070,14 @@ class MethodTranslator {
         spillCallerSlots(all);
         callerBox.frame.pc = resumePc;
         for (let i = 0; i < underCount; i++) callerBox.frame.stack.push(all[slotCount + i]);
-        calleeSt.nestedDeopts = (calleeSt.nestedDeopts || 0) + 1;
-        if (calleeSt.nestedDeopts > 256 &&
-            calleeSt.nestedDeopts * 4 > calleeSt.nestedCalls) {
-          calleeSt.linkVetoed = true;
-        }
+        recordNestedDeopt(calleeSt);
         // a structured callee's own call-site deopt parks deeper frames on
         // its box; they sit below the callee frame, innermost first
         const deeper = meta.box.pendingFrames;
         meta.box.pendingFrames = null;
         throw new NestedDeopt(deeper ? [...deeper, frame] : [frame]);
       }
-      return meta.box.ret;
+      return takeWasmReturnValue(meta);
     };
     // Direct wasm->wasm fast path for the single-ready-target shape. The
     // generic import above stays as the complete slow path — null receivers,
@@ -1299,6 +1294,26 @@ class MethodTranslator {
   }
 
   translate() {
+    try {
+      return this.translateBody();
+    } finally {
+      if (this.jvm.jit?.retainCompilerDiagnostics === false) {
+        // Imports retain execution state on this translator, but emission
+        // maps are no longer needed. Metadata returned by assemble keeps its
+        // own resume/link tables; never clear those shared objects in place.
+        for (const key of [
+          'items', 'labelIndex', 'blockStarts', 'slotTypes', 'declared',
+          'localOfSlot', 'stackLocals', 'entryStacks', 'fieldCaches',
+          'importDecls', 'importFns', 'importIndexByName', 'stringConstantImports',
+        ]) {
+          // Clear roots without changing the runtime import receiver's shape.
+          if (Object.hasOwn(this, key)) this[key] = undefined;
+        }
+      }
+    }
+  }
+
+  translateBody() {
     const codeAttr = this.method.attributes.find((a) => a.type === 'code');
     const excTable = codeAttr.code.exceptionTable || [];
     const liveRanges = liveExceptionRanges(this.jvm, codeAttr.code, this.labelIndex);
@@ -1320,6 +1335,16 @@ class MethodTranslator {
       if (op === 'goto' || op === 'goto_w' || BRANCH_COND[op] || op in BRANCH_ZERO ||
           op === 'ifnull' || op === 'ifnonnull' || op === 'if_acmpeq' || op === 'if_acmpne') {
         if (this.labelIndex.has(it.instruction.arg)) leaders.add(this.targetOf(it.instruction));
+        if (i + 1 < this.items.length) leaders.add(i + 1);
+      }
+      if (op === 'tableswitch' || op === 'lookupswitch') {
+        for (const label of switchTargetLabels(it.instruction)) {
+          const target = this.labelIndex.get(label);
+          if (target !== undefined) leaders.add(target);
+        }
+        if (i + 1 < this.items.length) leaders.add(i + 1);
+      }
+      if (op === 'athrow' || op === 'return' || /^[a-z]return$/.test(op || '')) {
         if (i + 1 < this.items.length) leaders.add(i + 1);
       }
     });
@@ -1635,6 +1660,13 @@ class MethodTranslator {
         if (b + 1 < N) pending.push(b + 1);
         continue;
       }
+      if (op === 'tableswitch' || op === 'lookupswitch') {
+        for (const label of switchTargetLabels(instruction)) {
+          const target = this.blockOfItem.get(this.labelIndex.get(label));
+          if (target !== undefined) pending.push(target);
+        }
+        continue;
+      }
       if (op === 'athrow' || op === 'return' || /^[a-z]return$/.test(op || '')) continue;
       if (b + 1 < N) pending.push(b + 1);
     }
@@ -1868,6 +1900,10 @@ class MethodTranslator {
         if (initializationIdx != null) initializationGuards.add(initializationIdx);
         continue;
       }
+      if (op === 'invokestatic') {
+        const call = addArraysImport(this, this.jvm, ins);
+        if (call?.initializationIdx != null) initializationGuards.add(call.initializationIdx);
+      }
       if (op !== 'getstatic' && op !== 'putstatic') continue;
       const {initializationIdx} = this.fieldImports(ins, true, op === 'getstatic');
       if (initializationIdx != null) initializationGuards.add(initializationIdx);
@@ -1905,7 +1941,9 @@ class MethodTranslator {
         emit(OP.i32_const, ...sleb(Number(ins.arg))); push(T.i32);
       } else if (op === 'ldc' || op === 'ldc_w') {
         const a = ins.arg;
-        if (typeof a === 'number') { emit(OP.i32_const, ...sleb(a)); push(T.i32); }
+        if (typeof a === 'string') {
+          emit(OP.call, ...uleb(addStringConstantImport(this, this.jvm, a, op))); push(T.ref);
+        } else if (typeof a === 'number') { emit(OP.i32_const, ...sleb(a)); push(T.i32); }
         else if (a && typeof a === 'object' && !Array.isArray(a) && a.type === 'Float') {
           emit(OP.f32_const, ...f32bytes(a.value)); push(T.f32);
         } else if (a && typeof a === 'object' && !Array.isArray(a) && a.type === 'Integer') {
@@ -2072,7 +2110,7 @@ class MethodTranslator {
         } catch (err) {
           if (!(err instanceof Unsupported)) throw err;
           try {
-            bound = addSystemImport(this, this.jvm, ins);
+            bound = addArraysImport(this, this.jvm, ins) || addSystemImport(this, this.jvm, ins);
             if (bound.writes === null) writes = null;
           } catch (err2) {
             if (!(err2 instanceof Unsupported)) throw err2;
@@ -2219,16 +2257,16 @@ class MethodTranslator {
         return code; // block terminated
       } else if (op === 'ireturn' || op === 'freturn' || op === 'lreturn' ||
           op === 'dreturn' || op === 'areturn') {
-        // The value leaves twice: through the exported retv global for
-        // direct wasm->wasm callers (global.get is one instruction there),
-        // and through the ret_* import for JS entries (the import call is
-        // cheaper than a JS-side WebAssembly.Global.value read).
+        // Reference results are consumed from retv without leaving a copy in
+        // the JS box. Numeric JS returns retain the cheaper ret_* import ABI.
         const retImport = op === 'ireturn' ? 'ret_i' : op === 'freturn' ? 'ret_f'
           : op === 'lreturn' ? 'ret_l' : op === 'dreturn' ? 'ret_d' : 'ret_r';
         pop();
         emit(OP.global_set, ...uleb(0));
-        emit(OP.global_get, ...uleb(0));
-        emit(OP.call, ...uleb(this.importIndexByName.get(retImport)));
+        if (op !== 'areturn') {
+          emit(OP.global_get, ...uleb(0));
+          emit(OP.call, ...uleb(this.importIndexByName.get(retImport)));
+        }
         emit(OP.i32_const, ...sleb(-1), OP.return);
         return code;
       } else if (op === 'return') {
@@ -2390,6 +2428,8 @@ class WasmJit {
     this.activeThread = null;
     this.synchronizedInstanceLinksEnabled =
       jvm.jitOptions?.wasmSynchronizedInstanceLinks === true;
+    this.synchronizedStaticLinksEnabled =
+      jvm.jitOptions?.wasmSynchronizedStaticLinks === true;
     this.normalFlowPreparedUpgradesEnabled =
       jvm.jitOptions?.wasmNormalFlowPreparedUpgrades === true;
     const compileClasses = jvm.jitOptions?.wasmCompileClasses;
@@ -2405,6 +2445,27 @@ class WasmJit {
     // directStaticLink, directInstanceLink, checkcast }. An option that is
     // set wins over its environment variable.
     const wasmOptions = (jvm && jvm.jitOptions && jvm.jitOptions.wasm) || {};
+    this.heapBulkCopy = wasmOptions.heapBulkCopy === true;
+    this.nestedArgumentBuffers = wasmOptions.reuseNestedArguments === true
+      ? new (require('./NestedArgumentBuffers'))() : null;
+    const heapVersionBytes = wasmOptions.parameterHeapSpecializationMaxBytes ?? 0;
+    if (!Number.isSafeInteger(heapVersionBytes) || heapVersionBytes < 0) {
+      throw new TypeError('wasm.parameterHeapSpecializationMaxBytes must be a nonnegative safe integer');
+    }
+    this.parameterHeapSpecializationMaxBytes = heapVersionBytes;
+    const implementationLimit = wasmOptions.maxInstanceImplementations;
+    if (implementationLimit !== undefined &&
+        (!Number.isSafeInteger(implementationLimit) || implementationLimit < 1)) {
+      throw new TypeError('wasm.maxInstanceImplementations must be a positive safe integer');
+    }
+    this.maxInstanceImplementations = implementationLimit;
+    for (const [name, fallback] of [['maxInlineCalleeItems', 96], ['inlineBudget', 512]]) {
+      const value = wasmOptions[name];
+      if (value !== undefined && (!Number.isSafeInteger(value) || value < 1)) {
+        throw new TypeError(`wasm.${name} must be a positive safe integer`);
+      }
+      this[name] = value === undefined ? fallback : value;
+    }
     this.enabled = (env.JVM_WASM_JIT === '1' || browserDefault) && typeof WebAssembly !== 'undefined' &&
       !env.JVM_TRACE && env.JVM_PROFILE_HOT_METHODS !== '1';
     // Browser launchers may explicitly finish an ahead-of-time preparation
@@ -2428,8 +2489,16 @@ class WasmJit {
     // is to preserve working tiers through the migration. This exists so the
     // contract can be tested, and so the cost of honouring it is measurable
     // before it is made the default.
-    this.refusePostMainCompiles =
-      env.JVM_JIT_REFUSE_POST_MAIN_WASM === '1';
+    if (wasmOptions.refusePostMainCompiles !== undefined &&
+        typeof wasmOptions.refusePostMainCompiles !== 'boolean') {
+      throw new TypeError('wasm.refusePostMainCompiles must be a boolean');
+    }
+    this.refusePostMainCompiles = wasmOptions.refusePostMainCompiles ??
+      (env.JVM_JIT_REFUSE_POST_MAIN_WASM === '1');
+    // See queueSkippedCallee.
+    this.skippedCalleeQueueEnabled = wasmOptions.skippedCalleeQueue ??
+      (env.JVM_WASM_SKIPPED_CALLEE_QUEUE !== '0');
+    this.skippedCalleeGapMs = Number(wasmOptions.skippedCalleeGapMs ?? 50);
     this.debug = env.JVM_DEBUG_WASMJIT === '1';
     this.traceMethodPattern = env.JVM_TRACE_WASM_METHOD || '';
     this.traceExitsOnly = env.JVM_TRACE_WASM_EXITS_ONLY === '1';
@@ -2476,6 +2545,18 @@ class WasmJit {
       ? 50 : Number(env.JVM_WASM_FAILED_RETRY_MIN_MS);
     this.retryBackoffMax = Math.max(1, Number(env.JVM_WASM_JIT_RETRY_BACKOFF_MAX || 4096));
     this.structuredEnabled = wasmOptions.structured ?? (env.JVM_WASM_STRUCTURED === '1');
+    // Deep inlining in the structured backend (wasmInline): splice call
+    // sites inside live handler ranges (exceptions dispatched at the call
+    // pc), static calls inside spliced instance bodies, and provably counted
+    // loops. Puts a sprite draw and its blit into the painter's module.
+    this.deepInline = wasmOptions.deepInline ?? (env.JVM_WASM_DEEP_INLINE === '1');
+    // A spliced sprite draw plus its blit is ~250 items per site, and a
+    // budget spent in program order must still reach a method's last loop
+    // site, so deep inlining raises the limits unless they were given.
+    if (this.deepInline) {
+      if (wasmOptions.maxInlineCalleeItems === undefined) this.maxInlineCalleeItems = 200;
+      if (wasmOptions.inlineBudget === undefined) this.inlineBudget = 16384;
+    }
     this.instanceLinkEnabled = env.JVM_WASM_DEVIRT !== '0';
     // Direct wasm->wasm static links: eligible fully-compiled callees are
     // called through their runv export with no JS bridge on the path.
@@ -2522,6 +2603,10 @@ class WasmJit {
     // JVM_WASM_DIRECT_INSTANCE_LINK=0, or jit.wasm.directInstanceLink:false,
     // to keep every instance call on the bridge.
     this.directInstanceLinkEnabled = wasmOptions.directInstanceLink ?? (env.JVM_WASM_DIRECT_INSTANCE_LINK !== '0');
+    // Complete guard-elided instance bodies are safe under bridge
+    // revalidation, but expanding a nested chain can worsen frame latency.
+    // Keep the alternative ranking opt-in until constrained gameplay passes.
+    this.preferCompleteInstanceCallees = wasmOptions.preferCompleteInstanceCallees === true;
     // Closed polymorphic sites can classify the externref once, then call the
     // selected raw Wasm export directly. This removes the JS nested-call
     // wrapper while retaining the generic import for null, late, partial, and
@@ -2713,6 +2798,25 @@ class WasmJit {
     return st.depWorld !== this.depWorldVersion();
   }
 
+  refreshPartialDependencies(st, {asCallee = false, allowOnDemand = false} = {}) {
+    if (st.status !== 'ready' || !st.partialDeps ||
+        !(st.partialDepsStructured || st.partialDepsUnserviceable) ||
+        !this.depsMoved(st)) return false;
+    // Preserve published code while replacement compilation is forbidden,
+    // for normal frame entry as well as callee lookup. Withdrawing first
+    // strands a usable module in the cold state until compilation resumes.
+    if (this.compilationFrozen ||
+        this.jvm.guestStarted && this.refusePostMainCompiles) return false;
+    if (asCallee && !allowOnDemand && (this.noOnDemandCalleeCompile ||
+        !this.onDemandCalleeBudgetAvailable())) return false;
+    st.depWorld = this.depWorldVersion();
+    st.blockerSig = this.blockerSignature(st.blockers);
+    if ((st.depRecompiles || 0) >= this.depRecompileLimit) return false;
+    st.depRecompiles = (st.depRecompiles || 0) + 1;
+    this.withdrawModule(st);
+    return true;
+  }
+
   // Withdraw a method's published module(s). Every path that resets a state
   // back to cold goes through here so the runtime linker can stop callers
   // entering the withdrawn module directly on their next call.
@@ -2731,7 +2835,8 @@ class WasmJit {
   methodState(frame) {
     let st = this.state.get(frame.method);
     if (!st) {
-      st = { entries: 0, status: 'cold', runs: 0, exits: 0, fuelExits: 0 };
+      st = { entries: 0, status: 'cold', runs: 0, exits: 0, fuelExits: 0,
+        synchronized: (frame.method.flags || []).includes('synchronized') };
       this.state.set(frame.method, st);
     }
     return st;
@@ -2744,10 +2849,8 @@ class WasmJit {
     return {
       enforcing: this.refusePostMainCompiles,
       frozen: this.compilationFrozen,
-      // Whether the freeze is the mode in force, so a census that reports no
-      // post-main Wasm compilation says which of the two reasons applies:
-      // nothing asked, or the tier was switched off after preparation.
-      executionOnly: this.compilationFrozen && !this.executionOnlyDeclined,
+      // A warmup freeze alone still permits synchronous callee compilation.
+      executionOnly: this.refusePostMainCompiles && !this.executionOnlyDeclined,
       compiled: Object.fromEntries(this.postMainCompilesByEntry),
       refused: Object.fromEntries(this.postMainRefusedByEntry),
     };
@@ -2888,16 +2991,9 @@ class WasmJit {
     // never exits at all. So rebuild here instead, and only when the world
     // that produced those demotions has actually changed — not on a timer or
     // an exit rate, both of which measured negative.
-    if (st.partialDeps && (st.partialDepsStructured || st.partialDepsUnserviceable) &&
-        this.depsMoved(st)) {
-      st.depWorld = this.depWorldVersion();
-      st.blockerSig = this.blockerSignature(st.blockers);
-      if ((st.depRecompiles || 0) < this.depRecompileLimit) {
-        st.depRecompiles = (st.depRecompiles || 0) + 1;
-        this.withdrawModule(st);
-        if (this.census) this._censusNote(frame, 'dependency-world-grew');
-        return null;
-      }
+    if (this.refreshPartialDependencies(st)) {
+      if (this.census) this._censusNote(frame, 'dependency-world-grew');
+      return null;
     }
 
     // Speculative modules (CHA-based inlined instance calls — instanceof
@@ -3092,7 +3188,7 @@ class WasmJit {
     const result = this.execute(frame, thread, prep.st, prep.blk, true, prep.osr === true);
     if (result.returned) {
       const meta = prep.osr === true ? prep.st.osr.meta : prep.st.meta;
-      return { returned: true, isVoid: meta.retChar === 'V', value: meta.box.ret };
+      return { returned: true, isVoid: meta.retChar === 'V', value: result.value };
     }
     // deopted: nested callee frames were materialized ABOVE this child — the
     // caller must yield to the scheduler rather than resume the child itself
@@ -3130,12 +3226,35 @@ class WasmJit {
     const parentNested = this._compileNestedMs || 0;
     this._compileNestedMs = 0;
     const statusBefore = st && st.status;
+    // While the guest is running, one compile entry is one uninterruptible
+    // turn on the thread the guest draws from, and linking pulls cold callees
+    // into it: `findReadyStatic` compiles them on demand, and each of those
+    // does the same for its own callees. Measured in Firefox on Deko Bloko's
+    // Start Game transition, entering qc.b(IZ)Z once cost 3607 ms and
+    // qc.a(ZIIZZ)V 4707 ms, most of it that recursion -- one callee subtree
+    // under qc.a was 2307 ms by itself. Arm a deadline at the outermost
+    // entry: past it, cold callees are left for their own warmup instead of
+    // being built inside this turn. Nothing is stranded -- an unlinked callee
+    // is the UNKNOWN state the linker already handles, it names itself as a
+    // blocker, and the caller relinks when it becomes ready.
+    const outermostEntry = this._calleeCompileDeadline === undefined;
+    if (outermostEntry) {
+      const budget = this.jit.guestCompileBudgetMs();
+      this._calleeCompileDeadline = budget > 0 ? t0 + budget : Infinity;
+    }
     // Phase 1 guard before any Wasm compiler work runs.
     const guard = this.jit.startSynchronousCompile(
       frame && frame.method, "wasm-compile");
     try {
       return this._compileUntimed(frame, st, options);
     } finally {
+      if (st && frame && frame.method) {
+        // Roots never pass the link paths that record the method; the
+        // skipped-callee queue rebuilds by state and needs it.
+        if (!st.method) st.method = frame.method;
+        this.noteBlockedCompile(st, frame.className || frame.method.className, frame.method);
+      }
+      if (outermostEntry) this._calleeCompileDeadline = undefined;
       const ms = now() - t0;
       const nested = this._compileNestedMs || 0;
       this._compileNestedMs = parentNested + ms;
@@ -3191,7 +3310,8 @@ class WasmJit {
       if (this.structuredEnabled) {
         try {
           const StructuredWasmCompiler = require('./StructuredWasmCompiler');
-          structuredMeta = new StructuredWasmCompiler(this.jvm, frame.method, className, this).translate();
+          structuredMeta = new StructuredWasmCompiler(this.jvm, frame.method, className, this,
+            {asCallee}).translate();
           this.structuredCompiles += 1;
         } catch (err) {
           if (!(err instanceof Unsupported)) throw err;
@@ -3426,7 +3546,17 @@ class WasmJit {
       // through frame imports and is refused by every link site, so
       // preferring it here left a linkable structured module unused and the
       // caller waiting forever on a "not ready" callee.
-      const rank = (m) => (m.boxedCount ? -1
+      // Static links cannot enter a module whose inline assumptions need the
+      // scheduler's speculation gate. Rank actual entry eligibility before
+      // coverage; otherwise a partial speculative primary ties with a usable
+      // dispatcher and hides the only body static callers can safely enter.
+      // Instance bridges revalidate guard-elided inline assumptions before
+      // every call. Static links lack that entry gate; retain their stricter
+      // refusal. Guarded inline modules remain ineligible for both paths.
+      const revalidatedInstance = this.preferCompleteInstanceCallees &&
+        !(frame.method.flags || []).includes('static');
+      const rank = (m) => (m.boxedCount || !m.externalEntry.has(0) ||
+          (revalidatedInstance ? m.speculations : hasUncheckedSpeculation(m)) ? -1
         : m.fullyCompiled ? 2 : m.normalFlowFullyCompiled ? 1 : 0);
       st.callee = st.osr && rank(st.osr.meta) > rank(st.meta) ? st.osr : null;
       st.status = 'ready';
@@ -3698,8 +3828,6 @@ class WasmJit {
         }));
       }
     }
-    meta.box.frame = frame;
-    meta.box.ret = undefined;
     const args = new Array(meta.paramSlots.length + 2);
     for (let i = 0; i < meta.paramSlots.length; i++) {
       const { slot, t } = meta.paramSlots[i];
@@ -3714,6 +3842,9 @@ class WasmJit {
     this.runCount += 1;
     let status;
     const previousThread = this.activeThread;
+    const previousFrame = meta.box.frame;
+    meta.box.frame = frame;
+    meta.box.ret = undefined;
     this.activeThread = thread;
     try {
       status = callWasmRun(mod.run, args);
@@ -3737,7 +3868,13 @@ class WasmJit {
       throw err;
     } finally {
       this.activeThread = previousThread;
+      // The installed module outlives this invocation. Its import box must
+      // not retain a retired Frame (and all of its locals). Nested entry can
+      // share the box, so restore the outer invocation rather than clear it.
+      meta.box.frame = previousFrame;
     }
+
+    const returnedValue = status === -1 ? takeWasmReturnValue(meta) : undefined;
 
     if (this.traceMethodPattern && st.key &&
         st.key.includes(this.traceMethodPattern) &&
@@ -3751,10 +3888,10 @@ class WasmJit {
         status,
         framePc: frame.pc,
         stackDepth: frame.stack.items.length,
-        returnedValueType: meta.box.ret === undefined ? 'undefined'
-          : meta.box.ret === null ? 'null'
-            : meta.box.ret && (meta.box.ret.type || meta.box.ret._className) ||
-              typeof meta.box.ret,
+        returnedValueType: returnedValue === undefined ? 'undefined'
+          : returnedValue === null ? 'null'
+            : returnedValue && (returnedValue.type || returnedValue._className) ||
+              typeof returnedValue,
         top: top && `${top.className || '?'}.${
           top.method?.name || '?'}${top.method?.descriptor || ''}`,
       }));
@@ -3774,9 +3911,9 @@ class WasmJit {
     if (status === -1) {
       thread.callStack.pop();
       if (!nested && meta.retChar !== 'V' && !thread.callStack.isEmpty()) {
-        thread.callStack.peek().stack.push(meta.box.ret);
+        thread.callStack.peek().stack.push(returnedValue);
       }
-      return { handled: true, returned: true };
+      return { handled: true, returned: true, value: returnedValue };
     }
     // transient exit: locals already spilled by the stub; resume interpreter here
     st.exits += 1;
@@ -3908,6 +4045,183 @@ class WasmJit {
     return keys.size ? keys : EMPTY_WRITE_SET;
   }
 
+  // Whether this compile turn may still build a cold callee. Outside a
+  // compile (no deadline armed) and before the guest starts there is nothing
+  // to keep responsive, so the answer is yes; inside one it is yes until the
+  // turn's budget is spent. Counted so a run can say how often the bound
+  // actually bit rather than assuming it never does.
+  onDemandCalleeBudgetAvailable() {
+    if (this._calleeCompileDeadline === undefined) return true;
+    if (nowMs() < this._calleeCompileDeadline) return true;
+    this.calleeCompileBudgetExhaustedCount =
+      (this.calleeCompileBudgetExhaustedCount || 0) + 1;
+    return false;
+  }
+
+  // A callee compile (or a partial callee's rebuild) skipped because the
+  // guest turn's budget was spent is otherwise never retried: methods that
+  // run as prepared JavaScript never pass the interpreter's warm-up gate, so
+  // nothing asks again. Deko Bloko's mixer ia.c()Z linked a channel factory
+  // whose constructor was skipped this way; the factory was refused as a
+  // partial reference-returning module and the mixer exit-stormed out of
+  // Wasm. These compiles run later, one per timer turn, each under its own
+  // budget; the most recently skipped (the deepest callee) goes first.
+  budgetSpent() {
+    return this._calleeCompileDeadline !== undefined &&
+      nowMs() >= this._calleeCompileDeadline;
+  }
+
+  queueSkippedCallee(st, className, method, front = true) {
+    if (!this.skippedCalleeQueueEnabled || !st || !method || !this.jvm.guestStarted ||
+        this.refusePostMainCompiles) return;
+    if (!this.skippedCallees) {
+      this.skippedCallees = new Map();
+      this.skippedCalleeOrder = [];
+      this.skippedCalleeCompiles = 0;
+    }
+    const key = st.key || `${className}.${method.name}${method.descriptor}`;
+    if (this.skippedCallees.has(key)) return;
+    this.skippedCallees.set(key, {st, className, method, attempts: 0});
+    if (front) this.skippedCalleeOrder.unshift(key);
+    else this.skippedCalleeOrder.push(key);
+    this.scheduleSkippedCalleeStep();
+  }
+
+  queueSkippedRebuild(st, className, method) {
+    if (st && st.status === 'ready' && st.partialDeps &&
+        (st.partialDepsStructured || st.partialDepsUnserviceable) &&
+        this.budgetSpent() && this.depsMoved(st)) {
+      this.queueSkippedCallee(st, className, method);
+    }
+  }
+
+  // A compile deferred on named blockers during the guest's run waits for
+  // them; when a queued compile makes them ready it is queued in turn.
+  // An as-callee deferral records its blockers separately (calleeBlockers)
+  // and is retried only from a later compile epoch; with compilation frozen
+  // and nothing else compiling, the epoch never advances, so it is queued
+  // here when what it waits for (a callee, or a class's initialization)
+  // becomes ready.
+  noteBlockedCompile(st, className, method) {
+    if (!this.skippedCalleeQueueEnabled || !this.jvm.guestStarted ||
+        st.status !== 'cold') return;
+    if (!(st.blockers && st.blockers.length) &&
+        !(st.calleeBlockers && st.calleeBlockers.length)) return;
+    if (!this.blockedCompiles) this.blockedCompiles = new Map();
+    this.blockedCompiles.set(st, {className, method});
+  }
+
+  blockedCompileResolved(st) {
+    return Boolean(st.blockers && st.blockers.length &&
+        this.blockersResolved(st.blockers, st.deferredBlockerSig) ||
+      st.calleeBlockers && st.calleeBlockers.length &&
+        this.blockersResolved(st.calleeBlockers, st.calleeBlockerSig));
+  }
+
+  queueResolvedBlockedCompiles() {
+    if (!this.blockedCompiles) return;
+    for (const [waiting, where] of this.blockedCompiles) {
+      if (waiting.status !== 'cold') {
+        this.blockedCompiles.delete(waiting);
+      } else if (this.blockedCompileResolved(waiting)) {
+        this.blockedCompiles.delete(waiting);
+        this.queueSkippedCallee(waiting, where.className, where.method, false);
+      }
+    }
+  }
+
+  // Called by the JIT when a class finishes initializing.
+  noteClassInitialized() {
+    this.queueResolvedBlockedCompiles();
+  }
+
+  scheduleSkippedCalleeStep() {
+    if (this.skippedCalleeTimer) return;
+    const timer = setTimeout(() => {
+      this.skippedCalleeTimer = null;
+      this.runSkippedCalleeStep();
+      if (this.skippedCalleeOrder.length) this.scheduleSkippedCalleeStep();
+      else this.reopenExitStorms();
+    }, this.skippedCalleeGapMs);
+    timer?.unref?.();
+    this.skippedCalleeTimer = timer || true;
+  }
+
+  runSkippedCalleeStep() {
+    const key = this.skippedCalleeOrder.shift();
+    const entry = key && this.skippedCallees.get(key);
+    if (!entry) return false;
+    this.skippedCallees.delete(key);
+    const {st, className, method} = entry;
+    // A compilation freeze forbids replacing published code but, like the
+    // callee-link paths, still lets a cold callee compile.
+    if (!this.compilationFrozen && st.status === 'ready' && st.partialDeps &&
+        this.depsMoved(st)) {
+      st.depWorld = this.depWorldVersion();
+      st.blockerSig = this.blockerSignature(st.blockers);
+      this.withdrawModule(st);
+    }
+    if (st.status === 'cold') {
+      st.calleeDeferredEpoch = undefined;
+      st.retryNotBeforeMs = undefined;
+      this.compile({className, method}, st, {
+        asCallee: !this.jit.hasBackwardBranch(method),
+        entryPath: 'skipped-callee'});
+      this.skippedCalleeCompiles += 1;
+    }
+    entry.attempts += 1;
+    const partial = st.status !== 'ready' ||
+      !(st.meta && st.meta.fullyCompiled) && Boolean(st.blockers && st.blockers.length);
+    if (partial && entry.attempts < 3 && st.status !== 'failed') {
+      this.skippedCallees.set(key, entry);
+      this.skippedCalleeOrder.push(key);
+    }
+    // Partial modules already linked by their callers are never looked up
+    // again, so their rebuild is queued here once a blocker they name moved
+    // (this step, or a callee it compiled on demand, made it ready).
+    if (st.status === 'ready' && !this.compilationFrozen) {
+      for (const other of this.compiled) {
+        if (other !== st && other.status === 'ready' && other.method && other.key &&
+            other.blockers && other.blockers.length && other.partialDeps &&
+            (other.partialDepsStructured || other.partialDepsUnserviceable) &&
+            this.depsMoved(other)) {
+          this.queueSkippedCallee(other, other.key.slice(0, other.key.indexOf('.')),
+            other.method, false);
+        }
+      }
+    }
+    if (st.status === 'ready') this.queueResolvedBlockedCompiles();
+    return true;
+  }
+
+  // The exit-storm veto judges a module by the exits it has taken. Exits
+  // taken inside callees that were still partial are no evidence about the
+  // world after those callees compiled, and a vetoed module never runs, so
+  // it could never collect new evidence. Once the queue drains, each vetoed
+  // module gets a fresh window, at most three times.
+  reopenExitStorms() {
+    for (const st of this.compiled) {
+      if (!st.method || st.status !== 'ready' ||
+          (st.stormReopens || 0) >= 3 || !this.jit.hasWasmExitStorm(st.method)) continue;
+      st.stormReopens = (st.stormReopens || 0) + 1;
+      st.runs = 0;
+      st.exits = 0;
+      st.fuelExits = 0;
+      this.jit.publishWasmTargetReady?.(st.method);
+    }
+  }
+
+  // Test hook: run the queue to completion synchronously.
+  drainSkippedCallees(limit = 1000) {
+    let steps = 0;
+    while (this.skippedCalleeOrder && this.skippedCalleeOrder.length && steps < limit) {
+      this.runSkippedCalleeStep();
+      steps += 1;
+    }
+    this.reopenExitStorms();
+    return steps;
+  }
+
   // Whether a callee whose last as-callee compile was deferred should be
   // tried again now. See the deferral in compile().
   calleeRetryAllowed(st) {
@@ -3980,7 +4294,7 @@ class WasmJit {
   // what the late-bound trampoline exists for, and conflating the two is the
   // coupling this whole phase removes -- but so is treating 'incompatible' as
   // 'unknown', which installs a caller that exits Wasm on every invocation.
-  staticLinkClassification(className, name, descriptor) {
+  staticLinkClassification(className, name, descriptor, allowSynchronized = false) {
     const cd = this.jvm.classes[className];
     const clsAst = cd && cd.ast && cd.ast.classes[0];
     // A JRE-native or unloaded class owns no bytecode this backend compiles,
@@ -3991,9 +4305,10 @@ class WasmJit {
     if (!method) return 'incompatible';
     const flags = method.flags || [];
     if (!flags.includes('static')) return 'incompatible';
-    // Structural and permanent: a linked call runs the body with no frame, so
-    // it has nowhere to hold a monitor, and native/abstract have no body here.
-    if (flags.includes('synchronized')) return 'incompatible';
+    // Raw/legacy links cannot own a monitor; structured links explicitly
+    // opt into the frame-based protocol. Native/abstract methods have no body.
+    if (flags.includes('synchronized') &&
+        !(allowSynchronized && this.synchronizedStaticLinksEnabled)) return 'incompatible';
     if (flags.includes('native') || flags.includes('abstract')) return 'incompatible';
     if (this.jit && this.jit.jitDenied && this.jit.jitDenied(method)) return 'incompatible';
     const st = this.state.get(method);
@@ -4084,38 +4399,51 @@ class WasmJit {
     let unresolvable = 0;
     for (const binding of pending) {
       const klass = this.staticLinkClassification(
-        binding.className, binding.name, binding.descriptor);
+        binding.className, binding.name, binding.descriptor, binding.synchronizedStaticProtocol);
       if (klass === 'incompatible') unresolvable += 1;
       else blockers.push(`${binding.className}.${binding.name}${binding.descriptor}`);
     }
     return { pending: pending.length, unresolvable, blockers };
   }
 
-  findReadyStatic(className, name, descriptor, allowPartial = false, allowOnDemand = false) {
+  findReadyStatic(className, name, descriptor, allowPartial = false, allowOnDemand = false, allowSynchronized = false) {
     const cd = this.jvm.classes[className];
     const clsAst = cd && cd.ast && cd.ast.classes[0];
     if (!clsAst) return null;
     const method = clsAst.items.filter((i) => i.type === 'method').map((i) => i.method)
       .find((m) => m.name === name && m.descriptor === descriptor);
     if (!method || !(method.flags || []).includes('static')) return null;
-    // ACC_SYNCHRONIZED is implied by the flag, not by bytecode, so the monitor
-    // only exists on the interpreter's frame path. A linked call runs the body
-    // with no frame at all, which would silently drop the lock.
-    if ((method.flags || []).includes('synchronized')) return null;
+    // ACC_SYNCHRONIZED is implied by the flag, not by bytecode. Only callers
+    // with the frame-based monitor protocol may link this body.
+    if ((method.flags || []).includes('synchronized') &&
+        !(allowSynchronized && this.synchronizedStaticLinksEnabled)) return null;
     let st = this.state.get(method);
     if (!st) st = this.methodState({ method });
     if (!st.method) st.method = method; // partial-link deopts materialize a Frame
+    const hasClassInitializer = clsAst.items.some(i =>
+      i.type === 'method' && i.method.name === '<clinit>');
+    const initializationAllowsCompile = !hasClassInitializer ||
+      this.jvm.classInitializationState.get(className) === 'INITIALIZED';
+    // A prebuilt artifact is not proof that its class initializer ran. Static
+    // synchronized links must return to ordinary invocation until it has.
+    if ((method.flags || []).includes('synchronized') && !initializationAllowsCompile) return null;
+    if (initializationAllowsCompile) {
+      this.refreshPartialDependencies(st, {asCallee: true, allowOnDemand});
+    }
     if (st.status === 'cold' && (allowOnDemand || !this.noOnDemandCalleeCompile) &&
         this.calleeRetryAllowed(st)) {
-      const hasClassInitializer = clsAst.items
-        .filter((i) => i.type === 'method')
-        .some((i) => i.method.name === '<clinit>');
       // Linking must not bypass an observable class initializer. Classes with
       // no <clinit> are safe because their initialization has no Java code.
-      if (!hasClassInitializer || this.jvm.classInitializationState.get(className) === 'INITIALIZED') {
+      if (!initializationAllowsCompile) {
+        // Waits for the class; the caller records it as a blocker.
+      } else if (allowOnDemand || this.onDemandCalleeBudgetAvailable()) {
         this.compile({ method, className }, st,
           { asCallee: true, entryPath: 'static-callee-link' });
+      } else {
+        this.queueSkippedCallee(st, className, method);
       }
+    } else if (initializationAllowsCompile) {
+      this.queueSkippedRebuild(st, className, method);
     }
     if (!st || st.status !== 'ready') return null;
     const cm = (st.callee || st).meta;
@@ -4177,9 +4505,17 @@ class WasmJit {
     if (!st.method) st.method = method;
     st.synchronized = flags.includes('synchronized');
     st.targetClassName = className;
-    if (st.status === 'cold' && !this.noOnDemandCalleeCompile && this.calleeRetryAllowed(st)) {
-      this.compile({ method, className }, st,
-        { asCallee: true, entryPath: 'instance-callee-link' });
+    this.refreshPartialDependencies(st, {asCallee: true});
+    if (st.status === 'cold' && !this.noOnDemandCalleeCompile &&
+        this.calleeRetryAllowed(st)) {
+      if (this.onDemandCalleeBudgetAvailable()) {
+        this.compile({ method, className }, st,
+          { asCallee: true, entryPath: 'instance-callee-link' });
+      } else {
+        this.queueSkippedCallee(st, className, method);
+      }
+    } else {
+      this.queueSkippedRebuild(st, className, method);
     }
     const unlinkable = (why) => {
       if (this.debug) {
@@ -4208,7 +4544,7 @@ class WasmJit {
   // a target another path already invalidated (meta gone).
   revalidateNestedCallee(st) {
     const meta = (st.callee || st).meta;
-    if (!meta) return false;
+    if (!meta || st.linkVetoed) return false;
     if (!meta.specSites || !meta.specSites.length) return true;
     if (meta.specEpoch === (this.jvm.classEpoch || 0)) return true;
     if (revalidateSpeculations(this.jvm, this.hierarchy, meta.specSites)) {
@@ -4257,10 +4593,10 @@ class WasmJit {
     return st;
   }
 
-  // A synchronized linked instance call owns a real frame even when its
+  // A synchronized linked call owns a real frame even when its
   // body is complete. Contention exits at entry with the original arguments;
   // continuations retain the monitor until CallStack.pop retires the frame.
-  runSynchronizedInstance(mod, frame, wasmArgs, javaArgs, argPosBySlot) {
+  runSynchronizedMethod(mod, frame, wasmArgs, javaArgs, argPosBySlot) {
     for (const [slot, pos] of argPosBySlot) frame.locals[slot] = javaArgs[pos];
     const thread = this.activeThread;
     if (!thread || !this.jvm.enterFrameMonitorIfNeeded(frame, thread)) return 0;
@@ -4291,6 +4627,7 @@ class WasmJit {
 
 module.exports = WasmJit;
 module.exports._test = {
+  MethodTranslator,
   capturesBooleanStatic, isNoOpExceptionHandler, toWasmValue,
   wasmFunctionNameSection, wasmProfilerName, T,
 };

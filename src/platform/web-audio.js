@@ -25,6 +25,17 @@
   const forceMonoByQuery = Boolean(global.location &&
     typeof global.location.search === "string" &&
     new URLSearchParams(global.location.search).get("audio") === "mono");
+  // Per-byte PCM checksums and per-sample amplitude statistics are
+  // verification aids, not delivery. They ran on every guest write on the
+  // main thread and cost as much as the guest's own int-to-byte conversion
+  // (2.5% of all CPU on the slow browser host, ~0.3 ms per 256-frame chunk).
+  // They stay available for tests and explicit diagnosis
+  // (`audioPlatform.pcmDiagnostics = true` before this module loads, or
+  // `?audiodiag=1`); the sparse every-128th-frame signal sampling that
+  // proves audible output is kept unconditionally.
+  const pcmDiagnostics = global.JVMDebug.audioPlatform.pcmDiagnostics === true ||
+    Boolean(global.location && typeof global.location.search === "string" &&
+      new URLSearchParams(global.location.search).get("audiodiag") === "1");
   const WORKLET_SOURCE = `
 class JVMSourceDataLineProcessor extends AudioWorkletProcessor {
   constructor(options) {
@@ -191,17 +202,18 @@ registerProcessor("jvm-source-data-line", JVMSourceDataLineProcessor);`;
       this.bufferSize = Math.max(1, Number(options.bufferSize) || 4096);
       this.bytesPerFrame = Math.max(1, options.channels || 1) *
         Math.max(1, (options.bitDepth || 16) / 8);
-      // Bound refill bursts while guest threads share the browser thread.
-      // Caveat: producers that derive occupancy from available() see this
-      // conservative window as queued data. Removing the window regresses
-      // frame pacing in the current runtime; it needs a coordinated mixer /
-      // scheduling fix, not an unconditional full-capacity advertisement.
-      const bytesPerSecond = Math.max(1,
-        Number(options.sampleRate) || 44100) * this.bytesPerFrame;
-      this.producerWindowBytes = options.cooperativeRefill === true || this.bufferSize <= 8192
-        ? this.bufferSize
-        : Math.min(this.bufferSize, Math.max(2048,
-          Math.ceil(bytesPerSecond * 0.025)));
+      // available() reports the real free space. An earlier 25 ms
+      // "producer window" capped it to bound refill bursts, but a Java Sound
+      // producer derives its queue occupancy from available(): with the cap a
+      // 16384-frame line always looked 97% full, so the guest mixer refilled
+      // at most two 256-frame chunks per pass and needed service every 23 ms
+      // to keep up, while a line whose fill target lay below capacity minus
+      // the window looked full forever, was never written, and was closed and
+      // reopened by the guest's stall detector every few seconds. Measured on
+      // the slow browser host (Deko Bloko menu, 22.05 kHz stereo): 87% of a
+      // 40 s window was silence with the cap. Burst bounding belongs to the
+      // scheduler, which already slices the producer thread at host deadlines.
+      this.producerWindowBytes = this.bufferSize;
       // SourceDataLine is a continuous stream. Scheduling every 256-frame
       // guest write as an independent 22.05 kHz AudioBufferSource makes the
       // browser restart its sample-rate converter at every tiny boundary.
@@ -394,6 +406,10 @@ registerProcessor("jvm-source-data-line", JVMSourceDataLineProcessor);`;
       const bytesPerSample = (this.options.bitDepth || 16) / 8;
       const frameCount =
         Math.floor(bytes.length / (channels * bytesPerSample));
+      if (!pcmDiagnostics) {
+        this.pcmRecordedFrames += frameCount;
+        return;
+      }
       for (let frame = 0; frame < frameCount; frame += 1) {
         let hasSignal = false;
         for (let channel = 0; channel < channels; channel += 1) {
@@ -441,6 +457,24 @@ registerProcessor("jvm-source-data-line", JVMSourceDataLineProcessor);`;
       this.pcmRecordedFrames += frameCount;
     }
 
+    // Verification-only per-sample statistics (see pcmDiagnostics).
+    recordSampleStatistics(channel, frame, sample) {
+      const amplitude = Math.abs(sample);
+      if (amplitude >= 1) saturatedSampleCount += 1;
+      this.channelAbsoluteSums[channel] += amplitude;
+      if (frame === 0 && this.lastSamples[channel] !== null) {
+        const jump = Math.abs(sample - this.lastSamples[channel]);
+        boundaryJumpCount += 1;
+        boundaryJumpTotal += jump;
+        boundaryJumpMaximum = Math.max(boundaryJumpMaximum, jump);
+      }
+      if (this.lastSamples[channel] !== null) {
+        this.channelDifferenceSums[channel] +=
+          Math.abs(sample - this.lastSamples[channel]);
+      }
+      this.lastSamples[channel] = sample;
+    }
+
     scheduleWorkletBytes(bytes) {
       const channels = Math.max(1, this.options.channels || 1);
       const bitDepth = this.options.bitDepth || 16;
@@ -458,20 +492,7 @@ registerProcessor("jvm-source-data-line", JVMSourceDataLineProcessor);`;
               sampleIndex, bitDepth,
               this.options.signed !== false, this.options.bigEndian === true);
             sum += sample;
-            const amplitude = Math.abs(sample);
-            if (amplitude >= 1) saturatedSampleCount += 1;
-            this.channelAbsoluteSums[channel] += amplitude;
-            if (frame === 0 && this.lastSamples[channel] !== null) {
-              const jump = Math.abs(sample - this.lastSamples[channel]);
-              boundaryJumpCount += 1;
-              boundaryJumpTotal += jump;
-              boundaryJumpMaximum = Math.max(boundaryJumpMaximum, jump);
-            }
-            if (this.lastSamples[channel] !== null) {
-              this.channelDifferenceSums[channel] +=
-                Math.abs(sample - this.lastSamples[channel]);
-            }
-            this.lastSamples[channel] = sample;
+            if (pcmDiagnostics) this.recordSampleStatistics(channel, frame, sample);
           }
           samples[frame] = sum / channels;
         } else {
@@ -482,20 +503,7 @@ registerProcessor("jvm-source-data-line", JVMSourceDataLineProcessor);`;
               sampleIndex, bitDepth,
               this.options.signed !== false, this.options.bigEndian === true);
             samples[frame * channels + channel] = sample;
-            const amplitude = Math.abs(sample);
-            if (amplitude >= 1) saturatedSampleCount += 1;
-            this.channelAbsoluteSums[channel] += amplitude;
-            if (frame === 0 && this.lastSamples[channel] !== null) {
-              const jump = Math.abs(sample - this.lastSamples[channel]);
-              boundaryJumpCount += 1;
-              boundaryJumpTotal += jump;
-              boundaryJumpMaximum = Math.max(boundaryJumpMaximum, jump);
-            }
-            if (this.lastSamples[channel] !== null) {
-              this.channelDifferenceSums[channel] +=
-                Math.abs(sample - this.lastSamples[channel]);
-            }
-            this.lastSamples[channel] = sample;
+            if (pcmDiagnostics) this.recordSampleStatistics(channel, frame, sample);
           }
         }
         if (frame % 128 === 0) {
@@ -545,20 +553,9 @@ registerProcessor("jvm-source-data-line", JVMSourceDataLineProcessor);`;
             this.options.signed !== false,
             this.options.bigEndian === true,
           );
-          const amplitude = Math.abs(channelData[frame]);
-          if (amplitude >= 1) saturatedSampleCount += 1;
-          this.channelAbsoluteSums[channel] += amplitude;
-          if (frame === 0 && this.lastSamples[channel] !== null) {
-            const jump = Math.abs(channelData[frame] - this.lastSamples[channel]);
-            boundaryJumpCount += 1;
-            boundaryJumpTotal += jump;
-            boundaryJumpMaximum = Math.max(boundaryJumpMaximum, jump);
+          if (pcmDiagnostics) {
+            this.recordSampleStatistics(channel, frame, channelData[frame]);
           }
-          if (this.lastSamples[channel] !== null) {
-            this.channelDifferenceSums[channel] +=
-              Math.abs(channelData[frame] - this.lastSamples[channel]);
-          }
-          this.lastSamples[channel] = channelData[frame];
         }
       }
       if (playbackChannels === 1 && channels > 1) {

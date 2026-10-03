@@ -273,7 +273,8 @@ function regionRangeSpillsStaleLocals(statements, from, to) {
   for (let index = from; index < to; index += 1) {
     const statement = statements[index];
     for (const name of statement.reads || []) {
-      if (name === "spillLocals" || name.startsWith("ssaMaterialize")) {
+      if (name === "spillLocals" || name.startsWith("ssaMaterialize") ||
+          name.startsWith("ssaSlowInvoke") || name.startsWith("ssaColdCall")) {
         callsSpillHelper = true;
       }
     }
@@ -338,6 +339,9 @@ function regionScopes(statements, from, to) {
       stack.pop();
       parents.push(parent);
       stack.push(parents.length - 1);
+      // What the continuation declares (a catch parameter) is bound in the
+      // arm it opens; what it reads resolves through that arm's parent.
+      scopeOf[scopeOf.length - 1] = parents.length - 1;
     }
   }
   if (stack.length !== 1) return null;
@@ -1637,28 +1641,41 @@ function partitionOversizedLinearBlocks(units, options = {}) {
             `${liveOutNames[index]} = ${sharedStateName}[${index + 2}];`,
             {reads: [sharedStateName], write: liveOutNames[index]}));
         }
+        // Consume the shared output before any return, throw or outward
+        // jump. Leaving its live-outs behind roots the previous invocation's
+        // objects (or exception) for the lifetime of the compiled body.
+        const statusName = `jvmRegionSegmentStatus${namespace}_${id}`;
+        const valueName = `jvmRegionSegmentValue${namespace}_${id}`;
+        for (const [name, slot] of [[statusName, 0], [valueName, 1]]) {
+          callStatements.push(ownStatement(
+            `const ${name} = ${sharedStateName}[${slot}];`,
+            {kind: "const", def: name, reads: [sharedStateName],
+              parts: ["const ", {ref: name}, " = ", {ref: sharedStateName}, `[${slot}];`]}));
+        }
+        callStatements.push(ownStatement(`${sharedStateName}.length = 0;`,
+          {reads: [sharedStateName]}));
         callStatements.push(ownStatement(
-          `if (${sharedStateName}[0] === 1) return ${sharedStateName}[1];`,
+          `if (${statusName} === 1) return ${valueName};`,
           {
-            reads: [sharedStateName],
+            reads: [statusName, valueName],
             exit: {
-              before: [`if (${sharedStateName}[0] === 1) `],
-              value: [`${sharedStateName}[1]`],
+              before: [`if (${statusName} === 1) `],
+              value: [`${valueName}`],
               after: [],
             },
           }));
         callStatements.push(ownStatement(
-          `if (${sharedStateName}[0] === 2) throw ${sharedStateName}[1];`,
-          {reads: [sharedStateName]}));
+          `if (${statusName} === 2) throw ${valueName};`,
+          {reads: [statusName, valueName]}));
         if (jumpTable.length) {
           callStatements.push(ownStatement(
-            `if (${sharedStateName}[0] === 3) {`,
-            {reads: [sharedStateName], delta: 1, opens: "block"}));
+            `if (${statusName} === 3) {`,
+            {reads: [statusName, valueName], delta: 1, opens: "block"}));
           jumpTable.forEach((entry, index) => {
             callStatements.push(ownStatement(
-              `  if (${sharedStateName}[1] === ${index}) ${entry.kind}${
+              `  if (${valueName} === ${index}) ${entry.kind}${
                 entry.label ? ` ${entry.label}` : ""};`,
-              {reads: [sharedStateName], relocatable: false}));
+              {reads: [statusName, valueName], relocatable: false}));
           });
           callStatements.push(ownStatement("}", {delta: -1}));
         }
@@ -3482,6 +3499,14 @@ class HotCallGraphRegionCompiler {
         error.message || error}`;
       return null;
     }
+    // Apply the installed-source policy before closures hide the executable
+    // module. The wrappers may expose the same diagnostic source only when
+    // the underlying body's source was admitted to the accounting budget.
+    body.jvmHotCallGraphRegionSource = moduleSource;
+    if (!this.jit.producesTransport) {
+      this.jit.installedSourceRetention.apply(body);
+    }
+    const retainedModuleSource = body.jvmHotCallGraphRegionSource;
     if (!framedRoot && this.traceDeopts) {
       const unprofiledBody = body;
       body = function hotCallGraphDeoptProbe() {
@@ -3531,7 +3556,7 @@ class HotCallGraphRegionCompiler {
       body.jvmSynchronous = true;
       body.jvmStructuredSsa = true;
       body.jvmHotCallGraphFramedRegion = true;
-      body.jvmHotCallGraphRegionSource = moduleSource;
+      body.jvmHotCallGraphRegionSource = retainedModuleSource;
     }
     body.jvmHotCallGraphRegion = true;
     body.jvmHotCallGraphRegionPlan = plan;
@@ -3575,7 +3600,8 @@ class HotCallGraphRegionCompiler {
     }
     body.jvmHotCallGraphElidedFieldCacheInvalidationCount =
       elidedFieldCacheInvalidations;
-    body.jvmHotCallGraphRegionSource = moduleSource;
+    body.jvmHotCallGraphRegionSource = retainedModuleSource;
+    body.jvmHotCallGraphRegionSourceLength = moduleSource.length;
     if (typeof process !== "undefined" && process.env &&
         process.env.JVM_TRACE_REGION_SOURCE_DIR) {
       try {
@@ -3626,6 +3652,17 @@ class HotCallGraphRegionCompiler {
     try {
       const nodesByMethod = new Map();
       const pending = [rootMethod];
+      // Charge attempts before lowering, including candidates that fail
+      // verification. Reservations are not refunded: that work already ran.
+      // Keep negative results local to this compilation so later publications
+      // can make a previously rejected target eligible on a subsequent pass.
+      const attemptedMethods = new Set([rootMethod]);
+      const scheduledMethods = new Set([rootMethod]);
+      const candidateRejections = new Map();
+      let attemptedCodeItems = rootCodeItems;
+      if (attemptedCodeItems > this.maxCodeItems) {
+        return reject("bytecode budget exceeded");
+      }
       let totalCodeItems = 0;
       while (pending.length) {
         const method = pending.shift();
@@ -3695,7 +3732,35 @@ class HotCallGraphRegionCompiler {
             });
             continue;
           }
+          const previousRejection = candidateRejections.get(target.method);
+          if (previousRejection) {
+            node.boundaries.push({
+              pc: site.pc, op: site.op, reason: previousRejection, site,
+            });
+            continue;
+          }
+          const alreadyAttempted = attemptedMethods.has(target.method);
+          const targetCodeItems = alreadyAttempted ? 0 :
+            this.jit.getCodeItems(target.method).length;
+          const budgetBoundary = alreadyAttempted ? null :
+            attemptedMethods.size >= this.maxMethods ? "method-budget" :
+              attemptedCodeItems + targetCodeItems > this.maxCodeItems
+                ? "bytecode-budget" : null;
+          if (budgetBoundary) {
+            node.boundaries.push({
+              pc: site.pc,
+              op: site.op,
+              reason: budgetBoundary,
+              site,
+            });
+            continue;
+          }
+          if (!alreadyAttempted) {
+            attemptedMethods.add(target.method);
+            attemptedCodeItems += targetCodeItems;
+          }
           if (!this.jit.canCompileSynchronously(target.method)) {
+            candidateRejections.set(target.method, "asynchronous-target");
             node.boundaries.push({
               pc: site.pc,
               op: site.op,
@@ -3709,6 +3774,7 @@ class HotCallGraphRegionCompiler {
           const targetGenerated = this.jit.getStructuredRegionCandidate(
             target.method, targetCanonicalGenerated);
           if (!targetGenerated?.jvmStructuredSsa) {
+            candidateRejections.set(target.method, "uncompiled-structured-target");
             node.boundaries.push({
               pc: site.pc,
               op: site.op,
@@ -3734,6 +3800,8 @@ class HotCallGraphRegionCompiler {
           if (typeof targetGenerated.jvmDirectPositionalSource !== "string" &&
               typeof targetGenerated.jvmRestoringDirectPositionalSource !==
                 "string") {
+            candidateRejections.set(target.method,
+              "target-without-positional-region-abi");
             node.boundaries.push({
               pc: site.pc,
               op: site.op,
@@ -3744,7 +3812,10 @@ class HotCallGraphRegionCompiler {
           }
           const edge = {pc: site.pc, site, ...target, node: null};
           node.edges.push(edge);
-          if (!nodesByMethod.has(target.method)) pending.push(target.method);
+          if (!scheduledMethods.has(target.method)) {
+            scheduledMethods.add(target.method);
+            pending.push(target.method);
+          }
         }
       }
       const nodes = [...nodesByMethod.values()];
@@ -3828,6 +3899,8 @@ class HotCallGraphRegionCompiler {
         recursiveComponents,
         standaloneRecursiveNodes,
         totalCodeItems,
+        attemptedMethods: attemptedMethods.size,
+        attemptedCodeItems,
         closed: nodes.every((node) => node.boundaries.length === 0),
         guards: nodes.map((node) => ({
           method: node.method,
@@ -3989,8 +4062,10 @@ class HotCallGraphRegionCompiler {
           return counts;
         }, new Map()).entries()].map(([reason, count]) => ({reason, count})),
         codeItems: plan.totalCodeItems,
-        sourceBytes: (plan.positionalBody?.jvmHotCallGraphRegionSource.length ||
-          0) + (plan.framedBody?.jvmHotCallGraphRegionSource.length || 0),
+        attemptedMethods: plan.attemptedMethods,
+        attemptedCodeItems: plan.attemptedCodeItems,
+        sourceBytes: (plan.positionalBody?.jvmHotCallGraphRegionSourceLength ||
+          0) + (plan.framedBody?.jvmHotCallGraphRegionSourceLength || 0),
         runs: 0,
         deopts: 0,
         deoptReasons: [],

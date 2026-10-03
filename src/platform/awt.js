@@ -1,8 +1,11 @@
 // =======================================================================
+
 // file: awt.js
 // Description: A JavaScript implementation of the AWT-on-Canvas API,
 // fully documented with JSDoc for type-checking and IntelliSense.
 // =======================================================================
+
+const {javaKeyCode} = require('./awt-key-code');
 
 // --- Type Definitions for Data Structures and Interfaces ---
 
@@ -572,12 +575,12 @@ class Canvas extends Component {
         // Key events require the canvas to be focusable
         this.canvasElement.tabIndex = 0;
         this.canvasElement.addEventListener('keydown', (e) => {
-            const event = new AwtKeyEvent(this, 401, e.keyCode, e.key);
+            const event = new AwtKeyEvent(this, 401, javaKeyCode(e), e.key);
             this.processKeyEvent(event);
         });
 
         this.canvasElement.addEventListener('keyup', (e) => {
-            const event = new AwtKeyEvent(this, 402, e.keyCode, e.key);
+            const event = new AwtKeyEvent(this, 402, javaKeyCode(e), e.key);
             this.processKeyEvent(event);
         });
     }

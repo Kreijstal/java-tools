@@ -34,6 +34,26 @@ function createLineSpecialisations({
   stats,
   e,
 }) {
+  // The `else` arm and closing line of the `if` statement that starts at
+  // `ifIndex`, or -1 for each when the statement has no else arm / does not
+  // close within `lines`. The scan stops at that statement's own close: a
+  // later statement's else arm (a merge block the structurer placed after
+  // the header test, inside the loop) is never mistaken for the header's.
+  const ifArms = (lines, ifIndex) => {
+    let alternate = -1;
+    let depth = 0;
+    for (let index = ifIndex; index < lines.length; index += 1) {
+      const record = recordOf(lines[index]);
+      if (index > ifIndex && depth === 1 && alternate < 0 &&
+          record?.kind === "elseArm") {
+        alternate = index;
+      }
+      depth += record?.blockDelta || 0;
+      if (index > ifIndex && depth === 0) return {alternate, closed: index};
+    }
+    return {alternate, closed: -1};
+  };
+
   const canonicalCountedLoop = (header, label, lines) => {
         const info = countedLoopInfos.get(header);
         if (!info || !Number.isInteger(info.slot) || !info.boundExpression ||
@@ -80,19 +100,13 @@ function createLineSpecialisations({
         } else {
           return null;
         }
-        let alternate = -1;
-        let depth = 0;
-        for (let index = conditionIndex; index < lines.length; index += 1) {
-          const record = recordOf(lines[index]);
-          const closesToElse = record?.kind === "elseArm";
-          if (index > conditionIndex && depth === 1 && closesToElse) {
-            alternate = index;
-            break;
-          }
-          depth += record?.blockDelta || 0;
+        // The emitted test may be the logical negation of the comparison it
+        // carries (`if (!(i >= n))`, body on the then arm).
+        if (recordOf(lines[conditionIndex])?.negated === true) {
+          bodyOnThen = !bodyOnThen;
         }
-        if (alternate < 0 ||
-            recordOf(lines[lines.length - 1])?.kind !== "blockEnd") return null;
+        const {alternate, closed} = ifArms(lines, conditionIndex);
+        if (alternate < 0 || closed !== lines.length - 1) return null;
         const unindentOne = (line) => line.startsWith("  ")
           ? line.slice(2) : line;
         const thenLines = lines.slice(conditionIndex + 1, alternate).map(unindentOne);
@@ -128,18 +142,9 @@ function createLineSpecialisations({
         const test = recordOf(lines[3]);
         if (test?.kind !== "if" || test.comparison?.input !== oldValue.def ||
             test.comparison?.cmp !== "<= 0") return null;
-        let alternate = -1;
-        let depth = 0;
-        for (let index = 3; index < lines.length; index += 1) {
-          const record = recordOf(lines[index]);
-          if (index > 3 && depth === 1 && record?.kind === "elseArm") {
-            alternate = index;
-            break;
-          }
-          depth += record?.blockDelta || 0;
-        }
-        if (alternate < 0 ||
-            recordOf(lines[lines.length - 1])?.kind !== "blockEnd") return null;
+        if (test.negated === true) return null;
+        const {alternate, closed} = ifArms(lines, 3);
+        if (alternate < 0 || closed !== lines.length - 1) return null;
         const unindentOne = (line) => line.startsWith("  ")
           ? line.slice(2) : line;
         const exit = lines.slice(4, alternate).map(unindentOne);

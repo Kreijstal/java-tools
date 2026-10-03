@@ -1,4 +1,5 @@
 const Stack = require("./stack");
+const ClassInitializationToken = require("./ClassInitializationToken");
 const AudioRefillPolicy = require("./AudioRefillPolicy");
 const { StaticFieldStore } = require("./StaticFieldStore");
 const CallStack = require("./callStack");
@@ -12,6 +13,7 @@ const DEBUG_STATIC_WRITES = (typeof process !== "undefined" &&
 const {
   loadClassByPath,
   loadClassByPathSync: loadConvertedClass,
+  getFileProvider,
 } = require("./classLoader");
 const { parseDescriptor, objectTypesInDescriptor } =
   require("../parsing/typeParser");
@@ -68,6 +70,9 @@ class ClassInitializationStateMap extends Map {
       token.state = state;
       token.initialized = state === "INITIALIZED";
     }
+    if (previous !== state && state === "INITIALIZED") {
+      this.jvm?.jit?.noteClassInitialized?.(className);
+    }
     return this;
   }
 
@@ -83,55 +88,20 @@ class ClassInitializationStateMap extends Map {
     }
     return deleted;
   }
-}
 
-let browserYieldChannel = null;
-const browserYieldQueue = [];
-
-// A rendering host paints between task-queue turns, so which task the JVM
-// resumes from decides whether the browser ever gets a rendering opportunity.
-// Node has no such distinction and keeps its immediate resumption.
-function hostPaintsBetweenTasks() {
-  return typeof requestAnimationFrame === "function" &&
-    typeof document !== "undefined";
-}
-
-function yieldToEventLoop(delayMs = 0, strategy = "message-channel") {
-  return new Promise((resolve) => {
-    if (delayMs > 0) {
-      setTimeout(resolve, delayMs);
-    } else if (strategy === "timer" && hostPaintsBetweenTasks()) {
-      // Bundled polyfills install a global setImmediate that resumes from a
-      // postMessage task, which is exactly the continuously runnable queue a
-      // caller asking for the timer strategy is trying to leave. Take the
-      // rendering opportunity the caller asked for.
-      setTimeout(resolve, 0);
-    } else if (typeof setImmediate === "function") {
-      setImmediate(resolve);
-    } else if (strategy === "timer" || typeof MessageChannel !== "function") {
-      // A timer gives the browser's rendering opportunity a task-queue
-      // boundary. Firefox can otherwise keep selecting a continuously
-      // replenished MessageChannel queue while requestAnimationFrame remains
-      // pending, coalescing many completed guest frames without painting.
-      setTimeout(resolve, 0);
-    } else {
-      // Browser setTimeout(0) is clamped after repeated scheduling. The JVM
-      // reaches this safe point every wall-clock slice, so that clamp can
-      // consume a material fraction of a render frame. MessageChannel avoids
-      // that delay, but callers should select the timer strategy when their
-      // browser prioritizes message tasks ahead of rendering opportunities.
-      if (!browserYieldChannel) {
-        browserYieldChannel = new MessageChannel();
-        browserYieldChannel.port1.onmessage = () => {
-          const resume = browserYieldQueue.shift();
-          if (resume) resume();
-        };
-      }
-      browserYieldQueue.push(resolve);
-      browserYieldChannel.port2.postMessage(0);
+  clear() {
+    if (this.size && Number.isFinite(this.jvm?.classInitializationEpoch)) {
+      this.jvm.classInitializationEpoch += 1;
     }
-  });
+    super.clear();
+    for (const token of this.jvm?.classInitializationTokens?.values() || []) {
+      token.state = undefined;
+      token.initialized = false;
+    }
+  }
 }
+
+const {yieldToEventLoop, hostPaintsBetweenTasks} = require('./hostYield');
 
 const BURST_TICK_OPTIONS = Object.freeze({ allowBurst: true });
 const TICK_CONTINUE = Object.freeze({ completed: false });
@@ -186,6 +156,25 @@ class JVM {
     // run() prepares everything before main() unless this is false. See the
     // preparation block in run().
     this.prepareBeforeMain = options.prepareBeforeMain !== false;
+    // Which methods that pass hands the Wasm tier. By default every
+    // loop-bearing method gets a module; with this set only the JS-prepared
+    // oversized-loop methods do (the "prepared upgrade" shape), which is what
+    // a browser launcher that then freezes Wasm compilation wants: hundreds of
+    // partial modules for ordinary loops are boot time spent on bodies the JS
+    // tier already owns.
+    this.prepareWasmPreparedUpgradesOnly =
+      options.prepareWasmPreparedUpgradesOnly === true;
+    // The two halves of that pass, so a launcher can measure each on its own:
+    // prepareWasm=false skips the Wasm tier, prepareEffectful=false compiles
+    // the ordinary (non-whole-method) JS bodies only.
+    this.prepareWasm = options.prepareWasm !== false;
+    this.prepareEffectful = options.prepareEffectful !== false;
+    // prepareLoopsOnly=true prepares only loop-bearing methods: the ones the
+    // JS tier would otherwise compile on sight at their first entry, which is
+    // where a first-entry stall comes from. A launcher can trade the rest of
+    // the pass (loop-free methods warm up over a couple of calls) for boot
+    // time.
+    this.prepareLoopsOnly = options.prepareLoopsOnly === true;
     // False until run() hands control to guest code. THE boundary the
     // measurement contract is written against: before it, compiling on this
     // thread is free because nothing the guest can observe has started; after
@@ -291,6 +280,12 @@ class JVM {
         ? Number(configuredStarvation) : 100;
     this._schedulerReliefActive = false;
     this._schedulerReliefCooldown = false;
+    // Audio refill override behaviour (see _prepareSchedulerTick). Both are
+    // runtime-toggleable so a paired comparison can run inside one session.
+    this.audioOverrideSurvivesSleep =
+      options.audioOverrideSurvivesSleep !== false;
+    this.audioOverrideKeepsStarvationClock =
+      options.audioOverrideKeepsStarvationClock !== false;
     const configuredYieldStrategy =
       options.eventLoopYieldStrategy ?? env.JVM_EVENT_LOOP_YIELD_STRATEGY;
     this.eventLoopYieldStrategy = configuredYieldStrategy === "timer"
@@ -821,8 +816,10 @@ class JVM {
       await this.precompileInitializedClasses({
         preloadClasspath: true,
         initializedOnly: false,
-        effectful: true,
-        wasm: true,
+        effectful: this.prepareEffectful,
+        wasm: this.prepareWasm,
+        wasmPreparedUpgradesOnly: this.prepareWasmPreparedUpgradesOnly,
+        loopsOnly: this.prepareLoopsOnly,
       });
       if (this.jit?.singleSiteInlineExperiment) {
         require('../jit/SingleSiteInlineExperiment').prepare(
@@ -1251,11 +1248,18 @@ class JVM {
       const finish = () => {
         if (settled) return;
         settled = true;
+        clearTimeout(timer);
+        // The presenter detaches its queue before invoking callbacks. A
+        // timeout must also unlink itself when no presentation arrives, but
+        // must not disturb a new queue or callbacks still waiting in it.
+        const waiters = this._awtPresentationWaiters;
+        const index = waiters ? waiters.indexOf(finish) : -1;
+        if (index >= 0) waiters.splice(index, 1);
         resolve();
       };
       if (!this._awtPresentationWaiters) this._awtPresentationWaiters = [];
       this._awtPresentationWaiters.push(finish);
-      setTimeout(finish, Math.max(24, this.eventLoopYieldMs + 12));
+      const timer = setTimeout(finish, Math.max(24, this.eventLoopYieldMs + 12));
     });
   }
 
@@ -1381,32 +1385,65 @@ class JVM {
       options.wasmPreparedUpgradesOnly === true;
     const compileEffectful = options.effectful === true;
     const initializedOnly = options.initializedOnly !== false;
-    const methods = [];
-    for (const [className, classData] of Object.entries(this.classes)) {
-      if (initializedOnly &&
-          this.classInitializationState.get(className) !== "INITIALIZED") {
-        continue;
-      }
-      for (const item of classData?.ast?.classes?.[0]?.items || []) {
-        const method = item?.type === "method" && item.method;
-        if (!method || (loopsOnly && !this.jit.hasBackwardBranch(method))) {
+    // Ahead of main() preparation runs to a fixed point: a body published in
+    // one round can make another compilable (a constructor proof that was
+    // waiting on a class, a stub upgraded to its real class by the load the
+    // first round caused), so the pass repeats until a round prepares
+    // nothing new. Rounds are bounded; the exit is "no progress", never a
+    // count. A seed pass while the guest runs is a single round: it queues
+    // work and returns.
+    const fixedPoint = options.fixedPoint !== false && !this.guestStarted;
+    const maxRounds = fixedPoint ? Math.max(1, Number(options.maxRounds) || 8) : 1;
+    const report = {
+      rounds: 0, methods: 0, newBodies: 0, unprepared: 0, unpreparedKeys: [],
+      linkedSites: 0,
+      linkedReceivers: 0, wasmMethods: 0, wasmSettled: 0,
+      tiers: { wasmFull: 0, jsOwned: 0, jsOwnedPartialWasm: 0 },
+      upgradedStubClasses: 0,
+    };
+    this.preparationReport = report;
+    const {applyPreparationPolicy, methodIdentitySet} = require("../jit/PreparationPolicy");
+    const preparationPolicy = options.preparationPolicy ??
+      this.jitOptions?.preparationPolicy ?? {};
+    // A measured dependency list can include tiny non-loop helpers needed
+    // by a larger Wasm caller. Keep the usual loop filter unless the
+    // launcher explicitly asks to prepare those selected helpers too.
+    const wasmLoopsOnly = preparationPolicy.wasmLoopsOnly !== false;
+    const wasmCalleeMethods = methodIdentitySet(preparationPolicy.wasmCalleeMethods,
+      "preparationPolicy.wasmCalleeMethods");
+    const wasmRootMethods = preparationPolicy.wasmRootMethods === undefined ? null
+      : methodIdentitySet(preparationPolicy.wasmRootMethods,
+        "preparationPolicy.wasmRootMethods");
+    const collect = () => {
+      const methods = [];
+      for (const [className, classData] of Object.entries(this.classes)) {
+        if (initializedOnly &&
+            this.classInitializationState.get(className) !== "INITIALIZED") {
           continue;
         }
-        methods.push({className, method});
+        for (const item of classData?.ast?.classes?.[0]?.items || []) {
+          const method = item?.type === "method" && item.method;
+          // Native/abstract declarations and class initializers cannot acquire
+          // generated bodies. Do not enqueue or yield a host turn for them on
+          // every fixed-point round. Java initialization still runs normally.
+          if (!method || method.name === "<clinit>" ||
+              !method.attributes?.some(attribute => attribute.type === "code") ||
+              (loopsOnly && !this.jit.hasBackwardBranch(method))) continue;
+          methods.push({className, method});
+        }
       }
-    }
-    if (compileEffectful) {
-      // Retire lifecycle-sensitive bodies first. They are already hot enough
-      // to have compiled before preparation and can otherwise keep paying a
-      // stale boolean-guard deopt while thousands of cold methods are handled
-      // ahead of them. The ordering is derived solely from compiler metadata;
-      // it does not change which methods preparation compiles.
-      methods.sort((left, right) => Number(Boolean(
-        this.jit.codegenCache.get(right.method)
-          ?.jvmStructuredGuardedBooleanSiteCount)) - Number(Boolean(
-        this.jit.codegenCache.get(left.method)
-          ?.jvmStructuredGuardedBooleanSiteCount)));
-    }
+      if (compileEffectful) {
+        // Lifecycle-sensitive bodies win ties; explicit launcher priorities
+        // take precedence when the generic policy performs its stable sort.
+        methods.sort((left, right) => Number(Boolean(
+          this.jit.codegenCache.get(right.method)
+            ?.jvmStructuredGuardedBooleanSiteCount)) - Number(Boolean(
+          this.jit.codegenCache.get(left.method)
+            ?.jvmStructuredGuardedBooleanSiteCount)));
+      }
+      return applyPreparationPolicy(methods, preparationPolicy);
+    };
+    let methods = collect();
     let completed = 0;
     let wasmCompleted = 0;
     const previousEffectfulPreparation = this.jit.effectfulPreparationActive;
@@ -1439,63 +1476,145 @@ class JVM {
       const compileLocally = options.compileLocally !== undefined
         ? options.compileLocally === true
         : !this.guestStarted;
-      for (const {method} of methods) {
-        this.jit.getGeneratedFunction(method, {
-          allowEffectfulCalls: compileEffectful,
-          compileLocally,
-        });
-        completed += 1;
-        if (typeof options.onProgress === "function") {
-          options.onProgress({completed, total: methods.length, tier: "javascript"});
+      const prepared = (method) => compileEffectful
+        ? this.jit.preparedCodegenMethods.has(method)
+        : this.jit.codegenCache.has(method);
+      const preparedCache = compileEffectful && compileLocally && !this.guestStarted &&
+        options.preparedCodeCache
+        ? new (require("../jit/PreparedCodeCache").PreparedCodeCache)(
+          this.jit, options.preparedCodeCache) : null;
+      if (preparedCache) report.preparedCache = preparedCache.stats;
+      for (let round = 1; round <= maxRounds; round += 1) {
+        report.rounds = round;
+        if (round > 1) {
+          // What the previous round may have changed: classes registered or
+          // upgraded by the compiles themselves, and their references.
+          await this.preloadReferencedClasses(options.onProgress);
+          methods = collect();
+          // An admission that failed last round on a callee without a body
+          // (a constructor's call graph, a caller's constructor target) is
+          // answered again against the bodies that round published.
+          this.jit.adaptiveCodegenSupportCache = new WeakMap();
         }
-        await yieldToEventLoop(0, this.eventLoopYieldStrategy);
-      }
-      if (!compileLocally && !this.guestStarted &&
-          this.jit.compileWorker?.enabled) {
-        // The pass above only QUEUED the work, so the cache is still empty.
-        // Preparation has to mean "everything is compiled" or the guest starts
-        // against an empty cache: wait for the worker to drain, then build
-        // whatever it declined, locally and unconditionally.
-        //
-        // Only before main(). Draining the queue is a wait for optimization
-        // and the local rebuild is a synchronous compile; both are free while
-        // the guest has not started and are forbidden once it has. A seed pass
-        // during execution leaves its work queued and returns -- the methods
-        // keep running in whatever tier they already have, which is the point
-        // of seeding asynchronously.
-        await this.jit.compileWorker.whenIdle();
-        for (const {method} of methods) {
-          if (this.jit.codegenCache.has(method)) continue;
-          this.jit.getGeneratedFunction(method, {
+        const todo = round === 1 ? methods
+          : methods.filter(({method}) => !prepared(method));
+        let newBodies = 0;
+        for (const {method} of todo) {
+          const before = prepared(method);
+          const compileOptions = {
             allowEffectfulCalls: compileEffectful,
-            compileLocally: true,
-          });
+            compileLocally,
+          };
+          if (preparedCache) await preparedCache.prepare(method, compileOptions);
+          else this.jit.getGeneratedFunction(method, compileOptions);
+          if (!before && prepared(method)) newBodies += 1;
+          completed += 1;
+          if (typeof options.onProgress === "function") {
+            options.onProgress({completed, total: methods.length, tier: "javascript", round});
+          }
           await yieldToEventLoop(0, this.eventLoopYieldStrategy);
         }
-        await this.jit.compileWorker.whenIdle();
+        if (!compileLocally && !this.guestStarted &&
+            this.jit.compileWorker?.enabled) {
+          // The pass above only QUEUED the work, so the cache is still empty.
+          // Preparation has to mean "everything is compiled" or the guest starts
+          // against an empty cache: wait for the worker to drain, then build
+          // whatever it declined, locally and unconditionally.
+          //
+          // Only before main(). Draining the queue is a wait for optimization
+          // and the local rebuild is a synchronous compile; both are free while
+          // the guest has not started and are forbidden once it has. A seed pass
+          // during execution leaves its work queued and returns -- the methods
+          // keep running in whatever tier they already have, which is the point
+          // of seeding asynchronously.
+          await this.jit.compileWorker.whenIdle();
+          for (const {method} of todo) {
+            if (this.jit.codegenCache.has(method)) continue;
+            const before = prepared(method);
+            this.jit.getGeneratedFunction(method, {
+              allowEffectfulCalls: compileEffectful,
+              compileLocally: true,
+            });
+            if (!before && prepared(method)) newBodies += 1;
+            await yieldToEventLoop(0, this.eventLoopYieldStrategy);
+          }
+          await this.jit.compileWorker.whenIdle();
+        }
+        report.newBodies += newBodies;
+        if (!fixedPoint || newBodies === 0 || round === 1 && !compileEffectful) {
+          break;
+        }
+      }
+      report.methods = methods.length;
+      // Stubs and abstract/native members have no bytecode to prepare; a
+      // class initializer is never compiled. What is left is what a later
+      // post-main compile could be spent on.
+      const unprepared = methods.filter(({method}) => !prepared(method) &&
+        method.name !== "<clinit>" && !this.jit.jitDenied(method) &&
+        Array.isArray(method.attributes) &&
+        method.attributes.some((attribute) => attribute?.type === "code"));
+      report.unprepared = unprepared.length;
+      // Who was left behind, so a stranded method is visible in the report
+      // rather than discovered as a post-main compile. Bounded.
+      report.unpreparedKeys = unprepared.slice(0, 400).map(({className, method}) =>
+        `${className}.${method.name}${method.descriptor}`);
+      report.upgradedStubClasses = this.upgradedStubClassCount || 0;
+      // Link what was compiled. Every synchronous call site a prepared body
+      // registered is given the target the first generic call would have
+      // built -- a static or special call has one by bytecode; a virtual call
+      // gets one per loaded receiver class in the declared class's cone --
+      // so the first Start Game does not spend its first call at each of
+      // thousands of sites resolving and publishing links. Nothing here
+      // compiles: a callee without a body is left for the ordinary path.
+      if (fixedPoint && compileEffectful &&
+          typeof this.jit.prelinkPreparedCallSites === "function") {
+        const linked = await this.jit.prelinkPreparedCallSites(
+          methods.map(({method}) => method).filter(prepared),
+          () => yieldToEventLoop(0, this.eventLoopYieldStrategy));
+        report.linkedSites = linked.sites;
+        report.linkedReceivers = linked.receivers;
       }
       if (compileWasm && this.jit.wasmJit?.enabled) {
         let wasmProcessed = 0;
+        const wasmCandidates = [];
+        const deferredDeepWasm = [];
         for (const {className, method} of methods) {
           const flags = method.flags || [];
-          const preparedWasmUpgrade =
+          const hasLoop = this.jit.hasBackwardBranch(method);
+          const selectedCallee = wasmCalleeMethods.has(
+            `${className}.${method.name}${method.descriptor}`);
+          const asCallee = selectedCallee || !wasmLoopsOnly && !hasLoop;
+          const preparedWasmUpgrade = selectedCallee ||
             this.jit.preparedCodegenMethods.has(method) &&
-            this.jit.isOversizedLoopMethod(method);
-          if ((!wasmPreparedUpgradesOnly || preparedWasmUpgrade) &&
-              (this.jit.hasBackwardBranch(method) || wasmFallbackOnly) &&
+            (this.jit.isOversizedLoopMethod(method) ||
+              hasLoop && this.jit.isPreparedWasmMethodSelected(method));
+          const admitted = (upgrade) => (selectedCallee || wasmRootMethods === null ||
+                wasmRootMethods.has(`${className}.${method.name}${method.descriptor}`)) &&
+              (!wasmPreparedUpgradesOnly || upgrade) &&
+              (selectedCallee || !wasmLoopsOnly || hasLoop || wasmFallbackOnly) &&
               (!wasmFallbackOnly ||
-                !this.jit.preparedCodegenMethods.has(method) ||
-                preparedWasmUpgrade) &&
+                !this.jit.preparedCodegenMethods.has(method) || upgrade);
+          // Admitted only by deep inlining: compiled after preparation.
+          const admittedNow = admitted(preparedWasmUpgrade);
+          if (!admittedNow && hasLoop && this.jit.isDeepInlineWasmCandidate(method) &&
+              admitted(true) && !flags.includes("synchronized") &&
+              method.name !== "<init>" && method.name !== "<clinit>" &&
+              !this.jit.jitDenied(method)) {
+            deferredDeepWasm.push({className, method});
+          }
+          if (admittedNow &&
               method.name !== "<init>" && method.name !== "<clinit>" &&
               !flags.includes("native") && !flags.includes("abstract") &&
               (!flags.includes("synchronized") ||
-                this.jit.wasmJit.synchronizedInstanceLinksEnabled &&
-                  !flags.includes("static")) && !this.jit.jitDenied(method)) {
+                (flags.includes("static")
+                  ? this.jit.wasmJit.synchronizedStaticLinksEnabled
+                  : this.jit.wasmJit.synchronizedInstanceLinksEnabled)) && !this.jit.jitDenied(method)) {
             const wasm = this.jit.wasmJit;
             const state = wasm.methodState({method});
             if (state.status === "cold") {
-              wasm.compile({className, method}, state);
+              wasm.compile({className, method}, state, {entryPath: "prepare", asCallee});
             }
+            wasmCandidates.push({className, method, asCallee});
             wasmCompleted += 1;
           }
           if (typeof options.onProgress === "function") {
@@ -1504,11 +1623,87 @@ class JVM {
           }
           await yieldToEventLoop(0, this.eventLoopYieldStrategy);
         }
+        report.wasmMethods = wasmCompleted;
+        report.deferredDeepWasm = deferredDeepWasm.length;
+        if (deferredDeepWasm.length) this.jit.scheduleDeferredDeepWasm(deferredDeepWasm);
+        if (fixedPoint) {
+          report.wasmSettled = await this.settlePreparedWasmModules(
+            wasmCandidates, options.onProgress);
+          for (const {method} of wasmCandidates) {
+            if (!this.jit.preparedCodegenMethods.has(method)) continue;
+            const state = this.jit.wasmJit.state.get(method);
+            const ready = state && state.status === "ready" && state.meta;
+            if (ready && state.meta.fullyCompiled) report.tiers.wasmFull += 1;
+            else if (ready) report.tiers.jsOwnedPartialWasm += 1;
+            else report.tiers.jsOwned += 1;
+          }
+        }
+      }
+      // A module may already have existed before this pass prepared its JS
+      // body and call sites. Republish even in a JS-only or single-round pass:
+      // selection must apply at PC zero, not only after a JS body yields into
+      // the import-heavy OSR companion. This performs no compilation.
+      if (this.jit.preparedWasmMethodKeys.size || this.jit.wasmJit?.deepInline) {
+        for (const {method} of methods) {
+          if (this.jit.preparedCodegenMethods.has(method) &&
+              (this.jit.isPreparedWasmMethodSelected(method) ||
+                this.jit.hasPreparedDeepInlineWasmUpgrade(method))) {
+            this.jit.publishWasmTargetReady(method);
+          }
+        }
       }
     } finally {
       this.jit.effectfulPreparationActive = previousEffectfulPreparation;
     }
-    return {preloadedClasses, methods: completed, wasmMethods: wasmCompleted};
+    return {preloadedClasses, methods: completed, wasmMethods: wasmCompleted,
+      report};
+  }
+
+  // A prepared Wasm module built while one of its callees was still cold
+  // keeps that loss: the block is an exit stub, the site stays on the generic
+  // dispatch import. At run time the gate rebuilds such a module once the
+  // world it lost to has moved -- inside the guest's turn, and only when the
+  // method is next entered. Before main() there is no turn to protect and
+  // every callee preparation will ever build already exists, so settle the
+  // dependency world here: rebuild every module whose blockers have moved,
+  // repeat while a rebuild moves another's, and stop when nothing moves or
+  // the same per-module recompile bound the runtime honours is reached.
+  //
+  // Selection is not changed here. A module that still does not cover its
+  // method end to end after settling stays what it is: the frame-entry and
+  // call-site selectors read `meta.fullyCompiled` and keep the prepared
+  // JavaScript body as that method's execution tier, so a partial module is
+  // never something gameplay has to discover through exits.
+  async settlePreparedWasmModules(candidates, onProgress = null) {
+    const wasm = this.jit.wasmJit;
+    if (!wasm || !wasm.enabled || !candidates.length) return 0;
+    let settled = 0;
+    const limit = Math.max(1, Number(wasm.depRecompileLimit) || 1);
+    for (let pass = 0; pass < limit; pass += 1) {
+      let moved = 0;
+      for (const {className, method, asCallee = false} of candidates) {
+        const state = wasm.state.get(method);
+        if (!state || state.status !== "ready") continue;
+        if (!(state.partialDeps &&
+            (state.partialDepsStructured || state.partialDepsUnserviceable) &&
+            wasm.depsMoved(state))) continue;
+        if ((state.depRecompiles || 0) >= limit) continue;
+        state.depWorld = wasm.depWorldVersion();
+        state.blockerSig = wasm.blockerSignature(state.blockers);
+        state.depRecompiles = (state.depRecompiles || 0) + 1;
+        wasm.withdrawModule(state);
+        wasm.compile({className, method}, state, {entryPath: "prepare-settle", asCallee});
+        moved += 1;
+        settled += 1;
+        if (typeof onProgress === "function") {
+          onProgress({completed: settled, total: candidates.length,
+            tier: "wasm-settle"});
+        }
+        await yieldToEventLoop(0, this.eventLoopYieldStrategy);
+      }
+      if (!moved) break;
+    }
+    return settled;
   }
 
   // Loading is deliberately separate from initialization in the JVM. An
@@ -1548,7 +1743,15 @@ class JVM {
           if (name.endsWith(".class")) names.add(name.slice(0, -6));
         }
       } else {
-        await visitDirectory(cp);
+        // A provider that can enumerate its classes (the browser's virtual
+        // file system, where there is no directory to read) answers for the
+        // entry; otherwise walk the directory.
+        const provider = getFileProvider();
+        if (provider && typeof provider.listClassNames === "function") {
+          for (const name of await provider.listClassNames(cp)) names.add(name);
+        } else {
+          await visitDirectory(cp);
+        }
       }
     }
     let completed = 0;
@@ -1614,8 +1817,13 @@ class JVM {
       for (const classData of Object.values(this.classes)) {
         this.collectReferencedClassNames(classData, wanted);
       }
+      // A JRE-override stub for an application class (applicationFallback)
+      // is registered before its class file is read; preparation must see
+      // the real class, so such a stub counts as not loaded here.
       const missing = [...wanted].filter((name) =>
-        name && !name.startsWith("[") && !this.classes[name]);
+        name && !name.startsWith("[") && (!this.classes[name] ||
+          this.classes[name].isJreStub && this.jre[name] &&
+            this.jre[name].applicationFallback));
       if (!missing.length) break;
       for (const name of missing) {
         try {
@@ -1638,14 +1846,36 @@ class JVM {
   enqueueAwtEventInvocation(listener, methodName, descriptor, event, coalesce = false) {
     if (!listener || !listener.type || !methodName || !descriptor) return;
     if (!this._awtEventQueue) this._awtEventQueue = [];
-    const record = { listener, methodName, descriptor, event };
-    const tail = this._awtEventQueue[this._awtEventQueue.length - 1];
-    if (coalesce && tail && tail.listener === listener &&
-        tail.methodName === methodName && tail.descriptor === descriptor) {
-      tail.event = event;
-    } else {
-      this._awtEventQueue.push(record);
+    // Motion events coalesce per (listener, source component) stream. Checking
+    // only the tail meant two motion listeners on one component interleaved
+    // L1,L2,L1,L2 and nothing ever merged, so the queue grew and delivery aged
+    // under sustained movement. Walk back to this stream's newest record and
+    // stop there:
+    //   - same callback: the newer coordinates replace it in place, so the
+    //     record keeps its queue position and cannot be starved by later
+    //     traffic on other streams;
+    //   - anything else: a press, a release or a move/drag switch is an
+    //     ordering boundary, so the new event is appended behind it.
+    // Records owned by another listener, or by the same listener on another
+    // component, are skipped rather than merged. They are separate streams,
+    // and merging across them would drop an event instead of coalescing one.
+    const source = event ? event.source : undefined;
+    if (coalesce) {
+      for (let index = this._awtEventQueue.length - 1; index >= 0; index -= 1) {
+        const pending = this._awtEventQueue[index];
+        if (pending.listener !== listener) continue;
+        if ((pending.event ? pending.event.source : undefined) !== source) continue;
+        if (pending.methodName === methodName &&
+            pending.descriptor === descriptor) {
+          pending.event = event;
+          this._awtCoalescedEventCount = (this._awtCoalescedEventCount || 0) + 1;
+          this._scheduleAwtEventPump();
+          return;
+        }
+        break;
+      }
     }
+    this._awtEventQueue.push({ listener, methodName, descriptor, event });
     this._scheduleAwtEventPump();
   }
 
@@ -1660,6 +1890,18 @@ class JVM {
       }
       const record = this._awtEventQueue && this._awtEventQueue.shift();
       if (!record) return;
+      // Delivery age of the coordinates actually handed to the guest. On a
+      // coalesced record this is the age of the newest event merged into it,
+      // which is the number that matters for input latency. Bounded ring, so
+      // this stays a sampled trace rather than an aggregate that hides spread.
+      const when = record.event && record.event.when;
+      if (typeof when === 'number') {
+        if (!this._awtDispatchAgeSamples) this._awtDispatchAgeSamples = [];
+        this._awtDispatchAgeSamples.push(Date.now() - when);
+        if (this._awtDispatchAgeSamples.length > 512) {
+          this._awtDispatchAgeSamples.shift();
+        }
+      }
       const method = await this.findMethodInHierarchy(
         record.listener.type, record.methodName, record.descriptor);
       if (method) {
@@ -1873,7 +2115,22 @@ class JVM {
         servicingAudio = true;
       }
     } else if (audioPriority) {
-      this._audioPriority = null;
+      // Keep the override across the producer's own refill sleep. A Java
+      // Sound mixer writes a few chunks, sleeps ~10 ms and writes again; a
+      // scheduler tick landing inside that sleep used to drop the override,
+      // so the thread woke without it and waited for starvation relief
+      // (~100 ms) with 20-40 ms queued: measured 74 ms median wake latency
+      // and 87% silence on the slow browser host. Clear it only once its
+      // deadline passed, the queue is healthy, or the thread is gone.
+      const output = audioPriority.output;
+      const queueHealthy = !output || output.closed ||
+        typeof output.queuedSeconds !== "function" ||
+        output.queuedSeconds() >= 0.12;
+      if (!this.audioOverrideSurvivesSleep || !audioPriority.thread ||
+          audioPriority.thread.status === "terminated" ||
+          schedulerNow > audioPriority.until || queueHealthy) {
+        this._audioPriority = null;
+      }
     }
 
     // A browser JVM serializes Java threads onto one JavaScript thread. Once
@@ -1915,10 +2172,41 @@ class JVM {
       }
     }
 
+    // A relief turn exists because the producer withheld other runnable
+    // threads for schedulerStarvationMs. Round-robin by tick does not repay
+    // that: a withheld thread whose frames return to the scheduler at every
+    // call boundary runs for a fraction of a millisecond, the rotation then
+    // reaches the producer, and its generated body keeps the CPU until the
+    // host deadline. Measured on one browser host that left a runnable audio
+    // thread with ~5% of the CPU behind an 80% producer. For the rest of a
+    // relief turn the producer stands aside whenever another thread can run;
+    // it is not withheld, since the following (cooldown) turn is its own.
+    if (this._schedulerReliefActive && !servicingAudio &&
+        frameProducer && thread === frameProducer) {
+      let index = (this.currentThreadIndex + 1) % this.threads.length;
+      while (index !== this.currentThreadIndex) {
+        const other = this.threads[index];
+        if (other !== frameProducer && other.status === "runnable") {
+          this.currentThreadIndex = index;
+          thread = other;
+          break;
+        }
+        index = (index + 1) % this.threads.length;
+      }
+    }
+
     // Service outside a relief turn means the producer yielded on its own;
     // service inside one keeps the starvation clock running so relief turns
     // alternate with priority turns for as long as the producer hogs the CPU.
-    if (thread._withheldSince !== undefined && !this._schedulerReliefActive) {
+    // Service under the audio override is not the producer yielding either:
+    // the override pre-empted it for a depleted queue. Resetting the clock
+    // there meant that once the queue crossed the override threshold the
+    // still-runnable mixer waited a fresh schedulerStarvationMs while its
+    // queue drained back below it (a 0-120 ms sawtooth with 6 underruns/s
+    // measured on the slow browser host). Keep the clock running so relief
+    // continues the refill at the ordinary alternation instead.
+    if (thread._withheldSince !== undefined && !this._schedulerReliefActive &&
+        !(servicingAudio && this.audioOverrideKeepsStarvationClock)) {
       thread._withheldSince = undefined;
     }
     return { thread, callStack: thread.callStack, schedulerNow };
@@ -2022,8 +2310,10 @@ class JVM {
       // points. Continue through the same Java thread's newly exposed child or
       // parent Frame without a full all-thread scan, but retain a bounded
       // scheduling and browser-event deadline.
-      if ((completedFrames & 7) === 7 &&
-          Date.now() >= this._nextEventLoopYieldAt) {
+      // A generated frame can run an entire nested call chain. Checking only
+      // every eight frames let several expensive chains overrun the host
+      // deadline before rendering or another Java thread could run.
+      if (Date.now() >= this._nextEventLoopYieldAt) {
         completedFrames += 1;
         break;
       }
@@ -2681,6 +2971,52 @@ class JVM {
     return null;
   }
 
+  // THE class-record identity invariant.
+  //
+  // A class name maps to one class record object for the life of the JVM.
+  // Everything compiled ahead of time holds that object, or something hung
+  // off it, by reference: the record itself (class objects' `_classData`,
+  // the JIT's owner lookups), its StaticFieldStore and the store's value
+  // cells (direct static targets), its initialization token (keyed by name,
+  // so stable already), its method objects (call-site targets, codegen
+  // caches), and the class-epoch-guarded caches that revalidate against
+  // `this.classes[name]`. A targeted JRE override with `applicationFallback`
+  // registers a stub record for an application class before the class file
+  // is read, and preparation compiles against the stub. Loading the real
+  // class therefore fills the existing record in place -- the stub's own
+  // store is kept and the real class's declared statics are merged into it --
+  // and never swaps a disconnected object in behind prepared code.
+  //
+  // Measured on Deko Bloko with preparation on before this existed: prepared
+  // bodies wrote `um.c` into the stub's store, read it back null from the
+  // replacement's, and the game died at "Unpacking graphics". Fixing the
+  // store alone would have left every other captured identity to fail the
+  // same way later; the in-place fill covers them all at once.
+  upgradeStubClassInPlace(className, existing, loaded) {
+    if (!existing || !existing.isJreStub || !loaded || loaded === existing) {
+      return loaded;
+    }
+    const store = existing.staticFields instanceof StaticFieldStore
+      ? existing.staticFields : loaded.staticFields;
+    if (store && loaded.staticFields && loaded.staticFields !== store &&
+        typeof loaded.staticFields.entries === "function") {
+      for (const [key, value] of loaded.staticFields.entries()) {
+        if (!store.has(key)) store.set(key, value);
+      }
+    }
+    // Stub-only members (isJreStub, the override's method tables) go; the
+    // real class's members arrive; the record object stays.
+    for (const key of Object.keys(existing)) delete existing[key];
+    Object.assign(existing, loaded);
+    existing.staticFields = store;
+    // Derived indexes keyed on the record's identity would otherwise keep
+    // the stub's (empty) member list.
+    this._indexedMethodClassData.delete(className);
+    this.classes[className] = existing;
+    this.upgradedStubClassCount = (this.upgradedStubClassCount || 0) + 1;
+    return existing;
+  }
+
   async loadClassByName(className) {
     const classNameWithSlashes = className.replace(/\./g, '/');
     const existingClass = this.classes[classNameWithSlashes];
@@ -2700,13 +3036,21 @@ class JVM {
     const pendingLoad = this.classLoadPromises.get(classNameWithSlashes);
     if (pendingLoad) return pendingLoad;
 
+    // An application class that also carries a targeted JRE override
+    // (applicationFallback) starts life as the override's stub, and the stub
+    // is what an ahead-of-main preparation pass compiles against. Loading the
+    // real class must not replace that record: see upgradeStubClassInPlace.
+    const adoptStubRecord = (classData) =>
+      this.upgradeStubClassInPlace(classNameWithSlashes, existingClass, classData);
+
     const loadPromise = (async () => {
       for (const cp of this.classpath) {
         const lowerCp = String(cp).toLowerCase();
 
         if (lowerCp.endsWith('.jar') || lowerCp.endsWith('.zip')) {
-          const classData = await this.loadClassFromJar(cp, classNameWithSlashes);
-          if (classData && classData.ast) {
+          const loaded = await this.loadClassFromJar(cp, classNameWithSlashes);
+          if (loaded && loaded.ast) {
+            const classData = adoptStubRecord(loaded);
             this.classes[classNameWithSlashes] = classData;
             this.bumpClassEpoch();
             this._notifyClassLoaded(classNameWithSlashes, classData);
@@ -2717,8 +3061,9 @@ class JVM {
 
         const classFilePath = path.join(cp, `${classNameWithSlashes}.class`);
         try {
-          const classData = await this.loadClassAsync(classFilePath);
-          if (classData && classData.ast) {
+          const loaded = await this.loadClassAsync(classFilePath);
+          if (loaded && loaded.ast) {
+            const classData = adoptStubRecord(loaded);
             this.classes[classNameWithSlashes] = classData;
             this.bumpClassEpoch();
             this._notifyClassLoaded(classNameWithSlashes, classData);
@@ -3075,7 +3420,7 @@ class JVM {
     let token = this.classInitializationTokens.get(className);
     if (!token) {
       const state = this.classInitializationState.get(className);
-      token = { state, initialized: state === "INITIALIZED" };
+      token = new ClassInitializationToken(state);
       this.classInitializationTokens.set(className, token);
     }
     return token;

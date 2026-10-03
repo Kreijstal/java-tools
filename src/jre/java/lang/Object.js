@@ -17,8 +17,12 @@ module.exports = {
     // finalizers. It has to be declared all the same: without it the frontend
     // cannot resolve `super.finalize()` and used to invent a descriptor for it.
     'finalize()V': () => {},
-    'getClass()Ljava/lang/Class;': async (jvm, obj, args) => {
-      return await jvm.getClassObject(obj._className || obj.type);
+    'getClass()Ljava/lang/Class;': (jvm, obj, args) => {
+      const className = obj._className || obj.type;
+      // Existing instances normally already have loaded class metadata. Keep
+      // that lookup synchronous so compiled callers need not yield to a
+      // Promise for every type check. Cold mirrors retain normal loading.
+      return jvm.getClassObjectSync(className) || jvm.getClassObject(className);
     },
     'hashCode()I': (jvm, obj, args) => {
       return obj.hashCode;

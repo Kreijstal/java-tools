@@ -10,13 +10,16 @@
 // what gets built next.
 
 const path = require("path");
+const { ClassMirrorEncoder } = require("./ClassMirrorTransport");
 
 // How much id room one in-flight request is granted in each transportable
 // table. Two results must never claim the same indices, so the requester
 // reserves a disjoint range up front and the worker refuses a compile that
-// outgrows it (the method is then compiled locally, which is rare enough to
-// be a diagnostic rather than a policy).
-const DEFAULT_GRANT_STRIDE = 512;
+// outgrows it. One bounded retry can reserve the measured requirement without
+// moving compilation onto the rendering thread or enlarging every request.
+const DEFAULT_GRANT_STRIDE = 64;
+const MAX_INITIAL_GRANT = 512;
+const MAX_RETRY_GRANT = 4096;
 
 // How many sends in a row may fail before the client gives up entirely.
 const CONSECUTIVE_FAILURE_LIMIT = 8;
@@ -41,10 +44,18 @@ class CompileWorkerClient {
     this.grantStride = Math.max(64, Number(
       options.compileWorkerGrantStride ||
       environment.JVM_JIT_COMPILE_WORKER_STRIDE || DEFAULT_GRANT_STRIDE));
+    this.adaptiveGrants = options.compileWorkerGrantStride === undefined &&
+      !environment.JVM_JIT_COMPILE_WORKER_STRIDE;
     this.maxInFlight = Math.max(1, Number(
       options.compileWorkerInFlight ||
-      environment.JVM_JIT_COMPILE_WORKER_INFLIGHT || 4));
+      environment.JVM_JIT_COMPILE_WORKER_INFLIGHT || 1));
+    this.maxQueued = options.compileWorkerMaxQueued ?? 64;
+    if (!Number.isSafeInteger(this.maxQueued) || this.maxQueued < 1 ||
+        !Number.isSafeInteger(this.maxInFlight)) {
+      throw new RangeError("compile worker limits must be positive integers");
+    }
     this.worker = null;
+    this.classMirror = null;
     // Where a browser can fetch the bundled worker script. Node derives its
     // path from __dirname; a page cannot.
     this.workerUrl = options.compileWorkerUrl ||
@@ -54,6 +65,7 @@ class CompileWorkerClient {
     this.queued = new Set();
     this.inFlight = new Map();
     this.sentClasses = new Set();
+    this.sentClassAsts = new WeakMap();
     this.sentInitialized = new Set();
     // Classes that cannot be structured-cloned, so must never be offered
     // again, and the methods the worker has already declined once.
@@ -67,6 +79,9 @@ class CompileWorkerClient {
     // on a host that has no worker at all (a browser, for one, where
     // `worker_threads` does not exist and every send throws).
     this.declinedByRefusal = new WeakSet();
+    // Compact reason codes let diagnostics explain stranded methods without
+    // retaining method objects, payloads, or worker error stacks.
+    this.refusalReasons = new WeakMap();
     // How often each queued method has been asked for again. A precompile
     // seed is asked once; a method the guest is running is asked every time
     // it misses the cache.
@@ -78,7 +93,8 @@ class CompileWorkerClient {
     this.idleWaiters = [];
     this.stats = { queued: 0, requested: 0, completed: 0, installed: 0,
       refused: 0, stale: 0, staleRetried: 0, superseded: 0, failed: 0,
-      refusedReasons: {}, staleReasons: {} };
+      refusedReasons: {}, staleReasons: {}, queueDeferred: 0, grantRetried: 0,
+      classMirrorPackets: 0, classMirrorMaxTaskMs: 0 };
     this.lastRefusal = null;
     // Methods whose bodies this worker actually delivered and published, so a
     // test can prove a transported body ran rather than a local fallback.
@@ -117,12 +133,22 @@ class CompileWorkerClient {
     this.worker = host;
     host.onMessage((message) => this.receive(message));
     host.onError((error) => {
+      if (this.worker !== host) return;
       // A dead worker must not stop the JVM: every queued method simply
       // compiles on the main thread again.
       this.lastRefusal = `worker error: ${error.message}`;
-      this.stats.failed += this.inFlight.size;
+      this.stats.failed += this.inFlight.size + this.queue.length;
+      for (const method of this.inFlight.keys()) this.decline(method);
+      for (const entry of this.queue) this.decline(entry.method);
       this.inFlight.clear();
+      this.queue.length = 0;
+      this.queued.clear();
+      this.cancelClassMirror();
       this.worker = null;
+      this.sentClasses.clear();
+      this.sentClassAsts = new WeakMap();
+      this.sentInitialized.clear();
+      Promise.resolve(host.terminate()).catch(() => {});
       this.settleIdle();
     });
     // The worker must not hold the process open while it is idle, but it
@@ -145,6 +171,7 @@ class CompileWorkerClient {
     const worker = new Worker(
       path.join(__dirname, "compileWorkerThread.js"),
       { workerData: { classpath: this.jvm.classpath,
+        denseInstanceFields: this.jvm.denseInstanceFields,
         jitOptions: this.jvm.jitOptions || {} } });
     return {
       kind: "worker_threads",
@@ -172,7 +199,8 @@ class CompileWorkerClient {
     // first message instead. It is sent before any compile request, and
     // postMessage preserves order, so the worker has it in time.
     worker.postMessage({ type: "init", classpath: this.jvm.classpath,
-      jitOptions: this.jvm.jitOptions || {} });
+      denseInstanceFields: this.jvm.denseInstanceFields,
+        jitOptions: this.jvm.jitOptions || {} });
     return {
       kind: "web-worker",
       postMessage: (message) => worker.postMessage(message),
@@ -188,20 +216,32 @@ class CompileWorkerClient {
     };
   }
 
-  // Everything the worker has not been told about yet. A class crosses once;
-  // its initialization is reported whenever it changes to INITIALIZED.
+  // A class crosses once per AST identity, including replacement of a stub.
+  // Weak keys avoid keeping superseded class graphs alive.
   pendingClasses() {
     const classes = [];
     for (const [className, classData] of Object.entries(this.jvm.classes)) {
       const initialized =
         this.jvm.classInitializationState.get(className) === "INITIALIZED";
-      const isNew = !this.sentClasses.has(className);
+      const isNew = !this.sentClasses.has(className) ||
+        (classData?.ast && this.sentClassAsts.get(classData.ast) !== className);
       const newlyInitialized = initialized &&
         !this.sentInitialized.has(className);
-      if (!isNew && !newlyInitialized) continue;
+      // Boolean branch specialization must use the execution JVM's current
+      // values, not the worker's synthetic <clinit> defaults. Re-snapshot them
+      // on each request; runtime guards still protect changes after the send.
+      const staticBooleans = [];
+      if (initialized && classData?.staticFields instanceof Map) {
+        for (const key of classData.staticFields.keys()) {
+          if (typeof key === 'string' && key.endsWith(':Z')) {
+            staticBooleans.push([key, classData.staticFields.get(key) ? 1 : 0]);
+          }
+        }
+      }
+      if (!isNew && !newlyInitialized && !staticBooleans.length) continue;
       if (isNew && !classData?.ast) continue;
       if (this.unsendableClasses.has(className)) continue;
-      classes.push({ className, initialized,
+      classes.push({ className, initialized, staticBooleans,
         // postMessage structured-clones these; an AST that cannot cross makes
         // the send throw, which is why nothing is marked delivered until the
         // send has actually returned.
@@ -218,6 +258,7 @@ class CompileWorkerClient {
   commitClasses(classes) {
     for (const entry of classes) {
       this.sentClasses.add(entry.className);
+      if (entry.ast) this.sentClassAsts.set(entry.ast, entry.className);
       if (entry.initialized) this.sentInitialized.add(entry.className);
     }
   }
@@ -264,6 +305,12 @@ class CompileWorkerClient {
       this.demand.set(method, pending + 1);
       return true;
     }
+    if (this.queue.length >= this.maxQueued) {
+      // Temporary backpressure, not a permanent refusal. A later invocation
+      // can retry; callers must keep executing their existing tier.
+      this.stats.queueDeferred += 1;
+      return false;
+    }
     const className = this.jvm.findClassNameForMethod?.(method) ||
       method.className;
     if (!className) return false;
@@ -273,7 +320,12 @@ class CompileWorkerClient {
       // Receiving-runtime identity only: never transported to the worker.
       // Publication may replace this exact body, but never a newer winner.
       replacementOf: options.replacementOf || null,
-      preparedWholeMethod: options.preparedWholeMethod === true });
+      // Adaptive admission may already have proved effectful calls safe even
+      // when this particular request did not explicitly ask for preparation.
+      // The worker must repeat that proof, not reject under ordinary admission.
+      preparedWholeMethod: options.preparedWholeMethod === true ||
+        this.jit.adaptiveCodegenMethods?.has(method) === true ||
+        this.jit.preparedCodegenMethods?.has(method) === true });
     this.stats.queued += 1;
     this.pump();
     return true;
@@ -305,23 +357,126 @@ class CompileWorkerClient {
     return this.queue.splice(bestIndex, 1)[0];
   }
 
-  pump() {
-    if (!this.enabled) return;
-    while (this.queue.length && this.inFlight.size < this.maxInFlight) {
-      const entry = this.nextRequest();
+  initialGrantFor(method) {
+    let size = this.grantStride;
+    if (!this.adaptiveGrants) return size;
+    // Most methods allocate only a handful of sites. Preserve the previous
+    // grant for large methods without retaining its empty slots for every
+    // tiny helper. The measured-requirement retry handles outliers.
+    const instructions = this.jit.getCodeItems(method).length;
+    while (size < MAX_INITIAL_GRANT && instructions > size * 4) size *= 2;
+    return size;
+  }
+
+  // One acknowledged packet at a time: neither postMessage nor the worker's
+  // event queue ever receives the complete class graph in one task. The next
+  // packet waits for a new acknowledgement task so rendering can run between copies.
+  startClassMirror(host, classes) {
+    const mirror = { host, classes, index: 0, encoder: null, timer: null,
+      id: this.nextRequestId++, sequence: 0, awaiting: false };
+    this.classMirror = mirror;
+    host.ref();
+    this.scheduleClassMirror(mirror);
+  }
+
+  scheduleClassMirror(mirror) {
+    mirror.timer = setTimeout(() => {
+      mirror.timer = null;
+      this.sendClassMirrorPacket(mirror);
+    }, 0);
+  }
+
+  sendClassMirrorPacket(mirror) {
+    if (this.classMirror !== mirror) return;
+    const started = performance.now();
+    try {
+      if (!mirror.encoder) mirror.encoder = new ClassMirrorEncoder(mirror.classes[mirror.index]);
+      const packet = mirror.encoder.next(4096, 4);
+      mirror.done = packet.done;
+      mirror.awaiting = true;
+      mirror.host.postMessage({ type: "class-mirror", id: mirror.id,
+        sequence: mirror.sequence, packet });
+      this.stats.classMirrorPackets += 1;
+      this.stats.classMirrorMaxTaskMs = Math.max(this.stats.classMirrorMaxTaskMs,
+        performance.now() - started);
+    } catch (error) {
+      // Yield before proceeding after a synchronous failure, too.
+      this.finishClassMirrorPacket(mirror, error);
+    }
+  }
+
+  finishClassMirrorPacket(mirror, error = null) {
+    if (this.classMirror !== mirror) return;
+    mirror.awaiting = false;
+    if (error) {
+      // A failed partial graph is discarded when the next mirror id arrives.
+      // Quarantine only this class; do not synchronously clone every class to
+      // diagnose one failed packet on the rendering thread.
+      try { mirror.host.postMessage({ type: "class-mirror-abort", id: mirror.id }); }
+      catch (_) { /* A failed worker will also release its partial graph. */ }
+      this.unsendableClasses.add(mirror.classes[mirror.index].className);
+      this.lastRefusal = `class mirror failed: ${error.message}`;
+      this.stats.failed += 1;
+    }
+    if (error || mirror.done) {
+      if (!error) this.commitClasses([mirror.classes[mirror.index]]);
+      mirror.encoder = null;
+      mirror.classes[mirror.index++] = null;
+      mirror.id = this.nextRequestId++;
+      mirror.sequence = 0;
+      if (mirror.index === mirror.classes.length) {
+        this.classMirror = null;
+        this.pump();
+        this.settleIdle();
+        return;
+      }
+    } else mirror.sequence += 1;
+    // An acknowledgement is already a fresh event-loop task. Another timer
+    // here adds a full scheduling delay for every small packet. Synchronous
+    // failures do need a new task so a run of bad classes cannot recurse.
+    if (error) this.scheduleClassMirror(mirror);
+    else this.sendClassMirrorPacket(mirror);
+  }
+
+  cancelClassMirror() {
+    if (this.classMirror) clearTimeout(this.classMirror.timer);
+    this.classMirror = null;
+  }
+
+  pump(retryEntry = null) {
+    if (!this.enabled || this.classMirror) return;
+    while ((retryEntry || this.queue.length) && this.inFlight.size <
+        (this.worker?.kind === "web-worker" ? 1 : this.maxInFlight)) {
+      const entry = retryEntry || this.nextRequest();
+      retryEntry = null;
       if (!entry) return;
       this.queued.delete(entry.method);
       const id = this.nextRequestId++;
       const grant = this.jit.siteIdWatermark();
+      if (entry.grantRetry) {
+        for (const table of this.jit.constructor.transportableSiteTables) {
+          grant[table] = Math.max(grant[table], entry.grantRetry.watermark[table]);
+        }
+      }
       const limit = { ...grant };
+      const initialGrant = this.initialGrantFor(entry.method);
       for (const table of this.jit.constructor.transportableSiteTables) {
-        limit[table] = grant[table] + this.grantStride;
+        limit[table] = grant[table] + Math.max(initialGrant,
+          entry.grantRetry?.required[table] || 0);
       }
       const classes = this.pendingClasses();
       entry.warmth = this.jit.describeCallSiteWarmth(entry.method);
-      this.inFlight.set(entry.method, { id, entry });
+      this.inFlight.set(entry.method, { id, entry, grant });
       try {
-        this.ensureWorker().postMessage({
+        const host = this.ensureWorker();
+        if (host.kind === "web-worker" && classes.some(item => item.ast)) {
+          this.inFlight.delete(entry.method);
+          this.queued.add(entry.method);
+          this.queue.unshift(entry);
+          this.startClassMirror(host, classes.filter(item => item.ast));
+          return;
+        }
+        host.postMessage({
           type: "compile", id,
           className: entry.className,
           name: entry.method.name,
@@ -380,6 +535,15 @@ class CompileWorkerClient {
   }
 
   receive(message) {
+    if (message?.type === "class-mirrored") {
+      const mirror = this.classMirror;
+      if (mirror?.awaiting && message.id === mirror.id &&
+          message.sequence === mirror.sequence) {
+        this.finishClassMirrorPacket(mirror,
+          message.error ? new Error(message.error) : null);
+      }
+      return;
+    }
     if (message?.type === "ready") return;
     if (message?.type !== "result") return;
     let found = null;
@@ -393,12 +557,46 @@ class CompileWorkerClient {
     }
     if (found === null) return;
     this.inFlight.delete(found);
+    const current = this.jit.codegenCache.get(found);
+    if (!message.refused && current &&
+        current !== foundRecord?.entry?.replacementOf) {
+      // Do not bind stale descriptors or construct functions for a lost race.
+      this.stats.superseded += 1;
+      this.stats.completed += 1;
+      message.payload = null;
+      this.pump();
+      return;
+    }
     if (message.refused) {
       this.stats.refused += 1;
       this.stats.completed += 1;
       const key = this.classifyRefusalReason(message.refused);
       this.stats.refusedReasons[key] = (this.stats.refusedReasons[key] || 0) + 1;
       this.lastRefusal = message.refused;
+      const retry = message.grantRetry;
+      const entry = foundRecord.entry;
+      const tables = this.jit.constructor.transportableSiteTables;
+      if (key === "grant-overflow" && !entry.grantRetry && retry &&
+          (!current || current === entry.replacementOf) &&
+          tables.every(table =>
+            Number.isSafeInteger(retry.required?.[table]) &&
+            retry.required[table] >= 0 && retry.required[table] <= MAX_RETRY_GRANT &&
+            Number.isSafeInteger(retry.watermark?.[table]) &&
+            retry.watermark[table] >= foundRecord.grant[table] &&
+            retry.watermark[table] - foundRecord.grant[table] <= MAX_RETRY_GRANT)) {
+        entry.grantRetry = { required: {}, watermark: {} };
+        for (const table of tables) {
+          entry.grantRetry.required[table] = retry.required[table];
+          entry.grantRetry.watermark[table] = retry.watermark[table];
+        }
+        this.stats.grantRetried += 1;
+        message.payload = null;
+        // Reuse the vacated in-flight slot; a full waiting queue must not
+        // strand this method or grow beyond its configured bound.
+        this.pump(entry);
+        return;
+      }
+      this.refusalReasons.set(found, key);
       this.decline(found, { refused: true });
     } else {
       // Task 2: everything from here to publication is main-thread work done
@@ -442,6 +640,7 @@ class CompileWorkerClient {
           this.queue.push(entry);
           this.pump();
         } else {
+          this.refusalReasons.set(found, key);
           this.decline(found, { refused: true });
         }
       } else if (!this.jit.codegenCache.get(found) ||
@@ -450,6 +649,7 @@ class CompileWorkerClient {
         // Publish exactly as a local compile would, so callers relink through
         // the ordinary upgrade path rather than a second mechanism.
         const publicationStart = this.jit.monotonicNow();
+        this.jit.installedSourceRetention?.apply(generated);
         this.jit.codegenCache.set(found, generated);
         if (foundRecord?.entry?.preparedWholeMethod) {
           this.jit.preparedCodegenMethods.add(found);
@@ -473,6 +673,7 @@ class CompileWorkerClient {
           { installed: false });
       }
     }
+    message.payload = null;
     this.pump();
   }
 
@@ -515,7 +716,7 @@ class CompileWorkerClient {
   }
 
   get idle() {
-    return this.queue.length === 0 && this.inFlight.size === 0;
+    return !this.classMirror && this.queue.length === 0 && this.inFlight.size === 0;
   }
 
   // One plain object for the benchmark: worker census plus the JIT's install
@@ -543,6 +744,16 @@ class CompileWorkerClient {
   }
 
   dispose() {
+    this.cancelClassMirror();
+    for (const method of this.inFlight.keys()) this.decline(method);
+    for (const entry of this.queue) this.decline(entry.method);
+    this.inFlight.clear();
+    this.queue.length = 0;
+    this.queued.clear();
+    this.settleIdle();
+    this.sentClasses.clear();
+    this.sentClassAsts = new WeakMap();
+    this.sentInitialized.clear();
     if (!this.worker) return Promise.resolve();
     const worker = this.worker;
     this.worker = null;

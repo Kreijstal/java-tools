@@ -14,6 +14,10 @@ const jvmDebugConfig = {
   module: {
     rules: [
       {
+        test: /[\\/]utilium[\\/]dist[\\/]buffer\.js$/,
+        use: path.resolve(__dirname, 'config/growing-buffer-loader.js')
+      },
+      {
         test: /\.js$/,
         exclude: /node_modules/,
         use: {

@@ -1175,3 +1175,31 @@ test('the partitioner cuts across a composed callee body', (t) => {
   }
   t.end();
 });
+
+test('partition protocol releases reference live-outs and thrown values after consumption', t => {
+  const moduleSource = `function work(value, fail, log) {
+  let current = null;
+${Array.from({ length: 240 }, (_, i) => `  current = value;\n  ${pad('retention' + i)}`).join('\n')}
+  if (fail) throw current;
+  return current;
+}
+return work;`;
+  const partitioned = partitionOversizedLinearBlocks(buildRegionUnits(moduleSource), OPTIONS);
+  t.ok(partitioned.count > 0, 'fixture really uses shared segment output');
+  const source = renderUnits(partitioned.units).replace('return work;',
+    'return { work, state: jvmRegionSegmentState0 };');
+  const compiled = compile(source);
+  const value = { retainedGraph: new Array(128).fill({}) };
+  t.equal(compiled.work(value, false, []), value, 'reference result survives write-back');
+  t.equal(compiled.state.length, 0, 'normal return does not retain reference live-outs');
+  let error;
+  try { compiled.work(value, true, []); } catch (caught) { error = caught; }
+  t.equal(error, value, 'exception identity preserved');
+  t.equal(compiled.state.length, 0, 'throw path does not retain reference live-outs or exception');
+  error = null;
+  try { compiled.work(value, false, { push() { throw value; } }); }
+  catch (caught) { error = caught; }
+  t.equal(error, value, 'exception thrown inside an extracted helper preserves identity');
+  t.equal(compiled.state.length, 0, 'helper exception payload is released before rethrow');
+  t.end();
+});

@@ -99,9 +99,10 @@ class ShadowCompiler {
     const { JVM } = require("../core/jvm");
     this.shadow = new JVM({
       classpath: this.jvm.classpath,
+      denseInstanceFields: this.jvm.denseInstanceFields,
       // The shadow compiles; it never schedules guest code, and it must not
       // recursively start a shadow of its own.
-      jit: { ...(this.jvm.jitOptions || {}), shadowCompile: false,
+      jit: { ...(this.jvm.jitOptions || {}), shadowCompile: false, producesTransport: true,
         hotness: false, warmupThreshold: 0 },
     });
     return this.shadow;
