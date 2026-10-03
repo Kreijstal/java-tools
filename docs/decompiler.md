@@ -1477,3 +1477,41 @@ overrides remain unchanged, as do diagnostics. The instrument-patch constructor
 shrinks from 492 to 468 lines and nine block labels to one. There remain 21 method
 spans of at least 300 lines, 13 with block labels; some include nested helpers.
 These controlled proofs do not establish whole-game or browser/phone acceptance.
+
+### Recovering conditional alternatives from plain exits
+
+`foldLabeledIfElseExits` runs after terminal-break cleanup. A direct braced `if`
+ending in the only break to a unique plain block has an existing alternate: the
+remaining statements in that block. It becomes `if/else`; a branch containing
+only the break becomes an ordinary guard using logical negation. Prefix work
+stays before the predicate, both branch bodies retain their order, and an outer
+block preserves prefix declaration scopes until existing scope-safe cleanup.
+The rewrite duplicates neither work nor predicates and introduces no locals.
+
+The break must be the final direct statement of the consequent, with a nonempty
+fallback after the `if`. Alternates, other references to the destination,
+intermediate loops/switches/protected regions, bare branches, unknown extents,
+duplicate/unbound labels and invalid ancestor transfers refuse reconstruction.
+Comments, Unicode escapes, nested executables and unsupported/malformed syntax
+also refuse it. Protected work inside either branch or the prefix remains intact,
+as do regions enclosing the entire destination. This does not yet reconstruct
+multi-exit decision trees such as the compact music score's controller decoder.
+
+`NODE_PATH=/path/to/dependencies JAVA_TOOL_OPTIONS=-XX:-UsePerfData node test/javaAstEmitterLoopExits.test.js`
+passes 52 groups with one optional historical corpus check skipped. Two new
+groups include 6,720 native comparisons and explicit selected/fallback oracles.
+They cover ordered work/predicates, unboxing, NaNs, partial effects, shadowed
+branch locals, ancestor break/continue, return overrides, enclosing and branch
+finally effects observed after invocation, and monitor ownership/release.
+Exception-exit and integer-argument tests retain eight and two passing groups.
+
+The fixed GeoBlox export reconstructs 64 labels/breaks: 47 conditional alternatives
+and 17 ordinary guards. Scope-safe cleanup unwraps 64 blocks across 45 files,
+removing 145 lines (78,441 to 78,296). Independent JDK body positions plus only
+these rules reproduce all 303 token streams. All sources compile, ordered
+19,591 declarations/119,181 references/388 overrides remain, and diagnostics
+are byte-identical. Gameplay rendering shrinks 395 to 390 lines and 22 to 20
+block labels; board reconciliation shrinks 504 to 502 lines and 17 to 16 labels.
+The instrument-patch constructor now has no labels and 466 lines. There remain
+21 large method spans, 12 with block labels. Complete gameplay/assets and
+browser/phone acceptance remain unverified.

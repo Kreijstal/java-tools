@@ -1307,6 +1307,118 @@ function foldLabeledSkipGuards(source) {
   return {source:output.slice(2,-2),framesRemoved:edits.length,guardJumpsRemoved};
 }
 
+// A direct conditional branch ending in the only break to a plain block has
+// an existing alternate: every following statement in that block. Keep both
+// branches and the enclosing declaration scope, replacing only the transfer.
+function foldLabeledIfElseExits(source) {
+  const unchanged = () => ({source, framesRemoved: 0, jumpsRemoved: 0, guardsRecovered: 0});
+  const proof = controlCleanupSource(source);
+  if (!proof) return unchanged();
+  const {wrapped, parsed, tokens, starts, closes, children, labelCounts} = proof;
+  const references = new Map(), loops = new Set(['WhileStatement', 'ForStatement', 'EnhancedForStatement', 'DoWhileStatement']);
+  let refused = false;
+  function inspect(node, labels = [], loopDepth = 0, breakDepth = 0) {
+    if (/ClassDeclaration|MethodDeclaration|ConstructorDeclaration|LambdaExpression|AnonymousClass/.test(node.kind || '')) refused = true;
+    if (['BreakStatement', 'ContinueStatement'].includes(node.kind)) {
+      if (node.label) {
+        const target = labels.slice().reverse().find(frame => frame.label === node.label);
+        if (!target || node.kind === 'ContinueStatement' && !loops.has(target.statement?.kind)) refused = true;
+        if (!references.has(node.label)) references.set(node.label, []);
+        references.get(node.label).push(node);
+      } else if (!(node.kind === 'ContinueStatement' ? loopDepth : breakDepth)) refused = true;
+    }
+    if (node.kind === 'ExpressionStatement') {
+      const expression = node.expression;
+      if (!['AssignmentExpression', 'MethodInvocationExpression', 'NewClassExpression'].includes(expression?.kind)
+          && !(expression?.kind === 'UnaryExpression' && ['++', '--'].includes(expression.operator))) refused = true;
+      let index = starts.get(node.range?.startOffset);
+      if (index === undefined) refused = true;
+      else {
+        while (index < tokens.length && tokens[index].text !== ';' && tokens[index].text !== '}') {
+          if (closes.has(index)) index = closes.get(index);
+          index++;
+        }
+        if (tokens[index]?.text !== ';') refused = true;
+      }
+    }
+    children(node, child => inspect(child,
+      node.kind === 'LabeledStatement' ? [...labels, node] : labels,
+      loopDepth + (loops.has(node.kind) ? 1 : 0),
+      breakDepth + (loops.has(node.kind) || node.kind === 'SwitchStatement' ? 1 : 0)));
+  }
+  inspect(parsed);
+  if (refused || [...labelCounts.values()].some(count => count !== 1)) return unchanged();
+  function blockExtent(node) {
+    const open = starts.get(node.range?.startOffset), close = closes.get(open);
+    return node.kind === 'BlockStatement' && tokens[open]?.text === '{' && tokens[close]?.text === '}'
+      && (!node.statements.length ? close === open + 1
+        : starts.get(node.statements[0].range?.startOffset) === open + 1
+          && node.statements.every(statement => {
+            const start = starts.get(statement.range?.startOffset);
+            return start > open && start < close;
+          })) ? {open, close} : null;
+  }
+  const edits = [];
+  let guardsRecovered = 0;
+  function find(node) {
+    if (node.kind === 'LabeledStatement' && node.statement?.kind === 'BlockStatement'
+        && references.get(node.label)?.length === 1) {
+      const frame = blockExtent(node.statement), start = starts.get(node.range?.startOffset);
+      if (!frame || tokens[start]?.text !== node.label || tokens[start + 1]?.text !== ':' || start + 2 !== frame.open) return;
+      const statements = node.statement.statements;
+      for (let index = 0; index < statements.length - 1; index++) {
+        const branch = statements[index], body = branch.consequent;
+        if (branch.kind !== 'IfStatement' || branch.alternate || body?.kind !== 'BlockStatement') continue;
+        const extent = blockExtent(body), jump = body.statements.at(-1);
+        if (!extent || jump?.kind !== 'BreakStatement' || jump.label !== node.label
+            || references.get(node.label)[0] !== jump) continue;
+        const branchStart = starts.get(branch.range?.startOffset), headerEnd = closes.get(branchStart + 1);
+        const jumpStart = starts.get(jump.range?.startOffset), rest = starts.get(statements[index + 1].range?.startOffset);
+        if (tokens[branchStart]?.text !== 'if' || tokens[branchStart + 1]?.text !== '(' || headerEnd === undefined
+            || headerEnd + 1 !== extent.open || rest !== extent.close + 1
+            || tokens[jumpStart]?.text !== 'break' || tokens[jumpStart + 1]?.text !== node.label
+            || tokens[jumpStart + 2]?.text !== ';' || jumpStart + 3 !== extent.close) continue;
+        const prefix = wrapped.slice(wrapped.lastIndexOf('\n', tokens[branchStart].range.startOffset - 1) + 1,
+          tokens[branchStart].range.startOffset);
+        const indent = /^[ \t]*$/.test(prefix) ? prefix : '';
+        const framePrefix = wrapped.slice(wrapped.lastIndexOf('\n', tokens[start].range.startOffset - 1) + 1,
+          tokens[start].range.startOffset);
+        const frameIndent = /^[ \t]*$/.test(framePrefix) ? framePrefix : '';
+        const multiline = wrapped.slice(tokens[start].range.startOffset, tokens[frame.close].range.endOffset).includes('\n');
+        const tailBytes = wrapped.slice(tokens[extent.close].range.endOffset, tokens[frame.close].range.startOffset);
+        const suffix = multiline && tailBytes.includes('\n')
+          ? tailBytes.replace(/\n([ \t]*)(?=\S)/g, '\n  $1').replace(/[ \t]*$/, indent) + '}'
+          : tailBytes + '}';
+        let replacement;
+        if (body.statements.length === 1) {
+          const predicate = wrapped.slice(tokens[branchStart + 1].range.endOffset, tokens[headerEnd].range.startOffset);
+          replacement = 'if (!(' + predicate + ')) {' + suffix;
+          guardsRecovered++;
+        } else {
+          let jumpOffset = tokens[jumpStart].range.startOffset;
+          const lineStart = wrapped.lastIndexOf('\n', jumpOffset - 1) + 1;
+          if (!wrapped.slice(lineStart, jumpOffset).trim()
+              && !wrapped.slice(tokens[jumpStart + 2].range.endOffset, tokens[extent.close].range.startOffset).trim()) jumpOffset = lineStart;
+          const branchBytes = wrapped.slice(tokens[branchStart].range.startOffset, jumpOffset);
+          replacement = branchBytes + (multiline ? indent : '') + '} else {' + suffix;
+        }
+        const prefixBytes = wrapped.slice(tokens[frame.open].range.endOffset, tokens[branchStart].range.startOffset);
+        edits.push({start: tokens[start].range.startOffset, end: tokens[frame.close].range.endOffset,
+          text: '{' + prefixBytes + replacement + (multiline ? '\n' + frameIndent : '') + '}'});
+        return;
+      }
+    }
+    children(node, find);
+  }
+  find(parsed);
+  if (!edits.length) return unchanged();
+  edits.sort((a, b) => a.start - b.start);
+  if (edits.some((edit, index) => index && edits[index - 1].end > edit.start)) return unchanged();
+  let output = wrapped;
+  for (const edit of edits.slice().reverse()) output = output.slice(0, edit.start) + edit.text + output.slice(edit.end);
+  return {source: output.slice(2, -2), framesRemoved: edits.length, jumpsRemoved: edits.length, guardsRecovered};
+}
+
 // A consumed block break immediately followed by a bare return has no work or
 // value evaluation left at its destination. Both transfers leave the same
 // cleanup regions, even when a finally overrides them. Completion is separate:
@@ -2122,6 +2234,7 @@ module.exports = {
   foldVoidReturnExits,
   foldNestedIfGuards,
   foldLabeledSkipGuards,
+  foldLabeledIfElseExits,
   removeDeadRegionSelectors,
   removeDeadReceiverSnapshots,
 };
