@@ -513,7 +513,7 @@ test('iinc snapshots operand-stack values loaded before the increment', (t) => {
   try {
     const source = decompileFixture(tempDir, 'PostIncrementArrayStore', POST_INCREMENT_ARRAY_STORE);
 
-    t.match(source, /int incrementValue\$\d+ = param1;\s*param1\+\+;\s*param0\[incrementValue\$\d+\] = param2;/,
+    t.match(source, /param0\[param1\+\+\] = param2;/,
       'array index uses the value captured before iinc');
     t.notOk(/param1\+\+;\s*param0\[param1\]/.test(source),
       'array store does not reread the incremented local');

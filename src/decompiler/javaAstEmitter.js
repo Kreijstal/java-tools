@@ -10,6 +10,7 @@ const { JavaParser } = require('../java-frontend/parser');
 const { tokenizeJava } = require('../java-frontend/lexer');
 const { recoverScalarLabelDispatches: recoverScalarDispatch } = require('./scalarDispatchRecovery');
 const { specializePathGuards: specializeGuards } = require('./pathGuardRecovery');
+const { recoverArrayIndexIncrements: recoverIndexIncrements } = require('./incrementCaptureRecovery');
 
 const rawExpression = (source) => createNode('UnsupportedExpression', { source: String(source) });
 const rawStatement = (source) => createNode('UnsupportedStatement', { source: String(source) });
@@ -644,6 +645,10 @@ function recoverScalarLabelDispatches(source, options = {}) {
 
 function specializePathGuards(source, options = {}) {
   return specializeGuards(source, controlCleanupSource(source), options);
+}
+
+function recoverArrayIndexIncrements(source, options = {}) {
+  return recoverIndexIncrements(source, controlCleanupSource(source), options);
 }
 
 // Guard specialization and frame cleanup can expose exits after the ordinary
@@ -3081,6 +3086,7 @@ module.exports = {
   simplifyIdentityReferenceCasts,
   recoverScalarLabelDispatches,
   specializePathGuards,
+  recoverArrayIndexIncrements,
   recoverPostGuardExits,
   foldLabeledBooleanDecisions,
   foldVoidReturnExits,
