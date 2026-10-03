@@ -8,7 +8,7 @@ const path = require('path');
 const {spawnSync} = require('child_process');
 const {treeToStatements, emitStatements, promoteBooleanStackCarriers, factorCommonBranchTails,
   removeDeadRegionSelectors, removeDeadReceiverSnapshots, factorLabeledBlockReturnTails,
-  simplifyControlFrames, foldLabeledBooleanDecisions, foldVoidReturnExits, foldNestedIfGuards, foldLabeledSkipGuards} = require('../src/decompiler/javaAstEmitter');
+  simplifyControlFrames, removeFallthroughLabelBreaks, foldLabeledBooleanDecisions, foldVoidReturnExits, foldNestedIfGuards, foldLabeledSkipGuards} = require('../src/decompiler/javaAstEmitter');
 const {printTree} = require('../src/decompiler/structurer');
 const {JavaParser} = require('../src/java-frontend/parser');
 const {decompileClassFile, assertNoFallback} = require('../src/decompiler/cfr');
@@ -2010,5 +2010,102 @@ test('labeled skip guards match native short circuits, scopes, ancestor transfer
     const javaFile=path.join(temporary,'SkipGuards.java');fs.writeFileSync(javaFile,source);
     run('javac',['--release','8','-d',temporary,javaFile],temporary);
     assert.equal(run('java',['-cp',temporary,'SkipGuards'],temporary).trim(),'skip-guard-native:4032');
+  }finally{fs.rmSync(temporary,{recursive:true,force:true});}
+});
+
+test('fallthrough label breaks remove only proven terminal paths and preserve bare branches',()=>{
+  const plain='Exit: { if (pick()) { work(); break Exit; } } tail();';
+  assert.deepEqual(removeFallthroughLabelBreaks(plain),{source:'Exit: { if (pick()) { work();  } } tail();',breaksRemoved:1});
+  assert.deepEqual(removeFallthroughLabelBreaks('Exit: { if(pick()) break Exit; else break Exit; }'),
+    {source:'Exit: { if(pick()) ; else ; }',breaksRemoved:2});
+  const multiline='Exit: {\n  work();\n  break Exit;\n}\ntail();';
+  assert.equal(removeFallthroughLabelBreaks(multiline).source,'Exit: {\n  work();\n}\ntail();');
+  const partial='Exit: { if(pick()) { break Exit; } work(); break Exit; }';
+  const removed=removeFallthroughLabelBreaks(partial);assert.equal(removed.breaksRemoved,1);
+  assert.match(simplifyControlFrames(removed.source).source,/Exit:/);
+  assert.equal(removeFallthroughLabelBreaks('Exit: { Inner: { work(); break Exit; } }').breaksRemoved,1);
+  for(const source of [
+    'Exit: { if(pick()) { break Exit; } work(); }',
+    'Exit: { if(pick()) { break Exit; work(); } }',
+    'Exit: { while(pick()) { break Exit; } }',
+    'Exit: { for(int i=0;i<3;i++) { break Exit; } }',
+    'Exit: { do { break Exit; } while(pick()); }',
+    'Exit: { switch(value) { case 0: break Exit; } }',
+    'Exit: { try { break Exit; } finally { work(); } }',
+    'Exit: { try { break Exit; } catch(RuntimeException error) { work(); } }',
+    'Exit: { synchronized(lock) { break Exit; } }',
+    'Exit: while(pick()) { break Exit; }',
+    'Exit: { continue Exit; }',
+    'Exit: { continue; break Exit; }',
+    'Exit: { break Other; break Exit; }',
+    'Exit: { break Exit; } Exit: { break Exit; }',
+    'Exit: { class Local { void run() { work(); } } break Exit; }',
+    'Exit: { Runnable r=()->work(); break Exit; }',
+    'Exit: { /*keep*/ break Exit; }',
+    'Exit: { \\u0061(); break Exit; }',
+    'Exit: { raw; break Exit; }',
+    'Exit: { work() break Exit; }',
+    'Exit: { break Exit; } }',
+  ])assert.deepEqual(removeFallthroughLabelBreaks(source),{source,breaksRemoved:0},source);
+});
+
+test('fallthrough label breaks match native scopes, effects, ancestor transfers and enclosing cleanup',()=>{
+  const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'cfr-fallthrough-break-native-'));
+  try {
+    const variants=[
+      'Exit: { work(); break Exit; } tail();',
+      'Exit: { if(pick(0,boxed)) { work(); break Exit; } } tail();',
+      'Exit: { if(floating<0d) { if(pick(0,boxed)) { work(); break Exit; } } } tail();',
+      'Exit: { if(pick(0,boxed)) { break Exit; } work(); break Exit; } tail();',
+      'try { Exit: { work(); if(pick(0,boxed)) { break Exit; } } tail(); } finally { cleanup(); }',
+      'synchronized(lock) { Exit: { work(); if(pick(0,boxed)) { break Exit; } } trace.append(Thread.holdsLock(lock)); } tail();',
+      'Exit: { try { work(); } finally { cleanup(); } if(pick(0,boxed)) { break Exit; } } tail();',
+      'Exit: { for(int index=0;index<3;index++) { work(); } break Exit; } tail();',
+      'Outer: for(int index=0;index<3;index++) { Exit: { work(); if(pick(0,boxed)) continue Outer; break Exit; } tail(); }',
+      'switch(mode%3) { case 0: Exit: { work(); break Exit; } tail(); break; default: work(); } tail();',
+      'Exit: { if(pick(0,boxed)) break Exit; else break Exit; } tail();',
+      'Exit: { { int local=++value; trace.append(local); if(pick(0,boxed)) { break Exit; } } } { int local=7; trace.append(local); } tail();',
+      'Exit: { Inner: { work(); break Exit; } } tail();',
+      'try { Exit: { work(); break Exit; } } catch(IllegalArgumentException error) { trace.append(error==specific); } tail();',
+      'Exit: { if(pick(0,boxed)) { work(); break Exit; } else { throw general; } } tail();',
+      'while(value<3) { Exit: { work(); break Exit; } if(mode==7) continue; tail(); } tail();',
+    ];
+    const methods=[];
+    variants.forEach((original,index)=>{
+      const removed=removeFallthroughLabelBreaks(original);assert.ok(removed.breaksRemoved>0,index);
+      let rebuilt=removed.source;
+      for(;;){const next=simplifyControlFrames(rebuilt);if(!next.labelsRemoved&&!next.jumpsUnlabeled&&!next.blocksUnwrapped)break;rebuilt=next.source;}
+      for(const [name,body]of[['original',original],['rebuilt',rebuilt]])
+        methods.push('static int '+name+index+'(Boolean boxed,double floating) { '+body+' return value; }');
+    });
+    const source=`public class FallthroughBreaks {
+      static int mode,value,seen;static Object lock;static StringBuilder trace;
+      static final RuntimeException specific=new IllegalArgumentException(),general=new IllegalStateException();
+      static final Error fatal=new AssertionError();
+      static boolean pick(int index,Boolean boxed){trace.append('p').append(index);if(mode==1)throw specific;if(mode==2)throw general;return boxed;}
+      static void work(){trace.append('w').append(lock!=null&&Thread.holdsLock(lock));value++;if(mode==3)throw general;if(mode==4)throw fatal;}
+      static void cleanup(){trace.append('f');seen=value;if(mode==5)throw general;if(mode==6)throw fatal;}
+      static void tail(){trace.append('t');value+=2;}
+      ${methods.join('\n')}
+      interface Call {int call();}
+      static String invoke(Call call,boolean nullLock){
+        lock=nullLock?null:new Object();trace=new StringBuilder();value=0;seen=-1;String result;
+        try{result="ok:"+call.call();}catch(Throwable error){result=error==specific?"specific":error==general?"general":error==fatal?"fatal":error.getClass().getName();}
+        if(lock!=null&&Thread.holdsLock(lock))throw new AssertionError("monitor retained");
+        return result+":"+value+":"+seen+":"+trace;
+      }
+      public static void main(String[]args){int cases=0;
+        for(mode=0;mode<8;mode++)for(Boolean boxed:new Boolean[]{null,false,true})
+        for(double floating:new double[]{Double.NEGATIVE_INFINITY,-1,-0d,0d,1,Double.POSITIVE_INFINITY,Double.NaN})
+        for(boolean nullLock:new boolean[]{false,true}){
+          ${variants.map((_,index)=>`{String expected=invoke(()->original${index}(boxed,floating),nullLock),actual=invoke(()->rebuilt${index}(boxed,floating),nullLock);
+            if(!expected.equals(actual))throw new AssertionError(${index}+":"+mode+":"+boxed+":"+floating+":"+nullLock+":"+expected+" != "+actual);cases++;}`).join('\n')}
+        }
+        if(cases!=5376)throw new AssertionError(cases);System.out.println("fallthrough-break-native:"+cases);
+      }
+    }`;
+    const javaFile=path.join(temporary,'FallthroughBreaks.java');fs.writeFileSync(javaFile,source);
+    run('javac',['--release','8','-d',temporary,javaFile],temporary);
+    assert.equal(run('java',['-cp',temporary,'FallthroughBreaks'],temporary).trim(),'fallthrough-break-native:5376');
   }finally{fs.rmSync(temporary,{recursive:true,force:true});}
 });

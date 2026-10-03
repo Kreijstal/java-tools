@@ -1443,3 +1443,37 @@ all 303 token streams; ordered 19,591 declarations, 119,181 references and 388
 override rows remain unchanged. The 21 spans of at least 300 lines (15 with
 labels) remain; some spans include nested helpers. This improves individual
 control decisions without claiming that the remaining large bodies are solved.
+
+### Removing terminal breaks to plain blocks
+
+`removeFallthroughLabelBreaks` runs after guard reconstruction. A labeled break
+can disappear when ordinary completion reaches exactly the same plain-block
+destination. The path may contain only final statements of braced blocks,
+conditional branches and plain labels. No predicate, effect or declaration moves.
+A bare conditional break becomes an empty statement so its predicate still runs.
+Existing control-frame cleanup then removes unused labels and scope-safe braces.
+
+Intermediate loops, switches, try/catch/finally and monitors refuse the rewrite;
+their continuations or abrupt-completion behavior require a different proof.
+Protected regions enclosing the entire destination remain intact. Exact lexical
+braces and jump tokens, unique resolved labels and valid ancestor/unlabeled
+transfers are required. Comments, Unicode escapes, nested executable bodies,
+unsupported syntax, malformed expressions and unknown extents refuse cleanup.
+Parser end offsets do not describe complete statement extents, so matching
+lexical delimiters establish block boundaries instead.
+
+`NODE_PATH=/path/to/dependencies JAVA_TOOL_OPTIONS=-XX:-UsePerfData node test/javaAstEmitterLoopExits.test.js`
+passes 50 tests with one optional historical corpus check skipped. Two new groups
+include 5,376 native comparisons of scopes, predicate/work failures, nullable
+unboxing, NaNs, ancestor transfers, retained meaningful exits, enclosing finally
+state after invocation and monitor ownership/release. Exception-exit and integer
+argument regression retain eight and two passing groups respectively.
+
+The fixed GeoBlox export removes 102 breaks, 73 unused labels and 73 nondeclaring
+block frames across 50 files, reducing 78,689 lines to 78,441. Independent JDK body
+positions and just these documented transforms reproduce all 303 token streams.
+All sources compile; ordered 19,591 declarations, 119,181 references and 388
+overrides remain unchanged, as do diagnostics. The instrument-patch constructor
+shrinks from 492 to 468 lines and nine block labels to one. There remain 21 method
+spans of at least 300 lines, 13 with block labels; some include nested helpers.
+These controlled proofs do not establish whole-game or browser/phone acceptance.
