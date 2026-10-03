@@ -1552,6 +1552,166 @@ function foldLabeledExitTrees(source) {
   return {source: output.slice(2, -2), framesRemoved: edits.length, jumpsRemoved, choicesRecovered, guardsRecovered};
 }
 
+// A tree containing only predicates and breaks to one plain destination can
+// guard its remainder directly. Preserve predicate evaluation and its nesting
+// using short-circuit AND/OR; never guess complementary floating comparisons.
+function foldLabeledGuardTrees(source) {
+  const unchanged = () => ({source, framesRemoved: 0, jumpsRemoved: 0, guardsRecovered: 0, predicatesRecovered: 0});
+  const proof = controlCleanupSource(source);
+  if (!proof) return unchanged();
+  const {wrapped, parsed, tokens, starts, closes, children, labelCounts} = proof;
+  const parents = new Map(), references = new Map(), loops = new Set(['WhileStatement', 'ForStatement', 'EnhancedForStatement', 'DoWhileStatement']);
+  let refused = false;
+  function inspect(node, parent, labels = [], loopDepth = 0, breakDepth = 0) {
+    parents.set(node, parent);
+    if (/ClassDeclaration|MethodDeclaration|ConstructorDeclaration|LambdaExpression|AnonymousClass/.test(node.kind || '')) refused = true;
+    if (['BreakStatement', 'ContinueStatement'].includes(node.kind)) {
+      if (node.label) {
+        const target = labels.slice().reverse().find(frame => frame.label === node.label);
+        if (!target || node.kind === 'ContinueStatement' && !loops.has(target.statement?.kind)) refused = true;
+        if (!references.has(node.label)) references.set(node.label, []);
+        references.get(node.label).push(node);
+      } else if (!(node.kind === 'ContinueStatement' ? loopDepth : breakDepth)) refused = true;
+    }
+    if (node.kind === 'ExpressionStatement') {
+      const expression = node.expression;
+      if (!['AssignmentExpression', 'MethodInvocationExpression', 'NewClassExpression'].includes(expression?.kind)
+          && !(expression?.kind === 'UnaryExpression' && ['++', '--'].includes(expression.operator))) refused = true;
+      let index = starts.get(node.range?.startOffset);
+      if (index === undefined) refused = true;
+      else {
+        while (index < tokens.length && tokens[index].text !== ';' && tokens[index].text !== '}') {
+          if (closes.has(index)) index = closes.get(index);
+          index++;
+        }
+        if (tokens[index]?.text !== ';') refused = true;
+      }
+    }
+    children(node, child => inspect(child, node,
+      node.kind === 'LabeledStatement' ? [...labels, node] : labels,
+      loopDepth + (loops.has(node.kind) ? 1 : 0),
+      breakDepth + (loops.has(node.kind) || node.kind === 'SwitchStatement' ? 1 : 0)));
+  }
+  inspect(parsed, null);
+  if (refused || [...labelCounts.values()].some(count => count !== 1)) return unchanged();
+  function extent(node) {
+    const open = starts.get(node?.range?.startOffset), close = closes.get(open);
+    return node?.kind === 'BlockStatement' && tokens[open]?.text === '{' && tokens[close]?.text === '}'
+      && (!node.statements.length ? close === open + 1
+        : starts.get(node.statements[0].range?.startOffset) === open + 1
+          && node.statements.every(statement => {
+            const start = starts.get(statement.range?.startOffset);
+            return start > open && start < close;
+          })) ? {open, close} : null;
+  }
+  const combine = (operator, parts) => {
+    const operands = parts.flatMap(part => part.operator === operator ? part.operands : [part]);
+    return operands.length === 1 ? operands[0] : {operator, operands};
+  };
+  function guard(node, label, depth = 0) {
+    if (depth > 16) return null;
+    if (node.kind === 'BreakStatement' && node.label === label) {
+      const start = starts.get(node.range?.startOffset);
+      if (tokens[start]?.text !== 'break' || tokens[start + 1]?.text !== label || tokens[start + 2]?.text !== ';') return null;
+      return {expression: {stop: true}, jumps: [node], predicates: 0, weight: 0, start, end: start + 2};
+    }
+    if (node.kind !== 'IfStatement' || node.alternate || node.consequent?.kind !== 'BlockStatement') return null;
+    const body = extent(node.consequent), start = starts.get(node.range?.startOffset), header = closes.get(start + 1);
+    if (!body || tokens[start]?.text !== 'if' || tokens[start + 1]?.text !== '(' || header === undefined
+        || header + 1 !== body.open || !node.consequent.statements.length) return null;
+    const parts = node.consequent.statements.map(statement => guard(statement, label, depth + 1));
+    if (parts.some(part => !part) || parts.some((part, index) => index && parts[index - 1].end + 1 !== part.start)
+        || parts[0].start !== body.open + 1 || parts.at(-1).end + 1 !== body.close) return null;
+    // A direct break must be the only statement: any following predicate is
+    // unreachable, and mixing stop with an AND would discard that predicate.
+    if (parts.some(part => part.expression.stop) && parts.length !== 1) return null;
+    const negated = {text: '!(' + wrapped.slice(tokens[start + 1].range.endOffset, tokens[header].range.startOffset) + ')'};
+    const nested = combine('&&', parts.map(part => part.expression));
+    return {expression: nested.stop ? negated : combine('||', [negated, nested]),
+      jumps: parts.flatMap(part => part.jumps), predicates: 1 + parts.reduce((sum, part) => sum + part.predicates, 0),
+      weight: header - start - 2 + parts.reduce((sum, part) => sum + part.weight, 0), start, end: body.close};
+  }
+  function reachesDestination(block, target) {
+    let child = block, parent = parents.get(child);
+    while (parent && parent !== target) {
+      if (parent.kind === 'BlockStatement') {
+        if (!extent(parent) || parent.statements.at(-1) !== child) return false;
+      } else if (parent.kind === 'IfStatement') {
+        if (parent.consequent !== child && parent.alternate !== child) return false;
+      } else if (parent.kind === 'LabeledStatement') {
+        if (parent.statement !== child || child.kind !== 'BlockStatement') return false;
+      } else return false;
+      child = parent; parent = parents.get(parent);
+    }
+    return parent === target && child === target.statement;
+  }
+  const render = (expression, indent = null) => expression.text || '(' + expression.operands
+    .map(part => render(part, indent === null ? null : indent + '  '))
+    .join(' ' + expression.operator + (indent === null ? ' ' : '\n' + indent)) + ')';
+  const edits = [];
+  let framesRemoved = 0, jumpsRemoved = 0, guardsRecovered = 0, predicatesRecovered = 0;
+  function find(node) {
+    if (node.kind === 'LabeledStatement' && node.statement?.kind === 'BlockStatement') {
+      const refs = references.get(node.label), frame = extent(node.statement), start = starts.get(node.range?.startOffset);
+      if (refs?.length && refs.length <= 16 && frame && tokens[start]?.text === node.label
+          && tokens[start + 1]?.text === ':' && start + 2 === frame.open) {
+        const candidates = [];
+        function collect(block) {
+          const body = extent(block);
+          if (body && reachesDestination(block, node)) {
+            for (let index = 0; index < block.statements.length - 1; index++) {
+              const parts = [];
+              for (let next = index; next < block.statements.length - 1; next++) {
+                const part = guard(block.statements[next], node.label);
+                if (!part || part.expression.stop) break;
+                parts.push(part);
+              }
+              if (!parts.length) continue;
+              const rest = starts.get(block.statements[index + parts.length].range?.startOffset);
+              if (rest !== parts.at(-1).end + 1
+                  || parts.some((part, i) => i && parts[i - 1].end + 1 !== part.start)) continue;
+              const offset = tokens[parts[0].start].range.startOffset;
+              const prefix = wrapped.slice(wrapped.lastIndexOf('\n', offset - 1) + 1, offset);
+              const indent = /^[ \t]*$/.test(prefix) ? prefix : '';
+              const tail = wrapped.slice(tokens[parts.at(-1).end].range.endOffset, tokens[body.close].range.startOffset);
+              const multiline = tail.includes('\n');
+              const closePrefix = wrapped.slice(wrapped.lastIndexOf('\n', tokens[body.close].range.startOffset - 1) + 1,
+                tokens[body.close].range.startOffset);
+              const closeIndent = /^[ \t]*$/.test(closePrefix) ? closePrefix : '';
+              const condition = render(combine('&&', parts.map(part => part.expression)), multiline ? indent + '    ' : null);
+              const text = 'if (' + condition + ') {' + (multiline ? tail.replace(/\n([ \t]*)(?=\S)/g, '\n  $1').trimEnd() + '\n' + indent : tail) + '}'
+                + (multiline ? '\n' + closeIndent : '');
+              candidates.push({start: offset, end: tokens[body.close].range.startOffset, text,
+                jumps: parts.flatMap(part => part.jumps), predicates: parts.reduce((sum, part) => sum + part.predicates, 0),
+                weight: parts.reduce((sum, part) => sum + part.weight, 0)});
+              return;
+            }
+          }
+          children(block, child => collect(child));
+        }
+        collect(node.statement);
+        const consumed = candidates.flatMap(candidate => candidate.jumps);
+        if (candidates.length && consumed.length === refs.length && refs.every(reference => consumed.includes(reference))
+            && candidates.reduce((sum, candidate) => sum + candidate.predicates, 0) <= 16
+            && candidates.reduce((sum, candidate) => sum + candidate.weight, 0) <= 512) {
+          edits.push({start: tokens[start].range.startOffset, end: tokens[frame.open].range.startOffset, text: ''}, ...candidates);
+          framesRemoved++; jumpsRemoved += consumed.length; guardsRecovered += candidates.length;
+          predicatesRecovered += candidates.reduce((sum, candidate) => sum + candidate.predicates, 0);
+          return;
+        }
+      }
+    }
+    children(node, find);
+  }
+  find(parsed);
+  if (!edits.length) return unchanged();
+  edits.sort((a, b) => a.start - b.start);
+  if (edits.some((edit, index) => index && edits[index - 1].end > edit.start)) return unchanged();
+  let output = wrapped;
+  for (const edit of edits.slice().reverse()) output = output.slice(0, edit.start) + edit.text + output.slice(edit.end);
+  return {source: output.slice(2, -2), framesRemoved, jumpsRemoved, guardsRecovered, predicatesRecovered};
+}
+
 // A consumed block break immediately followed by a bare return has no work or
 // value evaluation left at its destination. Both transfers leave the same
 // cleanup regions, even when a finally overrides them. Completion is separate:
@@ -2369,6 +2529,7 @@ module.exports = {
   foldLabeledSkipGuards,
   foldLabeledIfElseExits,
   foldLabeledExitTrees,
+  foldLabeledGuardTrees,
   removeDeadRegionSelectors,
   removeDeadReceiverSnapshots,
 };

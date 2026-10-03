@@ -1557,3 +1557,42 @@ Raw sources compile; ordered 19,591 declarations/119,181 references/388 override
 rows and diagnostics remain unchanged. There remain 21 large method spans,
 10 with block labels. Larger reconstructions and whole-game/browser/phone
 acceptance remain unfinished or unverified.
+
+### Recovering nested predicate-only skip trees
+
+`foldLabeledGuardTrees` turns trees containing only conditionals and breaks to
+one plain destination into a short-circuit condition for their remainder.
+Sequential guards combine with AND; an outer conditional whose nested guards
+may skip the remainder combines its logical negation with their continuation
+using OR. Negation retains original predicate bytes instead of guessing opposite
+floating comparisons. Prefix work stays before the condition and a new block
+keeps remainder declarations scoped. Multiline AND/OR expressions stay grouped.
+
+Every destination reference must be consumed. A nested remainder qualifies only
+when normal completion reaches that exact target through final plain blocks,
+if branches or plain labels. Intermediate work, loops, switches and protected
+wrappers refuse that path proof. Work inside a guard, alternates, unsupported
+syntax, comments, Unicode escapes, nested executables and invalid transfers also
+refuse it. Budgets per frame are 16 predicates, 16 target references, nesting
+depth 16 and 512 predicate tokens. No effect/predicate is duplicated or local
+added; existing enclosing/branch-local protected regions remain intact.
+
+`NODE_PATH=/path/to/dependencies JAVA_TOOL_OPTIONS=-XX:-UsePerfData node test/javaAstEmitterLoopExits.test.js`
+passes 56 groups with one optional historical corpus check skipped. Two new
+groups include 16,128 native comparisons and bypass/skip/NaN oracles. They cover
+short-circuit order, nullable predicates, NaNs, prefix effects, partial failures,
+declaration scopes, separate terminal branches, ancestor jumps/returns, finally
+state after invocation and monitor ownership/release. Exception-exit and integer
+argument tests retain eight and two passing groups.
+
+The fixed GeoBlox export removes 41 labels/frames and 82 breaks, recovering 42
+remainder guards over 97 predicates across 19 files. Scope-safe cleanup unwraps
+41 blocks and saves 219 lines (78,170 to 77,951). Menu rendering falls 372 to 304
+lines and 10 to four block labels; menu actions fall 325 to 322 lines and 18 to
+17 labels. Gameplay rendering falls 385 to 379 lines and 19 to 18 labels; board
+reconciliation falls 502 to 496 lines and 16 to 15 labels. Independent JDK body
+positions plus only these documented rules reproduce all 303 token streams.
+Sources compile; ordered 19,591 declarations/119,181 references/388 overrides
+and diagnostics remain unchanged. The 21 large method spans (10 with block
+labels) remain. Larger reconstructions and full-game/browser/phone acceptance
+remain unfinished or unverified.

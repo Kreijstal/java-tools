@@ -8,7 +8,7 @@ const path = require('path');
 const {spawnSync} = require('child_process');
 const {treeToStatements, emitStatements, promoteBooleanStackCarriers, factorCommonBranchTails,
   removeDeadRegionSelectors, removeDeadReceiverSnapshots, factorLabeledBlockReturnTails,
-  simplifyControlFrames, removeFallthroughLabelBreaks, foldLabeledBooleanDecisions, foldVoidReturnExits, foldNestedIfGuards, foldLabeledSkipGuards, foldLabeledIfElseExits, foldLabeledExitTrees} = require('../src/decompiler/javaAstEmitter');
+  simplifyControlFrames, removeFallthroughLabelBreaks, foldLabeledBooleanDecisions, foldVoidReturnExits, foldNestedIfGuards, foldLabeledSkipGuards, foldLabeledIfElseExits, foldLabeledExitTrees, foldLabeledGuardTrees} = require('../src/decompiler/javaAstEmitter');
 const {printTree} = require('../src/decompiler/structurer');
 const {JavaParser} = require('../src/java-frontend/parser');
 const {decompileClassFile, assertNoFallback} = require('../src/decompiler/cfr');
@@ -2309,5 +2309,112 @@ test('ordered exit trees match native predicate ordering, exclusive effects, sco
     const javaFile=path.join(temporary,'ExitTrees.java');fs.writeFileSync(javaFile,source);
     run('javac',['--release','8','-d',temporary,javaFile],temporary);
     assert.equal(run('java',['-cp',temporary,'ExitTrees'],temporary).trim(),'exit-tree-native:16128');
+  }finally{fs.rmSync(temporary,{recursive:true,force:true});}
+});
+
+test('pure guard trees consume only predicates and terminal destination breaks',()=>{
+  const plain='Exit: { prefix(); if(a()) { if(b()) { break Exit; } if(c()) { break Exit; } } work(); }';
+  assert.deepEqual(foldLabeledGuardTrees(plain),{source:'{ prefix(); if ((!(a()) || (!(b()) && !(c())))) { work(); }}',framesRemoved:1,jumpsRemoved:2,guardsRecovered:1,predicatesRecovered:3});
+  const scope=foldLabeledGuardTrees('Exit: { int local=1; if(a()) { if(b()) { break Exit; } } trace(local); }');
+  assert.match(simplifyControlFrames(scope.source).source,/^\{/);
+  const alternatives=foldLabeledGuardTrees('Exit: { if(a()) { if(b()) { break Exit; } work(); } else { if(c()) { break Exit; } other(); } }');
+  assert.equal(alternatives.guardsRecovered,2);assert.equal(alternatives.jumpsRemoved,2);
+  const multiline=foldLabeledGuardTrees('Exit: {\n  prefix();\n  if(a()) {\n    if(b()) { break Exit; }\n    if(c()) { break Exit; }\n  }\n  work();\n}');
+  assert.match(multiline.source,/\|\|\n/);assert.match(multiline.source,/&&\n/);
+  const chain=n=>'Exit: { prefix(); '+Array.from({length:n},(_,i)=>'if(p'+i+'()) { break Exit; }').join(' ')+' work(); }';
+  assert.equal(foldLabeledGuardTrees(chain(16)).predicatesRecovered,16);
+  const deep=n=>'Exit: { '+ 'if(a()) { '.repeat(n)+'break Exit; '+'} '.repeat(n)+'work(); }';
+  const oversized='Exit: { if('+Array.from({length:260},()=> 'flag').join(' && ')+') { break Exit; } work(); }';
+  for(const source of [chain(17),deep(17),oversized,
+    'Exit: { if(a()) { break Exit; } }',
+    'Exit: { if(a()) { work(); break Exit; } tail(); }',
+    'Exit: { if(a()) { break Exit; } work(); if(b()) { break Exit; } tail(); }',
+    'Exit: { if(a()) { if(b()) { break Exit; } work(); } tail(); }',
+    'Exit: { if(a()) { break Exit; } else { work(); } tail(); }',
+    'Exit: { if(a()) { try { break Exit; } finally { work(); } } tail(); }',
+    'Exit: { if(a()) { synchronized(lock) { break Exit; } } tail(); }',
+    'Exit: { if(a()) { while(b()) { break Exit; } } tail(); }',
+    'Exit: { while(a()) { if(b()) { break Exit; } work(); } }',
+    'Exit: { try { if(a()) { break Exit; } work(); } finally { cleanup(); } }',
+    'Exit: { synchronized(lock) { if(a()) { break Exit; } work(); } }',
+    'Exit: { if(a()) { break Exit; if(b()) { break Exit; } } tail(); }',
+    'Exit: { if(a()) break Exit; tail(); }',
+    'Exit: { if(a()) { continue Exit; } work(); }',
+    'Exit: { continue; if(a()) { break Exit; } work(); }',
+    'Exit: { break Other; if(a()) { break Exit; } work(); }',
+    'Exit: { if(a()) { break Exit; } work(); } Exit: { work(); }',
+    'Exit: { class Local { void run() {} } if(a()) { break Exit; } work(); }',
+    'Exit: { Runnable r=()->work(); if(a()) { break Exit; } work(); }',
+    'Exit: { /*keep*/ if(a()) { break Exit; } work(); }',
+    'Exit: { \\u0061(); if(a()) { break Exit; } work(); }',
+    'Exit: { raw; if(a()) { break Exit; } work(); }',
+    'Exit: { if(a()) { break Exit; } work() }',
+    'Exit: { if(a()) { break Exit; } work(); } }',
+  ])assert.deepEqual(foldLabeledGuardTrees(source),{source,framesRemoved:0,jumpsRemoved:0,guardsRecovered:0,predicatesRecovered:0},source);
+});
+
+test('pure guard trees match native short-circuit order, protected effects and terminal paths',()=>{
+  const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'cfr-guard-tree-native-'));
+  try {
+    const guards='if(pick(0,a)) { if(pick(1,b)) { break Exit; } if(floating<0d) { break Exit; } }';
+    const variants=[
+      'Exit: { '+guards+' work(0); }',
+      'Exit: { work(1); '+guards+' work(0); }',
+      'Exit: { '+guards+' if(pick(2,b)) { break Exit; } work(0); }',
+      'Exit: { if(pick(0,a)) { if(pick(1,b)) { if(floating<0d) { break Exit; } } } work(0); }',
+      'Exit: { if(pick(0,a)) { if(pick(1,b)) { break Exit; } work(0); } }',
+      'Exit: { if(pick(0,a)) { if(pick(1,b)) { break Exit; } work(0); } else { if(floating<0d) { break Exit; } work(1); } }',
+      'try { Exit: { '+guards+' work(0); } } finally { cleanup(); }',
+      'synchronized(lock) { Exit: { '+guards+' work(0); } trace.append(Thread.holdsLock(lock)); }',
+      'Exit: { try { work(1); } finally { cleanup(); } '+guards+' work(0); }',
+      'Exit: { '+guards+' try { work(0); } finally { cleanup(); } }',
+      'Exit: { int local=++value; '+guards+' trace.append(local); work(0); } { int local=7; trace.append(local); }',
+      'Outer: for(int index=0;index<3;index++) { Exit: { '+guards+' if(mode==7) continue Outer; work(0); } work(1); }',
+      'switch(mode%3) { case 0: Exit: { '+guards+' work(0); } break; default: work(1); }',
+      'Outer: { Exit: { '+guards+' if(mode==7) break Outer; work(0); } work(1); }',
+      'Exit: { if(pick(0,a)) { '+guards+' if(mode==7) return value; work(0); } }',
+      'try { Exit: { '+guards+' work(0); } } catch(IllegalArgumentException error) { trace.append(error==specific); }',
+    ];
+    const methods=[];
+    variants.forEach((original,index)=>{
+      let rebuilt=original,frames=0;
+      for(;;){const next=foldLabeledGuardTrees(rebuilt);if(!next.framesRemoved)break;rebuilt=next.source;frames+=next.framesRemoved;
+        for(;;){const cleaned=simplifyControlFrames(rebuilt);if(!cleaned.labelsRemoved&&!cleaned.jumpsUnlabeled&&!cleaned.blocksUnwrapped)break;rebuilt=cleaned.source;}
+      }
+      assert.ok(frames>0,index);
+      for(const [name,body]of[['original',original],['rebuilt',rebuilt]])methods.push('static int '+name+index+'(Boolean a,Boolean b,double floating) { '+body+' return value; }');
+    });
+    const source=`public class GuardTrees {
+      static int mode,value,seen;static Object lock;static StringBuilder trace;
+      static final RuntimeException specific=new IllegalArgumentException(),general=new IllegalStateException();
+      static final Error fatal=new AssertionError();
+      static boolean pick(int index,Boolean boxed){trace.append('p').append(index);if(mode==1&&index==0)throw specific;if(mode==2&&index==1)throw general;return boxed;}
+      static void work(int index){trace.append('w').append(index).append(lock!=null&&Thread.holdsLock(lock));value+=index+1;if(mode==3)throw general;if(mode==4)throw fatal;}
+      static void cleanup(){trace.append('f');seen=value;if(mode==5)throw general;if(mode==6)throw fatal;}
+      ${methods.join('\n')}
+      interface Call {int call();}
+      static String invoke(Call call,boolean nullLock){
+        lock=nullLock?null:new Object();trace=new StringBuilder();value=0;seen=-1;String result;
+        try{result="ok:"+call.call();}catch(Throwable error){result=error==specific?"specific":error==general?"general":error==fatal?"fatal":error.getClass().getName();}
+        if(lock!=null&&Thread.holdsLock(lock))throw new AssertionError("monitor retained");
+        return result+":"+value+":"+seen+":"+trace;
+      }
+      public static void main(String[]args){int cases=0;
+        if(!invoke(()->rebuilt0(false,null,Double.NaN),false).equals("ok:1:1:-1:p0w0false"))throw new AssertionError("outer bypass oracle");
+        if(!invoke(()->rebuilt0(true,true,Double.NaN),false).equals("ok:0:0:-1:p0p1"))throw new AssertionError("inner skip oracle");
+        if(!invoke(()->rebuilt0(true,false,Double.NaN),false).equals("ok:1:1:-1:p0p1w0false"))throw new AssertionError("NaN fallthrough oracle");
+        if(!invoke(()->rebuilt0(true,false,-1),false).equals("ok:0:0:-1:p0p1"))throw new AssertionError("floating skip oracle");
+        for(mode=0;mode<8;mode++)for(Boolean a:new Boolean[]{null,false,true})for(Boolean b:new Boolean[]{null,false,true})
+        for(double floating:new double[]{Double.NEGATIVE_INFINITY,-1,-0d,0d,1,Double.POSITIVE_INFINITY,Double.NaN})
+        for(boolean nullLock:new boolean[]{false,true}){
+          ${variants.map((_,index)=>`{String expected=invoke(()->original${index}(a,b,floating),nullLock),actual=invoke(()->rebuilt${index}(a,b,floating),nullLock);
+            if(!expected.equals(actual))throw new AssertionError(${index}+":"+mode+":"+a+":"+b+":"+floating+":"+nullLock+":"+expected+" != "+actual);cases++;}`).join('\n')}
+        }
+        if(cases!=16128)throw new AssertionError(cases);System.out.println("guard-tree-native:"+cases);
+      }
+    }`;
+    const javaFile=path.join(temporary,'GuardTrees.java');fs.writeFileSync(javaFile,source);
+    run('javac',['--release','8','-d',temporary,javaFile],temporary);
+    assert.equal(run('java',['-cp',temporary,'GuardTrees'],temporary).trim(),'guard-tree-native:16128');
   }finally{fs.rmSync(temporary,{recursive:true,force:true});}
 });
