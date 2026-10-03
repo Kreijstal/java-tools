@@ -8,7 +8,7 @@ const path = require('path');
 const {spawnSync} = require('child_process');
 const {treeToStatements, emitStatements, promoteBooleanStackCarriers, factorCommonBranchTails,
   removeDeadRegionSelectors, removeDeadReceiverSnapshots, factorLabeledBlockReturnTails,
-  simplifyControlFrames, removeFallthroughLabelBreaks, localizePlainBlockLoopBreaks, foldLabeledBooleanDecisions, foldVoidReturnExits, foldNestedIfGuards, foldLabeledSkipGuards, foldLabeledIfElseExits, foldLabeledExitTrees, foldLabeledGuardTrees} = require('../src/decompiler/javaAstEmitter');
+  simplifyControlFrames, removeFallthroughLabelBreaks, localizePlainBlockLoopBreaks, foldLeadingWhileBreakGuards, foldLabeledBooleanDecisions, foldVoidReturnExits, foldNestedIfGuards, foldLabeledSkipGuards, foldLabeledIfElseExits, foldLabeledExitTrees, foldLabeledGuardTrees} = require('../src/decompiler/javaAstEmitter');
 const {printTree} = require('../src/decompiler/structurer');
 const {JavaParser} = require('../src/java-frontend/parser');
 const {decompileClassFile, assertNoFallback} = require('../src/decompiler/cfr');
@@ -2556,5 +2556,184 @@ test('terminal plain-block loop breaks match native loop updates, scopes, cleanu
     const javaFile = path.join(temporary, 'TerminalLoopBreaks.java'); fs.writeFileSync(javaFile, source);
     run('javac', ['--release', '8', '-d', temporary, javaFile], temporary);
     assert.equal(run('java', ['-cp', temporary, 'TerminalLoopBreaks'], temporary).trim(), 'terminal-loop-native:11520');
+  } finally { fs.rmSync(temporary, {recursive: true, force: true}); }
+});
+
+test('leading while break guards retain predicate bytes, scopes and transfer labels', () => {
+  for (const [source, expression, options] of [
+    ['while (true) { if (stop()) { break; } work(); }', 'stop()', {}],
+    ['while (true) { if (stop()) break; work(); }', 'stop()', {}],
+    ['while (true) { if (stop()) break; }', 'stop()', {}],
+    ['int counter=0; while (true) { if (counter>=3) { break; } counter++; }', 'counter>=3', {}],
+    ['while (true) { if (boxed) { break; } work(); }', 'boxed', {parameterNames: ['boxed']}],
+    ['while (true) { if (floating<0d) { break; } work(); }', 'floating<0d', {parameterNames: ['floating']}],
+    ['while (true) { if ((value=next())>=3) { break; } work(); }', '(value=next())>=3', {}],
+    ['while (true) { if (flags[0]) { break; } work(); }', 'flags[0]', {}],
+    ['while (true) { if (item==null) { break; } work(); }', 'item==null', {}],
+    ['Loop: while (true) { if (stop()) { break; } if (again()) continue Loop; work(); }', 'stop()', {}],
+    ['try { while (true) { if (stop()) { break; } work(); } } finally { cleanup(); }', 'stop()', {}],
+    ['synchronized (lock) { while (true) { if (stop()) { break; } work(); } }', 'stop()', {}],
+    ['while (true) { if (stop()) { break; } try { work(); } finally { cleanup(); } }', 'stop()', {}],
+    ['for(int counter=0; counter<3; counter++) { while (true) { if (counter>=2) { break; } work(); } }', 'counter>=2', {}],
+    ['for(final boolean stop:flags) { while (true) { if (stop) { break; } work(); } }', 'stop', {}],
+    ['try { work(); } catch(final Exception failure) { while (true) { if (failure==specific) { break; } work(); } }', 'failure==specific', {}],
+  ]) {
+    const next = foldLeadingWhileBreakGuards(source, options);
+    assert.equal(next.guardsRecovered, 1, source);
+    assert.ok(next.source.includes('while (!('+expression+')) {'), source);
+    assert.deepEqual(foldLeadingWhileBreakGuards(next.source, options), {source: next.source, guardsRecovered: 0});
+  }
+  const scopes = '{ final int counter=3; while (true) { if (counter>=3) { break; } work(); } } '
+    +'{ int counter=3; while (true) { if (counter>=3) { break; } work(); } }';
+  const next = foldLeadingWhileBreakGuards(scopes);
+  assert.equal(next.guardsRecovered, 1);
+  assert.ok(next.source.startsWith('{ final int counter=3; while (true) { if (counter>=3) { break; }'));
+  assert.ok(next.source.endsWith('{ int counter=3; while (!(counter>=3)) { work(); } }'));
+  const nested = 'while (true) { if (stop()) { break; } while (true) { if (stop()) { break; } work(); } }';
+  assert.equal(foldLeadingWhileBreakGuards(nested).guardsRecovered, 2, 'disjoint prefix edits');
+});
+
+test('leading while break guards refuse constants, unproven names and changed entry scopes', () => {
+  for (const source of [
+    'while(true) { if(true) { break; } work(); }',
+    'while(true) { if(false) { break; } work(); }',
+    'while(true) { if(1<2) { break; } work(); }',
+    'while(true) { if(STOP) { break; } work(); }',
+    'while(true) { if(Owner.STOP) { break; } work(); }',
+    'final boolean stop=true; while(true) { if(stop) { break; } work(); }',
+    'final int counter=3; while(true) { if(counter>=3) { break; } work(); }',
+    '{ int counter=3; } while(true) { if(counter>=3) { break; } work(); }',
+    'while(true) { if(counter>=3) { break; } work(); } int counter=3;',
+    'Holder owner=new Holder(); while(true) { if(owner.STOP) { break; } work(); }',
+    'for(final boolean stop=true;;) { while(true) { if(stop) { break; } work(); } }',
+    'while(true) { if(stop()) { break; } else { work(); } }',
+    'while(true) { work(); if(stop()) { break; } }',
+    'while(true) { int local=make(); if(stop()) { break; } work(); }',
+    'while(true) { try { if(stop()) { break; } } finally { cleanup(); } work(); }',
+    'while(true) { synchronized(lock) { if(stop()) { break; } } work(); }',
+    'while(true) { if(stop()) { work(); break; } work(); }',
+    'while(true) { if(stop()) { break; ; } work(); }',
+    'Loop: while(true) { if(stop()) { break Loop; } work(); }',
+    'Exit: { while(true) { if(stop()) { break Exit; } work(); } }',
+    'while(true) { if(stop()) { continue; } work(); }',
+    'while(again()) { if(stop()) { break; } work(); }',
+    'do { if(stop()) { break; } work(); } while(true);',
+    'while(true) if(stop()) break;',
+    'while(true) { if(stop()) { break; } work(); } break;',
+    'while(true) { if(stop()) { break Missing; } work(); }',
+    'while(true) { if(stop()) { break; } work(); } Runnable task=()->work();',
+    'while(true) { if(stop()) { break; } work(); } class Local { void run() { work(); } }',
+    'while(true) { if(stop()) { break; } work(); } // comment',
+    'while(true) { if(stop()) { break; } work(); } String text="\\u0061";',
+    'while(true) { if(stop()) { break; } work(); } raw;',
+    'while(true) { if(stop()) { break; } work() }',
+    'while(true) { if(stop()) { break; } work(); } }',
+  ]) assert.deepEqual(foldLeadingWhileBreakGuards(source), {source, guardsRecovered: 0}, source);
+  for (const parameterNames of [['boxed', 'boxed'], ['not-a-name'], [null], 'boxed']) {
+    const source = 'while(true) { if(boxed) { break; } work(); }';
+    assert.deepEqual(foldLeadingWhileBreakGuards(source, {parameterNames}), {source, guardsRecovered: 0});
+  }
+});
+
+test('leading while break guards preserve Java constant-expression reachability', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-leading-loop-reachability-'));
+  try {
+    // JLS 14.21 and 15.28 distinguish a constant if from a loop condition:
+    // https://docs.oracle.com/javase/specs/jls/se8/html/jls-14.html#jls-14.21
+    // https://docs.oracle.com/javase/specs/jls/se8/html/jls-15.html#jls-15.28
+    const originals = ['true', 'false', 'STOP', 'Reachability.STOP', 'fixed'];
+    const methods = originals.map((expression, index) => {
+      const body = 'final boolean fixed=true; while(true) { if('+expression+') { break; } work(); } return 1;';
+      assert.deepEqual(foldLeadingWhileBreakGuards(body), {source: body, guardsRecovered: 0});
+      return 'static int original'+index+'() { '+body+' }';
+    });
+    const header = 'public class Reachability { static final boolean STOP=true; static void work() {} ';
+    const file = path.join(temporary, 'Reachability.java');
+    fs.writeFileSync(file, header+methods.join('\n')+' }');
+    run('javac', ['--release', '8', '-d', temporary, file], temporary);
+    for (const expression of ['true', 'false']) {
+      fs.writeFileSync(file, header+'static int invalid() { while(!'+expression+') { work(); } return 1; } }');
+      assert.throws(() => run('javac', ['--release', '8', '-d', temporary, file], temporary), /unreachable statement/);
+    }
+    const nullable = 'while(true) { if(null==null) { break; } work(); } return 1;';
+    const next = foldLeadingWhileBreakGuards(nullable); assert.equal(next.guardsRecovered, 1);
+    fs.writeFileSync(file, header+'static int nullable() { '+next.source+' } }');
+    run('javac', ['--release', '8', '-d', temporary, file], temporary);
+  } finally { fs.rmSync(temporary, {recursive: true, force: true}); }
+});
+
+test('leading while break guards match native entry effects, NaNs, cleanup and backedges', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-leading-loop-native-'));
+  try {
+    const variants = [
+      'while(true) { if(stop(a,floating)) { break; } work(0); } work(1);',
+      'while(true) { if(a) { break; } work(0); if(!more()) break; } work(1);',
+      'while(true) { if(floating<0d) { break; } work(0); if(!more()) break; } work(1);',
+      'int counter=0; while(true) { if(counter>=limit) { break; } trace.append(counter++); work(0); } work(1);',
+      'while(true) { if((value=++ticks)>=limit) { break; } work(0); } work(1);',
+      'while(true) { if(stop(a,floating)||pick(b)) { break; } work(0); } work(1);',
+      'try { while(true) { if(stop(a,floating)) { break; } work(0); } } finally { cleanup(); } work(1);',
+      'while(true) { if(stop(a,floating)) { break; } try { work(0); } finally { cleanup(); } } work(1);',
+      'synchronized(lock) { while(true) { if(stop(a,floating)) { break; } work(0); } trace.append(Thread.holdsLock(lock)); } work(1);',
+      'while(true) { if(stop(a,floating)) { break; } synchronized(lock) { work(0); } } work(1);',
+      'Outer: for(int index=0;index<3;index++) { while(true) { if(stop(a,floating)) { break; } try { work(0); } finally { cleanup(); if(mode==7) continue Outer; } } work(1); }',
+      'switch(mode%3) { case 0: while(true) { if(stop(a,floating)) { break; } work(0); } break; default: work(0); } work(1);',
+      'while(true) { if(stop(a,floating)) { break; } int local=++value; trace.append(local); work(0); } { int local=7; trace.append(local); } work(1);',
+      'while(true) { if(a ? stop(b,floating) : stop(a,floating)) { break; } work(0); } work(1);',
+      'while(true) { if(a=stop(b,floating)) { break; } work(0); } work(1);',
+      'try { while(true) { if(checkedStop(a,floating)) { break; } work(0); } } catch(java.io.IOException error) { trace.append(error==checked); } work(1);',
+      'Exit: { while(true) { if(stop(a,floating)) { break; } work(0); if(mode==7) break Exit; } } work(1);',
+      'Loop: while(true) { if(stop(a,floating)) { break; } work(0); if(mode==7) continue Loop; work(1); } work(1);',
+      'while(true) { if(stop(a,floating)) break; } work(1);',
+      'while(true) { if(stop(a,floating)) { break; } while(true) { if(stop(b,floating)) { break; } work(0); } } work(1);',
+      'for(final Boolean flag:new Boolean[]{a,b}) { while(true) { if(flag) { break; } work(0); if(!more()) break; } } work(1);',
+      'try { throw specific; } catch(final RuntimeException failure) { while(true) { if(failure==general) { break; } work(0); if(!more()) break; } } work(1);',
+      'for(int index=0;index<3;index++) { while(true) { if(index>=limit) { break; } work(0); if(!more()) break; } } work(1);',
+      'while(true) { if(null==null) { break; } work(0); } work(1);',
+    ];
+    const methods = [], options = {parameterNames: ['a', 'b', 'floating']};
+    variants.forEach((original, index) => {
+      const next = foldLeadingWhileBreakGuards(original, options);
+      assert.equal(next.guardsRecovered, index === 19 ? 2 : 1, index);
+      for (const [name, body] of [['original', original], ['rebuilt', next.source]])
+        methods.push('static int '+name+index+'(Boolean a,Boolean b,double floating) { '+body+' return value; }');
+    });
+    const source = `public class LeadingLoopGuards {
+      static int mode,value,ticks,cleanups,limit;static Object lock;static StringBuilder trace;
+      static final RuntimeException specific=new IllegalArgumentException(),general=new IllegalStateException();
+      static final Error fatal=new AssertionError();static final java.io.IOException checked=new java.io.IOException();
+      static boolean stop(Boolean boxed,double floating){trace.append('p').append(lock!=null&&Thread.holdsLock(lock));if(mode==1)throw specific;if(mode==2)throw general;return ++ticks>limit||boxed||floating<0d;}
+      static boolean checkedStop(Boolean boxed,double floating)throws java.io.IOException {if(mode==2){trace.append('c');throw checked;}return stop(boxed,floating);}
+      static boolean pick(Boolean boxed){trace.append('b');return boxed;}
+      static boolean more(){trace.append('s');return ++ticks<=limit;}
+      static void work(int index){trace.append('w').append(index).append(lock!=null&&Thread.holdsLock(lock));value+=index+1;if(mode==3)throw specific;if(mode==4)throw fatal;}
+      static void cleanup(){trace.append('f');cleanups++;if(mode==5)throw general;if(mode==6)throw fatal;}
+      ${methods.join('\n')}
+      interface Call {int call();}
+      static String invoke(Call call,boolean nullLock){
+        lock=nullLock?null:new Object();trace=new StringBuilder();value=0;ticks=0;cleanups=0;String result;
+        try{result="ok:"+call.call();}catch(Throwable error){result=error==specific?"specific":error==general?"general":error==fatal?"fatal":error==checked?"checked":error.getClass().getName();}
+        if(lock!=null&&Thread.holdsLock(lock))throw new AssertionError("monitor retained");
+        return result+":"+value+":"+ticks+":"+cleanups+":"+trace;
+      }
+      public static void main(String[]args){int cases=0;limit=2;
+        if(!invoke(()->rebuilt0(false,null,Double.NaN),false).equals("ok:4:4:3:0:pfalsew0falsepfalsew0falsepfalsew1false"))throw new AssertionError("iteration/NaN oracle");
+        if(!invoke(()->rebuilt0(true,null,Double.NaN),false).equals("ok:2:2:1:0:pfalsew1false"))throw new AssertionError("entry bypass oracle");
+        if(!invoke(()->rebuilt2(null,null,Double.NaN),false).equals("ok:5:5:3:0:w0falsesw0falsesw0falsesw1false"))throw new AssertionError("direct NaN oracle");
+        if(!invoke(()->rebuilt2(null,null,-1),false).equals("ok:2:2:0:0:w1false"))throw new AssertionError("direct floating skip oracle");
+        if(!invoke(()->rebuilt7(true,null,Double.NaN),false).equals("ok:2:2:1:0:pfalsew1false"))throw new AssertionError("inner cleanup skipped oracle");
+        if(!invoke(()->rebuilt6(true,null,Double.NaN),false).equals("ok:2:2:1:1:pfalsefw1false"))throw new AssertionError("outer cleanup retained oracle");
+        for(mode=0;mode<8;mode++)for(Boolean a:new Boolean[]{null,false,true})for(Boolean b:new Boolean[]{null,false,true})
+        for(double floating:new double[]{Double.NEGATIVE_INFINITY,-1,-0d,0d,1,Double.POSITIVE_INFINITY,Double.NaN})
+        for(int inputLimit:new int[]{0,1,2,4})for(boolean nullLock:new boolean[]{false,true}){limit=inputLimit;
+          ${variants.map((_, index) => `{String expected=invoke(()->original${index}(a,b,floating),nullLock),actual=invoke(()->rebuilt${index}(a,b,floating),nullLock);
+            if(!expected.equals(actual))throw new AssertionError(${index}+":"+mode+":"+a+":"+b+":"+floating+":"+limit+":"+nullLock+":"+expected+" != "+actual);cases++;}`).join('\n')}
+        }
+        if(cases!=96768)throw new AssertionError(cases);System.out.println("leading-loop-native:"+cases);
+      }
+    }`;
+    const javaFile = path.join(temporary, 'LeadingLoopGuards.java'); fs.writeFileSync(javaFile, source);
+    run('javac', ['--release', '8', '-d', temporary, javaFile], temporary);
+    assert.equal(run('java', ['-cp', temporary, 'LeadingLoopGuards'], temporary).trim(), 'leading-loop-native:96768');
   } finally { fs.rmSync(temporary, {recursive: true, force: true}); }
 });

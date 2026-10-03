@@ -16,7 +16,7 @@ const { listRegionSplitCandidates, applyRegionSplit } = require('../passes/regio
 const { jreClassInfo, jreMethodCandidates } = require('../java-frontend/jreMetadata');
 const { JavaParser } = require('../java-frontend/parser');
 const { tokenizeJava } = require('../java-frontend/lexer');
-const { promoteBooleanStackCarriers, factorCommonBranchTails, factorLabeledBlockReturnTails, simplifyControlFrames, removeFallthroughLabelBreaks, localizePlainBlockLoopBreaks, foldLabeledBooleanDecisions, foldVoidReturnExits, foldNestedIfGuards, foldLabeledSkipGuards, foldLabeledIfElseExits, foldLabeledExitTrees, foldLabeledGuardTrees, removeDeadRegionSelectors, removeDeadReceiverSnapshots } = require('./javaAstEmitter');
+const { promoteBooleanStackCarriers, factorCommonBranchTails, factorLabeledBlockReturnTails, simplifyControlFrames, removeFallthroughLabelBreaks, localizePlainBlockLoopBreaks, foldLeadingWhileBreakGuards, foldLabeledBooleanDecisions, foldVoidReturnExits, foldNestedIfGuards, foldLabeledSkipGuards, foldLabeledIfElseExits, foldLabeledExitTrees, foldLabeledGuardTrees, removeDeadRegionSelectors, removeDeadReceiverSnapshots } = require('./javaAstEmitter');
 
 const VERSION = 'CFR-JS 0.4.0';
 const javaStatementParser = new JavaParser();
@@ -1307,7 +1307,7 @@ function formatMethod(cls, method, options = {}) {
     replaceArrayContents(body, normalizedBody);
     ensureMissingSyntheticDeclarations(body);
     widenExceptionLocalsUsedByInstanceof(body, options.exceptionModel);
-    shareExistingExitTails(body);
+    shareExistingExitTails(body, localState.paramNames);
   }
   const needsUncheckedExceptionBoundary = methodThrowsTypes(method).length === 0
     && methodCallsUncaughtCheckedException(code, method, options.exceptionModel);
@@ -1756,7 +1756,7 @@ function formatStaticInitializer(code, localState, cls, options = {}) {
   return `${formatBlock('static', [`${helperName}();`])}\n\n${formatBlock(`private static void ${helperName}()`, body)}`;
 }
 
-function shareExistingExitTails(body) {
+function shareExistingExitTails(body, parameterNames = []) {
   // Normalize escaping JVM locals first: otherwise one cleanup copy may still
   // declare a slot that the following copy assigns. Exact matching must use
   // their final source identities, never discard an apparent inline shadow.
@@ -1856,6 +1856,11 @@ function shareExistingExitTails(body) {
       if (!simplified.labelsRemoved && !simplified.jumpsUnlabeled && !simplified.blocksUnwrapped) break;
       source = simplified.source;
     }
+  }
+  const loopGuards = foldLeadingWhileBreakGuards(source, {parameterNames});
+  if (loopGuards.guardsRecovered) {
+    source = loopGuards.source;
+    changed = true;
   }
   if (changed) replaceArrayContents(body, source.split('\n'));
 }

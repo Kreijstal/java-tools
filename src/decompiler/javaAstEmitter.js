@@ -977,6 +977,137 @@ function localizePlainBlockLoopBreaks(source) {
   return {source: output.slice(2, -2), breaksLocalized: edits.length};
 }
 
+// A direct first-statement loop exit is the loop's existing entry condition.
+// Keep its expression verbatim under logical negation, so effects, unboxing and
+// NaNs retain their original evaluation. Require a definitely nonconstant
+// expression: replacing a constant if with a while condition can invalidate
+// Java reachability (JLS 14.21/15.28). Caller-supplied parameter names identify
+// actual emitted formal parameters, never inferred fields or free identifiers.
+function foldLeadingWhileBreakGuards(source, {parameterNames = []} = {}) {
+  const unchanged = () => ({source, guardsRecovered: 0});
+  if (!Array.isArray(parameterNames) || new Set(parameterNames).size !== parameterNames.length
+      || parameterNames.some(name => typeof name !== 'string' || !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name))) return unchanged();
+  const proof = controlCleanupSource(source);
+  if (!proof) return unchanged();
+  const {wrapped, parsed, tokens, starts, closes, children, labelCounts} = proof;
+  const loops = new Set(['WhileStatement', 'ForStatement', 'EnhancedForStatement', 'DoWhileStatement']);
+  let refused = false;
+  function inspect(node, labels = [], loopDepth = 0, breakDepth = 0) {
+    if (/ClassDeclaration|MethodDeclaration|ConstructorDeclaration|LambdaExpression|AnonymousClass/.test(node.kind || '')) refused = true;
+    if (['BreakStatement', 'ContinueStatement'].includes(node.kind)) {
+      if (node.label) {
+        const target = labels.slice().reverse().find(frame => frame.label === node.label);
+        if (!target || node.kind === 'ContinueStatement' && !loops.has(target.statement?.kind)) refused = true;
+      } else if (!(node.kind === 'ContinueStatement' ? loopDepth : breakDepth)) refused = true;
+    }
+    if (node.kind === 'ExpressionStatement') {
+      const expression = node.expression;
+      if (!['AssignmentExpression', 'MethodInvocationExpression', 'NewClassExpression'].includes(expression?.kind)
+          && !(expression?.kind === 'UnaryExpression' && ['++', '--'].includes(expression.operator))) refused = true;
+      let index = starts.get(node.range?.startOffset);
+      if (index === undefined) refused = true;
+      else {
+        while (index < tokens.length && tokens[index].text !== ';' && tokens[index].text !== '}') {
+          if (closes.has(index)) index = closes.get(index);
+          index++;
+        }
+        if (tokens[index]?.text !== ';') refused = true;
+      }
+    }
+    children(node, child => inspect(child,
+      node.kind === 'LabeledStatement' ? [...labels, node] : labels,
+      loopDepth + (loops.has(node.kind) ? 1 : 0),
+      breakDepth + (loops.has(node.kind) || node.kind === 'SwitchStatement' ? 1 : 0)));
+  }
+  inspect(parsed);
+  if (refused || [...labelCounts.values()].some(count => count !== 1)) return unchanged();
+  function nonconstant(node, scope) {
+    if (node.kind === 'Identifier') return scope.get(node.name) === true;
+    if (node.kind === 'LiteralExpression') return node.literalKind === 'null';
+    if (['MethodInvocationExpression', 'AssignmentExpression', 'ArrayAccessExpression',
+      'NewClassExpression', 'NewArrayExpression'].includes(node.kind)) return true;
+    if (node.kind === 'UnaryExpression' && ['++', '--'].includes(node.operator)) return true;
+    // The parser also uses field access for qualified constant names. A local
+    // elsewhere in a chain must not stand in for proof about the field itself.
+    if (node.kind === 'FieldAccessExpression') return false;
+    let proven = false;
+    children(node, child => { if (nonconstant(child, scope)) proven = true; });
+    return proven;
+  }
+  function remember(declaration, scope) {
+    if (declaration?.kind !== 'LocalVariableDeclarationStatement') return;
+    const dynamic = !declaration.modifiers?.some(modifier => modifier.name === 'final');
+    for (const variable of declaration.declarators) scope.set(variable.name, dynamic);
+  }
+  const edits = [];
+  function visit(node, scope) {
+    if (node.kind === 'BlockStatement') {
+      const nested = new Map(scope);
+      for (const statement of node.statements) {
+        visit(statement, nested);
+        remember(statement, nested);
+      }
+      return;
+    }
+    if (node.kind === 'ForStatement') {
+      const nested = new Map(scope); remember(node.initializer, nested);
+      children(node, child => visit(child, nested)); return;
+    }
+    if (node.kind === 'EnhancedForStatement' || node.kind === 'CatchClause') {
+      const nested = new Map(scope);
+      // Parameters have no constant-expression initializer, including final
+      // catch/enhanced-for parameters. Their scope ends with this body.
+      if (node.parameter?.name) nested.set(node.parameter.name, true);
+      visit(node.body, nested); return;
+    }
+    if (node.kind === 'TryStatement') {
+      const nested = new Map(scope);
+      for (const resource of node.resources || []) remember(resource, nested);
+      visit(node.block, nested);
+      for (const handler of node.catches || []) visit(handler, scope);
+      if (node.finallyBlock) visit(node.finallyBlock, scope);
+      return;
+    }
+    if (node.kind === 'WhileStatement' && node.condition?.kind === 'LiteralExpression'
+        && node.condition.value === true && node.body?.kind === 'BlockStatement') {
+      const guard = node.body.statements[0];
+      const jump = guard?.consequent?.kind === 'BlockStatement' && guard.consequent.statements.length === 1
+        ? guard.consequent.statements[0] : guard?.consequent;
+      if (guard?.kind === 'IfStatement' && !guard.alternate && jump?.kind === 'BreakStatement'
+          && !jump.label && nonconstant(guard.condition, scope)) {
+        const start = starts.get(node.range?.startOffset), open = start + 4, end = closes.get(open);
+        const first = starts.get(guard.range?.startOffset), conditionEnd = closes.get(first + 1);
+        if (tokens[start]?.text !== 'while' || tokens[start + 1]?.text !== '('
+            || tokens[start + 2]?.text !== 'true' || tokens[start + 3]?.text !== ')'
+            || tokens[open]?.text !== '{' || tokens[end]?.text !== '}' || first !== open + 1
+            || tokens[first]?.text !== 'if' || tokens[first + 1]?.text !== '(' || conditionEnd === undefined) {
+          refused = true; return;
+        }
+        const braced = guard.consequent.kind === 'BlockStatement';
+        const jumpStart = conditionEnd + (braced ? 2 : 1), guardEnd = jumpStart + (braced ? 2 : 1);
+        if (tokens[jumpStart]?.text !== 'break' || tokens[jumpStart + 1]?.text !== ';'
+            || starts.get(jump.range?.startOffset) !== jumpStart
+            || braced && (tokens[conditionEnd + 1]?.text !== '{' || closes.get(conditionEnd + 1) !== guardEnd)
+            || node.body.statements.length > 1 && starts.get(node.body.statements[1].range?.startOffset) !== guardEnd + 1
+            || node.body.statements.length === 1 && end !== guardEnd + 1) {
+          refused = true; return;
+        }
+        const expression = wrapped.slice(tokens[first + 1].range.endOffset, tokens[conditionEnd].range.startOffset);
+        edits.push({start: tokens[start].range.startOffset, end: tokens[guardEnd].range.endOffset,
+          text: 'while (!(' + expression + ')) {'});
+      }
+    }
+    children(node, child => visit(child, scope));
+  }
+  visit(parsed, new Map(parameterNames.map(name => [name, true])));
+  if (refused || !edits.length) return unchanged();
+  edits.sort((a, b) => a.start - b.start);
+  if (edits.some((edit, index) => index && edits[index - 1].end > edit.start)) return unchanged();
+  let output = wrapped;
+  for (const edit of edits.slice().reverse()) output = output.slice(0, edit.start) + edit.text + output.slice(edit.end);
+  return {source: output.slice(2, -2), guardsRecovered: edits.length};
+}
+
 // Simplify Java's existing transfer destinations, never infer new CFG edges.
 // A labeled loop jump can lose its label only when the corresponding unlabeled
 // jump would bind to the exact same AST loop/switch. Plain frames may disappear
@@ -2615,6 +2746,7 @@ module.exports = {
   simplifyControlFrames,
   removeFallthroughLabelBreaks,
   localizePlainBlockLoopBreaks,
+  foldLeadingWhileBreakGuards,
   foldLabeledBooleanDecisions,
   foldVoidReturnExits,
   foldNestedIfGuards,
