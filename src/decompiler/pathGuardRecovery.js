@@ -5,8 +5,9 @@
 // global client flag is constant. A later or cyclic write invalidates the fact.
 // Preserve the selected arm's scope, then prove Java completion and prune only
 // unreachable suffixes with no declarations. Track labeled/unlabeled transfers,
-// finally overrides and loop completion before editing. Checked-catch regions
-// and switch completion remain opaque. One candidate per call avoids overlap.
+// finally overrides, loop completion and colon-switch fallthrough before
+// editing. Checked-catch regions and switch-rule forms remain opaque. One
+// candidate per call avoids overlap.
 function discoverPathGuards(source, proof) {
   if (!proof) return [];
   const {
@@ -191,7 +192,16 @@ function discoverPathGuards(source, proof) {
       walk(n.body, new Map(env), loopDepth, protectedDepth + 1);
       return env;
     }
-    // Switch entry/fallthrough needs its own destination proof.
+    if (n.kind === 'SwitchStatement') {
+      // Every case is a possible entry. Facts from a preceding case must not
+      // leak into another case, even when that preceding case falls through.
+      for (const group of n.groups || []) {
+        let entry = new Map(env);
+        for (const statement of group.statements || [])
+          entry = walk(statement, entry, loopDepth, protectedDepth);
+      }
+      return env;
+    }
     return env;
   }
   walk(parsed, new Map());
@@ -241,6 +251,7 @@ function specializePathGuards(source, proof, {
     locals = new Map(),
     counts = new Map();
   const loops = new Set(['WhileStatement', 'ForStatement', 'EnhancedForStatement', 'DoWhileStatement']);
+  const switches = new Map();
   let refused = false;
   function extent(n) {
     if (n?.kind !== 'BlockStatement') return null;
@@ -255,6 +266,58 @@ function specializePathGuards(source, proof, {
       open,
       close
     };
+  }
+  function switchExtent(n) {
+    const start = starts.get(n.range?.startOffset),
+      conditionEnd = closes.get(start + 1),
+      open = conditionEnd + 1,
+      close = closes.get(open);
+    if (tokens[start]?.text !== 'switch' || tokens[start + 1]?.text !== '('
+        || tokens[open]?.text !== '{' || tokens[close]?.text !== '}') return null;
+    return {open, close};
+  }
+  // The parser deliberately tolerates some missing punctuation. Prove every
+  // colon label and statement boundary against the original token stream;
+  // neither an arrow rule nor a malformed case can enter completion analysis.
+  function switchShape(n) {
+    const block = switchExtent(n);
+    if (!block || !Array.isArray(n.groups)) return null;
+    let index = block.open + 1;
+    try {
+      for (const group of n.groups) {
+        if (group.kind !== 'SwitchBlockStatementGroup' || !group.labels?.length
+            || !Array.isArray(group.statements)) return null;
+        for (const label of group.labels) {
+          if (label.kind !== 'SwitchLabel' || label.separator !== ':'
+              || !['case', 'default'].includes(label.labelKind)
+              || tokens[index]?.text !== label.labelKind) return null;
+          index++;
+          if (label.labelKind === 'case') {
+            const first = index;
+            let ternaries = 0;
+            for (; index < block.close; index++) {
+              const text = tokens[index].text;
+              if (['case', 'default', ';', '{', '->'].includes(text)) return null;
+              if (closes.has(index)) { index = closes.get(index); continue; }
+              if (text === '?') ternaries++;
+              if (text === ':') {
+                if (!ternaries) break;
+                ternaries--;
+              }
+            }
+            if (index === first || index >= block.close) return null;
+          }
+          if (tokens[index]?.text !== ':') return null;
+          index++;
+        }
+        for (const statement of group.statements) {
+          if (starts.get(statement.range?.startOffset) !== index) return null;
+          index = end(statement);
+          if (index > block.close) return null;
+        }
+      }
+    } catch (_) { return null; }
+    return index === block.close ? block : null;
   }
   function inspect(n, parent, labels = [], breaks = [], activeLoops = []) {
     parents.set(n, parent);
@@ -287,7 +350,11 @@ function specializePathGuards(source, proof, {
         if (separators !== 2) refused = true;
       } else if (terminator(n) === null) refused = true;
     }
-    if (n.kind === 'SwitchStatement') refused = true; // Case completion gets a separate proof.
+    if (n.kind === 'SwitchStatement') {
+      const shape = switchShape(n);
+      if (!shape) refused = true;
+      else switches.set(n, shape);
+    }
     children(n, c => inspect(c, n, n.kind === 'LabeledStatement' ? [...labels, n] : labels, loops.has(n.kind) || n.kind === 'SwitchStatement' ? [...breaks, n] : breaks, loops.has(n.kind) ? [...activeLoops, n] : activeLoops));
   }
   inspect(parsed, null);
@@ -330,6 +397,11 @@ function specializePathGuards(source, proof, {
       return close + 2;
     }
     if (n.kind === 'TryStatement') return end(n.finallyBlock || n.catches?.at(-1)?.body || n.block);
+    if (n.kind === 'SwitchStatement') {
+      const block = switchExtent(n);
+      if (!block) throw Error('switch extent');
+      return block.close + 1;
+    }
     if (start === undefined) throw Error('statement start');
     let index = start;
     while (index < tokens.length && ![';', '}'].includes(tokens[index].text)) {
@@ -436,6 +508,27 @@ function specializePathGuards(source, proof, {
         const a = complete(n.consequent, replace),
           b = complete(n.alternate, replace);
         return result(a.normal || b.normal, union(a.jumps, b.jumps));
+      }
+      if (n.kind === 'SwitchStatement') {
+        if (!switches.has(n)) { fails = true; return result(true); }
+        let lastNormal = true, jumps = new Set(), hasDefault = false;
+        for (const group of n.groups) {
+          // A label reestablishes reachability independently of fallthrough.
+          // Keep direct case-group suffixes opaque: unlike a BlockStatement,
+          // they have shared declaration scope and no closing-brace extent.
+          let normal = true;
+          hasDefault ||= group.labels.some(label => label.labelKind === 'default');
+          for (const statement of group.statements) {
+            if (!normal) { fails = true; return result(false, jumps); }
+            const next = complete(statement, replace);
+            normal = next.normal;
+            jumps = union(jumps, next.jumps);
+          }
+          lastNormal = normal;
+        }
+        const ownBreak = [...jumps].some(j => j.kind === 'BreakStatement' && targets.get(j) === n);
+        return result(!hasDefault || lastNormal || ownBreak,
+          new Set([...jumps].filter(j => !(j.kind === 'BreakStatement' && targets.get(j) === n))));
       }
       if (n.kind === 'LabeledStatement') {
         const child = complete(n.statement, replace),

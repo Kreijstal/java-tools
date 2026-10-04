@@ -110,7 +110,7 @@ test('unproven writes, field/boxed types, declaration loss and checked catches r
   original.replace('if(guard==0){step("yes");}', 'if(guard==0){step("yes");}else{int local=1;step(local);}'),
   'int guard=mode;if(guard!=0)return;if(guard==0)return;int local=0;step(local);',
   'int guard=mode;try{if(guard==0){if(guard==0)step("yes");}checked();}catch(java.io.IOException failure){step("caught");}',
-  original+'switch(input){case 0:break;default:break;}',
+  original+'switch(input){case 0 -> step("rule");default -> step("other");}',
   'int guard=mode;while(running){if(guard==0){if(guard==0)step("yes");}}',
   original.replace('step("yes");','step("yes")'),
   original.replace('int guard=mode;','int guard=mode'),
