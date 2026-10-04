@@ -1580,18 +1580,21 @@ class JVM {
         const deferredDeepWasm = [];
         for (const {className, method} of methods) {
           const flags = method.flags || [];
-          const hasLoop = this.jit.hasBackwardBranch(method);
+          const opaqueNormalFlow = this.jit.isPreparedNormalFlowWasmCandidate(method);
+          const hasLoop = this.jit.hasBackwardBranch(method) || opaqueNormalFlow;
+          const canonicalCaller = this.jit.isPreparedCanonicalWasmCallerCandidate(method);
           const selectedCallee = wasmCalleeMethods.has(
             `${className}.${method.name}${method.descriptor}`);
           const asCallee = selectedCallee || !wasmLoopsOnly && !hasLoop;
           const preparedWasmUpgrade = selectedCallee ||
             this.jit.preparedCodegenMethods.has(method) &&
             (this.jit.isOversizedLoopMethod(method) ||
+              this.jit.isPreparedLoopLeafWasmCandidate(method) || opaqueNormalFlow || canonicalCaller ||
               hasLoop && this.jit.isPreparedWasmMethodSelected(method));
           const admitted = (upgrade) => (selectedCallee || wasmRootMethods === null ||
                 wasmRootMethods.has(`${className}.${method.name}${method.descriptor}`)) &&
               (!wasmPreparedUpgradesOnly || upgrade) &&
-              (selectedCallee || !wasmLoopsOnly || hasLoop || wasmFallbackOnly) &&
+              (selectedCallee || !wasmLoopsOnly || hasLoop || canonicalCaller || wasmFallbackOnly) &&
               (!wasmFallbackOnly ||
                 !this.jit.preparedCodegenMethods.has(method) || upgrade);
           // Admitted only by deep inlining: compiled after preparation.
@@ -3122,7 +3125,15 @@ class JVM {
       const staticFields = jreClass.staticFields instanceof Map
         ? jreClass.staticFields
         : new Map(Object.entries(jreClass.staticFields || {}));
-      const reflectedFields = Array.from(staticFields.keys()).map((rawKey) => {
+      // Native initializers may create field cells only on first active use.
+      // Publish their declarations without running initialization or changing
+      // storage, so reflection and guarded compiler links can see cold fields.
+      const declaredFields = new Map((jreClass.staticFieldDeclarations || []).map(field =>
+        [field.name + ':' + field.descriptor, {
+          type: 'field', field: {accessFlags: 0x0008, ...field,
+            flags: [...(field.flags || ['static'])]},
+        }]));
+      const inferredFields = Array.from(staticFields.keys()).map((rawKey) => {
         const key = String(rawKey).replace(/^'|'$/g, '');
         const separator = key.indexOf(':');
         const name = separator === -1 ? key : key.slice(0, separator);
@@ -3137,6 +3148,8 @@ class JVM {
           },
         };
       });
+      const reflectedFields = [...declaredFields.values(), ...inferredFields.filter(item =>
+        !declaredFields.has(item.field.name + ':' + item.field.descriptor))];
       classData = {
         isJreStub: true,
         ast: {

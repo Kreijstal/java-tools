@@ -1074,7 +1074,22 @@ function outlineLargeRegionLoops(unit, options = {}) {
           }
         }
       }
-      const liveOutNames = freeNames.filter((name) => names.written.has(name));
+      // When every entry statement is recorded, values used only within
+      // this loop need no writeback. Include reads on both sides of the loop:
+      // an enclosing backedge can revisit statements that precede it.
+      let outsideReads = null;
+      if (options.pruneUnusedLiveOuts === true &&
+          unit.headerLines.length === 0 && unit.footerLines.length === 0) {
+        outsideReads = new Set();
+        for (let index = 0; index < statements.length; index += 1) {
+          if (index >= candidate.start && index < candidate.end) continue;
+          const reads = statements[index].reads ?? statements[index].mentions;
+          if (!reads) { outsideReads = null; break; }
+          for (const name of reads) outsideReads.add(name);
+        }
+      }
+      const liveOutNames = freeNames.filter((name) => names.written.has(name) &&
+        (!outsideReads || outsideReads.has(name)));
       const body = rewriteRegionExits(statements, candidate.start,
         candidate.end, (argument) => [
           `{ ${outputName}[0] = 1;`,

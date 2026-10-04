@@ -23,16 +23,17 @@
 // to fully-compiled wasm callees. Whole-method rejection remains only for
 // missing/irreducible CFGs, SSA rejection, or a demoted entry block.
 
-const { buildCfgFromCode, structure, IrreducibleError } = require('../decompiler/structurer');
+const { buildCfgFromCode, structure, IrreducibleError, succOfTerm, succAllOfTerm } = require('../decompiler/structurer');
+const { splitIrreducibleTerms } = require('../decompiler/exceptionStructurer');
 const { buildSsa } = require('../analysis/opgraph/ssa');
 const {
   T, OP, TRUNC_SAT, uleb, sleb, f32bytes, f64bytes,
-  emitTryTableCatchAll, supportsWasmTryTable,
+  emitTryTableCatchAll, supportsWasmTryTable, emitTryTableJsTag, supportsWasmJsTag,
   wasmProfilerName, parseMethodDescriptor, descToWasm, getOp,
   BRANCH_COND, BRANCH_ZERO, ICONST, BIN_OPS, ARRAY_LOAD, ARRAY_STORE,
   arrayLoadImportName,
   Unsupported, blockedNames, NestedDeopt, isGuestThrow, ehRecordingImport, sig, assembleModule,
-  liveExceptionRanges,
+  liveExceptionRanges, booleanStaticCaptures,
   maxImpls, recordNestedDeopt, NPE, AIOOBE, sealedNeverExits, callWasmRun, takeWasmReturnValue,
   directInstanceLinkCalleeEligible, identityInstanceParams, hasOnlyLeafInitializationExits,
 } = require('./wasmShared');
@@ -43,6 +44,7 @@ const {
   addSystemImport, addArraysImport, addNewArrayImport, addANewArrayImport, addNewImport,
 } = require('./wasmRuntimeImports');
 const { inlineCalls, GUARD_OWNER } = require('./wasmInline');
+const {DirectFrameContext,CanonicalDirectLinks} = require('./CanonicalDirectFrames');
 const { runtimeClassName } = require('../instructions/object');
 const {
   slabSlotFor, denseLayoutFor, BASE_KEY: SLAB_BASE_KEY,
@@ -184,6 +186,9 @@ class StructuredWasmCompiler {
       this.wasmJit.linker.release(this.linkSlots);
     }
     this.linkSlots = [];
+    if(this.canonicalSlots?.length)this.wasmJit.canonicalDirectLinks.release(this.canonicalSlots);
+    this.canonicalSlots=[];
+    if(this.canonicalLifetime)this.canonicalLifetime.fallbacks=[];
   }
 
   internSig(params, results) {
@@ -197,7 +202,7 @@ class StructuredWasmCompiler {
     return idx;
   }
 
-  addImport(name, params, results, fn) {
+  addImport(name, params, results, fn, nonThrowing = false) {
     if (this.importIndexByName.has(name)) return this.importIndexByName.get(name);
     const idx = this.importDecls.length;
     let wrapped = fn;
@@ -211,8 +216,9 @@ class StructuredWasmCompiler {
         return inner(...args);
       };
     }
-    if (this.ehMethod) {
-      wrapped = ehRecordingImport(fn, params.length, this.box);
+    if (!this.jsTagEh && (this.ehMethod || this.canonicalRecordedLeaf) &&
+        !(nonThrowing && this.wasmJit.canonicalDirectCallsEnabled)) {
+      wrapped = ehRecordingImport(wrapped, params.length, this.box);
     }
     this.importDecls.push({ name, params, results });
     this.importFns.push(wrapped);
@@ -250,7 +256,8 @@ class StructuredWasmCompiler {
         // intact; dropping these roots also covers refused translations.
         for (const key of [
           'fn', 'cfg', 'items', 'originalItems', 'localOf', 'arrayCaches',
-          'fieldCaches', 'castCaches', 'objCaches', 'linkSlotByNode',
+          'fieldArrayOwners', 'sharedFieldArrayGroups', 'arrayReaderGenerations', 'primitiveCopyZeroEntry',
+          'fieldCaches', 'castCaches', 'objCaches', 'linkSlotByNode', 'canonicalSlotByNode',
           'deoptableSites', 'linkSlotSites', 'fusedGuardOfLoad',
           'fusedGuardArms', 'fusedFieldReads', 'rematLoads', 'inlinedInitializationGuards',
           'labelIndex', 'origIdx', 'deoptStubs', 'deoptBlocks', 'declared',
@@ -276,6 +283,7 @@ class StructuredWasmCompiler {
     // Slots at or above this belong to spliced callees (wasmInline renumbers
     // them above the caller's frame): never spilled into the caller's Frame.
     this.callerLocals = Number(codeAttr.code.localsSize) || 0;
+    let coldStaticInlineOwners = [];
     let inlinedCalls = 0;
     let speculations = 0;
     let specSites = null;
@@ -290,6 +298,7 @@ class StructuredWasmCompiler {
         callerClassName: this.className,
         callerIsStatic: (this.method.flags || []).includes('static'),
         deepInline,
+        inlineColdIntegerLeaves: this.wasmJit?.inlineColdIntegerLeavesEnabled,
         // Sites in live handler ranges need Wasm-side exception dispatch.
         ehLiveRanges: deepInline && process.env.JVM_WASM_EH !== '0' &&
           supportsWasmTryTable(),
@@ -301,6 +310,7 @@ class StructuredWasmCompiler {
         this.deoptStubs = expanded.deoptStubs;
         this.didInline = true;
         this.guardSites = expanded.guardSites || [];
+        coldStaticInlineOwners = expanded.coldStaticInlineOwners || [];
         inlinedCalls = expanded.inlined;
         speculations = expanded.speculations;
         specSites = expanded.specSites;
@@ -308,14 +318,30 @@ class StructuredWasmCompiler {
       }
     }
 
-    const cfg = buildCfgFromCode(items);
+    let cfg = buildCfgFromCode(items);
     if (!cfg) throw new Unsupported('no cfg');
     let structured;
     try {
       structured = structure(cfg);
     } catch (err) {
-      if (err instanceof IrreducibleError) throw new Unsupported('irreducible');
-      throw err;
+      if (!(err instanceof IrreducibleError)) throw err;
+      if (!this.wasmJit.structuredIrreducibleSplittingEnabled) throw new Unsupported('irreducible');
+      // Clone only the basic blocks needed to turn a multiple-entry loop
+      // into single-entry loops. Each copy retains its original item PCs,
+      // so fuel/exception spills keep the canonical method's exact state.
+      const maximumBlocks = Math.min(512, cfg.n * 2);
+      const split = splitIrreducibleTerms(cfg.term, cfg.entry, {maxTerms:maximumBlocks});
+      if (!split || split.terms.length > maximumBlocks) throw new Unsupported('irreducible split budget');
+      const originalBlocks = cfg.blocks;
+      cfg = {...cfg,n:split.terms.length,term:split.terms,
+        succ:split.terms.map(succOfTerm),succAll:split.terms.map(succAllOfTerm),
+        blocks:split.origins.map((origin,id)=>({...originalBlocks[origin],id}))};
+      this.irreducibleSplitBlocks=cfg.n-originalBlocks.length;
+      try { structured=structure(cfg); }
+      catch (retry) {
+        if (retry instanceof IrreducibleError) throw new Unsupported('irreducible after split');
+        throw retry;
+      }
     }
 
     const fn = buildSsa(
@@ -386,8 +412,42 @@ class StructuredWasmCompiler {
     fn.params.forEach((p, i) => this.localOf.set(p, i));
     this.blkLocal = fn.params.length;
     this.fuelLocal = fn.params.length + 1;
+    this.usedCanonicalTable=this.wasmJit.canonicalDirectCallsEnabled;
+    this.canonicalLifetime=this.usedCanonicalTable?{fallbacks:[],metadata:null}:null;
+    this.canonicalSlots=[];
     this.declared = [];
     this.nextLocal = fn.params.length + 2;
+    const directFlags=this.method.flags||[];
+    this.directFrames = this.wasmJit.canonicalDirectCallsEnabled &&
+      supportsWasmTryTable() && directFlags.includes('static') &&
+      !directFlags.includes('synchronized') &&
+      !['<init>','<clinit>'].includes(this.method.name) &&
+      !'L['.includes(parseMethodDescriptor(this.method.descriptor).ret)
+      ? new DirectFrameContext(this.jvm,this.method,this.className,this.box) : null;
+    // A handler-free leaf can throw only through its runtime imports. Record
+    // those exceptions in its own box before the canonical wrapper catches
+    // them, so the caller receives the original guest or host throwable.
+    // Calls and local exception handlers keep their existing protocols.
+    this.canonicalRecordedLeaf = Boolean(this.directFrames &&
+      this.wasmJit.canonicalLeafCallsEnabled && !this.ehMethod &&
+      table.length === 0 && !items.some(item =>
+        getOp(item.instruction)?.startsWith('invoke')));
+    this.jsTagEh = Boolean(this.wasmJit.nativeJsExceptionTagsEnabled &&
+      (this.ehMethod || this.directFrames) && supportsWasmJsTag());
+    if (this.jsTagEh) {
+      const box = this.box;
+      this.jsTagRecordIdx = this.addImport('record_js_exception', [T.ref], [], e => {
+        box.lastThrown = e;
+        box.pendingException = isGuestThrow(e) ? e : null;
+      }, true);
+    }
+    if(this.directFrames){
+      this.directIdLocal=this.nextLocal++;
+      this.declared.push(T.i32);
+      const token=this.jvm.getClassInitializationToken(this.className);
+      this.directOwnerReadyIdx=this.addImport('canonical_owner_ready',[],[T.i32],
+        token.wasmReadinessGuard(),true);
+    }
 
     addRuntimeImports(this, this.box);
     addArrayImports(
@@ -404,6 +464,9 @@ class StructuredWasmCompiler {
     // load/store when base >= 0, else takes the aget/aset import path.
     this.heap = (process.env.JVM_WASM_HEAP_ARRAYS !== '0' && this.jvm.wasmHeap) || null;
     this.arrayCaches = new Map();
+    this.fieldArrayOwners = this.wasmJit.sharedFieldArrayCachesEnabled ? new Map() : null;
+    this.sharedFieldArrayGroups = null;
+    this.arrayReaderGenerations = null;
     this.usedHeap = false;
 
     // Field-value caches (ported from the dispatcher tier, SSA-keyed).
@@ -462,7 +525,24 @@ class StructuredWasmCompiler {
     // Unsupported demotes just that block to an exit stub instead of
     // rejecting the method.
     const treeBlocks = collectTreeBlocks(structured.tree);
+    // A scalar return block containing only total integer operations has no
+    // observable exception path. Reporter handlers do not change that proof.
+    // Keep calls, memory operations, division, branches, and loops excluded.
+    const entry = this.blockOf(cfg.entry);
+    this.canonicalNonThrowingNormalFlow = Boolean(this.directFrames &&
+      treeBlocks.size === 1 && fn.params.every(value => value.kind === 'I') &&
+      entry.term.kind === 'return' && entry.term.insnOp === 'ireturn' &&
+      entry.body.every(value => value.kind === 'I' && isPureNode(value)));
+
     this.inlinedInitializationGuards = new Set();
+    for (const owner of coldStaticInlineOwners) {
+      const token = this.jvm.getClassInitializationToken(owner);
+      const idx = this.addImport(
+        `inline_static_ready_${owner}`.replace(/[^\w]/g, '_'), [], [T.i32],
+        token.wasmReadinessGuard?.() || (() => token.initialized ? 1 : 0),true);
+      this.inlinedInitializationGuards.add(idx);
+      (this.staticInitializationGuards ||= new Set()).add(owner);
+    }
     this.demoted = new Map();
     this.demoteBlockers = new Set();
     this.demoteBlockersByBlock = new Map();
@@ -522,6 +602,11 @@ class StructuredWasmCompiler {
         blockers && blockers.size ? [...blockers] : null);
     }
 
+    this.prepareSharedFieldArrayCaches();
+
+    this.booleanStaticCaptures = booleanStaticCaptures(this.method);
+    this.booleanStaticSpillProof = true;
+    this.booleanStaticSpillSites = 0;
     const body = [];
     // Entry seed: a loop-header entry joins params with back edges; phi arg 0
     // is the seed (params/undef), copied once at function start.
@@ -554,7 +639,15 @@ class StructuredWasmCompiler {
     for (const cache of this.arrayCaches.values()) {
       if (cache.parameter) arrayEntry.push(...this.arrayCacheFill(cache));
     }
-    body.unshift(...arrayEntry);
+    const primitiveCopyEntry = require('./primitiveArrayCopyEntry').emitPrimitiveCopyEntry(this);
+    const intZeroClearEntry = require('./intZeroClearEntry').emitIntZeroClearEntry(this);
+    body.unshift(...(this.primitiveCopyZeroEntry || []), ...arrayEntry, ...primitiveCopyEntry, ...intZeroClearEntry);
+    if(this.directFrames){
+      const ret=parseMethodDescriptor(this.method.descriptor).ret;
+      const globals=(ret==='V'?0:1)+(this.usesSpecok?1:0);
+      body.unshift(OP.global_get,...uleb(globals),OP.local_set,...uleb(this.directIdLocal),
+        OP.i32_const,0,OP.global_set,...uleb(globals));
+    }
 
     const bytes = assembleModule({
       importDecls: this.importDecls,
@@ -570,6 +663,10 @@ class StructuredWasmCompiler {
       specokGlobal: !!this.usesSpecok,
       importTable: this.usedLinkTable,
       sigTypes: this.sigTypes,
+      canonicalFrameExport: this.directFrames ? {readyIdx:this.directOwnerReadyIdx,
+        recordIdx:this.jsTagEh ? this.jsTagRecordIdx : undefined} : null,
+      importJsTag: this.jsTagEh,
+      importCanonicalTable: !!this.usedCanonicalTable,
     });
 
     const blockOfItem = new Map();
@@ -587,9 +684,11 @@ class StructuredWasmCompiler {
       }
     }
     const env = {};
+    if (this.jsTagEh) env.js_tag = WebAssembly.JSTag;
     this.importDecls.forEach((d, i) => { env[d.name] = this.importFns[i]; });
     if (this.usedHeap) env.mem = this.heap.memory;
     if (this.usedLinkTable) env.ltab = this.wasmJit.linker.table;
+    if (this.usedCanonicalTable) env.ctab = this.wasmJit.canonicalDirectLinks.table;
     // Deopt stubs exit mid-method needing a real frame, so modules that have
     // them must take the partial-callee protocol (and are never pinned).
     const normalFlowFullyCompiled = this.demoted.size === 0 && this.deoptBlocks.size === 0;
@@ -638,11 +737,16 @@ class StructuredWasmCompiler {
         return plain;
       }
       if (plain && this.wasmJit.linker) this.wasmJit.linker.release(plain.linkSlots);
+      if(plain && this.wasmJit.canonicalDirectLinks)this.wasmJit.canonicalDirectLinks.release(plain.canonicalSlots);
     }
     return {
       bytes,
       importObject: { env },
       box: this.box,
+      directFrameContext: this.directFrames,
+      canonicalDirectSites: this.canonicalSlotByNode?.size || 0,
+      canonicalSlots: this.canonicalSlots.slice(),
+      canonicalLifetime:this.canonicalLifetime,
       paramSlots: this.paramSlots,
       retChar: parseMethodDescriptor(this.method.descriptor).ret,
       blockOfItem,
@@ -662,6 +766,9 @@ class StructuredWasmCompiler {
       blockCount: cfg.n,
       fullyCompiled: normalFlowFullyCompiled && table.length === 0,
       normalFlowFullyCompiled,
+      booleanStaticSpillProof: this.booleanStaticCaptures.length > 0 &&
+        this.booleanStaticSpillProof,
+      booleanStaticSpillSites: this.booleanStaticSpillSites,
       // Every normal-flow block compiled; the only exits are inlined
       // guard-miss stubs (rare receivers, resumed at the original call pc).
       guardOnlyNormalFlowGaps: !normalFlowFullyCompiled &&
@@ -671,6 +778,10 @@ class StructuredWasmCompiler {
       // the top frame, and a partial-link resume would re-execute the
       // throwing op (double side effects for invokes).
       usedEh: this.usedEh,
+      nativeJsExceptionTags: this.jsTagEh,
+      canonicalNonThrowingNormalFlow: normalFlowFullyCompiled &&
+        this.canonicalNonThrowingNormalFlow,
+      canonicalRecordedNormalFlow: normalFlowFullyCompiled && this.canonicalRecordedLeaf,
       // Sites that may exit mid-method through the deopt-flag protocol:
       // callers must nest this module with a real scratch frame, never the
       // junk sink (same contract as the dispatcher tier's deoptable calls).
@@ -694,6 +805,10 @@ class StructuredWasmCompiler {
           cfg.blocks[id].insns.filter((i) => items[i] && items[i].instruction).length, 0),
       boxedCount: 0,
       fieldCacheCount: this.fieldCaches.size,
+      primitiveCopyEntryUnroll: this.primitiveCopyEntryUnroll || 0,
+      primitiveCopyEntryBytes: this.primitiveCopyEntryBytes || 0,
+      intZeroClearEntryBytes: this.intZeroClearEntryBytes || 0,
+      intZeroClearEntryUnroll: this.intZeroClearEntryUnroll || 0,
       // getfield/putfield sites compiled to a raw slab load/store instead of
       // a gf_/pf_ import (JVM_WASM_FIELDS); they need no value cache.
       slabFieldSites: this.slabFieldSites,
@@ -713,9 +828,11 @@ class StructuredWasmCompiler {
       deoptStubCount: this.deoptBlocks.size,
       heapCopyArrayCount: [...this.arrayCaches.values()].filter(cache => cache.copyKind !== undefined).length,
       arrayCacheCount: this.arrayCaches.size,
+      sharedFieldArrayCacheCount: this.sharedFieldArrayGroups?.length || 0,
       parameterArrayCacheCount: [...this.arrayCaches.values()]
         .filter((cache) => cache.parameter).length,
       parameterHeapSpecializationBytes,
+      irreducibleSplitBlocks:this.irreducibleSplitBlocks || 0,
       importStats: this.importStats || null,
     };
   }
@@ -1057,6 +1174,19 @@ class StructuredWasmCompiler {
     out.push(OP.end);
   }
 
+  recordBooleanStaticSpill(slotState, itemIndex, spills) {
+    if (!this.booleanStaticCaptures?.length) return;
+    this.booleanStaticSpillSites += 1;
+    const emitted = new Set(spills.map(spill => spill.slot));
+    for (const {slot, storeIndex} of this.booleanStaticCaptures) {
+      // Before the capturing store, this boolean does not exist yet.
+      if (itemIndex <= storeIndex) continue;
+      const value = slotState?.get(slot);
+      if (!value || value.op === 'undef' || value.kind !== 'I' ||
+          !emitted.has(slot)) this.booleanStaticSpillProof = false;
+    }
+  }
+
   // Spill the block's reaching slot defs into frame.locals, push its entry
   // stack into frame.stack, and resume interpretation at the block. Shared by
   // fuel-exhaustion exits (inside the fuel if), demoted-block exit stubs, and
@@ -1064,6 +1194,42 @@ class StructuredWasmCompiler {
   // original invoke's operands [recv, args...] (read from the argument-store
   // slots; the entry stack holds only whatever sat UNDER them) and resume at
   // the original call-site pc so the interpreter re-executes the invoke.
+  framePush(type) {
+    if(!this.directFrames)return [OP.call,...uleb(pushImportFor(this,type))];
+    const context=this.directFrames;
+    const idx=this.addImport(`canonical_push_${sig(type)}`,[type,T.i32],[],
+      (value,id)=>context.frame(id).stack.push(value));
+    return [OP.local_get,...uleb(this.directIdLocal),OP.call,...uleb(idx)];
+  }
+
+  markDirectExit(status,out) {
+    if(!this.directFrames)return;
+    const context=this.directFrames;
+    const idx=this.addImport('canonical_exit_spill',[T.i32,T.i32],[],
+      (id,status)=>context.exit(id,status));
+    out.push(OP.local_get,...uleb(this.directIdLocal),OP.i32_const,...sleb(status),
+      OP.call,...uleb(idx));
+  }
+
+  consumeDirectExit(status,id,owner) {
+    const box=this.box;
+    if(status===-6){const flag=box.deoptFlag;box.deoptFlag=0;return flag;}
+    if(status===-4)return 1; // clinit still belongs to the original invoke
+    if(status===-5)throw owner.box.lastThrown;
+    const frame=owner.take(id);
+    this.wasmJit.canonicalResumeFrames.add(frame);
+    if(status===-3){
+      const exn=frame.wasmDirectException;
+      frame.wasmDirectException=null;
+      if(!this.jvm.dispatchExceptionInFrame(frame,exn,frame.wasmDirectThrowPc))throw exn;
+    }
+    const deeper=frame.wasmDirectPendingFrames;
+    frame.wasmDirectPendingFrames=null;
+    box.pendingFrames=deeper?[...deeper,frame]:[frame];
+    box.canonicalFrameHandoff=true;
+    return 2;
+  }
+
   emitSpillResume(blockId, out, stub = null) {
     const block = this.blockOf(blockId);
     const spills = [];
@@ -1078,14 +1244,16 @@ class StructuredWasmCompiler {
       }
       spills.push({ slot, value, t });
     }
+    this.recordBooleanStaticSpill(block.slotDefsIn,
+      stub ? stub.resumeIdx : this.resumeItemOf(blockId), spills);
     if (spills.length || (CLEAR_DROPPED && droppedSlots.length)) {
       const slots = spills.map((s) => s.slot);
       const clear = CLEAR_DROPPED ? droppedSlots : null;
       const box = this.box;
       const idx = this.addImport(
-        `spill_h${blockId}`, spills.map((s) => s.t), [],
+        `spill_h${blockId}`, [...spills.map((s) => s.t),...(this.directFrames?[T.i32]:[])], [],
         (...values) => {
-          const locals = box.frame.locals;
+          const locals = (this.directFrames ? this.directFrames.frame(values.pop()) : box.frame).locals;
           for (let i = 0; i < slots.length; i += 1) locals[slots[i]] = values[i];
           // JVM_WASM_CLEAR_DROPPED=1: a slot the filter dropped keeps whatever
           // the last user of this (reused) frame left in it. Clearing turns a
@@ -1095,12 +1263,13 @@ class StructuredWasmCompiler {
         },
       );
       for (const { value } of spills) out.push(...this.useOf(value));
+      if(this.directFrames)out.push(OP.local_get,...uleb(this.directIdLocal));
       out.push(OP.call, ...uleb(idx));
     }
     for (const value of block.entryStack) {
       const t = KIND_T[value.kind];
       if (t === undefined) throw new Unsupported('unkinded entry stack at exit');
-      out.push(...this.useOf(value), OP.call, ...uleb(pushImportFor(this, t)));
+      out.push(...this.useOf(value), ...this.framePush(t));
     }
     if (stub) {
       const defs = block.slotDefsIn || new Map();
@@ -1108,8 +1277,9 @@ class StructuredWasmCompiler {
         const def = defs.get(slot);
         const t = def && def.op !== 'undef' ? KIND_T[def.kind] : undefined;
         if (t === undefined) throw new Unsupported('deopt stub operand unavailable');
-        out.push(...this.useOf(def), OP.call, ...uleb(pushImportFor(this, t)));
+        out.push(...this.useOf(def), ...this.framePush(t));
       }
+      this.markDirectExit(stub.resumeIdx,out);
       out.push(OP.i32_const, ...sleb(stub.resumeIdx), OP.return);
       return;
     }
@@ -1117,6 +1287,7 @@ class StructuredWasmCompiler {
     if (!this.spillSlots) this.spillSlots = new Map();
     this.spillSlots.set(resumeItem,
       { slots: spills.map((s) => s.slot), dropped });
+    this.markDirectExit(resumeItem,out);
     out.push(OP.i32_const, ...sleb(resumeItem), OP.return);
   }
 
@@ -1174,7 +1345,7 @@ class StructuredWasmCompiler {
       });
       if (this.ehMethod) {
         const site = this.ehSiteFor(term.itemIdx);
-        emitTryTableCatchAll(
+        this.emitExceptionRegion(
           out,
           body => body.push(...this.useOf(value), OP.call, ...uleb(idx)),
           handler => this.emitEhCatch(term.slotState, site, handler),
@@ -1193,8 +1364,16 @@ class StructuredWasmCompiler {
       // References use only retv, consumed/cleared by both JS and runv callers;
       // copying them into box.ret would retain the last returned object.
       out.push(...this.useOf(value), OP.global_set, ...uleb(0));
-      if (t !== T.ref) out.push(OP.global_get, ...uleb(0), OP.call,
-        ...uleb(this.importIndexByName.get(`ret_${sig(t)}`)));
+      if (t !== T.ref) {
+        // Direct scalar calls return the exported global in their native ABI.
+        // Only ordinary JS entries need the legacy box.ret import callback.
+        if (this.canonicalNonThrowingNormalFlow || this.canonicalRecordedLeaf) {
+          out.push(OP.local_get, ...uleb(this.directIdLocal), OP.i32_eqz, OP.if, 0x40);
+        }
+        out.push(OP.global_get, ...uleb(0), OP.call,
+          ...uleb(this.importIndexByName.get(`ret_${sig(t)}`)));
+        if (this.canonicalNonThrowingNormalFlow || this.canonicalRecordedLeaf) out.push(OP.end);
+      }
     }
     out.push(OP.i32_const, ...sleb(-1), OP.return);
   }
@@ -1241,9 +1420,14 @@ class StructuredWasmCompiler {
   // try_table/catch_all is free when nothing throws; on a guest exception the
   // handler spills the locals reaching this op (its wasm locals are all still
   // live), records the throw pc, and returns -3. Host errors rethrow.
+  emitExceptionRegion(out, emitBody, emitCatch) {
+    if (this.jsTagEh) emitTryTableJsTag(out, emitBody, emitCatch, this.jsTagRecordIdx);
+    else emitTryTableCatchAll(out, emitBody, emitCatch);
+  }
+
   emitEhWrapped(node, out) {
     const site = this.ehSiteFor(node.itemIdx);
-    emitTryTableCatchAll(
+    this.emitExceptionRegion(
       out,
       body => this.emitNode(node, body),
       handler => this.emitEhCatch(node.slotState, site, handler),
@@ -1277,17 +1461,20 @@ class StructuredWasmCompiler {
     }
     const slots = spills.map((s) => s.slot);
     const { resumeIdx, pc } = site;
+    this.recordBooleanStaticSpill(slotState, resumeIdx, spills);
     const idx = this.addImport(
-      `eh_spill_${resumeIdx}`, spills.map((s) => s.t), [],
+      `eh_spill_${resumeIdx}`, [...spills.map((s) => s.t),...(this.directFrames?[T.i32]:[])], [],
       (...values) => {
-        const frame = box.frame;
+        const frame = this.directFrames ? this.directFrames.frame(values.pop()) : box.frame;
         for (let i = 0; i < slots.length; i += 1) frame.locals[slots[i]] = values[i];
         frame.pc = resumeIdx;
         box.throwPc = pc;
       },
     );
     for (const { value } of spills) out.push(...this.useOf(value));
+    if(this.directFrames)out.push(OP.local_get,...uleb(this.directIdLocal));
     out.push(OP.call, ...uleb(idx));
+    this.markDirectExit(-3,out);
     out.push(OP.i32_const, ...sleb(-3), OP.return);
     out.push(OP.end);
     out.push(OP.call, ...uleb(this.addImport('eh_rethrow', [], [],
@@ -1331,8 +1518,17 @@ class StructuredWasmCompiler {
       const wide = op[0] === 'l';
       out.push(...use(1), wide ? OP.i64_eqz : OP.i32_eqz, OP.if, 0x40,
         OP.call, ...uleb(this.importIndexByName.get('err_div0')), OP.end);
-      out.push(...use(0), ...use(1),
-        { idiv: OP.i32_div_s, irem: OP.i32_rem_s, ldiv: OP.i64_div_s, lrem: OP.i64_rem_s }[op]);
+      // Java wraps MIN_VALUE / -1; Wasm signed division traps. Negation
+      // supplies the exact wrapping result for every numerator when b=-1.
+      if (op === 'idiv' || op === 'ldiv') {
+        out.push(...use(1), wide ? OP.i64_const : OP.i32_const, ...sleb(-1),
+          wide ? OP.i64_eq : OP.i32_eq, OP.if, wide ? T.i64 : T.i32,
+          wide ? OP.i64_const : OP.i32_const, 0, ...use(0),
+          wide ? OP.i64_sub : OP.i32_sub, OP.else,
+          ...use(0), ...use(1), wide ? OP.i64_div_s : OP.i32_div_s, OP.end);
+      } else {
+        out.push(...use(0), ...use(1), wide ? OP.i64_rem_s : OP.i32_rem_s);
+      }
       return finish();
     }
     if (op === 'lshl' || op === 'lshr' || op === 'lushr') {
@@ -1484,6 +1680,9 @@ class StructuredWasmCompiler {
         const entry = this.fieldCacheFor(cacheKey, field.t, killKey, isStatic ? 's' : 'f',
           isStatic ? null : node.args[0].id);
         entry.readerIds.add(node.id);
+        if (this.fieldArrayOwners && descriptor[0] === "[") {
+          this.fieldArrayOwners.set(node.id, entry);
+        }
         // cached instance path skips the null check: a filled flag proves
         // this exact SSA value already loaded this field successfully
         const loadSeq = isStatic
@@ -1498,9 +1697,19 @@ class StructuredWasmCompiler {
         // (in-loop `b = grow(b)` reassignment was read through a stale
         // array base/len exactly this way).
         const onMiss = [];
+        if (entry.arrayGeneration !== undefined) {
+          onMiss.push(OP.local_get, ...uleb(entry.arrayGeneration),
+            OP.i64_const, ...sleb(1), OP.i64_add,
+            OP.local_set, ...uleb(entry.arrayGeneration));
+        }
         for (const id of entry.readerIds) onMiss.push(...this.cacheKillsFor(id));
         out.push(...this.cachedReadSeq(entry, loadSeq, onMiss));
         if (node.kind !== 'V') out.push(OP.local_set, ...uleb(this.mustLocal(node)));
+        const generation = this.arrayReaderGenerations?.get(node.id);
+        if (generation !== undefined) {
+          out.push(OP.local_get, ...uleb(entry.arrayGeneration),
+            OP.local_set, ...uleb(generation));
+        }
         return;
       }
       if (receiver) {
@@ -1614,6 +1823,27 @@ class StructuredWasmCompiler {
         this.deoptableSites.add(node.itemIdx);
       }
       for (let i = 0; i < node.args.length; i += 1) out.push(...use(i));
+      if(call.canonical){
+        const c=call.canonical;
+        out.push(OP.i32_const,...sleb(c.slot),OP.call_indirect,...uleb(c.type),
+          0x00);
+        if(node.kind!=='V')out.push(OP.local_set,...uleb(this.mustLocal(node)));
+        const owner=this.nextLocal++,id=this.nextLocal++,status=this.nextLocal++;
+        this.declared.push(T.ref,T.i32,T.i32);
+        out.push(OP.local_set,...uleb(owner),OP.local_set,...uleb(id),
+          OP.local_tee,...uleb(status),OP.i32_const,...sleb(-1),OP.i32_ne,
+          OP.if,0x40,
+          OP.local_get,...uleb(status),OP.local_get,...uleb(id),OP.local_get,...uleb(owner),
+          OP.call,...uleb(c.consumeIdx),OP.local_tee,...uleb(status),OP.if,0x40,
+          OP.local_get,...uleb(status),OP.i32_const,1,OP.i32_eq,OP.if,0x40);
+        this.emitCallExitStub(node,site,unders,true,out);
+        out.push(OP.end);
+        this.emitCallExitStub(node,site,unders,false,out);
+        out.push(OP.end,OP.end);
+        out.push(...this.callFieldCacheKills(call));
+        if(node.kind!=='V')out.push(...this.cacheKillsFor(node.id));
+        return;
+      }
       if (call.directLink) {
         // Guarded direct instance call: matching receivers take the runv
         // fast path (never-exits invariant verified in wasm), everything
@@ -1669,7 +1899,8 @@ class StructuredWasmCompiler {
         // stub reports -1 and signals deopt through the box flag checked
         // below, the callee's runv export upholds the never-exits invariant.
         out.push(OP.i32_const, ...sleb(call.indirect.slot),
-          OP.call_indirect, ...uleb(call.indirect.typeIdx), 0x00);
+          OP.call_indirect, ...uleb(call.indirect.typeIdx),
+          ...uleb(this.usedCanonicalTable?1:0));
       } else {
         out.push(OP.call, ...uleb(call.idx));
       }
@@ -1713,6 +1944,13 @@ class StructuredWasmCompiler {
     // net-negative on the dispatcher tier (it unlocks tiny cast-bearing
     // callees whose import-dispatch overhead exceeds interpreting them).
     if (op === 'checkcast' || op === 'instanceof') {
+      // A literal null never resolves the target class or calls a type guard.
+      // Keep arbitrary references under the existing cast admission policy.
+      if (node.args[0]?.op === 'aconst_null') {
+        out.push(...(op === 'checkcast'
+          ? [OP.ref_null, T.ref] : [OP.i32_const, 0]));
+        return finish();
+      }
       if ((!this.origIdx || this.origIdx[node.itemIdx] !== -1) &&
           !this.wasmJit?.checkcastEnabled) {
         throw new Unsupported(`op ${op}`);
@@ -1755,6 +1993,44 @@ class StructuredWasmCompiler {
     return null;
   }
 
+  // Discovery has seen every field reader and array access before real
+  // emission. Sibling readers can share a field generation's metadata while
+  // retaining private caches for older captured references. A field refill
+  // advances its generation; each reader snapshots it when its SSA value is
+  // assigned. These tags stay entirely inside Wasm. i64 avoids wraparound
+  // within a fuel-bounded Java method invocation.
+  prepareSharedFieldArrayCaches() {
+    if (!this.fieldArrayOwners || !this.heap) return;
+    const byOwner = new Map();
+    for (const [id, cache] of this.arrayCaches) {
+      const owner = this.fieldArrayOwners.get(id);
+      if (!owner || cache.parameter) continue;
+      let readers = byOwner.get(owner);
+      if (!readers) byOwner.set(owner, readers = []);
+      readers.push({id, cache});
+    }
+    const local = type => {
+      const result = this.nextLocal++;
+      this.declared.push(type);
+      return result;
+    };
+    for (const [owner, readers] of byOwner) {
+      // Bulk copies have additional representation metadata. Leave their
+      // existing cache protocol intact, including all sibling readers.
+      if (readers.length < 2 || readers.some(({cache}) => cache.copyKind !== undefined)) continue;
+      owner.arrayGeneration = local(T.i64);
+      const group = {base:local(T.i32), len:local(T.i32), filled:local(T.i32),
+        generation:local(T.i64)};
+      (this.sharedFieldArrayGroups ||= []).push(group);
+      this.arrayReaderGenerations ||= new Map();
+      for (const {id, cache} of readers) {
+        const readerGeneration = local(T.i64);
+        this.arrayReaderGenerations.set(id, readerGeneration);
+        cache.sharedField = {group, readerGeneration, generation:local(T.i64)};
+      }
+    }
+  }
+
   // base/len/filled locals for the array behind an SSA value; never killed
   // (array identity, base, and length are immutable for the whole run)
   arrayCacheFor(arrValue) {
@@ -1786,6 +2062,31 @@ class StructuredWasmCompiler {
 
   lazyArrayCacheFill(cache) {
     if (cache.parameter) return [];
+    if (cache.sharedField) {
+      const {group, readerGeneration, generation} = cache.sharedField;
+      const copy = (source, target) => [OP.local_get, ...uleb(source),
+        OP.local_set, ...uleb(target)];
+      return [
+        OP.local_get, ...uleb(cache.filled), OP.i32_eqz,
+        OP.local_get, ...uleb(generation),
+        OP.local_get, ...uleb(readerGeneration), OP.i64_ne, OP.i32_or,
+        OP.if, 0x40,
+          OP.local_get, ...uleb(group.filled),
+          OP.local_get, ...uleb(group.generation),
+          OP.local_get, ...uleb(readerGeneration), OP.i64_eq, OP.i32_and,
+          OP.if, 0x40,
+            ...copy(group.base, cache.base), ...copy(group.len, cache.len),
+          OP.else,
+            ...this.arrayCacheFill(cache),
+            ...copy(cache.base, group.base), ...copy(cache.len, group.len),
+            ...copy(readerGeneration, group.generation),
+            OP.i32_const, ...sleb(1), OP.local_set, ...uleb(group.filled),
+          OP.end,
+          ...copy(readerGeneration, generation),
+          OP.i32_const, ...sleb(1), OP.local_set, ...uleb(cache.filled),
+        OP.end,
+      ];
+    }
     return [
       OP.local_get, ...uleb(cache.filled), OP.i32_eqz, OP.if, 0x40,
       ...this.arrayCacheFill(cache),
@@ -1937,7 +2238,11 @@ class StructuredWasmCompiler {
   cacheKillsFor(id) {
     const seq = [];
     const arr = this.arrayCaches.get(id);
-    if (arr && !arr.parameter) seq.push(OP.i32_const, ...sleb(0), OP.local_set, ...uleb(arr.filled));
+    // Shared readers validate their captured generation on every access. A
+    // sibling refill must not discard an older, still-live captured array.
+    if (arr && !arr.parameter && !arr.sharedField) {
+      seq.push(OP.i32_const, ...sleb(0), OP.local_set, ...uleb(arr.filled));
+    }
     for (const e of this.fieldCaches.values()) {
       if (e.recvId === id) {
         seq.push(OP.i32_const, ...sleb(0), OP.local_set, ...uleb(e.filledLocal));
@@ -2163,7 +2468,8 @@ class StructuredWasmCompiler {
       throw new Unsupported(`invoke ${className}.${name} unsupported descriptor`);
     }
     const calleeSt = this.wasmJit &&
-      this.wasmJit.findReadyStatic(className, name, descriptor, true, false, true);
+      this.wasmJit.findReadyStatic(className, name, descriptor, true, false, true,
+        this.wasmJit.canonicalEhLinksEnabled);
     const linked = calleeSt && (calleeSt.callee || calleeSt);
     // A ready callee whose only exits are its own late-bound slot sites is a
     // member of a recursive group the linker has not sealed yet (it may be
@@ -2192,7 +2498,8 @@ class StructuredWasmCompiler {
     // install a caller that exits Wasm on every invocation.
     const klass = linked ? 'compatible'
       : (this.wasmJit
-        ? this.wasmJit.staticLinkClassification(className, name, descriptor, true)
+        ? this.wasmJit.staticLinkClassification(className, name, descriptor, true,
+          this.wasmJit.canonicalEhLinksEnabled)
         : 'incompatible');
     // `lateBound` is set below, only on the path that actually emits an
     // lcall_ trampoline. A binding is recorded for every static call site,
@@ -2212,6 +2519,47 @@ class StructuredWasmCompiler {
       // not get to reclassify how an existing refusal is retried.
       throw new Unsupported(`invoke ${className}.${name} callee not ready`,
         this.wasmJit.methodLinkBlockers(className, name, descriptor));
+    }
+    if(this.wasmJit.canonicalDirectCallsEnabled && this.wasmJit.canonicalEhLinksEnabled &&
+        !'L['.includes(ret)) {
+      const directMeta=CanonicalDirectLinks.eligible(calleeSt)?calleeSt.meta:linked?.meta;
+      const identity=!linked || directMeta.paramSlots.length===params.length &&
+        directMeta.paramSlots.every(p=>argPosBySlot.get(p.slot)!==undefined &&
+          p.t===wParams[argPosBySlot.get(p.slot)]);
+      if(identity && !calleeSt?.synchronized){
+        const scratch=new Map(),dummy=dummyRet(ret);
+        let bound=calleeSt,boundEpoch=-1;
+        const fallback=(...args)=>{
+          if(!bound || boundEpoch!==this.wasmJit.compileEpoch || !(bound.callee||bound).meta){
+            bound=this.wasmJit.findReadyStatic(className,name,descriptor,true,true,true,true);
+            boundEpoch=this.wasmJit.compileEpoch;
+            if(bound)this.wasmJit.canonicalDirectLinks.publish(bound);
+          }
+          if(!bound || !(bound.callee||bound).meta){this.box.deoptFlag=1;return dummy;}
+          return this.runNested(bound,className,args,argPosBySlot,scratch,dummy);
+        };
+        let direct=this.canonicalSlotByNode?.get(node);
+        if(direct===undefined){
+          // The stub's JS call crosses an indirect table, so the caller's
+          // ordinary import wrapper cannot record its exception for catch_all.
+          const recordedFallback = this.ehMethod && !this.jsTagEh
+            ? ehRecordingImport(fallback, wParams.length, this.box) : fallback;
+          direct=this.wasmJit.canonicalDirectLinks.allocate(key,wParams,results,recordedFallback);
+          (this.canonicalSlotByNode||=new Map()).set(node,direct);
+          this.canonicalSlots.push(direct);
+          this.canonicalLifetime.fallbacks.push(recordedFallback);
+          if(calleeSt)this.wasmJit.canonicalDirectLinks.publish(calleeSt);
+        }
+        binding.canonicalDirect=true;
+        binding.lateBound=!linked;
+        binding.slot=direct;
+        this.usedCanonicalTable=true;
+        this.canonicalDirectSites=(this.canonicalDirectSites||0)+1;
+        const type=this.internSig(wParams,[T.i32,T.i32,T.ref,...results]);
+        const consumeIdx=this.addImport('canonical_exit',[T.i32,T.i32,T.ref],[T.i32],
+          (status,id,owner)=>this.consumeDirectExit(status,id,owner));
+        return {canonical:{slot:direct,type,consumeIdx},writes,deoptable:true};
+      }
     }
     // UNKNOWN: the callee owns no module yet. Emit a late-bound call rather
     // than demoting the block. Codegen states the dependency; resolving it is
@@ -2241,7 +2589,8 @@ class StructuredWasmCompiler {
         // deopt on every call until some unrelated compile moved the epoch.
         if (bound === null || boundEpoch !== this.wasmJit.compileEpoch ||
             !(bound.callee || bound).meta) {
-          bound = this.wasmJit.findReadyStatic(className, name, descriptor, true, true, true);
+          bound = this.wasmJit.findReadyStatic(className, name, descriptor, true, true, true,
+            this.wasmJit.canonicalEhLinksEnabled);
           boundEpoch = this.wasmJit.compileEpoch;
           // The binding is the linker's record of this dependency; keeping it
           // current is what makes `pending` mean "still unresolved" to anyone
@@ -2405,6 +2754,26 @@ class StructuredWasmCompiler {
     if (!this.wasmJit || !this.wasmJit.instanceLinkEnabled) {
       throw new Unsupported('instance linking disabled');
     }
+    // A native instance call can be a cold branch in an otherwise productive
+    // body. Resume at the original invoke using the established deopt-flag
+    // spill protocol; no native implementation or guest effects run here.
+    // Dynamic dispatch, null receivers, suspension and exceptions remain
+    // the interpreter's responsibility, including later guest overrides.
+    const nativeExit = () => {
+      if (!this.wasmJit.nativeInstanceExitsEnabled ||
+          op === 'invokespecial' ||
+          !this.jvm._jreFindMethod?.(owner, name, descriptor)) return null;
+      const dummy = dummyRet(ret);
+      return {
+        idx: this.addImport(
+          `native_exit_${owner}_${name}_${descriptor}`.replace(/[^\w]/g, '_'),
+          [T.ref, ...params.map(descToWasm)],
+          ret === 'V' ? [] : [descToWasm(ret)],
+          () => { this.box.deoptFlag = 1; return dummy; }),
+        writes: null,
+        deoptable: true,
+      };
+    };
     const hierarchy = this.wasmJit.hierarchy;
     // See the matching site in WasmJit: these wait on the impl METHOD.
     const implKey = (implClassName) => `${implClassName}.${name}${descriptor}`;
@@ -2451,7 +2820,11 @@ class StructuredWasmCompiler {
     } else {
       const resolved = hierarchy.resolveDispatch(owner, name, descriptor);
       resolvedCone = resolved;
-      if (!resolved) throw new Unsupported(`invoke ${owner}.${name} unresolved`);
+      if (!resolved) {
+        const exit = nativeExit();
+        if (exit) return exit;
+        throw new Unsupported(`invoke ${owner}.${name} unresolved`);
+      }
       // Bound the dispatch cone per runtime; embedders may raise the default
       // for measured call chains without changing unrelated JVM instances.
       if (resolved.impls.size > maxImpls(this.wasmJit.maxInstanceImplementations)) {
@@ -2474,6 +2847,8 @@ class StructuredWasmCompiler {
         if (st) readyCount += 1;
       }
       if (!readyCount) {
+        const exit = nativeExit();
+        if (exit) return exit;
         // Any one impl gaining a module makes this site linkable.
         throw new Unsupported(`invoke ${owner}.${name} no ready impl`,
           [...resolved.impls.values()].map((impl) => implKey(impl.className)));
@@ -2714,6 +3089,10 @@ class StructuredWasmCompiler {
       }
       meta.box.frame = frame;
       meta.box.ret = undefined;
+      if (this.wasmJit.opaqueNormalFlowEnabled || this.wasmJit.canonicalEhLinksEnabled) {
+        meta.box.canonicalFrameHandoff = false;
+        this.wasmJit.canonicalResumeFrames.delete(frame);
+      }
       let status;
       try {
         status = calleeSt.synchronized
@@ -2727,6 +3106,12 @@ class StructuredWasmCompiler {
             console.error(`[wasmjit] nested callee ${calleeSt.key} unwound through a nested deopt`
               + ` (${err.frames.map((f) => `${f.className || '?'}.${f.method && f.method.name}@${f.pc}`).join(' <- ') || 'no frames'})`);
           }
+          if ((this.wasmJit.opaqueNormalFlowEnabled || this.wasmJit.canonicalEhLinksEnabled) &&
+              (meta.frameEntryOnly || meta.box.canonicalFrameHandoff ||
+                err.frames.some(owned => this.wasmJit.canonicalResumeFrames.has(owned)))) {
+            this.wasmJit.canonicalResumeFrames.add(frame);
+            box.canonicalFrameHandoff = true;
+          }
           err.frames.push(frame);
           if (frame === scratchFrames.get(calleeSt)) scratchFrames.delete(calleeSt);
           box.pendingFrames = err.frames;
@@ -2737,6 +3122,10 @@ class StructuredWasmCompiler {
       } finally {
         if (partial) frame.inUse = false;
         meta.box.frame = savedFrame;
+      }
+      if (status !== -1 && (meta.frameEntryOnly || meta.box.canonicalFrameHandoff)) {
+        this.wasmJit.canonicalResumeFrames.add(frame);
+        box.canonicalFrameHandoff = true;
       }
       if (status === -3) {
         // The callee caught a guest exception in wasm: its spill import
@@ -2816,33 +3205,36 @@ class StructuredWasmCompiler {
       }
       spills.push({ slot, value, t });
     }
+    this.recordBooleanStaticSpill(node.slotState, site.resumeIdx, spills);
     if (spills.length || (CLEAR_DROPPED && droppedSlots.length)) {
       const slots = spills.map((s) => s.slot);
       const clear = CLEAR_DROPPED ? droppedSlots : null;
       const box = this.box;
       const idx = this.addImport(
-        `call_spill_${site.resumeIdx}`, spills.map((s) => s.t), [],
+        `call_spill_${site.resumeIdx}`, [...spills.map((s) => s.t),...(this.directFrames?[T.i32]:[])], [],
         (...values) => {
-          const locals = box.frame.locals;
+          const locals = (this.directFrames ? this.directFrames.frame(values.pop()) : box.frame).locals;
           for (let i = 0; i < slots.length; i += 1) locals[slots[i]] = values[i];
           if (clear) for (let i = 0; i < clear.length; i += 1) locals[clear[i]] = undefined;
         },
       );
       for (const { value } of spills) out.push(...this.useOf(value));
+      if(this.directFrames)out.push(OP.local_get,...uleb(this.directIdLocal));
       out.push(OP.call, ...uleb(idx));
     }
     // interpreter operand stack, bottom-up: values under the call's args,
     // then — only when the invoke re-executes — the operands themselves
     for (const value of unders) {
-      out.push(...this.useOf(value), OP.call, ...uleb(pushImportFor(this, KIND_T[value.kind])));
+      out.push(...this.useOf(value), ...this.framePush(KIND_T[value.kind]));
     }
     if (reexecute) {
       for (const value of node.args) {
         const t = KIND_T[value.kind];
         if (t === undefined) throw new Unsupported('unkinded call operand');
-        out.push(...this.useOf(value), OP.call, ...uleb(pushImportFor(this, t)));
+        out.push(...this.useOf(value), ...this.framePush(t));
       }
     }
+    this.markDirectExit(reexecute ? site.resumeIdx : site.resumeIdx+1,out);
     out.push(OP.i32_const, ...sleb(reexecute ? site.resumeIdx : site.resumeIdx + 1), OP.return);
   }
 

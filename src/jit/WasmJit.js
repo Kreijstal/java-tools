@@ -2607,6 +2607,23 @@ class WasmJit {
     // revalidation, but expanding a nested chain can worsen frame latency.
     // Keep the alternative ranking opt-in until constrained gameplay passes.
     this.preferCompleteInstanceCallees = wasmOptions.preferCompleteInstanceCallees === true;
+    // Opt-in frame entry requires complete structured normal flow plus a
+    // captured-integer spill proof; partial OSR and raw callee links stay out.
+    this.opaqueNormalFlowEnabled = wasmOptions.opaqueNormalFlow === true;
+    this.canonicalEhLinksEnabled = wasmOptions.canonicalEhLinks === true;
+    this.canonicalDirectCallsEnabled = wasmOptions.canonicalDirectCalls === true;
+    this.canonicalLeafCallsEnabled = wasmOptions.canonicalLeafCalls === true;
+    this.primitiveArrayCopyEntryEnabled = wasmOptions.primitiveArrayCopyEntry === true;
+    this.intZeroClearEntryEnabled = wasmOptions.intZeroClearEntry === true;
+    this.nativeJsExceptionTagsEnabled = wasmOptions.nativeJsExceptionTags === true;
+    this.nativeInstanceExitsEnabled = wasmOptions.nativeInstanceExits === true;
+    this.canonicalDirectLinks = this.canonicalDirectCallsEnabled
+      ? new (require('./CanonicalDirectFrames').CanonicalDirectLinks)() : null;
+    this.inlineColdIntegerLeavesEnabled = wasmOptions.inlineColdIntegerLeaves === true;
+    this.primitiveByteCopyEntryEnabled = wasmOptions.primitiveByteCopyEntry === true;
+    this.structuredIrreducibleSplittingEnabled = wasmOptions.structuredIrreducibleSplitting === true;
+    this.sharedFieldArrayCachesEnabled = wasmOptions.sharedFieldArrayCaches === true;
+    this.canonicalResumeFrames = new WeakSet();
     // Closed polymorphic sites can classify the externref once, then call the
     // selected raw Wasm export directly. This removes the JS nested-call
     // wrapper while retaining the generic import for null, late, partial, and
@@ -2830,6 +2847,7 @@ class WasmJit {
     st.osr = null;
     st.callee = null;
     if (this.linker && st.key) this.linker.unbind(st.key);
+    if(this.canonicalDirectLinks && st.key)this.canonicalDirectLinks.withdraw(st.key);
   }
 
   methodState(frame) {
@@ -2865,8 +2883,23 @@ class WasmJit {
   }
 
   // shared gating/warmup/compile; returns {st, blk} when the frame can run now
+  requiresCanonicalResume(frame) {
+    if (!(this.opaqueNormalFlowEnabled || this.canonicalEhLinksEnabled)) return false;
+    if (this.canonicalResumeFrames.has(frame)) return true;
+    // The proof covers a fresh structured invocation and its spills. It
+    // does not authorize entering another compiled tier after interpreting
+    // a prefix, even when an exit-storm policy selected JS at PC zero.
+    if (frame?.pc !== 0 && this.state.get(frame?.method)?.meta?.frameEntryOnly) {
+      this.canonicalResumeFrames.add(frame);
+      return true;
+    }
+    return false;
+  }
+
   prepare(frame) {
     if (!this.enabled || !frame || !frame.method || !frame.instructions) return null;
+    if ((this.opaqueNormalFlowEnabled || this.canonicalEhLinksEnabled) &&
+        this.requiresCanonicalResume(frame)) return null;
     if (this.compileClassFilter &&
         !this.compileClassFilter.has(frame.className || frame.method.className)) return null;
     // Object construction and class initialization have observable all-or-
@@ -3301,7 +3334,8 @@ class WasmJit {
     st.status = 'compiling';
     let validatingBytes = null; // last bytes handed to WebAssembly.Module, for reject dumps
     let primaryMeta = null; // census-only: the meta a partial-module reject saw
-    let installedSlots = null; // linker slots the surviving module names
+    let installedSlots = null;
+    let installedCanonicalSlots = null; // linker slots the surviving module names
     let installed = false;
     try {
       let structuredMeta = null;
@@ -3364,9 +3398,11 @@ class WasmJit {
           (linkable(meta) || !linkable(structuredMeta))) {
         st.wasmCandidateCoverage.structuredDiscarded = true;
         if (this.linker) this.linker.release(structuredMeta.linkSlots);
+        if(this.canonicalDirectLinks)this.canonicalDirectLinks.release(structuredMeta.canonicalSlots);
         structuredMeta = null;
       }
       installedSlots = structuredMeta ? structuredMeta.linkSlots : null;
+      installedCanonicalSlots=structuredMeta?.canonicalSlots;
       // A partial module can leave and later resume with locals captured
       // before its first compiled block. Until boolean-static values have a
       // verifier-backed spill proof across every unsupported edge, keep that
@@ -3378,7 +3414,18 @@ class WasmJit {
       if (capturesBooleanStatic(frame.method) &&
           ((meta && !meta.fullyCompiled) ||
             (structuredMeta && !structuredMeta.fullyCompiled))) {
-        throw new Unsupported('partial module captures a boolean static');
+        if (this.opaqueNormalFlowEnabled && structuredMeta?.normalFlowFullyCompiled &&
+            structuredMeta.usedEh &&
+            structuredMeta.booleanStaticSpillProof && !structuredMeta.boxedCount &&
+            structuredMeta.externalEntry.has(0)) {
+          // This entry owns its entire normal flow. Every canonical exit
+          // retains the verifier's captured integer values; the partial
+          // dispatcher must never become an OSR or callee companion.
+          meta = null;
+          structuredMeta.frameEntryOnly = true;
+        } else {
+          throw new Unsupported('partial module captures a boolean static');
+        }
       }
       const primary = structuredMeta || meta;
       primaryMeta = primary;
@@ -3477,7 +3524,11 @@ class WasmJit {
           !!primary && primary.externalEntry.has(0) && !primary.boxedCount &&
           (primary.fullyCompiled || primary.normalFlowFullyCompiled);
         if (paidForByHeat) this.loopFreeAdmissions = (this.loopFreeAdmissions || 0) + 1;
-        if (!hasCompiledLoop && !paidForByHeat) {
+        const paidForByCanonicalCaller = !hasCompiledLoop &&
+          this.jit.isPreparedCanonicalWasmCallerCandidate(frame.method) &&
+          !!primary && primary.normalFlowFullyCompiled &&
+          primary.externalEntry.has(0) && !primary.boxedCount;
+        if (!hasCompiledLoop && !paidForByHeat && !paidForByCanonicalCaller) {
           if (this.debug && meta && meta.demoteReasons.size) {
             const details = [...meta.demoteReasons.entries()]
               .map(([block, reason]) => `${block}:${reason}`).join(', ');
@@ -3516,6 +3567,10 @@ class WasmJit {
       st.run = instance.exports.run;
       primary.retv = instance.exports.retv || null;
       primary.runv = instance.exports.runv || null;
+      primary.canonicalRun=instance.exports.canonicalRun||null;
+      primary.canonicalFuel=instance.exports.canonicalFuel||null;
+      primary.canonicalEntries=instance.exports.canonicalEntries||null;
+      if(primary.canonicalRun)instance.exports.canonicalOwner.value=primary.directFrameContext;
       primary.specok = instance.exports.specok || null;
       if (primary.specok) this.specokGlobals.add(primary.specok);
       if (structuredMeta && meta) {
@@ -3561,7 +3616,10 @@ class WasmJit {
       st.callee = st.osr && rank(st.osr.meta) > rank(st.meta) ? st.osr : null;
       st.status = 'ready';
       installed = true;
+      if(primary.canonicalLifetime)primary.canonicalLifetime.metadata=primary;
+      if(this.canonicalDirectLinks)this.canonicalDirectLinks.retain(primary);
       this.registerPendingLinks(st, primary);
+      if(this.canonicalDirectLinks)this.canonicalDirectLinks.publish(st);
       this.resolvePendingLinks(st);
       // Every publication, first or recompile: the table slots naming this
       // method follow the module that is current now.
@@ -3637,6 +3695,7 @@ class WasmJit {
     } catch (err) {
       // The surviving translation's slots die with it.
       if (!installed && this.linker && installedSlots) this.linker.release(installedSlots);
+      if(!installed && this.canonicalDirectLinks)this.canonicalDirectLinks.release(installedCanonicalSlots);
       if (process.env.JVM_WASM_DUMP_REJECT && validatingBytes &&
           /WebAssembly/.test(err.message)) {
         const file = `${process.env.JVM_WASM_DUMP_REJECT}/${st.key.replace(/[^\w.]/g, '_')}.wasm`;
@@ -3845,11 +3904,19 @@ class WasmJit {
     const previousFrame = meta.box.frame;
     meta.box.frame = frame;
     meta.box.ret = undefined;
+    if (this.opaqueNormalFlowEnabled || this.canonicalEhLinksEnabled) {
+      meta.box.canonicalFrameHandoff = false;
+    }
     this.activeThread = thread;
     try {
       status = callWasmRun(mod.run, args);
     } catch (err) {
       if (err instanceof NestedDeopt) {
+        if ((this.opaqueNormalFlowEnabled || this.canonicalEhLinksEnabled) &&
+            (meta.frameEntryOnly || meta.box.canonicalFrameHandoff ||
+              err.frames.some(owned => this.canonicalResumeFrames.has(owned)))) {
+          this.canonicalResumeFrames.add(frame);
+        }
         // A linked partial callee hit a demoted block. The import closures
         // already spilled every frame's state and set this frame's pc to the
         // post-invoke resume point; materialize the nested chain (frames are
@@ -3897,6 +3964,12 @@ class WasmJit {
       }));
     }
 
+    // The captured-local proof covers canonical bytecode resumption. Keep
+    // an exited activation on that path until retirement; prepared JS/OSR
+    // entries do not own the same post-call restoration state.
+    if (status !== -1 && (meta.frameEntryOnly || meta.box.canonicalFrameHandoff)) {
+      this.canonicalResumeFrames.add(frame);
+    }
     if (status === -3) {
       // EH catch site: a guest exception was thrown at a precise pc inside a
       // live handler range. The spill import already wrote the locals
@@ -4294,7 +4367,7 @@ class WasmJit {
   // what the late-bound trampoline exists for, and conflating the two is the
   // coupling this whole phase removes -- but so is treating 'incompatible' as
   // 'unknown', which installs a caller that exits Wasm on every invocation.
-  staticLinkClassification(className, name, descriptor, allowSynchronized = false) {
+  staticLinkClassification(className, name, descriptor, allowSynchronized = false, allowCanonicalEh = false) {
     const cd = this.jvm.classes[className];
     const clsAst = cd && cd.ast && cd.ast.classes[0];
     // A JRE-native or unloaded class owns no bytecode this backend compiles,
@@ -4327,6 +4400,8 @@ class WasmJit {
     }
     const cm = (st.callee || st).meta;
     if (!cm) return 'unknown';
+    if (cm.frameEntryOnly && !(allowCanonicalEh && this.canonicalEhLinksEnabled &&
+        cm.normalFlowFullyCompiled && cm.usedEh && cm.booleanStaticSpillProof)) return 'incompatible';
     if (cm.boxedCount) return 'incompatible';
     if (hasUncheckedSpeculation(cm)) return 'incompatible';
     if (cm.fullyCompiled || cm.normalFlowFullyCompiled) return 'compatible';
@@ -4406,7 +4481,8 @@ class WasmJit {
     return { pending: pending.length, unresolvable, blockers };
   }
 
-  findReadyStatic(className, name, descriptor, allowPartial = false, allowOnDemand = false, allowSynchronized = false) {
+  findReadyStatic(className, name, descriptor, allowPartial = false, allowOnDemand = false, allowSynchronized = false, allowCanonicalEh = false) {
+    if (this.jvm._jreFindMethod?.(className, name, descriptor)) return null;
     const cd = this.jvm.classes[className];
     const clsAst = cd && cd.ast && cd.ast.classes[0];
     if (!clsAst) return null;
@@ -4447,6 +4523,8 @@ class WasmJit {
     }
     if (!st || st.status !== 'ready') return null;
     const cm = (st.callee || st).meta;
+    if (cm.frameEntryOnly && !(allowCanonicalEh && this.canonicalEhLinksEnabled &&
+        cm.normalFlowFullyCompiled && cm.usedEh && cm.booleanStaticSpillProof)) return null;
     if (cm.boxedCount) return null;
     // Inline-baked speculative modules are entered only through prepare(),
     // whose epoch check invalidates them; a captured link would outlive that
@@ -4490,6 +4568,7 @@ class WasmJit {
   // whose class was initialized at instantiation, so linking cannot bypass
   // an observable class initializer.
   findReadyInstance(className, name, descriptor, allowSynchronized = false) {
+    if (this.jvm._jreFindMethod?.(className, name, descriptor)) return null;
     const cd = this.jvm.classes[className];
     const clsAst = cd && cd.ast && cd.ast.classes[0];
     if (!clsAst) return null;
@@ -4525,6 +4604,7 @@ class WasmJit {
     };
     if (!st || st.status !== 'ready') return unlinkable(`status ${st ? st.status : 'none'}`);
     const cm = (st.callee || st).meta;
+    if (cm.frameEntryOnly) return unlinkable('canonical frame entry only');
     if (cm.boxedCount) return unlinkable(`${cm.boxedCount} boxed slots`);
     // Guarded speculative modules are excluded like findReadyStatic. Guard-
     // elided modules (specSites without speculations) ARE returned: every

@@ -874,6 +874,7 @@ class JitCompiler {
     this.scalarPositionalCallsEnabled = options.scalarPositionalCalls === true;
     this.prepareColdIntegerInlines = options.prepareColdIntegerInlines === true;
     this.preparedLoopLeafWasm = options.preparedLoopLeafWasm === true;
+    this.preparedWasmPositionalFrames = options.preparedWasmPositionalFrames === true;
     this.preparedCompleteWasm = options.preparedCompleteWasm === true;
     this.preparedPartialWasmMethodKeys = methodIdentitySet(options.preparedPartialWasmMethods, "preparedPartialWasmMethods");
     this.preparedWasmMethodKeys = methodIdentitySet(options.preparedWasmMethods, "preparedWasmMethods");
@@ -1187,6 +1188,8 @@ class JitCompiler {
   }
 
   tryRunFrame(frame, thread) {
+    if ((this.wasmJit.opaqueNormalFlowEnabled || this.wasmJit.canonicalEhLinksEnabled) &&
+        this.wasmJit.requiresCanonicalResume(frame)) return UNHANDLED_RESULT;
     // A transient generated-code deopt requests one canonical bytecode before
     // any compiled tier may try the frame again.  Consume that request at the
     // dispatcher boundary: letting canRun() consume it later still leaves the
@@ -1495,6 +1498,15 @@ class JitCompiler {
       this.hasReadyFullWasmModule(method);
   }
 
+  // The preparation filter must supply modules for the same call-free loop
+  // policy that selects them. Reporter handlers are outside normal flow;
+  // executable calls retain their current preparation and entry policy.
+  isPreparedLoopLeafWasmCandidate(method) {
+    return this.preparedLoopLeafWasm &&
+      this.preparedCodegenMethods.has(method) && this.hasBackwardBranch(method) &&
+      !normalFlowContainsInvoke(this.getCodeItems(method));
+  }
+
   hasPreparedLoopLeafWasmUpgrade(method) {
     const selected = this.isPreparedWasmMethodSelected(method);
     if (!(this.preparedLoopLeafWasm || this.preparedCompleteWasm || selected) || !this.preparedCodegenMethods.has(method) ||
@@ -1532,14 +1544,43 @@ class JitCompiler {
     return selected;
   }
 
+  isPreparedNormalFlowWasmCandidate(method) {
+    return this.wasmJit.opaqueNormalFlowEnabled &&
+      (!this.preparedWasmMethodKeys.size || this.isPreparedWasmMethodSelected(method)) &&
+      this.preparedCodegenMethods.has(method) &&
+      this.requiresOpaqueControlInterpreter(method, this.getCodeItems(method)) &&
+      this.hasControlFlowBackedge(method) &&
+      !['<init>', '<clinit>'].includes(method.name) &&
+      /\)[VZBCSIJFD]$/.test(method.descriptor);
+  }
+
+  isPreparedCanonicalWasmCallerCandidate(method) {
+    // A selected caller can remove a JS boundary around already-proved EH
+    // callees even without its own loop. Keep this separate from the ordinary
+    // backedge policy, and require an explicit selection in canonical mode.
+    return this.wasmJit.canonicalEhLinksEnabled &&
+      this.wasmJit.normalFlowPreparedUpgradesEnabled &&
+      this.isPreparedWasmMethodSelected(method) &&
+      this.preparedCodegenMethods.has(method) &&
+      !['<init>', '<clinit>'].includes(method.name) &&
+      !(method.flags || []).some(flag => ['native', 'abstract', 'synchronized'].includes(flag)) &&
+      /\)[VZBCSIJFD]$/.test(method.descriptor) &&
+      normalFlowContainsInvoke(this.getCodeItems(method));
+  }
+
   hasPreparedNormalFlowWasmUpgrade(method) {
     // This is frame-entry selection, not permission to raw-link an EH body.
     // Complete normal flow can run in the prepared module while a throw still
     // exits through its canonical Frame/exception table. Keep this in the
     // opt-in compiled call-chain experiment until the browser gate passes.
-    if (!this.wasmJit.normalFlowPreparedUpgradesEnabled ||
+    if (!this.wasmJit.normalFlowPreparedUpgradesEnabled &&
+        !this.wasmJit.opaqueNormalFlowEnabled) return false;
+    if (this.preparedWasmMethodKeys.size && !this.isPreparedWasmMethodSelected(method)) return false;
+    const opaqueCandidate = this.isPreparedNormalFlowWasmCandidate(method);
+    if ((!this.wasmJit.normalFlowPreparedUpgradesEnabled && !opaqueCandidate) ||
         !this.preparedCodegenMethods.has(method) ||
-        !this.hasBackwardBranch(method)) return false;
+        (!this.hasBackwardBranch(method) && !opaqueCandidate &&
+          !this.isPreparedCanonicalWasmCallerCandidate(method))) return false;
     const state = this.wasmJit.enabled && this.wasmJit.state.get(method);
     const meta = state?.status === 'ready' && state.meta;
     return Boolean(meta && meta.normalFlowFullyCompiled &&
@@ -2207,7 +2248,13 @@ class JitCompiler {
     if (this.wasmJit.enabled) this.wasmJit.dumpStats();
   }
 
+  hasNativeMethodOverride(method) {
+    const owner = this.jvm.findClassNameForMethod?.(method) || method?.className;
+    return Boolean(owner && this.jvm._jreFindMethod?.(owner, method.name, method.descriptor));
+  }
+
   getGeneratedFunction(method, options = {}) {
+    if (this.hasNativeMethodOverride(method)) return null;
     const preparedEffectful = options.allowEffectfulCalls === true ||
       this.preparedCodegenMethods.has(method);
     if (!this.codegenEnabled || this.codegenUnavailable ||
@@ -4055,6 +4102,7 @@ class JitCompiler {
       directJreInitializationTokens: this.directJreInitializationTokens.length,
       // Unsupported local tables remain watermarked so transport refuses
       // generated text that would address missing receiver entries.
+      directCheckedLeafBodies: this.directCheckedLeafBodies.length,
       checkedLeafCaptureCaches: this.checkedLeafCaptureCaches.length,
       inlineLoopRegions: this.inlineLoopRegions.length,
     };
@@ -4113,6 +4161,9 @@ class JitCompiler {
       watermark.restoringFrameLayouts);
     grow(this.directJreIntrinsics, watermark.directJreIntrinsics);
     grow(this.directJreInitializationTokens, watermark.directJreInitializationTokens);
+    // A worker cannot carry these executable entries. Reserve the sender's
+    // prefix so a new allocation is detected as unsupported table growth.
+    grow(this.directCheckedLeafBodies, watermark.directCheckedLeafBodies ?? 0);
     return this.siteIdWatermark();
   }
 
@@ -6267,6 +6318,8 @@ class JitCompiler {
   }
 
   tryRunInlineLoopRegionOsr(frame, thread) {
+    if ((this.wasmJit.opaqueNormalFlowEnabled || this.wasmJit.canonicalEhLinksEnabled) &&
+        this.wasmJit.requiresCanonicalResume(frame)) return false;
     if (!frame || !frame.method || !frame.instructions ||
         frame.jitSkipOnce || this.runningFrames.has(frame) ||
         this._envInstrumented || thread?.status !== "runnable") return false;
@@ -9947,9 +10000,78 @@ class JitCompiler {
       state.meta.fullyCompiled);
   }
 
+  // Reuse a canonical child only after Wasm retires it. Fuel, exceptions and
+  // nested deopts leave scheduler-owned frames out of the pool. This keeps the
+  // frame-entry proof while avoiding an allocation on every productive call.
+  getPreparedWasmPositionalInvoker(site, target) {
+    const method = target?.method;
+    const state = method && this.wasmJit.state.get(method);
+    if (!this.preparedWasmPositionalFrames || !this.hasPreparedFullWasmUpgrade(method) ||
+        state?.status !== 'ready' || !state.meta?.frameEntryOnly ||
+        !state.meta.booleanStaticSpillProof || !state.meta.normalFlowFullyCompiled ||
+        (method.flags || []).includes('synchronized')) return null;
+    const receiverSlots = site.op === 'invokestatic' ? 0 : 1;
+    const count = site.params.length + receiverSlots;
+    if (count > 32) return null;
+    if (target.positionalInvoker?.jvmPreparedWasmFrameAdapter) return target.positionalInvoker;
+    const args = Array.from({length: count}, (_, i) => `argument${i}`);
+    const assignments = receiverSlots ? ['child.locals[0] = argument0;'] : [];
+    let local = receiverSlots;
+    for (let i = 0; i < site.params.length; i += 1) {
+      assignments.push(`child.locals[${local}] = argument${i + receiverSlots};`);
+      local += site.params[i] === 'long' || site.params[i] === 'double' ? 2 : 1;
+    }
+    const source = [
+      "'use strict';",
+      "if (plan.staticInitialization && !plan.staticInitialization.initialized) return plan.asyncInvoke;",
+      "const jit = plan.jit;",
+      "if (!jit.hasPreparedFullWasmUpgrade(plan.method)) return plan.asyncInvoke;",
+      "const child = plan.target.freeFrame || new plan.Frame(plan.method);",
+      "plan.target.freeFrame = null;",
+      "if (plan.clearStructuredContinuation) plan.clearStructuredContinuation(child);",
+      "jit.wasmJit.canonicalResumeFrames.delete(child);",
+      "child.pc = 0; child.stack.items.length = 0;",
+      "child.jitSkipOnce = undefined; child.jitJsDisabled = undefined;",
+      "child.jitAdaptiveEntryCounted = undefined;",
+      "child.jitGeneratedReturnParent = undefined; child.jitGeneratedReturnType = undefined;",
+      "child.className = plan.lookupClass;",
+      ...assignments,
+      "const depth = thread.callStack.items.length;",
+      "thread.callStack.push(child);",
+      "const result = jit.wasmJit.runNested(child, thread, {requireNormalFlowFullyCompiled:true});",
+      "if (result.returned && thread.callStack.items.length === depth) {",
+      "  plan.target.freeFrame = child;",
+      site.returnType === 'void' ? "  return plan.returnVoid;" : "  return result.value;",
+      "}",
+      "if (result.handled === false) {",
+      "  if (thread.callStack.peek() === child) thread.callStack.pop();",
+      "  plan.target.freeFrame = child;",
+      "  return plan.asyncInvoke;",
+      "}",
+      "return {deopt:true,transient:true,callHandoff:true,",
+      "  reason:'prepared positional Wasm exit',",
+      "  jvmPositionalChild:thread.callStack.items.includes(child) ? child : undefined};",
+    ].join('\n');
+    const entry = this.createGeneratedFunction(method, 'wasm-positional-frame',
+      ['plan', ...args, 'thread'], source, target.lookupClass);
+    const invoke = entry.bind(null, {jit:this,target,method,Frame,
+      clearStructuredContinuation:target.generated?.jvmClearStructuredContinuation,
+      staticInitialization:site.op === 'invokestatic' ? site.initializationToken : null,
+      lookupClass:target.lookupClass,asyncInvoke:ASYNC_INVOKE,returnVoid:RETURN_VOID});
+    invoke.jvmPreparedWasmFrameAdapter = true;
+    invoke.jvmCanonicalFrameAdapter = true;
+    invoke.jvmRestoresExceptionFrames = true;
+    invoke.jvmSafePointCharge = Math.max(1,this.getCodeItems(method).length);
+    target.positionalInvoker = invoke;
+    return invoke;
+  }
+
   getPositionalGeneratedInvoker(site, target) {
     if (!this.positionalGeneratedCallsEnabled) return null;
     if (!target || target.positionalInvoker === null) return null;
+    const preparedWasmInvoker = this.preparedWasmPositionalFrames
+      ? this.getPreparedWasmPositionalInvoker(site, target) : null;
+    if (preparedWasmInvoker) return preparedWasmInvoker;
     const { method, lookupClass, generated } = target;
     // A direct JavaScript edge bypasses normal frame-entry tier selection.
     // Do not publish or reuse one while the callee has a complete productive
@@ -10607,6 +10729,9 @@ class JitCompiler {
   // or null when the call cannot be made synchronously here.
   linkSyncCallTarget(site, targetClassName, wholeMethodCaller, prewarm) {
     const { op, methodName, descriptor, params, returnType } = site;
+    // A registered async override must hand off at the invoke. Linking its
+    // original Java body would silently replace the native operation.
+    if (this.jvm._jreFindMethod(targetClassName, methodName, descriptor)) return null;
     let classData = this.jvm.classes[targetClassName];
     if (!classData) return null;
     let method = this.jvm.findMethod(classData, methodName, descriptor);
@@ -10623,7 +10748,7 @@ class JitCompiler {
       if (!classData) return null;
       method = this.jvm.findMethod(classData, methodName, descriptor);
     }
-    if (!method) return null;
+    if (!method || this.hasNativeMethodOverride(method)) return null;
     // The Firefox whole-method tier deliberately accepts a wider verified
     // opcode/control-flow set than the legacy runner. Keep nested calls in
     // that same tier: otherwise a generated caller yields to the scheduler,
@@ -11299,6 +11424,7 @@ class JitCompiler {
   }
 
   getSynchronousIntrinsic(method, descriptor) {
+    if (this.hasNativeMethodOverride(method)) return null;
     const codeItems = this.getCodeItems(method);
     const code = method.attributes.find((attribute) => attribute.type === "code");
     const intrinsicCodeItems = stripProvenDeadEntryInitializers(
@@ -11338,6 +11464,31 @@ class JitCompiler {
     }
 
     return null;
+  }
+
+  tryTypedByteCopyLoop(destination, di, source, si, count) {
+    if (source == null || destination == null ||
+        source.type === '[Z' || destination.type === '[Z' ||
+        source.elementType === 'boolean' || destination.elementType === 'boolean' ||
+        !Number.isInteger(si) || !Number.isInteger(di) ||
+        !Number.isInteger(count) || count <= 0 || count > 4096 ||
+        si < 0 || di < 0) return false;
+    const src = this.arrayData(source), dst = this.arrayData(destination);
+    if (!(src instanceof Int8Array) || !(dst instanceof Int8Array) ||
+        Object.getPrototypeOf(src) !== Int8Array.prototype ||
+        Object.getPrototypeOf(dst) !== Int8Array.prototype ||
+        source.length !== src.length || destination.length !== dst.length ||
+        si > src.length - count || di > dst.length - count ||
+        si + count > 2147483647 || di + count > 2147483647 ||
+        typeof SharedArrayBuffer !== 'undefined' &&
+          (src.buffer instanceof SharedArrayBuffer || dst.buffer instanceof SharedArrayBuffer)) return false;
+    const sb=src.byteOffset+si,db=dst.byteOffset+di;
+    // This loop copies forward, including when Java references alias.
+    if (src.buffer === dst.buffer && db > sb && db < sb + count) return false;
+    Int8Array.prototype.set.call(dst,new Int8Array(src.buffer,sb,count),di);
+    this.typedByteCopyLoopCount = (this.typedByteCopyLoopCount || 0) + 1;
+    this.typedByteCopyLoopBytes = (this.typedByteCopyLoopBytes || 0) + count;
+    return true;
   }
 
   primitiveArrayCopyDirect(source, sourceIndex, destination, destinationIndex, length) {
@@ -11439,6 +11590,7 @@ class JitCompiler {
   // a structured (positional) caller binds fixed parameter names to its own
   // operands by declaration. Each form is rendered once per callee.
   getInlineIntegerPlan(method, params, returnType, positional = false) {
+    if (this.hasNativeMethodOverride(method)) return null;
     const cache = positional
       ? this.inlineIntegerPositionalPlanCache : this.inlineIntegerPlanCache;
     if (cache.has(method)) return cache.get(method);
@@ -11475,6 +11627,7 @@ class JitCompiler {
   }
 
   emitInlineIntegerMethod(method, params, returnType, args, state, depth) {
+    if (this.hasNativeMethodOverride(method)) return null;
     if (returnType !== "int" || !params.every((type) => type === "int") || depth > 4 ||
         state.active.has(method)) return null;
     const code = method.attributes.find((attr) => attr.type === "code");
@@ -12070,7 +12223,8 @@ class JitCompiler {
     // Code attribute; treating such an empty Frame as a successful call
     // silently skips required work. Match the interpreter and fail explicitly
     // when no shim exists.
-    if (this.jvm.jre[targetClassName]) {
+    if (this.jvm.jre[targetClassName] &&
+        !this.jvm.jre[targetClassName].applicationFallback) {
       frame.stack.items = stackSnapshot;
       frame.pc = invokePc;
       throw new Error(

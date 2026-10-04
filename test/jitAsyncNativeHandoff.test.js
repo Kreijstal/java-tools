@@ -69,3 +69,57 @@ public class NativeStreamReads {
   }
   t.end();
 });
+
+for(const policy of [
+ {codegen:false},
+ {structuredSsa:false},
+ {structuredSsa:true},
+ {structuredSsa:true,prepareColdIntegerInlines:true},
+])test(`an async override of a bytecode method wins on every call ${JSON.stringify(policy)}`,async t=>{
+ const classpath=fixture(t,'BytecodeOverride',`public class BytecodeOverride {
+   static int first,second;
+   static int read(){return -99;}
+   static int nested(){return read();}
+   static int outer(){return nested();}
+   public static void main(String[] args){first=outer();second=outer();}
+ }`);
+ let reads=0;
+ const j=new JVM({classpath,prepareBeforeMain:true,jit:{compileWorker:false,
+   compiledCallChains:true,ordinaryAdaptiveFramelessPositional:true,...policy},
+   jreOverrides:{BytecodeOverride:{natives:{applicationFallback:true},
+     methods:{'read()I':async()=>++reads}}}});
+ await j.run('BytecodeOverride');
+ t.equal(reads,2,'every call reaches the registered override');
+ t.equal(j.classes.BytecodeOverride.staticFields.get('first:I'),1,'first native result retained');
+ t.equal(j.classes.BytecodeOverride.staticFields.get('second:I'),2,'later native result retained');
+ const method=await j.findMethodInHierarchy('BytecodeOverride','read','()I');
+ t.equal(j.jit.getGeneratedFunction(method),null,'original body is not published');
+ t.equal(j.jit.getInlineIntegerPlan(method,[],'int',true),null,'original integer leaf is not inlined');
+ t.end();
+});
+
+test('ready Wasm bodies and static inlining cannot bypass a native override',async t=>{
+ const classpath=fixture(t,'OverrideLinks',`public class OverrideLinks {
+   static int read(){return -99;}
+   int instanceRead(){return -77;}
+   static int call(){return read();}
+ }`);
+ const j=new JVM({classpath,prepareBeforeMain:false,jit:{compileWorker:false,
+   wasmStructured:true},jreOverrides:{OverrideLinks:{natives:{applicationFallback:true},
+   methods:{'read()I':async()=>1,'instanceRead()I':async()=>2}}}});
+ await j.preloadClasspathClasses();j.classInitializationState.set('OverrideLinks','INITIALIZED');
+ const w=j.jit.wasmJit;w.enabled=true;
+ for(const [name,isStatic] of [['read',true],['instanceRead',false]]){
+   const method=await j.findMethodInHierarchy('OverrideLinks',name,'()I');
+   const state=w.methodState({method});
+   w.compile({method,className:'OverrideLinks'},state,{asCallee:true});
+   t.equal(state.status,'ready','an original body is deliberately available for the stale-link test');
+   t.equal(isStatic?w.findReadyStatic('OverrideLinks',name,'()I'):
+     w.findReadyInstance('OverrideLinks',name,'()I'),null,'the native override withholds the original module link');
+ }
+ const method=await j.findMethodInHierarchy('OverrideLinks','call','()I');
+ const code=method.attributes.find(a=>a.type==='code');
+ const {inlineCalls}=require('../src/jit/wasmInline');
+ t.equal(inlineCalls(j,code,{deepInline:true}),null,'static Wasm inlining preserves the native invoke');
+ t.end();
+});

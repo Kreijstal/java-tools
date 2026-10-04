@@ -41,6 +41,7 @@ function world(jvm) {
     .filter(item => item.type === 'method').map(item => item.method);
   return {
     watermark: jit.siteIdWatermark(),
+    directCheckedLeafBodies: jit.directCheckedLeafBodies.map(body => String(body)),
     syncCallSites: jit.syncCallSites.map((site, index) => site ? [site.op,
       site.declaredClassName, site.methodName, site.descriptor, site.callerPc,
       site.callerMethod ? methodKey(jvm, site.callerMethod) : null,
@@ -193,5 +194,25 @@ test('a mismatched or damaged pack falls back to compiling', async t => {
   t.equal(run.cache.refused, 1, 'the damaged entry is refused');
   t.ok(run.cache.hits < keys.length, 'replay stops at the refusal');
   t.equal(await invokeRun(partial, 9), expected, 'a partial replay computes the same result');
+  t.end();
+});
+
+
+test('a worker reservation cannot hide direct checked-leaf allocations', async t => {
+  const classpath = fixture(t, 'PackProbe', SOURCE);
+  const sender = await create(classpath);
+  await prepare(sender, memoryStore(), {requireCompleteResults: true});
+  const prefix = sender.jit.siteIdWatermark();
+  t.ok(prefix.directCheckedLeafBodies > 0, 'real checked-leaf calls allocate the table');
+  const worker = await create(classpath);
+  worker.jit.reserveSiteIdSpace(prefix);
+  t.equal(worker.jit.directCheckedLeafBodies.length, prefix.directCheckedLeafBodies,
+    'the worker reserves the sender prefix without inventing callable entries');
+  const caller = await worker.findMethodInHierarchy('PackProbe', 'run', '(I)I');
+  worker.jit.getGeneratedFunction(caller, {allowEffectfulCalls: true, compileLocally: true});
+  t.ok(worker.jit.directCheckedLeafBodies.length > prefix.directCheckedLeafBodies,
+    'new callable entries allocate beyond the reserved prefix');
+  t.ok(worker.jit.untransportableTableGrowth(prefix).includes('directCheckedLeafBodies'),
+    'the result is refused rather than addressing unrelated receiver entries');
   t.end();
 });

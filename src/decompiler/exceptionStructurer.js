@@ -410,35 +410,49 @@ function splitIrreducibleTerms(inputTerms, entry, options = {}) {
   for (let round = 0; round < 64; round++) {
     const succ = succFromTerms(terms);
     const n = terms.length;
-    const index = new Array(n).fill(-1), low = new Array(n).fill(0);
-    const stack = [], onStack = new Array(n).fill(false), components = [];
-    let nextIndex = 0;
-    const visit = (v) => {
-      index[v] = low[v] = nextIndex++;
-      stack.push(v); onStack[v] = true;
-      for (const w of succ[v]) {
-        if (index[w] < 0) { visit(w); low[v] = Math.min(low[v], low[w]); }
-        else if (onStack[w]) low[v] = Math.min(low[v], index[w]);
-      }
-      if (low[v] === index[v]) {
-        const component = [];
-        for (;;) { const w = stack.pop(); onStack[w] = false; component.push(w); if (w === v) break; }
-        components.push(component);
-      }
+    const componentsWithin = (nodes) => {
+      const has = v => nodes === null || nodes.has(v);
+      const index = new Array(n).fill(-1), low = new Array(n).fill(0);
+      const stack = [], onStack = new Array(n).fill(false), components = [];
+      let nextIndex = 0;
+      const visit = v => {
+        index[v] = low[v] = nextIndex++;
+        stack.push(v); onStack[v] = true;
+        for (const w of succ[v]) {
+          if (!has(w)) continue;
+          if (index[w] < 0) { visit(w); low[v] = Math.min(low[v], low[w]); }
+          else if (onStack[w]) low[v] = Math.min(low[v], index[w]);
+        }
+        if (low[v] === index[v]) {
+          const component = [];
+          for (;;) { const w = stack.pop(); onStack[w] = false; component.push(w); if (w === v) break; }
+          components.push(component);
+        }
+      };
+      for (let v = 0; v < n; v++) if (has(v) && index[v] < 0) visit(v);
+      return components;
     };
-    for (let v = 0; v < n; v++) if (index[v] < 0) visit(v);
-
-    let candidate = null;
-    for (const component of components) {
-      if (component.length === 1 && !succ[component[0]].includes(component[0])) continue;
-      const inside = new Set(component), entries = [];
-      for (const node of component) {
-        let externalPreds = node === entry ? 1 : 0;
-        for (let pred = 0; pred < n; pred++) if (!inside.has(pred) && succ[pred].includes(node)) externalPreds++;
-        if (externalPreds) entries.push({ node, externalPreds });
+    const findCandidate = nodes => {
+      for (const component of componentsWithin(nodes)) {
+        if (component.length === 1 && !succ[component[0]].includes(component[0])) continue;
+        const inside = new Set(component), entries = [];
+        for (const node of component) {
+          let externalPreds = node === entry ? 1 : 0;
+          for (let pred = 0; pred < n; pred++) if (!inside.has(pred) && succ[pred].includes(node)) externalPreds++;
+          if (externalPreds) entries.push({node, externalPreds});
+        }
+        if (entries.length > 1) return {component, inside, entries};
+        // A reducible outer loop can hide a multiple-entry inner loop.
+        // Peeling its sole header exposes the inner region while counting
+        // header edges as external entries, exactly as the structurer does.
+        if (entries.length === 1) {
+          inside.delete(entries[0].node);
+          if (inside.size) { const nested = findCandidate(inside); if (nested) return nested; }
+        }
       }
-      if (entries.length > 1) { candidate = { component, inside, entries }; break; }
-    }
+      return null;
+    };
+    const candidate = findCandidate(null);
     if (!candidate) return round ? { terms, origins } : null;
     const primary = candidate.entries.find((item) => item.node === entry)
       || candidate.entries.slice().sort((a, b) => b.externalPreds - a.externalPreds)[0];

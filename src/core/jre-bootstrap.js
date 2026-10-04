@@ -758,12 +758,23 @@ class JreBootstrap {
   static createClassItems(jreClassDef) {
     const classItems = [];
     if (jreClassDef) {
-      // Add fields
+      // Lazy native fields are declarations, not initialized storage.
+      const explicitStatics = new Map((jreClassDef.staticFieldDeclarations || [])
+        .map(field => [field.name + ':' + field.descriptor, field]));
+      for (const field of explicitStatics.values()) {
+        classItems.push({
+          type: 'field',
+          field: {accessFlags: 0x0008, ...field,
+            flags: [...(field.flags || ['static'])]},
+        });
+      }
+      // Add fields inferred from the older native models.
       const declaredFields = new Set(Object.keys(jreClassDef.fields || {}));
       for (const fieldSig of Object.keys(jreClassDef.staticFields || {})) {
         declaredFields.add(fieldSig.replace(/'/g, ''));
       }
       for (const fieldSig of declaredFields) {
+          if (explicitStatics.has(fieldSig)) continue;
           const colon = fieldSig.indexOf(":");
           if (colon === -1) continue;
           const isStatic = Object.keys(jreClassDef.staticFields || {})

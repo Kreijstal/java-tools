@@ -38,7 +38,11 @@ class PreparedCodeCache {
     // (JitCompiler.transportOptionalKeys): a restored checked leaf then has
     // no row entry or lexical-insertion body for its callers. With this set
     // such a step is not stored, so the replay compiles it and keeps them.
-    this.requireCompleteResults = options.requireCompleteResults === true;
+    // Checked-leaf factories are inputs to later uncached callers. Dropping
+    // them changes which bodies and numbered raw-call entries those callers
+    // allocate, so preparation must retain them even in optional-metadata mode.
+    this.requireCompleteResults = options.requireCompleteResults === true ||
+      jit.checkedLeafDirectPositionalEnabled;
     this.onUnrecorded = typeof options.onUnrecorded === 'function' ? options.onUnrecorded : null;
     this.stats = {hits:0, misses:0, writes:0, refused:0, errors:0, peakPayloadBytes:0,
       unrecorded:0, companions:0, restoreMs:0, counterNames:{}};

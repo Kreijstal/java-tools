@@ -266,6 +266,8 @@ function storedSlot(ins, op) {
 }
 
 function planStaticInline(ctx, ins, base, maxItems) {
+  if (Array.isArray(ins.arg) &&
+      ctx.jvm._jreFindMethod?.(ins.arg[1], ins.arg[2]?.[0], ins.arg[2]?.[1])) return null;
   const [, className, [name, descriptor]] = ins.arg;
   const cd = ctx.jvm.classes[className];
   const clsAst = cd && cd.ast && cd.ast.classes[0];
@@ -282,9 +284,23 @@ function planStaticInline(ctx, ins, base, maxItems) {
   // the same gate findReadyStatic applies before linking.
   const hasClinit = clsAst.items.filter((x) => x.type === 'method')
     .some((x) => x.method.name === '<clinit>');
-  if (hasClinit && ctx.jvm.classInitializationState.get(className) !== 'INITIALIZED') return null;
+  const coldOwner = hasClinit &&
+    ctx.jvm.classInitializationState.get(className) !== 'INITIALIZED';
+  if (coldOwner && !ctx.inlineColdIntegerLeaves) return null;
   const reachable = analyzeCallee(codeAttr.code, maxItems);
   if (!reachable) return null;
+  if (coldOwner) {
+    // An entry guard can defer the original invocation without moving clinit.
+    // Keep this proof narrow: no heap accesses, calls, throws, or division.
+    const signature = parseMethodDescriptor(descriptor);
+    if (!signature.params.every(t => /^[ZBCSI]$/.test(t)) ||
+        !/^[ZBCSI]$/.test(signature.ret) ||
+        ['native', 'abstract'].some(flag => (methodAst.flags || []).includes(flag))) return null;
+    const pureInteger = /^(nop|iconst_(m1|[0-5])|bipush|sipush|iload(_[0-3])?|istore(_[0-3])?|iinc|i(add|sub|mul|neg|shl|shr|ushr|and|or|xor)|i2[bcs]|dup|dup_x1|dup_x2|dup2|dup2_x1|dup2_x2|pop|pop2|swap|ireturn)$/;
+    for (const idx of reachable) {
+      if (!pureInteger.test(getOp(codeAttr.code.codeItems[idx].instruction) || '')) return null;
+    }
+  }
   for (const idx of reachable) {
     const it = codeAttr.code.codeItems[idx];
     const op2 = getOp(it.instruction);
@@ -309,7 +325,10 @@ function planStaticInline(ctx, ins, base, maxItems) {
   }));
   const localsSize = Number(codeAttr.code.localsSize) ||
     paramSlotsOf(params, 0).end;
-  return { stores, body, prefix, localsSize };
+  // Retain readiness after warm recompilation too: resetting initialization
+  // must not turn an already-inlined invocation into an unguarded bypass.
+  return { stores, body, prefix, localsSize,
+    coldOwner: hasClinit && ctx.inlineColdIntegerLeaves ? className : null };
 }
 
 // Splices one instance-call site. depth 0 = a site in the original caller
@@ -481,6 +500,8 @@ function planInstanceSite(ctx, ins, op, callerClassName, alloc, depth, recvIsThi
 // stub; its locals sit above every slot allocated so far. The callee itself
 // must be a leaf (no calls) whose loops are proven counted.
 function planInteriorStatic(ctx, ins, alloc) {
+  if (Array.isArray(ins.arg) &&
+      ctx.jvm._jreFindMethod?.(ins.arg[1], ins.arg[2]?.[0], ins.arg[2]?.[1])) return null;
   if (!Array.isArray(ins.arg)) return null;
   const [, className, [name, descriptor]] = ins.arg;
   const cd = ctx.jvm.classes[className];
@@ -528,6 +549,7 @@ function planInteriorStatic(ctx, ins, alloc) {
 
 function buildCalleeBody(ctx, impl, alloc, retLabel, depth) {
   const { className, method } = impl;
+  if (ctx.jvm._jreFindMethod?.(className, method.name, method.descriptor)) return null;
   const flags = method.flags || [];
   if (flags.includes('static') || flags.includes('abstract') ||
       flags.includes('native') || flags.includes('synchronized')) return null;
@@ -654,6 +676,7 @@ function inlineCalls(jvm, codeAttr, options = {}) {
     // Deep inlining (opt-in): splice static calls inside instance callees
     // and provably counted loops (planInteriorStatic, countedBackEdge).
     deepInline: options.deepInline === true,
+    inlineColdIntegerLeaves: options.inlineColdIntegerLeaves === true,
   };
   // Slot 0 holds `this` for the whole method only when nothing ever stores
   // over it (javac never does; obfuscated code may).
@@ -699,6 +722,7 @@ function inlineCalls(jvm, codeAttr, options = {}) {
   const deoptStubs = new Map();
   const alloc = { next: Number(codeAttr.code.localsSize) || 0 };
   let inlined = 0;
+  const coldStaticInlineOwners = new Set();
   for (let i = 0; i < items.length; i += 1) {
     const item = items[i];
     const op = getOp(item.instruction);
@@ -707,6 +731,7 @@ function inlineCalls(jvm, codeAttr, options = {}) {
       const entryMarker = plan && !plan.stores.length && item.labelDef;
       const planCost = plan && plan.stores.length + plan.body.length + 1 + (entryMarker ? 1 : 0);
       if (plan && planCost <= budget) {
+        if (plan.coldOwner) coldStaticInlineOwners.add(plan.coldOwner);
         plan.stores.forEach((s, si) => {
           out.push(si === 0 && item.labelDef ? { ...s, labelDef: item.labelDef } : s);
           origIdx.push(si === 0 ? i : -1);
@@ -775,6 +800,7 @@ function inlineCalls(jvm, codeAttr, options = {}) {
     ehOrigIdx,
     inlined,
     loopSites,
+    coldStaticInlineOwners: [...coldStaticInlineOwners],
     deoptStubs,
     speculations: ctx.speculations,
     specSites: ctx.specSites,

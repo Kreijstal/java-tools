@@ -12,6 +12,12 @@ function javaString(value) {
 module.exports = {
   super: 'java/lang/Object',
   staticFields: new Map(),
+  // These fields exist before initialization; <clinit> supplies their values.
+  staticFieldDeclarations: [
+    {name:'in', descriptor:'Ljava/io/InputStream;', accessFlags:0x0019, flags:['public','static','final']},
+    {name:'out', descriptor:'Ljava/io/PrintStream;', accessFlags:0x0019, flags:['public','static','final']},
+    {name:'err', descriptor:'Ljava/io/PrintStream;', accessFlags:0x0019, flags:['public','static','final']},
+  ],
   staticMethods: {
     'mapLibraryName(Ljava/lang/String;)Ljava/lang/String;': (jvm, obj, args) => {
       const name = String(args[0] && args[0].value !== undefined ? args[0].value : args[0]);

@@ -1,3 +1,4 @@
+const {pruneArgumentRanges} = require('./argumentRangePruning');
 const { narrowIntegerLoadRanges, maskedIntegerRange } = require("./narrowIntegerRanges");
 const { attachInsertionAssembler } = require("./positionalInsertion");
 const {
@@ -633,6 +634,7 @@ class JvmSsaBlockRenderer {
     this.compactRestoringVoidCalls = options.structuredCompactRestoringVoidCalls === true;
     this.explicitFrameSpills = options.structuredExplicitFrameSpills === true;
     this.sharedFramedMaterializer = options.structuredSharedFramedMaterializer === true;
+    this.argumentRanges = options.structuredArgumentRanges || null;
     this.sharedFieldAccess = options.structuredSharedFieldAccess === true;
     this.sharedFieldAccessMinCodeItems =
       Number.isSafeInteger(options.structuredSharedFieldAccessMinCodeItems) &&
@@ -716,6 +718,7 @@ class JvmSsaBlockRenderer {
     this.staticPrimitiveArrayKindsEnabled =
       options.structuredStaticPrimitiveArrayKinds !== false &&
       environment.JVM_DISABLE_STRUCTURED_STATIC_ARRAY_KINDS !== "1";
+    this.typedByteCopyLoopsEnabled = options.structuredTypedByteCopyLoops === true;
     this.loopInvariantStaticArrayViewsEnabled =
       options.structuredLoopInvariantStaticArrayViews === true ||
       environment.JVM_ENABLE_STRUCTURED_LOOP_STATIC_ARRAY_VIEWS === "1";
@@ -1405,8 +1408,14 @@ class JvmSsaBlockRenderer {
         verifiedStackWidthsBefore.set(index, kinds.map(kindWidth));
       }
     }
+    const argumentPruning = pruneArgumentRanges(method, items, cfg,
+      this.argumentRanges?.[compiledMethodIdentity]);
+    if (argumentPruning.targets.size) {
+      cfg.succ = cfg.term.map(succOfTerm);
+      cfg.succAll = cfg.term.map(succAllOfTerm);
+    }
     let prunedBooleanCfgBranches = 0;
-    const prunedBooleanBranchTargets = new Map();
+    const prunedBooleanBranchTargets = new Map(argumentPruning.targets);
     const prunedBooleanReadIndexes = new Set();
     if (guardedStaticBooleanSpecializationEnabled) {
       const instructionOp = (instruction) => !instruction ? null
@@ -4585,6 +4594,7 @@ class JvmSsaBlockRenderer {
     // inside it is unwound by the enclosing compile phase.
     const emitPhase = this.jit.beginCompilePhase("emit");
     for (const block of cfg.blocks) {
+      if (argumentPruning.targets.size && !reachableBlocks.has(block.id)) continue;
       if (block.synthetic) {
         const synthetic = block.synthetic;
         const descriptor = cfg.term[block.id];
@@ -7372,7 +7382,9 @@ class JvmSsaBlockRenderer {
           if (!edge) valid = false; else lines.push(...edge);
         } else if (op.startsWith("if")) {
           if (prunedBooleanBranchTargets.has(index)) {
+            const right = op.startsWith('if_icmp') ? pop() : undefined;
             const input = pop();
+            if (right === null) valid = false;
             const target = prunedBooleanBranchTargets.get(index);
             const edge = input === null ? null : edgeLines(target, stack);
             if (!edge) valid = false;
@@ -7795,8 +7807,24 @@ class JvmSsaBlockRenderer {
       const header = Number(node.label.slice(1));
       const block = cfg.blocks[header];
       if (!block || block.synthetic || cfg.term[header]?.kind !== "cond") return null;
-      const headerInstructions = block.insns
-        .map((index) => items[index]?.instruction).filter(Boolean);
+      let headerEntries = block.insns
+        .map((itemIndex) => ({itemIndex, instruction: items[itemIndex]?.instruction}))
+        .filter((entry) => entry.instruction);
+      // Complement reverses signed int order without overflow:
+      // ~bound >= ~counter is exactly counter >= bound. Normalize only
+      // this analysis view; emitted bytecodes and exception PCs stay intact.
+      const tail = headerEntries.slice(-7);
+      if (this.typedByteCopyLoopsEnabled && tail.length === 7 &&
+          ['if_icmpge', 'if_icmplt'].includes(opOf(tail[6].instruction)) &&
+          /^iload(?:_[0-3])?$/.test(opOf(tail[0].instruction)) &&
+          /^iload(?:_[0-3])?$/.test(opOf(tail[3].instruction)) &&
+          constantInstructionValue(tail[1].instruction) === -1 &&
+          constantInstructionValue(tail[4].instruction) === -1 &&
+          opOf(tail[2].instruction) === 'ixor' &&
+          opOf(tail[5].instruction) === 'ixor') {
+        headerEntries = [...headerEntries.slice(0, -7), tail[3], tail[0], tail[6]];
+      }
+      const headerInstructions = headerEntries.map((entry) => entry.instruction);
       if (headerInstructions.length < 2) return null;
       const branch = headerInstructions[headerInstructions.length - 1];
       const branchOp = opOf(branch);
@@ -7812,7 +7840,7 @@ class JvmSsaBlockRenderer {
       } else if ((branchOp === "if_icmpge" || branchOp === "if_icmplt") &&
           headerInstructions.length >= 3) {
         const boundItemIndex =
-          block.insns[block.insns.length - 2];
+          headerEntries[headerEntries.length - 2].itemIndex;
         const boundInstruction =
           headerInstructions[headerInstructions.length - 2];
         bound = constantInstructionValue(boundInstruction);
@@ -11448,6 +11476,103 @@ class JvmSsaBlockRenderer {
             opens: "loop",
             inductionLocal: countedLoop?.inductionLocal || null,
             bound: countedLoop?.bound || null});
+        // The shortcut only consumes a proved byte-copy body; the original
+        // loop still executes its exit arm and remains the guard-miss path.
+        let byteCopyPrefix = [];
+        if (this.typedByteCopyLoopsEnabled && !checkedLeafOnly &&
+            !holdsResumeEntry) {
+          const info = countedLoopInfos.get(header);
+          const bodyItems = info && [...info.loopBlocks]
+            .filter(block => block !== header)
+            .flatMap(block => cfg.blocks[block].insns).sort((a,b) => a-b);
+          const ins = bodyItems?.map(i => items[i]?.instruction);
+          const slotOf = (i,kind) => i && new RegExp('^'+kind+'(?:_[0-3])?$').test(opOf(i))
+            ? localIndex(i,opOf(i)) : null;
+          const headerInstructions = headerBlock.insns
+            .map(i=>items[i]?.instruction);
+          const pureHeader = headerInstructions.length===7 &&
+              slotOf(headerInstructions[0],'iload')!==null &&
+              constantInstructionValue(headerInstructions[1])===-1 &&
+              opOf(headerInstructions[2])==='ixor' &&
+              slotOf(headerInstructions[3],'iload')!==null &&
+              constantInstructionValue(headerInstructions[4])===-1 &&
+              opOf(headerInstructions[5])==='ixor' ||
+            headerInstructions.length===3 &&
+              slotOf(headerInstructions[0],'iload')!==null &&
+              (slotOf(headerInstructions[1],'iload')!==null ||
+                constantInstructionValue(headerInstructions[1])!==null);
+          if (pureHeader && info?.increment === 1 && (ins?.length === 12 || ins?.length === 13) &&
+              slotOf(ins[0],'aload') !== null &&
+              slotOf(ins[1],'iload') !== null &&
+              opOf(ins[2]) === 'iinc' &&
+              Number(ins[2].varnum ?? ins[2].arg) === slotOf(ins[1],'iload') &&
+              Number(ins[2].incr) === 1 &&
+              opOf(ins[3]) === 'getstatic' &&
+              slotOf(ins[4],'iload') === info.slot &&
+              opOf(ins[5]) === 'baload' && opOf(ins[6]) === 'bastore' &&
+              opOf(ins[7]) === 'iinc' &&
+              Number(ins[7].varnum ?? ins[7].arg) === info.slot &&
+              Number(ins[7].incr) === 1 &&
+              slotOf(ins[8],'iload') !== null &&
+              slotOf(ins[10],'iload') === slotOf(ins[8],'iload') &&
+              ((ins.length === 12 && opOf(ins[9]) === 'ifne' && opOf(ins[11]) === 'ifeq') ||
+               (ins.length === 13 && opOf(ins[9]) === 'ifeq' && opOf(ins[11]) === 'ifne' && opOf(ins[12]) === 'goto'))) {
+            const directSource = directStaticSites.get(bodyItems[3]);
+            const sourceView = loopInvariantStaticArrayViewsByItem.get(bodyItems[3]) ||
+              (directSource?.entryReadCache?.value ? {descriptor:directSource.descriptor,value:directSource.entryReadCache.value} : null);
+            const dst = slotOf(ins[0],'aload'),di = slotOf(ins[1],'iload');
+            const flag = slotOf(ins[8],'iload');
+            const branchBlocks = [...info.loopBlocks].filter(block => block !== header &&
+              cfg.term[block]?.kind === 'cond').sort((a,b) =>
+                cfg.blocks[a].insns[0]-cfg.blocks[b].insns[0]);
+            const first=cfg.term[branchBlocks[0]],last=cfg.term[branchBlocks[1]];
+            // Boolean entry proofs can turn these two conditionals into a
+            // deterministic cycle while retaining their original bytecodes.
+            // Validate that the live CFG visits every body block once.
+            let prunedPath = branchBlocks.length === 0;
+            if (prunedPath) {
+              const seen=new Set();let b=info.bodyOnTaken
+                ? cfg.term[header].taken : cfg.term[header].fall;
+              while(b!==header && !seen.has(b) && info.loopBlocks.has(b)){
+                seen.add(b);
+                const term=cfg.term[b];
+                if(term?.kind!=='goto'){prunedPath=false;break;}
+                b=term.target;
+              }
+              prunedPath &&= b===header && seen.size===info.loopBlocks.size-1;
+            }
+            if (sourceView?.descriptor === '[B' && di !== info.slot &&
+                dst !== info.slot && dst !== di &&
+                !info.writtenSlots.has(flag) &&
+                info.writtenSlots.size === 2 &&
+                (prunedPath || branchBlocks.length === 2 &&
+                first && last && (ins.length === 12
+                  ? !info.loopBlocks.has(first.taken) && info.loopBlocks.has(first.fall) &&
+                    last.taken === header && !info.loopBlocks.has(last.fall)
+                  : info.loopBlocks.has(first.taken) && !info.loopBlocks.has(first.fall) &&
+                    !info.loopBlocks.has(last.taken) && cfg.term[last.fall]?.kind === 'goto' &&
+                    cfg.succ[last.fall]?.length === 1 && cfg.succ[last.fall][0] === header))) {
+              const n=named('ssaByteCopyTrips'+header);
+              const charged = coarse ? 'true' : runtimeCoarse?.variable || 'false';
+              byteCopyPrefix = [
+                constDecl(n,exprConcat(e`(${info.boundExpression} - ${localName(info.slot)})`)),
+                stmt(exprConcat(e`if (`,
+                  resumeDispatchActive ? e`ssaResumePc === 0 && ` : '',
+                  e`${localName(flag)} === 0 && ${n} > 0 && ${n} <= 4096 && (`,
+                  e`${charged} || safePointBudget > ${n} + 1) && `,
+                  e`!helpers.needsBytecodeChecks() && helpers.tryTypedByteCopyLoop(`,
+                  e`${localName(dst)}, ${localName(di)}, ${sourceView.value}, `,
+                  e`${localName(info.slot)}, ${n})) {`)),
+                stmt(e`  ${localName(di)} = (${localName(di)} + ${n}) | 0;`),
+                stmt(e`  ${localName(info.slot)} = (${info.boundExpression}) | 0;`),
+                stmt(e`  if (!(${charged})) safePointBudget -= ${n};`),
+                blockEnd('')
+              ];
+              stats.typedByteCopyLoopCount = (stats.typedByteCopyLoopCount || 0) + 1;
+            }
+          }
+        }
+        prefix.push(...byteCopyPrefix);
         const polledLoop = [
           loopHeaderLine(),
           ...(coarse ? [] : [
@@ -12414,8 +12539,8 @@ class JvmSsaBlockRenderer {
       (code.code.exceptionTable || []).length === 0 &&
       fieldReadCaches.size === 0,
     );
-    let directPositionalEligible = directPositionalBaseEligible;
-    let internalRegionPositionalEligible = directPositionalBaseEligible;
+    let directPositionalEligible = directPositionalBaseEligible && !argumentPruning.guards.length;
+    let internalRegionPositionalEligible = directPositionalBaseEligible && !argumentPruning.guards.length;
     for (let index = 0; index < items.length &&
       (directPositionalEligible || internalRegionPositionalEligible);
       index += 1) {
@@ -12503,7 +12628,7 @@ class JvmSsaBlockRenderer {
       directMethodDescriptor.returnType.endsWith("[]");
     let restoringDirectRejection = null;
     let restoringDirectPositionalEligible = Boolean(
-      directMethodDescriptor &&
+      !argumentPruning.guards.length && directMethodDescriptor &&
       (directMethodDescriptor.returnType === "void" ||
         restoringDirectParameterType(directMethodDescriptor.returnType)) &&
       directMethodDescriptor.params.every(restoringDirectParameterType) &&
@@ -13537,6 +13662,10 @@ class JvmSsaBlockRenderer {
         })(),
         blockEnd(""),
       ] : []),
+      ...argumentPruning.guards.map(({slot,min,max}) => returnStmt(
+        e`if (${localName(slot)} < ${min} || ${localName(slot)} > ${max}) { helpers.skipJitOnce(frame); `,
+        "{deopt:true,transient:true,reason:'structured SSA argument range guard'}",
+        ' }', {kind:'argumentRangeGuard',relocatable:false})),
       ...invariantPositionalCallDeclarations,
       ...entryArrayDataDeclarations,
       ...persistentStaticArrayDataDeclarations,
@@ -15644,6 +15773,8 @@ class JvmSsaBlockRenderer {
       let adaptivePositionalBody = null;
       let adaptivePositionalSource = null;
       let adaptivePartitionCount = 0;
+      let adaptiveOutlinedLoopCount = 0;
+      let adaptiveHoistedSource = null;
       let ordinaryAdaptive = false;
       // An ordinary adaptive body cannot preserve lexical SSA state when its
       // wall-clock quantum expires. That is safe for a positional call (the
@@ -15737,10 +15868,37 @@ class JvmSsaBlockRenderer {
             st`helpers.ordinaryAdaptiveFramelessRunCount += 1;`);
         }
         adaptivePositionalSource = adaptiveBody.join("\n");
+        // An ordinary adaptive entry owns execution independently of the
+        // canonical generator. Split its large loops using the same recorded
+        // statements and exact exit protocol. A field-cache invalidator closes
+        // over entry locals, so that shape must keep its original activation.
+        if (this.loopOutliningEnabled && ordinaryAdaptive &&
+            !fieldCacheInvalidationHelperUsed) {
+          const fragments = regionFragmentsOf(adaptiveBody.map(
+            (line) => typeof line === "string" ? line : blankStatement()));
+          const outlined = fragments && outlineLargeRegionLoops(regionUnit({
+            statements: fragments.flatMap((fragment) => fragment.statements),
+            generator: false,
+          }), {
+            minimumSourceBytes: this.loopOutlineSourceBytes,
+            maximumOutlines: 32,
+            namespace: 98,
+            pruneUnusedLiveOuts: true,
+          });
+          adaptiveOutlinedLoopCount = outlined?.count || 0;
+          if (adaptiveOutlinedLoopCount > 0) {
+            adaptivePositionalSource = renderRegionUnit(outlined.unit);
+            // Outlined helpers take every activation value as a parameter.
+            // Allocate them once in the factory, so hot entries do not create
+            // closures or include their code in the entry's optimization unit.
+            adaptiveHoistedSource = outlined.helpers.map(renderRegionUnit)
+              .join("\n");
+          }
+        }
         // Ordinary adaptive entries can own the hot invocation even when the
         // framed body was split. Apply the same bounded pass to the selected
         // entry, using its actual generator ABI and recorded statements.
-        if (this.linearPartitionEnabled &&
+        if (this.linearPartitionEnabled && adaptiveOutlinedLoopCount === 0 &&
             adaptivePositionalSource.length > this.linearPartitionUnitBytes) {
           const fragments = regionFragmentsOf(adaptiveBody.map(
             (line) => typeof line === "string" ? line : blankStatement()));
@@ -15759,6 +15917,8 @@ class JvmSsaBlockRenderer {
           ["frame", "thread", "helpers", "initialBytecodeChecks", "framelessEntry"],
           bindFramedSentinels(adaptivePositionalSource),
           null, false, !ordinaryAdaptive, framedSentinelCaptures,
+          adaptiveHoistedSource === null ? null
+            : bindFramedSentinels(adaptiveHoistedSource),
         );
         adaptiveGeneratedBodyPublished = adaptiveGeneratedBody;
         if (ordinaryAdaptive) {
@@ -16156,6 +16316,7 @@ class JvmSsaBlockRenderer {
         persistentProducedArrayLocalViews.size;
       this.persistentProducedArrayLocalViewCompileCount +=
         persistentProducedArrayLocalViews.size;
+      generated.jvmStructuredTypedByteCopyLoopCount = stats.typedByteCopyLoopCount || 0;
       generated.jvmStructuredLoopInvariantStaticArrayViewCount =
         [...loopInvariantStaticArrayViewsByHeader.values()].reduce(
           (count, views) => count + views.size, 0);
@@ -16272,6 +16433,7 @@ class JvmSsaBlockRenderer {
       generated.jvmStructuredInlinedRestoringSpills =
         inlinedRestoringSpills;
       generated.jvmStructuredExplicitFrameSpills = explicitFrameSpills;
+      generated.jvmStructuredArgumentRangeBranchCount = argumentPruning.targets.size;
       generated.jvmStructuredCaptureFreeRestoringSpills =
         captureFreeRestoringSpills;
       generated.jvmStructuredOutlinedCaptureFreeRestoringSpills =
@@ -16322,6 +16484,7 @@ class JvmSsaBlockRenderer {
       generated.jvmStructuredPartitionedSegmentCount =
         partitionedGenerated.count;
       generated.jvmAdaptivePartitionedSegmentCount = adaptivePartitionCount;
+      generated.jvmAdaptiveOutlinedLoopCount = adaptiveOutlinedLoopCount;
       generated.jvmStructuredPartitionedSourceBytes =
         partitionedGenerated.partitionedSourceBytes;
       generated.jvmStructuredPartitionAttemptedRuns =

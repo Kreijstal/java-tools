@@ -1,7 +1,20 @@
 const path = require('path');
 const browserBabel = require('./config/browser-babel');
 
+// Cache each compiler separately across invocations. Webpack invalidates
+// changed modules and their dependents; config/loader changes invalidate the
+// cache too. This affects build work, never generated runtime behavior.
+const buildCache = name => ({
+  type: 'filesystem',
+  name,
+  buildDependencies: {
+    config: [__filename, require.resolve('./config/browser-babel'),
+      require.resolve('./config/growing-buffer-loader')]
+  }
+});
+
 const jvmDebugConfig = {
+  cache: buildCache('jvm-debug'),
   mode: 'production',
   entry: './src/platform/browser-entry.js',
   output: {
@@ -88,6 +101,7 @@ const jvmDebugConfig = {
 // window.Terminal) and only bundles golden-layout, so it must not claim a
 // UMD library global of its own.
 const ideUiConfig = {
+  cache: buildCache('ide-ui'),
   mode: 'production',
   entry: './src/platform/ide/main.js',
   output: {
@@ -103,6 +117,7 @@ const ideUiConfig = {
 // bundle, and the page must be told where this one lands
 // (window.JVM_COMPILE_WORKER_URL, or the compileWorkerUrl jit option).
 const compileWorkerConfig = {
+  cache: buildCache('jvm-compile-worker'),
   mode: 'production',
   target: 'webworker',
   entry: './src/jit/compileWorkerThread.js',

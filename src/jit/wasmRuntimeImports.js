@@ -348,7 +348,7 @@ function addFieldImport(reg, jvm, ins, isStaticOp, isGet, elementOf = null) {
       const token = jvm.getClassInitializationToken(currentClassName);
       initializationIdx = reg.addImport(
         `static_ready_${currentClassName}`.replace(/[^\w]/g, '_'), [], [T.i32],
-        token.wasmReadinessGuard?.() || (() => token.initialized ? 1 : 0));
+        token.wasmReadinessGuard?.() || (() => token.initialized ? 1 : 0),true);
       (reg.staticInitializationGuards ||= new Set()).add(currentClassName);
     }
     const access = bindStaticFieldAccessors(container, key, t);
@@ -606,7 +606,7 @@ function addNativeInitializationGuard(reg, jvm, owner) {
   if (jvm.classInitializationState.get(owner) === 'INITIALIZED') return null;
   const token = jvm.getClassInitializationToken(owner);
   const idx = reg.addImport(`static_ready_${owner.replace(/\//g, '_')}`, [], [T.i32],
-    token.wasmReadinessGuard?.() || (() => token.initialized ? 1 : 0));
+    token.wasmReadinessGuard?.() || (() => token.initialized ? 1 : 0),true);
   (reg.staticInitializationGuards ||= new Set()).add(owner);
   return idx;
 }

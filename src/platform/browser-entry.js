@@ -179,6 +179,11 @@ class BrowserJVMDebug {
         compiledCallChains: true,
         ordinaryAdaptiveFramelessPositional: true,
         ordinaryAdaptiveCallChainSafePointBudget: 1,
+        // Preparation sees cold classes. Inline verified pure integer helpers
+        // with an initialization guard at the original call, so pixel loops
+        // avoid a general JVM call after the owner has initialized.
+        prepareColdIntegerInlines: true,
+        structuredExplicitFrameSpills: true,
       },
     });
     this.isReady = false;

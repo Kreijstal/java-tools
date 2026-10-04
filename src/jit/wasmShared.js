@@ -92,6 +92,45 @@ function emitTryTableCatchAll(out, emitBody, emitCatch) {
   );
 }
 
+// Capture the original JavaScript throwable, including primitive values.
+// Foreign Wasm tags and traps propagate without entering this handler.
+function emitTryTableJsTag(out, emitBody, emitCatch, recordIdx) {
+  const body = [], handler = [];
+  emitBody(body);
+  emitCatch(handler);
+  out.push(OP.block, 0x40, OP.block, T.ref,
+    OP.try_table, 0x40, ...uleb(1), 0x00, ...uleb(0), ...uleb(0),
+    ...body, OP.end, OP.br, ...uleb(1), OP.end,
+    OP.call, ...uleb(recordIdx), ...handler, OP.end);
+}
+
+let wasmJsTagSupport;
+function supportsWasmJsTag() {
+  if (wasmJsTagSupport !== undefined) return wasmJsTagSupport;
+  wasmJsTagSupport = false;
+  if (typeof WebAssembly === 'undefined' || !WebAssembly.JSTag ||
+      !supportsWasmTryTable()) return false;
+  try {
+    const marker = {}, body = [];
+    let caught;
+    emitTryTableJsTag(body,
+      out => out.push(OP.call, 0), () => {}, 1);
+    body.push(OP.end);
+    const bytes = assembleModule({
+      importDecls: [{name:'throw_js',params:[],results:[]},
+        {name:'record_js',params:[T.ref],results:[]}],
+      mainParams:[], mainResults:[], declared:[], body, importJsTag:true,
+    });
+    const instance = new WebAssembly.Instance(new WebAssembly.Module(bytes), {
+      env: {js_tag:WebAssembly.JSTag, throw_js:() => {throw marker;},
+        record_js:value => {caught = value;}},
+    });
+    instance.exports.run();
+    wasmJsTagSupport = caught === marker;
+  } catch (_) { wasmJsTagSupport = false; }
+  return wasmJsTagSupport;
+}
+
 let wasmTryTableSupport;
 function supportsWasmTryTable() {
   if (wasmTryTableSupport !== undefined) return wasmTryTableSupport;
@@ -565,6 +604,37 @@ function runvWrapperBody(paramCount, mainIdx, retvType) {
   return out;
 }
 
+// Direct canonical wrapper returns status, invocation id, owner, and value.
+// The main body captures/clears the active id before any guest work. Its
+// spill imports use that local id, so recursive calls cannot overwrite it.
+function canonicalRunWrapperBody(paramCount, mainIdx, retvType, globals, readyIdx, recordIdx) {
+  const id=paramCount, status=paramCount+1;
+  const out=[1,2,T.i32]; // two i32 locals
+  out.push(OP.call,...uleb(readyIdx),OP.i32_eqz,OP.if,0x40,
+    OP.i32_const,...sleb(-4),OP.i32_const,0,OP.ref_null,T.ref);
+  if(retvType)out.push(...(retvType===T.i64?[OP.i64_const,0]:
+    retvType===T.f32?[OP.f32_const,0,0,0,0]:
+    retvType===T.f64?[OP.f64_const,0,0,0,0,0,0,0,0]:[OP.i32_const,0]));
+  out.push(OP.return,OP.end);
+  out.push(OP.global_get,...uleb(globals+1),OP.i32_const,1,OP.i32_add,
+    OP.local_tee,...uleb(id),OP.i32_eqz,OP.if,0x40,
+    OP.i32_const,1,OP.local_set,...uleb(id),OP.end,
+    OP.local_get,...uleb(id),OP.global_set,...uleb(globals+1),
+    OP.local_get,...uleb(id),OP.global_set,...uleb(globals));
+  const emitCatch = recordIdx == null ? emitTryTableCatchAll :
+    (out, body, handler) => emitTryTableJsTag(out, body, handler, recordIdx);
+  emitCatch(out,body=>{
+    for(let i=0;i<paramCount;i++)body.push(OP.local_get,...uleb(i));
+    body.push(OP.i32_const,0,OP.global_get,...uleb(globals+3),
+      OP.call,...uleb(mainIdx),OP.local_set,...uleb(status));
+  },body=>body.push(OP.i32_const,...sleb(-5),OP.local_set,...uleb(status)));
+  out.push(OP.local_get,...uleb(status),OP.local_get,...uleb(id),
+    OP.global_get,...uleb(globals+2));
+  if(retvType)out.push(OP.global_get,0);
+  out.push(OP.end);
+  return out;
+}
+
 // Mutable i32 global (init 1) exported as "specok": the world-validity flag
 // for speculative monomorphic direct links. The jit zeroes every registered
 // instance's flag on each class load; entry/nested revalidation sets it back
@@ -575,7 +645,8 @@ function specokGlobalEntry() {
 }
 
 function assembleModule({ importDecls, mainParams, mainResults, declared, body, profilerName,
-  importMemory, retvType, runvWrapper, specokGlobal, importTable, sigTypes }) {
+  importMemory, retvType, runvWrapper, specokGlobal, importTable, sigTypes,
+  canonicalFrameExport, importCanonicalTable, importJsTag }) {
   const typeKey = (p, r) => `${p.join(',')}|${r.join(',')}`;
   const types = [];
   const typeIndex = new Map();
@@ -599,6 +670,9 @@ function assembleModule({ importDecls, mainParams, mainResults, declared, body, 
     // functions, so this does not shift any call target
     importEntries.push([3, 0x65, 0x6e, 0x76, 3, 0x6d, 0x65, 0x6d, 0x02, 0x00, ...uleb(1)]);
   }
+  if (importCanonicalTable) {
+    importEntries.push([3,0x65,0x6e,0x76,4,0x63,0x74,0x61,0x62,0x01,0x70,0x00,0x00]);
+  }
   if (importTable) {
     // (import "env" "ltab" (table 0 funcref)) — the runtime linker's slot
     // table (WasmLinker). Tables index separately from functions too. The
@@ -610,6 +684,12 @@ function assembleModule({ importDecls, mainParams, mainResults, declared, body, 
     const ti = internType(d.params, d.results);
     const nameBytes = [...d.name].map((c) => c.charCodeAt(0));
     importEntries.push([3, 0x65, 0x6e, 0x76, ...uleb(nameBytes.length), ...nameBytes, 0x00, ...uleb(ti)]);
+  }
+  if (importJsTag) {
+    const ti = internType([T.ref], []);
+    // Tags have a separate index space; existing function indices stay fixed.
+    const name = [...'js_tag'].map(c => c.charCodeAt(0));
+    importEntries.push([3,0x65,0x6e,0x76,name.length,...name,0x04,0x00,...uleb(ti)]);
   }
   const mainType = internType(mainParams, mainResults);
   const mainIdx = importDecls.length;
@@ -624,6 +704,8 @@ function assembleModule({ importDecls, mainParams, mainResults, declared, body, 
   const globalEntries = [
     ...(retvType ? [retvGlobalEntry(retvType)] : []),
     ...(specokGlobal ? [specokGlobalEntry()] : []),
+    ...(canonicalFrameExport ? [retvGlobalEntry(T.i32), retvGlobalEntry(T.i32),
+      retvGlobalEntry(T.ref), [T.i32,1,OP.i32_const,...sleb(100_000_000),OP.end]] : []),
   ];
   const globalSection = globalEntries.length
     ? section(6, [globalEntries.length, ...globalEntries.flat()]) : [];
@@ -648,13 +730,23 @@ function assembleModule({ importDecls, mainParams, mainResults, declared, body, 
     ...(specokGlobal
       ? [[specokName.length, ...specokName, 0x03, ...uleb(specokIdx)]] : []),
   ];
-  const functionSection = runvWrapper
-    ? [2, ...uleb(mainType), ...uleb(runvType)]
-    : [1, ...uleb(mainType)];
-  const codeSection = runvWrapper
-    ? [2, ...uleb(funcBody.length), ...funcBody,
-      ...uleb(runvBody.length), ...runvBody]
-    : [1, ...uleb(funcBody.length), ...funcBody];
+  const functionTypes = [mainType];
+  const functionBodies = [funcBody];
+  if(runvWrapper){functionTypes.push(runvType);functionBodies.push(runvBody);}
+  if(canonicalFrameExport){
+    const globals=(retvType?1:0)+(specokGlobal?1:0);
+    const directType=internType(paramOnly,[T.i32,T.i32,T.ref,...(retvType?[retvType]:[])]);
+    const directBody=canonicalRunWrapperBody(paramOnly.length,mainIdx,retvType,globals,
+      canonicalFrameExport.readyIdx, canonicalFrameExport.recordIdx);
+    const name=[...'canonicalRun'].map(c=>c.charCodeAt(0));
+    exportEntries.push([name.length,...name,0,...uleb(mainIdx+functionTypes.length)]);
+    for(const [label,index] of [['canonicalOwner',globals+2],['canonicalFuel',globals+3],['canonicalEntries',globals+1]]){
+      const bytes=[...label].map(c=>c.charCodeAt(0));exportEntries.push([bytes.length,...bytes,3,...uleb(index)]);
+    }
+    functionTypes.push(directType);functionBodies.push(directBody);
+  }
+  const functionSection=[...uleb(functionTypes.length),...functionTypes.flatMap(uleb)];
+  const codeSection=[...uleb(functionBodies.length),...functionBodies.flatMap(b=>[...uleb(b.length),...b])];
 
   return Uint8Array.from([
     0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
@@ -735,11 +827,11 @@ function liveExceptionRanges(jvm, code, labelIndex) {
 // Shared by both compilers: WasmJit gates a deopt on it and JitCompiler gates
 // its effectful-call policy on it, so it belongs beside the other shared
 // bytecode predicates rather than in either tier.
-const capturesBooleanStaticCache = new WeakMap();
+const booleanStaticCapturesCache = new WeakMap();
 
-function capturesBooleanStatic(method) {
-  if (method && capturesBooleanStaticCache.has(method)) {
-    return capturesBooleanStaticCache.get(method);
+function booleanStaticCaptures(method) {
+  if (method && booleanStaticCapturesCache.has(method)) {
+    return booleanStaticCapturesCache.get(method);
   }
   const code = method && method.attributes &&
     method.attributes.find((attribute) => attribute.type === 'code');
@@ -756,7 +848,8 @@ function capturesBooleanStatic(method) {
     const numeric = Number(value);
     return Number.isInteger(numeric) ? numeric : null;
   };
-  const result = Boolean(items && items.some((item, index) => {
+  const result = [];
+  (items || []).forEach((item, index) => {
     const instruction = item && item.instruction;
     if (!(getOp(instruction) === 'getstatic' &&
       Array.isArray(instruction.arg) &&
@@ -776,21 +869,27 @@ function capturesBooleanStatic(method) {
         if (useOp && useOp.startsWith('invoke')) crossedCall = true;
         if (localIndex(useInstruction, useOp, 'istore') === capturedLocal) return false;
         if (localIndex(useInstruction, useOp, 'iload') === capturedLocal) {
-          return crossedCall;
+          if (crossedCall) result.push(Object.freeze({slot: capturedLocal, storeIndex: next}));
+          return;
         }
       }
       return false;
     }
     return false;
-  }));
-  if (method) capturesBooleanStaticCache.set(method, result);
+  });
+  Object.freeze(result);
+  if (method) booleanStaticCapturesCache.set(method, result);
   return result;
+}
+
+function capturesBooleanStatic(method) {
+  return booleanStaticCaptures(method).length > 0;
 }
 
 module.exports = {
   T, CAT2, OP, TRUNC_SAT,
   uleb, sleb, f32bytes, f64bytes,
-  emitTryTableCatchAll, supportsWasmTryTable,
+  emitTryTableCatchAll, supportsWasmTryTable, emitTryTableJsTag, supportsWasmJsTag,
   wasmProfilerName, wasmFunctionNameSection,
   getOp, descToWasm, toWasmValue, parseMethodDescriptor, sig,
   I32_LOAD_OPS, arrayLoadImportName,
@@ -812,5 +911,5 @@ module.exports = {
   FUEL,
   assembleModule, retvGlobalEntry, runvWrapperBody,
   isNoOpExceptionHandler, catchesOnlyCheckedExceptions, liveExceptionRanges,
-  capturesBooleanStatic,
+  capturesBooleanStatic, booleanStaticCaptures,
 };
