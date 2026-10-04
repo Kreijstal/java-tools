@@ -1,0 +1,179 @@
+'use strict';
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
+const {spawnSync} = require('node:child_process');
+const {foldGuardedAbruptPlainBlockExits: fold, simplifyControlFrames: clean,
+  recoverPostGuardExits: compose} = require('../src/decompiler/javaAstEmitter');
+
+function recover(source) {
+  let frames = 0;
+  for (let limit = 0; limit < 128; limit++) {
+    const next = fold(source);
+    if (!next.framesRemoved) return {source, frames};
+    source = next.source; frames += next.framesRemoved;
+  }
+  assert.fail('guarded abrupt exit recovery did not reach a fixed point');
+}
+
+test('guarded abrupt exits retain scopes and invert only exact logical complements', () => {
+  for (const [guard, expected] of [
+    ['mode!=0', 'mode==0'], ['mode==0', 'mode!=0'], ['((mode!=0))', '((mode==0))'],
+    ['metric>0', '!(metric>0)'], ['metric<=0', '!(metric<=0)'],
+    ['boxed', '!(boxed)'], ['predicate(mode)', '!(predicate(mode))'],
+  ]) {
+    const source = `int prefix=1;Frame:{if(outer(input)){int local=prefix;step(local);if(${guard}){break Frame;}return value();}int fallback=prefix;step(fallback);}return 99;`;
+    const next = fold(source);
+    assert.equal(next.framesRemoved, 1, source);
+    assert.equal(next.jumpsRemoved, 1);
+    assert.ok(next.source.includes(expected), expected);
+    assert.ok(next.source.includes('else {'));
+    assert.ok(next.source.includes('int prefix=1;'));
+    assert.ok(next.source.includes('int local=prefix;'));
+    assert.ok(next.source.includes('int fallback=prefix;'));
+    assert.equal(fold(next.source).framesRemoved, 0);
+    assert.ok(!Object.hasOwn(next, 'diagnostics'));
+  }
+  const source = 'for(int i=0;i<2;i++){Frame:{if(outer(input)){step("P");if(mode!=0)break Frame;continue;}fallback();}tail();}';
+  assert.equal(fold(source).framesRemoved, 1, 'a bare guarded break has the same destination');
+  const next = compose(source, {parameterNames: ['input', 'mode']});
+  assert.equal(next.counts.guardedAbruptFrames, 1);
+  assert.equal(compose(next.source, {parameterNames: ['input', 'mode']}).rewrites, 0);
+  const scoped = 'Frame:{int prefix=1;if(outer(input)){step(prefix);if(mode!=0){break Frame;}return value();}fallback();}tail();';
+  assert.equal(fold(scoped, {retainDiagnostics: true}).diagnostics.frameScopeRetained, true);
+  const positioned = 'if(other())Frame:{step("prefix");if(outer(input)){step("P");if(mode!=0){break Frame;}return value();}fallback();}else tail();';
+  assert.equal(fold(positioned, {retainDiagnostics: true}).diagnostics.frameScopeRetained, true);
+  assert.equal(fold(source, {retainDiagnostics: true}).diagnostics.frameScopeRetained, false);
+  const multiline = 'while(more()){\n  Frame:{\n    if(entity!=null){\n      step();\n      if(flag!=0){\n        break Frame;\n      }\n      continue;\n    }\n    fallback();\n  }\n  tail();\n}';
+  assert.equal(fold(multiline).source, 'while(more()){\n  if(entity!=null){\n    step();\n    if (flag==0) {\n      continue;\n    }\n  } else {\n    fallback();\n  }\n  tail();\n}');
+});
+
+test('ambiguous targets, intervening protected scopes and incomplete statements refuse recovery', () => {
+  const original = 'for(int i=0;i<2;i++){Frame:{if(outer(input)){step("P");if(mode!=0){break Frame;}continue;}fallback();}tail();}';
+  for (const source of [
+    original.replace('break Frame;', 'break Missing;'),
+    original.replace('continue;', 'continue Missing;'),
+    original.replace('continue;', 'continue Frame;'),
+    original.replace('step("P");', 'if(other())break Frame;step("P");'),
+    original.replace('continue;', 'break Frame;'),
+    original.replace('if(mode!=0){break Frame;}', 'if(mode!=0){try{break Frame;}finally{cleanup();}}'),
+    original.replace('if(mode!=0){break Frame;}', 'if(mode!=0){synchronized(lock){break Frame;}}'),
+    original.replace('if(mode!=0){break Frame;}', 'if(mode!=0){step("guard-effect");break Frame;}'),
+    original.replace('if(mode!=0){break Frame;}', 'if(mode!=0){break Frame;}else{step("alternate");}'),
+    original.replace('continue;', '{continue;}'),
+    original.replace('fallback();', ''),
+    original.replace('step("P");', 'step("P")'),
+    original.replace('step("P");', '1+2;'),
+    original.replace('fallback();', 'fallback()'),
+    original.replace('continue;', 'return value()'),
+    original.replace('continue;', 'throw specific'),
+    original.replace('continue;', 'break'),
+    original + ' // comment\n',
+    original + '\\u000a',
+    original + 'Runnable task=()->step("task");',
+    original + 'class Local {void run(){step("local");}}',
+    original + 'Frame:{step("separate");}',
+  ]) assert.deepEqual(fold(source), {source, framesRemoved: 0, jumpsRemoved: 0}, source);
+});
+
+test('diagnostics identify the consumed frame and transfer without claiming a flag value', () => {
+  const source = 'Frame:{if(outer(input)){step("P");if(Holder.flag!=0){break Frame;}throw makeFailure();}fallback();}tail();';
+  const next = fold(source, {retainDiagnostics: true});
+  assert.equal(next.framesRemoved, 1);
+  assert.equal(next.diagnostics.abruptKind, 'ThrowStatement');
+  assert.equal(next.diagnostics.predicate, 'Holder.flag==0');
+  assert.equal(source.slice(next.diagnostics.labelRange.start, next.diagnostics.labelRange.end), 'Frame:');
+  assert.equal(source.slice(next.diagnostics.jumpRange.start, next.diagnostics.jumpRange.end), 'break Frame;');
+  assert.deepEqual(fold(source, {retainDiagnostics: 'yes'}), {source, framesRemoved: 0, jumpsRemoved: 0});
+});
+
+test('native guarded abrupt exits preserve effect order, targets, NaNs, unboxing and cleanup', () => {
+  const variants = [
+    'Frame:{if(outer(input)){step("P");if(predicate(mode)){break Frame;}return value();}fallback();}tail();',
+    'Frame:{if(outer(input)){step("P");if(mode!=0){break Frame;}return value();}fallback();}tail();',
+    'Frame:{if(outer(input)){step("P");if(metric>0){break Frame;}return value();}fallback();}tail();',
+    'Frame:{if(outer(input)){step("P");if(metric==0){break Frame;}return value();}fallback();}tail();',
+    'Frame:{if(outer(input)){step("P");if(metric!=0){break Frame;}return value();}fallback();}tail();',
+    'Frame:{if(outer(input)){step("P");if(boxed){break Frame;}return value();}fallback();}tail();',
+    'Frame:{if(outer(input)){step("P");if(predicate(mode)){break Frame;}throw makeFailure();}fallback();}tail();',
+    'for(int index=0;index<2;index++){Frame:{if(outer(input)){step("P"+index);if(predicate(mode)){break Frame;}continue;}fallback();}tail();}',
+    'Outer:for(int index=0;index<2;index++){for(int inner=0;inner<2;inner++){Frame:{if(outer(input)){step("P"+index+inner);if(predicate(mode)){break Frame;}continue Outer;}fallback();}tail();}}',
+    'for(int index=0;index<2;index++){Frame:{if(outer(input)){step("P"+index);if(predicate(mode)){break Frame;}break;}fallback();}tail();}',
+    'Outer:{Frame:{if(outer(input)){step("P");if(predicate(mode)){break Frame;}break Outer;}fallback();}tail();}step("outside");',
+    'switch(input){case 0:Frame:{if(outer(input)){step("P");if(predicate(mode)){break Frame;}break;}fallback();}tail();default:step("default");}',
+    'try{Frame:{if(outer(input)){step("P");if(predicate(mode)){break Frame;}return value();}fallback();}tail();}finally{cleanup();}',
+    'try{Frame:{if(outer(input)){step("P");if(predicate(mode)){break Frame;}throw makeFailure();}fallback();}tail();}catch(RuntimeException failure){step(failure==specific?"caught-specific":"caught-other");}finally{cleanup();}',
+    'synchronized(lock){Frame:{if(outer(input)){step("P"+Thread.holdsLock(lock));if(predicate(mode)){break Frame;}return value();}fallback();}tail();}',
+    'Frame:{if(outer(input)){try{step("P");}finally{cleanup();}if(predicate(mode)){break Frame;}return value();}fallback();}tail();',
+    'int prefix=13;Frame:{step("prefix");if(outer(input)){int local=prefix+1;step("P"+local);if(predicate(mode)){break Frame;}return local;}int local=prefix+2;step("fallback"+local);}tail();',
+    'int guard=mode;Frame:{if(outer(input)){guard=input;step("P");if(guard!=0){break Frame;}return guard;}fallback();}tail();',
+    'Frame:{if(outer(input)){step("/* string */");if(((predicate(mode)==true))){break Frame;}return value();}fallback();}tail();',
+    'for(int index=0;index<2;index++){try{Frame:{if(outer(input)){step("P"+index);if(predicate(mode)){break Frame;}continue;}fallback();}tail();}finally{cleanup();if(input==1)break;}}',
+    'Frame:{if(outer(input)){step("P");if(predicate(mode)&&boxed){break Frame;}return value();}fallback();}tail();',
+    'Frame:{int nested=13;if(outer(input)){step("P"+nested);if(predicate(mode)){break Frame;}return nested;}fallback();}step("after"+nested);',
+    'if(input>=0)Frame:{step("prefix");if(outer(input)){step("P");if(predicate(mode)){break Frame;}return value();}fallback();}else step("outside-else");tail();',
+  ];
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'guarded-abrupt-native-'));
+  function run(command, args) {
+    const files = ['stdout', 'stderr'].map(name => path.join(directory, name));
+    const descriptors = files.map(file => fs.openSync(file, 'w'));
+    try {
+      const result = spawnSync(command, args, {stdio: ['ignore', ...descriptors], timeout: 30000,
+        env: {...process.env, JAVA_TOOL_OPTIONS: '-XX:-UsePerfData'}});
+      if (result.error) throw result.error;
+      assert.equal(result.status, 0, fs.readFileSync(files[1], 'utf8'));
+      return fs.readFileSync(files[0], 'utf8');
+    } finally { descriptors.forEach(descriptor => fs.closeSync(descriptor)); }
+  }
+  try {
+    const methods = [];
+    variants.forEach((source, index) => {
+      const next = recover(source);
+      assert.ok(next.frames > 0, index + ': ' + source);
+      let cleaned = next.source;
+      for (;;) { const result = clean(cleaned); if (result.source === cleaned) break; cleaned = result.source; }
+      cleaned = compose(cleaned, {parameterNames: ['mode', 'input', 'metric', 'boxed']}).source;
+      for (const [name, body] of [['original', source], ['rebuilt', next.source], ['composed', cleaned]])
+        methods.push(`static int ${name}${index}(int mode,int input,double metric,Boolean boxed){${body}return 99;}`);
+    });
+    const java = `public class GuardedAbruptExits {
+      static StringBuilder trace;static int failures,effects,cleanups,mutableGuard,nested=77;static Object lock;
+      static final RuntimeException specific=new IllegalArgumentException();static final Error fatal=new AssertionError();
+      static void step(String s){trace.append(s).append('/');effects++;mutableGuard++;if(failures==1&&effects==1||failures==2&&effects==2)throw specific;}
+      static void fallback(){step("fallback");}static void tail(){step("tail");}
+      static boolean outer(int input){trace.append("outer/");return input==0||input==1;}
+      static boolean predicate(int mode){trace.append("guard/");if(failures==4)throw specific;return mode!=0&&mutableGuard>0;}
+      static int value(){step("value");return mutableGuard;}
+      static RuntimeException makeFailure(){step("failure");return specific;}
+      static void cleanup(){trace.append("cleanup/");cleanups++;if(failures==3)throw fatal;}
+      ${methods.join('\n')}
+      interface Call{int run();}
+      static String invoke(Call call,boolean nullLock){trace=new StringBuilder();effects=0;cleanups=0;mutableGuard=0;lock=nullLock?null:new Object();String result;try{result="ok="+call.run();}catch(Throwable e){result=e==specific?"specific":e==fatal?"fatal":e.getClass().getName();}if(lock!=null&&Thread.holdsLock(lock))throw new AssertionError("lock retained");return result+":"+effects+":"+cleanups+":"+mutableGuard+":"+trace;}
+      static void oracle(Call call,String expected){String actual=invoke(call,false);if(!expected.equals(actual))throw new AssertionError(expected+" != "+actual);}
+      public static void main(String[]args){int comparisons=0;
+        oracle(()->composed0(0,0,0,false),"ok=2:2:0:2:outer/P/guard/value/");
+        oracle(()->composed0(7,0,0,false),"ok=99:2:0:2:outer/P/guard/tail/");
+        oracle(()->composed0(0,7,0,false),"ok=99:2:0:2:outer/fallback/tail/");
+        oracle(()->composed2(0,0,Double.NaN,false),"ok=2:2:0:2:outer/P/value/");
+        oracle(()->composed4(0,0,Double.NaN,false),"ok=99:2:0:2:outer/P/tail/");
+        oracle(()->composed5(0,0,0,null),"java.lang.NullPointerException:1:0:1:outer/P/");
+        oracle(()->composed6(0,0,0,false),"specific:2:0:2:outer/P/guard/failure/");
+        oracle(()->composed7(0,0,0,false),"ok=99:2:0:2:outer/P0/guard/outer/P1/guard/");
+        oracle(()->composed9(0,0,0,false),"ok=99:1:0:1:outer/P0/guard/");
+        oracle(()->composed12(0,0,0,false),"ok=2:2:1:2:outer/P/guard/value/cleanup/");
+        oracle(()->composed14(0,0,0,false),"ok=2:2:0:2:outer/Ptrue/guard/value/");
+        oracle(()->composed16(0,0,0,false),"ok=14:2:0:2:prefix/outer/P14/guard/");
+        oracle(()->composed21(7,0,0,false),"ok=99:2:0:2:outer/P13/guard/after77/");
+        oracle(()->composed21(0,0,0,false),"ok=13:1:0:1:outer/P13/guard/");
+        oracle(()->composed22(0,-1,0,false),"ok=99:2:0:2:outside-else/tail/");
+        for(failures=0;failures<5;failures++)for(int mode:new int[]{Integer.MIN_VALUE,-1,0,1,7,Integer.MAX_VALUE})for(int input:new int[]{Integer.MIN_VALUE,-1,0,1,7,Integer.MAX_VALUE})for(double metric:new double[]{Double.NaN,Double.NEGATIVE_INFINITY,-1,-0.0,0.0,1,Double.POSITIVE_INFINITY})for(Boolean boxed:new Boolean[]{false,true,null})for(boolean nullLock:new boolean[]{false,true}){
+          ${variants.flatMap((_, i) => ['rebuilt', 'composed'].map(name => `{String expected=invoke(()->original${i}(mode,input,metric,boxed),nullLock),actual=invoke(()->${name}${i}(mode,input,metric,boxed),nullLock);if(!expected.equals(actual))throw new AssertionError("${name}${i}:"+failures+":"+mode+":"+input+":"+metric+":"+boxed+":"+nullLock+":"+expected+" != "+actual);comparisons++;}`)).join('\n')}
+        }if(comparisons!=347760)throw new AssertionError(comparisons);System.out.println("guarded-abrupt-native:"+comparisons+",oracles:15");
+      }
+    }`;
+    const file = path.join(directory, 'GuardedAbruptExits.java');
+    fs.writeFileSync(file, java);
+    run('javac', ['--release', '8', '-d', directory, file]);
+    console.log(run('java', ['-cp', directory, 'GuardedAbruptExits']).trim());
+  } finally { fs.rmSync(directory, {recursive: true, force: true}); }
+});

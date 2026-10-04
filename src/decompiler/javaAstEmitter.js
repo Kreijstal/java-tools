@@ -11,6 +11,7 @@ const { tokenizeJava } = require('../java-frontend/lexer');
 const { recoverScalarLabelDispatches: recoverScalarDispatch } = require('./scalarDispatchRecovery');
 const { specializePathGuards: specializeGuards } = require('./pathGuardRecovery');
 const { recoverArrayIndexIncrements: recoverIndexIncrements } = require('./incrementCaptureRecovery');
+const { foldGuardedAbruptPlainBlockExits: recoverGuardedAbruptExit } = require('./guardedAbruptExitRecovery');
 
 const rawExpression = (source) => createNode('UnsupportedExpression', { source: String(source) });
 const rawStatement = (source) => createNode('UnsupportedStatement', { source: String(source) });
@@ -651,6 +652,10 @@ function recoverArrayIndexIncrements(source, options = {}) {
   return recoverIndexIncrements(source, controlCleanupSource(source), options);
 }
 
+function foldGuardedAbruptPlainBlockExits(source, options = {}) {
+  return recoverGuardedAbruptExit(source, controlCleanupSource(source), options);
+}
+
 // Guard specialization and frame cleanup can expose exits after the ordinary
 // exit passes have already run. Revisit only their existing destination/scope
 // proofs. Do not infer any new value facts or re-run scalar dispatch selection.
@@ -659,7 +664,7 @@ function recoverArrayIndexIncrements(source, options = {}) {
 function recoverPostGuardExits(source, {parameterNames = []} = {}) {
   const original = source;
   const counts = {voidReturnFrames: 0, fallthroughBreaks: 0, exitTreeFrames: 0,
-    ifElseFrames: 0, guardTreeFrames: 0, effectfulExits: 0,
+    ifElseFrames: 0, guardedAbruptFrames: 0, guardTreeFrames: 0, effectfulExits: 0,
     localizedLoopBreaks: 0, leadingLoopGuards: 0,
     labelsRemoved: 0, jumpsUnlabeled: 0, blocksUnwrapped: 0};
   const unchanged = () => ({source: original, rewrites: 0, counts});
@@ -687,6 +692,7 @@ function recoverPostGuardExits(source, {parameterNames = []} = {}) {
     [removeFallthroughLabelBreaks, 'breaksRemoved', 'fallthroughBreaks'],
     [foldLabeledExitTrees, 'framesRemoved', 'exitTreeFrames'],
     [foldLabeledIfElseExits, 'framesRemoved', 'ifElseFrames'],
+    [foldGuardedAbruptPlainBlockExits, 'framesRemoved', 'guardedAbruptFrames'],
     [foldLabeledGuardTrees, 'framesRemoved', 'guardTreeFrames'],
     [foldEffectfulPlainBlockExits, 'exitsRecovered', 'effectfulExits'],
     [localizePlainBlockLoopBreaks, 'breaksLocalized', 'localizedLoopBreaks'],
@@ -3083,6 +3089,7 @@ module.exports = {
   localizePlainBlockLoopBreaks,
   foldLeadingWhileBreakGuards,
   foldEffectfulPlainBlockExits,
+  foldGuardedAbruptPlainBlockExits,
   simplifyIdentityReferenceCasts,
   recoverScalarLabelDispatches,
   specializePathGuards,
