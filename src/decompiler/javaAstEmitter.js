@@ -9,6 +9,7 @@ const {
 const { JavaParser } = require('../java-frontend/parser');
 const { tokenizeJava } = require('../java-frontend/lexer');
 const { recoverScalarLabelDispatches: recoverScalarDispatch } = require('./scalarDispatchRecovery');
+const { recoverScalarIfDispatches: recoverIfDispatch } = require('./scalarIfDispatchRecovery');
 const { specializePathGuards: specializeGuards } = require('./pathGuardRecovery');
 const { recoverArrayIndexIncrements: recoverIndexIncrements } = require('./incrementCaptureRecovery');
 const { foldGuardedAbruptPlainBlockExits: recoverGuardedAbruptExit } = require('./guardedAbruptExitRecovery');
@@ -648,6 +649,10 @@ function removeDeadReceiverSnapshots(source, declarations, carrierNames) {
 
 function recoverScalarLabelDispatches(source, options = {}) {
   return recoverScalarDispatch(source, controlCleanupSource(source), options);
+}
+
+function recoverScalarIfDispatches(source, options = {}) {
+  return recoverIfDispatch(source, controlCleanupSource(source), options);
 }
 
 function specializePathGuards(source, options = {}) {
@@ -3134,6 +3139,7 @@ module.exports = {
   foldLoopElseExitGuards,
   simplifyIdentityReferenceCasts,
   recoverScalarLabelDispatches,
+  recoverScalarIfDispatches,
   specializePathGuards,
   recoverArrayIndexIncrements,
   recoverPostGuardExits,

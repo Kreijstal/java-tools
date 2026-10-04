@@ -1,6 +1,7 @@
 'use strict';
 
 const {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits, foldNonlocalLoopExits, foldLoopElseExitGuards} = require('./javaAstEmitter');
+const {recoverScalarIfDispatches} = require('./javaAstEmitter');
 
 const fs = require('fs');
 const path = require('path');
@@ -1991,6 +1992,14 @@ function shareExistingExitTails(body, parameterNames = [], parameters = []) {
     const loops = foldTerminalLoopExits(source, {parameterNames});
     if (!loops.loopsRecovered) break;
     source = loops.source;
+    changed = true;
+  }
+  // Classify immutable captured integers once while retaining the original
+  // effectful case runs and control-flag fallthrough. Never duplicate actions.
+  for (;;) {
+    const dispatch = recoverScalarIfDispatches(source);
+    if (!dispatch.dispatchesRecovered) break;
+    source = dispatch.source;
     changed = true;
   }
   if (changed) replaceArrayContents(body, source.split('\n'));

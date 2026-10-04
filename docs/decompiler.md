@@ -1560,6 +1560,29 @@ acceptance remain unfinished or unverified.
 
 ### Keeping terminating else effects inside their loop
 
+`recoverScalarIfDispatches` recognizes transparent integer if ladders inside an
+existing plain labeled block. A unique captured primitive `int` local must stay
+unmodified throughout dispatch; leading computations remain before the new
+switch. At least three and at most sixteen equality constants partition all
+integer values, including negative values and an exhaustive Other class.
+Actions retain their original lexical order and each appears exactly once.
+Unknown flag guards, callbacks, numeric work and original labeled exits remain.
+Only contiguous case runs and exits to the existing frame can be serialized;
+noncontiguous shared work refuses reconstruction instead of being duplicated.
+New bare switch exits skip only a simple break to the frame, or finish a run.
+Nested protected actions remain whole. Nested loops/switches/labels, local
+declarations, ambiguous transfers, mutable or boxed classifiers, unsupported
+syntax and excessive depth/action counts refuse this feature. The ordinary
+cleanup path runs it after the existing guard/loop recovery passes.
+
+`node --test test/scalarIfDispatchRecovery.test.js` covers supported case runs,
+empty/default paths, integer extremes, scope/target/mutation refusals and budgets.
+Seven native variants compare 20,160 independent cases, retaining negative/zero/
+positive flags, short-circuit/null/throwing callbacks, overflow, return snapshots,
+finally overrides, monitor ownership/release and ancestor break/continue targets.
+An additional native fixture checks 21 empty/default/extreme-key cases, including
+signed minimum and maximum case constants and overflow in the action itself.
+
 Terminal trailing-loop recovery also permits earlier breaks to the same loop
 inside the intact prefix. For example,
 `while (true) { if (stop()) { cleanup(); break; } work(); if (again()) continue; break; }`
