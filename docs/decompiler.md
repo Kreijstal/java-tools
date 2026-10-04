@@ -35,10 +35,24 @@ In particular, a break in a finally block can override a pending return and
 must remain. Cleanup entirely inside an enclosing protected region is allowed;
 its statements retain their exception and monitor coverage.
 
+The final stage also calls `finalizeTerminalSwitchFrames`. When a switch is the
+last statement on every enclosing continuation to a plain-block exit, breaking
+the nearest switch reaches that same exit. The shared destination localizer
+can then erase the jump's label; the unused-frame proof removes its wrapper
+only when declaration scope permits. Case order, guards, fallthrough, actions,
+returns and exceptions remain intact. Work, loops or protected constructs
+between the switch and plain exit refuse reconstruction. Protected constructs
+inside the switch remain intact and unwind on the same abrupt exit, including
+finally overrides of pending returns. An enclosing protected region also stays
+in place. This is a destination rewrite, not break removal.
+
 The focused terminal cleanup, loop exit, trailing loop and branch merge suites
-pass 94 tests, with one existing optional corpus check skipped. Publication
-still requires compiling and auditing the complete exported corpus, including
-retired labels and any resulting lexical-label ordinal migrations.
+pass 99 tests, with one existing optional corpus check skipped. Five new switch
+groups include six independent native event/completion models matching 49,920
+cases: case fallthrough, nonzero/negative flags, partial effects, signed overflow,
+injected failures, return/finally priority and monitor ownership. Publication
+still requires compiling and independently auditing the complete exported
+corpus, including retired labels and resulting lexical-label ordinal migrations.
 
 ## Why our own decompiler?
 

@@ -1,7 +1,7 @@
 'use strict';
 
 const {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits, foldNonlocalLoopExits, foldLoopElseExitGuards} = require('./javaAstEmitter');
-const {recoverScalarIfDispatches, simplifyPredicateNegations, simplifyDominatedPredicates, finalizeControlFrames} = require('./javaAstEmitter');
+const {recoverScalarIfDispatches, simplifyPredicateNegations, simplifyDominatedPredicates, finalizeControlFrames, finalizeTerminalSwitchFrames} = require('./javaAstEmitter');
 
 const fs = require('fs');
 const path = require('path');
@@ -2022,6 +2022,11 @@ function shareExistingExitTails(body, parameterNames = [], parameters = []) {
   const finalFrames = finalizeControlFrames(source);
   if (finalFrames.breaksRemoved) {
     source = finalFrames.source;
+    changed = true;
+  }
+  const switchFrames = finalizeTerminalSwitchFrames(source);
+  if (switchFrames.breaksLocalized) {
+    source = switchFrames.source;
     changed = true;
   }
   if (changed) replaceArrayContents(body, source.split('\n'));

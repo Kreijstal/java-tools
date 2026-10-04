@@ -847,6 +847,27 @@ function finalizeControlFrames(source) {
   return {source, ...counts};
 }
 
+// A terminal switch and its enclosing plain frame have the same continuation.
+// Localize only those exits, then remove the now-unused frame with the existing
+// scope proof. No condition, case body, fallthrough or protected group moves.
+function finalizeTerminalSwitchFrames(source) {
+  const counts = {breaksLocalized: 0, labelsRemoved: 0, jumpsUnlabeled: 0, blocksUnwrapped: 0};
+  if (typeof source !== 'string' || source.length > 400000) return {source, ...counts};
+  for (;;) {
+    const exits = localizePlainBlockLoopBreaks(source, {switchesOnly: true});
+    if (!exits.breaksLocalized) break;
+    source = exits.source;
+    counts.breaksLocalized += exits.breaksLocalized;
+    for (;;) {
+      const frames = simplifyControlFrames(source);
+      if (frames.source === source) break;
+      source = frames.source;
+      for (const key of ['labelsRemoved', 'jumpsUnlabeled', 'blocksUnwrapped']) counts[key] += frames[key];
+    }
+  }
+  return {source, ...counts};
+}
+
 // A structurer-owned plain exit block already provides a destination for a
 // common return/throw tail. Reuse it rather than introducing another frame.
 // Nested loops and plain labels can be exited by that break, but a try/catch,
@@ -1052,7 +1073,7 @@ function removeFallthroughLabelBreaks(source) {
 // entire continuation after that loop is empty. Change only the break's target
 // spelling. Inner cleanup still executes on the same abrupt exit; cleanup,
 // switches, other loops and work between the loop and label refuse the proof.
-function localizePlainBlockLoopBreaks(source) {
+function localizePlainBlockLoopBreaks(source, {switchesOnly = false} = {}) {
   const unchanged = () => ({source, breaksLocalized: 0});
   const proof = controlCleanupSource(source);
   if (!proof) return unchanged();
@@ -1108,7 +1129,8 @@ function localizePlainBlockLoopBreaks(source) {
   const edits = [];
   for (const jump of jumps) {
     const target = targets.get(jump), loop = nearest.get(jump);
-    if (!loops.has(loop?.kind) || target?.statement?.kind !== 'BlockStatement' || !blockExtent(target.statement)) continue;
+    if (!(switchesOnly ? loop?.kind === 'SwitchStatement' : loops.has(loop?.kind))
+        || target?.statement?.kind !== 'BlockStatement' || !blockExtent(target.statement)) continue;
     const labelStart = starts.get(target.range?.startOffset);
     if (tokens[labelStart]?.text !== target.label || tokens[labelStart + 1]?.text !== ':') continue;
     let child = loop, parent = parents.get(child), terminal = true;
@@ -3176,6 +3198,7 @@ module.exports = {
   specializePathGuards,
   simplifyDominatedPredicates,
   finalizeControlFrames,
+  finalizeTerminalSwitchFrames,
   recoverArrayIndexIncrements,
   recoverPostGuardExits,
   foldLabeledBooleanDecisions,
