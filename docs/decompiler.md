@@ -20,6 +20,26 @@ The design guarantee: **for any reducible CFG the structurer emits zero gotos**,
 and region-splitting brings the irreducible minority into that class. This is an
 *algorithmic* property, not a heuristic that happens to work on today's inputs.
 
+## Final control-frame cleanup
+
+Loop and dispatch reconstruction can expose a redundant labeled break after
+the earlier frame cleanup has run. `finalizeControlFrames` finishes the source
+pipeline by reusing the existing lexical fallthrough and unused-frame proofs.
+It removes such breaks and their unused labels, retaining blocks that contain
+declarations. It does not rerun predicate or loop transformations.
+
+A break can disappear only when its entire path to its plain-block destination
+is the final statement of transparent blocks, branches and plain labels.
+Intermediate loops, switches, try/catch/finally and monitors refuse that proof.
+In particular, a break in a finally block can override a pending return and
+must remain. Cleanup entirely inside an enclosing protected region is allowed;
+its statements retain their exception and monitor coverage.
+
+The focused terminal cleanup, loop exit, trailing loop and branch merge suites
+pass 94 tests, with one existing optional corpus check skipped. Publication
+still requires compiling and auditing the complete exported corpus, including
+retired labels and any resulting lexical-label ordinal migrations.
+
 ## Why our own decompiler?
 
 The immediate motivation was a gamepack-deobfuscation pipeline where the final

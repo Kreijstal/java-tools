@@ -825,6 +825,28 @@ function controlCleanupSource(source) {
   return unknown ? null : {wrapped, parsed, tokens, starts, closes, children, labelCounts};
 }
 
+// Loop and dispatch recovery can expose a fallthrough exit after the earlier
+// frame cleanup has already run. Finish with the existing lexical proofs only:
+// remove redundant breaks, then remove their unused labels without rerunning
+// predicate or loop transformations. Protected transfers remain opaque.
+function finalizeControlFrames(source) {
+  const counts = {breaksRemoved: 0, labelsRemoved: 0, jumpsUnlabeled: 0, blocksUnwrapped: 0};
+  if (typeof source !== 'string' || source.length > 400000) return {source, ...counts};
+  for (;;) {
+    const exits = removeFallthroughLabelBreaks(source);
+    if (!exits.breaksRemoved) break;
+    source = exits.source;
+    counts.breaksRemoved += exits.breaksRemoved;
+    for (;;) {
+      const frames = simplifyControlFrames(source);
+      if (frames.source === source) break;
+      source = frames.source;
+      for (const key of ['labelsRemoved', 'jumpsUnlabeled', 'blocksUnwrapped']) counts[key] += frames[key];
+    }
+  }
+  return {source, ...counts};
+}
+
 // A structurer-owned plain exit block already provides a destination for a
 // common return/throw tail. Reuse it rather than introducing another frame.
 // Nested loops and plain labels can be exited by that break, but a try/catch,
@@ -3153,6 +3175,7 @@ module.exports = {
   simplifyPredicateNegations,
   specializePathGuards,
   simplifyDominatedPredicates,
+  finalizeControlFrames,
   recoverArrayIndexIncrements,
   recoverPostGuardExits,
   foldLabeledBooleanDecisions,
