@@ -1,10 +1,11 @@
 'use strict';
 
-// A direct arm ending in `if (guard) break Frame; abrupt;` skips the frame's
-// remainder on both paths. Express that remainder as the outer else, and keep
-// the abrupt statement under the inverse guard. Nothing crosses a protected
-// boundary. Keep prefix-local scope and the original effect-arm braces; the
-// complete fallback stays together in its new else arm.
+// A direct arm ending in `if (guard) break Frame; suffix; abrupt;` skips the
+// frame's remainder on both paths. Express that remainder as the outer else,
+// and keep the complete suffix and abrupt statement under the inverse guard.
+// No suffix statement moves across another statement or protected boundary.
+// Prefix locals retain their scope; suffix locals have no following arm work
+// that could escape their new braces. The complete fallback stays together.
 function foldGuardedAbruptPlainBlockExits(source, proof, {retainDiagnostics = false} = {}) {
   const unchanged = () => ({source, framesRemoved: 0, jumpsRemoved: 0});
   if (!proof || typeof retainDiagnostics !== 'boolean') return unchanged();
@@ -104,7 +105,16 @@ function foldGuardedAbruptPlainBlockExits(source, proof, {retainDiagnostics = fa
         for (let index = 0; index < statements.length - 1; index++) {
           const branch = statements[index], body = branch.consequent, arm = extent(body);
           if (branch.kind !== 'IfStatement' || branch.alternate || !arm || body.statements.length < 2) continue;
-          const guard = body.statements.at(-2), abrupt = body.statements.at(-1);
+          // The one reference to this frame must be a direct guarded break in
+          // the arm. Keep every following statement, including nested scopes
+          // and cleanup, together with the final abrupt transfer.
+          const guardIndex = body.statements.findIndex(statement =>
+            statement.kind === 'IfStatement' && (statement.consequent === references.get(node)[0]
+              || statement.consequent?.kind === 'BlockStatement'
+                && statement.consequent.statements.length === 1
+                && statement.consequent.statements[0] === references.get(node)[0]));
+          if (guardIndex < 0 || guardIndex >= body.statements.length - 1) continue;
+          const guard = body.statements[guardIndex], abrupt = body.statements.at(-1);
           const jump = guard?.consequent?.kind === 'BlockStatement' && guard.consequent.statements.length === 1
             ? guard.consequent.statements[0] : guard?.consequent;
           if (guard?.kind !== 'IfStatement' || guard.alternate || jump?.kind !== 'BreakStatement'
@@ -114,6 +124,7 @@ function foldGuardedAbruptPlainBlockExits(source, proof, {retainDiagnostics = fa
           const branchStart = starts.get(branch.range?.startOffset), headerEnd = closes.get(branchStart + 1);
           const guardStart = starts.get(guard.range?.startOffset), guardEnd = closes.get(guardStart + 1);
           const jumpStart = starts.get(jump.range?.startOffset), jumpEnd = ends.get(jump);
+          const suffixStart = starts.get(body.statements[guardIndex + 1].range?.startOffset);
           const abruptStart = starts.get(abrupt.range?.startOffset), abruptEnd = ends.get(abrupt);
           const restStart = starts.get(statements[index + 1].range?.startOffset);
           const braced = guard.consequent.kind === 'BlockStatement';
@@ -121,16 +132,18 @@ function foldGuardedAbruptPlainBlockExits(source, proof, {retainDiagnostics = fa
               || tokens[guardStart]?.text !== 'if' || tokens[guardStart + 1]?.text !== '(' || guardEnd === undefined
               || braced && (tokens[guardEnd + 1]?.text !== '{' || closes.get(guardEnd + 1) !== jumpEnd + 1)
               || jumpStart !== guardEnd + (braced ? 2 : 1)
-              || abruptStart !== jumpEnd + (braced ? 2 : 1) || abruptEnd + 1 !== arm.close
+              || suffixStart !== jumpEnd + (braced ? 2 : 1) || abruptStart < suffixStart
+              || abruptEnd + 1 !== arm.close
               || restStart !== arm.close + 1) continue;
           const predicate = negate(guard.condition, guardStart + 1, guardEnd);
-          const abruptBytes = wrapped.slice(tokens[abruptStart].range.startOffset, tokens[abruptEnd].range.endOffset);
+          const suffixBytes = wrapped.slice(tokens[suffixStart].range.startOffset, tokens[abruptEnd].range.endOffset);
           const prefix = wrapped.slice(wrapped.lastIndexOf('\n', tokens[guardStart].range.startOffset - 1) + 1,
             tokens[guardStart].range.startOffset);
           const indent = /^[ \t]*$/.test(prefix) ? prefix : '';
           const multiline = indent && wrapped.slice(tokens[guardStart].range.startOffset, tokens[arm.close].range.endOffset).includes('\n');
-          const transfer = multiline ? 'if (' + predicate + ') {\n' + indent + '  ' + abruptBytes + '\n' + indent + '}'
-            : 'if (' + predicate + ') { ' + abruptBytes + ' }';
+          const transfer = multiline ? 'if (' + predicate + ') {\n' + indent + '  '
+            + suffixBytes.replace(/\n([ \t]*)(?=\S)/g, '\n  $1') + '\n' + indent + '}'
+            : 'if (' + predicate + ') { ' + suffixBytes + ' }';
           const branchBytes = wrapped.slice(tokens[branchStart].range.startOffset, tokens[guardStart].range.startOffset)
             + transfer + wrapped.slice(tokens[abruptEnd].range.endOffset, tokens[arm.close].range.endOffset);
           const remainder = wrapped.slice(tokens[arm.close].range.endOffset, tokens[frame.close].range.startOffset);
@@ -166,6 +179,7 @@ function foldGuardedAbruptPlainBlockExits(source, proof, {retainDiagnostics = fa
           return {start: tokens[labelStart].range.startOffset, end: tokens[frame.close].range.endOffset,
             text,
             diagnostics: {label: node.label, abruptKind: abrupt.kind, predicate, frameScopeRetained: keepFrame,
+              guardedSuffixStatements: body.statements.length - guardIndex - 1,
               labelRange: {start: tokens[labelStart].range.startOffset - 2, end: tokens[labelStart + 1].range.endOffset - 2},
               jumpRange: {start: tokens[jumpStart].range.startOffset - 2, end: tokens[jumpEnd].range.endOffset - 2}}};
         }
