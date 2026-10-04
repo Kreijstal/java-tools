@@ -13,7 +13,8 @@ const { specializePathGuards: specializeGuards } = require('./pathGuardRecovery'
 const { recoverArrayIndexIncrements: recoverIndexIncrements } = require('./incrementCaptureRecovery');
 const { foldGuardedAbruptPlainBlockExits: recoverGuardedAbruptExit } = require('./guardedAbruptExitRecovery');
 const { foldGuardedLoopContinuations: recoverLoopContinuation, foldNonrepeatingWhileLoops: recoverNonrepeatingLoops,
-  foldTrailingLoopContinuations: recoverTrailingLoopContinuation } = require('./guardedLoopContinuationRecovery');
+  foldTrailingLoopContinuations: recoverTrailingLoopContinuation,
+  foldLoopExitContinuations: recoverLoopExitContinuation } = require('./guardedLoopContinuationRecovery');
 
 const rawExpression = (source) => createNode('UnsupportedExpression', { source: String(source) });
 const rawStatement = (source) => createNode('UnsupportedStatement', { source: String(source) });
@@ -668,6 +669,10 @@ function foldNonrepeatingWhileLoops(source, options = {}) {
 
 function foldTrailingLoopContinuations(source, options = {}) {
   return recoverTrailingLoopContinuation(source, controlCleanupSource(source), options);
+}
+
+function foldLoopExitContinuations(source, options = {}) {
+  return recoverLoopExitContinuation(source, controlCleanupSource(source), options);
 }
 
 // Guard specialization and frame cleanup can expose exits after the ordinary
@@ -3108,6 +3113,7 @@ module.exports = {
   foldGuardedLoopContinuations,
   foldNonrepeatingWhileLoops,
   foldTrailingLoopContinuations,
+  foldLoopExitContinuations,
   simplifyIdentityReferenceCasts,
   recoverScalarLabelDispatches,
   specializePathGuards,

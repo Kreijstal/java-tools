@@ -1,6 +1,6 @@
 'use strict';
 
-const {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations} = require('./javaAstEmitter');
+const {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations} = require('./javaAstEmitter');
 
 const fs = require('fs');
 const path = require('path');
@@ -1946,6 +1946,16 @@ function shareExistingExitTails(body, parameterNames = [], parameters = []) {
     const loops = foldTrailingLoopContinuations(source, {parameterNames});
     if (!loops.loopsRecovered) break;
     source = loops.source;
+    changed = true;
+  }
+  // Complete repeatable prefixes and abrupt continuations need not share an
+  // infinite-loop body. Only normal prefix completion takes the new bare break;
+  // all existing backedges/nonlocal transfers and protected groups stay intact.
+  // The new own break excludes the loop from any subsequent recovery.
+  for (;;) {
+    const exits = foldLoopExitContinuations(source, {parameterNames});
+    if (!exits.continuationsRecovered) break;
+    source = exits.source;
     changed = true;
   }
   if (changed) replaceArrayContents(body, source.split('\n'));

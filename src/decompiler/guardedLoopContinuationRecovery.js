@@ -6,7 +6,8 @@
 // the continuation cannot repeat/exit this loop or complete normally. Keep
 // each protected construct whole and retain every existing transfer target.
 function recoverLoopForms(source, proof, {parameterNames = [], retainDiagnostics = false} = {}, form = 'guarded') {
-  const counter = form === 'nonrepeating' ? 'conditionalsRecovered' : 'loopsRecovered';
+  const counter = form === 'nonrepeating' ? 'conditionalsRecovered'
+    : form === 'exitContinuation' ? 'continuationsRecovered' : 'loopsRecovered';
   const unchanged = () => ({source, [counter]: 0});
   if (!proof || typeof retainDiagnostics !== 'boolean' || !Array.isArray(parameterNames)
       || new Set(parameterNames).size !== parameterNames.length
@@ -216,11 +217,77 @@ function recoverLoopForms(source, proof, {parameterNames = [], retainDiagnostics
         }
       }
     }
+    if (form === 'exitContinuation' && node.kind === 'WhileStatement' && constantTrue(node.condition)
+        && node.body?.kind === 'BlockStatement') {
+      const statements = node.body.statements;
+      const label = parents.get(node)?.kind === 'LabeledStatement' ? parents.get(node) : null;
+      const referencesToLoop = [...references.get(node) || [], ...references.get(label) || []];
+      if (referencesToLoop.length && referencesToLoop.every(reference => reference.kind === 'ContinueStatement')) {
+        for (let index = 1; index < statements.length; index++) {
+          const prefix = statements.slice(0, index), suffix = statements.slice(index), roots = new Set(prefix);
+          const inPrefix = reference => {
+            for (let ancestor = reference; ancestor && ancestor !== node; ancestor = parents.get(ancestor))
+              if (roots.has(ancestor)) return true;
+            return false;
+          };
+          // Every repeating path stays in the intact prefix. Own breaks would
+          // skip the old continuation but enter the hoisted one, so refuse all
+          // of them, including finally overrides and syntactically dead exits.
+          // Never hoist locals or split an if/try/switch/monitor/label construct.
+          if (prefix.some(statement => statement.kind === 'LocalVariableDeclarationStatement')
+              || !referencesToLoop.every(inPrefix)) continue;
+          const head = sequence(prefix), tail = sequence(suffix);
+          if (!refused && head.has(normal) && !tail.has(normal)) {
+            candidate = {node, label, prefix, suffix}; return;
+          }
+        }
+      }
+    }
     children(node, child => visit(child, scope));
   }
   visit(parsed, new Map(parameterNames.map(name => [name, true])));
   if (refused || !candidate) return unchanged();
   const {node, guard, suffix, label} = candidate;
+  if (form === 'exitContinuation') {
+    const {prefix} = candidate;
+    const start = starts.get(node.range.startOffset), bodyOpen = start + 4, bodyClose = closes.get(bodyOpen);
+    const rangeStart = label ? starts.get(label.range.startOffset) : start;
+    const first = starts.get(prefix[0].range.startOffset), suffixStart = starts.get(suffix[0].range.startOffset);
+    if (tokens[start]?.text !== 'while' || tokens[start + 1]?.text !== '(' || tokens[start + 2]?.text !== 'true'
+        || tokens[start + 3]?.text !== ')' || tokens[bodyOpen]?.text !== '{' || tokens[bodyClose]?.text !== '}'
+        || first !== bodyOpen + 1 || suffixStart === undefined
+        || label && (tokens[rangeStart]?.text !== label.label || tokens[rangeStart + 1]?.text !== ':' || rangeStart + 2 !== start)) return unchanged();
+    const indentAt = offset => {
+      const bytes = wrapped.slice(wrapped.lastIndexOf('\n', offset - 1) + 1, offset);
+      return /^[ \t]*$/.test(bytes) ? bytes : '';
+    };
+    const indent = indentAt(tokens[rangeStart].range.startOffset), prefixIndent = indentAt(tokens[first].range.startOffset);
+    const prefixBytes = wrapped.slice(tokens[bodyOpen].range.endOffset, tokens[suffixStart].range.startOffset).trimEnd();
+    let tailBytes = wrapped.slice(tokens[suffixStart].range.startOffset, tokens[bodyClose].range.startOffset).trimEnd();
+    const retainTailScope = suffix.some(statement => statement.kind === 'LocalVariableDeclarationStatement');
+    if (retainTailScope) tailBytes = '{\n' + indent + '  ' + tailBytes + '\n' + indent + '}';
+    else {
+      const tailIndent = indentAt(tokens[suffixStart].range.startOffset);
+      if (tailIndent.startsWith(indent) && tailIndent.length > indent.length)
+        tailBytes = tailBytes.split('\n').map((line, index) => index && line.startsWith(tailIndent)
+          ? indent + line.slice(tailIndent.length) : line).join('\n');
+    }
+    // The literal-true header has no effects. Normal prefix completion takes
+    // this new bare break; existing continues still repeat without executing
+    // the continuation. Nonlocal transfers still leave both sections. The
+    // suffix remains at exactly the same enclosing protection/monitor depth.
+    let replacement = wrapped.slice(tokens[rangeStart].range.startOffset, tokens[bodyOpen].range.endOffset)
+      + prefixBytes + '\n' + prefixIndent + 'break;\n' + indent + '}\n' + indent + tailBytes;
+    if (parents.get(label || node)?.kind !== 'BlockStatement') replacement = '{\n' + replacement + '\n' + indent + '}';
+    const begin = tokens[rangeStart].range.startOffset, end = tokens[bodyClose].range.endOffset;
+    const output = wrapped.slice(0, begin) + replacement + wrapped.slice(end);
+    return {source: output.slice(2, -2), continuationsRecovered: 1, ...(retainDiagnostics ? {diagnostics: {
+      label: label?.label || null, retainedTailScope: retainTailScope,
+      loopRange: {start: begin - 2, end: end - 2},
+      prefixRange: {start: tokens[first].range.startOffset - 2, end: tokens[suffixStart].range.startOffset - 2},
+      suffixRange: {start: tokens[suffixStart].range.startOffset - 2, end: tokens[bodyClose].range.startOffset - 2},
+    }} : {})};
+  }
   if (form === 'nonrepeating') {
     const start = starts.get(node.range?.startOffset), close = closes.get(start + 1);
     const bodyOpen = starts.get(node.body.range?.startOffset), bodyClose = closes.get(bodyOpen);
@@ -347,4 +414,8 @@ function foldTrailingLoopContinuations(source, proof, options) {
   return recoverLoopForms(source, proof, options, 'trailing');
 }
 
-module.exports = {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations};
+function foldLoopExitContinuations(source, proof, options) {
+  return recoverLoopForms(source, proof, options, 'exitContinuation');
+}
+
+module.exports = {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations};
