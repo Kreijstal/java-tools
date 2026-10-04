@@ -2002,10 +2002,11 @@ function shareExistingExitTails(body, parameterNames = [], parameters = []) {
     source = dispatch.source;
     changed = true;
   }
-  // Exit recovery can create fresh negations after typed IR rendering. Keep
-  // short-circuit/operand order; unknown relational tests retain their NaNs.
-  for (;;) {
-    const predicates = simplifyPredicateNegations(source);
+  // Finish Boolean cleanup before typed relational cleanup, so grouping does
+  // not depend on when operand types become available. Preserve the existing
+  // source grouping; unknown/floating relations keep their NaN outcomes.
+  for (const complementIntegralRelations of [false, true]) for (;;) {
+    const predicates = simplifyPredicateNegations(source, {parameters, complementIntegralRelations});
     if (!predicates.predicatesSimplified) break;
     source = predicates.source;
     changed = true;

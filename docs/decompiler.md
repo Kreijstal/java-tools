@@ -1564,20 +1564,34 @@ acceptance remain unfinished or unverified.
 fresh negations after typed IR rendering. It complements `==`/`!=`, cancels
 double negation, and applies De Morgan to `&&`/`||` in if/while/for conditions
 and braced do-while conditions. Both operand order and short-circuit paths stay
-the same. Every other atom remains verbatim beneath logical negation: relational
-tests retain NaN outcomes, call arguments keep their own operators, and boxed
-Boolean identity comparisons keep their operand expressions and unboxing.
+the same. The final pipeline finishes Boolean cleanup before enabling
+`complementIntegralRelations` (default true for the standalone helper), making
+grouping independent of when operand types become available.
+Relational tests are complemented only when both operands have proven
+primitive integral types. The optional `parameters: [{name, type}]` comes from
+the method signature; scoped unique local declarations, primitive casts,
+integer/character literals, integral arithmetic and known array access/length
+provide further evidence. Floating/unknown relations retain their negation and
+NaN outcomes. Field/call results and boxed values remain unknown unless an
+explicit primitive cast proves the result. Shadowed names, for-initializer
+locals and out-of-scope declarations do not establish types. Call arguments
+and boxed-Boolean identity operands remain byte exact, including unboxing.
 Double negation is simplified only where Java requires a primitive Boolean
 condition; assignments, return values and call arguments remain opaque.
 The implementation applies token edits without moving statements, scopes,
 labels, protected regions or monitors. Unsupported/commented/Unicode-translated
 input, nested executables and source/depth/edit budgets refuse this cleanup.
 
-`node --test test/predicateNegationRecovery.test.js` passes six focused groups.
+`node --test test/predicateNegationRecovery.test.js` passes nine focused groups.
 Six native context variants match 708,750 independent ordered-oracle cases,
 including nullable/noncached Boolean values, reference identity, integer
 overflow, NaN/signed zeros/infinities, throwing callbacks, skipped evaluations,
-finally overrides and nullable monitor acquisition/release.
+finally overrides and nullable monitor acquisition/release. Seven further
+integral variants match 453,600 independent ordered `Long.compare` oracle cases:
+postincrements, int overflow/division, long shifts with masked/negative counts,
+NaN/infinity casts, nullable arrays and bounds failures, narrowing casts,
+throwing callbacks, finally overrides and monitor release. Diagnostics report
+the operand types and exact operator ranges for independent compiler audits.
 
 ### Recovering captured-integer if dispatches
 
