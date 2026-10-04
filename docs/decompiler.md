@@ -1558,6 +1558,38 @@ rows and diagnostics remain unchanged. There remain 21 large method spans,
 10 with block labels. Larger reconstructions and whole-game/browser/phone
 acceptance remain unfinished or unverified.
 
+### Simplifying dominated Boolean predicates
+
+`simplifyDominatedPredicates` removes neutral `&&`/`||` operands when a preceding
+branch or short-circuit operand proves an equality of the same captured
+primitive int local. For example, inside `if (flag == 0)`,
+`if (ready() && flag == 0)` becomes `if (ready())`. Equality/exclusion facts also
+apply to different decimal int constants. While/for bodies receive their
+entry-condition facts; do-while bodies do not receive facts from their later
+condition. The final pipeline runs this after existing structural/predicate
+cleanup, without rerunning passes that move control frames.
+
+Facts require a unique visible declaration and no later/cyclic writes or
+cyclic declaration. Fields, boxed/floating values, ambiguous names and nested
+executables remain opaque. No initializer/global value is assumed. Boolean
+identity elimination retains every unknown atom exactly once, in order;
+absorbing expressions such as `effect() && knownFalse` remain in place. Entirely
+known conditions remain for the separate completion-aware pass. Loop cleanup
+requires a surviving expression proven nonconstant to the Java compiler.
+
+Only source characters are deleted; all statements, declarations, scopes,
+labels, protected regions, monitors and diagnostics remain. Optional
+`retainDiagnostics` records deleted ranges, removed comparisons and their
+branch facts. `parameterNames` supplies method-signature evidence for
+nonconstant loop operands. Source/depth/edit budgets and unsupported/commented/
+Unicode-translated input refuse cleanup.
+
+`node --test test/dominatedPredicateRecovery.test.js` passes five focused groups.
+Ten native variants match 262,500 independent ordered-oracle cases: varying
+signed flags, nullable/noncached Booleans, reference identity, NaN/signed zeros/
+infinities, callbacks that mutate a volatile global while the snapshot stays
+stable, callback failures, loops, abrupt exits, finally overrides and monitors.
+
 ### Simplifying recovered Boolean predicates
 
 `simplifyPredicateNegations` runs after control-flow recovery, which can add

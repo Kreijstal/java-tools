@@ -12,6 +12,7 @@ const { recoverScalarLabelDispatches: recoverScalarDispatch } = require('./scala
 const { recoverScalarIfDispatches: recoverIfDispatch } = require('./scalarIfDispatchRecovery');
 const { simplifyPredicateNegations: simplifyNegations } = require('./predicateNegationRecovery');
 const { specializePathGuards: specializeGuards } = require('./pathGuardRecovery');
+const { simplifyDominatedPredicates: simplifyDominated } = require('./dominatedPredicateRecovery');
 const { recoverArrayIndexIncrements: recoverIndexIncrements } = require('./incrementCaptureRecovery');
 const { foldGuardedAbruptPlainBlockExits: recoverGuardedAbruptExit } = require('./guardedAbruptExitRecovery');
 const { foldGuardedLoopContinuations: recoverLoopContinuation, foldNonrepeatingWhileLoops: recoverNonrepeatingLoops,
@@ -658,6 +659,10 @@ function recoverScalarIfDispatches(source, options = {}) {
 
 function simplifyPredicateNegations(source, options = {}) {
   return simplifyNegations(source, controlCleanupSource(source), options);
+}
+
+function simplifyDominatedPredicates(source, options = {}) {
+  return simplifyDominated(source, controlCleanupSource(source), options);
 }
 
 function specializePathGuards(source, options = {}) {
@@ -3147,6 +3152,7 @@ module.exports = {
   recoverScalarIfDispatches,
   simplifyPredicateNegations,
   specializePathGuards,
+  simplifyDominatedPredicates,
   recoverArrayIndexIncrements,
   recoverPostGuardExits,
   foldLabeledBooleanDecisions,

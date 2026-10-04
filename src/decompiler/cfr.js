@@ -1,7 +1,7 @@
 'use strict';
 
 const {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits, foldNonlocalLoopExits, foldLoopElseExitGuards} = require('./javaAstEmitter');
-const {recoverScalarIfDispatches, simplifyPredicateNegations} = require('./javaAstEmitter');
+const {recoverScalarIfDispatches, simplifyPredicateNegations, simplifyDominatedPredicates} = require('./javaAstEmitter');
 
 const fs = require('fs');
 const path = require('path');
@@ -2009,6 +2009,14 @@ function shareExistingExitTails(body, parameterNames = [], parameters = []) {
     const predicates = simplifyPredicateNegations(source, {parameters, complementIntegralRelations});
     if (!predicates.predicatesSimplified) break;
     source = predicates.source;
+    changed = true;
+  }
+  // Branch and short-circuit facts can remove neutral comparisons of a stable
+  // captured int. Keep every unknown atom/action and all completion scopes.
+  for (;;) {
+    const dominated = simplifyDominatedPredicates(source, {parameterNames});
+    if (!dominated.conditionsSimplified) break;
+    source = dominated.source;
     changed = true;
   }
   if (changed) replaceArrayContents(body, source.split('\n'));
