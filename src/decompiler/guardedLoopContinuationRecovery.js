@@ -185,6 +185,37 @@ function recoverLoopForms(source, proof, {parameterNames = [], retainDiagnostics
         }
       }
     }
+    if (form === 'trailing' && node.kind === 'WhileStatement' && constantTrue(node.condition)
+        && node.body?.kind === 'BlockStatement') {
+      const statements = node.body.statements;
+      const label = parents.get(node)?.kind === 'LabeledStatement' ? parents.get(node) : null;
+      const referencesToLoop = [...references.get(node) || [], ...references.get(label) || []];
+      const directContinue = statement => {
+        if (statement?.kind !== 'IfStatement' || statement.alternate) return null;
+        const arm = statement.consequent;
+        const jump = arm?.kind === 'BlockStatement' && arm.statements.length === 1 ? arm.statements[0] : arm;
+        return jump?.kind === 'ContinueStatement' && [node, label].includes(targets.get(jump)) ? jump : null;
+      };
+      for (let index = 1; index < statements.length - 1; index++) {
+        if (!directContinue(statements[index])) continue;
+        let end = index;
+        while (end < statements.length && directContinue(statements[end])) end++;
+        const prefix = statements.slice(0, index), guards = statements.slice(index, end), suffix = statements.slice(end);
+        const jumps = guards.map(directContinue);
+        // Only direct guard backedges may reach this loop. In particular an
+        // earlier continue (even in a finally) would now evaluate the predicate
+        // where the original skipped it. Own breaks would skip the old suffix.
+        // Body-owned locals would lose their scope in the new trailing header
+        // or continuation; retain that loop rather than hoist declarations.
+        if (!suffix.length || prefix.some(statement => statement.kind === 'LocalVariableDeclarationStatement')
+            || referencesToLoop.length !== jumps.length || !referencesToLoop.every(reference => jumps.includes(reference))
+            || !guards.some(guard => nonconstant(guard.condition, scope))) continue;
+        const head = sequence(prefix), tail = sequence(suffix);
+        if (!refused && head.has(normal) && !tail.has(normal)) {
+          candidate = {node, label, prefix, guards, suffix}; return;
+        }
+      }
+    }
     children(node, child => visit(child, scope));
   }
   visit(parsed, new Map(parameterNames.map(name => [name, true])));
@@ -201,6 +232,66 @@ function recoverLoopForms(source, proof, {parameterNames = [], retainDiagnostics
       label: label?.label || null,
       loopRange: {start: begin - 2, end: tokens[bodyClose].range.endOffset - 2},
       headerKeywordRange: {start: begin - 2, end: end - 2},
+    }} : {})};
+  }
+  if (form === 'trailing') {
+    const {prefix, guards} = candidate;
+    const start = starts.get(node.range.startOffset), bodyOpen = start + 4, bodyClose = closes.get(bodyOpen);
+    const rangeStart = label ? starts.get(label.range.startOffset) : start;
+    const first = starts.get(prefix[0].range.startOffset), guardStart = starts.get(guards[0].range.startOffset);
+    const suffixStart = starts.get(suffix[0].range.startOffset);
+    if (tokens[start]?.text !== 'while' || tokens[start + 1]?.text !== '(' || tokens[start + 2]?.text !== 'true'
+        || tokens[start + 3]?.text !== ')' || tokens[bodyOpen]?.text !== '{' || tokens[bodyClose]?.text !== '}'
+        || first !== bodyOpen + 1 || suffixStart === undefined
+        || label && (tokens[rangeStart]?.text !== label.label || tokens[rangeStart + 1]?.text !== ':' || rangeStart + 2 !== start)) return unchanged();
+    const predicates = [];
+    let expected = guardStart;
+    for (const guard of guards) {
+      const begin = starts.get(guard.range.startOffset), conditionEnd = closes.get(begin + 1);
+      const armStart = conditionEnd + 1;
+      const arm = guard.consequent;
+      const jump = arm.kind === 'BlockStatement' ? arm.statements[0] : arm;
+      const jumpStart = starts.get(jump.range.startOffset), jumpEnd = ends.get(jump);
+      const armEnd = arm.kind === 'BlockStatement' ? closes.get(armStart) : jumpEnd;
+      if (begin !== expected || tokens[begin]?.text !== 'if' || tokens[begin + 1]?.text !== '(' || conditionEnd === undefined
+          || jumpEnd === undefined || arm.kind === 'BlockStatement' && (tokens[armStart]?.text !== '{'
+            || jumpStart !== armStart + 1 || armEnd !== jumpEnd + 1 || tokens[armEnd]?.text !== '}')
+          || arm.kind !== 'BlockStatement' && jumpStart !== armStart) return unchanged();
+      predicates.push(wrapped.slice(tokens[begin + 1].range.endOffset, tokens[conditionEnd].range.startOffset));
+      expected = armEnd + 1;
+    }
+    if (expected !== suffixStart) return unchanged();
+    const indentAt = offset => {
+      const bytes = wrapped.slice(wrapped.lastIndexOf('\n', offset - 1) + 1, offset);
+      return /^[ \t]*$/.test(bytes) ? bytes : '';
+    };
+    const indent = indentAt(tokens[rangeStart].range.startOffset);
+    const prefixBytes = wrapped.slice(tokens[bodyOpen].range.endOffset, tokens[guardStart].range.startOffset).trimEnd();
+    let tailBytes = wrapped.slice(tokens[suffixStart].range.startOffset, tokens[bodyClose].range.startOffset).trimEnd();
+    const retainTailScope = suffix.some(statement => statement.kind === 'LocalVariableDeclarationStatement');
+    if (retainTailScope) tailBytes = '{\n' + indent + '  ' + tailBytes + '\n' + indent + '}';
+    else {
+      const tailIndent = indentAt(tokens[suffixStart].range.startOffset);
+      if (tailIndent.startsWith(indent) && tailIndent.length > indent.length)
+        tailBytes = tailBytes.split('\n').map((line, index) => index && line.startsWith(tailIndent)
+          ? indent + line.slice(tailIndent.length) : line).join('\n');
+    }
+    // Ordered short-circuit OR preserves evaluation of each separate guard,
+    // including mutations, unboxing failures, and skipped later callbacks.
+    const predicate = predicates.length === 1 ? predicates[0] : predicates.map(bytes => '(' + bytes + ')').join(' || ');
+    let replacement = (label ? label.label + ': ' : '') + 'do {' + prefixBytes + '\n' + indent + '} while (' + predicate + ');\n' + indent + tailBytes;
+    if (parents.get(label || node)?.kind !== 'BlockStatement') replacement = '{\n' + replacement + '\n' + indent + '}';
+    const begin = tokens[rangeStart].range.startOffset, end = tokens[bodyClose].range.endOffset;
+    const output = wrapped.slice(0, begin) + replacement + wrapped.slice(end);
+    return {source: output.slice(2, -2), loopsRecovered: 1, ...(retainDiagnostics ? {diagnostics: {
+      label: label?.label || null, predicates, retainedTailScope: retainTailScope,
+      loopRange: {start: begin - 2, end: end - 2},
+      prefixRange: {start: tokens[first].range.startOffset - 2, end: tokens[guardStart].range.startOffset - 2},
+      suffixRange: {start: tokens[suffixStart].range.startOffset - 2, end: tokens[bodyClose].range.startOffset - 2},
+      removedContinueRanges: guards.map(guard => {
+        const jump = guard.consequent.kind === 'BlockStatement' ? guard.consequent.statements[0] : guard.consequent;
+        return {start: jump.range.startOffset - 2, end: tokens[ends.get(jump)].range.endOffset - 2};
+      }),
     }} : {})};
   }
   const start = starts.get(node.range.startOffset), bodyOpen = start + 4, bodyClose = closes.get(bodyOpen);
@@ -252,4 +343,8 @@ function foldNonrepeatingWhileLoops(source, proof, options) {
   return recoverLoopForms(source, proof, options, 'nonrepeating');
 }
 
-module.exports = {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops};
+function foldTrailingLoopContinuations(source, proof, options) {
+  return recoverLoopForms(source, proof, options, 'trailing');
+}
+
+module.exports = {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations};

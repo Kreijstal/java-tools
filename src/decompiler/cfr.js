@@ -1,6 +1,6 @@
 'use strict';
 
-const {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops} = require('./javaAstEmitter');
+const {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations} = require('./javaAstEmitter');
 
 const fs = require('fs');
 const path = require('path');
@@ -1936,6 +1936,15 @@ function shareExistingExitTails(body, parameterNames = [], parameters = []) {
   for (;;) {
     const loops = foldNonrepeatingWhileLoops(source, {parameterNames});
     if (!loops.conditionalsRecovered) break;
+    source = loops.source;
+    changed = true;
+  }
+  // Direct conditional backedges after a complete prefix are a do-while.
+  // Each rewrite consumes at least one own continue and preserves the ordered
+  // short-circuit tests, complete protected prefix, and abrupt continuation.
+  for (;;) {
+    const loops = foldTrailingLoopContinuations(source, {parameterNames});
+    if (!loops.loopsRecovered) break;
     source = loops.source;
     changed = true;
   }
