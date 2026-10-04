@@ -15,7 +15,8 @@ const { foldGuardedAbruptPlainBlockExits: recoverGuardedAbruptExit } = require('
 const { foldGuardedLoopContinuations: recoverLoopContinuation, foldNonrepeatingWhileLoops: recoverNonrepeatingLoops,
   foldTrailingLoopContinuations: recoverTrailingLoopContinuation,
   foldLoopExitContinuations: recoverLoopExitContinuation,
-  foldTerminalLoopExits: recoverTerminalLoopExit } = require('./guardedLoopContinuationRecovery');
+  foldTerminalLoopExits: recoverTerminalLoopExit,
+  foldNonlocalLoopExits: recoverNonlocalLoopExit } = require('./guardedLoopContinuationRecovery');
 
 const rawExpression = (source) => createNode('UnsupportedExpression', { source: String(source) });
 const rawStatement = (source) => createNode('UnsupportedStatement', { source: String(source) });
@@ -678,6 +679,10 @@ function foldLoopExitContinuations(source, options = {}) {
 
 function foldTerminalLoopExits(source, options = {}) {
   return recoverTerminalLoopExit(source, controlCleanupSource(source), options);
+}
+
+function foldNonlocalLoopExits(source, options = {}) {
+  return recoverNonlocalLoopExit(source, controlCleanupSource(source), options);
 }
 
 // Guard specialization and frame cleanup can expose exits after the ordinary
@@ -3120,6 +3125,7 @@ module.exports = {
   foldTrailingLoopContinuations,
   foldLoopExitContinuations,
   foldTerminalLoopExits,
+  foldNonlocalLoopExits,
   simplifyIdentityReferenceCasts,
   recoverScalarLabelDispatches,
   specializePathGuards,

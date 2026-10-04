@@ -1,6 +1,6 @@
 'use strict';
 
-const {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits} = require('./javaAstEmitter');
+const {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits, foldNonlocalLoopExits} = require('./javaAstEmitter');
 
 const fs = require('fs');
 const path = require('path');
@@ -1963,6 +1963,15 @@ function shareExistingExitTails(body, parameterNames = [], parameters = []) {
   // turning a partial arm into another iteration. Each loop header changes once.
   for (;;) {
     const loops = foldTerminalLoopExits(source, {parameterNames});
+    if (!loops.loopsRecovered) break;
+    source = loops.source;
+    changed = true;
+  }
+  // Leading breaks to enclosing frames can be the negated loop condition.
+  // The same nonlocal break follows the loop; any own break would reach that
+  // continuation incorrectly and is refused. Keep every other destination.
+  for (;;) {
+    const loops = foldNonlocalLoopExits(source, {parameterNames});
     if (!loops.loopsRecovered) break;
     source = loops.source;
     changed = true;

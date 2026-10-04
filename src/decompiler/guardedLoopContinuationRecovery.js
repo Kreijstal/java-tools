@@ -186,6 +186,26 @@ function recoverLoopForms(source, proof, {parameterNames = [], retainDiagnostics
         }
       }
     }
+    if (form === 'nonlocalExit' && node.kind === 'WhileStatement' && constantTrue(node.condition)
+        && node.body?.kind === 'BlockStatement' && node.body.statements.length >= 2) {
+      const [guard, ...suffix] = node.body.statements;
+      const label = parents.get(node)?.kind === 'LabeledStatement' ? parents.get(node) : null;
+      const jump = guard.consequent?.kind === 'BlockStatement' && guard.consequent.statements.length === 1
+        ? guard.consequent.statements[0] : null;
+      const referencesToLoop = [...references.get(node) || [], ...references.get(label) || []];
+      // A leading break to an enclosing frame ends this loop too. Once that
+      // guard becomes the header, its exact break follows the loop. An own
+      // break (including a finally override) would incorrectly enter that exit,
+      // so refuse every own break. Own continues still test the guard at the
+      // same next-iteration point. Keep the complete remaining body/protection.
+      if (guard.kind === 'IfStatement' && !guard.alternate && jump?.kind === 'BreakStatement' && jump.label
+          && targets.get(jump) !== label && targets.get(jump) !== node
+          && nonconstant(guard.condition, scope)
+          && referencesToLoop.every(reference => reference.kind === 'ContinueStatement')) {
+        sequence(suffix);
+        if (!refused) { candidate = {node, label, guard, suffix, jump}; return; }
+      }
+    }
     if (form === 'terminalExit' && node.kind === 'WhileStatement' && constantTrue(node.condition)
         && node.body?.kind === 'BlockStatement' && node.body.statements.length === 2) {
       const [guard, exit] = node.body.statements;
@@ -267,6 +287,46 @@ function recoverLoopForms(source, proof, {parameterNames = [], retainDiagnostics
   visit(parsed, new Map(parameterNames.map(name => [name, true])));
   if (refused || !candidate) return unchanged();
   const {node, guard, suffix, label} = candidate;
+  if (form === 'nonlocalExit') {
+    const {jump} = candidate;
+    const start = starts.get(node.range.startOffset), bodyOpen = start + 4, bodyClose = closes.get(bodyOpen);
+    const rangeStart = label ? starts.get(label.range.startOffset) : start;
+    const first = starts.get(guard.range.startOffset), conditionClose = closes.get(first + 1);
+    const armOpen = conditionClose + 1, armClose = closes.get(armOpen);
+    const jumpStart = starts.get(jump.range.startOffset), jumpEnd = ends.get(jump);
+    const suffixStart = starts.get(suffix[0].range.startOffset);
+    if (tokens[start]?.text !== 'while' || tokens[start + 1]?.text !== '(' || tokens[start + 2]?.text !== 'true'
+        || tokens[start + 3]?.text !== ')' || tokens[bodyOpen]?.text !== '{' || tokens[bodyClose]?.text !== '}'
+        || first !== bodyOpen + 1 || tokens[first]?.text !== 'if' || tokens[first + 1]?.text !== '('
+        || tokens[armOpen]?.text !== '{' || jumpStart !== armOpen + 1 || jumpEnd + 1 !== armClose
+        || tokens[armClose]?.text !== '}' || suffixStart !== armClose + 1
+        || label && (tokens[rangeStart]?.text !== label.label || tokens[rangeStart + 1]?.text !== ':' || rangeStart + 2 !== start)) return unchanged();
+    const indentAt = offset => {
+      const prefix = wrapped.slice(wrapped.lastIndexOf('\n', offset - 1) + 1, offset);
+      return /^[ \t]*$/.test(prefix) ? prefix : '';
+    };
+    const indent = indentAt(tokens[rangeStart].range.startOffset);
+    const begin = tokens[rangeStart].range.startOffset, end = tokens[bodyClose].range.endOffset;
+    const conditionStart = tokens[first + 1].range.endOffset, conditionEnd = tokens[conditionClose].range.startOffset;
+    const bodyStart = tokens[suffixStart].range.startOffset, bodyEnd = tokens[bodyClose].range.startOffset;
+    const exitStart = tokens[jumpStart].range.startOffset, exitEnd = tokens[jumpEnd].range.endOffset;
+    const predicate = wrapped.slice(conditionStart, conditionEnd);
+    const bodyBytes = wrapped.slice(tokens[armClose].range.endOffset, bodyEnd).trimEnd();
+    const jumpBytes = wrapped.slice(exitStart, exitEnd);
+    let replacement = (label ? label.label + ': ' : '') + 'while (!(' + predicate + ')) {'
+      + bodyBytes + '\n' + indent + '}\n' + indent + jumpBytes;
+    const scalarParentWrapped = parents.get(label || node)?.kind !== 'BlockStatement';
+    if (scalarParentWrapped) replacement = '{\n' + replacement + '\n' + indent + '}';
+    const output = wrapped.slice(0, begin) + replacement + wrapped.slice(end);
+    return {source: output.slice(2, -2), loopsRecovered: 1, ...(retainDiagnostics ? {diagnostics: {
+      label: label?.label || null, exitTarget: jump.label, predicate, scalarParentWrapped,
+      loopRange: {start: begin - 2, end: end - 2},
+      loopKeywordRange: {start: tokens[start].range.startOffset - 2, end: tokens[start].range.endOffset - 2},
+      conditionRange: {start: conditionStart - 2, end: conditionEnd - 2},
+      bodyRange: {start: bodyStart - 2, end: bodyEnd - 2},
+      exitRange: {start: exitStart - 2, end: exitEnd - 2},
+    }} : {})};
+  }
   if (form === 'exitContinuation') {
     const {prefix} = candidate;
     const start = starts.get(node.range.startOffset), bodyOpen = start + 4, bodyClose = closes.get(bodyOpen);
@@ -460,4 +520,8 @@ function foldTerminalLoopExits(source, proof, options) {
   return recoverLoopForms(source, proof, options, 'terminalExit');
 }
 
-module.exports = {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits};
+function foldNonlocalLoopExits(source, proof, options) {
+  return recoverLoopForms(source, proof, options, 'nonlocalExit');
+}
+
+module.exports = {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits, foldNonlocalLoopExits};

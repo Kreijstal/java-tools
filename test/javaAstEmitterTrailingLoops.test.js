@@ -6,7 +6,144 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const {spawnSync} = require('node:child_process');
-const {foldTrailingLoopContinuations: fold, foldLoopExitContinuations: foldExit, foldTerminalLoopExits: foldTerminal} = require('../src/decompiler/javaAstEmitter');
+const {foldTrailingLoopContinuations: fold, foldLoopExitContinuations: foldExit, foldTerminalLoopExits: foldTerminal, foldNonlocalLoopExits: foldNonlocal} = require('../src/decompiler/javaAstEmitter');
+
+test('leading nonlocal breaks become loop headers without changing their destination', () => {
+  const source = 'Stop:{Next:while(true){if(stop()){break Stop;}step();if(again())continue Next;}finish();}after();';
+  const result = foldNonlocal(source, {retainDiagnostics: true});
+  assert.equal(result.loopsRecovered, 1);
+  assert.match(result.source, /^Stop:\{Next: while \(!\(stop\(\)\)\) \{step\(\);if\(again\(\)\)continue Next;\s*\}\s*break Stop;finish\(\);\}after\(\);$/);
+  assert.equal(result.diagnostics.exitTarget, 'Stop');
+  assert.equal(source.slice(result.diagnostics.exitRange.start, result.diagnostics.exitRange.end), 'break Stop;');
+  assert.equal(foldNonlocal(result.source).loopsRecovered, 0);
+  const scalar = 'Stop:{if(pick)Next:while(true){if(stop()){break Stop;}step();}else other();}';
+  const scalarResult = foldNonlocal(scalar, {parameterNames: ['pick'], retainDiagnostics: true});
+  assert.equal(scalarResult.diagnostics.scalarParentWrapped, true);
+  assert.match(scalarResult.source, /if\(pick\)\{\s*Next: while/);
+  assert.match(scalarResult.source, /break Stop;\s*\}else other\(\);/);
+});
+
+test('nonlocal header recovery retains body declarations and complete protected transfers', () => {
+  for (const body of [
+    'int mark=step();use(mark);',
+    'try{if(again())continue Next;}finally{cleanup();}',
+    'try{step();}finally{if(again())continue Next;}',
+    'synchronized(lock){if(again())continue Next;}',
+    'Inner:while(more()){if(stop)break Inner;continue;}',
+    'if(stop)break Stop;step();',
+    'if(stop)continue Rounds;step();',
+  ]) {
+    const source = 'Rounds:for(;;){Stop:{Next:while(true){if(done()){break Stop;}' + body + '}finish();}}';
+    const result = foldNonlocal(source, {parameterNames: ['stop', 'lock']});
+    assert.equal(result.loopsRecovered, 1, source);
+    assert.ok(result.source.includes(body), 'complete remaining body bytes');
+  }
+});
+
+test('own exits, non-break entry transfers, constants and ambiguous syntax refuse nonlocal headers', () => {
+  for (const source of [
+    'Stop:{Next:while(true){if(done()){break Stop;}if(stop)break;step();}}',
+    'Stop:{Next:while(true){if(done()){break Stop;}if(stop)break Next;step();}}',
+    'Stop:{Next:while(true){if(done()){break Stop;}try{step();}finally{if(stop)break Next;}}}',
+    'Next:while(true){if(done()){break Next;}step();}',
+    'Stop:{while(true){if(done()){break;}step();}}',
+    'Stop:{while(true){if(done()){return;}step();}}',
+    'Stop:{while(true){if(done()){step();break Stop;}step();}}',
+    'Stop:{while(true){if(done())break Stop;step();}}',
+    'Stop:{while(true){if(done()){break Stop;}else step();step();}}',
+    'Stop:{while(true){step();if(done()){break Stop;}step();}}',
+    'Stop:{while(true){if(true){break Stop;}step();}}',
+    'final boolean done=true;Stop:{while(true){if(done){break Stop;}step();}}',
+    'Stop:{while(true){if(Holder.CONSTANT){break Stop;}step();}}',
+    'Stop:{while(true){if(done()){break Missing;}step();}}',
+    'Stop:{while(true){if(done()){break Stop;}1+2;}}',
+    'Stop:{while(true){if(done()){break Stop;}step()}}',
+    'Stop:{while(true){if(done()){break Stop;}step();}}Stop:{}',
+    'Stop:{while(true){if(done()){break Stop;}step();}} // comment\n',
+    'Stop:{while(true){if(done()){break Stop;}step();}}\\u000a',
+  ]) assert.equal(foldNonlocal(source, {parameterNames: ['stop']}).source, source, source);
+});
+
+test('nonlocal header native traces match an independent guard/body/finally event model', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'nonlocal-header-native-'));
+  const run = (command, args) => {
+    const result = spawnSync(command, args, {encoding: 'utf8', maxBuffer: 16 * 1024 * 1024});
+    assert.equal(result.status, 0, result.stderr || result.stdout); return result.stdout;
+  };
+  try {
+    const inner = 'step("B",mode,t);index++;if(mode==4)return done(index,polls,t);if(mode==5)break Stop;if(mode==6)continue Rounds;if(mode==8)throw SPECIFIC;if(flag==0)continue Next;step("T",mode,t);';
+    const finalizer = 'step("F",mode,t);if(mode==7)return done(99,polls,t);if(mode==8&&index<3)continue Next;if(mode==9)break Rounds;';
+    const bodies = [inner, 'try{' + inner + '}finally{' + finalizer + '}',
+      'synchronized(lock){t.append(Thread.holdsLock(lock)?"L":"bad");' + inner + '}',
+      'try{' + inner + '}catch(Specific failure){t.append("C");return done(70,polls,t);}',
+      'try{synchronized(lock){t.append(Thread.holdsLock(lock)?"L":"bad");' + inner + '}}finally{' + finalizer + '}',
+      'int mark=index;t.append(mark);' + inner];
+    let methods = '';
+    for (const [variant, body] of bodies.entries()) {
+      const source = 'Rounds:for(int round=0;round<2;round++){Stop:{Next:while(true){if(++polls>limit||!gate){break Stop;}' + body + '}}step("S",mode,t);return done(index,polls,t);}return done(index,polls,t);';
+      const result = foldNonlocal(source, {parameterNames: ['limit', 'gate', 'flag', 'mode', 'lock'], retainDiagnostics: true});
+      assert.equal(result.loopsRecovered, 1, source);
+      for (const [name, contents] of Object.entries({old: source, next: result.source}))
+        methods += `static String ${name}${variant}(int limit,Boolean gate,int flag,int mode,Object lock){int index=0,polls=0;StringBuilder t=trace=new StringBuilder();${contents}}\n`;
+    }
+    const fixture = `public class NonlocalHeaders {
+      static class Specific extends RuntimeException{}static final Specific SPECIFIC=new Specific();static final Error FATAL=new Error();static StringBuilder trace;
+      static void step(String stage,int mode,StringBuilder t){t.append(stage);if(stage.equals("B")&&mode==1||stage.equals("T")&&mode==2||stage.equals("F")&&mode==3||stage.equals("S")&&mode==11)throw SPECIFIC;if(stage.equals("B")&&mode==10)throw FATAL;}
+      static String done(int index,int polls,StringBuilder t){return index+":"+polls+":"+t;}
+      ${methods}
+      static String invoke(boolean next,int v,int limit,Boolean gate,int flag,int mode,Object lock){try{switch(v){${bodies.map((_,i) => `case ${i}:return next?next${i}(limit,gate,flag,mode,lock):old${i}(limit,gate,flag,mode,lock);`).join('')}}throw new AssertionError();}
+        catch(Throwable failure){if(failure==SPECIFIC)return "error:S";if(failure==FATAL)return "error:E";if(failure instanceof NullPointerException)return "error:N";throw new AssertionError(failure);}}
+      public static void main(String[]args){boolean next=args[0].equals("next");for(int v=0;v<6;v++)for(int limit:new int[]{-1,0,1,3})for(Boolean gate:new Boolean[]{null,false,true})for(int flag=-1;flag<=1;flag++)for(int mode=0;mode<12;mode++)for(int lockKind=0;lockKind<2;lockKind++){
+        Object lock=lockKind==0?null:new Object();String result=invoke(next,v,limit,gate,flag,mode,lock);if(lock!=null&&Thread.holdsLock(lock))throw new AssertionError("monitor leaked");
+        System.out.println(v+","+limit+","+gate+","+flag+","+mode+","+lockKind+"|"+result+"|"+trace);}}
+    }`;
+    const file = path.join(temporary, 'NonlocalHeaders.java'); fs.writeFileSync(file, fixture);
+    run('javac', ['--release', '8', '-d', temporary, file]);
+    const original = run('java', ['-cp', temporary, 'NonlocalHeaders', 'old']);
+    assert.equal(run('java', ['-cp', temporary, 'NonlocalHeaders', 'next']), original);
+    const expected = [];
+    for (let v=0;v<6;v++) for (const limit of [-1,0,1,3]) for (const gate of [null,false,true]) for (let flag=-1;flag<=1;flag++) for (let mode=0;mode<12;mode++) for (let lock=0;lock<2;lock++) {
+      let index=0,polls=0,trace='',result;
+      const done = n => n+':'+polls+':'+trace;
+      for (let round=0;round<2 && result===undefined;round++) {
+        let endRounds=false,nextRound=false;
+        for (;;) {
+          polls++;
+          if (polls<=limit && gate===null) {result='error:N';break;}
+          if (polls>limit || !gate) break;
+          let failure,pending,exitStop=false,repeat=false;
+          if (v===5) trace+=index;
+          if ((v===2 || v===4) && !lock) failure='N';
+          else {
+            if (v===2 || v===4) trace+='L';trace+='B';
+            if (mode===1) failure='S';else if(mode===10)failure='E';
+            else {index++;if(mode===4)pending=done(index);else if(mode===5)exitStop=true;else if(mode===6)nextRound=true;else if(mode===8)failure='S';else if(flag===0)repeat=true;else {trace+='T';if(mode===2)failure='S';}}
+          }
+          if (v===3 && failure==='S') {trace+='C';failure=undefined;pending=done(70);}
+          if (v===1 || v===4) {
+            trace+='F';
+            if (mode===3) {failure='S';pending=undefined;exitStop=false;nextRound=false;repeat=false;}
+            else if(mode===7) {failure=undefined;pending=done(99);exitStop=false;nextRound=false;repeat=false;}
+            else if(mode===8 && index<3) {failure=undefined;pending=undefined;exitStop=false;nextRound=false;repeat=true;}
+            else if(mode===9) {failure=undefined;pending=undefined;exitStop=false;nextRound=false;repeat=false;endRounds=true;}
+          }
+          if(failure){result='error:'+failure;break;}
+          if(pending!==undefined){result=pending;break;}
+          if(exitStop || nextRound || endRounds)break;
+          if(repeat)continue;
+        }
+        if(result!==undefined || endRounds)break;
+        if(nextRound)continue;
+        trace+='S';result=mode===11?'error:S':done(index);
+      }
+      if(result===undefined)result=done(index);
+      expected.push(`${v},${limit},${gate},${flag},${mode},${lock}|${result}|${trace}`);
+    }
+    const actualRows = original.trim().split('\n');assert.equal(actualRows.length,expected.length);
+    for(let index=0;index<expected.length;index++)assert.equal(actualRows[index],expected[index],'independent nonlocal-header case '+index);
+    assert.equal(expected.length,5184);
+  } finally {fs.rmSync(temporary, {recursive: true, force: true});}
+});
 
 test('direct trailing backedges become ordered do-while guards at a fixed point', () => {
   const source = 'Next:while(true){step();if(first())continue Next;if(second()){continue;}finish();return;}';
