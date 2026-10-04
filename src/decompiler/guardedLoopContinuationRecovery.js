@@ -186,7 +186,22 @@ function recoverLoopForms(source, proof, {parameterNames = [], retainDiagnostics
         }
       }
     }
-    if (form === 'trailing' && node.kind === 'WhileStatement' && constantTrue(node.condition)
+    if (form === 'terminalExit' && node.kind === 'WhileStatement' && constantTrue(node.condition)
+        && node.body?.kind === 'BlockStatement' && node.body.statements.length === 2) {
+      const [guard, exit] = node.body.statements;
+      if (guard.kind === 'IfStatement' && !guard.alternate && guard.consequent?.kind === 'BlockStatement'
+          && nonconstant(guard.condition, scope) && exit.kind === 'BreakStatement' && !exit.label
+          && targets.get(exit) === node) {
+        const label = parents.get(node)?.kind === 'LabeledStatement' ? parents.get(node) : null;
+        // If the arm falls through it must still exit after this iteration.
+        // Earlier own continues, including finally overrides, remain legal and
+        // evaluate the original guard again at the same point. Keep all arm
+        // scopes/protected constructs whole; no inferred value facts are used.
+        const arm = completion(guard.consequent);
+        if (!refused) { candidate = {node, guard, suffix: [exit], label, headerExit: true, armFallsThrough: arm.has(normal)}; return; }
+      }
+    }
+    if (['trailing', 'terminalExit'].includes(form) && node.kind === 'WhileStatement' && constantTrue(node.condition)
         && node.body?.kind === 'BlockStatement') {
       const statements = node.body.statements;
       const label = parents.get(node)?.kind === 'LabeledStatement' ? parents.get(node) : null;
@@ -203,17 +218,21 @@ function recoverLoopForms(source, proof, {parameterNames = [], retainDiagnostics
         while (end < statements.length && directContinue(statements[end])) end++;
         const prefix = statements.slice(0, index), guards = statements.slice(index, end), suffix = statements.slice(end);
         const jumps = guards.map(directContinue);
+        const terminalExit = form === 'terminalExit' && suffix.length === 1 && suffix[0].kind === 'BreakStatement'
+          && !suffix[0].label && targets.get(suffix[0]) === node ? suffix[0] : null;
         // Only direct guard backedges may reach this loop. In particular an
         // earlier continue (even in a finally) would now evaluate the predicate
         // where the original skipped it. Own breaks would skip the old suffix.
         // Body-owned locals would lose their scope in the new trailing header
         // or continuation; retain that loop rather than hoist declarations.
         if (!suffix.length || prefix.some(statement => statement.kind === 'LocalVariableDeclarationStatement')
-            || referencesToLoop.length !== jumps.length || !referencesToLoop.every(reference => jumps.includes(reference))
+            || form === 'terminalExit' && !terminalExit
+            || referencesToLoop.length !== jumps.length + (terminalExit ? 1 : 0)
+            || !referencesToLoop.every(reference => jumps.includes(reference) || reference === terminalExit)
             || !guards.some(guard => nonconstant(guard.condition, scope))) continue;
         const head = sequence(prefix), tail = sequence(suffix);
         if (!refused && head.has(normal) && !tail.has(normal)) {
-          candidate = {node, label, prefix, guards, suffix}; return;
+          candidate = {node, label, prefix, guards, suffix, terminalExit}; return;
         }
       }
     }
@@ -301,7 +320,7 @@ function recoverLoopForms(source, proof, {parameterNames = [], retainDiagnostics
       headerKeywordRange: {start: begin - 2, end: end - 2},
     }} : {})};
   }
-  if (form === 'trailing') {
+  if (form === 'trailing' || form === 'terminalExit' && !candidate.headerExit) {
     const {prefix, guards} = candidate;
     const start = starts.get(node.range.startOffset), bodyOpen = start + 4, bodyClose = closes.get(bodyOpen);
     const rangeStart = label ? starts.get(label.range.startOffset) : start;
@@ -346,12 +365,18 @@ function recoverLoopForms(source, proof, {parameterNames = [], retainDiagnostics
     // Ordered short-circuit OR preserves evaluation of each separate guard,
     // including mutations, unboxing failures, and skipped later callbacks.
     const predicate = predicates.length === 1 ? predicates[0] : predicates.map(bytes => '(' + bytes + ')').join(' || ');
-    let replacement = (label ? label.label + ': ' : '') + 'do {' + prefixBytes + '\n' + indent + '} while (' + predicate + ');\n' + indent + tailBytes;
+    // In the terminal form every own reference is one of the consumed direct
+    // continues or the final bare break. Its loop label consequently has no
+    // surviving reference; remove just that definition, never another frame.
+    const retainLabel = label && !candidate.terminalExit;
+    let replacement = (retainLabel ? label.label + ': ' : '') + 'do {' + prefixBytes + '\n' + indent + '} while (' + predicate + ');'
+      + (candidate.terminalExit ? '' : '\n' + indent + tailBytes);
     if (parents.get(label || node)?.kind !== 'BlockStatement') replacement = '{\n' + replacement + '\n' + indent + '}';
     const begin = tokens[rangeStart].range.startOffset, end = tokens[bodyClose].range.endOffset;
     const output = wrapped.slice(0, begin) + replacement + wrapped.slice(end);
     return {source: output.slice(2, -2), loopsRecovered: 1, ...(retainDiagnostics ? {diagnostics: {
       label: label?.label || null, predicates, retainedTailScope: retainTailScope,
+      ...(candidate.terminalExit ? {form: 'doWhile', terminalBareBreakRemoved: true, removedLoopLabel: label?.label || null} : {}),
       loopRange: {start: begin - 2, end: end - 2},
       prefixRange: {start: tokens[first].range.startOffset - 2, end: tokens[guardStart].range.startOffset - 2},
       suffixRange: {start: tokens[suffixStart].range.startOffset - 2, end: tokens[bodyClose].range.startOffset - 2},
@@ -380,6 +405,19 @@ function recoverLoopForms(source, proof, {parameterNames = [], retainDiagnostics
   let armBytes = wrapped.slice(tokens[armOpen].range.startOffset, tokens[armClose].range.endOffset);
   if (armIndent.startsWith(indent) && armIndent.length > indent.length)
     armBytes = armBytes.split('\n').map((line, index) => index && line.startsWith(armIndent) ? indent + line.slice(armIndent.length) : line).join('\n');
+  if (candidate.headerExit) {
+    if (ends.get(suffix[0]) + 1 !== bodyClose) return unchanged();
+    if (candidate.armFallsThrough) armBytes = armBytes.slice(0, -1).trimEnd() + '\n' + indent + '  break;\n' + indent + '}';
+    const begin = tokens[rangeStart].range.startOffset, end = tokens[bodyClose].range.endOffset;
+    const replacement = (label ? label.label + ': ' : '') + 'while (' + predicate + ') ' + armBytes;
+    const output = wrapped.slice(0, begin) + replacement + wrapped.slice(end);
+    return {source: output.slice(2, -2), loopsRecovered: 1, ...(retainDiagnostics ? {diagnostics: {
+      label: label?.label || null, form: 'while', predicate, retainedFallthroughBreak: candidate.armFallsThrough,
+      terminalBareBreakRemoved: !candidate.armFallsThrough,
+      loopRange: {start: begin - 2, end: end - 2},
+      armRange: {start: tokens[armOpen].range.startOffset - 2, end: tokens[armClose].range.endOffset - 2},
+    }} : {})};
+  }
   let tailBytes = wrapped.slice(tokens[suffixStart].range.startOffset, tokens[bodyClose].range.startOffset).trimEnd();
   // A declaration owned by the old loop body must retain a separate scope.
   // Other complete statements already own any declarations nested within them.
@@ -418,4 +456,8 @@ function foldLoopExitContinuations(source, proof, options) {
   return recoverLoopForms(source, proof, options, 'exitContinuation');
 }
 
-module.exports = {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations};
+function foldTerminalLoopExits(source, proof, options) {
+  return recoverLoopForms(source, proof, options, 'terminalExit');
+}
+
+module.exports = {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits};

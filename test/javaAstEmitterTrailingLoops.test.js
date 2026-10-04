@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const {spawnSync} = require('node:child_process');
-const {foldTrailingLoopContinuations: fold, foldLoopExitContinuations: foldExit} = require('../src/decompiler/javaAstEmitter');
+const {foldTrailingLoopContinuations: fold, foldLoopExitContinuations: foldExit, foldTerminalLoopExits: foldTerminal} = require('../src/decompiler/javaAstEmitter');
 
 test('direct trailing backedges become ordered do-while guards at a fixed point', () => {
   const source = 'Next:while(true){step();if(first())continue Next;if(second()){continue;}finish();return;}';
@@ -126,8 +126,149 @@ test('own exits, continuing/fallthrough tails, local scopes and ambiguity refuse
     assert.deepEqual(foldExit(source, options), {source, continuationsRecovered: 0});
 });
 
+test('terminal entry guards retain the true arm fallthrough exit and all earlier backedges', () => {
+  const source = 'Next:while(true){if(more()){step();if(flag)continue Next;}break;}finish();';
+  const result = foldTerminal(source, {parameterNames: ['flag'], retainDiagnostics: true});
+  assert.equal(result.loopsRecovered, 1);
+  assert.equal(result.diagnostics.form, 'while');
+  assert.equal(result.diagnostics.retainedFallthroughBreak, true);
+  assert.match(result.source, /Next: while \(more\(\)\) \{step\(\);if\(flag\)continue Next;\s*break;\s*\}finish\(\);/);
+  assert.equal(foldTerminal(result.source, {parameterNames: ['flag']}).loopsRecovered, 0);
+  const abrupt = foldTerminal('while(true){if(more()){try{continue;}finally{cleanup();}}break;}finish();', {retainDiagnostics: true});
+  assert.equal(abrupt.loopsRecovered, 1);
+  assert.equal(abrupt.diagnostics.retainedFallthroughBreak, false);
+  assert.match(abrupt.source, /while \(more\(\)\) \{try\{continue;\}finally\{cleanup\(\);\}\}finish\(\);/);
+  const scoped = foldTerminal('while(true){if(more()){int mark=1;use(mark);if(flag)continue;}break;}int mark=2;use(mark);', {parameterNames: ['flag']});
+  assert.equal(scoped.loopsRecovered, 1);
+  assert.match(scoped.source, /int mark=1;use\(mark\);if\(flag\)continue;\s*break;\s*\}int mark=2/);
+});
+
+test('terminal trailing guards consume only direct own continues and the final bare break', () => {
+  const source = 'Next:while(true){step();if(first())continue Next;if(second()){continue;}break;}finish();';
+  const result = foldTerminal(source, {retainDiagnostics: true});
+  assert.equal(result.loopsRecovered, 1);
+  assert.equal(result.diagnostics.form, 'doWhile');
+  assert.equal(result.diagnostics.removedLoopLabel, 'Next');
+  assert.deepEqual(result.diagnostics.predicates, ['first()', 'second()']);
+  assert.match(result.source, /^do \{step\(\);\s*\} while \(\(first\(\)\) \|\| \(second\(\)\)\);finish\(\);/);
+  assert.equal(foldTerminal(result.source).loopsRecovered, 0);
+  const scalar = 'if(pick)while(true){step();if(more())continue;break;}else other();';
+  assert.equal(foldTerminal(scalar, {parameterNames: ['pick']}).loopsRecovered, 1);
+  assert.match(foldTerminal(scalar, {parameterNames: ['pick']}).source, /\}\s*else other\(\);/);
+});
+
+test('terminal exits refuse constant guards, earlier trailing backedges, scopes and ambiguous syntax', () => {
+  for (const source of [
+    'while(true){if(true){step();}break;}finish();',
+    'final boolean more=true;while(true){if(more){step();}break;}finish();',
+    'while(true){if(Holder.CONSTANT){step();}break;}finish();',
+    'while(true){if(more()){step();}else other();break;}finish();',
+    'Next:while(true){if(more()){step();}break Next;}finish();',
+    'while(true){step();if(more())continue;step();break;}',
+    'Next:while(true){if(stop)continue Next;step();if(more())continue Next;break;}',
+    'Next:while(true){try{step();}finally{if(stop)continue Next;}if(more())continue Next;break;}',
+    'while(true){int count=step();if(count>0)continue;break;}',
+    'while(true){step();if(true)continue;break;}finish();',
+    'while(true){step();if(more())continue Missing;break;}',
+    'Next:while(true){if(more()){step();}break;}Next:{step();}',
+    'while(true){if(more()){step();}break;} // comment\n',
+    'while(true){if(more()){step();}break;}\\u000a',
+    'while(true){if(more()){step();}break;}class Local{}',
+    'while(true){if(more()){step();}break;}Runnable r=()->step();',
+    'while(true){if(more()){1+2;}break;}',
+    'while(true){if(more()){step() break;}break;}',
+  ]) assert.equal(foldTerminal(source, {parameterNames: ['stop']}).source, source, source);
+  const source = 'while(true){if(more()){step();}break;}';
+  for (const options of [{parameterNames: ['pick', 'pick']}, {parameterNames: ['bad-name']}, {retainDiagnostics: 'yes'}])
+    assert.deepEqual(foldTerminal(source, options), {source, loopsRecovered: 0});
+});
+
+test('terminal entry headers match independent native cases for partial arms and finally backedges', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'terminal-header-native-'));
+  const run = (command, args) => {
+    const result = spawnSync(command, args, {encoding: 'utf8', maxBuffer: 24 * 1024 * 1024});
+    assert.equal(result.status, 0, result.stderr || result.stdout); return result.stdout;
+  };
+  try {
+    const inner = 'step("B",mode,t);index++;if(mode==4)return done(index,polls,t);if(mode==5)break Stop;if(mode==6)continue Rounds;if(mode==8)throw SPECIFIC;if(flag==0)continue Next;';
+    const finalizer = 'step("F",mode,t);if(mode==7)return done(99,polls,t);if(mode==8&&index<3)continue Next;if(mode==9)break Rounds;';
+    const arms = [inner, 'try{' + inner + '}finally{' + finalizer + '}',
+      'synchronized(lock){t.append(Thread.holdsLock(lock)?"L":"bad");' + inner + '}',
+      'try{' + inner + '}catch(Specific failure){t.append("C");return done(70,polls,t);}',
+      'try{synchronized(lock){t.append(Thread.holdsLock(lock)?"L":"bad");' + inner + '}}finally{' + finalizer + '}',
+      'int mark=index;t.append(mark);' + inner];
+    let methods = '';
+    for (const [variant, arm] of arms.entries()) {
+      const source = 'Rounds:for(int round=0;round<2;round++){Stop:{Next:while(true){if(++polls<=limit&&gate){' + arm + '}break;}step("S",mode,t);return done(index,polls,t);}t.append("E");}return done(index,polls,t);';
+      const result = foldTerminal(source, {parameterNames: ['limit', 'gate', 'flag', 'mode', 'lock'], retainDiagnostics: true});
+      assert.equal(result.loopsRecovered, 1, source);
+      assert.equal(result.diagnostics.form, 'while');
+      assert.equal(result.diagnostics.retainedFallthroughBreak, true);
+      for (const [name, body] of Object.entries({old: source, next: result.source}))
+        methods += `static String ${name}${variant}(int limit,Boolean gate,int flag,int mode,Object lock){int index=0,polls=0;StringBuilder t=trace=new StringBuilder();${body}}\n`;
+    }
+    const fixture = `public class TerminalHeaders {
+      static class Specific extends RuntimeException{}static final Specific SPECIFIC=new Specific();static final Error FATAL=new Error();static StringBuilder trace;
+      static void step(String stage,int mode,StringBuilder t){t.append(stage);if(stage.equals("B")&&mode==1||stage.equals("S")&&mode==2||stage.equals("F")&&mode==3)throw SPECIFIC;if(stage.equals("B")&&mode==10)throw FATAL;}
+      static String done(int index,int polls,StringBuilder t){return index+":"+polls+":"+t;}
+      ${methods}
+      static String invoke(boolean next,int v,int limit,Boolean gate,int flag,int mode,Object lock){try{switch(v){${arms.map((_,i) => `case ${i}:return next?next${i}(limit,gate,flag,mode,lock):old${i}(limit,gate,flag,mode,lock);`).join('')}}throw new AssertionError();}
+        catch(Throwable failure){if(failure==SPECIFIC)return "error:S";if(failure==FATAL)return "error:E";if(failure instanceof NullPointerException)return "error:N";throw new AssertionError(failure);}}
+      public static void main(String[]args){boolean next=args[0].equals("next");for(int v=0;v<6;v++)for(int limit=-5;limit<=25;limit++)for(Boolean gate:new Boolean[]{null,false,true})for(int flag=-1;flag<=1;flag++)for(int mode=0;mode<11;mode++)for(int lockKind=0;lockKind<2;lockKind++){
+        Object lock=lockKind==0?null:new Object();String result=invoke(next,v,limit,gate,flag,mode,lock);if(lock!=null&&Thread.holdsLock(lock))throw new AssertionError("monitor leaked");
+        System.out.println(v+","+limit+","+gate+","+flag+","+mode+","+lockKind+"|"+result+"|"+trace);}}
+    }`;
+    const file = path.join(temporary, 'TerminalHeaders.java'); fs.writeFileSync(file, fixture);
+    run('javac', ['--release', '8', '-d', temporary, file]);
+    const original = run('java', ['-cp', temporary, 'TerminalHeaders', 'old']);
+    assert.equal(run('java', ['-cp', temporary, 'TerminalHeaders', 'next']), original);
+    const expected = [];
+    for (let v=0;v<6;v++) for (let limit=-5;limit<=25;limit++) for (const gate of [null,false,true]) for (let flag=-1;flag<=1;flag++) for (let mode=0;mode<11;mode++) for (let lock=0;lock<2;lock++) {
+      let index=0,polls=0,trace='',result;
+      const done = n => n+':'+polls+':'+trace;
+      for (let round=0;round<2 && result===undefined;round++) {
+        let endRounds=false;
+        for (;;) {
+          polls++;
+          if (polls<=limit && gate===null) {result='error:N';break;}
+          if (polls>limit || !gate) {trace+='S';result=mode===2?'error:S':done(index);break;}
+          let failure,pending,exitStop=false,nextRound=false,repeat=false;
+          if (v===5) trace+=index;
+          if ((v===2 || v===4) && !lock) failure='N';
+          else {
+            if (v===2 || v===4) trace+='L';trace+='B';
+            if (mode===1) failure='S';else if(mode===10)failure='E';
+            else {index++;if(mode===4)pending=done(index);else if(mode===5)exitStop=true;else if(mode===6)nextRound=true;else if(mode===8)failure='S';else if(flag===0)repeat=true;}
+          }
+          if (v===3 && failure==='S') {trace+='C';failure=undefined;pending=done(70);}
+          if (v===1 || v===4) {
+            trace+='F';
+            if (mode===3) {failure='S';pending=undefined;exitStop=false;nextRound=false;repeat=false;}
+            else if(mode===7) {failure=undefined;pending=done(99);exitStop=false;nextRound=false;repeat=false;}
+            else if(mode===8 && index<3) {failure=undefined;pending=undefined;exitStop=false;nextRound=false;repeat=true;}
+            else if(mode===9) {failure=undefined;pending=undefined;exitStop=false;nextRound=false;repeat=false;endRounds=true;}
+          }
+          if(failure){result='error:'+failure;break;}
+          if(pending!==undefined){result=pending;break;}
+          if(exitStop){trace+='E';break;}
+          if(nextRound || endRounds)break;
+          if(repeat)continue;
+          trace+='S';result=mode===2?'error:S':done(index);break;
+        }
+        if(endRounds)break;
+      }
+      if(result===undefined)result=done(index);
+      expected.push(`${v},${limit},${gate},${flag},${mode},${lock}|${result}|${trace}`);
+    }
+    const actualRows = original.trim().split('\n');assert.equal(actualRows.length,expected.length);
+    for(let index=0;index<expected.length;index++)assert.equal(actualRows[index],expected[index],'independent partial-arm case '+index);
+    assert.equal(expected.length,36828);
+  } finally {fs.rmSync(temporary, {recursive: true, force: true});}
+});
+
 for (const [name, recover, counter] of [
   ['trailing', fold, 'loopsRecovered'], ['exit continuation', foldExit, 'continuationsRecovered'],
+  ['terminal do-while', (source, options) => foldTerminal(foldExit(source, options).source, options), 'loopsRecovered'],
 ]) test(name + ' native traces match an independent event oracle across protected and nullable guard paths', () => {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'trailing-loop-native-'));
   const run = (command, args) => {

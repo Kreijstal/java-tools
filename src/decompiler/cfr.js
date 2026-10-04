@@ -1,6 +1,6 @@
 'use strict';
 
-const {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations} = require('./javaAstEmitter');
+const {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits} = require('./javaAstEmitter');
 
 const fs = require('fs');
 const path = require('path');
@@ -1956,6 +1956,15 @@ function shareExistingExitTails(body, parameterNames = [], parameters = []) {
     const exits = foldLoopExitContinuations(source, {parameterNames});
     if (!exits.continuationsRecovered) break;
     source = exits.source;
+    changed = true;
+  }
+  // A terminal bare exit can make the original entry/trailing guard explicit.
+  // Preserve early continues and the fallthrough exit rather than silently
+  // turning a partial arm into another iteration. Each loop header changes once.
+  for (;;) {
+    const loops = foldTerminalLoopExits(source, {parameterNames});
+    if (!loops.loopsRecovered) break;
+    source = loops.source;
     changed = true;
   }
   if (changed) replaceArrayContents(body, source.split('\n'));
