@@ -271,19 +271,29 @@ function recoverLoopForms(source, proof, {parameterNames = [], retainDiagnostics
         const jumps = guards.map(directContinue);
         const terminalExit = form === 'terminalExit' && suffix.length === 1 && suffix[0].kind === 'BreakStatement'
           && !suffix[0].label && targets.get(suffix[0]) === node ? suffix[0] : null;
-        // Only direct guard backedges may reach this loop. In particular an
+        const prefixRoots = new Set(prefix);
+        const inPrefix = reference => {
+          for (let ancestor = reference; ancestor && ancestor !== node; ancestor = parents.get(ancestor))
+            if (prefixRoots.has(ancestor)) return true;
+          return false;
+        };
+        const prefixBreaks = terminalExit ? referencesToLoop.filter(reference =>
+          reference.kind === 'BreakStatement' && inPrefix(reference)) : [];
+        // Only direct guard backedges may repeat this loop. In particular an
         // earlier continue (even in a finally) would now evaluate the predicate
-        // where the original skipped it. Own breaks would skip the old suffix.
+        // where the original skipped it. A prefix break remains an exit that
+        // skips the trailing predicate only when the suffix is a bare own break.
+        // Other suffixes must not run after an original prefix break.
         // Body-owned locals would lose their scope in the new trailing header
         // or continuation; retain that loop rather than hoist declarations.
         if (!suffix.length || prefix.some(statement => statement.kind === 'LocalVariableDeclarationStatement')
             || form === 'terminalExit' && !terminalExit
-            || referencesToLoop.length !== jumps.length + (terminalExit ? 1 : 0)
-            || !referencesToLoop.every(reference => jumps.includes(reference) || reference === terminalExit)
+            || referencesToLoop.length !== jumps.length + prefixBreaks.length + (terminalExit ? 1 : 0)
+            || !referencesToLoop.every(reference => jumps.includes(reference) || reference === terminalExit || prefixBreaks.includes(reference))
             || !guards.some(guard => nonconstant(guard.condition, scope))) continue;
         const head = sequence(prefix), tail = sequence(suffix);
         if (!refused && head.has(normal) && !tail.has(normal)) {
-          candidate = {node, label, prefix, guards, suffix, terminalExit}; return;
+          candidate = {node, label, prefix, guards, suffix, terminalExit, prefixBreaks}; return;
         }
       }
     }
@@ -468,7 +478,7 @@ function recoverLoopForms(source, proof, {parameterNames = [], retainDiagnostics
         || tokens[start + 3]?.text !== ')' || tokens[bodyOpen]?.text !== '{' || tokens[bodyClose]?.text !== '}'
         || first !== bodyOpen + 1 || suffixStart === undefined
         || label && (tokens[rangeStart]?.text !== label.label || tokens[rangeStart + 1]?.text !== ':' || rangeStart + 2 !== start)) return unchanged();
-    const predicates = [];
+    const predicates = [], conditionRanges = [];
     let expected = guardStart;
     for (const guard of guards) {
       const begin = starts.get(guard.range.startOffset), conditionEnd = closes.get(begin + 1);
@@ -482,6 +492,7 @@ function recoverLoopForms(source, proof, {parameterNames = [], retainDiagnostics
             || jumpStart !== armStart + 1 || armEnd !== jumpEnd + 1 || tokens[armEnd]?.text !== '}')
           || arm.kind !== 'BlockStatement' && jumpStart !== armStart) return unchanged();
       predicates.push(wrapped.slice(tokens[begin + 1].range.endOffset, tokens[conditionEnd].range.startOffset));
+      conditionRanges.push({start: tokens[begin + 1].range.endOffset - 2, end: tokens[conditionEnd].range.startOffset - 2});
       expected = armEnd + 1;
     }
     if (expected !== suffixStart) return unchanged();
@@ -503,19 +514,21 @@ function recoverLoopForms(source, proof, {parameterNames = [], retainDiagnostics
     // Ordered short-circuit OR preserves evaluation of each separate guard,
     // including mutations, unboxing failures, and skipped later callbacks.
     const predicate = predicates.length === 1 ? predicates[0] : predicates.map(bytes => '(' + bytes + ')').join(' || ');
-    // In the terminal form every own reference is one of the consumed direct
-    // continues or the final bare break. Its loop label consequently has no
-    // surviving reference; remove just that definition, never another frame.
-    const retainLabel = label && !candidate.terminalExit;
+    // Retain the original loop label when an intact prefix still breaks to it.
+    // Otherwise terminal conversion consumes all references to that label.
+    const retainLabel = label && (!candidate.terminalExit || candidate.prefixBreaks.some(reference => reference.label));
     let replacement = (retainLabel ? label.label + ': ' : '') + 'do {' + prefixBytes + '\n' + indent + '} while (' + predicate + ');'
       + (candidate.terminalExit ? '' : '\n' + indent + tailBytes);
     if (parents.get(label || node)?.kind !== 'BlockStatement') replacement = '{\n' + replacement + '\n' + indent + '}';
     const begin = tokens[rangeStart].range.startOffset, end = tokens[bodyClose].range.endOffset;
     const output = wrapped.slice(0, begin) + replacement + wrapped.slice(end);
     return {source: output.slice(2, -2), loopsRecovered: 1, ...(retainDiagnostics ? {diagnostics: {
-      label: label?.label || null, predicates, retainedTailScope: retainTailScope,
-      ...(candidate.terminalExit ? {form: 'doWhile', terminalBareBreakRemoved: true, removedLoopLabel: label?.label || null} : {}),
+      label: label?.label || null, predicates, conditionRanges, retainedTailScope: retainTailScope,
+      ...(candidate.terminalExit ? {form: 'doWhile', terminalBareBreakRemoved: true,
+        removedLoopLabel: retainLabel ? null : label?.label || null,
+        retainedPrefixBreakRanges: candidate.prefixBreaks.map(jump => ({start: jump.range.startOffset - 2, end: tokens[ends.get(jump)].range.endOffset - 2}))} : {}),
       loopRange: {start: begin - 2, end: end - 2},
+      loopKeywordRange: {start: tokens[start].range.startOffset - 2, end: tokens[start].range.endOffset - 2},
       prefixRange: {start: tokens[first].range.startOffset - 2, end: tokens[guardStart].range.startOffset - 2},
       suffixRange: {start: tokens[suffixStart].range.startOffset - 2, end: tokens[bodyClose].range.startOffset - 2},
       removedContinueRanges: guards.map(guard => {

@@ -1560,6 +1560,22 @@ acceptance remain unfinished or unverified.
 
 ### Keeping terminating else effects inside their loop
 
+Terminal trailing-loop recovery also permits earlier breaks to the same loop
+inside the intact prefix. For example,
+`while (true) { if (stop()) { cleanup(); break; } work(); if (again()) continue; break; }`
+becomes `do { if (stop()) { cleanup(); break; } work(); } while (again());`.
+The early exit still skips `again()`, including its side effects or unboxing
+failure. A label remains when a prefix break still names it. Whole nested
+try/catch/finally, monitor, switch and local scopes remain in place.
+Earlier own continues still refuse this rewrite because they skipped the old
+trailing test; a nonterminal suffix still refuses own prefix breaks because
+moving that suffix outside the loop would execute it after an early exit.
+The ordinary cleanup path repeats terminal recovery after making terminating
+else arms explicit, since those exits can expose direct trailing backedges.
+Three focused groups include 8,064 independent native event cases for both exit
+reasons, short-circuit predicates, nulls, exceptions, finally overrides, monitor
+release, nested destinations, return snapshots and enclosing transfers.
+
 `foldLoopElseExitGuards` recognizes a literal-true loop containing exactly a
 braced `if (predicate) { arm } else { exitEffects }` and a terminal bare break
 to that loop. It emits `if (!(predicate)) { exitEffects; break; }`, followed by

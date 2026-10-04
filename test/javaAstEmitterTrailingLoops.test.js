@@ -294,6 +294,144 @@ test('terminal trailing guards consume only direct own continues and the final b
   assert.match(foldTerminal(scalar, {parameterNames: ['pick']}).source, /\}\s*else other\(\);/);
 });
 
+test('terminal trailing headers retain prefix breaks and their loop destinations', () => {
+  for (const prefix of [
+    'if(stop){exitEffects();break;}',
+    'if(stop){exitEffects();break Next;}',
+    'try{step();}finally{if(stop)break Next;}',
+    'try{step();}catch(RuntimeException failure){break Next;}',
+    'synchronized(lock){if(stop)break Next;}',
+    'switch(value){case 1:break Next;default:break;}',
+    'while(nested()){if(stop)break Next;break;}',
+  ]) {
+    const source = 'Next:while(true){' + prefix + 'step();if(first())continue Next;if(second())continue;break;}finish();';
+    const result = foldTerminal(source, {parameterNames: ['stop', 'lock', 'value'], retainDiagnostics: true});
+    assert.equal(result.loopsRecovered, 1, source);
+    assert.ok(result.source.includes(prefix), 'complete prefix bytes and protection stay intact');
+    assert.deepEqual(result.diagnostics.conditionRanges.map(range => source.slice(range.start, range.end)), ['first()', 'second()']);
+    assert.deepEqual(result.diagnostics.retainedPrefixBreakRanges.map(range => source.slice(range.start, range.end)),
+      [prefix.includes('break Next;') ? 'break Next;' : 'break;']);
+    assert.equal(result.diagnostics.removedLoopLabel, prefix.includes('break Next;') ? null : 'Next');
+    assert.equal(result.source.startsWith('Next:'), prefix.includes('break Next;'));
+    assert.equal(foldTerminal(result.source).loopsRecovered, 0);
+    // An effectful/returning suffix would incorrectly execute after an early
+    // own break if moved outside the loop. That distinct form stays refused.
+    const nonterminal = source.replace('break;}finish();', 'tail();return;}finish();');
+    assert.equal(fold(nonterminal, {parameterNames: ['stop', 'lock', 'value']}).source, nonterminal);
+  }
+  const scalar = 'if(pick)Next:while(true){if(stop)break Next;step();if(more())continue;break;}else other();';
+  const result = foldTerminal(scalar, {parameterNames: ['pick', 'stop']});
+  assert.equal(result.loopsRecovered, 1);
+  assert.match(result.source, /if\(pick\)\{\s*Next: do/);
+  assert.match(result.source, /\}\s*else other\(\);/);
+  for (const prefix of ['if(stop)continue Next;', 'try{if(stop)break Next;}finally{if(again())continue Next;}']) {
+    const source = 'Next:while(true){' + prefix + 'step();if(more())continue Next;break;}';
+    assert.equal(foldTerminal(source, {parameterNames: ['stop']}).source, source, 'prefix continues must still skip the predicate');
+  }
+});
+
+test('explicit else exits expose terminal predicates without merging the two exit reasons', () => {
+  const source = 'while(true){if(poll()){handle();if(flag==0)continue;}else{emptyQueueEffects();}break;}after();';
+  assert.equal(foldTerminal(source, {parameterNames: ['flag']}).loopsRecovered, 0);
+  const guarded = foldElseExit(source, {parameterNames: ['flag']});
+  assert.equal(guarded.loopsRecovered, 1);
+  const result = foldTerminal(guarded.source, {parameterNames: ['flag']});
+  assert.equal(result.loopsRecovered, 1);
+  assert.match(result.source, /^do \{\s*if \(!\(poll\(\)\)\) \{emptyQueueEffects\(\);\s*break;\s*\}\s*handle\(\);\s*\} while \(flag==0\);after\(\);$/);
+});
+
+test('early terminal breaks match independent native traces and skip effectful trailing tests', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'terminal-prefix-break-native-'));
+  const run = (command, args) => {
+    const result = spawnSync(command, args, {encoding: 'utf8', maxBuffer: 16 * 1024 * 1024});
+    assert.equal(result.status, 0, result.stderr || result.stdout); return result.stdout;
+  };
+  try {
+    const inner = 'step("B",mode,t);index++;if(mode==5)break Next;if(mode==6)break Stop;if(mode==7)return done(index,t);if(mode==8)continue Rounds;';
+    const finalizer = 'step("F",mode,t);if(mode==9)break Next;if(mode==10)return done(99,t);if(mode==11)break Rounds;';
+    const prefixes = [inner.replace('break Next;', 'break;'),
+      'try{' + inner + '}finally{' + finalizer + '}',
+      'synchronized(lock){t.append(Thread.holdsLock(lock)?"L":"bad");' + inner + '}',
+      'try{' + inner + '}catch(Specific failure){t.append("C");break Next;}',
+      'try{synchronized(lock){t.append(Thread.holdsLock(lock)?"L":"bad");' + inner + '}}finally{' + finalizer + '}',
+      '{int mark=index;t.append(mark);}' + inner,
+      inner.replace('if(mode==5)break Next;', 'switch(mode){case 5:break Next;default:break;}')];
+    let methods = '';
+    for (const [variant, prefix] of prefixes.entries()) {
+      const source = 'Rounds:for(int round=0;round<2;round++){Stop:{Next:while(true){' + prefix
+        + 'if(first(index,limit,gate,mode,t))continue Next;if(second(index,limit,extra,mode,t))continue;break;}step("S",mode,t);}t.append("E");}return done(index,t);';
+      const result = foldTerminal(source, {parameterNames: ['limit', 'gate', 'extra', 'mode', 'lock'], retainDiagnostics: true});
+      assert.equal(result.loopsRecovered, 1, source);
+      assert.equal(result.diagnostics.retainedPrefixBreakRanges.length, 1 + Number(variant === 1 || variant === 3 || variant === 4));
+      for (const [name, body] of Object.entries({old: source, next: result.source}))
+        methods += `static String ${name}${variant}(int limit,Boolean gate,Boolean extra,int mode,Object lock){int index=0;StringBuilder t=trace=new StringBuilder();${body}}\n`;
+    }
+    const fixture = `public class TerminalPrefixBreaks {
+      static class Specific extends RuntimeException{}static final Specific SPECIFIC=new Specific();static final Error FATAL=new Error();static StringBuilder trace;
+      static void step(String stage,int mode,StringBuilder t){t.append(stage);if(stage.equals("B")&&(mode==1||mode==9)||stage.equals("F")&&mode==2)throw SPECIFIC;if(stage.equals("B")&&mode==3)throw FATAL;if(stage.equals("S")&&mode==4)throw SPECIFIC;}
+      static Boolean first(int index,int limit,Boolean gate,int mode,StringBuilder t){t.append("A");if(mode==12)throw SPECIFIC;if(mode==13)return null;return index<limit?gate:false;}
+      static Boolean second(int index,int limit,Boolean extra,int mode,StringBuilder t){t.append("D");if(mode==14)throw SPECIFIC;if(mode==15)return null;return index==limit?extra:false;}
+      static String done(int index,StringBuilder t){return index+":"+t;}
+      ${methods}
+      static String invoke(boolean next,int v,int limit,Boolean gate,Boolean extra,int mode,Object lock){try{switch(v){${prefixes.map((_,i) => `case ${i}:return next?next${i}(limit,gate,extra,mode,lock):old${i}(limit,gate,extra,mode,lock);`).join('')}}throw new AssertionError();}
+        catch(Throwable failure){if(failure==SPECIFIC)return "error:S";if(failure==FATAL)return "error:E";if(failure instanceof NullPointerException)return "error:N";throw new AssertionError(failure);}}
+      public static void main(String[]args){boolean next=args[0].equals("next");for(int v=0;v<7;v++)for(int limit:new int[]{-1,0,1,3})for(Boolean gate:new Boolean[]{null,false,true})for(Boolean extra:new Boolean[]{null,false,true})for(int mode=0;mode<16;mode++)for(int lockKind=0;lockKind<2;lockKind++){
+        Object lock=lockKind==0?null:new Object();String result=invoke(next,v,limit,gate,extra,mode,lock);if(lock!=null&&Thread.holdsLock(lock))throw new AssertionError("monitor leaked");
+        System.out.println(v+","+limit+","+gate+","+extra+","+mode+","+lockKind+"|"+result+"|"+trace);}}
+    }`;
+    const file = path.join(temporary, 'TerminalPrefixBreaks.java'); fs.writeFileSync(file, fixture);
+    run('javac', ['--release', '8', '-d', temporary, file]);
+    const original = run('java', ['-cp', temporary, 'TerminalPrefixBreaks', 'old']);
+    assert.equal(run('java', ['-cp', temporary, 'TerminalPrefixBreaks', 'next']), original);
+    const expected = [];
+    for (let v=0;v<7;v++) for (const limit of [-1,0,1,3]) for (const gate of [null,false,true]) for (const extra of [null,false,true]) for (let mode=0;mode<16;mode++) for (let lock=0;lock<2;lock++) {
+      let index=0,trace='',result;
+      const done = n => n+':'+trace;
+      for (let round=0;round<2 && result===undefined;round++) {
+        let stop=false,nextRound=false,endRounds=false;
+        for (;;) {
+          let failure,pending,exitLoop=false;
+          if(v===5)trace+=index;
+          if((v===2||v===4)&&!lock)failure='N';
+          else {
+            if(v===2||v===4)trace+='L';trace+='B';
+            if(mode===1||mode===9)failure='S';else if(mode===3)failure='E';
+            else {index++;if(mode===5)exitLoop=true;else if(mode===6)stop=true;else if(mode===7)pending=done(index);else if(mode===8)nextRound=true;}
+          }
+          if(v===3&&failure==='S'){trace+='C';failure=undefined;exitLoop=true;}
+          if(v===1||v===4){
+            trace+='F';
+            if(mode===2){failure='S';pending=undefined;exitLoop=false;stop=false;nextRound=false;}
+            else if(mode===9){failure=undefined;pending=undefined;exitLoop=true;stop=false;nextRound=false;}
+            else if(mode===10){failure=undefined;pending=done(99);exitLoop=false;stop=false;nextRound=false;}
+            else if(mode===11){failure=undefined;pending=undefined;exitLoop=false;stop=false;nextRound=false;endRounds=true;}
+          }
+          if(failure){result='error:'+failure;break;}
+          if(pending!==undefined){result=pending;break;}
+          if(exitLoop||stop||nextRound||endRounds)break;
+          trace+='A';
+          if(mode===12){result='error:S';break;}
+          if(mode===13||index<limit&&gate===null){result='error:N';break;}
+          if(index<limit&&gate)continue;
+          trace+='D';
+          if(mode===14){result='error:S';break;}
+          if(mode===15||index===limit&&extra===null){result='error:N';break;}
+          if(index===limit&&extra)continue;
+          break;
+        }
+        if(result!==undefined||endRounds)break;
+        if(nextRound)continue;
+        if(!stop){trace+='S';if(mode===4){result='error:S';break;}}
+        trace+='E';
+      }
+      if(result===undefined)result=done(index);
+      expected.push(`${v},${limit},${gate},${extra},${mode},${lock}|${result}|${trace}`);
+    }
+    assert.equal(expected.length,8064);
+    assert.equal(original, expected.join('\n')+'\n', 'all8064 cases match independent early-exit/guard/finally/monitor model');
+  } finally {fs.rmSync(temporary, {recursive: true, force: true});}
+});
+
 test('terminal exits refuse constant guards, earlier trailing backedges, scopes and ambiguous syntax', () => {
   for (const source of [
     'while(true){if(true){step();}break;}finish();',

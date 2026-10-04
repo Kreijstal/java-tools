@@ -1985,6 +1985,14 @@ function shareExistingExitTails(body, parameterNames = [], parameters = []) {
     source = loops.source;
     changed = true;
   }
+  // Explicit false-arm exits can expose direct trailing backedges. Run the
+  // terminal proof again so both exit reasons remain inside a do-while body.
+  for (;;) {
+    const loops = foldTerminalLoopExits(source, {parameterNames});
+    if (!loops.loopsRecovered) break;
+    source = loops.source;
+    changed = true;
+  }
   if (changed) replaceArrayContents(body, source.split('\n'));
 }
 
