@@ -1558,7 +1558,28 @@ rows and diagnostics remain unchanged. There remain 21 large method spans,
 10 with block labels. Larger reconstructions and whole-game/browser/phone
 acceptance remain unfinished or unverified.
 
-### Keeping terminating else effects inside their loop
+### Simplifying recovered Boolean predicates
+
+`simplifyPredicateNegations` runs after control-flow recovery, which can add
+fresh negations after typed IR rendering. It complements `==`/`!=`, cancels
+double negation, and applies De Morgan to `&&`/`||` in if/while/for conditions
+and braced do-while conditions. Both operand order and short-circuit paths stay
+the same. Every other atom remains verbatim beneath logical negation: relational
+tests retain NaN outcomes, call arguments keep their own operators, and boxed
+Boolean identity comparisons keep their operand expressions and unboxing.
+Double negation is simplified only where Java requires a primitive Boolean
+condition; assignments, return values and call arguments remain opaque.
+The implementation applies token edits without moving statements, scopes,
+labels, protected regions or monitors. Unsupported/commented/Unicode-translated
+input, nested executables and source/depth/edit budgets refuse this cleanup.
+
+`node --test test/predicateNegationRecovery.test.js` passes six focused groups.
+Six native context variants match 708,750 independent ordered-oracle cases,
+including nullable/noncached Boolean values, reference identity, integer
+overflow, NaN/signed zeros/infinities, throwing callbacks, skipped evaluations,
+finally overrides and nullable monitor acquisition/release.
+
+### Recovering captured-integer if dispatches
 
 `recoverScalarIfDispatches` recognizes transparent integer if ladders inside an
 existing plain labeled block. A unique captured primitive `int` local must stay
@@ -1582,6 +1603,8 @@ positive flags, short-circuit/null/throwing callbacks, overflow, return snapshot
 finally overrides, monitor ownership/release and ancestor break/continue targets.
 An additional native fixture checks 21 empty/default/extreme-key cases, including
 signed minimum and maximum case constants and overflow in the action itself.
+
+### Keeping terminating else effects inside their loop
 
 Terminal trailing-loop recovery also permits earlier breaks to the same loop
 inside the intact prefix. For example,

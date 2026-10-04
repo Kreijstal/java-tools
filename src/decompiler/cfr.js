@@ -1,7 +1,7 @@
 'use strict';
 
 const {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits, foldNonlocalLoopExits, foldLoopElseExitGuards} = require('./javaAstEmitter');
-const {recoverScalarIfDispatches} = require('./javaAstEmitter');
+const {recoverScalarIfDispatches, simplifyPredicateNegations} = require('./javaAstEmitter');
 
 const fs = require('fs');
 const path = require('path');
@@ -2000,6 +2000,14 @@ function shareExistingExitTails(body, parameterNames = [], parameters = []) {
     const dispatch = recoverScalarIfDispatches(source);
     if (!dispatch.dispatchesRecovered) break;
     source = dispatch.source;
+    changed = true;
+  }
+  // Exit recovery can create fresh negations after typed IR rendering. Keep
+  // short-circuit/operand order; unknown relational tests retain their NaNs.
+  for (;;) {
+    const predicates = simplifyPredicateNegations(source);
+    if (!predicates.predicatesSimplified) break;
+    source = predicates.source;
     changed = true;
   }
   if (changed) replaceArrayContents(body, source.split('\n'));

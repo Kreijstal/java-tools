@@ -10,6 +10,7 @@ const { JavaParser } = require('../java-frontend/parser');
 const { tokenizeJava } = require('../java-frontend/lexer');
 const { recoverScalarLabelDispatches: recoverScalarDispatch } = require('./scalarDispatchRecovery');
 const { recoverScalarIfDispatches: recoverIfDispatch } = require('./scalarIfDispatchRecovery');
+const { simplifyPredicateNegations: simplifyNegations } = require('./predicateNegationRecovery');
 const { specializePathGuards: specializeGuards } = require('./pathGuardRecovery');
 const { recoverArrayIndexIncrements: recoverIndexIncrements } = require('./incrementCaptureRecovery');
 const { foldGuardedAbruptPlainBlockExits: recoverGuardedAbruptExit } = require('./guardedAbruptExitRecovery');
@@ -653,6 +654,10 @@ function recoverScalarLabelDispatches(source, options = {}) {
 
 function recoverScalarIfDispatches(source, options = {}) {
   return recoverIfDispatch(source, controlCleanupSource(source), options);
+}
+
+function simplifyPredicateNegations(source, options = {}) {
+  return simplifyNegations(source, controlCleanupSource(source), options);
 }
 
 function specializePathGuards(source, options = {}) {
@@ -3140,6 +3145,7 @@ module.exports = {
   simplifyIdentityReferenceCasts,
   recoverScalarLabelDispatches,
   recoverScalarIfDispatches,
+  simplifyPredicateNegations,
   specializePathGuards,
   recoverArrayIndexIncrements,
   recoverPostGuardExits,
