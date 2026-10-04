@@ -7,11 +7,11 @@ const {foldGuardedAbruptPlainBlockExits: fold, simplifyControlFrames: clean,
   recoverPostGuardExits: compose} = require('../src/decompiler/javaAstEmitter');
 
 function recover(source) {
-  let frames = 0;
+  let frames = 0, jumps = 0;
   for (let limit = 0; limit < 128; limit++) {
     const next = fold(source);
-    if (!next.framesRemoved) return {source, frames};
-    source = next.source; frames += next.framesRemoved;
+    if (!next.jumpsRemoved) return {source, frames, jumps};
+    source = next.source; frames += next.framesRemoved; jumps += next.jumpsRemoved;
   }
   assert.fail('guarded abrupt exit recovery did not reach a fixed point');
 }
@@ -102,6 +102,28 @@ test('a guarded suffix retains every statement and nested scope before the abrup
   ]) assert.deepEqual(fold(refused), {source: refused, framesRemoved: 0, jumpsRemoved: 0}, refused);
 });
 
+test('shared fallback exits keep their exact labeled destination and its scope', () => {
+  const source = 'while(more()){\n  Frame:{\n    if(entity!=null){\n      step();\n      if(flag!=0){\n        break Frame;\n      }\n      draw();\n      continue;\n    }\n    while(fallbackMore()){\n      fallback();\n      if(done())break Frame;\n    }\n    afterFallback();\n  }\n  tail();\n}';
+  const next = fold(source, {retainDiagnostics: true});
+  assert.equal(next.framesRemoved, 0);
+  assert.equal(next.jumpsRemoved, 1);
+  assert.equal(next.diagnostics.labelRetained, true);
+  assert.equal(next.diagnostics.frameScopeRetained, true);
+  assert.equal(next.source, 'while(more()){\n  Frame:{\n    if(entity!=null){\n      step();\n      if (flag==0) {\n        draw();\n        continue;\n      }\n    } else {\n      while(fallbackMore()){\n        fallback();\n        if(done())break Frame;\n      }\n      afterFallback();\n    }\n  }\n  tail();\n}');
+  assert.equal(fold(next.source).jumpsRemoved, 0);
+  const composed = compose(source);
+  assert.equal(composed.counts.guardedAbruptJumps, 1);
+  assert.equal(composed.counts.guardedAbruptFrames, 0);
+  assert.equal(compose(composed.source).rewrites, 0);
+  for (const bad of [
+    source.replace('if(entity!=null){', 'if(prefixExit())break Frame;\n    if(entity!=null){'),
+    source.replace('draw();', 'if(suffixExit())break Frame;draw();'),
+    source.replace('step();', 'if(armExit())break Frame;step();'),
+    source.replace('if(flag!=0){', 'try{if(flag!=0){').replace('draw();', '}finally{cleanup();}draw();'),
+    source.replace('if(done())break Frame;', 'if(done())continue Frame;'),
+  ]) assert.deepEqual(fold(bad), {source: bad, framesRemoved: 0, jumpsRemoved: 0});
+});
+
 test('native guarded abrupt exits preserve effect order, targets, NaNs, unboxing and cleanup', () => {
   const variants = [
     'Frame:{if(outer(input)){step("P");if(predicate(mode)){break Frame;}return value();}fallback();}tail();',
@@ -138,6 +160,20 @@ test('native guarded abrupt exits preserve effect order, targets, NaNs, unboxing
     'Frame:{if(outer(input)){step("P");if(predicate(mode)){break Frame;}int result=17;if(metric<0)result++;step("result"+result);return result;}fallback();}tail();',
     'Frame:{if(outer(input)){step("P");if(predicate(mode))break Frame;{int nested=19;step("inner"+nested);}step("field"+nested);return value();}fallback();}tail();',
     'if(input>=0)Frame:{step("prefix");if(outer(input)){step("P");if(predicate(mode)){break Frame;}int nested=19;step("suffix"+nested);return nested;}int nested=23;step("fallback"+nested);}else step("outside-else");step("after"+nested);',
+    'Frame:{if(outer(input)){step("P");if(predicate(mode)){break Frame;}step("suffix");return value();}if(input<0){step("early-fallback");break Frame;}fallback();}tail();',
+    'Frame:{int nested=13;if(outer(input)){step("P"+nested);if(predicate(mode)){break Frame;}step("suffix");return nested;}try{fallback();if(input!=0)break Frame;}finally{cleanup();}step("after-fallback");}step("after"+nested);',
+    'Frame:{if(outer(input)){step("P");if(predicate(mode)){break Frame;}return value();}synchronized(lock){step("fallback-held"+Thread.holdsLock(lock));if(input!=0)break Frame;}step("after-fallback");}tail();',
+    'Frame:{if(outer(input)){step("P");if(predicate(mode)){break Frame;}return value();}for(int index=0;index<2;index++){step("fallback"+index);if(index==1)break Frame;}step("after-fallback");}tail();',
+    'Frame:{if(outer(input)){step("P");if(predicate(mode)){break Frame;}return value();}switch(input){case -1:step("case-1");break Frame;case 7:step("case7");default:step("default");}step("after-fallback");}tail();',
+    'if(input>=0)Frame:{step("prefix");if(outer(input)){step("P");if(predicate(mode)){break Frame;}return value();}for(int index=0;index<2;index++){fallback();if(index==1)break Frame;}step("after-fallback");}else step("outside-else");tail();',
+    'Frame:{if(outer(input)){step("P");if(predicate(mode)){break Frame;}try{step("suffix");}finally{cleanup();}return value();}try{fallback();if(input!=0)break Frame;}finally{cleanup();}step("after-fallback");}tail();',
+    'Outer:for(int index=0;index<2;index++){Frame:{if(outer(input)){step("P"+index);if(predicate(mode)){break Frame;}step("suffix");continue Outer;}for(int inner=0;inner<2;inner++){fallback();if(inner==1)break Frame;}step("after-fallback");}tail();}',
+    'try{Frame:{if(outer(input)){step("P");if(predicate(mode)){break Frame;}step("suffix");throw makeFailure();}try{fallback();if(input!=0)break Frame;}finally{cleanup();}step("after-fallback");}tail();}catch(RuntimeException caught){step("caught"+(caught==specific));}finally{cleanup();}',
+    'Frame:{if(outer(input)){step("P");if(predicate(mode)){break Frame;}return value();}if(input<0){step("negative");break Frame;}if(input>1){step("positive");break Frame;}fallback();}tail();',
+    'Frame:{if(outer(input)){step("P");if(boxed){break Frame;}step("suffix");return value();}for(int index=0;index<2;index++){fallback();if(index==1)break Frame;}step("after-fallback");}tail();',
+    'Outside:{Frame:{if(outer(input)){step("P");if(predicate(mode)){break Frame;}return value();}for(int index=0;index<2;index++){fallback();if(input<0)break Outside;if(index==1)break Frame;}step("after-fallback");}tail();}step("outside");',
+    'Frame:{if(outer(input)){step("P");if(predicate(mode)){break Frame;}return value();}try{fallback();return 17;}finally{if(input<0)break Frame;cleanup();}}tail();',
+    'Frame:{step("prefix");if(outer(input)){step("P");if(predicate(mode)){break Frame;}return value();}try{fallback();}catch(IllegalArgumentException caught){step("caught"+(caught==specific));break Frame;}step("after-fallback");}tail();',
   ];
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'guarded-abrupt-native-'));
   function run(command, args) {
@@ -155,7 +191,7 @@ test('native guarded abrupt exits preserve effect order, targets, NaNs, unboxing
     const methods = [];
     variants.forEach((source, index) => {
       const next = recover(source);
-      assert.ok(next.frames > 0, index + ': ' + source);
+      assert.ok(next.jumps > 0, index + ': ' + source);
       let cleaned = next.source;
       for (;;) { const result = clean(cleaned); if (result.source === cleaned) break; cleaned = result.source; }
       cleaned = compose(cleaned, {parameterNames: ['mode', 'input', 'metric', 'boxed']}).source;
@@ -208,9 +244,26 @@ test('native guarded abrupt exits preserve effect order, targets, NaNs, unboxing
         oracle(()->composed33(7,0,0,false),"ok=99:3:0:3:prefix/outer/P/guard/after77/");
         oracle(()->composed33(0,7,0,false),"ok=99:3:0:3:prefix/outer/fallback23/after77/");
         failures=2;oracle(()->composed27(0,0,0,false),"ok=4:4:0:4:outer/P/guard/suffix/caughttrue/value/");failures=0;
+        oracle(()->composed34(7,0,0,false),"ok=99:2:0:2:outer/P/guard/tail/");
+        oracle(()->composed34(0,-1,0,false),"ok=99:2:0:2:outer/early-fallback/tail/");
+        oracle(()->composed35(0,7,0,false),"ok=99:2:1:2:outer/fallback/cleanup/after77/");
+        oracle(()->composed35(7,0,0,false),"ok=99:2:0:2:outer/P13/guard/after77/");
+        oracle(()->composed36(0,7,0,false),"ok=99:2:0:2:outer/fallback-heldtrue/tail/");
+        oracle(()->composed37(0,7,0,false),"ok=99:3:0:3:outer/fallback0/fallback1/tail/");
+        oracle(()->composed38(0,-1,0,false),"ok=99:2:0:2:outer/case-1/tail/");
+        oracle(()->composed38(0,7,0,false),"ok=99:4:0:4:outer/case7/default/after-fallback/tail/");
+        oracle(()->composed39(0,-1,0,false),"ok=99:2:0:2:outside-else/tail/");
+        oracle(()->composed40(0,0,0,false),"ok=3:3:1:3:outer/P/guard/suffix/cleanup/value/");
+        oracle(()->composed40(7,0,0,false),"ok=99:2:0:2:outer/P/guard/tail/");
+        oracle(()->composed42(0,7,0,false),"ok=99:2:2:2:outer/fallback/cleanup/tail/cleanup/");
+        oracle(()->composed43(0,7,0,false),"ok=99:2:0:2:outer/positive/tail/");
+        oracle(()->composed45(0,-1,0,false),"ok=99:2:0:2:outer/fallback/outside/");
+        oracle(()->composed46(0,-1,0,false),"ok=99:2:0:2:outer/fallback/tail/");
+        oracle(()->composed46(0,7,0,false),"ok=17:1:1:1:outer/fallback/cleanup/");
+        failures=2;oracle(()->composed47(0,7,0,false),"ok=99:4:0:4:prefix/outer/fallback/caughttrue/tail/");failures=0;
         for(failures=0;failures<5;failures++)for(int mode:new int[]{Integer.MIN_VALUE,-1,0,1,7,Integer.MAX_VALUE})for(int input:new int[]{Integer.MIN_VALUE,-1,0,1,7,Integer.MAX_VALUE})for(double metric:new double[]{Double.NaN,Double.NEGATIVE_INFINITY,-1,-0.0,0.0,1,Double.POSITIVE_INFINITY})for(Boolean boxed:new Boolean[]{false,true,null})for(boolean nullLock:new boolean[]{false,true}){
           ${variants.flatMap((_, i) => ['rebuilt', 'composed'].map(name => `{String expected=invoke(()->original${i}(mode,input,metric,boxed),nullLock),actual=invoke(()->${name}${i}(mode,input,metric,boxed),nullLock);if(!expected.equals(actual))throw new AssertionError("${name}${i}:"+failures+":"+mode+":"+input+":"+metric+":"+boxed+":"+nullLock+":"+expected+" != "+actual);comparisons++;}`)).join('\n')}
-        }if(comparisons!=514080)throw new AssertionError(comparisons);System.out.println("guarded-abrupt-native:"+comparisons+",oracles:31");
+        }if(comparisons!=725760)throw new AssertionError(comparisons);System.out.println("guarded-abrupt-native:"+comparisons+",oracles:48");
       }
     }`;
     const file = path.join(directory, 'GuardedAbruptExits.java');

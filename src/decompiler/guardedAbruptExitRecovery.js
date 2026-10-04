@@ -6,6 +6,8 @@
 // No suffix statement moves across another statement or protected boundary.
 // Prefix locals retain their scope; suffix locals have no following arm work
 // that could escape their new braces. The complete fallback stays together.
+// If the fallback also exits this frame, keep its original label and braces:
+// only the selected guarded jump disappears, never the fallback's destination.
 function foldGuardedAbruptPlainBlockExits(source, proof, {retainDiagnostics = false} = {}) {
   const unchanged = () => ({source, framesRemoved: 0, jumpsRemoved: 0});
   if (!proof || typeof retainDiagnostics !== 'boolean') return unchanged();
@@ -98,27 +100,29 @@ function foldGuardedAbruptPlainBlockExits(source, proof, {retainDiagnostics = fa
   }
   function find(node) {
     if (node.kind === 'LabeledStatement' && node.statement?.kind === 'BlockStatement'
-        && references.get(node)?.length === 1) {
+        && references.get(node)?.length) {
       const frame = extent(node.statement), labelStart = starts.get(node.range?.startOffset);
       if (frame && tokens[labelStart]?.text === node.label && tokens[labelStart + 1]?.text === ':' && labelStart + 2 === frame.open) {
         const statements = node.statement.statements;
         for (let index = 0; index < statements.length - 1; index++) {
           const branch = statements[index], body = branch.consequent, arm = extent(body);
           if (branch.kind !== 'IfStatement' || branch.alternate || !arm || body.statements.length < 2) continue;
-          // The one reference to this frame must be a direct guarded break in
-          // the arm. Keep every following statement, including nested scopes
-          // and cleanup, together with the final abrupt transfer.
-          const guardIndex = body.statements.findIndex(statement =>
-            statement.kind === 'IfStatement' && (statement.consequent === references.get(node)[0]
-              || statement.consequent?.kind === 'BlockStatement'
-                && statement.consequent.statements.length === 1
-                && statement.consequent.statements[0] === references.get(node)[0]));
+          // The selected reference must be a direct guarded break in this arm.
+          // Any other references must be in the complete fallback, not the
+          // prefix or effect arm. Their original enclosing frame stays labeled.
+          const guardIndex = body.statements.findIndex(statement => {
+            if (statement.kind !== 'IfStatement') return false;
+            const consequent = statement.consequent;
+            const jump = consequent?.kind === 'BlockStatement' && consequent.statements.length === 1
+              ? consequent.statements[0] : consequent;
+            return jump?.kind === 'BreakStatement' && targets.get(jump) === node;
+          });
           if (guardIndex < 0 || guardIndex >= body.statements.length - 1) continue;
           const guard = body.statements[guardIndex], abrupt = body.statements.at(-1);
           const jump = guard?.consequent?.kind === 'BlockStatement' && guard.consequent.statements.length === 1
             ? guard.consequent.statements[0] : guard?.consequent;
           if (guard?.kind !== 'IfStatement' || guard.alternate || jump?.kind !== 'BreakStatement'
-              || targets.get(jump) !== node || references.get(node)[0] !== jump
+              || targets.get(jump) !== node
               || !['ReturnStatement', 'ThrowStatement', 'BreakStatement', 'ContinueStatement'].includes(abrupt.kind)
               || targets.get(abrupt) === node) continue;
           const branchStart = starts.get(branch.range?.startOffset), headerEnd = closes.get(branchStart + 1);
@@ -135,6 +139,10 @@ function foldGuardedAbruptPlainBlockExits(source, proof, {retainDiagnostics = fa
               || suffixStart !== jumpEnd + (braced ? 2 : 1) || abruptStart < suffixStart
               || abruptEnd + 1 !== arm.close
               || restStart !== arm.close + 1) continue;
+          if (references.get(node).some(reference => reference !== jump
+              && (starts.get(reference.range.startOffset) < restStart
+                || starts.get(reference.range.startOffset) >= frame.close))) continue;
+          const keepLabel = references.get(node).length > 1;
           const predicate = negate(guard.condition, guardStart + 1, guardEnd);
           const suffixBytes = wrapped.slice(tokens[suffixStart].range.startOffset, tokens[abruptEnd].range.endOffset);
           const prefix = wrapped.slice(wrapped.lastIndexOf('\n', tokens[guardStart].range.startOffset - 1) + 1,
@@ -158,10 +166,11 @@ function foldGuardedAbruptPlainBlockExits(source, proof, {retainDiagnostics = fa
           // declarations keep their braces, and all fallback declarations are
           // confined to the complete else. A statement-position frame keeps
           // its braces so multiple prefix statements cannot escape an if/loop.
-          const keepFrame = parents.get(node)?.kind !== 'BlockStatement'
+          const keepFrame = keepLabel || parents.get(node)?.kind !== 'BlockStatement'
             || statements.slice(0, index).some(statement => statement.kind === 'LocalVariableDeclarationStatement');
           let text = branchBytes + ' else {' + tail + '}';
-          if (keepFrame) text = '{' + framePrefix + text + (multiline ? '\n' + frameIndent : ' ') + '}';
+          if (keepFrame) text = (keepLabel ? wrapped.slice(tokens[labelStart].range.startOffset, tokens[frame.open].range.startOffset) : '')
+            + '{' + framePrefix + text + (multiline ? '\n' + frameIndent : ' ') + '}';
           else {
             const prefixStart = multiline ? tokens[starts.get(statements[0].range.startOffset)].range.startOffset
               : tokens[frame.open].range.endOffset;
@@ -177,8 +186,9 @@ function foldGuardedAbruptPlainBlockExits(source, proof, {retainDiagnostics = fa
             }
           }
           return {start: tokens[labelStart].range.startOffset, end: tokens[frame.close].range.endOffset,
-            text,
+            text, labelRetained: keepLabel,
             diagnostics: {label: node.label, abruptKind: abrupt.kind, predicate, frameScopeRetained: keepFrame,
+              labelRetained: keepLabel,
               guardedSuffixStatements: body.statements.length - guardIndex - 1,
               labelRange: {start: tokens[labelStart].range.startOffset - 2, end: tokens[labelStart + 1].range.endOffset - 2},
               jumpRange: {start: tokens[jumpStart].range.startOffset - 2, end: tokens[jumpEnd].range.endOffset - 2}}};
@@ -192,7 +202,8 @@ function foldGuardedAbruptPlainBlockExits(source, proof, {retainDiagnostics = fa
   const edit = find(parsed);
   if (!edit) return unchanged();
   return {source: (wrapped.slice(0, edit.start) + edit.text + wrapped.slice(edit.end)).slice(2, -2),
-    framesRemoved: 1, jumpsRemoved: 1, ...(retainDiagnostics ? {diagnostics: edit.diagnostics} : {})};
+    framesRemoved: edit.labelRetained ? 0 : 1, jumpsRemoved: 1,
+    ...(retainDiagnostics ? {diagnostics: edit.diagnostics} : {})};
 }
 
 module.exports = {foldGuardedAbruptPlainBlockExits};

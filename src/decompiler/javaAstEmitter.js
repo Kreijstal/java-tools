@@ -664,7 +664,7 @@ function foldGuardedAbruptPlainBlockExits(source, options = {}) {
 function recoverPostGuardExits(source, {parameterNames = []} = {}) {
   const original = source;
   const counts = {voidReturnFrames: 0, fallthroughBreaks: 0, exitTreeFrames: 0,
-    ifElseFrames: 0, guardedAbruptFrames: 0, guardTreeFrames: 0, effectfulExits: 0,
+    ifElseFrames: 0, guardedAbruptFrames: 0, guardedAbruptJumps: 0, guardTreeFrames: 0, effectfulExits: 0,
     localizedLoopBreaks: 0, leadingLoopGuards: 0,
     labelsRemoved: 0, jumpsUnlabeled: 0, blocksUnwrapped: 0};
   const unchanged = () => ({source: original, rewrites: 0, counts});
@@ -692,7 +692,7 @@ function recoverPostGuardExits(source, {parameterNames = []} = {}) {
     [removeFallthroughLabelBreaks, 'breaksRemoved', 'fallthroughBreaks'],
     [foldLabeledExitTrees, 'framesRemoved', 'exitTreeFrames'],
     [foldLabeledIfElseExits, 'framesRemoved', 'ifElseFrames'],
-    [foldGuardedAbruptPlainBlockExits, 'framesRemoved', 'guardedAbruptFrames'],
+    [foldGuardedAbruptPlainBlockExits, 'jumpsRemoved', 'guardedAbruptJumps'],
     [foldLabeledGuardTrees, 'framesRemoved', 'guardTreeFrames'],
     [foldEffectfulPlainBlockExits, 'exitsRecovered', 'effectfulExits'],
     [localizePlainBlockLoopBreaks, 'breaksLocalized', 'localizedLoopBreaks'],
@@ -709,6 +709,7 @@ function recoverPostGuardExits(source, {parameterNames = []} = {}) {
       if (nextWeight === null || nextWeight >= weight) continue;
       source = next.source; weight = nextWeight;
       counts[counter] += next[key]; rewrites++;
+      if (pass === foldGuardedAbruptPlainBlockExits) counts.guardedAbruptFrames += next.framesRemoved;
       for (;;) {
         const cleaned = simplifyControlFrames(source);
         if (cleaned.source === source) break;
