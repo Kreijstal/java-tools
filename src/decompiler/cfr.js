@@ -1,6 +1,6 @@
 'use strict';
 
-const {foldGuardedLoopContinuations} = require('./javaAstEmitter');
+const {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops} = require('./javaAstEmitter');
 
 const fs = require('fs');
 const path = require('path');
@@ -1927,6 +1927,15 @@ function shareExistingExitTails(body, parameterNames = [], parameters = []) {
   for (;;) {
     const loops = foldGuardedLoopContinuations(source, {parameterNames});
     if (!loops.loopsRecovered) break;
+    source = loops.source;
+    changed = true;
+  }
+  // A braced while whose body cannot fall through or continue to its own
+  // header is a single conditional. Preserve the complete body and every
+  // legal labeled exit; refuse bare own breaks and possibly constant guards.
+  for (;;) {
+    const loops = foldNonrepeatingWhileLoops(source, {parameterNames});
+    if (!loops.conditionalsRecovered) break;
     source = loops.source;
     changed = true;
   }

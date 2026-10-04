@@ -5,8 +5,9 @@
 // Move the guard to the header only when the arm cannot fall through, and
 // the continuation cannot repeat/exit this loop or complete normally. Keep
 // each protected construct whole and retain every existing transfer target.
-function foldGuardedLoopContinuations(source, proof, {parameterNames = [], retainDiagnostics = false} = {}) {
-  const unchanged = () => ({source, loopsRecovered: 0});
+function recoverLoopForms(source, proof, {parameterNames = [], retainDiagnostics = false} = {}, form = 'guarded') {
+  const counter = form === 'nonrepeating' ? 'conditionalsRecovered' : 'loopsRecovered';
+  const unchanged = () => ({source, [counter]: 0});
   if (!proof || typeof retainDiagnostics !== 'boolean' || !Array.isArray(parameterNames)
       || new Set(parameterNames).size !== parameterNames.length
       || parameterNames.some(name => typeof name !== 'string' || !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name))) return unchanged();
@@ -152,7 +153,21 @@ function foldGuardedLoopContinuations(source, proof, {parameterNames = [], retai
     if (node.kind === 'ForStatement') {
       const nested = new Map(scope); remember(node.initializer, nested); visit(node.body, nested); return;
     }
-    if (node.kind === 'WhileStatement' && constantTrue(node.condition) && node.body?.kind === 'BlockStatement'
+    if (form === 'nonrepeating' && node.kind === 'WhileStatement' && node.body?.kind === 'BlockStatement'
+        && nonconstant(node.condition, scope)) {
+      const label = parents.get(node)?.kind === 'LabeledStatement' ? parents.get(node) : null;
+      const referencesToLoop = [...references.get(node) || [], ...references.get(label) || []];
+      const result = completion(node.body);
+      // No normal completion or own continue can evaluate the header again.
+      // A labeled break remains legal when this labeled while becomes an if;
+      // an unlabeled own break would lose its loop destination, so retain it.
+      // All inner/nonlocal transfers and protected bodies stay byte identical.
+      if (!refused && !result.has(normal)
+          && referencesToLoop.every(reference => reference.kind === 'BreakStatement' && reference.label)) {
+        candidate = {node, label}; return;
+      }
+    }
+    if (form === 'guarded' && node.kind === 'WhileStatement' && constantTrue(node.condition) && node.body?.kind === 'BlockStatement'
         && node.body.statements.length >= 2) {
       const [guard, ...suffix] = node.body.statements;
       const label = parents.get(node)?.kind === 'LabeledStatement' ? parents.get(node) : null;
@@ -175,6 +190,19 @@ function foldGuardedLoopContinuations(source, proof, {parameterNames = [], retai
   visit(parsed, new Map(parameterNames.map(name => [name, true])));
   if (refused || !candidate) return unchanged();
   const {node, guard, suffix, label} = candidate;
+  if (form === 'nonrepeating') {
+    const start = starts.get(node.range?.startOffset), close = closes.get(start + 1);
+    const bodyOpen = starts.get(node.body.range?.startOffset), bodyClose = closes.get(bodyOpen);
+    if (tokens[start]?.text !== 'while' || tokens[start + 1]?.text !== '(' || close === undefined
+        || bodyOpen !== close + 1 || tokens[bodyOpen]?.text !== '{' || tokens[bodyClose]?.text !== '}') return unchanged();
+    const begin = tokens[start].range.startOffset, end = tokens[start].range.endOffset;
+    const output = wrapped.slice(0, begin) + 'if' + wrapped.slice(end);
+    return {source: output.slice(2, -2), conditionalsRecovered: 1, ...(retainDiagnostics ? {diagnostics: {
+      label: label?.label || null,
+      loopRange: {start: begin - 2, end: tokens[bodyClose].range.endOffset - 2},
+      headerKeywordRange: {start: begin - 2, end: end - 2},
+    }} : {})};
+  }
   const start = starts.get(node.range.startOffset), bodyOpen = start + 4, bodyClose = closes.get(bodyOpen);
   const first = starts.get(guard.range.startOffset), guardClose = closes.get(first + 1);
   const armOpen = guardClose + 1, armClose = closes.get(armOpen);
@@ -216,4 +244,12 @@ function foldGuardedLoopContinuations(source, proof, {parameterNames = [], retai
   }} : {})};
 }
 
-module.exports = {foldGuardedLoopContinuations};
+function foldGuardedLoopContinuations(source, proof, options) {
+  return recoverLoopForms(source, proof, options);
+}
+
+function foldNonrepeatingWhileLoops(source, proof, options) {
+  return recoverLoopForms(source, proof, options, 'nonrepeating');
+}
+
+module.exports = {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops};
