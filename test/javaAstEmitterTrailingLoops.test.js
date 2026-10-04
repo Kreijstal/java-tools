@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const {spawnSync} = require('node:child_process');
-const {foldTrailingLoopContinuations: fold, foldLoopExitContinuations: foldExit, foldTerminalLoopExits: foldTerminal, foldNonlocalLoopExits: foldNonlocal} = require('../src/decompiler/javaAstEmitter');
+const {foldTrailingLoopContinuations: fold, foldLoopExitContinuations: foldExit, foldTerminalLoopExits: foldTerminal, foldNonlocalLoopExits: foldNonlocal, foldLoopElseExitGuards: foldElseExit} = require('../src/decompiler/javaAstEmitter');
 
 test('leading nonlocal breaks become loop headers without changing their destination', () => {
   const source = 'Stop:{Next:while(true){if(stop()){break Stop;}step();if(again())continue Next;}finish();}after();';
@@ -510,4 +510,109 @@ for (const [name, recover, counter] of [
     for (let index=0;index<expected.length;index++) assert.equal(actualRows[index], expected[index], 'independent event case ' + index);
     assert.equal(expected.length, exitForm ? 18432 : 12096);
   } finally {fs.rmSync(temporary, {recursive: true, force: true});}
+});
+
+
+test('terminal else effects become explicit in-loop exits without changing either exit reason', () => {
+  const source='Stop:{Next:while(true){if(poll()){step();if(again())continue Next;}else{finish();}break;}after();}';
+  const result=foldElseExit(source,{retainDiagnostics:true});
+  assert.equal(result.loopsRecovered,1);
+  assert.match(result.source,/Next:while\(true\)\{\s*if \(!\(poll\(\)\)\) \{finish\(\);\s*break;\s*\}\s*step\(\);if\(again\(\)\)continue Next;\s*break;/);
+  assert.equal(result.diagnostics.label,'Next');
+  assert.equal(source.slice(result.diagnostics.armRange.start,result.diagnostics.armRange.end),'step();if(again())continue Next;');
+  assert.equal(foldElseExit(result.source).loopsRecovered,0);
+  for(const body of [
+    'try{step();if(again())continue Next;}finally{if(stop)break Next;}',
+    'try{step();if(stop)return;}finally{if(again())continue Next;}',
+    'synchronized(lock){step();if(stop)break Stop;}',
+    'Inner:for(int slot=0;slot<2;slot++){if(stop)break Inner;}step();',
+  ]) {
+    const original='Stop:{if(pick)Next:while(true){if(poll()){'+body+'}else{finish();}break;}else other();}';
+    const next=foldElseExit(original,{parameterNames:['stop','lock','pick']});
+    assert.equal(next.loopsRecovered,1,original);
+    assert.ok(next.source.includes(body),'intact protected/inner-control construct');
+    assert.match(next.source,/\}else other\(\);\}/,'scalar parent retains its original else');
+  }
+});
+
+test('exit guard recovery refuses declarations, changed frame order and unreachable new exits', () => {
+  for(const source of [
+    'while(true){if(poll()){int slot=step();use(slot);}else{finish();}break;}',
+    'while(true){if(poll()){step();}else{int slot=step();use(slot);}break;}',
+    'while(true){if(poll()){step();}else{Exit:{finish();}}break;}',
+    'while(true){if(poll()){step();}else{while(again()){finish();}}break;}',
+    'while(true){if(poll()){step();}else{try{finish();}finally{cleanup();}}break;}',
+    'while(true){if(poll()){return;}else{finish();}break;}',
+    'while(true){if(poll()){step();}else{return;}break;}',
+    'while(true){if(poll()){step();}else{finish();}return;}',
+    'Next:while(true){if(poll()){step();}else{finish();}break Next;}',
+    'while(true){prefix();if(poll()){step();}else{finish();}break;}',
+    'while(true){if(poll())step();else{finish();}break;}',
+    'while(true){if(poll()){step();}else finish();break;}',
+    'while(true){if(poll()){continue Missing;}else{finish();}break;}',
+    'while(true){if(poll()){step()}else{finish();}break;}',
+    'while(true){if(poll()){step();}else{finish();}break;} // comment\n',
+    'while(true){if(poll()){step();}else{finish();}break;}\\u000a',
+  ])assert.equal(foldElseExit(source).source,source,source);
+});
+
+test('loop exit guards match an independent native event model including finally overrides and monitors', () => {
+  const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'loop-else-exit-native-'));
+  const run=(command,args)=>{const result=spawnSync(command,args,{encoding:'utf8',maxBuffer:16*1024*1024});assert.equal(result.status,0,result.stderr||result.stdout);return result.stdout;};
+  try {
+    const inner='step("B",mode,t);index++;if(mode==4)return done(index,polls,t);if(mode==5)break Stop;if(mode==6)continue Rounds;if(mode==8)throw SPECIFIC;if(flag==0)continue Next;step("T",mode,t);';
+    const finalizer='step("F",mode,t);if(mode==7)return done(99,polls,t);if(mode==8&&index<3)continue Next;if(mode==9)break Next;';
+    const bodies=[inner,'try{'+inner+'}finally{'+finalizer+'}',
+      'synchronized(lock){t.append(Thread.holdsLock(lock)?"L":"bad");'+inner+'}',
+      'try{'+inner+'}catch(Specific failure){t.append("C");return done(70,polls,t);}',
+      'try{synchronized(lock){t.append(Thread.holdsLock(lock)?"L":"bad");'+inner+'}}finally{'+finalizer+'}',
+      'Inner:for(int scan=0;scan<1;scan++){t.append("I");if(mode>=0)break Inner;}'+inner];
+    let methods='';
+    for(const [variant,body] of bodies.entries()){
+      const source='Rounds:for(int round=0;round<2;round++){Stop:{Next:while(true){if(++polls<=limit&&gate){'+body+'}else{step("X",mode,t);}break;}}step("S",mode,t);return done(index,polls,t);}return done(index,polls,t);';
+      const result=foldElseExit(source,{parameterNames:['limit','gate','flag','mode','lock'],retainDiagnostics:true});
+      assert.equal(result.loopsRecovered,1,source);
+      for(const [name,contents]of Object.entries({old:source,next:result.source}))
+        methods+='static String '+name+variant+'(int limit,Boolean gate,int flag,int mode,Object lock){int index=0,polls=0;StringBuilder t=trace=new StringBuilder();'+contents+'}\n';
+    }
+    const fixture='public class LoopElseExits {\n'+
+      'static class Specific extends RuntimeException{}static final Specific SPECIFIC=new Specific();static final Error FATAL=new Error();static StringBuilder trace;\n'+
+      'static void step(String stage,int mode,StringBuilder t){t.append(stage);if(stage.equals("B")&&mode==1||stage.equals("T")&&mode==2||stage.equals("F")&&mode==3||stage.equals("X")&&mode==11)throw SPECIFIC;if(stage.equals("B")&&mode==10)throw FATAL;}\n'+
+      'static String done(int index,int polls,StringBuilder t){return index+":"+polls+":"+t;}\n'+methods+
+      'static String invoke(boolean next,int v,int limit,Boolean gate,int flag,int mode,Object lock){try{switch(v){'+bodies.map((_,i)=>'case '+i+':return next?next'+i+'(limit,gate,flag,mode,lock):old'+i+'(limit,gate,flag,mode,lock);').join('')+'}throw new AssertionError();}catch(Throwable failure){if(failure==SPECIFIC)return "error:S";if(failure==FATAL)return "error:E";if(failure instanceof NullPointerException)return "error:N";throw new AssertionError(failure);}}\n'+
+      'public static void main(String[]args){boolean next=args[0].equals("next");for(int v=0;v<6;v++)for(int limit:new int[]{-1,0,1,3})for(Boolean gate:new Boolean[]{null,false,true})for(int flag=-1;flag<=1;flag++)for(int mode=0;mode<12;mode++)for(int lockKind=0;lockKind<2;lockKind++){Object lock=lockKind==0?null:new Object();String result=invoke(next,v,limit,gate,flag,mode,lock);if(lock!=null&&Thread.holdsLock(lock))throw new AssertionError("monitor leaked");System.out.println(v+","+limit+","+gate+","+flag+","+mode+","+lockKind+"|"+result+"|"+trace);}}\n}';
+    const file=path.join(temporary,'LoopElseExits.java');fs.writeFileSync(file,fixture);run('javac',['--release','8','-d',temporary,file]);
+    const original=run('java',['-cp',temporary,'LoopElseExits','old']);
+    assert.equal(run('java',['-cp',temporary,'LoopElseExits','next']),original);
+    const expected=[];
+    for(let v=0;v<6;v++)for(const limit of [-1,0,1,3])for(const gate of [null,false,true])for(let flag=-1;flag<=1;flag++)for(let mode=0;mode<12;mode++)for(let lock=0;lock<2;lock++){
+      let index=0,polls=0,trace='',result;const done=n=>n+':'+polls+':'+trace;
+      for(let round=0;round<2&&result===undefined;round++){
+        let nextRound=false;
+        for(;;){
+          polls++;
+          if(polls<=limit&&gate===null){result='error:N';break;}
+          if(polls>limit||!gate){trace+='X';if(mode===11)result='error:S';break;}
+          let failure,pending,exitStop=false,repeat=false,exitLoop=false;
+          if(v===5)trace+='I';
+          if((v===2||v===4)&&!lock)failure='N';
+          else{if(v===2||v===4)trace+='L';trace+='B';
+            if(mode===1)failure='S';else if(mode===10)failure='E';
+            else{index++;if(mode===4)pending=done(index);else if(mode===5)exitStop=true;else if(mode===6)nextRound=true;else if(mode===8)failure='S';else if(flag===0)repeat=true;else{trace+='T';if(mode===2)failure='S';}}}
+          if(v===3&&failure==='S'){trace+='C';failure=undefined;pending=done(70);}
+          if(v===1||v===4){trace+='F';
+            if(mode===3){failure='S';pending=undefined;exitStop=false;nextRound=false;repeat=false;}
+            else if(mode===7){pending=done(99);failure=undefined;exitStop=false;nextRound=false;repeat=false;}
+            else if(mode===8&&index<3){failure=undefined;pending=undefined;exitStop=false;nextRound=false;repeat=true;}
+            else if(mode===9){failure=undefined;pending=undefined;exitStop=false;nextRound=false;repeat=false;exitLoop=true;}}
+          if(failure){result='error:'+failure;break;}if(pending!==undefined){result=pending;break;}
+          if(exitStop||nextRound||exitLoop)break;if(repeat)continue;break;
+        }
+        if(result!==undefined||nextRound)continue;trace+='S';result=done(index);
+      }
+      if(result===undefined)result=done(index);
+      expected.push([v,limit,String(gate),flag,mode,lock].join(',')+'|'+result+'|'+trace);
+    }
+    assert.equal(original,expected.join('\n')+'\n','all5184 native cases match independent guard/body/false-arm/finally/monitor event model');
+  }finally{fs.rmSync(temporary,{recursive:true,force:true});}
 });

@@ -1,6 +1,6 @@
 'use strict';
 
-const {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits, foldNonlocalLoopExits} = require('./javaAstEmitter');
+const {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits, foldNonlocalLoopExits, foldLoopElseExitGuards} = require('./javaAstEmitter');
 
 const fs = require('fs');
 const path = require('path');
@@ -1972,6 +1972,15 @@ function shareExistingExitTails(body, parameterNames = [], parameters = []) {
   // continuation incorrectly and is refused. Keep every other destination.
   for (;;) {
     const loops = foldNonlocalLoopExits(source, {parameterNames});
+    if (!loops.loopsRecovered) break;
+    source = loops.source;
+    changed = true;
+  }
+  // Keep terminating false-arm effects in the loop, as an explicit exit guard.
+  // Flatten only the true arm's declaration-free outer block; protected groups
+  // and both distinct exit reasons retain their exact original behavior.
+  for (;;) {
+    const loops = foldLoopElseExitGuards(source, {parameterNames});
     if (!loops.loopsRecovered) break;
     source = loops.source;
     changed = true;

@@ -1558,6 +1558,38 @@ rows and diagnostics remain unchanged. There remain 21 large method spans,
 10 with block labels. Larger reconstructions and whole-game/browser/phone
 acceptance remain unfinished or unverified.
 
+### Keeping terminating else effects inside their loop
+
+`foldLoopElseExitGuards` recognizes a literal-true loop containing exactly a
+braced `if (predicate) { arm } else { exitEffects }` and a terminal bare break
+to that loop. It emits `if (!(predicate)) { exitEffects; break; }`, followed by
+the original arm contents and original terminal break. This removes one nesting
+level without moving the false-arm effects outside the loop. A true arm that
+falls through still skips those effects; a true-arm continue still reevaluates
+the predicate. Original own/nonlocal transfers keep their destinations.
+
+Both arms must have a normal completion path, so neither synthesized nor
+retained breaks create unreachable Java. Direct true-arm declarations refuse
+flattening. Declarations, labels, loops, switches and protected groups in the
+false arm also refuse reconstruction; whole nested true-arm scopes, loops,
+try/catch/finally and synchronized groups stay intact. Existing syntax/transfer,
+comment, Unicode-escape and nested-executable refusals still apply. Predicate
+bytes are evaluated once and negated as written, with no numeric/control-flag
+assumption. No local, label or ordinary reference is added or removed.
+
+`NODE_PATH=/path/to/dependencies JAVA_TOOL_OPTIONS=-XX:-UsePerfData node --test test/javaAstEmitterTrailingLoops.test.js`
+passes 20 groups. Three new groups include six native variants and 5,184 cases
+checked against an independent event model: both exit reasons, nullable/effectful
+predicates, nonzero flags, pending return/exception snapshots, finally backedges
+and own-loop break overrides, ancestor transfers, local scopes and monitor
+release. `node --test test/javaAstEmitterLoopExits.test.js` with the same
+environment passes 66 groups with one existing optional corpus check skipped.
+
+In the fixed GeoBlox corpus the new form applies to 12 loops in 10 methods
+across six owners, including screen/session updates and board reconciliation.
+It changes indentation, not line counts: eight large labeled bodies remain.
+Full game/browser/phone behavior and performance acceptance are unverified.
+
 ### Recovering nested predicate-only skip trees
 
 `foldLabeledGuardTrees` turns trees containing only conditionals and breaks to
