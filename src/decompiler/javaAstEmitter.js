@@ -12,6 +12,7 @@ const { recoverScalarLabelDispatches: recoverScalarDispatch } = require('./scala
 const { specializePathGuards: specializeGuards } = require('./pathGuardRecovery');
 const { recoverArrayIndexIncrements: recoverIndexIncrements } = require('./incrementCaptureRecovery');
 const { foldGuardedAbruptPlainBlockExits: recoverGuardedAbruptExit } = require('./guardedAbruptExitRecovery');
+const { foldGuardedLoopContinuations: recoverLoopContinuation } = require('./guardedLoopContinuationRecovery');
 
 const rawExpression = (source) => createNode('UnsupportedExpression', { source: String(source) });
 const rawStatement = (source) => createNode('UnsupportedStatement', { source: String(source) });
@@ -654,6 +655,10 @@ function recoverArrayIndexIncrements(source, options = {}) {
 
 function foldGuardedAbruptPlainBlockExits(source, options = {}) {
   return recoverGuardedAbruptExit(source, controlCleanupSource(source), options);
+}
+
+function foldGuardedLoopContinuations(source, options = {}) {
+  return recoverLoopContinuation(source, controlCleanupSource(source), options);
 }
 
 // Guard specialization and frame cleanup can expose exits after the ordinary
@@ -3091,6 +3096,7 @@ module.exports = {
   foldLeadingWhileBreakGuards,
   foldEffectfulPlainBlockExits,
   foldGuardedAbruptPlainBlockExits,
+  foldGuardedLoopContinuations,
   simplifyIdentityReferenceCasts,
   recoverScalarLabelDispatches,
   specializePathGuards,

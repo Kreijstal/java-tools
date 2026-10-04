@@ -1,5 +1,7 @@
 'use strict';
 
+const {foldGuardedLoopContinuations} = require('./javaAstEmitter');
+
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -1917,6 +1919,15 @@ function shareExistingExitTails(body, parameterNames = [], parameters = []) {
   const indexIncrements = recoverArrayIndexIncrements(source, {parameters});
   if (indexIncrements.capturesFolded) {
     source = indexIncrements.source;
+    changed = true;
+  }
+  // A nested backedge need not be the arm's final direct statement. Recover
+  // complete guarded loops after other cleanup, using lexical completion and
+  // destination proofs rather than assumptions about game control flags.
+  for (;;) {
+    const loops = foldGuardedLoopContinuations(source, {parameterNames});
+    if (!loops.loopsRecovered) break;
+    source = loops.source;
     changed = true;
   }
   if (changed) replaceArrayContents(body, source.split('\n'));
