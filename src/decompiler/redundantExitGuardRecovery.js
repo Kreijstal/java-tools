@@ -148,7 +148,7 @@ function foldRedundantExitGuards(source, proof, {parameters = [], retainDiagnost
     if (!yes || tokens[first]?.text !== 'if' || tokens[open]?.text !== '(' || close === undefined
         || pureType(guard.condition, tokens[first].range.startOffset) !== 'boolean') continue;
     const no = jump(guard.alternate), following = jump(list[index + 1]);
-    const bothArms = same(yes, no), adjacent = empty(guard.alternate) && same(yes, following);
+    const bothArms = Boolean(same(yes, no)), adjacent = empty(guard.alternate) && same(yes, following);
     if (!bothArms && !adjacent) continue;
     const last = finish(guard.alternate || guard.consequent), jumpFirst = starts.get(yes.range?.startOffset), jumpLast = finish(yes);
     if (last === null || jumpFirst === undefined || jumpLast === null) continue;

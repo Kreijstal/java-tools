@@ -54,8 +54,6 @@ injected failures, return/finally priority and monitor ownership. Publication
 still requires compiling and independently auditing the complete exported
 corpus, including retired labels and resulting lexical-label ordinal migrations.
 
-## Why our own decompiler?
-
 ### Effect-free guards with identical exits
 
 The final cleanup also removes a guard such as `if (flag == 0) break; break;`
@@ -88,6 +86,8 @@ Result: 106 passing tests and one existing optional corpus skip. This is generic
 Java reconstruction; publication still requires independent complete-corpus
 type/binding/destination and source-byte proofs. Catalog-wide effects are not
 yet verified.
+
+## Why our own decompiler?
 
 The immediate motivation was a gamepack-deobfuscation pipeline where the final
 quality gate is "does CFR decompile every method without a `** GOTO` /

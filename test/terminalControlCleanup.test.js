@@ -243,6 +243,7 @@ test('guard diagnostics account for every deleted character and fixed point step
       assert.equal(source.slice(guard.start, guard.start + 2), 'if');
       assert.match(source.slice(guard.conditionStart, guard.conditionEnd), /^flag[!=]=0$/);
       assert.equal(guard.exitKind, 'BreakStatement'); assert.equal(guard.exitLabel, 'Exit');
+      assert.equal(guard.bothArms, false);
     }
     removed += result.guardsRemoved; source = result.source;
   }
