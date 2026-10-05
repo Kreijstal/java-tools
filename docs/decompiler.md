@@ -1801,6 +1801,29 @@ models checking 13,824 cases, with integer extremes, signed overflow, nullable
 guards/monitors, finally overrides, nonlocal transfers, declaration scopes and
 mutation inside the unchanged old switch body.
 
+
+`foldBooleanLocalAssignments` replaces an if/else whose complete arms assign
+opposite Boolean literals to the same unique primitive Boolean local with one
+assignment of the original condition (or its logical negation). It retains the
+condition's original grouping and evaluates/unboxes it once before the store.
+Condition callbacks, short-circuit order, partial local writes, floating/NaN
+predicates and all enclosing exception/finally/monitor scopes remain. The
+surviving destination identifier keeps its original binding; declarations and
+initializers remain intact. Boxed, field, array, parameter, ambiguous or
+out-of-scope destinations, extra arm effects, same-valued arms, nested
+executables, translated Unicode/comments and unsupported syntax refuse.
+At most 256 branches, 40,000-character regions, 128 AST levels and a
+400,000-character body are considered. This runs after switch-prefix recovery;
+earlier structural and predicate phases are not repeated.
+
+`node --test test/booleanLocalAssignmentRecovery.test.js` checks both polarities,
+final/uninitialized declarations, braced and unbraced arms, nested local scopes,
+independent token-permutation diagnostics and all destination/budget refusals.
+Six independent native truth/completion models compare 124,416 cases with
+condition writes, short-circuit null unboxing, integer overflow in callbacks,
+NaN/infinite predicates, returns/nonlocal continues, failure identity, finally
+overrides and monitor release.
+
 `node --test test/scalarIfDispatchRecovery.test.js` covers supported case runs,
 empty/default paths, integer extremes, scope/target/mutation refusals and budgets.
 Seven native variants compare 20,160 independent cases, retaining negative/zero/

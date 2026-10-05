@@ -797,6 +797,93 @@ function recoverPostGuardExits(source, {parameterNames = []} = {}) {
   }
 }
 
+// Opposite literal assignments encode the condition's Boolean value. Restrict
+// the destination to a unique primitive local: evaluating an effectful field or
+// array destination before the condition would change observable order.
+function foldBooleanLocalAssignments(source, {retainDiagnostics = false} = {}) {
+  const unchanged = () => ({source, assignmentsFolded: 0});
+  if (typeof retainDiagnostics !== 'boolean' || source.length > 400000) return unchanged();
+  let proof;
+  try { proof = controlCleanupSource(source); }
+  catch (error) { if (error instanceof RangeError) return unchanged(); throw error; }
+  if (!proof) return unchanged();
+  const {wrapped, parsed, tokens, starts, closes, children} = proof;
+  const counts = new Map(), locals = new Map(), branches = [];
+  let refused = false;
+  function walk(node, parent = null, depth = 0) {
+    if (depth > 128) {refused = true; return;}
+    if (/ClassDeclaration|InterfaceDeclaration|EnumDeclaration|RecordDeclaration|MethodDeclaration|ConstructorDeclaration|LambdaExpression|AnonymousClass/.test(node.kind || '')
+        || node.kind === 'NewClassExpression' && node.body != null) refused = true;
+    if (['VariableDeclarator', 'FormalParameter'].includes(node.kind)) counts.set(node.name, (counts.get(node.name) || 0) + 1);
+    if (node.kind === 'LocalVariableDeclarationStatement' && parent?.kind === 'BlockStatement'
+        && node.variableType?.kind === 'PrimitiveType' && node.variableType.name === 'boolean'
+        && !node.annotations?.length && !node.variableType.annotations?.length) {
+      let open = starts.get(parent.range?.startOffset);
+      if (open === undefined) {
+        const firstStatement = starts.get(parent.statements?.[0]?.range?.startOffset);
+        if (tokens[firstStatement - 1]?.text === '{') open = firstStatement - 1;
+      }
+      const close = closes.get(open), first = starts.get(node.range?.startOffset);
+      let end = first;
+      while (end < tokens.length && tokens[end].text !== ';' && tokens[end].text !== '}') {
+        if (closes.has(end)) end = closes.get(end);
+        end++;
+      }
+      if (tokens[open]?.text === '{' && close !== undefined && tokens[end]?.text === ';')
+        for (const variable of node.declarators) if (!variable.dimensions)
+          locals.set(variable.name, {start: tokens[end].range.endOffset, end: tokens[close].range.startOffset});
+    }
+    if (node.kind === 'IfStatement') branches.push(node);
+    children(node, child => walk(child, node, depth + 1));
+  }
+  walk(parsed);
+  if (refused) return unchanged();
+  function arm(node) {
+    const block = node?.kind === 'BlockStatement', statement = block && node.statements.length === 1 ? node.statements[0] : node;
+    const assignment = statement?.kind === 'ExpressionStatement' && statement.expression;
+    if (assignment?.kind !== 'AssignmentExpression' || assignment.operator !== '='
+        || assignment.left?.kind !== 'Identifier' || assignment.right?.kind !== 'LiteralExpression'
+        || !['true', 'false'].includes(assignment.right.raw)) return null;
+    const first = starts.get(statement.range?.startOffset);
+    if (tokens[first]?.text !== assignment.left.name || tokens[first + 1]?.text !== '='
+        || tokens[first + 2]?.text !== assignment.right.raw || tokens[first + 3]?.text !== ';') return null;
+    const open = block && starts.get(node.range?.startOffset), close = block ? closes.get(open) : first + 3;
+    if (block && (tokens[open]?.text !== '{' || first !== open + 1 || close !== first + 4)) return null;
+    return {name: assignment.left.name, value: assignment.right.raw, first, start: block ? open : first, end: close, block};
+  }
+  const assignments = [];
+  for (const node of branches) {
+    const yes = arm(node.consequent), no = arm(node.alternate);
+    if (!yes || !no || yes.name !== no.name || yes.value === no.value || counts.get(yes.name) !== 1) continue;
+    const local = locals.get(yes.name), first = starts.get(node.range?.startOffset), close = closes.get(first + 1);
+    if (!local || tokens[first]?.text !== 'if' || tokens[first + 1]?.text !== '(' || close === undefined
+        || yes.start !== close + 1 || tokens[yes.end + 1]?.text !== 'else' || no.start !== yes.end + 2
+        || tokens[first].range.startOffset < local.start || tokens[no.end].range.endOffset > local.end
+        || tokens[no.end].range.endOffset - tokens[first].range.startOffset > 40000) continue;
+    const range = {start: tokens[first].range.startOffset - 2, end: tokens[no.end].range.endOffset - 2};
+    const conditionRange = {start: tokens[first + 1].range.startOffset - 2, end: tokens[close].range.endOffset - 2};
+    const nameRange = {start: tokens[yes.first].range.startOffset - 2, end: tokens[yes.first].range.endOffset - 2};
+    const discardedNameRange = {start: tokens[no.first].range.startOffset - 2, end: tokens[no.first].range.endOffset - 2};
+    const inverted = yes.value === 'false';
+    assignments.push({range, conditionRange, nameRange, discardedNameRange, variable: yes.name, inverted,
+      blocksRemoved: Number(yes.block) + Number(no.block)});
+    if (assignments.length > 256) return unchanged();
+  }
+  if (!assignments.length) return unchanged();
+  assignments.sort((a, b) => a.range.start - b.range.start);
+  for (let index = 1; index < assignments.length; index++) if (assignments[index].range.start < assignments[index - 1].range.end) return unchanged();
+  let output = source;
+  for (const assignment of assignments.slice().reverse()) {
+    const text = source.slice(assignment.nameRange.start, assignment.nameRange.end) + ' = '
+      + (assignment.inverted ? '!' : '') + source.slice(assignment.conditionRange.start, assignment.conditionRange.end) + ';';
+    output = output.slice(0, assignment.range.start) + text + output.slice(assignment.range.end);
+  }
+  return {source: output, assignmentsFolded: assignments.length,
+    negatedAssignments: assignments.filter(assignment => assignment.inverted).length,
+    blocksRemoved: assignments.reduce((total, assignment) => total + assignment.blocksRemoved, 0),
+    ...(retainDiagnostics ? {diagnostics: {assignments}} : {})};
+}
+
 function controlCleanupSource(source) {
   if (/\\u+[0-9a-fA-F]{4}/.test(source)) return null;
   const wrapped = `{\n${source}\n}`;
@@ -3217,6 +3304,7 @@ module.exports = {
   recoverScalarLabelDispatches,
   recoverScalarIfDispatches,
   foldScalarSwitchPrefixes,
+  foldBooleanLocalAssignments,
   simplifyPredicateNegations,
   simplifyPredicateGrouping,
   specializePathGuards,

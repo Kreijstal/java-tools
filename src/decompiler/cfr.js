@@ -3,7 +3,7 @@
 const {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits, foldNonlocalLoopExits, foldLoopElseExitGuards, foldTerminalLoopTails} = require('./javaAstEmitter');
 const {recoverScalarIfDispatches, simplifyPredicateNegations, simplifyDominatedPredicates, finalizeControlFrames, finalizeTerminalSwitchFrames, foldRedundantExitGuards} = require('./javaAstEmitter');
 const {simplifyPredicateGrouping} = require('./javaAstEmitter');
-const {foldScalarSwitchPrefixes} = require('./javaAstEmitter');
+const {foldScalarSwitchPrefixes, foldBooleanLocalAssignments} = require('./javaAstEmitter');
 
 const fs = require('fs');
 const path = require('path');
@@ -2111,6 +2111,13 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
     const prefixes = foldScalarSwitchPrefixes(source);
     if (!prefixes.switchesExtended) break;
     source = prefixes.source;
+    changed = true;
+  }
+  // Boolean literal branches keep a single condition evaluation/unboxing and
+  // primitive-local store. Field and array destinations remain explicit.
+  const booleanAssignments = foldBooleanLocalAssignments(source);
+  if (booleanAssignments.assignmentsFolded) {
+    source = booleanAssignments.source;
     changed = true;
   }
   if (changed) replaceArrayContents(body, source.split('\n'));
