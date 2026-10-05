@@ -21,7 +21,8 @@ const { foldGuardedLoopContinuations: recoverLoopContinuation, foldNonrepeatingW
   foldLoopExitContinuations: recoverLoopExitContinuation,
   foldTerminalLoopExits: recoverTerminalLoopExit,
   foldNonlocalLoopExits: recoverNonlocalLoopExit,
-  foldLoopElseExitGuards: recoverLoopElseExitGuard } = require('./guardedLoopContinuationRecovery');
+  foldLoopElseExitGuards: recoverLoopElseExitGuard,
+  foldTerminalLoopTails: recoverTerminalLoopTail } = require('./guardedLoopContinuationRecovery');
 
 const rawExpression = (source) => createNode('UnsupportedExpression', { source: String(source) });
 const rawStatement = (source) => createNode('UnsupportedStatement', { source: String(source) });
@@ -704,6 +705,10 @@ function foldTerminalLoopExits(source, options = {}) {
 
 function foldLoopElseExitGuards(source, options = {}) {
   return recoverLoopElseExitGuard(source, controlCleanupSource(source), options);
+}
+
+function foldTerminalLoopTails(source, options = {}) {
+  return recoverTerminalLoopTail(source, controlCleanupSource(source), options);
 }
 
 function foldNonlocalLoopExits(source, options = {}) {
@@ -3196,6 +3201,7 @@ module.exports = {
   foldTerminalLoopExits,
   foldNonlocalLoopExits,
   foldLoopElseExitGuards,
+  foldTerminalLoopTails,
   simplifyIdentityReferenceCasts,
   recoverScalarLabelDispatches,
   recoverScalarIfDispatches,

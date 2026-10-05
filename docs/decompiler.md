@@ -46,8 +46,8 @@ inside the switch remain intact and unwind on the same abrupt exit, including
 finally overrides of pending returns. An enclosing protected region also stays
 in place. This is a destination rewrite, not break removal.
 
-The focused terminal cleanup, loop exit, trailing loop and branch merge suites
-pass 99 tests, with one existing optional corpus check skipped. Five new switch
+The terminal switch cleanup was validated with 99 passing tests and one
+existing optional corpus check skipped. Five new switch
 groups include six independent native event/completion models matching 49,920
 cases: case fallthrough, nonzero/negative flags, partial effects, signed overflow,
 injected failures, return/finally priority and monitor ownership. Publication
@@ -88,6 +88,37 @@ type/binding/destination and source-byte proofs. Catalog-wide effects are not
 yet verified.
 
 ## Why our own decompiler?
+
+### Finishing work after repeatable loop prefixes
+
+`foldTerminalLoopTails` handles an infinite loop with a repeatable prefix,
+finishing work and a final bare own-loop break. Every other own transfer must
+be a continue inside the prefix. Moving that same final break before the
+finishing work makes the prefix's normal completion leave the loop; the intact
+finishing work then runs once after it. No predicate is moved or reevaluated,
+and no field or control-flag value is assumed. Earlier own breaks, including
+finally overrides, refuse recovery because they originally skip finishing work.
+
+Each moved statement remains whole. Direct prefix declarations refuse because
+their loop scope would not reach the continuation. Direct tail declarations
+retain a block, and scalar/case parents retain a wrapper around loop and tail.
+All inner/nonlocal transfers and protected/monitor groups keep their targets.
+Diagnostics record a token permutation, including the original break, rather
+than synthesizing another execution path. This runs last in source cleanup.
+
+Run:
+
+```sh
+JAVA_TOOL_OPTIONS=-XX:-UsePerfData NODE_PATH=/home/kreijstal/git/java-tools/node_modules node --test test/terminalControlCleanup.test.js test/javaAstEmitterLoopExits.test.js test/javaAstEmitterTrailingLoops.test.js test/cfrBranchMergeRegressions.test.js
+```
+
+Result: 113 passing tests and one existing optional corpus skip. Seven new
+focused groups include eight independent native event/completion models matching
+69,120 cases, including predicate callbacks/nullable unboxing, partial effects,
+signed overflow, return/finally priority, monitor ownership, declaration shadowing
+and refusal of early own breaks. Publication separately requires exact complete
+source replay and independent compiler binding, transfer and protected-scope
+evidence. Catalog-wide effects remain unverified.
 
 The immediate motivation was a gamepack-deobfuscation pipeline where the final
 quality gate is "does CFR decompile every method without a `** GOTO` /

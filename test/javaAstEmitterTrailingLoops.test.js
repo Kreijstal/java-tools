@@ -6,7 +6,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const {spawnSync} = require('node:child_process');
-const {foldTrailingLoopContinuations: fold, foldLoopExitContinuations: foldExit, foldTerminalLoopExits: foldTerminal, foldNonlocalLoopExits: foldNonlocal, foldLoopElseExitGuards: foldElseExit} = require('../src/decompiler/javaAstEmitter');
+const {foldTrailingLoopContinuations: fold, foldLoopExitContinuations: foldExit, foldTerminalLoopExits: foldTerminal, foldNonlocalLoopExits: foldNonlocal, foldLoopElseExitGuards: foldElseExit,
+  foldTerminalLoopTails: foldTail} = require('../src/decompiler/javaAstEmitter');
 
 test('leading nonlocal breaks become loop headers without changing their destination', () => {
   const source = 'Stop:{Next:while(true){if(stop()){break Stop;}step();if(again())continue Next;}finish();}after();';
@@ -752,5 +753,132 @@ test('loop exit guards match an independent native event model including finally
       expected.push([v,limit,String(gate),flag,mode,lock].join(',')+'|'+result+'|'+trace);
     }
     assert.equal(original,expected.join('\n')+'\n','all5184 native cases match independent guard/body/false-arm/finally/monitor event model');
+  }finally{fs.rmSync(temporary,{recursive:true,force:true});}
+});
+
+test('normal finishing tails follow repeatable prefixes with the same final bare exit', () => {
+  const source='Next:while(true){poll();if(again()){step();continue Next;}finish();notifyDone();break;}after();';
+  const result=foldTail(source,{retainDiagnostics:true});
+  assert.equal(result.tailsHoisted,1);
+  assert.match(result.source,/^Next:while\(true\)\{poll\(\);if\(again\(\)\)\{step\(\);continue Next;\}\s*break;\s*\}\s*finish\(\);notifyDone\(\);after\(\);$/);
+  assert.equal(source.slice(result.diagnostics.exitRange.start,result.diagnostics.exitRange.end),'break;');
+  assert.equal(source.slice(result.diagnostics.suffixRange.start,result.diagnostics.suffixRange.end),'finish();notifyDone();');
+  assert.equal(result.diagnostics.scalarParentWrapped,false);assert.equal(result.diagnostics.retainedTailScope,false);
+  assert.deepEqual(foldTail(result.source),{source:result.source,tailsHoisted:0});
+});
+
+test('tail declaration scope and scalar parents remain explicit', () => {
+  const source='if(pick)Next:while(true){if(again()){step();continue Next;}int mark=read();use(mark);break;}else other();use(mark);';
+  const result=foldTail(source,{retainDiagnostics:true});assert.equal(result.tailsHoisted,1);
+  assert.equal(result.diagnostics.scalarParentWrapped,true);assert.equal(result.diagnostics.retainedTailScope,true);
+  assert.match(result.source,/if\(pick\)\{\s*Next:while/);
+  assert.match(result.source,/\}\s*\{\s*int mark=read\(\);use\(mark\);\s*\}\s*\}else other\(\);use\(mark\);$/);
+  const nested='while(true){{int mark=read();if(again())continue;use(mark);}finish();break;}';
+  assert.equal(foldTail(nested).tailsHoisted,1,'complete nested declaration scope stays in the prefix');
+});
+
+test('whole protected tails and nonlocal exits keep their original bindings', () => {
+  for(const tail of [
+    'try{finish();}finally{cleanup();}',
+    'try{finish();}catch(RuntimeException failure){recover(failure);}',
+    'synchronized(lock){finish();}',
+    'if(stop())break Stop;finish();',
+    'if(stop())continue Rounds;finish();',
+    'if(stop())return value();finish();',
+    'Inner:for(int scan=0;scan<2;scan++){if(stop())break Inner;step();}',
+    'switch(key){case 0:step();break;default:finish();break;}',
+  ]){
+    const source='Rounds:for(;;){Stop:{Next:while(true){try{step();if(again())continue Next;}finally{cleanup();}'+tail+'break;}after();}}';
+    const result=foldTail(source);assert.equal(result.tailsHoisted,1,tail);assert.ok(result.source.includes(tail),'tail tokens and complete groups remain intact');
+  }
+});
+
+test('early own breaks, escaping locals and tails with backedges refuse hoisting', () => {
+  for(const source of [
+    'Next:while(true){if(skip())break Next;if(again())continue Next;finish();break;}',
+    'while(true){if(skip())break;if(again())continue;finish();break;}',
+    'Next:while(true){try{if(again())continue Next;}finally{if(skip())break Next;}finish();break;}',
+    'while(true){int mark=read();if(again())continue;use(mark);break;}',
+    'while(true){if(again())continue;int mark=read();if(mark>0)continue;finish();break;}',
+    'while(true){if(again())continue;return value();break;}',
+    'while(true){if(again())continue;finish();}',
+    'while(true){finish();break;}',
+    'Next:while(more()){if(again())continue Next;finish();break;}',
+    'Next:while(true){if(again())continue Next;finish();break Next;}',
+  ])assert.equal(foldTail(source).source,source,source);
+});
+
+test('tail permutation preserves every original token identity without evaluating predicates again', () => {
+  const {tokenizeJava}=require('../src/java-frontend/lexer');
+  const tokens=s=>tokenizeJava(s).tokens.filter(t=>!['whitespace','eof'].includes(t.kind)).map(t=>t.text);
+  const source='while(true){poll();if(again()&&++counter>0)continue;finish();break;}after();';
+  const result=foldTail(source,{retainDiagnostics:true}),d=result.diagnostics;
+  const slice=r=>tokens(source.slice(r.start,r.end));
+  const expected=[...tokens(source.slice(0,d.loopRange.start)),...slice(d.headerRange),...slice(d.prefixRange),...slice(d.exitRange),...slice(d.closingBraceRange),...slice(d.suffixRange),...tokens(source.slice(d.loopRange.end))];
+  assert.deepEqual(tokens(result.source),expected);
+  assert.equal(result.source.match(/again\(\)/g).length,1);assert.equal(result.source.match(/\+\+counter/g).length,1);
+  assert.equal(result.source.match(/finish\(\)/g).length,1);
+});
+
+test('uncertain syntax and nested execution refuse finishing tail recovery', () => {
+  for(const source of [
+    'while(true){if(again())continue;finish();break;} // diagnostics\n',
+    'while(true){if(again())continue;finish();break;}\\u000a',
+    'while(true){if(again())continue Missing;finish();break;}',
+    'while(true){42;if(again())continue;finish();break;}',
+    'while(true){class Inner{void run(){}}if(again())continue;finish();break;}',
+    'while(true){if(again())continue;finish() break;}',
+  ])assert.equal(foldTail(source).source,source,source);
+});
+
+test('finishing tails match independent native event, completion and scope models', () => {
+  const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'terminal-tail-native-'));
+  const variants=[
+    "while(true){if(++c.polls<=limit&&gate){emit(c,'b',fail);continue;}emit(c,'t',fail);break;}emit(c,'q',fail);return c.hash;",
+    "Next:while(true){emit(c,'p',fail);if(++c.polls<=limit&&gate){emit(c,'b',fail);if(flag==0)continue Next;}emit(c,'t',fail);break;}emit(c,'q',fail);return c.hash;",
+    "Next:while(true){c.polls++;try{emit(c,'b',fail);if((mode&1)!=0)return c.hash;}finally{emit(c,'f',fail);if(c.polls<limit&&flag==0)continue Next;}emit(c,'t',fail);break;}emit(c,'q',fail);return c.hash;",
+    "while(true){synchronized(c.lock){emit(c,'p',fail);if(++c.polls<=limit&&gate)continue;}try{emit(c,'t',fail);}catch(IllegalStateException failure){emit(c,'c',fail);}finally{emit(c,'f',fail);}break;}emit(c,'q',fail);return c.hash;",
+    "if((mode&1)==0)Next:while(true){if(++c.polls<=limit&&gate){emit(c,'b',fail);continue Next;}int marker=capture(c,flag,fail);emit(c,(char)(marker&127),fail);break;}else emit(c,'o',fail);emit(c,'q',fail);return c.hash+marker;",
+    "while(true){if(++c.polls<=limit&&gate){emit(c,'b',fail);continue;}if((mode&1)!=0)return c.hash+1;emit(c,'t',fail);break;}emit(c,'q',fail);return c.hash;",
+    "Next:while(true){if(flag>0)break Next;if(++c.polls<=limit&&gate){emit(c,'b',fail);continue Next;}emit(c,'t',fail);break;}emit(c,'q',fail);return c.hash;",
+    "while(true){if(++c.polls<=limit&&gate){emit(c,'b',fail);continue;}int local=flag;if(local!=0&&c.polls<limit+2)continue;emit(c,'t',fail);break;}emit(c,'q',fail);return c.hash;",
+  ];
+  const models=[
+    "for(;++c.polls<=limit&&gate;)emit(c,'b',fail);emit(c,'t',fail);emit(c,'q',fail);return c.hash;",
+    "for(;;){emit(c,'p',fail);if(!(++c.polls<=limit&&gate))break;emit(c,'b',fail);if(flag!=0)break;}emit(c,'t',fail);emit(c,'q',fail);return c.hash;",
+    "for(;;){c.polls++;Integer pending=null;RuntimeException failure=null;try{emit(c,'b',fail);if((mode&1)!=0)pending=c.hash;}catch(RuntimeException caught){failure=caught;}emit(c,'f',fail);if(c.polls<limit&&flag==0)continue;if(failure!=null)throw failure;if(pending!=null)return pending;break;}emit(c,'t',fail);emit(c,'q',fail);return c.hash;",
+    "for(;;){boolean again;synchronized(c.lock){emit(c,'p',fail);again=++c.polls<=limit&&gate;}if(!again)break;}try{emit(c,'t',fail);}catch(IllegalStateException failure){emit(c,'c',fail);}finally{emit(c,'f',fail);}emit(c,'q',fail);return c.hash;",
+    "if((mode&1)==0){for(;++c.polls<=limit&&gate;)emit(c,'b',fail);int value=capture(c,flag,fail);emit(c,(char)(value&127),fail);}else emit(c,'o',fail);emit(c,'q',fail);return c.hash+marker;",
+    "for(;++c.polls<=limit&&gate;)emit(c,'b',fail);if((mode&1)!=0)return c.hash+1;emit(c,'t',fail);emit(c,'q',fail);return c.hash;",
+    "if(flag<=0){for(;++c.polls<=limit&&gate;)emit(c,'b',fail);emit(c,'t',fail);}emit(c,'q',fail);return c.hash;",
+    "for(;;){if(++c.polls<=limit&&gate){emit(c,'b',fail);continue;}if(flag!=0&&c.polls<limit+2)continue;break;}emit(c,'t',fail);emit(c,'q',fail);return c.hash;",
+  ];
+  try{
+    const rewritten=variants.map(s=>foldTail(s));assert.deepEqual(rewritten.map(r=>r.tailsHoisted),[1,1,1,1,1,1,0,0]);
+    const signature='(Ctx c,int limit,Boolean gate,int flag,int mode,int fail)';
+    const methods=variants.flatMap((s,i)=>[`static int original${i}${signature}{${s}}`,`static int rewritten${i}${signature}{${rewritten[i].source}}`,`static int model${i}${signature}{${models[i]}}`]).join('\n');
+    const file=path.join(temporary,'TerminalTailNative.java');fs.writeFileSync(file,`public final class TerminalTailNative {
+      static final int marker=77;
+      static final class Ctx {int count,hash,polls;final Object lock;final StringBuilder trace=new StringBuilder();Ctx(int seed,boolean monitor){hash=seed;lock=monitor?new Object():null;}}
+      interface Eval {int run(Ctx c,int limit,Boolean gate,int flag,int mode,int fail);}
+      static void emit(Ctx c,char event,int fail){c.count++;c.hash=c.hash*31+event;c.trace.append(event).append(c.lock!=null&&Thread.holdsLock(c.lock)?'L':'_');if(c.count==fail)throw new IllegalStateException("event"+c.count);}
+      static int capture(Ctx c,int flag,int fail){emit(c,'s',fail);return flag;}
+      static String invoke(Eval eval,int limit,Boolean gate,int flag,int mode,int fail,int seed,boolean monitor){Ctx c=new Ctx(seed,monitor);String result;try{result="return:"+eval.run(c,limit,gate,flag,mode,fail);}catch(RuntimeException failure){result=failure.getClass().getName()+":"+failure.getMessage();}if(c.lock!=null&&Thread.holdsLock(c.lock))throw new AssertionError("monitor leaked");return result+":"+c.polls+":"+c.count+":"+c.hash+":"+c.trace;}
+      ${methods}
+      public static void main(String[] args){
+        Eval[] original={${variants.map((_,i)=>'TerminalTailNative::original'+i).join(',')}};
+        Eval[] rewritten={${variants.map((_,i)=>'TerminalTailNative::rewritten'+i).join(',')}};
+        Eval[] model={${variants.map((_,i)=>'TerminalTailNative::model'+i).join(',')}};
+        int cases=0;
+        for(int variant=0;variant<original.length;variant++)for(int limit:new int[]{-1,0,1,3})for(Boolean gate:new Boolean[]{null,false,true})for(int flag:new int[]{-2,0,1,Integer.MIN_VALUE,Integer.MAX_VALUE})for(int mode=0;mode<4;mode++)for(int fail=0;fail<9;fail++)for(int seed:new int[]{0,Integer.MAX_VALUE})for(boolean monitor:new boolean[]{false,true}){
+          String expected=invoke(model[variant],limit,gate,flag,mode,fail,seed,monitor),before=invoke(original[variant],limit,gate,flag,mode,fail,seed,monitor),after=invoke(rewritten[variant],limit,gate,flag,mode,fail,seed,monitor);
+          if(!expected.equals(before)||!expected.equals(after))throw new AssertionError(variant+":"+limit+":"+gate+":"+flag+":"+mode+":"+fail+":"+seed+":"+monitor+" expected="+expected+" before="+before+" after="+after);cases++;
+        }
+        System.out.println("oracle-complete:"+cases+":"+original.length);
+      }
+    }`);
+    const run=(command,args)=>{const r=spawnSync(command,args,{encoding:'utf8'});assert.equal(r.status,0,r.stderr||r.error?.message);return r.stdout.trim();};
+    run('javac',['--release','8','-d',temporary,file]);
+    assert.equal(run('java',['-XX:-OmitStackTraceInFastThrow','-cp',temporary,'TerminalTailNative']),'oracle-complete:69120:8');
   }finally{fs.rmSync(temporary,{recursive:true,force:true});}
 });

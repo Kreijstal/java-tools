@@ -7,7 +7,7 @@
 // each protected construct whole and retain every existing transfer target.
 function recoverLoopForms(source, proof, {parameterNames = [], retainDiagnostics = false} = {}, form = 'guarded') {
   const counter = form === 'nonrepeating' ? 'conditionalsRecovered'
-    : form === 'exitContinuation' ? 'continuationsRecovered' : 'loopsRecovered';
+    : form === 'exitContinuation' ? 'continuationsRecovered' : form === 'terminalTail' ? 'tailsHoisted' : 'loopsRecovered';
   const unchanged = () => ({source, [counter]: 0});
   if (!proof || typeof retainDiagnostics !== 'boolean' || !Array.isArray(parameterNames)
       || new Set(parameterNames).size !== parameterNames.length
@@ -297,28 +297,32 @@ function recoverLoopForms(source, proof, {parameterNames = [], retainDiagnostics
         }
       }
     }
-    if (form === 'exitContinuation' && node.kind === 'WhileStatement' && constantTrue(node.condition)
+    if (['exitContinuation', 'terminalTail'].includes(form) && node.kind === 'WhileStatement' && constantTrue(node.condition)
         && node.body?.kind === 'BlockStatement') {
       const statements = node.body.statements;
       const label = parents.get(node)?.kind === 'LabeledStatement' ? parents.get(node) : null;
       const referencesToLoop = [...references.get(node) || [], ...references.get(label) || []];
-      if (referencesToLoop.length && referencesToLoop.every(reference => reference.kind === 'ContinueStatement')) {
-        for (let index = 1; index < statements.length; index++) {
-          const prefix = statements.slice(0, index), suffix = statements.slice(index), roots = new Set(prefix);
+      const exit = form === 'terminalTail' ? statements.at(-1) : null;
+      const terminalExit = exit?.kind === 'BreakStatement' && !exit.label && targets.get(exit) === node;
+      const continuations = referencesToLoop.filter(reference => reference !== exit);
+      if (continuations.length && (form !== 'terminalTail' || terminalExit)
+          && continuations.every(reference => reference.kind === 'ContinueStatement')) {
+        for (let index = 1; index < statements.length - (terminalExit ? 1 : 0); index++) {
+          const prefix = statements.slice(0, index), suffix = statements.slice(index, terminalExit ? -1 : undefined), roots = new Set(prefix);
           const inPrefix = reference => {
             for (let ancestor = reference; ancestor && ancestor !== node; ancestor = parents.get(ancestor))
               if (roots.has(ancestor)) return true;
             return false;
           };
-          // Every repeating path stays in the intact prefix. Own breaks would
+          // Every repeating path stays in the intact prefix. Earlier own breaks would
           // skip the old continuation but enter the hoisted one, so refuse all
           // of them, including finally overrides and syntactically dead exits.
           // Never hoist locals or split an if/try/switch/monitor/label construct.
           if (prefix.some(statement => statement.kind === 'LocalVariableDeclarationStatement')
-              || !referencesToLoop.every(inPrefix)) continue;
+              || !continuations.every(inPrefix)) continue;
           const head = sequence(prefix), tail = sequence(suffix);
-          if (!refused && head.has(normal) && !tail.has(normal)) {
-            candidate = {node, label, prefix, suffix}; return;
+          if (!refused && head.has(normal) && (terminalExit ? tail.has(normal) : !tail.has(normal))) {
+            candidate = {node, label, prefix, suffix, exit: terminalExit ? exit : null}; return;
           }
         }
       }
@@ -415,8 +419,8 @@ function recoverLoopForms(source, proof, {parameterNames = [], retainDiagnostics
       exitRange: {start: exitStart - 2, end: exitEnd - 2},
     }} : {})};
   }
-  if (form === 'exitContinuation') {
-    const {prefix} = candidate;
+  if (['exitContinuation', 'terminalTail'].includes(form)) {
+    const {prefix, exit} = candidate;
     const start = starts.get(node.range.startOffset), bodyOpen = start + 4, bodyClose = closes.get(bodyOpen);
     const rangeStart = label ? starts.get(label.range.startOffset) : start;
     const first = starts.get(prefix[0].range.startOffset), suffixStart = starts.get(suffix[0].range.startOffset);
@@ -430,7 +434,9 @@ function recoverLoopForms(source, proof, {parameterNames = [], retainDiagnostics
     };
     const indent = indentAt(tokens[rangeStart].range.startOffset), prefixIndent = indentAt(tokens[first].range.startOffset);
     const prefixBytes = wrapped.slice(tokens[bodyOpen].range.endOffset, tokens[suffixStart].range.startOffset).trimEnd();
-    let tailBytes = wrapped.slice(tokens[suffixStart].range.startOffset, tokens[bodyClose].range.startOffset).trimEnd();
+    const exitStart = exit ? starts.get(exit.range.startOffset) : bodyClose, exitEnd = exit ? ends.get(exit) : null;
+    if (exit && (tokens[exitStart]?.text !== 'break' || tokens[exitEnd]?.text !== ';' || exitEnd + 1 !== bodyClose)) return unchanged();
+    let tailBytes = wrapped.slice(tokens[suffixStart].range.startOffset, tokens[exitStart].range.startOffset).trimEnd();
     const retainTailScope = suffix.some(statement => statement.kind === 'LocalVariableDeclarationStatement');
     if (retainTailScope) tailBytes = '{\n' + indent + '  ' + tailBytes + '\n' + indent + '}';
     else {
@@ -440,19 +446,25 @@ function recoverLoopForms(source, proof, {parameterNames = [], retainDiagnostics
           ? indent + line.slice(tailIndent.length) : line).join('\n');
     }
     // The literal-true header has no effects. Normal prefix completion takes
-    // this new bare break; existing continues still repeat without executing
+    // this bare break (the original final exit for terminal tails); existing continues still repeat without executing
     // the continuation. Nonlocal transfers still leave both sections. The
     // suffix remains at exactly the same enclosing protection/monitor depth.
     let replacement = wrapped.slice(tokens[rangeStart].range.startOffset, tokens[bodyOpen].range.endOffset)
-      + prefixBytes + '\n' + prefixIndent + 'break;\n' + indent + '}\n' + indent + tailBytes;
-    if (parents.get(label || node)?.kind !== 'BlockStatement') replacement = '{\n' + replacement + '\n' + indent + '}';
+      + prefixBytes + '\n' + prefixIndent + (exit ? wrapped.slice(tokens[exitStart].range.startOffset, tokens[exitEnd].range.endOffset) : 'break;')
+      + '\n' + indent + '}\n' + indent + tailBytes;
+    const scalarParentWrapped = parents.get(label || node)?.kind !== 'BlockStatement';
+    if (scalarParentWrapped) replacement = '{\n' + replacement + '\n' + indent + '}';
     const begin = tokens[rangeStart].range.startOffset, end = tokens[bodyClose].range.endOffset;
     const output = wrapped.slice(0, begin) + replacement + wrapped.slice(end);
-    return {source: output.slice(2, -2), continuationsRecovered: 1, ...(retainDiagnostics ? {diagnostics: {
+    return {source: output.slice(2, -2), [counter]: 1, ...(retainDiagnostics ? {diagnostics: {
       label: label?.label || null, retainedTailScope: retainTailScope,
+      ...(exit ? {scalarParentWrapped,
+        headerRange: {start: begin - 2, end: tokens[bodyOpen].range.endOffset - 2},
+        exitRange: {start: tokens[exitStart].range.startOffset - 2, end: tokens[exitEnd].range.endOffset - 2},
+        closingBraceRange: {start: tokens[bodyClose].range.startOffset - 2, end: tokens[bodyClose].range.endOffset - 2}} : {}),
       loopRange: {start: begin - 2, end: end - 2},
       prefixRange: {start: tokens[first].range.startOffset - 2, end: tokens[suffixStart].range.startOffset - 2},
-      suffixRange: {start: tokens[suffixStart].range.startOffset - 2, end: tokens[bodyClose].range.startOffset - 2},
+      suffixRange: {start: tokens[suffixStart].range.startOffset - 2, end: tokens[exitStart].range.startOffset - 2},
     }} : {})};
   }
   if (form === 'nonrepeating') {
@@ -619,4 +631,8 @@ function foldLoopElseExitGuards(source, proof, options) {
   return recoverLoopForms(source, proof, options, 'elseExitGuard');
 }
 
-module.exports = {foldLoopElseExitGuards, foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits, foldNonlocalLoopExits};
+function foldTerminalLoopTails(source, proof, options) {
+  return recoverLoopForms(source, proof, options, 'terminalTail');
+}
+
+module.exports = {foldTerminalLoopTails, foldLoopElseExitGuards, foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits, foldNonlocalLoopExits};

@@ -1,6 +1,6 @@
 'use strict';
 
-const {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits, foldNonlocalLoopExits, foldLoopElseExitGuards} = require('./javaAstEmitter');
+const {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits, foldNonlocalLoopExits, foldLoopElseExitGuards, foldTerminalLoopTails} = require('./javaAstEmitter');
 const {recoverScalarIfDispatches, simplifyPredicateNegations, simplifyDominatedPredicates, finalizeControlFrames, finalizeTerminalSwitchFrames, foldRedundantExitGuards} = require('./javaAstEmitter');
 
 const fs = require('fs');
@@ -2035,6 +2035,15 @@ function shareExistingExitTails(body, parameterNames = [], parameters = []) {
     const guards = foldRedundantExitGuards(source, {parameters});
     if (!guards.guardsRemoved) break;
     source = guards.source;
+    changed = true;
+  }
+  // Finishing work belongs after a repeatable prefix when the only own break
+  // is the final bare exit. Move that same exit earlier; retain every backedge,
+  // nonlocal transfer, complete protected construct and declaration scope.
+  for (;;) {
+    const tails = foldTerminalLoopTails(source, {parameterNames});
+    if (!tails.tailsHoisted) break;
+    source = tails.source;
     changed = true;
   }
   if (changed) replaceArrayContents(body, source.split('\n'));
