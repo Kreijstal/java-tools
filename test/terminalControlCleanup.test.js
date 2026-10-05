@@ -6,7 +6,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const {spawnSync} = require('node:child_process');
-const {finalizeControlFrames: finish, finalizeTerminalSwitchFrames: finishSwitches} = require('../src/decompiler/javaAstEmitter');
+const {finalizeControlFrames: finish, finalizeTerminalSwitchFrames: finishSwitches,
+  foldRedundantExitGuards: foldGuards} = require('../src/decompiler/javaAstEmitter');
 
 test('late fallthrough exits lose their unused frame while guards and actions remain', () => {
   const source = 'while(true){Phase:{if(more()){step();if(flag==0)continue;}else{done();break Phase;}}tail();break;}after();';
@@ -152,5 +153,190 @@ test('terminal switch frames match independent native event and completion model
     };
     run('javac', ['--release', '8', '-d', temporary, file]);
     assert.equal(run('java', ['-cp', temporary, 'TerminalSwitchNative']), 'oracle-complete:49920:6');
+  } finally {fs.rmSync(temporary, {recursive: true, force: true});}
+});
+
+test('redundant primitive exit guards preserve snapshots and exact exit spelling', () => {
+  const cases = [
+    ['int flag=read();while(more()){if(flag==0)break;break;}after();', 'int flag=read();while(more()){break;}after();'],
+    ['int flag=read();Outer:while(more()){if(flag!=0)continue Outer;continue Outer;}after();', 'int flag=read();Outer:while(more()){continue Outer;}after();'],
+    ['int flag=read();Exit:{if(flag<0){{break Exit;}}else{{break Exit;}}}after();', 'int flag=read();Exit:{break Exit;}after();'],
+    ['int flag=read();if(flag>0){return;}else{return;}', 'int flag=read();return;'],
+    ['int flag=read();while(more()){if(flag==0)break;else ;break;}after();', 'int flag=read();while(more()){break;}after();'],
+    ['int flag=read();while(more()){if(flag==0){break;}else{}break;}after();', 'int flag=read();while(more()){break;}after();'],
+    ['int flag=read();while(more()){flag++;if(((flag*2+1)&3)!=0)continue;continue;}after();', 'int flag=read();while(more()){flag++;continue;}after();'],
+  ];
+  for (const [source, expected] of cases) {
+    const result = foldGuards(source);
+    assert.equal(result.guardsRemoved, 1, source); assert.equal(result.source, expected);
+    assert.deepEqual(foldGuards(expected), {source: expected, guardsRemoved: 0});
+  }
+});
+
+test('case fallthrough permits guard removal only at an immediate matching exit', () => {
+  const source = 'int flag=read();switch(key){case 0:work();if(flag==0){break;}case 1:default:break;}after();';
+  assert.equal(foldGuards(source).source, 'int flag=read();switch(key){case 0:work();case 1:default:break;}after();');
+  for (const body of [
+    'switch(key){case 0:if(flag==0)break;case 1:work();break;}',
+    'Outer:while(more()){switch(key){default:if(flag==0)break;break Outer;}}',
+    'Outer:while(more()){if(flag==0)continue Outer;break Outer;}',
+    'Outer:while(more()){if(flag==0)break Outer;break;}',
+    'Outer:while(more()){if(flag==0)continue Outer;continue;}',
+    'Outer:{Inner:{if(flag==0)break Inner;}break Outer;}',
+    'while(more()){if(flag==0){try{break;}finally{cleanup();}}break;}',
+  ]) {
+    const unchanged = 'int flag=read();' + body + 'after();';
+    assert.equal(foldGuards(unchanged).source, unchanged, body);
+  }
+});
+
+test('only explicitly scoped primitive operands admit effect-free guard evaluation', () => {
+  for (const [type, predicate] of [
+    ['boolean', 'flag'], ['byte', 'flag==0'], ['short', 'flag<0'], ['char', "flag=='x'"],
+    ['int', '((flag<<1)^~flag)!=0'], ['long', 'flag*0x7fffffffL!=0L'],
+    ['float', 'flag!=flag'], ['double', 'flag>=flag'],
+  ]) {
+    const source = `while(more()){if(${predicate})break;break;}after();`;
+    assert.equal(foldGuards(source, {parameters: [{name: 'flag', type}]}).guardsRemoved, 1, type);
+    assert.equal(foldGuards(source).source, source, 'unknown operands are not inferred');
+  }
+  for (const source of [
+    'Integer flag=read();while(more()){if(flag==0)break;break;}',
+    'Boolean flag=read();while(more()){if(flag)break;break;}',
+    'var flag=read();while(more()){if(flag==0)break;break;}',
+    'int flag[]=read();while(more()){if(flag[0]==0)break;break;}',
+    '{int flag=read();}while(more()){if(flag==0)break;break;}',
+    'while(more()){if(flag==0)break;break;}int flag=read();',
+    '{int flag=read();}int flag=read();while(more()){if(flag==0)break;break;}',
+  ]) assert.equal(foldGuards(source).source, source, source);
+  const collision = 'int flag=read();while(more()){if(flag==0)break;break;}';
+  assert.equal(foldGuards(collision, {parameters: [{name: 'flag', type: 'int'}]}).source, collision);
+});
+
+test('calls, fields, arrays, unboxing and failing or mutating expressions remain', () => {
+  for (const predicate of [
+    'test()', 'state.flag==0', 'flag==0', 'array[0]==0', '(Integer)value==0',
+    'boxed==0', 'flag/other==0', 'flag%other==0', 'flag++==0', '++flag==0',
+    '(flag=other)==0', 'flag==0&&test()', 'test()||flag==0',
+    'flag==0?true:test()', '"text"==value', '(int)value==0',
+  ]) {
+    const declarations = predicate === 'flag==0' ? '' : 'int flag=read(),other=read();';
+    const source = `${declarations}while(more()){if(${predicate})break;break;}after();`;
+    assert.equal(foldGuards(source, {parameters: [{name: 'boxed', type: 'Integer'}, {name: 'value', type: 'Object'}]}).source, source, predicate);
+  }
+});
+
+test('guard diagnostics account for every deleted character and fixed point step', () => {
+  let source = 'int flag=read();\nExit:{\n    if(flag==0){break Exit;}\n    if(flag!=0){break Exit;}\n    break Exit;\n}\nafter();';
+  let removed = 0;
+  for (;;) {
+    const result = foldGuards(source, {retainDiagnostics: true});
+    if (!result.guardsRemoved) break;
+    let reconstructed = source;
+    for (const {start, end} of result.diagnostics.deletedRanges.slice().reverse()) {
+      assert.ok(start >= 0 && end > start && end <= source.length);
+      reconstructed = reconstructed.slice(0, start) + reconstructed.slice(end);
+    }
+    assert.equal(reconstructed, result.source);
+    assert.equal(result.diagnostics.removedGuards.length, result.guardsRemoved);
+    for (const guard of result.diagnostics.removedGuards) {
+      assert.equal(source.slice(guard.start, guard.start + 2), 'if');
+      assert.match(source.slice(guard.conditionStart, guard.conditionEnd), /^flag[!=]=0$/);
+      assert.equal(guard.exitKind, 'BreakStatement'); assert.equal(guard.exitLabel, 'Exit');
+    }
+    removed += result.guardsRemoved; source = result.source;
+  }
+  assert.equal(removed, 2); assert.equal(source, 'int flag=read();\nExit:{\n    break Exit;\n}\nafter();');
+  const both = foldGuards('int flag=read();Exit:{if(flag==0){break Exit;}else{break Exit;}}', {retainDiagnostics: true});
+  assert.equal(both.diagnostics.deletedRanges.length, 2); assert.equal(both.diagnostics.removedGuards[0].bothArms, true);
+});
+
+test('uncertain syntax, nested execution and invalid options refuse guard cleanup', () => {
+  for (const source of [
+    'int flag=read();while(more()){42;if(flag==0)break;break;}',
+    'int flag=read();while(more()){work() if(flag==0)break;break;}',
+    'int flag=read();while(more()){if(flag==0)break Missing;break Missing;}',
+    'int flag=read();Exit:{if(flag==0)break Exit;break Exit;}Exit:{}',
+    'int flag=read();while(more()){if(flag==0)break;break;} // diagnostic\n',
+    'int flag=read();while(more()){if(flag==0)break;break;}\\u000a',
+    'int flag=read();class Inner{void run(){}}while(more()){if(flag==0)break;break;}',
+    'int flag=read();Runnable task=()->work();while(more()){if(flag==0)break;break;}',
+    'int flag=read();switch(key){case 0 -> {if(flag==0)break;break;}}',
+    'int flag=read();while(more()){if(flag==0)break;break;}' + ' '.repeat(400001),
+  ]) assert.equal(foldGuards(source).source, source, source.slice(0, 100));
+  const source = 'while(more()){if(flag==0)break;break;}';
+  for (const parameters of [null, {}, [null], [{name: 'flag', type: 0}], [{name: 'bad name', type: 'int'}],
+    [{name: 'flag', type: 'int'}, {name: 'flag', type: 'int'}]]) assert.equal(foldGuards(source, {parameters}).source, source);
+  assert.equal(foldGuards(source, {retainDiagnostics: 1}).source, source);
+});
+
+test('redundant guards match independent native completion and event models', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'redundant-guard-native-'));
+  const variants = [
+    "int saved=capture(c,flag,fail);switch(mode){case 0:emit(c,'a',fail);if(saved==0)break;case 1:break;default:emit(c,'d',fail);break;}emit(c,'q',fail);",
+    "int saved=capture(c,flag,fail);Exit:{emit(c,'a',fail);if(saved<0){{break Exit;}}else{{break Exit;}}}emit(c,'q',fail);",
+    "int saved=capture(c,flag,fail);for(int i=0;i<3;i++){emit(c,'a',fail);saved++;if(((saved*31)^flag)!=0)continue;continue;}emit(c,'q',fail);",
+    "int saved=capture(c,flag,fail);while(true){emit(c,'a',fail);if(saved==0)break;break;}emit(c,'q',fail);",
+    "try{emit(c,'a',fail);return;}finally{emit(c,'f',fail);if(flag!=0)return;return;}",
+    "Exit:{try{emit(c,'a',fail);throw new IllegalArgumentException(\"body\");}finally{synchronized(c.lock){emit(c,'f',fail);if(flag==0){break Exit;}break Exit;}}}emit(c,'q',fail);",
+    "if((value!=value || value<flag) && flag>=0)return;return;",
+    "Exit:{emit(c,'a',fail);if(test(c,flag,fail))break Exit;break Exit;}emit(c,'q',fail);",
+    "Exit:{emit(c,'a',fail);if(flag/divisor==0)break Exit;break Exit;}emit(c,'q',fail);",
+    "Exit:{emit(c,'a',fail);if(boxed==0)break Exit;break Exit;}emit(c,'q',fail);",
+  ];
+  const models = [
+    "capture(c,flag,fail);if(mode==0)emit(c,'a',fail);else if(mode!=1)emit(c,'d',fail);emit(c,'q',fail);",
+    "capture(c,flag,fail);emit(c,'a',fail);emit(c,'q',fail);",
+    "capture(c,flag,fail);emit(c,'a',fail);emit(c,'a',fail);emit(c,'a',fail);emit(c,'q',fail);",
+    "capture(c,flag,fail);emit(c,'a',fail);emit(c,'q',fail);",
+    "try{emit(c,'a',fail);}finally{emit(c,'f',fail);return;}",
+    "try{emit(c,'a',fail);}catch(RuntimeException ignored){}synchronized(c.lock){emit(c,'f',fail);}emit(c,'q',fail);",
+    "return;",
+    "emit(c,'a',fail);test(c,flag,fail);emit(c,'q',fail);",
+    "emit(c,'a',fail);int ignored=flag/divisor;emit(c,'q',fail);",
+    "emit(c,'a',fail);int ignored=boxed.intValue();emit(c,'q',fail);",
+  ];
+  const parameters = [{name: 'flag', type: 'int'}, {name: 'mode', type: 'int'}, {name: 'fail', type: 'int'},
+    {name: 'value', type: 'double'}, {name: 'boxed', type: 'Integer'}, {name: 'divisor', type: 'int'}];
+  try {
+    const rewritten = variants.map(source => foldGuards(source, {parameters}));
+    assert.deepEqual(rewritten.map(result => result.guardsRemoved), [1, 1, 1, 1, 1, 1, 1, 0, 0, 0]);
+    const signature = '(Ctx c,int flag,int mode,int fail,double value,Integer boxed,int divisor)';
+    const methods = variants.flatMap((source, index) => [
+      `static void original${index}${signature}{${source}}`,
+      `static void rewritten${index}${signature}{${rewritten[index].source}}`,
+      `static void model${index}${signature}{${models[index]}}`,
+    ]).join('\n');
+    const file = path.join(temporary, 'RedundantGuardNative.java');
+    fs.writeFileSync(file, `public final class RedundantGuardNative {
+      static final class Ctx {int count,hash;final Object lock=new Object();final StringBuilder trace=new StringBuilder();Ctx(int seed){hash=seed;}}
+      interface Eval {void run(Ctx c,int flag,int mode,int fail,double value,Integer boxed,int divisor);}
+      static void emit(Ctx c,char event,int fail){c.count++;c.hash=c.hash*31+event;c.trace.append(event).append(Thread.holdsLock(c.lock)?'L':'_');if(c.count==fail)throw new IllegalStateException("event"+c.count);}
+      static int capture(Ctx c,int flag,int fail){emit(c,'s',fail);return flag;}
+      static boolean test(Ctx c,int flag,int fail){emit(c,'t',fail);return flag==0;}
+      static String invoke(Eval eval,int flag,int mode,int fail,double value,Integer boxed,int divisor,int seed){Ctx c=new Ctx(seed);String result="return:void";try{eval.run(c,flag,mode,fail,value,boxed,divisor);}catch(RuntimeException failure){result=failure.getClass().getName()+":"+failure.getMessage();}if(Thread.holdsLock(c.lock))throw new AssertionError("monitor leaked");return result+":"+c.count+":"+c.hash+":"+c.trace;}
+      ${methods}
+      public static void main(String[] args){
+        Eval[] original={${variants.map((_, index) => 'RedundantGuardNative::original' + index).join(',')}};
+        Eval[] rewritten={${variants.map((_, index) => 'RedundantGuardNative::rewritten' + index).join(',')}};
+        Eval[] model={${variants.map((_, index) => 'RedundantGuardNative::model' + index).join(',')}};
+        int cases=0;
+        for(int variant=0;variant<original.length;variant++)for(int flag:new int[]{-2,0,1,Integer.MIN_VALUE,Integer.MAX_VALUE})for(int mode=0;mode<4;mode++)for(int fail=0;fail<5;fail++)for(double value:new double[]{Double.NEGATIVE_INFINITY,-0.0,0.0,Double.NaN,Double.POSITIVE_INFINITY,Double.MIN_VALUE,Double.MAX_VALUE,1.0})for(Integer boxed:new Integer[]{null,0,1})for(int divisor:new int[]{-1,0,1,Integer.MAX_VALUE})for(int seed:new int[]{0,Integer.MAX_VALUE}){
+          String expected=invoke(model[variant],flag,mode,fail,value,boxed,divisor,seed),before=invoke(original[variant],flag,mode,fail,value,boxed,divisor,seed),after=invoke(rewritten[variant],flag,mode,fail,value,boxed,divisor,seed);
+          if(!expected.equals(before)||!expected.equals(after))throw new AssertionError(variant+":"+flag+":"+mode+":"+fail+":"+value+":"+boxed+":"+divisor+":"+seed+" expected="+expected+" before="+before+" after="+after);
+          cases++;
+        }
+        System.out.println("oracle-complete:"+cases+":"+original.length);
+      }
+    }`);
+    const run = (command, args) => {
+      const result = spawnSync(command, args, {encoding: 'utf8'});
+      assert.equal(result.status, 0, result.stderr || result.error?.message);
+      return result.stdout.trim();
+    };
+    run('javac', ['--release', '8', '-d', temporary, file]);
+    // Repeated implicit divide/unboxing failures otherwise acquire null
+    // messages at different JIT warmup counts in the three independent methods.
+    assert.equal(run('java', ['-XX:-OmitStackTraceInFastThrow', '-cp', temporary, 'RedundantGuardNative']), 'oracle-complete:192000:10');
   } finally {fs.rmSync(temporary, {recursive: true, force: true});}
 });

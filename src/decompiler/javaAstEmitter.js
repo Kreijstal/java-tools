@@ -13,6 +13,7 @@ const { recoverScalarIfDispatches: recoverIfDispatch } = require('./scalarIfDisp
 const { simplifyPredicateNegations: simplifyNegations } = require('./predicateNegationRecovery');
 const { specializePathGuards: specializeGuards } = require('./pathGuardRecovery');
 const { simplifyDominatedPredicates: simplifyDominated } = require('./dominatedPredicateRecovery');
+const { foldRedundantExitGuards: recoverRedundantExitGuards } = require('./redundantExitGuardRecovery');
 const { recoverArrayIndexIncrements: recoverIndexIncrements } = require('./incrementCaptureRecovery');
 const { foldGuardedAbruptPlainBlockExits: recoverGuardedAbruptExit } = require('./guardedAbruptExitRecovery');
 const { foldGuardedLoopContinuations: recoverLoopContinuation, foldNonrepeatingWhileLoops: recoverNonrepeatingLoops,
@@ -663,6 +664,10 @@ function simplifyPredicateNegations(source, options = {}) {
 
 function simplifyDominatedPredicates(source, options = {}) {
   return simplifyDominated(source, controlCleanupSource(source), options);
+}
+
+function foldRedundantExitGuards(source, options = {}) {
+  return recoverRedundantExitGuards(source, controlCleanupSource(source), options);
 }
 
 function specializePathGuards(source, options = {}) {
@@ -3199,6 +3204,7 @@ module.exports = {
   simplifyDominatedPredicates,
   finalizeControlFrames,
   finalizeTerminalSwitchFrames,
+  foldRedundantExitGuards,
   recoverArrayIndexIncrements,
   recoverPostGuardExits,
   foldLabeledBooleanDecisions,

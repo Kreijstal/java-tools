@@ -1,7 +1,7 @@
 'use strict';
 
 const {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits, foldNonlocalLoopExits, foldLoopElseExitGuards} = require('./javaAstEmitter');
-const {recoverScalarIfDispatches, simplifyPredicateNegations, simplifyDominatedPredicates, finalizeControlFrames, finalizeTerminalSwitchFrames} = require('./javaAstEmitter');
+const {recoverScalarIfDispatches, simplifyPredicateNegations, simplifyDominatedPredicates, finalizeControlFrames, finalizeTerminalSwitchFrames, foldRedundantExitGuards} = require('./javaAstEmitter');
 
 const fs = require('fs');
 const path = require('path');
@@ -2027,6 +2027,14 @@ function shareExistingExitTails(body, parameterNames = [], parameters = []) {
   const switchFrames = finalizeTerminalSwitchFrames(source);
   if (switchFrames.breaksLocalized) {
     source = switchFrames.source;
+    changed = true;
+  }
+  // Localized exits can expose a pure guard whose outcomes share the exact
+  // same lexical transfer. Preserve its captured declaration and initializer.
+  for (;;) {
+    const guards = foldRedundantExitGuards(source, {parameters});
+    if (!guards.guardsRemoved) break;
+    source = guards.source;
     changed = true;
   }
   if (changed) replaceArrayContents(body, source.split('\n'));

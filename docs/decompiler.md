@@ -56,6 +56,39 @@ corpus, including retired labels and resulting lexical-label ordinal migrations.
 
 ## Why our own decompiler?
 
+### Effect-free guards with identical exits
+
+The final cleanup also removes a guard such as `if (flag == 0) break; break;`
+when both exits have the same kind, spelling and resolved lexical destination.
+Matching exits in both arms are reduced to the original first exit. Colon-case
+fallthrough is eligible only when its next statement is the matching exit;
+work in the next case prevents removal. No loop, case, action or protected
+region moves. A return is eligible only when it has no value.
+
+`redundantExitGuardRecovery.js` proves that guard evaluation consists solely of
+explicitly scoped primitive local/parameter reads, literals and supported
+effect-free operators. It makes no assumptions about captured values, including
+negative/nonzero flags, NaNs or signed zero. Declarations, initializers and
+mutations elsewhere stay intact. Fields, calls, arrays, casts, unboxing,
+allocation, assignments, increments, division and remainder refuse recovery.
+Unknown types, shadowed bindings, ambiguous syntax and nested execution also
+refuse. Optional diagnostics enumerate character deletions without retaining
+the proof tree.
+
+Seven new focused groups include ten independent native completion/event
+models covering 192,000 cases: capture callbacks and injected failures,
+case fallthrough, cyclic mutation/overflow, finally overrides, monitor ownership,
+floating values, nullable unboxing and division failures. Run:
+
+```sh
+JAVA_TOOL_OPTIONS=-XX:-UsePerfData NODE_PATH=/home/kreijstal/git/java-tools/node_modules node --test test/terminalControlCleanup.test.js test/javaAstEmitterLoopExits.test.js test/javaAstEmitterTrailingLoops.test.js test/cfrBranchMergeRegressions.test.js
+```
+
+Result: 106 passing tests and one existing optional corpus skip. This is generic
+Java reconstruction; publication still requires independent complete-corpus
+type/binding/destination and source-byte proofs. Catalog-wide effects are not
+yet verified.
+
 The immediate motivation was a gamepack-deobfuscation pipeline where the final
 quality gate is "does CFR decompile every method without a `** GOTO` /
 `Unable to fully structure code` marker?" After a long campaign of
