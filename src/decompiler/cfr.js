@@ -3,6 +3,7 @@
 const {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits, foldNonlocalLoopExits, foldLoopElseExitGuards, foldTerminalLoopTails} = require('./javaAstEmitter');
 const {recoverScalarIfDispatches, simplifyPredicateNegations, simplifyDominatedPredicates, finalizeControlFrames, finalizeTerminalSwitchFrames, foldRedundantExitGuards} = require('./javaAstEmitter');
 const {simplifyPredicateGrouping} = require('./javaAstEmitter');
+const {foldScalarSwitchPrefixes} = require('./javaAstEmitter');
 
 const fs = require('fs');
 const path = require('path');
@@ -2102,6 +2103,14 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
     const dispatch = recoverScalarIfDispatches(source, {nestedRegions: true});
     if (!dispatch.dispatchesRecovered) break;
     source = dispatch.source;
+    changed = true;
+  }
+  // Join terminating cases before an existing primitive-local switch. The
+  // original switch body and targets remain intact; no action is duplicated.
+  for (;;) {
+    const prefixes = foldScalarSwitchPrefixes(source);
+    if (!prefixes.switchesExtended) break;
+    source = prefixes.source;
     changed = true;
   }
   if (changed) replaceArrayContents(body, source.split('\n'));

@@ -660,6 +660,12 @@ function recoverScalarIfDispatches(source, options = {}) {
   return recoverIfDispatch(source, controlCleanupSource(source), options);
 }
 
+function foldScalarSwitchPrefixes(source, options = {}) {
+  const result = recoverIfDispatch(source, controlCleanupSource(source), {...options, switchPrefixes: true});
+  return {source: result.source, switchesExtended: result.dispatchesRecovered, comparisonsRemoved: result.comparisonsRemoved || 0,
+    blocksUnwrapped: result.blocksUnwrapped || 0, ...(result.diagnostics ? {diagnostics: result.diagnostics} : {})};
+}
+
 function simplifyPredicateNegations(source, options = {}) {
   return simplifyNegations(source, controlCleanupSource(source), options);
 }
@@ -3210,6 +3216,7 @@ module.exports = {
   simplifyIdentityReferenceCasts,
   recoverScalarLabelDispatches,
   recoverScalarIfDispatches,
+  foldScalarSwitchPrefixes,
   simplifyPredicateNegations,
   simplifyPredicateGrouping,
   specializePathGuards,

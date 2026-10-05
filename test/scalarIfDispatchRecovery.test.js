@@ -2,7 +2,8 @@
 const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), path = require('node:path'), os = require('node:os');
 const {spawnSync} = require('node:child_process');
-const {recoverScalarIfDispatches: recover} = require('../src/decompiler/javaAstEmitter');
+const {recoverScalarIfDispatches: recover, foldScalarSwitchPrefixes: foldPrefixes} = require('../src/decompiler/javaAstEmitter');
+const {tokenizeJava} = require('../src/java-frontend/lexer');
 
 function ladder(action) {
   return 'if(selected!=0){if(selected!=1){if(selected!=2){if(selected==3){' + action(3) + '}'
@@ -10,6 +11,96 @@ function ladder(action) {
     + 'if(selected!=7){break Section;}' + action(7) + '}' + action(5) + '}' + action(4) + '}'
     + action(2) + '}' + action(1) + '}' + action(0);
 }
+
+test('terminating equality prefixes join an existing captured-int switch without changing its tail', () => {
+  const source='int selected=prepare();Tag:{if(selected==-2147483648){first();break Tag;}if(!(selected!=2147483647)){second();return done();}switch(((selected))){case 1:step();break;default:fallback();}}after();';
+  const result=foldPrefixes(source,{retainDiagnostics:true});assert.equal(result.switchesExtended,1);assert.equal(result.comparisonsRemoved,2);assert.equal(result.blocksUnwrapped,2);
+  assert.match(result.source,/switch\(\(\(selected\)\)\)/);assert.match(result.source,/case -2147483648:/);assert.match(result.source,/case 2147483647:/);
+  assert.ok(result.source.includes('case 1:step();break;default:fallback();'));assert.equal(foldPrefixes(result.source).switchesExtended,0);
+});
+
+test('prefix declaration blocks remain scoped while empty declaration scopes can be flattened', () => {
+  const source='int selected=prepare();Tag:{if(selected==0){int value=selected;use(value);break Tag;}if(selected==1){try{hit();}finally{finish();}break Tag;}switch(selected){case 2:int value=7;use(value);break;default:miss();}}';
+  const result=foldPrefixes(source);assert.equal(result.switchesExtended,1);assert.equal(result.blocksUnwrapped,1);
+  assert.match(result.source,/case 0: \{int value=selected;use\(value\);break Tag;\}/);assert.match(result.source,/case 2:int value=7;/);
+});
+
+test('prefix diagnostics preserve the existing header, every action and the complete old switch body', () => {
+  const source='int selected=prepare();Tag:{before();if(selected==0){hit();break Tag;}switch(selected){case 2:tail();break;default:miss();}after();}';
+  const result=foldPrefixes(source,{retainDiagnostics:true}),d=result.diagnostics;
+  const lexical=s=>tokenizeJava(s).tokens.filter(t=>!['whitespace','eof'].includes(t.kind)).map(t=>t.text);
+  const copy=range=>lexical(source.slice(range.start,range.end));
+  const expected=[...lexical(source.slice(0,d.regionRange.start)),...copy(d.headerRange),...d.actions.flatMap(action=>[...lexical('case '+action.cases[0]+':'),...copy(action.range)]),...copy(d.tailRange),...lexical(source.slice(d.regionRange.end))];
+  assert.deepEqual(lexical(result.source),expected);assert.equal(source.slice(d.selectorOrigin,d.selectorOrigin+d.selector.length),d.selector);
+});
+
+test('overlapping, effectful, mutable, boxed, incomplete or retargeted switch prefixes refuse', () => {
+  const good='int selected=prepare();Tag:{if(selected==0){hit();break Tag;}switch(selected){case 2:tail();break;default:miss();}}';
+  for(const source of [good.replace('case 2:','case 0:'),good.replace('case 2:','case 0x2:'),good.replace('case 2:',"case 'A':"),
+    good.replace('break Tag;','finish();'),good.replace('hit();','selected++;hit();'),good.replace('hit();','selected+=1;hit();'),
+    good.replace('hit();','try{hit();}finally{selected=2;}'),good.replace('int selected=','Integer selected='),
+    good.replace('selected==0','read()==0'),good.replace('selected==0','selected!=0'),good.replace('break Tag;','break;'),
+    good.replace('hit();','{int selected=0;hit();}'),good.replace('switch(selected)','switch(read())'),
+    good.replace('break Tag;','break Missing;'),good+' // comment\n',good+'\\u000a',good+'Runnable r=()->hit();'])assert.equal(foldPrefixes(source).source,source);
+  assert.equal(foldPrefixes(good,{retainDiagnostics:'yes'}).source,good);
+});
+
+test('switch-prefix region, case-count and source budgets retain the complete original', () => {
+  const body=n=>Array.from({length:n},(_,i)=>`if(selected==${i}){hit();break Tag;}`).join('');
+  const many='int selected=prepare();Tag:{'+body(33)+'switch(selected){default:miss();}}';assert.equal(foldPrefixes(many).source,many);
+  const cases='int selected=prepare();Tag:{if(selected==-1){hit();break Tag;}switch(selected){'+Array.from({length:65},(_,i)=>`case ${i}:hit();break;`).join('')+'}}';assert.equal(foldPrefixes(cases).source,cases);
+  const large='int selected=prepare();Tag:{if(selected==0){hit();break Tag;}switch(selected){default:hit("'+'x'.repeat(40001)+'");}}';assert.equal(foldPrefixes(large).source,large);
+  const huge='int selected=prepare();Tag:{if(selected==0){hit();break Tag;}switch(selected){default:miss();}}'+' '.repeat(400001);assert.equal(foldPrefixes(huge).source,huge);
+});
+
+test('native switch prefixes match independent selector, action and protected completion models', () => {
+  const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'switch-prefix-native-'));
+  const run=(command,args)=>{const r=spawnSync(command,args,{encoding:'utf8',maxBuffer:1024*1024});assert.equal(r.status,0,r.stderr||r.stdout);return r.stdout;};
+  let methods='';
+  for(let v=0;v<6;v++){
+    const action=stage=>{
+      let body=`emit(${stage},mode);if(mode==6)continue Outer;if(mode==7)return done();if(flag!=0&&escape(${stage},mode))return done();break Tag;`;
+      if(v===2||v===5)body=`synchronized(lock){emit(-7,mode);${body}}`;
+      if(v===3)body=`try{${body}}catch(Specific failure){emit(-8,mode);break Tag;}`;
+      if(v===1||v===3||v===5)body=`try{${body}}finally{emit(${stage}+20,mode);if(mode==10)continue Outer;if(mode==11)return done();if(mode==12)throw FAILURE;}`;
+      if(v===4)body=`int copy=selected;emit(copy==selected?-9:-10,mode);${body}`;
+      return body;
+    };
+    const source=`int selected=input;Outer:for(int round=0;round<2;round++){Tag:{if(selected==Integer.MIN_VALUE){${action(1)}}if(!(selected!=0)){${action(2)}}if(selected==Integer.MAX_VALUE){${action(3)}}switch(selected){case 1:emit(4,mode);if(mode==15)selected=0;if(flag!=0)break;case 2:emit(5,mode);break;default:emit(6,mode);}emit(7,mode);}emit(8,mode);}return done();`
+      .replace('selected==Integer.MIN_VALUE','selected==-2147483648').replace('selected==Integer.MAX_VALUE','selected==2147483647');
+    const next=foldPrefixes(source);assert.equal(next.switchesExtended,1,'variant '+v);assert.equal(next.comparisonsRemoved,3);assert.equal(foldPrefixes(next.source).switchesExtended,0);
+    for(const[name,body]of Object.entries({old:source,next:next.source}))methods+=`static String ${name}${v}(int input,int flag,int mode,Object lock){${body}}\n`;
+  }
+  const fixture=`public class PrefixNative {
+    static class Specific extends RuntimeException{}static final Specific FAILURE=new Specific();static int effects;static StringBuilder trace;
+    static void emit(int stage,int mode){trace.append(stage).append(',');effects=Integer.rotateLeft(effects^((stage+17)*0x9e3779b9),stage&31);if(stage==mode)throw FAILURE;}
+    static Boolean escape(int stage,int mode){trace.append('g').append(stage).append(',');if(mode==8&&stage==2)return null;return mode==9;}
+    static String done(){return effects+":"+trace;}
+    ${methods}
+    // Classification and pending completion are modeled directly, separately
+    // from both the parsed prefix and the generated switch.
+    static String oracle(int variant,int input,int flag,int mode,Object lock){int selected=input;
+      for(int round=0;round<2;round++){int stage=selected==Integer.MIN_VALUE?1:selected==0?2:selected==Integer.MAX_VALUE?3:0;boolean nextRound=false;String pending=null;Throwable failure=null;
+        if(stage!=0){
+          if(variant==4)emit(-9,mode);
+          if((variant==2||variant==5)&&lock==null)failure=new NullPointerException();else{
+            if(variant==2||variant==5)emit(-7,mode);
+            try{emit(stage,mode);if(mode==6)nextRound=true;else if(mode==7)pending=done();else if(flag!=0&&escape(stage,mode))pending=done();}catch(Throwable caught){failure=caught;}
+          }
+          if(variant==3&&failure==FAILURE){emit(-8,mode);failure=null;}
+          if(variant==1||variant==3||variant==5){emit(stage+20,mode);if(mode==10){nextRound=true;pending=null;failure=null;}else if(mode==11){nextRound=false;failure=null;pending=done();}else if(mode==12){nextRound=false;pending=null;failure=FAILURE;}}
+          if(failure!=null){if(failure==FAILURE)throw FAILURE;throw new NullPointerException();}if(pending!=null)return pending;if(nextRound)continue;
+        }else{
+          if(selected==1){emit(4,mode);if(mode==15)selected=0;if(flag==0)emit(5,mode);}else emit(selected==2?5:6,mode);emit(7,mode);
+        }emit(8,mode);
+      }return done();
+    }
+    static String invoke(int kind,int variant,int input,int flag,int mode,Object lock,int seed){effects=seed;trace=new StringBuilder();String result;try{if(kind==2)result=oracle(variant,input,flag,mode,lock);else switch(variant){${Array.from({length:6},(_,i)=>`case ${i}:result=kind==0?old${i}(input,flag,mode,lock):next${i}(input,flag,mode,lock);break;`).join('')}default:throw new AssertionError();}}catch(Throwable failure){if(failure==FAILURE)result="injected";else if(failure instanceof NullPointerException)result="null";else throw new AssertionError(failure);}if(lock!=null&&Thread.holdsLock(lock))throw new AssertionError("monitor leaked");return result+"|"+effects+"|"+trace;}
+    public static void main(String[]args){int cases=0;Object monitor=new Object();for(int variant=0;variant<6;variant++)for(int input:new int[]{Integer.MIN_VALUE,-1,0,1,2,3,9,Integer.MAX_VALUE})for(int flag:new int[]{-1,0,1})for(int mode=0;mode<16;mode++)for(Object lock:new Object[]{null,monitor})for(int seed:new int[]{Integer.MIN_VALUE,0,Integer.MAX_VALUE}){String expected=invoke(2,variant,input,flag,mode,lock,seed);for(int kind=0;kind<2;kind++){String actual=invoke(kind,variant,input,flag,mode,lock,seed);if(!actual.equals(expected))throw new AssertionError(variant+":"+input+":"+flag+":"+mode+":"+seed+":"+actual+" != "+expected);}cases++;}System.out.println(cases+" independent switch prefix cases");}
+  }`;
+  try{const file=path.join(temporary,'PrefixNative.java');fs.writeFileSync(file,fixture);run('javac',['--release','8','-d',temporary,file]);assert.equal(run('java',['-XX:-OmitStackTraceInFastThrow','-Xmx128m','-cp',temporary,'PrefixNative']).trim(),'13824 independent switch prefix cases');}
+  finally{fs.rmSync(temporary,{recursive:true,force:true});}
+});
 
 test('captured integer ladders become ordered switches with guarded fallthrough and intact prefix', () => {
   const body = ladder(k => 'step(' + k + ');if(flag==0)break Section;');

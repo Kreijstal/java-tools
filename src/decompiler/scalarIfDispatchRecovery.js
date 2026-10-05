@@ -4,9 +4,9 @@
 // Keep all effectful actions and flag guards, in their original lexical order.
 // Accept only paths that are contiguous runs or leave the existing plain label;
 // never duplicate a shared action or assume another guard's value.
-function recoverScalarIfDispatches(source, proof, {retainDiagnostics = false, nestedRegions = false} = {}) {
+function recoverScalarIfDispatches(source, proof, {retainDiagnostics = false, nestedRegions = false, switchPrefixes = false} = {}) {
   const unchanged = () => ({source, dispatchesRecovered: 0});
-  if (!proof || typeof retainDiagnostics !== 'boolean' || typeof nestedRegions !== 'boolean'
+  if (!proof || typeof retainDiagnostics !== 'boolean' || typeof nestedRegions !== 'boolean' || typeof switchPrefixes !== 'boolean'
       || source.length > 400000) return unchanged();
   const {wrapped, parsed, tokens, starts, closes, children, labelCounts} = proof;
   const loops = new Set(['WhileStatement', 'ForStatement', 'DoWhileStatement', 'EnhancedForStatement']);
@@ -116,6 +116,81 @@ function recoverScalarIfDispatches(source, proof, {retainDiagnostics = false, ne
     const number = sign * Number(value.raw);
     if (number < -2147483648 || number > 2147483647) return null;
     return {name: id.name, value: number, equal: (node.operator === '==') !== negate, identifier: id};
+  }
+  if (switchPrefixes) {
+    let chosen;
+    walk(parsed, block => {
+      if (chosen || block.kind !== 'BlockStatement') return;
+      for (let index = 1; index < block.statements.length; index++) {
+        const node = block.statements[index];
+        if (node.kind !== 'SwitchStatement') continue;
+        const selector = strip(node.expression), local = locals.get(selector?.name);
+        const first = starts.get(node.range?.startOffset), headerEnd = closes.get(first + 1), open = headerEnd + 1, close = closes.get(open);
+        if (selector?.kind !== 'Identifier' || names.get(selector.name) !== 1 || !local
+            || tokens[first]?.text !== 'switch' || tokens[open]?.text !== '{' || tokens[close]?.text !== '}'
+            || tokens[close].range.endOffset > local.end) continue;
+        const values = new Set(); let uncertain = false, defaults = 0;
+        for (const group of node.groups || []) for (const label of group.labels || []) {
+          if (label.separator !== ':') uncertain = true;
+          if (label.labelKind === 'default') { if (++defaults > 1) uncertain = true; continue; }
+          const value = comparison({kind:'BinaryExpression',operator:'==',left:selector,right:label.expression});
+          if (!value || values.has(value.value)) uncertain = true; else values.add(value.value);
+        }
+        if (uncertain || values.size > 64) continue;
+        const arms = [];let begin = index;
+        while (begin > 0) {
+          const branch = block.statements[begin - 1], test = branch.kind === 'IfStatement' && comparison(branch.condition);
+          if (!test?.equal || test.name !== selector.name || branch.alternate || branch.consequent?.kind !== 'BlockStatement') break;
+          if (values.has(test.value)) { uncertain = true; break; }
+          let unsafe = false;
+          walk(branch.consequent, child => {
+            // A bare break outside an inner frame would now exit the switch.
+            // Keep the conservative refusal even for inner bare breaks here.
+            if (child.kind === 'BreakStatement' && !child.label) unsafe = true;
+            const operand = strip(child.kind === 'AssignmentExpression' ? child.left
+              : child.kind === 'UnaryExpression' && ['++','--'].includes(child.operator) ? child.expression || child.operand : null);
+            if (operand?.kind === 'Identifier' && operand.name === selector.name) unsafe = true;
+          });
+          if (unsafe || normal(branch.consequent) || invalid) { uncertain = true; break; }
+          const start = starts.get(branch.range.startOffset), end = closes.get(start + 1);
+          const body = starts.get(branch.consequent.range.startOffset), bodyEnd = closes.get(body);
+          if (tokens[start]?.text !== 'if' || tokens[body]?.text !== '{' || tokens[bodyEnd]?.text !== '}'
+              || body !== end + 1 || tokens[start].range.startOffset < local.start) { uncertain = true; break; }
+          const scoped = branch.consequent.statements.some(statement => statement.kind === 'LocalVariableDeclarationStatement');
+          arms.unshift({value:test.value,condition:{start:tokens[start+1].range.endOffset-2,end:tokens[end].range.startOffset-2},
+            range:{start:tokens[scoped?body:body+1].range.startOffset-2,end:tokens[scoped?bodyEnd:bodyEnd-1].range.endOffset-2},
+            scoped, first: scoped ? body : body+1});
+          values.add(test.value);begin--;
+          if (arms.length > 32 || values.size > 64) { uncertain=true;break; }
+        }
+        if (uncertain || !arms.length || invalid) continue;
+        const start = starts.get(block.statements[begin].range.startOffset);
+        if (tokens[close].range.endOffset - tokens[start].range.startOffset > 40000) continue;
+        const identifiers = tokens.slice(first+2,headerEnd).filter(token => token.kind==='identifier' && token.text===selector.name);
+        if (identifiers.length!==1) continue;
+        chosen={arms,start,first,open,close,selector:selector.name,selectorOrigin:identifiers[0].range.startOffset-2};break;
+      }
+    });
+    if (!chosen || invalid) return unchanged();
+    const {arms,start,first,open,close,selector,selectorOrigin}=chosen;
+    const line = wrapped.slice(wrapped.lastIndexOf('\n',tokens[start].range.startOffset-1)+1,tokens[start].range.startOffset);
+    const indent = (line.match(/^[ \t]*/)||[''])[0];
+    const header = wrapped.slice(tokens[first].range.startOffset,tokens[open].range.endOffset),chunks=[header];
+    for(const arm of arms){
+      const bytes=source.slice(arm.range.start,arm.range.end);
+      const oldIndent=wrapped.slice(wrapped.lastIndexOf('\n',tokens[arm.first].range.startOffset-1)+1,tokens[arm.first].range.startOffset);
+      const body=bytes.split('\n').map((line,index)=>index && /^[ \t]*$/.test(oldIndent) && line.startsWith(oldIndent)?indent+'    '+line.slice(oldIndent.length):line).join('\n');
+      chunks.push(indent+'  case '+arm.value+':'+(arm.scoped?' '+body:'\n'+indent+'    '+body));
+    }
+    const tail=wrapped.slice(tokens[open].range.endOffset,tokens[close].range.startOffset);
+    const oldSwitchIndent=wrapped.slice(wrapped.lastIndexOf('\n',tokens[first].range.startOffset-1)+1,tokens[first].range.startOffset);
+    chunks.push(tail.split('\n').map((line,index)=>index && /^[ \t]*$/.test(oldSwitchIndent) && line.startsWith(oldSwitchIndent)?indent+line.slice(oldSwitchIndent.length):line).join('\n').replace(/^[ \t]*\r?\n/,'').trimEnd(),indent+'}');
+    const output=wrapped.slice(0,tokens[start].range.startOffset)+chunks.join('\n')+wrapped.slice(tokens[close].range.endOffset);
+    return {source:output.slice(2,-2),dispatchesRecovered:1,comparisonsRemoved:arms.length,blocksUnwrapped:arms.filter(arm=>!arm.scoped).length,
+      ...(retainDiagnostics?{diagnostics:{selector,selectorOrigin,regionRange:{start:tokens[start].range.startOffset-2,end:tokens[close].range.endOffset-2},
+        headerRange:{start:tokens[first].range.startOffset-2,end:tokens[open].range.endOffset-2},
+        tailRange:{start:tokens[open].range.endOffset-2,end:tokens[close].range.endOffset-2},
+        conditionRanges:arms.map(arm=>arm.condition),actions:arms.map(arm=>({range:arm.range,cases:[arm.value],scoped:arm.scoped}))}}:{})};
   }
   function candidate(frame, block = frame.statement, offset) {
     if (frame.kind !== 'LabeledStatement' || frame.statement?.kind !== 'BlockStatement'

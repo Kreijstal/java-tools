@@ -1782,6 +1782,25 @@ unsafe suffixes. Six independent native models compare 99,144 cases across
 guarded fallthrough, zero/nonzero flags, selector writes, null unboxing/monitors,
 signed overflow, injected failures and return/break/continue/finally completion.
 
+`foldScalarSwitchPrefixes` joins consecutive terminating equality arms before
+an existing primitive-local switch. The unique captured `int` local must be
+in scope, and prefix actions cannot write it. Prefix case constants must be
+distinct from each other and every existing numeric case. The original switch
+header/body, callback order, fallthrough and transfer targets stay intact. Its
+pure selector read moves before the removed comparisons; no action is copied
+twice. Arms must not complete normally, including through catches/finally, and
+bare prefix breaks refuse. Declaration-bearing arm blocks retain their scopes;
+empty declaration scopes can be flattened. Fields, boxed/effectful selectors,
+unknown case constants, overlapping cases, nested executables and unsupported
+syntax refuse. Prefixes are bounded to 32 arms and 64 total numeric cases, with
+40,000-character regions and 400,000-character bodies. The compiler runs this
+after nested dispatch recovery.
+
+Six additional test groups include six independent native control/completion
+models checking 13,824 cases, with integer extremes, signed overflow, nullable
+guards/monitors, finally overrides, nonlocal transfers, declaration scopes and
+mutation inside the unchanged old switch body.
+
 `node --test test/scalarIfDispatchRecovery.test.js` covers supported case runs,
 empty/default paths, integer extremes, scope/target/mutation refusals and budgets.
 Seven native variants compare 20,160 independent cases, retaining negative/zero/
