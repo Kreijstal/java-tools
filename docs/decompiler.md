@@ -1824,6 +1824,34 @@ condition writes, short-circuit null unboxing, integer overflow in callbacks,
 NaN/infinite predicates, returns/nonlocal continues, failure identity, finally
 overrides and monitor release.
 
+`foldNaturalLoopExits` removes a continue that is the final statement of its
+own braced loop body: normal completion already takes the same update/header.
+It also changes an outer labeled continue to an inner bare break when that
+inner loop is the outer body's final statement. Every reference to the retired
+outer label must be such a continue, and each replacement must have the inner
+loop as its nearest break destination. An intervening loop/switch, suffix
+statement, try/finally/monitor wrapper between the two loops, or other outer
+label reference refuses that reconstruction. Bare prefix exits retain their
+existing targets. All while/for/do/enhanced-for headers, updates, declarations,
+condition effects and complete protected groups stay in place; finally can
+still override a pending completion. The label is retired only when no other
+reference needs it. No value is inferred and no action is duplicated.
+
+Diagnostics identify exact original transfer/keyword/label ranges and both
+loop bodies, with lexical edits sufficient for independent replay. Each call
+removes a continue or its nonlocal name; the compiler repeats this final phase
+after Boolean-local recovery without rerunning earlier reconstruction phases.
+Regions are bounded to 40,000 characters, bodies to 400,000, nested paths to 128
+AST levels and a localizing step to 128 outward references. Unsupported syntax,
+comments/Unicode translation and nested executables refuse.
+
+`node --test test/naturalLoopExitRecovery.test.js` checks all loop forms,
+remaining label references, complete protected bodies, token/byte edit replay,
+incorrect break destinations and scope/statement/budget refusals. An independent
+native pending-completion dispatcher compares 20,160 cases in eight loop models,
+with effectful headers/updates, signed-overflow callbacks, zero/nonzero flags,
+partial failures, return snapshots, finally overrides and monitor release.
+
 `node --test test/scalarIfDispatchRecovery.test.js` covers supported case runs,
 empty/default paths, integer extremes, scope/target/mutation refusals and budgets.
 Seven native variants compare 20,160 independent cases, retaining negative/zero/

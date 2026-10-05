@@ -23,7 +23,7 @@ const { foldGuardedLoopContinuations: recoverLoopContinuation, foldNonrepeatingW
   foldTerminalLoopExits: recoverTerminalLoopExit,
   foldNonlocalLoopExits: recoverNonlocalLoopExit,
   foldLoopElseExitGuards: recoverLoopElseExitGuard,
-  foldTerminalLoopTails: recoverTerminalLoopTail } = require('./guardedLoopContinuationRecovery');
+  foldTerminalLoopTails: recoverTerminalLoopTail, foldNaturalLoopExits: recoverNaturalLoopExit } = require('./guardedLoopContinuationRecovery');
 
 const rawExpression = (source) => createNode('UnsupportedExpression', { source: String(source) });
 const rawStatement = (source) => createNode('UnsupportedStatement', { source: String(source) });
@@ -720,6 +720,12 @@ function foldLoopElseExitGuards(source, options = {}) {
 
 function foldTerminalLoopTails(source, options = {}) {
   return recoverTerminalLoopTail(source, controlCleanupSource(source), options);
+}
+
+function foldNaturalLoopExits(source, options = {}) {
+  if (source.length > 400000) return {source, loopExitsRecovered: 0};
+  try { return recoverNaturalLoopExit(source, controlCleanupSource(source), options); }
+  catch (error) { if (error instanceof RangeError) return {source, loopExitsRecovered: 0}; throw error; }
 }
 
 function foldNonlocalLoopExits(source, options = {}) {
@@ -3300,6 +3306,7 @@ module.exports = {
   foldNonlocalLoopExits,
   foldLoopElseExitGuards,
   foldTerminalLoopTails,
+  foldNaturalLoopExits,
   simplifyIdentityReferenceCasts,
   recoverScalarLabelDispatches,
   recoverScalarIfDispatches,

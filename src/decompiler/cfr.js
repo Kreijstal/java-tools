@@ -3,7 +3,7 @@
 const {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits, foldNonlocalLoopExits, foldLoopElseExitGuards, foldTerminalLoopTails} = require('./javaAstEmitter');
 const {recoverScalarIfDispatches, simplifyPredicateNegations, simplifyDominatedPredicates, finalizeControlFrames, finalizeTerminalSwitchFrames, foldRedundantExitGuards} = require('./javaAstEmitter');
 const {simplifyPredicateGrouping} = require('./javaAstEmitter');
-const {foldScalarSwitchPrefixes, foldBooleanLocalAssignments} = require('./javaAstEmitter');
+const {foldScalarSwitchPrefixes, foldBooleanLocalAssignments, foldNaturalLoopExits} = require('./javaAstEmitter');
 
 const fs = require('fs');
 const path = require('path');
@@ -2118,6 +2118,14 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
   const booleanAssignments = foldBooleanLocalAssignments(source);
   if (booleanAssignments.assignmentsFolded) {
     source = booleanAssignments.source;
+    changed = true;
+  }
+  // At an iteration's end, normal completion already takes the same update
+  // and header. Final-inner-loop breaks can express that continuation locally.
+  for (;;) {
+    const exits = foldNaturalLoopExits(source);
+    if (!exits.loopExitsRecovered) break;
+    source = exits.source;
     changed = true;
   }
   if (changed) replaceArrayContents(body, source.split('\n'));

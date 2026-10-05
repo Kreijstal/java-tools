@@ -6,22 +6,25 @@
 // the continuation cannot repeat/exit this loop or complete normally. Keep
 // each protected construct whole and retain every existing transfer target.
 function recoverLoopForms(source, proof, {parameterNames = [], retainDiagnostics = false} = {}, form = 'guarded') {
-  const counter = form === 'nonrepeating' ? 'conditionalsRecovered'
+  const counter = form === 'naturalExits' ? 'loopExitsRecovered' : form === 'nonrepeating' ? 'conditionalsRecovered'
     : form === 'exitContinuation' ? 'continuationsRecovered' : form === 'terminalTail' ? 'tailsHoisted' : 'loopsRecovered';
   const unchanged = () => ({source, [counter]: 0});
+  if (form === 'naturalExits' && source.length > 400000) return unchanged();
   if (!proof || typeof retainDiagnostics !== 'boolean' || !Array.isArray(parameterNames)
       || new Set(parameterNames).size !== parameterNames.length
       || parameterNames.some(name => typeof name !== 'string' || !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name))) return unchanged();
   const {wrapped, parsed, tokens, starts, closes, children, labelCounts} = proof;
   const loops = new Set(['WhileStatement', 'ForStatement', 'EnhancedForStatement', 'DoWhileStatement']);
   const parents = new Map(), targets = new Map(), references = new Map(), ids = new Map(), ends = new Map();
-  const statementStarts = new Set();
+  const statementStarts = new Set(), nearestBreaks = new Map();
   let refused = false;
-  function collect(node) {
+  function collect(node, depth = 0) {
+    if (form === 'naturalExits' && depth > 128) {refused = true; return;}
     if (node.kind?.endsWith('Statement') && node.range) statementStarts.add(node.range.startOffset);
-    children(node, collect);
+    children(node, child => collect(child, depth + 1));
   }
   collect(parsed);
+  if (refused) return unchanged();
   function terminator(node) {
     const first = starts.get(node.range?.startOffset);
     if (first === undefined) return null;
@@ -35,7 +38,10 @@ function recoverLoopForms(source, proof, {parameterNames = [], retainDiagnostics
   }
   function inspect(node, parent, labels = [], breaks = [], activeLoops = []) {
     parents.set(node, parent); if (!ids.has(node)) ids.set(node, ids.size);
+    if (form === 'naturalExits') nearestBreaks.set(node, breaks.at(-1));
     if (/ClassDeclaration|MethodDeclaration|ConstructorDeclaration|LambdaExpression|AnonymousClass/.test(node.kind || '')) refused = true;
+    if (form === 'naturalExits' && (/InterfaceDeclaration|EnumDeclaration|RecordDeclaration/.test(node.kind || '')
+        || node.kind === 'NewClassExpression' && node.body != null)) refused = true;
     if (['BreakStatement', 'ContinueStatement'].includes(node.kind)) {
       const target = node.label ? labels.slice().reverse().find(frame => frame.label === node.label)
         : node.kind === 'ContinueStatement' ? activeLoops.at(-1) : breaks.at(-1);
@@ -68,6 +74,97 @@ function recoverLoopForms(source, proof, {parameterNames = [], retainDiagnostics
   }
   inspect(parsed, null);
   if (refused || [...labelCounts.values()].some(count => count !== 1)) return unchanged();
+  if (form === 'naturalExits') {
+    let selected, overBudget = false;
+    function visitNatural(node, depth = 0) {
+      if (depth > 128) {overBudget = true; return;}
+      if (selected) return;
+      if (loops.has(node.kind) && node.body?.kind === 'BlockStatement') {
+        const label = parents.get(node)?.kind === 'LabeledStatement' ? parents.get(node) : null;
+        const first = starts.get(node.range?.startOffset), open = starts.get(node.body.range?.startOffset), close = closes.get(open);
+        const last = node.body.statements.at(-1);
+        if (first !== undefined && tokens[open]?.text === '{' && tokens[close]?.text === '}'
+            && tokens[close].range.endOffset - tokens[first].range.startOffset <= 40000) {
+          const own = last?.kind === 'ContinueStatement' && [node, label].includes(targets.get(last));
+          if (own && nearestBreaks.get(last) === node && ends.get(last) + 1 === close) {
+            selected = {node, label, first, open, close, removed: last, localized: [],
+              retireLabel: Boolean(label && (references.get(label) || []).every(reference => reference === last))};
+            return;
+          }
+          const inner = last?.kind === 'LabeledStatement' ? last.statement : last;
+          const innerFirst = starts.get(inner?.range?.startOffset), innerOpen = starts.get(inner?.body?.range?.startOffset), innerClose = closes.get(innerOpen);
+          let innerEnd = innerClose;
+          if (inner?.kind === 'DoWhileStatement') {
+            const conditionClose = closes.get(innerClose + 2);
+            innerEnd = tokens[innerClose + 1]?.text === 'while' && tokens[innerClose + 2]?.text === '('
+              && tokens[conditionClose + 1]?.text === ';' ? conditionClose + 1 : null;
+          }
+          const outward = label && references.get(label) || [];
+          const inInner = reference => {
+            for (let ancestor = parents.get(reference); ancestor && ancestor !== node; ancestor = parents.get(ancestor))
+              if (ancestor === inner) return true;
+            return false;
+          };
+          // There is no statement, protected boundary or update between the
+          // final inner loop and normal outer-body completion. A bare inner
+          // break therefore takes the same outer update/header as this continue.
+          // Refuse a nested switch/loop that would capture the new bare break.
+          if (label && loops.has(inner?.kind)
+              && inner.body?.kind === 'BlockStatement' && outward.length > 0 && outward.length <= 128
+              && tokens[innerFirst]?.text === ({WhileStatement: 'while', ForStatement: 'for', EnhancedForStatement: 'for', DoWhileStatement: 'do'})[inner.kind]
+              && tokens[innerOpen]?.text === '{' && tokens[innerClose]?.text === '}' && innerEnd + 1 === close
+              && outward.every(reference => reference.kind === 'ContinueStatement'
+                && nearestBreaks.get(reference) === inner && inInner(reference))) {
+            selected = {node, label, first, open, close, inner, innerFirst, innerOpen, innerClose,
+              removed: null, localized: outward, retireLabel: true};
+            return;
+          }
+        }
+      }
+      children(node, child => visitNatural(child, depth + 1));
+    }
+    visitNatural(parsed);
+    if (!selected || overBudget) return unchanged();
+    const {node, label, first, open, close, removed, localized, retireLabel} = selected;
+    const range = (a, b) => ({start: tokens[a].range.startOffset - 2, end: tokens[b].range.endOffset - 2});
+    const edits = [], transfers = [];
+    let retiredLabelRange = null;
+    if (retireLabel) {
+      const begin = starts.get(label.range.startOffset);
+      if (tokens[begin]?.text !== label.label || tokens[begin + 1]?.text !== ':' || begin + 2 !== first) return unchanged();
+      retiredLabelRange = {start: tokens[begin].range.startOffset - 2, end: tokens[first].range.startOffset - 2};
+      edits.push({...retiredLabelRange, text: ''});
+    }
+    for (const reference of removed ? [removed] : localized) {
+      const begin = starts.get(reference.range.startOffset), end = ends.get(reference);
+      if (tokens[begin]?.text !== 'continue' || tokens[end]?.text !== ';') return unchanged();
+      const transferRange = range(begin, end);
+      const keywordRange = range(begin, begin);
+      const labelRange = reference.label ? range(begin + 1, begin + 1) : null;
+      if (removed) {
+        let start = transferRange.start, finish = transferRange.end;
+        const lineStart = source.lastIndexOf('\n', start - 1) + 1, lineEnd = source.indexOf('\n', finish);
+        if (lineEnd >= 0 && /^[ \t]*$/.test(source.slice(lineStart, start)) && /^[ \t\r]*$/.test(source.slice(finish, lineEnd))) {
+          start = lineStart; finish = lineEnd + 1;
+        }
+        edits.push({start, end: finish, text: ''});
+      } else {
+        edits.push({...keywordRange, text: 'break'});
+        edits.push({start: keywordRange.end, end: tokens[end].range.startOffset - 2, text: ''});
+      }
+      transfers.push({range: transferRange, keywordRange, labelRange, removed: Boolean(removed)});
+    }
+    edits.sort((a, b) => a.start - b.start);
+    for (let index = 1; index < edits.length; index++) if (edits[index].start < edits[index - 1].end) return unchanged();
+    let output = source;
+    for (const edit of edits.slice().reverse()) output = output.slice(0, edit.start) + edit.text + output.slice(edit.end);
+    return {source: output, loopExitsRecovered: 1, terminalContinuesRemoved: Number(Boolean(removed)),
+      outerContinuesLocalized: localized.length, loopLabelsRemoved: Number(retireLabel),
+      labelReferencesRemoved: transfers.filter(transfer => transfer.labelRange).length,
+      ...(retainDiagnostics ? {diagnostics: {edits, transfers, retiredLabelRange, label: label?.label || null,
+        outerLoopKeywordRange: range(first, first), outerBodyRange: range(open, close), outerLoopKind: node.kind,
+        ...(selected.inner ? {innerLoopKeywordRange: range(selected.innerFirst, selected.innerFirst), innerBodyRange: range(selected.innerOpen, selected.innerClose)} : {})}} : {})};
+  }
   const transfer = (kind, target) => kind + ':' + ids.get(target);
   const normal = 'normal', abrupt = kind => new Set([kind]);
   const union = (...sets) => new Set(sets.flatMap(set => [...set]));
@@ -635,4 +732,8 @@ function foldTerminalLoopTails(source, proof, options) {
   return recoverLoopForms(source, proof, options, 'terminalTail');
 }
 
-module.exports = {foldTerminalLoopTails, foldLoopElseExitGuards, foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits, foldNonlocalLoopExits};
+function foldNaturalLoopExits(source, proof, options) {
+  return recoverLoopForms(source, proof, options, 'naturalExits');
+}
+
+module.exports = {foldNaturalLoopExits, foldTerminalLoopTails, foldLoopElseExitGuards, foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits, foldNonlocalLoopExits};
