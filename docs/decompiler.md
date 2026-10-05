@@ -1852,6 +1852,18 @@ native pending-completion dispatcher compares 20,160 cases in eight loop models,
 with effectful headers/updates, signed-overflow callbacks, zero/nonzero flags,
 partial failures, return snapshots, finally overrides and monitor release.
 
+The emitter finishes terminal switch frames again after late nested dispatch,
+switch-prefix, Boolean-local and natural-loop recovery. A switch introduced by
+those phases can expose an enclosing plain label with the same continuation.
+This uses the existing terminal-destination and frame-scope proofs, retaining
+all cases, fallthrough, conditions, callbacks and protected constructs. It does
+not rerun earlier predicate or dispatch recovery. The complete emitter-pipeline
+fixture `node --test test/cfrLateSwitchFrames.test.js` proves the ordering
+regression, unsafe suffix/protection refusals and declaration scope retention.
+An independent native action dispatcher compares 66,528 cases across four
+completion contexts, including nonzero flags, callback failures, overflow,
+return snapshots, finally overrides and nullable monitors.
+
 `node --test test/scalarIfDispatchRecovery.test.js` covers supported case runs,
 empty/default paths, integer extremes, scope/target/mutation refusals and budgets.
 Seven native variants compare 20,160 independent cases, retaining negative/zero/

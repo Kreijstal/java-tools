@@ -2128,6 +2128,14 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
     source = exits.source;
     changed = true;
   }
+  // Late nested dispatch can create a terminal switch after the earlier
+  // switch-frame proof ran. Localize only exits to the same continuation;
+  // case bodies, fallthrough and complete protected constructs stay intact.
+  const lateSwitchFrames = finalizeTerminalSwitchFrames(source);
+  if (lateSwitchFrames.breaksLocalized) {
+    source = lateSwitchFrames.source;
+    changed = true;
+  }
   if (changed) replaceArrayContents(body, source.split('\n'));
 }
 
@@ -10975,6 +10983,7 @@ module.exports = {
   decompilePath,
   buildExceptionModel,
   _internals: {
+    shareExistingExitTails,
     binaryExpr,
     negateNumericExpression,
     coerceExpressionForType,
