@@ -106,6 +106,15 @@ CFR checks every superclass and interface for fields or member types hiding the 
 unknown ancestor declines that evidence. Locals/formals and a same-named own field
 still refuse; direct `this.field` evidence does not depend on this flag.
 
+`simplifyPredicateGrouping` removes redundant parentheses only in if/while,
+braced do-while and for conditions. It retains every operator and operand and
+preserves exact association, including same-precedence right-hand Boolean
+chains. Mandatory control/cast/call parentheses and arithmetic/comparison
+operands stay intact. Lower-precedence groups remain explicit. Diagnostics
+record only matched parentheses and one-character deletions. Comments, Unicode
+translation, nested executable scopes and uncertain syntax decline recovery.
+CFR runs this last, after all structural and operator choices.
+
 `foldTerminalLoopTails` handles an infinite loop with a repeatable prefix,
 finishing work and a final bare own-loop break. Every other own transfer must
 be a continue inside the prefix. Moving that same final break before the

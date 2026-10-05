@@ -11,6 +11,7 @@ const { tokenizeJava } = require('../java-frontend/lexer');
 const { recoverScalarLabelDispatches: recoverScalarDispatch } = require('./scalarDispatchRecovery');
 const { recoverScalarIfDispatches: recoverIfDispatch } = require('./scalarIfDispatchRecovery');
 const { simplifyPredicateNegations: simplifyNegations } = require('./predicateNegationRecovery');
+const { simplifyPredicateGrouping: simplifyGrouping } = require('./predicateGroupingRecovery');
 const { specializePathGuards: specializeGuards } = require('./pathGuardRecovery');
 const { simplifyDominatedPredicates: simplifyDominated } = require('./dominatedPredicateRecovery');
 const { foldRedundantExitGuards: recoverRedundantExitGuards } = require('./redundantExitGuardRecovery');
@@ -661,6 +662,10 @@ function recoverScalarIfDispatches(source, options = {}) {
 
 function simplifyPredicateNegations(source, options = {}) {
   return simplifyNegations(source, controlCleanupSource(source), options);
+}
+
+function simplifyPredicateGrouping(source, options = {}) {
+  return simplifyGrouping(source, controlCleanupSource(source), options);
 }
 
 function simplifyDominatedPredicates(source, options = {}) {
@@ -3206,6 +3211,7 @@ module.exports = {
   recoverScalarLabelDispatches,
   recoverScalarIfDispatches,
   simplifyPredicateNegations,
+  simplifyPredicateGrouping,
   specializePathGuards,
   simplifyDominatedPredicates,
   finalizeControlFrames,
