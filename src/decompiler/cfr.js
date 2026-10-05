@@ -1311,7 +1311,8 @@ function formatMethod(cls, method, options = {}) {
     ensureMissingSyntheticDeclarations(body);
     widenExceptionLocalsUsedByInstanceof(body, options.exceptionModel);
     shareExistingExitTails(body, localState.paramNames,
-      params.map((type, index) => ({name: localState.paramNames[index], type: simplifyType(type)})));
+      params.map((type, index) => ({name: localState.paramNames[index], type: simplifyType(type)})),
+      ownedPredicateFields(cls, options));
   }
   const needsUncheckedExceptionBoundary = methodThrowsTypes(method).length === 0
     && methodCallsUncaughtCheckedException(code, method, options.exceptionModel);
@@ -1720,7 +1721,7 @@ function formatStaticInitializer(code, localState, cls, options = {}) {
   const missingDeclarations = localState.missingDeclarations(body);
   if (missingDeclarations.length) body.unshift(...missingDeclarations);
   replaceArrayContents(body, normalizeSyntheticVariableScopes(body));
-  shareExistingExitTails(body);
+  shareExistingExitTails(body, [], [], ownedPredicateFields(cls, options));
   assertNoFallback(body, { className: cls.className, methodName: '<clinit>', descriptor: '()V' });
   if (!body.length) return formatBlock('static', body);
 
@@ -1760,7 +1761,14 @@ function formatStaticInitializer(code, localState, cls, options = {}) {
   return `${formatBlock('static', [`${helperName}();`])}\n\n${formatBlock(`private static void ${helperName}()`, body)}`;
 }
 
-function shareExistingExitTails(body, parameterNames = [], parameters = []) {
+function ownedPredicateFields(cls, options) {
+  return {owner: javaTypeFromInternalName(cls.className), fields: (cls.items || [])
+    .filter(item => item.type === 'field' && item.field && !shouldSkipField(cls, item.field))
+    .map(({field}) => ({name: sourceFieldName(cls.className, field.name, options),
+      type: descriptorToJavaType(field.descriptor), static: (field.flags || []).includes('static')}))};
+}
+
+function shareExistingExitTails(body, parameterNames = [], parameters = [], ownedFields = null) {
   // Normalize escaping JVM locals first: otherwise one cleanup copy may still
   // declare a slot that the following copy assigns. Exact matching must use
   // their final source identities, never discard an apparent inline shadow.
@@ -2044,6 +2052,16 @@ function shareExistingExitTails(body, parameterNames = [], parameters = []) {
     const tails = foldTerminalLoopTails(source, {parameterNames});
     if (!tails.tailsHoisted) break;
     source = tails.source;
+    changed = true;
+  }
+  // Field descriptors prove integral comparison operands without assuming
+  // values, purity or stability. Complement only operators: each field/array
+  // read and receiver stays in its original order, with all possible failures.
+  // Run last so earlier structural decisions retain their existing evidence.
+  if (ownedFields) for (;;) {
+    const predicates = simplifyPredicateNegations(source, {parameters, ownedFields});
+    if (!predicates.predicatesSimplified) break;
+    source = predicates.source;
     changed = true;
   }
   if (changed) replaceArrayContents(body, source.split('\n'));

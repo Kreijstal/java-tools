@@ -91,6 +91,17 @@ yet verified.
 
 ### Finishing work after repeatable loop prefixes
 
+`simplifyPredicateNegations` optionally accepts `ownedFields: {owner, fields}`,
+where each field has its emitted `name`, Java `type` and Boolean `static` flag.
+CFR supplies only declarations on the current class, using the original field
+descriptors and the same spelling policy as field emission. Direct `this.field`
+and unshadowed current-class static accesses can prove integral operands,
+including array elements and lengths. Inherited, arbitrary-receiver and free
+field names remain unknown; boxed/floating comparisons retain unboxing and NaN
+behavior. Only predicate operators change. Volatile reads, receivers, increments,
+array checks, callbacks and protected completion stay in their original order.
+This typed field phase runs after existing structural cleanup.
+
 `foldTerminalLoopTails` handles an infinite loop with a repeatable prefix,
 finishing work and a final bare own-loop break. Every other own transfer must
 be a continue inside the prefix. Moving that same final break before the

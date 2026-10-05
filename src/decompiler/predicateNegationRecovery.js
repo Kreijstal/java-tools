@@ -4,7 +4,7 @@
 // complements and double negation preserve short-circuit order and unboxing.
 // Keep arbitrary atoms verbatim. Relational complements require scoped
 // primitive integral operands; unknown and floating operands retain NaNs.
-function simplifyPredicateNegations(source, proof, {retainDiagnostics = false, parameters = [], complementIntegralRelations = true} = {}) {
+function simplifyPredicateNegations(source, proof, {retainDiagnostics = false, parameters = [], complementIntegralRelations = true, ownedFields = null} = {}) {
   const unchanged = () => ({source, predicatesSimplified: 0});
   if (!proof || typeof retainDiagnostics !== 'boolean' || typeof complementIntegralRelations !== 'boolean' || !Array.isArray(parameters) || source.length > 400000) return unchanged();
   const {wrapped, parsed, tokens, starts, closes, children} = proof;
@@ -21,6 +21,17 @@ function simplifyPredicateNegations(source, proof, {retainDiagnostics = false, p
   if (invalid) return unchanged();
   const integral = type => ['byte', 'short', 'char', 'int', 'long'].includes(type);
   const declarations = new Map(), locals = new Map(), formalTypes = new Map();
+  const fieldTypes = new Map();
+  if (ownedFields !== null) {
+    if (!ownedFields || typeof ownedFields !== 'object' || !/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/.test(ownedFields.owner || '')
+        || !Array.isArray(ownedFields.fields) || ownedFields.fields.length > 4096) return unchanged();
+    for (const field of ownedFields.fields) {
+      if (!field || !/^[A-Za-z_$][\w$]*$/.test(field.name || '') || typeof field.type !== 'string'
+          || !/^[A-Za-z_$][\w.$]*(?:\[\])*$/.test(field.type) || typeof field.static !== 'boolean'
+          || fieldTypes.has(field.name)) return unchanged();
+      fieldTypes.set(field.name, field);
+    }
+  }
   const statementStarts = new Set();
   walk(parsed, node => {
     if (node.kind?.endsWith('Statement') && node.range) statementStarts.add(node.range.startOffset);
@@ -92,8 +103,18 @@ function simplifyPredicateNegations(source, proof, {retainDiagnostics = false, p
       const type = childType(node.array);
       return type?.endsWith('[]') ? type.slice(0, -2) : null;
     }
-    if (node.kind === 'FieldAccessExpression' && node.name === 'length')
-      return childType(node.target)?.endsWith('[]') ? 'int' : null;
+    if (node.kind === 'FieldAccessExpression') {
+      if (node.name === 'length' && childType(node.target)?.endsWith('[]')) return 'int';
+      const field = fieldTypes.get(node.name);
+      // Only fields declared on this exact source class are supplied by CFR.
+      // Do not infer an arbitrary receiver, inherited field or free name. A
+      // class-qualified access is invalid as type evidence if its qualifier
+      // can instead bind to a formal/local (including catches and loop locals).
+      if (field && (node.target?.kind === 'ThisExpression'
+          || field.static && node.target?.kind === 'Identifier' && node.target.name === ownedFields.owner
+            && !formalTypes.has(node.target.name) && !declarations.has(node.target.name))) return field.type;
+      return null;
+    }
     if (node.kind === 'UnaryExpression' && ['+', '-', '~', '++', '--'].includes(node.operator)) {
       const type = childType(node.operand);
       return integral(type) ? ['++', '--'].includes(node.operator) ? type : type === 'long' ? 'long' : 'int' : null;
@@ -104,7 +125,7 @@ function simplifyPredicateNegations(source, proof, {retainDiagnostics = false, p
       return ['<<', '>>', '>>>'].includes(node.operator) ? left === 'long' ? 'long' : 'int'
         : left === 'long' || right === 'long' ? 'long' : 'int';
     }
-    // Calls, fields, boxed values and unsupported scopes have no proven type.
+    // Calls, unknown fields, boxed values and unsupported scopes have no proven type.
     return null;
   }
   const relational = node => node?.kind === 'BinaryExpression' && ['<', '<=', '>', '>='].includes(node.operator);

@@ -225,3 +225,104 @@ test('native integral complements match ordered comparison oracles through overf
     assert.equal(run('java',['-Xmx128m','-cp',temporary,'IntegralPredicates']).trim(),'453600 independent integral predicate cases');
   } finally {fs.rmSync(temporary,{recursive:true,force:true});}
 });
+
+const ownedFields = {owner:'OwnedPredicates', fields:[
+  ['tick','int',false],['limit','long',false],['shared','long',true],
+  ['values','int[]',false],['small','byte',false],['letter','char',false],
+  ['floating','float',false],['boxed','Integer',false],['ready','Boolean',false],
+].map(([name,type,staticField])=>({name,type,static:staticField}))};
+
+test('owned primitive field evidence complements relations without altering receiver or read order', () => {
+  const source='if(!(this.tick++ < OwnedPredicates.shared) || !(this.letter >= this.small))hit();';
+  const next=simplify(source,{ownedFields,retainDiagnostics:true});
+  assert.equal(next.source,'if((this.tick++ >= OwnedPredicates.shared) || (this.letter < this.small))hit();');
+  assert.equal(next.diagnostics.counts.relationalComplements,2);
+  assert.deepEqual(next.diagnostics.relationalComparisons.map(c=>[c.leftType,c.rightType]),[['int','long'],['char','byte']]);
+  assert.equal(simplify(next.source,{ownedFields}).predicatesSimplified,0);
+  assert.equal(simplify(source).source,source,'default contract retains unknown field comparisons');
+});
+
+test('owned arrays prove element and length types while keeping bounds/null/increment effects', () => {
+  const source='int index=0;if(!(this.values[index++] < this.values.length))hit();';
+  assert.equal(simplify(source,{ownedFields}).source,'int index=0;if((this.values[index++] >= this.values.length))hit();');
+  assert.equal(simplify('if(!(this.values[read()] < (int)callback()))hit();',{ownedFields}).predicatesSimplified,1);
+  assert.equal(simplify('if(!(this.tick < callback()))hit();',{ownedFields}).predicatesSimplified,0);
+});
+
+test('field evidence refuses arbitrary, inherited, shadowed and unqualified receivers', () => {
+  for(const source of [
+    'if(!(other.tick < 4))hit();','if(!(super.tick < 4))hit();','if(!(tick < 4))hit();',
+    'if(!(this.missing < 4))hit();','if(!(OwnedPredicates.tick < 4))hit();',
+    'Object OwnedPredicates=null;if(!(OwnedPredicates.shared < 4))hit();',
+    'for(int OwnedPredicates=0;OwnedPredicates<1;OwnedPredicates++){if(!(OwnedPredicates.shared < 4))hit();}',
+    'try{hit();}catch(Exception OwnedPredicates){if(!(OwnedPredicates.shared < 4))hit();}',
+  ]) assert.equal(simplify(source,{ownedFields}).source,source);
+  const source='if(!(OwnedPredicates.shared < 4))hit();';
+  assert.equal(simplify(source,{ownedFields,parameters:[{name:'OwnedPredicates',type:'Object'}]}).source,source);
+});
+
+test('floating and boxed owned fields retain NaN and unboxing outcomes', () => {
+  for(const source of ['if(!(this.floating < 4))hit();','if(!(this.boxed >= 4))hit();',
+    'if(!(this.tick < this.floating))hit();','if(!(this.ready))hit();'])
+    assert.equal(simplify(source,{ownedFields}).source,source);
+  assert.equal(simplify('if(!(this.tick < (int)this.floating))hit();',{ownedFields}).source,
+    'if((this.tick >= (int)this.floating))hit();');
+});
+
+test('invalid or ambiguous owned field contracts fail closed', () => {
+  const source='if(!(this.tick < 4))hit();';
+  for(const bad of [[],{}, {owner:'x/y',fields:[]},{owner:'X',fields:{}},
+    {owner:'X',fields:[{name:'tick',type:'int',static:0}]},
+    {owner:'X',fields:[{name:'tick',type:'int[]bad',static:false}]},
+    {owner:'X',fields:[{name:'tick',type:'int',static:false},{name:'tick',type:'float',static:false}]},
+  ]) assert.equal(simplify(source,{ownedFields:bad}).source,source);
+  for(const suffix of [' // comment\n','\\u000a','Runnable r=()->hit();','class Inner{void f(){hit();}}'])
+    assert.equal(simplify(source+suffix,{ownedFields}).source,source+suffix);
+});
+
+test('native owned-field complements preserve reads, writes, volatile callbacks and protected failures', () => {
+  const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'owned-field-predicates-'));
+  const run=(command,args)=>{const r=spawnSync(command,args,{encoding:'utf8',maxBuffer:1024*1024});assert.equal(r.status,0,r.stderr||r.stdout);return r.stdout;};
+  const variants=[
+    {test:'!(this.tick < OwnedPredicates.shared)',oracle:'long left=this.tick;long right=shared;boolean result=Long.compare(left,right)>=0;',changes:1},
+    {test:'!(this.tick++ <= (int)mark(mode))',oracle:'long left=this.tick;this.tick++;long right=(int)mark(mode);boolean result=Long.compare(left,right)>0;',changes:1},
+    {test:'!(this.values[index++] > this.values.length)',oracle:'long left=this.values[index++];long right=this.values.length;boolean result=Long.compare(left,right)<=0;',changes:1},
+    {test:'!(this.letter >= this.small)',oracle:'long left=this.letter;long right=this.small;boolean result=Long.compare(left,right)<0;',changes:1},
+    {test:'!((this.tick < (int)mark(mode)) && !(this.tick >= this.limit))',oracle:'long left=this.tick;long right=(int)mark(mode);boolean result=Long.compare(left,right)>=0;if(!result){left=this.tick;right=this.limit;result=Long.compare(left,right)>=0;}',changes:1},
+    {test:'!(this.floating < this.tick)',oracle:'boolean result=Float.isNaN(this.floating)||Float.compare(this.floating, (float)this.tick)>0||this.floating==(float)this.tick;',changes:0},
+    {test:'!(this.boxed < this.tick)',oracle:'long left=this.boxed.intValue();long right=this.tick;boolean result=Long.compare(left,right)>=0;',changes:0},
+  ];
+  const parameters=[{name:'mode',type:'int'},{name:'index',type:'int'},{name:'lock',type:'Object'}];
+  const tail='trace.append(result?"T":"N");return result+":"+tick+":"+shared+":"+index+":"+trace;';
+  const wrap=code=>`try{synchronized(lock){trace.append("L");${code}${tail}}}finally{trace.append("F");if(mode==3)throw FAILURE;}`;
+  try{
+    let methods='';
+    variants.forEach((v,i)=>{
+      // Only control-condition operands are rewritten by this API.
+      const original=wrap('boolean result=false;if('+v.test+')result=true;');
+      const next=simplify(original,{ownedFields,parameters,retainDiagnostics:true});
+      assert.equal(next.diagnostics?.counts.relationalComplements??0,v.changes,'variant '+i);
+      methods+=`String old${i}(int mode,int index,Object lock){${original}}\nString next${i}(int mode,int index,Object lock){${next.source}}\nString oracle${i}(int mode,int index,Object lock){${wrap(v.oracle)}}\n`;
+    });
+    const fixture=`public class OwnedPredicates {
+      volatile int tick;long limit;static volatile long shared;int[]values;byte small;char letter;float floating;Integer boxed;StringBuilder trace;
+      static final RuntimeException FAILURE=new RuntimeException();
+      long mark(int mode){trace.append("C").append(tick).append(';');tick=tick+7;shared=shared-1;if(mode==1)throw FAILURE;return tick;}
+      ${methods}
+      static String invoke(int kind,int v,int a,long b,int index,int mode,int[]array,float f,Object monitor){
+        OwnedPredicates p=new OwnedPredicates();p.tick=a;p.limit=b;shared=b;p.values=array;p.small=(byte)a;p.letter=(char)b;p.floating=f;p.boxed=mode==2?null:Integer.valueOf((int)b);p.trace=new StringBuilder();
+        try{switch(v){${variants.map((_,i)=>`case ${i}:return kind==0?p.old${i}(mode,index,monitor):kind==1?p.next${i}(mode,index,monitor):p.oracle${i}(mode,index,monitor);`).join('')}}throw new AssertionError();}
+        catch(Throwable e){String type=e==FAILURE?"injected":e instanceof NullPointerException?"null":e instanceof ArrayIndexOutOfBoundsException?"bounds":null;if(type==null)throw new AssertionError(e);return type+":"+p.tick+":"+shared+":"+p.trace;}
+      }
+      public static void main(String[]args){Object lock=new Object();int count=0;
+        for(int v=0;v<${variants.length};v++)for(int a:new int[]{0,1,-1,Integer.MIN_VALUE,Integer.MAX_VALUE})for(long b:new long[]{0,1,-1,Long.MIN_VALUE,Long.MAX_VALUE})
+        for(int index:new int[]{-1,0,2,3})for(int mode=0;mode<5;mode++)for(int[]array:new int[][]{null,{}, {Integer.MIN_VALUE,0,Integer.MAX_VALUE}})
+        for(float f:new float[]{Float.NaN,-0.0f,0.0f,Float.NEGATIVE_INFINITY,Float.POSITIVE_INFINITY}){
+          Object monitor=mode==4?null:lock;String expected=invoke(2,v,a,b,index,mode,array,f,monitor);
+          for(int kind=0;kind<2;kind++){String actual=invoke(kind,v,a,b,index,mode,array,f,monitor);if(!actual.equals(expected))throw new AssertionError(v+":"+actual+" != "+expected);if(Thread.holdsLock(lock))throw new AssertionError("monitor leak");}count++;
+        }System.out.println(count+" independent owned-field cases");}
+    }`;
+    const file=path.join(temporary,'OwnedPredicates.java');fs.writeFileSync(file,fixture);run('javac',['--release','8','-d',temporary,file]);
+    assert.equal(run('java',['-XX:-OmitStackTraceInFastThrow','-Xmx128m','-cp',temporary,'OwnedPredicates']).trim(),'52500 independent owned-field cases');
+  }finally{fs.rmSync(temporary,{recursive:true,force:true});}
+});
