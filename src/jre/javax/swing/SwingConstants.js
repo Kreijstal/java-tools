@@ -1,0 +1,21 @@
+module.exports = {
+  super: 'java/lang/Object',
+  isInterface: true,
+  interfaces: [],
+  staticFields: {
+    'CENTER:I': 0,
+    'TOP:I': 1,
+    'LEFT:I': 2,
+    'BOTTOM:I': 3,
+    'RIGHT:I': 4,
+    'NORTH:I': 1,
+    'EAST:I': 3,
+    'SOUTH:I': 5,
+    'WEST:I': 7,
+    'HORIZONTAL:I': 0,
+    'VERTICAL:I': 1,
+    'LEADING:I': 10,
+    'TRAILING:I': 11,
+  },
+  methods: {},
+};

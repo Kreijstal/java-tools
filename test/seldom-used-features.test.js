@@ -295,6 +295,20 @@ Two unique strings == : false
 unique1.intern() == unique2.intern(): true
 unique1.intern() == unique1: false`,
   },
+  {
+    name: "SwingCanvasSmoke",
+    description: "Swing components, listeners, paintComponent and the event dispatch thread",
+    shouldFail: false,
+    expectedOutput: `After doClick: Clicked Press 42
+EDT? true
+Main EDT? false
+Frame title: Swing Canvas
+Panel size: 3
+Button text: Done
+Painted: true
+Later 1
+Later 2 Clicked Press 42`,
+  },
 ];
 
 test("Seldom-used Java Features", async function (t) {

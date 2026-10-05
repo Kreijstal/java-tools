@@ -1265,6 +1265,8 @@ class JVM {
 
   async execute() {
     this.debugManager.resume();
+    this._executeDepth = (this._executeDepth || 0) + 1;
+    this._executionFinished = false;
 
     try {
       while (!this.debugManager.isPaused) {
@@ -1304,6 +1306,7 @@ class JVM {
         this._endSchedulerTiming(timingSample);
         if (result.completed) {
           this.debugManager.pause();
+          this._executionFinished = true;
           return { completed: true, paused: false };
         }
 
@@ -1350,9 +1353,23 @@ class JVM {
     } catch (e) {
       this.debugManager.pause();
       throw e;
+    } finally {
+      this._executeDepth -= 1;
     }
 
     return { paused: true, completed: false };
+  }
+
+  /**
+   * Host input (a DOM click, a window close) can hand the guest new work after
+   * every thread had finished and execute() returned. Run that work unless
+   * the scheduler is still active or a debugger paused it.
+   */
+  resumeForHostEvent() {
+    if (this._executeDepth > 0 || !this._executionFinished) return;
+    this.execute().catch((error) => {
+      console.error('JVM execution after host event failed:', error);
+    });
   }
 
   // Compile methods only after their declaring classes have completed Java
@@ -1940,6 +1957,7 @@ class JVM {
       if (this._awtEventQueue.length || thread && !thread.callStack.isEmpty()) {
         this._scheduleAwtEventPump();
       }
+      if (method) this.resumeForHostEvent();
     }, 4);
   }
 

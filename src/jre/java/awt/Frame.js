@@ -27,6 +27,12 @@ module.exports = {
       }
     },
     'pack()V': () => {},
+    'setTitle(Ljava/lang/String;)V': (jvm, obj, args) => {
+      obj._title = args[0] || '';
+      if (obj._titleElement) obj._titleElement.textContent = String(obj._title);
+    },
+    'getTitle()Ljava/lang/String;': (jvm, obj) => obj._title || '',
+    'isResizable()Z': (jvm, obj) => (obj._resizable === false ? 0 : 1),
     'setResizable(Z)V': (jvm, obj, args) => {
       obj._resizable = !!args[0];
     },

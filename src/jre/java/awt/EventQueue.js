@@ -1,3 +1,5 @@
+const eventDispatch = require('./eventDispatch');
+
 module.exports = {
   super: 'java/lang/Object',
   methods: {
@@ -9,12 +11,13 @@ module.exports = {
     'push(Ljava/awt/EventQueue;)V': () => {},
   },
   staticMethods: {
-    'isDispatchThread()Z': () => 0,
+    'isDispatchThread()Z': (jvm, obj, args, thread) =>
+      (eventDispatch.isDispatchThread(jvm, thread) ? 1 : 0),
     'invokeLater(Ljava/lang/Runnable;)V': async (jvm, obj, args) => {
-      const runnable = args[0];
-      if (runnable) {
-        await jvm.callMethodOnObject?.(runnable, 'run', '()V');
-      }
+      await eventDispatch.invokeLater(jvm, args[0], 'run', '()V');
+    },
+    'invokeAndWait(Ljava/lang/Runnable;)V': async (jvm, obj, args, thread) => {
+      await eventDispatch.invokeAndWait(jvm, args[0], thread);
     },
   },
 };
