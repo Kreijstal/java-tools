@@ -226,7 +226,7 @@ test('native integral complements match ordered comparison oracles through overf
   } finally {fs.rmSync(temporary,{recursive:true,force:true});}
 });
 
-const ownedFields = {owner:'OwnedPredicates', fields:[
+const ownedFields = {owner:'OwnedPredicates', classQualifierUnshadowed:true, fields:[
   ['tick','int',false],['limit','long',false],['shared','long',true],
   ['values','int[]',false],['small','byte',false],['letter','char',false],
   ['floating','float',false],['boxed','Integer',false],['ready','Boolean',false],
@@ -250,6 +250,13 @@ test('owned arrays prove element and length types while keeping bounds/null/incr
 });
 
 test('field evidence refuses arbitrary, inherited, shadowed and unqualified receivers', () => {
+  const qualified='if(!(OwnedPredicates.shared < 4))hit();';
+  assert.equal(simplify(qualified,{ownedFields:{owner:ownedFields.owner,fields:ownedFields.fields}}).source,qualified,
+    'class-qualified evidence requires a complete field/member-type shadowing proof');
+  assert.equal(simplify(qualified,{ownedFields:{...ownedFields,classQualifierUnshadowed:false}}).source,qualified,
+    'known inherited field/member-type shadowing declines the class qualifier');
+  assert.equal(simplify(qualified,{ownedFields:{...ownedFields,fields:[...ownedFields.fields,
+    {name:'OwnedPredicates',type:'Other',static:false}]}}).source,qualified,'own field can shadow a type qualifier');
   for(const source of [
     'if(!(other.tick < 4))hit();','if(!(super.tick < 4))hit();','if(!(tick < 4))hit();',
     'if(!(this.missing < 4))hit();','if(!(OwnedPredicates.tick < 4))hit();',
@@ -272,6 +279,7 @@ test('floating and boxed owned fields retain NaN and unboxing outcomes', () => {
 test('invalid or ambiguous owned field contracts fail closed', () => {
   const source='if(!(this.tick < 4))hit();';
   for(const bad of [[],{}, {owner:'x/y',fields:[]},{owner:'X',fields:{}},
+    {owner:'X',fields:[],classQualifierUnshadowed:1},
     {owner:'X',fields:[{name:'tick',type:'int',static:0}]},
     {owner:'X',fields:[{name:'tick',type:'int[]bad',static:false}]},
     {owner:'X',fields:[{name:'tick',type:'int',static:false},{name:'tick',type:'float',static:false}]},
@@ -297,6 +305,14 @@ test('native owned-field complements preserve reads, writes, volatile callbacks 
   const wrap=code=>`try{synchronized(lock){trace.append("L");${code}${tail}}}finally{trace.append("F");if(mode==3)throw FAILURE;}`;
   try{
     let methods='';
+    const memberShadowBody='if(!(QualifierMemberShadow.shared >= 0))return true;return false;';
+    const memberShadowNext=simplify(memberShadowBody,{ownedFields:{owner:'QualifierMemberShadow',classQualifierUnshadowed:false,
+      fields:[{name:'shared',type:'int',static:true}]}}).source;
+    assert.equal(memberShadowNext,memberShadowBody);
+    const fieldShadowBody='if(!(QualifierFieldShadow.shared >= 0))return true;return false;';
+    const fieldShadowNext=simplify(fieldShadowBody,{ownedFields:{owner:'QualifierFieldShadow',classQualifierUnshadowed:true,
+      fields:[{name:'shared',type:'int',static:true},{name:'QualifierFieldShadow',type:'QualifierFloatHolder',static:false}]}}).source;
+    assert.equal(fieldShadowNext,fieldShadowBody);
     variants.forEach((v,i)=>{
       // Only control-condition operands are rewritten by this API.
       const original=wrap('boolean result=false;if('+v.test+')result=true;');
@@ -314,15 +330,21 @@ test('native owned-field complements preserve reads, writes, volatile callbacks 
         try{switch(v){${variants.map((_,i)=>`case ${i}:return kind==0?p.old${i}(mode,index,monitor):kind==1?p.next${i}(mode,index,monitor):p.oracle${i}(mode,index,monitor);`).join('')}}throw new AssertionError();}
         catch(Throwable e){String type=e==FAILURE?"injected":e instanceof NullPointerException?"null":e instanceof ArrayIndexOutOfBoundsException?"bounds":null;if(type==null)throw new AssertionError(e);return type+":"+p.tick+":"+shared+":"+p.trace;}
       }
-      public static void main(String[]args){Object lock=new Object();int count=0;
+      public static void main(String[]args){Object lock=new Object();int count=2;
+        if(!QualifierMemberShadow.old()||!QualifierMemberShadow.next()||!new QualifierFieldShadow().old()||!new QualifierFieldShadow().next())throw new AssertionError("NaN qualifier shadowing");
         for(int v=0;v<${variants.length};v++)for(int a:new int[]{0,1,-1,Integer.MIN_VALUE,Integer.MAX_VALUE})for(long b:new long[]{0,1,-1,Long.MIN_VALUE,Long.MAX_VALUE})
         for(int index:new int[]{-1,0,2,3})for(int mode=0;mode<5;mode++)for(int[]array:new int[][]{null,{}, {Integer.MIN_VALUE,0,Integer.MAX_VALUE}})
         for(float f:new float[]{Float.NaN,-0.0f,0.0f,Float.NEGATIVE_INFINITY,Float.POSITIVE_INFINITY}){
           Object monitor=mode==4?null:lock;String expected=invoke(2,v,a,b,index,mode,array,f,monitor);
           for(int kind=0;kind<2;kind++){String actual=invoke(kind,v,a,b,index,mode,array,f,monitor);if(!actual.equals(expected))throw new AssertionError(v+":"+actual+" != "+expected);if(Thread.holdsLock(lock))throw new AssertionError("monitor leak");}count++;
         }System.out.println(count+" independent owned-field cases");}
-    }`;
+    }
+    class QualifierParent {static class QualifierMemberShadow {static float shared=Float.NaN;}}
+    class QualifierMemberShadow extends QualifierParent {static int shared=1;static boolean old(){${memberShadowBody}}static boolean next(){${memberShadowNext}}}
+    class QualifierFloatHolder {float shared=Float.NaN;}
+    class QualifierFieldShadow {static int shared=1;QualifierFloatHolder QualifierFieldShadow=new QualifierFloatHolder();boolean old(){${fieldShadowBody}}boolean next(){${fieldShadowNext}}}
+    `;
     const file=path.join(temporary,'OwnedPredicates.java');fs.writeFileSync(file,fixture);run('javac',['--release','8','-d',temporary,file]);
-    assert.equal(run('java',['-XX:-OmitStackTraceInFastThrow','-Xmx128m','-cp',temporary,'OwnedPredicates']).trim(),'52500 independent owned-field cases');
+    assert.equal(run('java',['-XX:-OmitStackTraceInFastThrow','-Xmx128m','-cp',temporary,'OwnedPredicates']).trim(),'52502 independent owned-field cases');
   }finally{fs.rmSync(temporary,{recursive:true,force:true});}
 });

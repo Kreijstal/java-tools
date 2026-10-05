@@ -101,6 +101,10 @@ field names remain unknown; boxed/floating comparisons retain unboxing and NaN
 behavior. Only predicate operators change. Volatile reads, receivers, increments,
 array checks, callbacks and protected completion stay in their original order.
 This typed field phase runs after existing structural cleanup.
+Class-qualified evidence additionally requires `classQualifierUnshadowed: true`:
+CFR checks every superclass and interface for fields or member types hiding the class name. An
+unknown ancestor declines that evidence. Locals/formals and a same-named own field
+still refuse; direct `this.field` evidence does not depend on this flag.
 
 `foldTerminalLoopTails` handles an infinite loop with a repeatable prefix,
 finishing work and a final bare own-loop break. Every other own transfer must

@@ -1762,7 +1762,30 @@ function formatStaticInitializer(code, localState, cls, options = {}) {
 }
 
 function ownedPredicateFields(cls, options) {
-  return {owner: javaTypeFromInternalName(cls.className), fields: (cls.items || [])
+  const owner = javaTypeFromInternalName(cls.className);
+  let classQualifierUnshadowed = true;
+  const seen = new Set(), pending = [cls];
+  // Java expression-name lookup prefers fields to a same-spelled type. The
+  // qualifier must be known unshadowed across every superclass and interface;
+  // missing external declarations decline only this qualified-static evidence.
+  while (pending.length) {
+    const current = pending.pop();
+    if (seen.has(current.className)) continue;
+    if (seen.size >= 4096 || (current.items || []).some(item => item.type === 'field' && item.field
+        && sourceFieldName(current.className, item.field.name, options) === owner)
+        || [...nestedSourceNames.values()].some(type => type.outer === current.className.replace(/\//g, '.')
+          && type.simpleName === owner)) {
+      classQualifierUnshadowed = false; break;
+    }
+    seen.add(current.className);
+    for (const parent of [current.superClassName, ...(current.interfaces || [])].filter(Boolean)) {
+      if (parent === 'java/lang/Object') continue;
+      const info = options.exceptionModel?.classInfo?.get(parent);
+      if (!info) classQualifierUnshadowed = false;
+      else pending.push(info);
+    }
+  }
+  return {owner, classQualifierUnshadowed, fields: (cls.items || [])
     .filter(item => item.type === 'field' && item.field && !shouldSkipField(cls, item.field))
     .map(({field}) => ({name: sourceFieldName(cls.className, field.name, options),
       type: descriptorToJavaType(field.descriptor), static: (field.flags || []).includes('static')}))};

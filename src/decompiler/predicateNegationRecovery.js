@@ -24,7 +24,8 @@ function simplifyPredicateNegations(source, proof, {retainDiagnostics = false, p
   const fieldTypes = new Map();
   if (ownedFields !== null) {
     if (!ownedFields || typeof ownedFields !== 'object' || !/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/.test(ownedFields.owner || '')
-        || !Array.isArray(ownedFields.fields) || ownedFields.fields.length > 4096) return unchanged();
+        || !Array.isArray(ownedFields.fields) || ownedFields.fields.length > 4096
+        || ownedFields.classQualifierUnshadowed !== undefined && typeof ownedFields.classQualifierUnshadowed !== 'boolean') return unchanged();
     for (const field of ownedFields.fields) {
       if (!field || !/^[A-Za-z_$][\w$]*$/.test(field.name || '') || typeof field.type !== 'string'
           || !/^[A-Za-z_$][\w.$]*(?:\[\])*$/.test(field.type) || typeof field.static !== 'boolean'
@@ -111,7 +112,8 @@ function simplifyPredicateNegations(source, proof, {retainDiagnostics = false, p
       // class-qualified access is invalid as type evidence if its qualifier
       // can instead bind to a formal/local (including catches and loop locals).
       if (field && (node.target?.kind === 'ThisExpression'
-          || field.static && node.target?.kind === 'Identifier' && node.target.name === ownedFields.owner
+          || field.static && ownedFields.classQualifierUnshadowed === true && !fieldTypes.has(ownedFields.owner)
+            && node.target?.kind === 'Identifier' && node.target.name === ownedFields.owner
             && !formalTypes.has(node.target.name) && !declarations.has(node.target.name))) return field.type;
       return null;
     }
