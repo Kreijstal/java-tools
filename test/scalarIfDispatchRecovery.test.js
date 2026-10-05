@@ -69,6 +69,96 @@ test('oversized classifier and depth budgets refuse without dropping earlier wor
   assert.equal(recover(deep).source,deep);
 });
 
+test('nested suffix dispatch retains switches, loop exits and selector writes in its opaque prefix', () => {
+  const prefix='switch(other){case 0:step(9);break;default:step(8);}for(int i=0;i<2;i++){if(stop)break;step(i);}try{selected=prepare();}finally{mark();}';
+  const source='int selected=0;Section:{if(enabled){'+prefix+ladder(k=>'step('+k+');if(flag==0)break Section;')+'}}after();';
+  assert.equal(recover(source).source,source,'original whole-frame policy remains conservative');
+  const result=recover(source,{nestedRegions:true,retainDiagnostics:true});
+  assert.equal(result.dispatchesRecovered,1);assert.ok(result.source.includes(prefix));
+  assert.deepEqual(result.diagnostics.actions.flatMap(action=>action.cases),[3,6,7,5,4,2,1,0]);
+  assert.match(result.source,/if\(enabled\)\{/);assert.equal(result.source.match(/break Section;/g).length,9);
+  assert.equal(recover(result.source,{nestedRegions:true}).dispatchesRecovered,0);
+});
+
+test('nested region uses its own captured local scope and leaves surrounding case exits intact', () => {
+  for(const source of [
+    'Section:{if(enabled){int selected=prepare();'+ladder(k=>'step('+k+');if(flag==0)break Section;')+'}}',
+    'Section:{switch(other){case 0:{int selected=prepare();'+ladder(k=>'step('+k+');if(flag==0)break Section;')+'}break;default:step(9);}}',
+    'int selected=0;Outer:for(int round=0;round<2;round++){Section:{try{synchronized(lock){selected=prepare();'+ladder(k=>'step('+k+');if(flag==0)continue Outer;')+'}}finally{finish();}}}',
+  ])assert.equal(recover(source,{nestedRegions:true}).dispatchesRecovered,1);
+});
+
+test('nested suffix still refuses altered transfer destinations, mutable classifiers and merged scopes', () => {
+  const good='int selected=0;Section:{if(enabled){switch(other){default:step(9);}selected=prepare();'+[0,1,2].map(k=>'if(selected=='+k+'){step('+k+');break Section;}').join('')+'}}';
+  for(const source of [good.replace('step(0);','selected++;step(0);'),good.replace('step(0);','try{step(0);}finally{selected=2;}'),
+    good.replace('int selected=','Integer selected='),good.replace('step(0);','{int selected=0;step(selected);}'),
+    good.replace('step(0);','while(more()){step(0);}'),good.replace('step(0);','switch(extra){default:step(0);}'),
+    good.replace('step(0);','if(stop)break;step(0);'),good.replace('step(0);','class Nested{}step(0);'),
+    good+' // comment\n',good+'\\u000a',good.replace('break Section;','break Missing;')])
+    assert.equal(recover(source,{nestedRegions:true}).source,source);
+  assert.equal(recover(good,{nestedRegions:1}).source,good);
+});
+
+test('native nested suffixes match independent case runs after opaque prefixes and protected completion', () => {
+  const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'scalar-nested-dispatch-native-'));
+  const run=(command,args)=>{const r=spawnSync(command,args,{encoding:'utf8',maxBuffer:1024*1024});assert.equal(r.status,0,r.stderr||r.stdout);return r.stdout;};
+  const body=action=>'if(selected!=0){if(selected!=1){if(selected!=2){if(selected==3){'+action(3)+'}if(selected!=4){break Section;}'+action(4)+'}'+action(2)+'}'+action(1)+'}'+action(0);
+  let methods='';
+  for(let v=0;v<6;v++){
+    const action=k=>{
+      let inner=`emit(${k},mode);if(mode==5&&${k}==2)continue Rounds;if(mode==6&&${k}==1)return done();if(mode==9&&${k}==3)break Outer;if(flag==0||escape(${k},mode))break Section;`;
+      if(v===3||v===4)inner=`synchronized(mode==13?null:lock){emit(-7,mode);${inner}}`;
+      if(v===2)inner=`try{${inner}}catch(Specific failure){emit(-8,mode);break Outer;}`;
+      if(v===5)inner=`try{${inner}}catch(Specific failure){emit(-9,mode);throw failure;}`;
+      if(v===1||v===4)inner=`try{${inner}}finally{emit(20+${k},mode);if(mode==10)break Section;if(mode==11)continue Rounds;if(mode==12)return done();}`;
+      return inner;
+    };
+    const source=`int selected=0;Rounds:for(int round=0;round<2;round++){Outer:{Section:{synchronized(lock){if(enabled){switch(prefix){case 0:emit(-2,mode);if(flag==0)break;case 1:emit(-1,mode);break;default:emit(-3,mode);}for(int i=0;i<2;i++){emit(-10-i,mode);if(mode==16)break;}try{emit(-4,mode);selected=7;}finally{selected=input+round;emit(-5,mode);if(mode==15)return done();}${body(action)}emit(90,mode);}emit(91,mode);}}emit(92,mode);}emit(93,mode);}return done();`;
+    assert.equal(recover(source).dispatchesRecovered,0,'opaque prefix stays outside old policy');
+    const next=recover(source,{nestedRegions:true});assert.equal(next.dispatchesRecovered,1,'nested variant '+v);
+    assert.equal(recover(next.source,{nestedRegions:true}).dispatchesRecovered,0);
+    for(const [name,code]of Object.entries({old:source,next:next.source}))methods+=`static String ${name}${v}(int input,int flag,int mode,int prefix,boolean enabled,Object lock){${code}}\n`;
+  }
+  const fixture=`public class NestedDispatch {
+    static class Specific extends RuntimeException{}static final Specific FAILURE=new Specific();static int effects;static StringBuilder trace;
+    static void emit(int stage,int mode){trace.append(stage).append(',');effects=Integer.rotateLeft(effects^((stage+17)*0x9e3779b9),stage&31);if(stage==mode||stage==-4&&mode==14)throw FAILURE;}
+    static Boolean escape(int stage,int mode){trace.append('g').append(stage).append(',');if(mode==7&&stage==2)return null;return mode==8&&stage==0;}
+    static String done(){return effects+":"+trace;}
+    ${methods}
+    // The model selects an explicit observed run, then models pending
+    // completion independently; it does not parse or rebuild the if ladder.
+    static String oracle(int variant,int input,int flag,int mode,int prefix,boolean enabled,Object lock){
+      for(int round=0;round<2;round++){boolean leaveOuter=false,nextRound=false,leaveSection=false;
+        if(lock==null)throw new NullPointerException();
+        if(enabled){
+          if(prefix==0){emit(-2,mode);if(flag!=0)emit(-1,mode);}else emit(prefix==1?-1:-3,mode);
+          emit(-10,mode);if(mode!=16)emit(-11,mode);
+          int selected=0;Throwable prefixFailure=null;try{emit(-4,mode);}catch(Throwable failure){prefixFailure=failure;}selected=input+round;emit(-5,mode);if(mode==15)return done();if(prefixFailure!=null)throw FAILURE;
+          int[] run=selected==0?new int[]{0}:selected==1?new int[]{1,0}:selected==2?new int[]{2,1,0}:selected==3?new int[]{3}:selected==4?new int[]{4,2,1,0}:new int[]{};
+          for(int stage:run){Throwable failure=null;String pending=null;
+            if((variant==3||variant==4)&&mode==13)failure=new NullPointerException();else{
+              if(variant==3||variant==4)emit(-7,mode);
+              try{emit(stage,mode);if(mode==5&&stage==2)nextRound=true;else if(mode==6&&stage==1)pending=done();else if(mode==9&&stage==3)leaveOuter=true;else if(flag==0||escape(stage,mode))leaveSection=true;}catch(Throwable caught){failure=caught;}
+            }
+            if(failure==FAILURE&&variant==2){emit(-8,mode);failure=null;leaveOuter=true;}
+            if(failure==FAILURE&&variant==5)emit(-9,mode);
+            if(variant==1||variant==4){emit(20+stage,mode);if(mode==10){failure=null;pending=null;nextRound=false;leaveOuter=false;leaveSection=true;}else if(mode==11){failure=null;pending=null;leaveOuter=false;leaveSection=false;nextRound=true;}else if(mode==12){failure=null;pending=done();leaveOuter=false;leaveSection=false;nextRound=false;}}
+            if(failure!=null){if(failure==FAILURE)throw FAILURE;throw new NullPointerException();}if(pending!=null)return pending;if(leaveOuter||leaveSection||nextRound)break;
+          }
+          // Key 3 exits the original plain frame after its guarded action;
+          // unknown keys also exit without entering any case action.
+          if(!leaveOuter&&!nextRound&&!leaveSection){if(selected==3||run.length==0)leaveSection=true;else emit(90,mode);}
+        }
+        if(nextRound)continue;if(!leaveOuter&&!leaveSection)emit(91,mode);if(!leaveOuter)emit(92,mode);emit(93,mode);
+      }return done();
+    }
+    static String invoke(int kind,int variant,int input,int flag,int mode,int prefix,boolean enabled,Object lock,int seed){effects=seed;trace=new StringBuilder();String result;try{if(kind==2)result=oracle(variant,input,flag,mode,prefix,enabled,lock);else switch(variant){${Array.from({length:6},(_,i)=>`case ${i}:result=kind==0?old${i}(input,flag,mode,prefix,enabled,lock):next${i}(input,flag,mode,prefix,enabled,lock);break;`).join('')}default:throw new AssertionError();}}catch(Throwable failure){if(failure==FAILURE)result="injected";else if(failure instanceof NullPointerException)result="null";else throw new AssertionError(failure);}if(lock!=null&&Thread.holdsLock(lock))throw new AssertionError("monitor leaked");return result+"|"+effects+"|"+trace;}
+    public static void main(String[]args){int cases=0;Object monitor=new Object();for(int variant=0;variant<6;variant++)for(int input:new int[]{Integer.MIN_VALUE,-1,0,1,2,3,4,5,Integer.MAX_VALUE})for(int flag:new int[]{-5,0,7})for(int mode=0;mode<17;mode++)for(int prefix=-1;prefix<=1;prefix++)for(boolean enabled:new boolean[]{false,true})for(Object lock:new Object[]{null,monitor})for(int seed:new int[]{Integer.MIN_VALUE,0,Integer.MAX_VALUE}){String expected=invoke(2,variant,input,flag,mode,prefix,enabled,lock,seed);for(int kind=0;kind<2;kind++){String actual=invoke(kind,variant,input,flag,mode,prefix,enabled,lock,seed);if(!actual.equals(expected))throw new AssertionError(variant+":"+input+":"+flag+":"+mode+":"+prefix+":"+enabled+":"+seed+":"+actual+" != "+expected);}cases++;}System.out.println(cases+" independent nested dispatch cases");}
+  }`;
+  try{const file=path.join(temporary,'NestedDispatch.java');fs.writeFileSync(file,fixture);run('javac',['--release','8','-d',temporary,file]);assert.equal(run('java',['-XX:-OmitStackTraceInFastThrow','-Xmx128m','-cp',temporary,'NestedDispatch']).trim(),'99144 independent nested dispatch cases');}
+  finally{fs.rmSync(temporary,{recursive:true,force:true});}
+});
+
 test('empty defaults and extreme case constants compile and match an independent value oracle', () => {
   const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'scalar-empty-dispatch-native-'));
   const run=(command,args)=>{const r=spawnSync(command,args,{encoding:'utf8'});assert.equal(r.status,0,r.stderr||r.stdout);return r.stdout;};

@@ -2095,6 +2095,15 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
     source = grouping.source;
     changed = true;
   }
+  // Classify a nested suffix after its intact prefix has run. Prefix switches,
+  // selector writes and protected constructs remain outside the new switch;
+  // existing labeled transfers and every guarded fallthrough stay unchanged.
+  for (;;) {
+    const dispatch = recoverScalarIfDispatches(source, {nestedRegions: true});
+    if (!dispatch.dispatchesRecovered) break;
+    source = dispatch.source;
+    changed = true;
+  }
   if (changed) replaceArrayContents(body, source.split('\n'));
 }
 

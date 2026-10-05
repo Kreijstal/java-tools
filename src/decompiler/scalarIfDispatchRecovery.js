@@ -4,9 +4,10 @@
 // Keep all effectful actions and flag guards, in their original lexical order.
 // Accept only paths that are contiguous runs or leave the existing plain label;
 // never duplicate a shared action or assume another guard's value.
-function recoverScalarIfDispatches(source, proof, {retainDiagnostics = false} = {}) {
+function recoverScalarIfDispatches(source, proof, {retainDiagnostics = false, nestedRegions = false} = {}) {
   const unchanged = () => ({source, dispatchesRecovered: 0});
-  if (!proof || typeof retainDiagnostics !== 'boolean') return unchanged();
+  if (!proof || typeof retainDiagnostics !== 'boolean' || typeof nestedRegions !== 'boolean'
+      || source.length > 400000) return unchanged();
   const {wrapped, parsed, tokens, starts, closes, children, labelCounts} = proof;
   const loops = new Set(['WhileStatement', 'ForStatement', 'DoWhileStatement', 'EnhancedForStatement']);
   const parents = new Map(), targets = new Map(), locals = new Map(), names = new Map(), ends = new Map();
@@ -116,21 +117,30 @@ function recoverScalarIfDispatches(source, proof, {retainDiagnostics = false} = 
     if (number < -2147483648 || number > 2147483647) return null;
     return {name: id.name, value: number, equal: (node.operator === '==') !== negate, identifier: id};
   }
-  function candidate(frame) {
-    if (frame.kind !== 'LabeledStatement' || frame.statement?.kind !== 'BlockStatement') return null;
-    const block = frame.statement, open = starts.get(block.range?.startOffset), close = closes.get(open);
+  function candidate(frame, block = frame.statement, offset) {
+    if (frame.kind !== 'LabeledStatement' || frame.statement?.kind !== 'BlockStatement'
+        || block?.kind !== 'BlockStatement') return null;
+    const open = starts.get(block.range?.startOffset), close = closes.get(open);
     if (tokens[open]?.text !== '{' || tokens[close]?.text !== '}'
         || tokens[close].range.endOffset - tokens[open].range.startOffset > 40000) return null;
+    let first = offset ?? 0;
+    if (offset === undefined) while (['ExpressionStatement', 'EmptyStatement'].includes(block.statements[first]?.kind)) first++;
+    const initial = block.statements[first], initialTest = initial?.kind === 'IfStatement' && comparison(initial.condition);
+    if (!initialTest) return null;
+    // The prefix stays byte-for-byte in place, outside the new switch. Its
+    // declarations, switches, loop exits and selector writes therefore keep
+    // their scopes/destinations. Only the selected suffix is classified.
+    const dispatch = {kind: 'BlockStatement', statements: block.statements.slice(first)};
     let refused = false;
     const classifiers = new Map();
-    walk(block, node => {
+    walk(dispatch, node => {
       // Do not merge declaration scopes or change destinations of bare breaks.
       // Inner control frames are opaque until a separate proof supports them.
       if (['LocalVariableDeclarationStatement', 'LabeledStatement', 'SwitchStatement', ...loops].includes(node.kind)
           || node.kind === 'BreakStatement' && !node.label) refused = true;
       if (node.kind === 'IfStatement') {
         const test = comparison(node.condition), local = locals.get(test?.name);
-        if (test && names.get(test.name) === 1 && local && frame.range.startOffset >= local.start
+        if (test && names.get(test.name) === 1 && local && initial.range.startOffset >= local.start
             && tokens[close].range.endOffset <= local.end) {
           if (!classifiers.has(test.name)) classifiers.set(test.name, new Set());
           classifiers.get(test.name).add(test.value);
@@ -140,11 +150,7 @@ function recoverScalarIfDispatches(source, proof, {retainDiagnostics = false} = 
     if (refused) return null;
     for (const [name, values] of classifiers) {
       if (values.size < 3 || values.size > 16) continue;
-      let first = 0;
-      while (['ExpressionStatement', 'EmptyStatement'].includes(block.statements[first]?.kind)) first++;
-      const initial = block.statements[first], initialTest = initial?.kind === 'IfStatement' && comparison(initial.condition);
       if (!initialTest || initialTest.name !== name) continue;
-      const dispatch = {kind: 'BlockStatement', statements: block.statements.slice(first)};
       const prefixEnd = tokens[starts.get(initial.range.startOffset)].range.startOffset;
       let written = false;
       walk(dispatch, node => {
@@ -177,7 +183,7 @@ function recoverScalarIfDispatches(source, proof, {retainDiagnostics = false} = 
         const action = {node, first, end, normal: normal(node), ownExit: node.kind === 'BreakStatement' && targets.get(node) === frame};
         actions.push(action); return {action: actions.length - 1};
       }
-      normal(block);
+      normal(dispatch);
       const tree = build(dispatch);
       if (!tree || invalid || conditions.length < 3 || conditions.length > 32 || actions.length > 128) continue;
       function path(tree, value, result) {
@@ -220,6 +226,21 @@ function recoverScalarIfDispatches(source, proof, {retainDiagnostics = false} = 
   }
   let selected;
   walk(parsed, node => { if (!selected) selected = candidate(node); });
+  if (!selected && nestedRegions) {
+    let attempts = 0;
+    walk(parsed, block => {
+      if (selected || attempts >= 128 || block.kind !== 'BlockStatement') return;
+      let frame = parents.get(block);
+      while (frame && !(frame.kind === 'LabeledStatement' && frame.statement?.kind === 'BlockStatement')) frame = parents.get(frame);
+      if (!frame) return;
+      for (let index = 0; index < block.statements.length && !selected && attempts < 128; index++) {
+        const node = block.statements[index];
+        if (node.kind !== 'IfStatement' || !comparison(node.condition)) continue;
+        attempts++;
+        selected = candidate(frame, block, index);
+      }
+    });
+  }
   if (!selected) return unchanged();
   const {frame, open, close, name, prefixEnd, actions, conditions, entries, empty, cuts} = selected;
   const begin = tokens[open].range.endOffset, end = tokens[close].range.startOffset;

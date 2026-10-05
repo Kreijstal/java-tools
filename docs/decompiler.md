@@ -1764,6 +1764,24 @@ declarations, ambiguous transfers, mutable or boxed classifiers, unsupported
 syntax and excessive depth/action counts refuse this feature. The ordinary
 cleanup path runs it after the existing guard/loop recovery passes.
 
+The optional `{nestedRegions: true}` also searches suffixes inside blocks
+enclosed by a plain label. It keeps the complete prefix in place outside the
+new switch, including declarations, earlier switches/loops, selector writes,
+and whole protected constructs. The selected suffix must still meet every
+ordinary dispatch restriction. Its unique local must be in scope at the first
+comparison and remain unmodified until the suffix ends. Bare breaks in the
+suffix refuse because a new switch would change their destination; prefix
+breaks retain their original frames. Scalar captures declared inside the same
+block are supported. At most 128 suffix candidates are inspected, with the
+existing 40,000-character region limit and a 400,000-character body limit.
+The compiler runs this option after its other structural/predicate cleanup;
+the default whole-frame policy stays conservative.
+
+Four additional test groups cover nested capture scopes, opaque prefixes and
+unsafe suffixes. Six independent native models compare 99,144 cases across
+guarded fallthrough, zero/nonzero flags, selector writes, null unboxing/monitors,
+signed overflow, injected failures and return/break/continue/finally completion.
+
 `node --test test/scalarIfDispatchRecovery.test.js` covers supported case runs,
 empty/default paths, integer extremes, scope/target/mutation refusals and budgets.
 Seven native variants compare 20,160 independent cases, retaining negative/zero/
