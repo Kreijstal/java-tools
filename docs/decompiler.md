@@ -54,6 +54,38 @@ injected failures, return/finally priority and monitor ownership. Publication
 still requires compiling and independently auditing the complete exported
 corpus, including retired labels and resulting lexical-label ordinal migrations.
 
+### Guarded primitive-local value selection
+
+The final emitter phase also recognizes a provisional local assignment followed
+by a keep-value guard and a fallback assignment. For example,
+`Pick: { if (test()) { value = 235; if (flag == 0) break Pick; } value = 285; }`
+becomes `value = (test()) && (flag == 0) ? (235) : (285);`.
+The condition remains evaluated once, with its original effects and unboxing.
+The captured flag remains a value read; its initializer is never treated as a
+constant. The guard and both value expressions must be total expressions over
+proven primitive locals or parameters. Calls, fields, arrays, unboxing,
+division, remainder, mutations and unsupported syntax refuse the proof.
+Neither the guard nor the fallback may read the destination: those reads would
+observe the provisional store on the original path. Only a uniquely scoped
+primitive local is a destination; fields, arrays and formal parameters remain.
+
+The value expressions must have the same Java primitive type, avoiding
+conditional numeric promotion and precision changes. Narrow destinations use
+an explicit byte/short/char cast when required to preserve assignment conversion
+and compilation. Parentheses retain every numeric expression's association.
+The exact frame contains no extra actions, declarations or protected boundary;
+enclosing try/catch/finally and monitor scopes stay in place. Diagnostics identify
+each original value, guard, local store, declaration and consumed labeled exit.
+The generic primitive-expression proof is shared with redundant-exit cleanup;
+it proves types and scope, not values.
+
+`node --test test/guardedLocalAssignmentRecovery.test.js` checks the normal
+emitter phase, token origins, dependencies, scope and refusal cases. Native
+independent tables compare 30,240 cases across six completion contexts, with
+condition callbacks, nullable unboxing, partial failures, signed overflow,
+finally overrides and monitor release. Nine primitive models add 378 typed
+cases for narrowing, signed zero, NaN and integers beyond double precision.
+
 ### Effect-free guards with identical exits
 
 The final cleanup also removes a guard such as `if (flag == 0) break; break;`

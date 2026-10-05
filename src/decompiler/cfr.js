@@ -3,7 +3,7 @@
 const {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits, foldNonlocalLoopExits, foldLoopElseExitGuards, foldTerminalLoopTails} = require('./javaAstEmitter');
 const {recoverScalarIfDispatches, simplifyPredicateNegations, simplifyDominatedPredicates, finalizeControlFrames, finalizeTerminalSwitchFrames, foldRedundantExitGuards} = require('./javaAstEmitter');
 const {simplifyPredicateGrouping} = require('./javaAstEmitter');
-const {foldScalarSwitchPrefixes, foldBooleanLocalAssignments, foldNaturalLoopExits} = require('./javaAstEmitter');
+const {foldScalarSwitchPrefixes, foldBooleanLocalAssignments, foldNaturalLoopExits, foldGuardedLocalAssignments} = require('./javaAstEmitter');
 
 const fs = require('fs');
 const path = require('path');
@@ -2134,6 +2134,13 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
   const lateSwitchFrames = finalizeTerminalSwitchFrames(source);
   if (lateSwitchFrames.breaksLocalized) {
     source = lateSwitchFrames.source;
+    changed = true;
+  }
+  // A total primitive guard can select a provisional local value directly.
+  // Preserve the condition's effects and reject dependencies on that store.
+  const guardedAssignments = foldGuardedLocalAssignments(source, {parameters});
+  if (guardedAssignments.assignmentsFolded) {
+    source = guardedAssignments.source;
     changed = true;
   }
   if (changed) replaceArrayContents(body, source.split('\n'));

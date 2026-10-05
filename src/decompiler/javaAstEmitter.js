@@ -15,6 +15,7 @@ const { simplifyPredicateGrouping: simplifyGrouping } = require('./predicateGrou
 const { specializePathGuards: specializeGuards } = require('./pathGuardRecovery');
 const { simplifyDominatedPredicates: simplifyDominated } = require('./dominatedPredicateRecovery');
 const { foldRedundantExitGuards: recoverRedundantExitGuards } = require('./redundantExitGuardRecovery');
+const { foldGuardedLocalAssignments: recoverGuardedLocalAssignments } = require('./guardedLocalAssignmentRecovery');
 const { recoverArrayIndexIncrements: recoverIndexIncrements } = require('./incrementCaptureRecovery');
 const { foldGuardedAbruptPlainBlockExits: recoverGuardedAbruptExit } = require('./guardedAbruptExitRecovery');
 const { foldGuardedLoopContinuations: recoverLoopContinuation, foldNonrepeatingWhileLoops: recoverNonrepeatingLoops,
@@ -680,6 +681,13 @@ function simplifyDominatedPredicates(source, options = {}) {
 
 function foldRedundantExitGuards(source, options = {}) {
   return recoverRedundantExitGuards(source, controlCleanupSource(source), options);
+}
+
+function foldGuardedLocalAssignments(source, options = {}) {
+  let proof;
+  try { proof = controlCleanupSource(source); }
+  catch (error) { if (error instanceof RangeError) return {source, assignmentsFolded: 0}; throw error; }
+  return recoverGuardedLocalAssignments(source, proof, options);
 }
 
 function specializePathGuards(source, options = {}) {
@@ -3312,6 +3320,7 @@ module.exports = {
   recoverScalarIfDispatches,
   foldScalarSwitchPrefixes,
   foldBooleanLocalAssignments,
+  foldGuardedLocalAssignments,
   simplifyPredicateNegations,
   simplifyPredicateGrouping,
   specializePathGuards,
