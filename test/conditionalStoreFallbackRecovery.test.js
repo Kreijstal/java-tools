@@ -1,6 +1,6 @@
 'use strict';
 const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),os=require('node:os'),path=require('node:path'),{spawnSync}=require('node:child_process');
-const {foldConditionalStoreFallbacks:fold,foldArithmeticStoreFallbacks:arithmetic,foldTerminalGuardedFrameExits:terminal}=require('../src/decompiler/javaAstEmitter');
+const {foldConditionalStoreFallbacks:fold,foldArithmeticStoreFallbacks:arithmetic,foldTerminalGuardedFrameExits:terminal,simplifyPredicateNegations:negate,simplifyPredicateGrouping:group}=require('../src/decompiler/javaAstEmitter');
 const {shareExistingExitTails:finish}=require('../src/decompiler/cfr')._internals;
 const fields={owner:'Game',fields:[{name:'position',type:'int',static:false}]};
 const frame=suffix=>'Frame:{if(choose()){if(early())break Frame;prefix();if(keep())break Frame;}'+suffix+'}';
@@ -10,7 +10,7 @@ test('whole conditional primitive continuations occupy exclusive arms without du
 });
 test('normal emission recovers a complete conditional continuation',()=>{
  const body=[frame(suffix)];finish(body,[],[],fields);
- assert.equal(body[0],'if(choose()){if (!(early())) {prefix();if (!(keep())) {this.position=this.position+1;if(post()){this.position=this.position-1;}}}} else {this.position=this.position+1;if(post()){this.position=this.position-1;}}');
+ assert.equal(body[0],'if(choose()){if (!early()) {prefix();if (!keep()) {this.position=this.position+1;if(post()){this.position=this.position-1;}}}} else {this.position=this.position+1;if(post()){this.position=this.position-1;}}');
 });
 test('braced/scalar if/else trees, boolean stores and original expression association remain explicit',()=>{
  for(const tail of ['this.position=1;if(post())this.position=2;','if(post()){this.position=1;}else{this.position=2;}','this.position=0;if(first()){if(second())this.position=1;else this.position=2;}'])assert.equal(fold(frame(tail),{ownedFields:fields}).framesRecovered,1,tail);
@@ -36,7 +36,7 @@ test('native conditional continuations preserve nullable predicates, callback or
  const prefix='event(1);x=x+seed;y=y-1;counter=counter+seed;if(inject==1)throw FAILURE;';
  try{let methods='',models=0;for(const protect of contexts)for(const nested of [false,true])for(const [fallback,oracleTail]of fallbacks){
   const active='if(probe(conditionBox)){if(early(earlyBox))break Frame;'+prefix+'if(keep(guardBox,inject))break Frame;}'+fallback;
-  const source='int x=seed;long y=seed;'+protect('Frame:{'+(nested?'if(outer(outerBox)){'+active+'}':active)+'}event(3);')+'return snap(x,y);',next=fold(source,{parameters:[{name:'seed',type:'int'}],ownedFields:{owner:'ConditionalNative',fields:[{name:'counter',type:'int',static:true}]}});assert.equal(next.framesRecovered,1);assert.equal(next.sharedFramesRetained,1);const clean=terminal(next.source);assert.equal(clean.labelsRemoved,1);
+  const source='int x=seed;long y=seed;'+protect('Frame:{'+(nested?'if(outer(outerBox)){'+active+'}':active)+'}event(3);')+'return snap(x,y);',next=fold(source,{parameters:[{name:'seed',type:'int'}],ownedFields:{owner:'ConditionalNative',fields:[{name:'counter',type:'int',static:true}]}});assert.equal(next.framesRecovered,1);assert.equal(next.sharedFramesRetained,1);const clean=terminal(next.source);assert.equal(clean.labelsRemoved,1);for(;;){const normalized=negate(clean.source,{parameters:[{name:'seed',type:'int'}],ownedFields:{owner:'ConditionalNative',fields:[{name:'counter',type:'int',static:true}]}});if(!normalized.predicatesSimplified)break;clean.source=normalized.source;}clean.source=group(clean.source).source;
   const select='boolean selected=probe(conditionBox);boolean use=true;if(selected){boolean leave=early(earlyBox);if(leave)use=false;else{'+prefix+'use=!keep(guardBox,inject);}}if(use){'+oracleTail+'}';
   const oracle='int x=seed;long y=seed;'+protect((nested?'if(outer(outerBox)){'+select+'}':select)+'event(3);')+'return snap(x,y);';
   for(const[name,body]of [['old',source],['next',next.source],['clean',clean.source],['oracle',oracle]])methods+=`static String ${name}${models}(Boolean outerBox,Boolean conditionBox,Boolean earlyBox,Boolean guardBox,Boolean postBox,int seed,int inject,int mode){${body}}\n`;models++;

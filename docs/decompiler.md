@@ -106,7 +106,9 @@ their policy. Remaining exits keep their original frame name and scope. The
 normal emitter then rechecks terminal guarded exits exposed by these complete
 exclusive arms, guarding each entire suffix and retiring a label only when its
 last reference disappears. The actual intermediate source must be independently
-reattributed before publication.
+reattributed before publication. Predicate operators and condition grouping
+are then finalized again, so the newly exposed inverse guards use direct
+comparisons where their types permit them.
 
 `node --test test/conditionalStoreFallbackRecovery.test.js` covers six groups
 and 1,049,760 native cases across 36 models. Independent oracles compare original,

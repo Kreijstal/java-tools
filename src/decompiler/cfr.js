@@ -2239,6 +2239,15 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
     if (!conditionalRemainder.guardsRecovered) break;
     source = conditionalRemainder.source; changed = true;
   }
+  for (;;) {
+    const conditionalPredicates = simplifyPredicateNegations(source, {parameters, ownedFields});
+    if (!conditionalPredicates.predicatesSimplified) break;
+    source = conditionalPredicates.source; changed = true;
+  }
+  const conditionalGrouping = simplifyPredicateGrouping(source);
+  if (conditionalGrouping.parenthesisPairsRemoved) {
+    source = conditionalGrouping.source; changed = true;
+  }
   if (changed) replaceArrayContents(body, source.split('\n'));
 }
 
