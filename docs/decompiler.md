@@ -93,6 +93,30 @@ and six contexts. It checks callback order, partial writes, nullable unboxing,
 NaNs, signed overflow, guard mutations, finally overrides and monitor release.
 Another 55 FP-strict arithmetic cases cover underflow, overflow and signed zero.
 
+### Terminal guarded frame remainders
+
+`foldTerminalGuardedFrameExits` replaces a direct guarded break followed by
+work with an inverse guard around that complete suffix. The containing block
+must reach the frame's end through only terminal plain blocks and if arms.
+No condition or action is copied or reevaluated; whole nested/protected suffixes
+stay together. Nonterminal work and corridors crossing loops, try/catch/finally,
+monitors or other unsupported boundaries refuse.
+
+The last eligible guard recovers first. Other exits retain their existing frame
+name and scope; the last removed reference retires that label. Declaration and
+scalar-statement scopes retain braces when needed. Diagnostics provide exact
+frame/container/guard/suffix ranges, corridor kinds and the consumed transfer
+for independent javac continuation and per-occurrence binding validation.
+Source/nesting/label/transfer and individual-region limits bound the work.
+
+`node --test test/terminalGuardedFrameRecovery.test.js` covers six groups,
+including 77,760 native comparisons across 24 direct/nested/chained/protected
+models. Nullable and effectful guards, partial writes, overflow, local aliases,
+nested loop exits, returns, throws, finally priority and monitor release are
+compared with an independent structured oracle. Publication checks every
+original action and binding, consumed and remaining transfers, protected scopes,
+retained/retired label identities, compilation and byte reversal.
+
 ### Guarded primitive-store fallbacks
 
 `foldGuardedStoreFallbacks` extends exclusive fallback reconstruction to one
