@@ -4,9 +4,9 @@ const {primitiveExpressionProof} = require('./primitiveExpressionProof');
 // Preserve an unstable condition/guard once. A bounded sequence of integral or
 // boolean stores can occupy exclusive arms, so no selector or predicate copy is
 // needed. Only terminal plain-block/if corridors may lead to the frame exit.
-function foldGuardedStoreFallbacks(source, proof, {parameters = [], ownedFields = null, retainDiagnostics = false, preserveSharedFrames = false} = {}) {
+function foldGuardedStoreFallbacks(source, proof, {parameters = [], ownedFields = null, retainDiagnostics = false, preserveSharedFrames = false, allowIntegralArithmetic = false} = {}) {
   const unchanged = () => ({source, framesRecovered: 0});
-  if (!proof || typeof retainDiagnostics !== 'boolean' || typeof preserveSharedFrames !== 'boolean' || source.length > 400000) return unchanged();
+  if (!proof || typeof retainDiagnostics !== 'boolean' || typeof preserveSharedFrames !== 'boolean' || typeof allowIntegralArithmetic !== 'boolean' || source.length > 400000) return unchanged();
   const {parsed, tokens, starts, closes, children, labelCounts} = proof;
   if (labelCounts.size > 256 || [...labelCounts.values()].some(count => count !== 1)) return unchanged();
   const primitive = primitiveExpressionProof(proof, parameters);
@@ -50,9 +50,24 @@ function foldGuardedStoreFallbacks(source, proof, {parameters = [], ownedFields 
     node = bare(node);
     return supported.has(valueType(node, site)) && (['Identifier', 'LiteralExpression', 'FieldAccessExpression'].includes(node?.kind) || node?.kind === 'UnaryExpression' && node.prefix === true && ['+', '-'].includes(node.operator) && bare(node.operand)?.kind === 'LiteralExpression');
   }
+  const integral = type => ['byte', 'short', 'char', 'int', 'long'].includes(type);
+  function arithmeticValue(node, site, depth = 0) {
+    if (!node || depth > 16) return null;
+    node = bare(node);
+    if (simpleValue(node, site)) return valueType(node, site);
+    if (node.kind === 'UnaryExpression' && node.prefix === true && ['+', '-', '~'].includes(node.operator)) {
+      const operand = arithmeticValue(node.operand, site, depth + 1);
+      return integral(operand) ? operand === 'long' ? 'long' : 'int' : null;
+    }
+    if (node.kind !== 'BinaryExpression' || !['+', '-', '*', '/', '%', '&', '|', '^', '<<', '>>', '>>>'].includes(node.operator)) return null;
+    const left = arithmeticValue(node.left, site, depth + 1), right = arithmeticValue(node.right, site, depth + 1);
+    if (!integral(left) || !integral(right)) return null;
+    return ['<<', '>>', '>>>'].includes(node.operator) ? left === 'long' ? 'long' : 'int'
+      : left === 'long' || right === 'long' ? 'long' : 'int';
+  }
   function simpleStore(statement) {
     const store = statement?.expression, destination = bare(store?.left), site = statement?.range?.startOffset;
-    return statement?.kind === 'ExpressionStatement' && store?.kind === 'AssignmentExpression' && store.operator === '=' && ['Identifier', 'FieldAccessExpression'].includes(destination?.kind) && supported.has(valueType(destination, site)) && simpleValue(store.right, site);
+    return statement?.kind === 'ExpressionStatement' && store?.kind === 'AssignmentExpression' && store.operator === '=' && ['Identifier', 'FieldAccessExpression'].includes(destination?.kind) && supported.has(valueType(destination, site)) && (allowIntegralArithmetic ? supported.has(arithmeticValue(store.right, site)) : simpleValue(store.right, site));
   }
   function corridor(block, frame) {
     const kinds = []; let current = block;

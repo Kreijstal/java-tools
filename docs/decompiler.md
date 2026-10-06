@@ -93,6 +93,24 @@ and six contexts. It checks callback order, partial writes, nullable unboxing,
 NaNs, signed overflow, guard mutations, finally overrides and monitor release.
 Another 55 FP-strict arithmetic cases cover underflow, overflow and signed zero.
 
+### Arithmetic fallback stores
+
+`foldArithmeticStoreFallbacks` permits bounded integral arithmetic in primitive
+assignment fallbacks. It preserves original expression association and read order,
+including signed overflow, shifts and division/remainder failures. Exclusive
+source arms execute each original store once on its original paths. Other frame
+exits retain their name and scope; the final reference can retire the frame.
+Scoped local/formal and owned-field evidence is required. Floating, boxed,
+unknown, cast, call, increment, array and conditional operands refuse. Original
+simple-store APIs retain their existing policy.
+
+`node --test test/arithmeticStoreFallbackRecovery.test.js` checks six groups,
+including 262,440 native comparisons across 36 models. Independent oracles cover
+nullable early/keep guards, prefix mutations, volatile reads, overflow, shifts,
+zero divisors, partial writes, aliases, finally overrides and monitor release.
+Publication independently attributes every arithmetic operand, original/copied
+binding and surviving transfer/protected scope before export.
+
 ### Final conditions after structural recovery
 
 The normal emitter finishes predicate operators and condition grouping after

@@ -3,7 +3,7 @@
 const {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits, foldNonlocalLoopExits, foldLoopElseExitGuards, foldTerminalLoopTails} = require('./javaAstEmitter');
 const {recoverScalarIfDispatches, simplifyPredicateNegations, simplifyDominatedPredicates, finalizeControlFrames, finalizeTerminalSwitchFrames, foldRedundantExitGuards} = require('./javaAstEmitter');
 const {simplifyPredicateGrouping} = require('./javaAstEmitter');
-const {foldScalarSwitchPrefixes, foldBooleanLocalAssignments, foldNaturalLoopExits, foldGuardedLocalAssignments, foldStableGuardedFallbacks, foldGuardedAssignmentSequences, simplifySelfCasts, foldSinglePassInnerLoops, foldSmallGuardedFallbacks, foldTerminalLoopFrames, foldGuardedStoreFallbacks, foldTerminalGuardedFrameExits, foldTerminalFrameLoops, foldSharedGuardedFallbacks, foldSharedStoreFallbacks} = require('./javaAstEmitter');
+const {foldScalarSwitchPrefixes, foldBooleanLocalAssignments, foldNaturalLoopExits, foldGuardedLocalAssignments, foldStableGuardedFallbacks, foldGuardedAssignmentSequences, simplifySelfCasts, foldSinglePassInnerLoops, foldSmallGuardedFallbacks, foldTerminalLoopFrames, foldGuardedStoreFallbacks, foldTerminalGuardedFrameExits, foldTerminalFrameLoops, foldSharedGuardedFallbacks, foldSharedStoreFallbacks, foldArithmeticStoreFallbacks} = require('./javaAstEmitter');
 
 const fs = require('fs');
 const path = require('path');
@@ -2223,6 +2223,11 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
   const finalGrouping = simplifyPredicateGrouping(source);
   if (finalGrouping.parenthesisPairsRemoved) {
     source = finalGrouping.source; changed = true;
+  }
+  for (;;) {
+    const arithmeticStores = foldArithmeticStoreFallbacks(source, {parameters, ownedFields});
+    if (!arithmeticStores.framesRecovered) break;
+    source = arithmeticStores.source; changed = true;
   }
   if (changed) replaceArrayContents(body, source.split('\n'));
 }
