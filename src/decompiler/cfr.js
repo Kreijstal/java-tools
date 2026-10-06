@@ -2234,6 +2234,11 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
     if (!conditionalStores.framesRecovered) break;
     source = conditionalStores.source; changed = true;
   }
+  for (;;) {
+    const conditionalRemainder = foldTerminalGuardedFrameExits(source);
+    if (!conditionalRemainder.guardsRecovered) break;
+    source = conditionalRemainder.source; changed = true;
+  }
   if (changed) replaceArrayContents(body, source.split('\n'));
 }
 

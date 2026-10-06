@@ -10,7 +10,7 @@ test('whole conditional primitive continuations occupy exclusive arms without du
 });
 test('normal emission recovers a complete conditional continuation',()=>{
  const body=[frame(suffix)];finish(body,[],[],fields);
- assert.equal(body[0],'Frame:{if(choose()){if(early())break Frame;prefix();if (!(keep())) {this.position=this.position+1;if(post()){this.position=this.position-1;}}} else {this.position=this.position+1;if(post()){this.position=this.position-1;}}}');
+ assert.equal(body[0],'if(choose()){if (!(early())) {prefix();if (!(keep())) {this.position=this.position+1;if(post()){this.position=this.position-1;}}}} else {this.position=this.position+1;if(post()){this.position=this.position-1;}}');
 });
 test('braced/scalar if/else trees, boolean stores and original expression association remain explicit',()=>{
  for(const tail of ['this.position=1;if(post())this.position=2;','if(post()){this.position=1;}else{this.position=2;}','this.position=0;if(first()){if(second())this.position=1;else this.position=2;}'])assert.equal(fold(frame(tail),{ownedFields:fields}).framesRecovered,1,tail);

@@ -102,7 +102,11 @@ once on the original paths. Original association and arithmetic failures remain.
 A continuation has at most eight store leaves, four tree levels, 24 statement
 nodes and the existing 128-token/1-KiB budget. Declarations, transfers, loops,
 protected regions and unsupported stores refuse. Earlier store APIs retain
-their policy. Remaining exits keep their original frame name and scope.
+their policy. Remaining exits keep their original frame name and scope. The
+normal emitter then rechecks terminal guarded exits exposed by these complete
+exclusive arms, guarding each entire suffix and retiring a label only when its
+last reference disappears. The actual intermediate source must be independently
+reattributed before publication.
 
 `node --test test/conditionalStoreFallbackRecovery.test.js` covers six groups
 and 1,049,760 native cases across 36 models. Independent oracles compare original,
