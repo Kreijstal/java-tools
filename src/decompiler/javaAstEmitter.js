@@ -26,7 +26,7 @@ const { foldGuardedLoopContinuations: recoverLoopContinuation, foldNonrepeatingW
   foldLoopExitContinuations: recoverLoopExitContinuation,
   foldTerminalLoopExits: recoverTerminalLoopExit,
   foldNonlocalLoopExits: recoverNonlocalLoopExit,
-  foldLoopElseExitGuards: recoverLoopElseExitGuard,
+  foldLoopElseExitGuards: recoverLoopElseExitGuard, foldSinglePassInnerLoops: recoverSinglePassInner,
   foldTerminalLoopTails: recoverTerminalLoopTail, foldNaturalLoopExits: recoverNaturalLoopExit } = require('./guardedLoopContinuationRecovery');
 
 const rawExpression = (source) => createNode('UnsupportedExpression', { source: String(source) });
@@ -705,6 +705,11 @@ function foldGuardedAssignmentSequences(source, options = {}) {
   try { proof = controlCleanupSource(source); }
   catch (error) { if (error instanceof RangeError) return {source, sequencesFolded: 0}; throw error; }
   return recoverGuardedAssignmentSequences(source, proof, options);
+}
+
+function foldSinglePassInnerLoops(source, options = {}) {
+  try { return recoverSinglePassInner(source, controlCleanupSource(source), options); }
+  catch (error) { if (error instanceof RangeError) return {source, innerLoopsRecovered: 0}; throw error; }
 }
 
 function simplifySelfCasts(source, options = {}) {
@@ -3352,6 +3357,7 @@ module.exports = {
   foldStableGuardedFallbacks,
   foldGuardedAssignmentSequences,
   simplifySelfCasts,
+  foldSinglePassInnerLoops,
   simplifyPredicateNegations,
   simplifyPredicateGrouping,
   specializePathGuards,

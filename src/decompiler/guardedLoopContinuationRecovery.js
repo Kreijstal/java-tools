@@ -6,10 +6,11 @@
 // the continuation cannot repeat/exit this loop or complete normally. Keep
 // each protected construct whole and retain every existing transfer target.
 function recoverLoopForms(source, proof, {parameterNames = [], retainDiagnostics = false} = {}, form = 'guarded') {
-  const counter = form === 'naturalExits' ? 'loopExitsRecovered' : form === 'nonrepeating' ? 'conditionalsRecovered'
+  const bounded = ['naturalExits', 'singlePassInner'].includes(form);
+  const counter = form === 'singlePassInner' ? 'innerLoopsRecovered' : form === 'naturalExits' ? 'loopExitsRecovered' : form === 'nonrepeating' ? 'conditionalsRecovered'
     : form === 'exitContinuation' ? 'continuationsRecovered' : form === 'terminalTail' ? 'tailsHoisted' : 'loopsRecovered';
   const unchanged = () => ({source, [counter]: 0});
-  if (form === 'naturalExits' && source.length > 400000) return unchanged();
+  if (bounded && source.length > 400000) return unchanged();
   if (!proof || typeof retainDiagnostics !== 'boolean' || !Array.isArray(parameterNames)
       || new Set(parameterNames).size !== parameterNames.length
       || parameterNames.some(name => typeof name !== 'string' || !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name))) return unchanged();
@@ -19,7 +20,7 @@ function recoverLoopForms(source, proof, {parameterNames = [], retainDiagnostics
   const statementStarts = new Set(), nearestBreaks = new Map();
   let refused = false;
   function collect(node, depth = 0) {
-    if (form === 'naturalExits' && depth > 128) {refused = true; return;}
+    if (bounded && depth > 128) {refused = true; return;}
     if (node.kind?.endsWith('Statement') && node.range) statementStarts.add(node.range.startOffset);
     children(node, child => collect(child, depth + 1));
   }
@@ -40,7 +41,7 @@ function recoverLoopForms(source, proof, {parameterNames = [], retainDiagnostics
     parents.set(node, parent); if (!ids.has(node)) ids.set(node, ids.size);
     if (form === 'naturalExits') nearestBreaks.set(node, breaks.at(-1));
     if (/ClassDeclaration|MethodDeclaration|ConstructorDeclaration|LambdaExpression|AnonymousClass/.test(node.kind || '')) refused = true;
-    if (form === 'naturalExits' && (/InterfaceDeclaration|EnumDeclaration|RecordDeclaration/.test(node.kind || '')
+    if (bounded && (/InterfaceDeclaration|EnumDeclaration|RecordDeclaration/.test(node.kind || '')
         || node.kind === 'NewClassExpression' && node.body != null)) refused = true;
     if (['BreakStatement', 'ContinueStatement'].includes(node.kind)) {
       const target = node.label ? labels.slice().reverse().find(frame => frame.label === node.label)
@@ -73,7 +74,7 @@ function recoverLoopForms(source, proof, {parameterNames = [], retainDiagnostics
       loops.has(node.kind) ? [...activeLoops, node] : activeLoops));
   }
   inspect(parsed, null);
-  if (refused || [...labelCounts.values()].some(count => count !== 1)) return unchanged();
+  if (refused || bounded && labelCounts.size > 256 || [...labelCounts.values()].some(count => count !== 1)) return unchanged();
   if (form === 'naturalExits') {
     let selected, overBudget = false;
     function visitNatural(node, depth = 0) {
@@ -250,6 +251,40 @@ function recoverLoopForms(source, proof, {parameterNames = [], retainDiagnostics
     }
     if (node.kind === 'ForStatement') {
       const nested = new Map(scope); remember(node.initializer, nested); visit(node.body, nested); return;
+    }
+    if (form === 'singlePassInner' && node.kind === 'WhileStatement' && node.body?.kind === 'BlockStatement'
+        && parents.get(node)?.kind !== 'LabeledStatement') {
+      const own = references.get(node) || [];
+      // Every body path exits. An own continue or fallthrough would repeat the
+      // inner prefix instead of the outer prefix, so neither can be redirected.
+      if (own.length && own.length <= 128 && own.every(jump => jump.kind === 'BreakStatement' && !jump.label)) {
+        const outcomes = completion(node.body);
+        let current = node, parent = parents.get(current), outer = null, terminal = true;
+        const corridor = [];
+        while (parent && terminal) {
+          if (loops.has(parent.kind)) {if (parent.body === current) outer = parent;break;}
+          if (parent.kind === 'BlockStatement') terminal = parent.statements.at(-1) === current;
+          else if (parent.kind === 'LabeledStatement') terminal = parent.statement === current;
+          else if (parent.kind === 'IfStatement') terminal = [parent.consequent, parent.alternate].includes(current);
+          else if (parent.kind === 'SynchronizedStatement') terminal = parent.body === current;
+          else if (parent.kind === 'CatchClause') terminal = parent.body === current;
+          // Normal completion of a finally resumes a pending return/throw.
+          // A continue from it would override that completion, so refuse it.
+          else if (parent.kind === 'TryStatement') terminal = parent.finallyBlock !== current
+            && (parent.block === current || (parent.catches || []).includes(current));
+          else terminal = false;
+          if (terminal) {corridor.push(parent);current = parent;parent = parents.get(current);}
+        }
+        if (!refused && !outcomes.has(normal) && outer && terminal) {
+          const first = starts.get(node.range?.startOffset), open = starts.get(node.body.range?.startOffset), close = closes.get(open);
+          if (tokens[first]?.text === 'while' && tokens[first + 1]?.text === '(' && closes.get(first + 1) + 1 === open
+              && tokens[open]?.text === '{' && tokens[close]?.text === '}'
+              && tokens[close].range.endOffset - tokens[first].range.startOffset <= 40000) {
+            candidate = {node, outer, own, corridor, first, open, close,
+              literalTrue: tokens[first + 2]?.text === 'true' && tokens[first + 3]?.text === ')' && first + 4 === open};return;
+          }
+        }
+      }
     }
     if (form === 'nonrepeating' && node.kind === 'WhileStatement' && node.body?.kind === 'BlockStatement'
         && nonconstant(node.condition, scope)) {
@@ -428,6 +463,47 @@ function recoverLoopForms(source, proof, {parameterNames = [], retainDiagnostics
   }
   visit(parsed, new Map(parameterNames.map(name => [name, true])));
   if (refused || !candidate) return unchanged();
+  if (form === 'singlePassInner') {
+    const {node, outer, own, corridor, first, open, close, literalTrue} = candidate;
+    const range = (a, b) => ({start: tokens[a].range.startOffset - 2, end: tokens[b].range.endOffset - 2});
+    const jumpRanges = own.map(jump => range(starts.get(jump.range.startOffset), ends.get(jump)));
+    const keywordRanges = own.map(jump => range(starts.get(jump.range.startOffset), starts.get(jump.range.startOffset)));
+    const loopRange = range(first, close), bodyRange = range(open, close), headerRange = {start: loopRange.start, end: bodyRange.start};
+    const flat = literalTrue && parents.get(node)?.kind === 'BlockStatement'
+      && !node.body.statements.some(statement => statement.kind === 'LocalVariableDeclarationStatement');
+    const scalarWrapped = !literalTrue && parents.get(node)?.kind !== 'BlockStatement';
+    const edits = keywordRanges.map(r => ({...r, text: 'continue'}));
+    if (literalTrue) {
+      edits.push({start: loopRange.start, end: flat ? tokens[open].range.endOffset - 2 : bodyRange.start, text: ''});
+      if (flat) edits.push({...range(close, close), text: ''});
+    } else edits.push({...range(first, first), text: 'if'});
+    let replacement = source.slice(loopRange.start, loopRange.end);
+    for (const edit of edits.slice().sort((a,b) => b.start - a.start)) replacement = replacement.slice(0,edit.start-loopRange.start)+edit.text+replacement.slice(edit.end-loopRange.start);
+    let contentRange = null, dedent = null;
+    if (flat) {
+      const contentFirst = starts.get(node.body.statements[0]?.range?.startOffset);
+      const contentLast = close - 1;
+      if (contentFirst === undefined) return unchanged();
+      contentRange = range(contentFirst, contentLast);
+      const prefix = source.slice(source.lastIndexOf('\n',loopRange.start-1)+1,loopRange.start);
+      const oldIndent = source.slice(source.lastIndexOf('\n',contentRange.start-1)+1,contentRange.start);
+      const multiline = /^[ \t]*$/.test(prefix) && /^[ \t]*$/.test(oldIndent) && oldIndent.startsWith(prefix);
+      replacement = replacement.trim();
+      if (multiline && oldIndent.length > prefix.length) {
+        dedent = {indent: oldIndent, delta: oldIndent.length-prefix.length};
+        replacement = replacement.split('\n').map((line,index) => index && line.startsWith(oldIndent) ? line.slice(dedent.delta) : line).join('\n');
+      }
+    }
+    if (scalarWrapped) replacement = '{' + replacement + '}';
+    const outerFirst = starts.get(outer.range?.startOffset), outerOpen = starts.get(outer.body?.range?.startOffset), outerClose = closes.get(outerOpen);
+    return {source: source.slice(0,loopRange.start)+replacement+source.slice(loopRange.end),innerLoopsRecovered:1,
+      breaksContinued: own.length, bodyScopesFlattened:Number(flat), conditionalBodiesRecovered:Number(!literalTrue),
+      ...(retainDiagnostics ? {diagnostics:{loopRange,bodyRange,headerRange,literalTrue,flat,scalarWrapped,contentRange,dedent,
+        loopKeywordRange:range(first,first),jumpRanges,keywordRanges,
+        outerLoopKeywordRange:range(outerFirst,outerFirst),
+        ...(outerClose !== undefined ? {outerBodyRange:range(outerOpen,outerClose)} : {}),
+        corridorKinds:corridor.map(part=>part.kind)}} : {})};
+  }
   const {node, guard, suffix, label} = candidate;
   if (form === 'elseExitGuard') {
     const start = starts.get(node.range.startOffset), bodyOpen = start + 4, bodyClose = closes.get(bodyOpen);
@@ -736,4 +812,8 @@ function foldNaturalLoopExits(source, proof, options) {
   return recoverLoopForms(source, proof, options, 'naturalExits');
 }
 
-module.exports = {foldNaturalLoopExits, foldTerminalLoopTails, foldLoopElseExitGuards, foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits, foldNonlocalLoopExits};
+function foldSinglePassInnerLoops(source, proof, options) {
+  return recoverLoopForms(source, proof, options, 'singlePassInner');
+}
+
+module.exports = {foldSinglePassInnerLoops, foldNaturalLoopExits, foldTerminalLoopTails, foldLoopElseExitGuards, foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits, foldNonlocalLoopExits};

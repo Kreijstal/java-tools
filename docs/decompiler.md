@@ -93,6 +93,37 @@ and six contexts. It checks callback order, partial writes, nullable unboxing,
 NaNs, signed overflow, guard mutations, finally overrides and monitor release.
 Another 55 FP-strict arithmetic cases cover underflow, overflow and signed zero.
 
+### Single-pass inner loops
+
+`foldSinglePassInnerLoops` removes an inner `while` whose body cannot fall
+through or continue to its own header. Its bare breaks become continues of
+the immediately enclosing loop only when normal inner-loop completion already
+reaches that loop's next update/test point without intervening actions. Literal
+`true` headers become intact blocks, or flatten a declaration-free body into its
+parent block. Other headers become ordinary `if` statements with the original
+condition evaluated once; scalar statement slots keep braces.
+
+The lexical destination resolver checks every original break and continue,
+including syntactically dead ones and finally overrides. A terminal corridor
+may pass through blocks, branches, labels, catches, try bodies and monitors.
+It cannot pass through a switch or an enclosing finally: normal completion of a
+finally resumes a pending return/throw, whereas a continue would override it.
+Protected constructs inside the removed loop stay whole. An inner finally's
+own break can still override a pending completion at the same outer boundary.
+Inner labels, own backedges, body fallthrough, suffix actions, unsupported
+resource syntax, nested execution and source/nesting/transfer limits refuse.
+No predicate, callback, selector or assumed control-flag value is introduced.
+Diagnostics identify the loop/body/header, original transfers, exact outer loop
+and terminal corridor for independent javac auditing.
+
+`node --test test/singlePassInnerLoopRecovery.test.js` covers eight groups.
+Native independent models compare 31,104 cases across 48 outer-loop/protected
+contexts plus 50 inner-finally override cases. They check outer updates and
+condition effects, nullable guards, aliases, partial writes, overflow, returns,
+throws, close callbacks, monitor release and finally priority. Source publication
+requires independent completion/corridor/destination evidence, every retained
+binding and protected scope, full compilation and byte reversal.
+
 ### Exact self casts
 
 The final emitter calls `simplifySelfCasts` with its actual erased source class
