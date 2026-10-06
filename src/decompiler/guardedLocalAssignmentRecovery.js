@@ -2,6 +2,16 @@
 
 const {primitiveExpressionProof} = require('./primitiveExpressionProof');
 
+function floatingLiteralType(node) {
+  if (node.literalKind !== 'number') return null;
+  const raw = (node.raw || '').replace(/_/g, '');
+  // Decimal or hexadecimal floating literals, with their exact Java type.
+  if (!/^(?:(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?[fFdD]?|0[xX](?:[\da-fA-F]+\.?[\da-fA-F]*|\.[\da-fA-F]+)[pP][+-]?\d+[fFdD]?)$/.test(raw)
+      || !/[.eEpPfFdD]/.test(raw)) return null;
+  return /[fF]$/.test(raw) ? 'float' : 'double';
+}
+
+
 // A provisional primitive-local value followed by an effect-free keep guard
 // can be selected directly. The guard and fallback cannot read the destination:
 // in the original body they observe the provisional assignment on that path.
@@ -10,15 +20,7 @@ function foldGuardedLocalAssignments(source, proof, {parameters = [], retainDiag
   if (!proof || typeof retainDiagnostics !== 'boolean' || source.length > 400000) return unchanged();
   const {wrapped, parsed, tokens, starts, closes, children, labelCounts} = proof;
   if ([...labelCounts.values()].some(count => count !== 1)) return unchanged();
-  const floatingLiteral = node => {
-    if (node.literalKind !== 'number') return null;
-    const raw = (node.raw || '').replace(/_/g, '');
-    // Decimal or hexadecimal floating literals, with their exact Java type.
-    if (!/^(?:(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?[fFdD]?|0[xX](?:[\da-fA-F]+\.?[\da-fA-F]*|\.[\da-fA-F]+)[pP][+-]?\d+[fFdD]?)$/.test(raw)
-        || !/[.eEpPfFdD]/.test(raw)) return null;
-    return /[fF]$/.test(raw) ? 'float' : 'double';
-  };
-  const primitive = primitiveExpressionProof(proof, parameters, floatingLiteral);
+  const primitive = primitiveExpressionProof(proof, parameters, floatingLiteralType);
   if (!primitive) return unchanged();
   const {pureType, counts, locals, reads} = primitive;
   const frames = [], references = new Map();
@@ -99,4 +101,4 @@ function foldGuardedLocalAssignments(source, proof, {parameters = [], retainDiag
     ...(retainDiagnostics ? {diagnostics: {assignments}} : {})};
 }
 
-module.exports = {foldGuardedLocalAssignments};
+module.exports = {foldGuardedLocalAssignments, floatingLiteralType};

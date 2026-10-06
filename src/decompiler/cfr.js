@@ -3,7 +3,7 @@
 const {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits, foldNonlocalLoopExits, foldLoopElseExitGuards, foldTerminalLoopTails} = require('./javaAstEmitter');
 const {recoverScalarIfDispatches, simplifyPredicateNegations, simplifyDominatedPredicates, finalizeControlFrames, finalizeTerminalSwitchFrames, foldRedundantExitGuards} = require('./javaAstEmitter');
 const {simplifyPredicateGrouping} = require('./javaAstEmitter');
-const {foldScalarSwitchPrefixes, foldBooleanLocalAssignments, foldNaturalLoopExits, foldGuardedLocalAssignments, foldStableGuardedFallbacks} = require('./javaAstEmitter');
+const {foldScalarSwitchPrefixes, foldBooleanLocalAssignments, foldNaturalLoopExits, foldGuardedLocalAssignments, foldStableGuardedFallbacks, foldGuardedAssignmentSequences} = require('./javaAstEmitter');
 
 const fs = require('fs');
 const path = require('path');
@@ -2141,6 +2141,11 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
   const guardedAssignments = foldGuardedLocalAssignments(source, {parameters});
   if (guardedAssignments.assignmentsFolded) {
     source = guardedAssignments.source;
+    changed = true;
+  }
+  const assignmentSequences = foldGuardedAssignmentSequences(source, {parameters});
+  if (assignmentSequences.sequencesFolded) {
+    source = assignmentSequences.source;
     changed = true;
   }
   // A prefix cannot change a proven primitive-local predicate. Reuse that

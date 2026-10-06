@@ -17,6 +17,7 @@ const { simplifyDominatedPredicates: simplifyDominated } = require('./dominatedP
 const { foldRedundantExitGuards: recoverRedundantExitGuards } = require('./redundantExitGuardRecovery');
 const { foldGuardedLocalAssignments: recoverGuardedLocalAssignments } = require('./guardedLocalAssignmentRecovery');
 const { foldStableGuardedFallbacks: recoverStableGuardedFallbacks } = require('./stableGuardedFallbackRecovery');
+const { foldGuardedAssignmentSequences: recoverGuardedAssignmentSequences } = require('./guardedAssignmentSequenceRecovery');
 const { recoverArrayIndexIncrements: recoverIndexIncrements } = require('./incrementCaptureRecovery');
 const { foldGuardedAbruptPlainBlockExits: recoverGuardedAbruptExit } = require('./guardedAbruptExitRecovery');
 const { foldGuardedLoopContinuations: recoverLoopContinuation, foldNonrepeatingWhileLoops: recoverNonrepeatingLoops,
@@ -696,6 +697,13 @@ function foldStableGuardedFallbacks(source, options = {}) {
   try { proof = controlCleanupSource(source); }
   catch (error) { if (error instanceof RangeError) return {source, framesRecovered: 0}; throw error; }
   return recoverStableGuardedFallbacks(source, proof, options);
+}
+
+function foldGuardedAssignmentSequences(source, options = {}) {
+  let proof;
+  try { proof = controlCleanupSource(source); }
+  catch (error) { if (error instanceof RangeError) return {source, sequencesFolded: 0}; throw error; }
+  return recoverGuardedAssignmentSequences(source, proof, options);
 }
 
 function specializePathGuards(source, options = {}) {
@@ -3330,6 +3338,7 @@ module.exports = {
   foldBooleanLocalAssignments,
   foldGuardedLocalAssignments,
   foldStableGuardedFallbacks,
+  foldGuardedAssignmentSequences,
   simplifyPredicateNegations,
   simplifyPredicateGrouping,
   specializePathGuards,

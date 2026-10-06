@@ -93,6 +93,35 @@ and six contexts. It checks callback order, partial writes, nullable unboxing,
 NaNs, signed overflow, guard mutations, finally overrides and monitor release.
 Another 55 FP-strict arithmetic cases cover underflow, overflow and signed zero.
 
+### Guarded primitive assignment sequences
+
+`foldGuardedAssignmentSequences` reconstructs a frame that provisionally assigns
+several primitive locals or parameters, then either keeps the sequence or
+assigns a complete fallback sequence. It emits one ordinary `if/else` with
+`originalCondition && keepGuard`. Both conditions occur once; both assignment
+sequences retain their original statement order and assignment conversions.
+No selector, repeated predicate or assumed flag value is introduced.
+
+Both arms must assign the same unique primitive destinations exactly once.
+All right-hand sides and the keep guard must be total primitive expressions.
+The guard cannot read a destination, and no fallback value can read any
+selected destination: those reads would observe discarded provisional stores.
+Provisional values may depend on earlier provisional assignments. Calls,
+unboxing, arrays, fields, division, remainder and mutations refuse recovery.
+The original condition may have effects or throw; it still executes once,
+before either sequence. Protected scopes and enclosing statement slots remain.
+The shared primitive proof verifies binding scope and type without inferring
+values. Diagnostics identify both sequences and the sole consumed labeled exit.
+Bodies, regions, destinations, nesting and label counts are bounded.
+
+`node --test test/guardedAssignmentSequenceRecovery.test.js` covers nine groups.
+Independent native models compare 10,800 cases across six completion contexts,
+including partial condition effects, nullable unboxing, signed overflow,
+finally overrides and monitor release. Seven primitive models add 294 cases
+for narrowing conversions, integers beyond double precision, NaNs and signed
+zero. Full corpus compilation and independent binding/transfer audits remain
+publication requirements.
+
 ### Guarded primitive-local value selection
 
 The final emitter phase also recognizes a provisional local assignment followed
