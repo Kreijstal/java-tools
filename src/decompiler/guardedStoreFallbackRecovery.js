@@ -4,9 +4,9 @@ const {primitiveExpressionProof} = require('./primitiveExpressionProof');
 // Preserve an unstable condition/guard once. A bounded sequence of integral or
 // boolean stores can occupy exclusive arms, so no selector or predicate copy is
 // needed. Only terminal plain-block/if corridors may lead to the frame exit.
-function foldGuardedStoreFallbacks(source, proof, {parameters = [], ownedFields = null, retainDiagnostics = false} = {}) {
+function foldGuardedStoreFallbacks(source, proof, {parameters = [], ownedFields = null, retainDiagnostics = false, preserveSharedFrames = false} = {}) {
   const unchanged = () => ({source, framesRecovered: 0});
-  if (!proof || typeof retainDiagnostics !== 'boolean' || source.length > 400000) return unchanged();
+  if (!proof || typeof retainDiagnostics !== 'boolean' || typeof preserveSharedFrames !== 'boolean' || source.length > 400000) return unchanged();
   const {parsed, tokens, starts, closes, children, labelCounts} = proof;
   if (labelCounts.size > 256 || [...labelCounts.values()].some(count => count !== 1)) return unchanged();
   const primitive = primitiveExpressionProof(proof, parameters);
@@ -65,7 +65,7 @@ function foldGuardedStoreFallbacks(source, proof, {parameters = [], ownedFields 
   }
   for (const frame of frames) {
     const body = bounds(frame.statement), refs = references.get(frame.label), label = starts.get(frame.range?.startOffset);
-    if (!body || refs?.length !== 1 || refs[0].kind !== 'BreakStatement' || tokens[label]?.text !== frame.label || tokens[label + 1]?.text !== ':' || label + 2 !== body.open || tokens[body.close].range.endOffset - tokens[label].range.startOffset > 40000) continue;
+    if (!body || !refs?.length || refs.length > 128 || refs.some(jump => jump.kind !== 'BreakStatement') || !preserveSharedFrames && refs.length !== 1 || tokens[label]?.text !== frame.label || tokens[label + 1]?.text !== ':' || label + 2 !== body.open || tokens[body.close].range.endOffset - tokens[label].range.startOffset > 40000) continue;
     for (const block of blocks) {
       const corridorKinds = corridor(block, frame), container = bounds(block);
       if (!corridorKinds || !container) continue;
@@ -75,15 +75,16 @@ function foldGuardedStoreFallbacks(source, proof, {parameters = [], ownedFields 
         const prefix = branch.consequent.statements.slice(0, -1), guard = branch.consequent.statements.at(-1);
         if (!prefix.length || prefix.some(statement => statement.kind === 'LocalVariableDeclarationStatement') || guard?.kind !== 'IfStatement' || guard.alternate) continue;
         const braced = guard.consequent?.kind === 'BlockStatement', jump = braced && guard.consequent.statements.length === 1 ? guard.consequent.statements[0] : guard.consequent;
-        if (jump !== refs[0]) continue;
+        if (!refs.includes(jump)) continue;
         const first = starts.get(branch.range?.startOffset), conditionClose = closes.get(first + 1), keep = starts.get(guard.range?.startOffset), keepClose = closes.get(keep + 1), jumpFirst = starts.get(jump.range?.startOffset), jumpLast = jumpFirst + 2, guardLast = braced ? closes.get(keepClose + 1) : jumpLast, fall = starts.get(fallback[0].range?.startOffset);
         if (tokens[first]?.text !== 'if' || tokens[first + 1]?.text !== '(' || conditionClose + 1 !== arm.open || tokens[keep]?.text !== 'if' || tokens[keep + 1]?.text !== '(' || keepClose === undefined || tokens[jumpFirst]?.text !== 'break' || tokens[jumpFirst + 1]?.text !== frame.label || tokens[jumpLast]?.text !== ';' || (braced ? tokens[keepClose + 1]?.text !== '{' || jumpFirst !== keepClose + 2 || guardLast !== jumpLast + 1 : jumpFirst !== keepClose + 1) || arm.close !== guardLast + 1 || fall !== arm.close + 1) continue;
         const fallbackRange = range(fall, container.close - 1);
         if (tokens[container.close - 1]?.text !== ';' || container.close - fall > 128 || fallbackRange.end - fallbackRange.start > 1024) continue;
-        const keepFrame = parents.get(frame)?.kind !== 'BlockStatement' || frame.statement.statements.some(statement => statement.kind === 'LocalVariableDeclarationStatement');
+        const labelRetained = refs.length > 1;
+        const keepFrame = labelRetained || parents.get(frame)?.kind !== 'BlockStatement' || frame.statement.statements.some(statement => statement.kind === 'LocalVariableDeclarationStatement');
         const indentAt = offset => {const value = source.slice(source.lastIndexOf('\n', offset - 1) + 1, offset); return /^[ \t]*$/.test(value) ? value : null;};
         const frameIndent = indentAt(tokens[label].range.startOffset - 2), branchIndent = indentAt(tokens[first].range.startOffset - 2), guardIndent = indentAt(tokens[keep].range.startOffset - 2), multiline = frameIndent !== null && branchIndent !== null && guardIndent !== null;
-        const contentStart = keepFrame ? tokens[body.open].range.startOffset - 2 : tokens[starts.get(frame.statement.statements[0].range.startOffset)].range.startOffset - 2, contentEnd = keepFrame ? tokens[body.close].range.endOffset - 2 : tokens[body.close].range.startOffset - 2;
+        const contentStart = labelRetained ? tokens[label].range.startOffset - 2 : keepFrame ? tokens[body.open].range.startOffset - 2 : tokens[starts.get(frame.statement.statements[0].range.startOffset)].range.startOffset - 2, contentEnd = keepFrame ? tokens[body.close].range.endOffset - 2 : tokens[body.close].range.startOffset - 2;
         const segments = [
           {range: {start: contentStart, end: tokens[keep].range.startOffset - 2}},
           {text: 'if (!'}, {range: range(keep + 1, keepClose)}, {text: ') {' + (multiline ? '\n' + guardIndent + '  ' : '')},
@@ -99,8 +100,8 @@ function foldGuardedStoreFallbacks(source, proof, {parameters = [], ownedFields 
           text = text.trimEnd();
         }
         const editRange = range(label, body.close);
-        return {source: source.slice(0, editRange.start) + text + source.slice(editRange.end), framesRecovered: 1, fallbackAssignmentsCopied: fallback.length, fallbackIdentifierCopiesAdded: tokens.slice(fall, container.close).filter(token => token.kind === 'identifier').length,
-          ...(retainDiagnostics ? {diagnostics: {range: editRange, segments, dedent, label: frame.label, frameScopeRetained: keepFrame, corridorKinds, containerRange: range(container.open, container.close), branchRange: range(first, arm.close), conditionRange: range(first + 1, conditionClose), guardRange: range(keep + 1, keepClose), jumpRange: range(jumpFirst, jumpLast), fallbackRange, prefixStatements: prefix.length}} : {})};
+        return {source: source.slice(0, editRange.start) + text + source.slice(editRange.end), framesRecovered: 1, labelsRemoved: Number(!labelRetained), sharedFramesRetained: Number(labelRetained), fallbackAssignmentsCopied: fallback.length, fallbackIdentifierCopiesAdded: tokens.slice(fall, container.close).filter(token => token.kind === 'identifier').length,
+          ...(retainDiagnostics ? {diagnostics: {range: editRange, segments, dedent, label: frame.label, labelRetained, frameScopeRetained: keepFrame, corridorKinds, containerRange: range(container.open, container.close), branchRange: range(first, arm.close), conditionRange: range(first + 1, conditionClose), guardRange: range(keep + 1, keepClose), jumpRange: range(jumpFirst, jumpLast), fallbackRange, prefixStatements: prefix.length}} : {})};
       }
     }
   }

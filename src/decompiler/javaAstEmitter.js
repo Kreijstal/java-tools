@@ -713,6 +713,11 @@ function foldGuardedAssignmentSequences(source, options = {}) {
   return recoverGuardedAssignmentSequences(source, proof, options);
 }
 
+function foldSharedStoreFallbacks(source, options = {}) {
+  try { return recoverGuardedStoreFallbacks(source, controlCleanupSource(source), {...options, preserveSharedFrames: true}); }
+  catch (error) { if (error instanceof RangeError) return {source, framesRecovered: 0}; throw error; }
+}
+
 function foldSharedGuardedFallbacks(source, options = {}) {
   try { return recoverSharedFallbacks(source, controlCleanupSource(source), options); }
   catch (error) { if (error instanceof RangeError) return {source, guardsRecovered: 0}; throw error; }
@@ -3400,6 +3405,7 @@ module.exports = {
   foldTerminalGuardedFrameExits,
   foldTerminalFrameLoops,
   foldSharedGuardedFallbacks,
+  foldSharedStoreFallbacks,
   simplifyPredicateNegations,
   simplifyPredicateGrouping,
   specializePathGuards,

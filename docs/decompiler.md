@@ -93,6 +93,24 @@ and six contexts. It checks callback order, partial writes, nullable unboxing,
 NaNs, signed overflow, guard mutations, finally overrides and monitor release.
 Another 55 FP-strict arithmetic cases cover underflow, overflow and signed zero.
 
+### Shared frames with primitive store fallbacks
+
+`foldSharedStoreFallbacks` extends primitive-store recovery to frames with other
+exits. It consumes only the selected guarded skip and retains the original frame
+name, braces and remaining destinations. One through eight integral/boolean
+assignments occupy exclusive arms; each store still executes once on its original
+paths. Scoped local/formal and owned-field type evidence is required. Unknown,
+boxed, floating or computed operands, direct prefix declarations, intervening
+work and crossed loop/protected/monitor corridors refuse reconstruction.
+
+`node --test test/sharedStoreFallbackRecovery.test.js` covers six groups,
+including 174,960 native comparisons across 24 models. Original, shared and
+subsequently structured forms compare with independent oracles for early exits,
+nullable predicates/guards, mutations, partial writes, overflow, volatile fields,
+aliases, finally overrides and monitor release. Publication independently
+reattributes primitive stores, exact terminal corridors, all original/copied
+bindings and every surviving transfer/protected scope before export.
+
 ### Late cleanup after shared callbacks
 
 Shared callback recovery changes a nested branch into complete exclusive arms.
