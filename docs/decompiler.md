@@ -43,6 +43,27 @@ single-callback and primitive-store APIs retain their original policies.
 across 18 contexts, comparing original, shared and final structured forms
 against independently written ordered models.
 
+## Comparisons of two complemented integer operands
+
+`simplifyComplementedRelations` rewrites `~a < ~b` as `a > b`, with the
+corresponding reversal for `<=`, `>` and `>=`. Legal Java unary complement
+produces a signed int or long. Sign extension commutes with complement, and
+complement reverses that signed order. All original operands, casts and
+parentheses remain, preserving promotion, callback order and nullable unboxing.
+Equality is excluded: removing complement there could change boxed reference
+identity into a different numeric operation, or the converse.
+
+The recovery first recognizes complete binary expressions, then verifies the
+entire parsed statement tree against the exact intended AST rewrite. It changes
+only the relational operator and deletes the two unary complement tokens.
+Nested executables, patterns, comments and Unicode translation refuse. Bounds
+limit bodies to 400,000 characters, AST depth to 128, comparisons to 512 and
+individual expressions to 8 KiB/256 tokens per operand. The native fixture
+compares 2,612,736 cases across 672 models against independent ordered models,
+including byte/short/char/int/long promotion, boxed values, nulls, callbacks,
+finally overrides and monitor release. Source publication separately checks
+independent javac ASTs/types, every binding and transfer, and all 303 CLI bytes.
+
 ## Final control-frame cleanup
 
 Loop and dispatch reconstruction can expose a redundant labeled break after

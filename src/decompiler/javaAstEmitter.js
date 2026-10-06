@@ -11,6 +11,7 @@ const { tokenizeJava } = require('../java-frontend/lexer');
 const { recoverScalarLabelDispatches: recoverScalarDispatch } = require('./scalarDispatchRecovery');
 const { recoverScalarIfDispatches: recoverIfDispatch } = require('./scalarIfDispatchRecovery');
 const { simplifyPredicateNegations: simplifyNegations } = require('./predicateNegationRecovery');
+const {simplifyComplementedRelations: recoverComplementedRelations} = require('./complementedRelationRecovery');
 const { simplifyPredicateGrouping: simplifyGrouping } = require('./predicateGroupingRecovery');
 const { specializePathGuards: specializeGuards } = require('./pathGuardRecovery');
 const { simplifyDominatedPredicates: simplifyDominated } = require('./dominatedPredicateRecovery');
@@ -713,6 +714,11 @@ function foldGuardedAssignmentSequences(source, options = {}) {
   try { proof = controlCleanupSource(source); }
   catch (error) { if (error instanceof RangeError) return {source, sequencesFolded: 0}; throw error; }
   return recoverGuardedAssignmentSequences(source, proof, options);
+}
+
+function simplifyComplementedRelations(source, options = {}) {
+  try { return recoverComplementedRelations(source, controlCleanupSource(source), options); }
+  catch (error) { if (error instanceof RangeError) return {source, comparisonsSimplified: 0}; throw error; }
 }
 
 function foldNestedIfConditions(source, options = {}) {
@@ -3432,6 +3438,7 @@ module.exports = {
   foldArithmeticStoreFallbacks,
   foldConditionalStoreFallbacks,
   foldNestedIfConditions,
+  simplifyComplementedRelations,
   simplifyPredicateNegations,
   simplifyPredicateGrouping,
   specializePathGuards,

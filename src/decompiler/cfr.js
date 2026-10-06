@@ -3,7 +3,7 @@
 const {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits, foldNonlocalLoopExits, foldLoopElseExitGuards, foldTerminalLoopTails} = require('./javaAstEmitter');
 const {recoverScalarIfDispatches, simplifyPredicateNegations, simplifyDominatedPredicates, finalizeControlFrames, finalizeTerminalSwitchFrames, foldRedundantExitGuards} = require('./javaAstEmitter');
 const {simplifyPredicateGrouping} = require('./javaAstEmitter');
-const {foldScalarSwitchPrefixes, foldBooleanLocalAssignments, foldNaturalLoopExits, foldGuardedLocalAssignments, foldStableGuardedFallbacks, foldGuardedAssignmentSequences, simplifySelfCasts, foldSinglePassInnerLoops, foldSmallGuardedFallbacks, foldTerminalLoopFrames, foldGuardedStoreFallbacks, foldTerminalGuardedFrameExits, foldTerminalFrameLoops, foldSharedGuardedFallbacks, foldSharedStoreFallbacks, foldArithmeticStoreFallbacks, foldConditionalStoreFallbacks, foldNestedIfConditions, foldSharedStatementFallbacks} = require('./javaAstEmitter');
+const {foldScalarSwitchPrefixes, foldBooleanLocalAssignments, foldNaturalLoopExits, foldGuardedLocalAssignments, foldStableGuardedFallbacks, foldGuardedAssignmentSequences, simplifySelfCasts, foldSinglePassInnerLoops, foldSmallGuardedFallbacks, foldTerminalLoopFrames, foldGuardedStoreFallbacks, foldTerminalGuardedFrameExits, foldTerminalFrameLoops, foldSharedGuardedFallbacks, foldSharedStoreFallbacks, foldArithmeticStoreFallbacks, foldConditionalStoreFallbacks, foldNestedIfConditions, foldSharedStatementFallbacks, simplifyComplementedRelations} = require('./javaAstEmitter');
 
 const fs = require('fs');
 const path = require('path');
@@ -2268,6 +2268,11 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
     const mixedRemainder = foldTerminalGuardedFrameExits(source);
     if (!mixedRemainder.guardsRecovered) break;
     source = mixedRemainder.source; changed = true;
+  }
+  for (;;) {
+    const complementedRelations = simplifyComplementedRelations(source);
+    if (!complementedRelations.comparisonsSimplified) break;
+    source = complementedRelations.source; changed = true;
   }
   if (changed) replaceArrayContents(body, source.split('\n'));
 }
