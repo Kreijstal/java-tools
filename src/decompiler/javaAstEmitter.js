@@ -21,6 +21,7 @@ const { foldGuardedAssignmentSequences: recoverGuardedAssignmentSequences } = re
 const { simplifySelfCasts: recoverSelfCasts, normalizedSelfCastAst } = require('./selfCastRecovery');
 const { foldSmallGuardedFallbacks: recoverSmallGuardedFallbacks } = require('./smallGuardedFallbackRecovery');
 const { foldSharedGuardedFallbacks: recoverSharedFallbacks } = require('./sharedGuardedFallbackRecovery');
+const { foldSharedStatementFallbacks: recoverSharedStatementFallbacks } = require('./sharedStatementFallbackRecovery');
 const {foldNestedIfConditions: recoverNestedIfConditions} = require('./nestedIfConditionRecovery');
 const { foldTerminalFrameLoops: recoverTerminalFrameLoops } = require('./terminalFrameLoopRecovery');
 const { foldTerminalGuardedFrameExits: recoverTerminalGuardedFrames } = require('./terminalGuardedFrameRecovery');
@@ -732,6 +733,11 @@ function foldArithmeticStoreFallbacks(source, options = {}) {
 function foldSharedStoreFallbacks(source, options = {}) {
   try { return recoverGuardedStoreFallbacks(source, controlCleanupSource(source), {...options, preserveSharedFrames: true}); }
   catch (error) { if (error instanceof RangeError) return {source, framesRecovered: 0}; throw error; }
+}
+
+function foldSharedStatementFallbacks(source, options = {}) {
+  try { return recoverSharedStatementFallbacks(source, controlCleanupSource(source), options); }
+  catch (error) { if (error instanceof RangeError) return {source, guardsRecovered: 0}; throw error; }
 }
 
 function foldSharedGuardedFallbacks(source, options = {}) {
@@ -3421,6 +3427,7 @@ module.exports = {
   foldTerminalGuardedFrameExits,
   foldTerminalFrameLoops,
   foldSharedGuardedFallbacks,
+  foldSharedStatementFallbacks,
   foldSharedStoreFallbacks,
   foldArithmeticStoreFallbacks,
   foldConditionalStoreFallbacks,

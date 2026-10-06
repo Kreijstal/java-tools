@@ -20,6 +20,25 @@ The design guarantee: **for any reducible CFG the structurer emits zero gotos**,
 and region-splitting brings the irreducible minority into that class. This is an
 *algorithmic* property, not a heuristic that happens to work on today's inputs.
 
+## Bounded mixed statement continuations
+
+`foldSharedStatementFallbacks` extends the final source recovery to short
+continuations mixing calls, stores and complete conditional trees. For
+`Frame: { if (a) { prefix; if (g) break Frame; } tail; }`, it emits
+`if (a) { prefix; if (!g) { tail; } } else { tail; }`, retaining the frame
+when other exits still use it. Each original predicate and action executes
+once on its original paths. Complete expressions keep receiver, argument,
+array-index, boxing, allocation and arithmetic evaluation order.
+
+Only terminal plain-block/if/label corridors are eligible. A continuation has
+at most eight expression leaves, four conditions, 24 statement nodes, 256 tokens
+and 2 KiB. Declarations, labels, transfers, loops and protected continuation
+constructs refuse. Enclosing try/finally and monitor regions remain intact;
+nested executables, patterns, comments and Unicode translation refuse.
+Earlier single-callback and primitive-store APIs retain their original policies.
+`test/sharedStatementFallbackRecovery.test.js` compares 641,520 native cases
+across 18 contexts against independently written ordered models.
+
 ## Final control-frame cleanup
 
 Loop and dispatch reconstruction can expose a redundant labeled break after
