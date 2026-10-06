@@ -3,7 +3,7 @@
 const {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits, foldNonlocalLoopExits, foldLoopElseExitGuards, foldTerminalLoopTails} = require('./javaAstEmitter');
 const {recoverScalarIfDispatches, simplifyPredicateNegations, simplifyDominatedPredicates, finalizeControlFrames, finalizeTerminalSwitchFrames, foldRedundantExitGuards} = require('./javaAstEmitter');
 const {simplifyPredicateGrouping} = require('./javaAstEmitter');
-const {foldScalarSwitchPrefixes, foldBooleanLocalAssignments, foldNaturalLoopExits, foldGuardedLocalAssignments} = require('./javaAstEmitter');
+const {foldScalarSwitchPrefixes, foldBooleanLocalAssignments, foldNaturalLoopExits, foldGuardedLocalAssignments, foldStableGuardedFallbacks} = require('./javaAstEmitter');
 
 const fs = require('fs');
 const path = require('path');
@@ -1314,7 +1314,7 @@ function formatMethod(cls, method, options = {}) {
     widenExceptionLocalsUsedByInstanceof(body, options.exceptionModel);
     shareExistingExitTails(body, localState.paramNames,
       params.map((type, index) => ({name: localState.paramNames[index], type: simplifyType(type)})),
-      ownedPredicateFields(cls, options));
+      ownedPredicateFields(cls, options), flags.includes('strictfp'));
   }
   const needsUncheckedExceptionBoundary = methodThrowsTypes(method).length === 0
     && methodCallsUncaughtCheckedException(code, method, options.exceptionModel);
@@ -1793,7 +1793,7 @@ function ownedPredicateFields(cls, options) {
       type: descriptorToJavaType(field.descriptor), static: (field.flags || []).includes('static')}))};
 }
 
-function shareExistingExitTails(body, parameterNames = [], parameters = [], ownedFields = null) {
+function shareExistingExitTails(body, parameterNames = [], parameters = [], ownedFields = null, fpStrict = false) {
   // Normalize escaping JVM locals first: otherwise one cleanup copy may still
   // declare a slot that the following copy assigns. Exact matching must use
   // their final source identities, never discard an apparent inline shadow.
@@ -2141,6 +2141,14 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
   const guardedAssignments = foldGuardedLocalAssignments(source, {parameters});
   if (guardedAssignments.assignmentsFolded) {
     source = guardedAssignments.source;
+    changed = true;
+  }
+  // A prefix cannot change a proven primitive-local predicate. Reuse that
+  // predicate to guard the complete fallback, retaining each action once.
+  for (;;) {
+    const fallback = foldStableGuardedFallbacks(source, {parameters, fpStrict});
+    if (!fallback.framesRecovered) break;
+    source = fallback.source;
     changed = true;
   }
   if (changed) replaceArrayContents(body, source.split('\n'));

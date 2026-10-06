@@ -1,5 +1,27 @@
 'use strict';
 
+function negateControlCondition(condition, open, close, {wrapped, tokens, closes}) {
+  const first = tokens[open].range.endOffset, last = tokens[close].range.startOffset;
+  while (condition?.kind === 'ParenthesizedExpression') condition = condition.expression;
+  // Equality and inequality are exact logical complements, including NaNs,
+  // nullable unboxing and effectful operands. Relational operators are not.
+  if (condition?.kind === 'BinaryExpression' && ['==', '!='].includes(condition.operator)) {
+    let begin = open + 1, end = close;
+    while (tokens[begin]?.text === '(' && closes.get(begin) === end - 1) { begin++; end--; }
+    const operators = [];
+    for (let index = begin; index < end; index++) {
+      if (closes.has(index)) { index = closes.get(index); continue; }
+      if (tokens[index].text === condition.operator) operators.push(index);
+    }
+    if (operators.length === 1) {
+      const operator = tokens[operators[0]];
+      return wrapped.slice(first, operator.range.startOffset)
+        + (condition.operator === '==' ? '!=' : '==') + wrapped.slice(operator.range.endOffset, last);
+    }
+  }
+  return '!(' + wrapped.slice(first, last) + ')';
+}
+
 // A direct arm ending in `if (guard) break Frame; suffix; abrupt;` skips the
 // frame's remainder on both paths. Express that remainder as the outer else,
 // and keep the complete suffix and abrupt statement under the inverse guard.
@@ -77,27 +99,6 @@ function foldGuardedAbruptPlainBlockExits(source, proof, {retainDiagnostics = fa
         })) return null;
     return {open, close};
   }
-  function negate(condition, open, close) {
-    const first = tokens[open].range.endOffset, last = tokens[close].range.startOffset;
-    while (condition?.kind === 'ParenthesizedExpression') condition = condition.expression;
-    // Equality and inequality are exact logical complements, including NaNs,
-    // nullable unboxing and effectful operands. Relational operators are not.
-    if (condition?.kind === 'BinaryExpression' && ['==', '!='].includes(condition.operator)) {
-      let begin = open + 1, end = close;
-      while (tokens[begin]?.text === '(' && closes.get(begin) === end - 1) { begin++; end--; }
-      const operators = [];
-      for (let index = begin; index < end; index++) {
-        if (closes.has(index)) { index = closes.get(index); continue; }
-        if (tokens[index].text === condition.operator) operators.push(index);
-      }
-      if (operators.length === 1) {
-        const operator = tokens[operators[0]];
-        return wrapped.slice(first, operator.range.startOffset)
-          + (condition.operator === '==' ? '!=' : '==') + wrapped.slice(operator.range.endOffset, last);
-      }
-    }
-    return '!(' + wrapped.slice(first, last) + ')';
-  }
   function find(node) {
     if (node.kind === 'LabeledStatement' && node.statement?.kind === 'BlockStatement'
         && references.get(node)?.length) {
@@ -143,7 +144,7 @@ function foldGuardedAbruptPlainBlockExits(source, proof, {retainDiagnostics = fa
               && (starts.get(reference.range.startOffset) < restStart
                 || starts.get(reference.range.startOffset) >= frame.close))) continue;
           const keepLabel = references.get(node).length > 1;
-          const predicate = negate(guard.condition, guardStart + 1, guardEnd);
+          const predicate = negateControlCondition(guard.condition, guardStart + 1, guardEnd, proof);
           const suffixBytes = wrapped.slice(tokens[suffixStart].range.startOffset, tokens[abruptEnd].range.endOffset);
           const prefix = wrapped.slice(wrapped.lastIndexOf('\n', tokens[guardStart].range.startOffset - 1) + 1,
             tokens[guardStart].range.startOffset);
@@ -206,4 +207,4 @@ function foldGuardedAbruptPlainBlockExits(source, proof, {retainDiagnostics = fa
     ...(retainDiagnostics ? {diagnostics: edit.diagnostics} : {})};
 }
 
-module.exports = {foldGuardedAbruptPlainBlockExits};
+module.exports = {foldGuardedAbruptPlainBlockExits, negateControlCondition};

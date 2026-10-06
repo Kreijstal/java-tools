@@ -54,6 +54,45 @@ injected failures, return/finally priority and monitor ownership. Publication
 still requires compiling and independently auditing the complete exported
 corpus, including retired labels and resulting lexical-label ordinal migrations.
 
+### Stable guarded fallbacks
+
+`foldStableGuardedFallbacks` replaces a frame such as
+`Pick: { if (selected) { prefix(); if (keep()) break Pick; } fallback(); }`
+with `if (selected) { prefix(); } if (!(selected) || !(keep())) { fallback(); }`.
+Every prefix, guard and fallback action stays in one source location. No
+selector variable, duplicated callback or assumed control-flag value is added.
+
+A repeated condition must be a total expression over uniquely scoped primitive
+locals or parameters, and the complete prefix must not write any of its inputs.
+Assignment, compound assignment and increment targets are checked through
+parentheses, including nested loops, assertions and protected statements. Calls
+cannot mutate these primitive bindings by reference. A guard cannot use a local
+declared in the prefix, since that declaration's scope ends before the second
+condition. The guard itself can throw, unbox, divide or mutate: it still runs
+once, after the same prefix and only when the original condition was true.
+An empty prefix needs one condition evaluation, allowing effectful conditions.
+
+Floating arithmetic is repeated only with a verified FP-strict source context.
+The normal emitter passes its actual emitted `strictfp` method flag. Comparisons
+of stored floating values remain supported without that flag. This preserves
+the choices allowed by [Java8-16 value-set conversion](https://docs.oracle.com/javase/specs/jls/se11/html/jls-5.html#jls-5.1.13).
+Equality negation uses the existing exact complement helper; other predicates
+retain logical negation, including NaN-sensitive ordering comparisons.
+
+The frame must have one direct guarded exit and a complete following fallback.
+Protected boundaries around that exit and extra references decline recovery.
+Prefix, fallback and declaration scopes stay whole; a declaring frame or a
+single-statement slot keeps its braces. Diagnostics record source fragments,
+condition copies, equality complements and the sole consumed transfer.
+Bodies, regions, nesting and label counts are bounded. Each recovery removes
+one label, so the emitter's final iteration converges.
+
+`node --test test/stableGuardedFallbackRecovery.test.js` covers nine groups,
+including 207,360 independent native action/completion cases across 12 models
+and six contexts. It checks callback order, partial writes, nullable unboxing,
+NaNs, signed overflow, guard mutations, finally overrides and monitor release.
+Another 55 FP-strict arithmetic cases cover underflow, overflow and signed zero.
+
 ### Guarded primitive-local value selection
 
 The final emitter phase also recognizes a provisional local assignment followed
