@@ -3,7 +3,7 @@
 const {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits, foldNonlocalLoopExits, foldLoopElseExitGuards, foldTerminalLoopTails} = require('./javaAstEmitter');
 const {recoverScalarIfDispatches, simplifyPredicateNegations, simplifyDominatedPredicates, finalizeControlFrames, finalizeTerminalSwitchFrames, foldRedundantExitGuards} = require('./javaAstEmitter');
 const {simplifyPredicateGrouping} = require('./javaAstEmitter');
-const {foldScalarSwitchPrefixes, foldBooleanLocalAssignments, foldNaturalLoopExits, foldGuardedLocalAssignments, foldStableGuardedFallbacks, foldGuardedAssignmentSequences} = require('./javaAstEmitter');
+const {foldScalarSwitchPrefixes, foldBooleanLocalAssignments, foldNaturalLoopExits, foldGuardedLocalAssignments, foldStableGuardedFallbacks, foldGuardedAssignmentSequences, simplifySelfCasts} = require('./javaAstEmitter');
 
 const fs = require('fs');
 const path = require('path');
@@ -2156,6 +2156,10 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
     source = fallback.source;
     changed = true;
   }
+  // Source class headers are erased. Casts from this to that exact class add
+  // no type information; other receiver casts retain their binding role.
+  const selfCasts = simplifySelfCasts(source, {selfType: ownedFields && {sourceName: ownedFields.owner, typeParameters: []}});
+  if (selfCasts.castsRemoved) { source = selfCasts.source; changed = true; }
   if (changed) replaceArrayContents(body, source.split('\n'));
 }
 

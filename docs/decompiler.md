@@ -93,6 +93,32 @@ and six contexts. It checks callback order, partial writes, nullable unboxing,
 NaNs, signed overflow, guard mutations, finally overrides and monitor release.
 Another 55 FP-strict arithmetic cases cover underflow, overflow and signed zero.
 
+### Exact self casts
+
+The final emitter calls `simplifySelfCasts` with its actual erased source class
+header. Casts such as `((Owner) (this)).field` become `this.field`; argument,
+constructor, return and monitor expressions receive the same cleanup. The
+caller must provide the exact source type and confirm that it has no type
+parameters. Different class casts, ordinary receivers, nullable expressions,
+boxing and qualified enclosing `this` retain their original source.
+
+Only exact owner casts around the bare `this` expression are eligible. No
+initializer value, hierarchy guess, field or callback is evaluated by recovery.
+The original and resulting frontend ASTs must match after ignoring parentheses
+and these exact self casts. Calls and syntactic control/monitor parentheses
+remain distinct. Nested execution, annotations, translated offsets and excessive
+source, nesting or cast counts refuse. Diagnostics identify the original `this`
+and each removed cast-type token range, allowing independent publication audits
+to verify the type references removed and every surviving binding.
+
+`node --test test/selfCastRecovery.test.js test/javaAstEmitterIdentityCasts.test.js`
+passes 11 groups. The self-cast native fixture compares 810 cases across six
+completion contexts, covering overloaded calls, hidden fields, aliases,
+constructors, retained runtime checks, boxing, partial effects, finally priority
+and monitor release. Existing local identity-cast tests remain unchanged.
+Corpus publication requires independent javac proof of exact self types, full
+AST and surviving occurrence-binding comparison, compilation and byte reversal.
+
 ### Guarded primitive assignment sequences
 
 `foldGuardedAssignmentSequences` reconstructs a frame that provisionally assigns
