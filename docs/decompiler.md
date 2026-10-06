@@ -93,6 +93,31 @@ and six contexts. It checks callback order, partial writes, nullable unboxing,
 NaNs, signed overflow, guard mutations, finally overrides and monitor release.
 Another 55 FP-strict arithmetic cases cover underflow, overflow and signed zero.
 
+### Frames ending in terminal loops
+
+`foldTerminalFrameLoops` recognizes a loop ending a plain frame through only
+terminal blocks, if arms and labels. Every frame break must be inside that loop.
+When the loop is also each break's nearest loop/switch destination, ordinary
+bare breaks replace the frame exits and its label retires. Otherwise the existing
+frame name moves onto the loop, or merges into the loop's existing name. No new
+name, condition, selector, action or header/update evaluation is introduced.
+
+Frame prefixes remain before the loop. Declaration and scalar-statement scopes
+retain braces; declaration-free frame bodies flatten. Whole protected constructs
+inside the loop stay intact. Prefix references, nonterminal work, crossed loops,
+try/catch/finally or monitor corridors, nested execution and unsupported syntax
+refuse. Bounds limit source, nesting, labels, references and individual regions.
+Diagnostics identify complete frame/loop extents, the terminal corridor, retained
+scope and every moved, merged or localized break for independent javac proof.
+
+`node --test test/terminalFrameLoopRecovery.test.js` covers six groups, including
+69,120 native comparisons across 96 loop/protected/merge/exit models. Loop guards,
+updates and iterator work, nullable conditions, aliases, partial failures,
+overflow, nested exits, pending returns/throws, finally priority and monitor
+release compare with independent models. Publication must prove every binding,
+exact continuation/destination/protected scope, label identity migration,
+compilation, dictionary reversal and clean source/archive reproduction.
+
 ### Terminal guarded frame remainders
 
 `foldTerminalGuardedFrameExits` replaces a direct guarded break followed by

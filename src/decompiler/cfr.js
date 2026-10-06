@@ -3,7 +3,7 @@
 const {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits, foldNonlocalLoopExits, foldLoopElseExitGuards, foldTerminalLoopTails} = require('./javaAstEmitter');
 const {recoverScalarIfDispatches, simplifyPredicateNegations, simplifyDominatedPredicates, finalizeControlFrames, finalizeTerminalSwitchFrames, foldRedundantExitGuards} = require('./javaAstEmitter');
 const {simplifyPredicateGrouping} = require('./javaAstEmitter');
-const {foldScalarSwitchPrefixes, foldBooleanLocalAssignments, foldNaturalLoopExits, foldGuardedLocalAssignments, foldStableGuardedFallbacks, foldGuardedAssignmentSequences, simplifySelfCasts, foldSinglePassInnerLoops, foldSmallGuardedFallbacks, foldTerminalLoopFrames, foldGuardedStoreFallbacks, foldTerminalGuardedFrameExits} = require('./javaAstEmitter');
+const {foldScalarSwitchPrefixes, foldBooleanLocalAssignments, foldNaturalLoopExits, foldGuardedLocalAssignments, foldStableGuardedFallbacks, foldGuardedAssignmentSequences, simplifySelfCasts, foldSinglePassInnerLoops, foldSmallGuardedFallbacks, foldTerminalLoopFrames, foldGuardedStoreFallbacks, foldTerminalGuardedFrameExits, foldTerminalFrameLoops} = require('./javaAstEmitter');
 
 const fs = require('fs');
 const path = require('path');
@@ -2180,6 +2180,11 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
     const guardedFrame = foldTerminalGuardedFrameExits(source);
     if (!guardedFrame.guardsRecovered) break;
     source = guardedFrame.source; changed = true;
+  }
+  for (;;) {
+    const frameLoop = foldTerminalFrameLoops(source);
+    if (!frameLoop.framesRecovered) break;
+    source = frameLoop.source; changed = true;
   }
   // Source class headers are erased. Casts from this to that exact class add
   // no type information; other receiver casts retain their binding role.
