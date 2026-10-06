@@ -1,5 +1,18 @@
 'use strict';
 
+function simple(node, depth=0) {
+  if (!node || depth>16) return false;
+  if (['Identifier','ThisExpression','SuperExpression','LiteralExpression'].includes(node.kind)) return true;
+  if (node.kind==='ParenthesizedExpression') return simple(node.expression,depth+1);
+  if (node.kind==='FieldAccessExpression') return simple(node.target,depth+1);
+  if (node.kind==='UnaryExpression' && node.prefix===true && ['+','-'].includes(node.operator)
+      && node.operand?.kind==='LiteralExpression' && node.operand.literalKind==='number'
+      && /^(?:0[xX][0-9a-fA-F_]+|0[bB][01_]+|[0-9][0-9_]*)(?:[lL])?$/.test(node.operand.raw||'')) return true;
+  // Do not clone arithmetic, casts, unboxing conversions or poly expressions
+  // into another source context. The call itself may have effects or fail.
+  return false;
+}
+
 // A bounded fallback call can occupy both exclusive arms instead of repeating
 // an unstable condition or introducing a selector. It still executes once.
 function foldSmallGuardedFallbacks(source, proof, {retainDiagnostics = false} = {}) {
@@ -21,18 +34,6 @@ function foldSmallGuardedFallbacks(source, proof, {retainDiagnostics = false} = 
   walk(parsed);if(refused)return unchanged();
   const range = (a,b) => ({start:tokens[a].range.startOffset-2,end:tokens[b].range.endOffset-2});
   const bounds = node => {const open=starts.get(node?.range?.startOffset),close=closes.get(open);return node?.kind==='BlockStatement'&&tokens[open]?.text==='{'&&tokens[close]?.text==='}'?{open,close}:null;};
-  function simple(node, depth=0) {
-    if (!node || depth>16) return false;
-    if (['Identifier','ThisExpression','SuperExpression','LiteralExpression'].includes(node.kind)) return true;
-    if (node.kind==='ParenthesizedExpression') return simple(node.expression,depth+1);
-    if (node.kind==='FieldAccessExpression') return simple(node.target,depth+1);
-    if (node.kind==='UnaryExpression' && node.prefix===true && ['+','-'].includes(node.operator)
-        && node.operand?.kind==='LiteralExpression' && node.operand.literalKind==='number'
-        && /^(?:0[xX][0-9a-fA-F_]+|0[bB][01_]+|[0-9][0-9_]*)(?:[lL])?$/.test(node.operand.raw||'')) return true;
-    // Do not clone arithmetic, casts, unboxing conversions or poly expressions
-    // into another source context. The call itself may have effects or fail.
-    return false;
-  }
   for (const frame of frames) {
     const body=bounds(frame.statement),refs=references.get(frame.label),label=starts.get(frame.range?.startOffset);
     if(!body||refs?.length!==1||refs[0].kind!=='BreakStatement'||tokens[label]?.text!==frame.label||tokens[label+1]?.text!==':'||label+2!==body.open
@@ -79,4 +80,4 @@ function foldSmallGuardedFallbacks(source, proof, {retainDiagnostics = false} = 
   }
   return unchanged();
 }
-module.exports={foldSmallGuardedFallbacks};
+module.exports={foldSmallGuardedFallbacks,simpleFallbackOperand:simple};

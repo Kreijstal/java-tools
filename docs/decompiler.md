@@ -93,6 +93,30 @@ and six contexts. It checks callback order, partial writes, nullable unboxing,
 NaNs, signed overflow, guard mutations, finally overrides and monitor release.
 Another 55 FP-strict arithmetic cases cover underflow, overflow and signed zero.
 
+### Shared frames with bounded callback fallbacks
+
+`foldSharedGuardedFallbacks` keeps other frame exits while reconstructing one
+final guarded skip of a bounded callback. Its callback occupies exclusive source
+arms and executes once on the original paths. Original conditions, prefixes and
+guards occur once. Terminal plain-block/if/label corridors permit nested dispatch;
+nonterminal work and crossed loop/protected/monitor corridors refuse. Other
+exits retain the original frame name, braces and destination.
+
+One callback with simple operands, at most 32 tokens/512 bytes and one line, can
+be copied. Computed arithmetic, casts, array/call operands, poly expressions,
+prefix-owned direct declarations, nested execution and unsupported syntax refuse.
+The original sole-exit API remains unchanged. Late shared recovery makes remaining
+terminal guards available for a separately verified continuation cleanup.
+
+`node --test test/sharedGuardedFallbackRecovery.test.js` covers six groups,
+including 174,960 native comparisons across 12 direct/nested/protected contexts.
+Original, shared and subsequent structured forms compare with independent models
+for early exits, mutations, nullable guards/payloads, overloads, aliases, partial
+failures, overflow, finally overrides and monitor release. Publication requires
+independent callback/corridor/scope evidence, all original/copied bindings,
+consumed and surviving transfers/protected scopes, unchanged complete naming
+objects, compilation and dictionary reversal.
+
 ### Frames ending in terminal loops
 
 `foldTerminalFrameLoops` recognizes a loop ending a plain frame through only
