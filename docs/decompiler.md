@@ -93,6 +93,21 @@ and six contexts. It checks callback order, partial writes, nullable unboxing,
 NaNs, signed overflow, guard mutations, finally overrides and monitor release.
 Another 55 FP-strict arithmetic cases cover underflow, overflow and signed zero.
 
+### Late cleanup after shared callbacks
+
+Shared callback recovery changes a nested branch into complete exclusive arms.
+A previously nonterminal early frame exit can then have an action-free terminal
+corridor. The normal emitter reruns `foldTerminalGuardedFrameExits` after shared
+recovery to express that remaining exit as an inverse guard around its complete
+suffix. Original predicates/actions stay once; other exits retain their frame.
+Protected/loop/monitor crossings and intervening work still refuse.
+
+`node --test test/sharedGuardedFallbackRecovery.test.js` validates normal emission
+of the final structured form. Its 174,960 native cases compare original, shared
+and final forms with an independent oracle. Publication must reattribute the
+actual intermediate source with javac and independently prove every consumed
+exit, remaining transfer/protected scope, binding and complete naming object.
+
 ### Shared frames with bounded callback fallbacks
 
 `foldSharedGuardedFallbacks` keeps other frame exits while reconstructing one

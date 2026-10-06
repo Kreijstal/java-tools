@@ -2195,6 +2195,13 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
     if (!sharedFallback.guardsRecovered) break;
     source = sharedFallback.source; changed = true;
   }
+  // Exclusive callback arms expose early exits whose suffix now ends the
+  // frame. Recheck that complete continuation after shared recovery.
+  for (;;) {
+    const sharedRemainder = foldTerminalGuardedFrameExits(source);
+    if (!sharedRemainder.guardsRecovered) break;
+    source = sharedRemainder.source; changed = true;
+  }
   if (changed) replaceArrayContents(body, source.split('\n'));
 }
 
