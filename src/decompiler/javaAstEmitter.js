@@ -21,6 +21,7 @@ const { foldGuardedAssignmentSequences: recoverGuardedAssignmentSequences } = re
 const { simplifySelfCasts: recoverSelfCasts, normalizedSelfCastAst } = require('./selfCastRecovery');
 const { foldSmallGuardedFallbacks: recoverSmallGuardedFallbacks } = require('./smallGuardedFallbackRecovery');
 const { foldSharedGuardedFallbacks: recoverSharedFallbacks } = require('./sharedGuardedFallbackRecovery');
+const {foldNestedIfConditions: recoverNestedIfConditions} = require('./nestedIfConditionRecovery');
 const { foldTerminalFrameLoops: recoverTerminalFrameLoops } = require('./terminalFrameLoopRecovery');
 const { foldTerminalGuardedFrameExits: recoverTerminalGuardedFrames } = require('./terminalGuardedFrameRecovery');
 const { foldGuardedStoreFallbacks: recoverGuardedStoreFallbacks } = require('./guardedStoreFallbackRecovery');
@@ -711,6 +712,11 @@ function foldGuardedAssignmentSequences(source, options = {}) {
   try { proof = controlCleanupSource(source); }
   catch (error) { if (error instanceof RangeError) return {source, sequencesFolded: 0}; throw error; }
   return recoverGuardedAssignmentSequences(source, proof, options);
+}
+
+function foldNestedIfConditions(source, options = {}) {
+  try { return recoverNestedIfConditions(source, controlCleanupSource(source), options); }
+  catch (error) { if (error instanceof RangeError) return {source, ifsMerged: 0}; throw error; }
 }
 
 function foldConditionalStoreFallbacks(source, options = {}) {
@@ -3418,6 +3424,7 @@ module.exports = {
   foldSharedStoreFallbacks,
   foldArithmeticStoreFallbacks,
   foldConditionalStoreFallbacks,
+  foldNestedIfConditions,
   simplifyPredicateNegations,
   simplifyPredicateGrouping,
   specializePathGuards,

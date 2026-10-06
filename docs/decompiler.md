@@ -93,6 +93,27 @@ and six contexts. It checks callback order, partial writes, nullable unboxing,
 NaNs, signed overflow, guard mutations, finally overrides and monitor release.
 Another 55 FP-strict arithmetic cases cover underflow, overflow and signed zero.
 
+### Sole nested-if condition chains
+
+Earlier guard cleanup already joins braced chains. Later frame reconstruction
+can expose additional chains; the late `foldNestedIfConditions` entry point
+retains complete source-range diagnostics and supports scalar deepest bodies.
+It joins a maximal chain of if statements into an ordered
+short-circuit conjunction when every intermediate then-block contains only its
+next if and no branch has an else. Complete original conditions and the deepest
+body retain their expression association, effects, unboxing and protected
+completion. Intermediate blocks contain no declarations or actions to move.
+Comments, Unicode translation, nested executables, patterns and oversized chains
+refuse reconstruction. Chains have at most 32 conditions and 40 KiB of source.
+
+`node --test test/nestedIfConditionRecovery.test.js` checks seven groups,
+including 3,280,500 native cases across 18 models. Original, joined and grouped
+forms compare with independent ordered oracles for nullable Boolean callbacks,
+reference identity, NaNs, overflow, failures, aliases, finally overrides and
+monitor release. Publication independently attributes every condition and proves
+exact sole-child topology, complete body preservation, every binding and all
+transfer/protected-scope destinations, including labels around the merged if.
+
 ### Conditional primitive-store continuations
 
 `foldConditionalStoreFallbacks` keeps a bounded continuation of primitive stores
