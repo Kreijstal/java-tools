@@ -93,6 +93,33 @@ and six contexts. It checks callback order, partial writes, nullable unboxing,
 NaNs, signed overflow, guard mutations, finally overrides and monitor release.
 Another 55 FP-strict arithmetic cases cover underflow, overflow and signed zero.
 
+### Guarded primitive-store fallbacks
+
+`foldGuardedStoreFallbacks` extends exclusive fallback reconstruction to one
+through eight simple integral/boolean assignments. The guarded prefix keeps its
+original condition and guard exactly once; fallback assignments occupy exclusive
+arms in their original order. No selector, predicate reevaluation, inferred
+control flag value, reassociation, new label or repeated runtime store is needed.
+A terminal plain-block/if corridor can connect the selected branch to the frame
+exit. Extra work, loops, protected boundaries and other corridors refuse.
+
+Scoped primitive local/formal declarations or exact owned-field metadata prove
+destination and operand types. Reference boxing stores, floating stores,
+computed/cast/call/array operands, unknown receivers and shadowed class qualifiers
+refuse. Prefix-owned direct declarations refuse so cloned assignments cannot
+capture different locals. Original frame scopes remain when needed. Limits bound
+source/nesting/labels, fallback statements/tokens/bytes and individual regions.
+Diagnostics identify the exact store clone, source ranges and terminal corridor
+for independent javac attribution and per-occurrence transfer/scope validation.
+
+`node --test test/guardedStoreFallbackRecovery.test.js` covers six groups,
+including 77,760 native comparisons across 24 direct/nested/protected/store models.
+The independent oracle checks nullable conditions/guards, volatile writes, partial
+failures, signed overflow, finally overrides, monitor release and alias identity.
+Publication requires exact copied-store bindings and terminal-corridor evidence,
+every original binding/transfer/protected scope, explicit label migrations,
+compilation, dictionary reversal and clean source/archive reproduction.
+
 ### Terminal loop-frame labels
 
 `foldTerminalLoopFrames` recognizes a loop body ending with a plain labeled
