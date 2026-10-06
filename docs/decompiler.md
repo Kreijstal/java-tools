@@ -93,6 +93,35 @@ and six contexts. It checks callback order, partial writes, nullable unboxing,
 NaNs, signed overflow, guard mutations, finally overrides and monitor release.
 Another 55 FP-strict arithmetic cases cover underflow, overflow and signed zero.
 
+### Small exclusive guarded fallbacks
+
+`foldSmallGuardedFallbacks` reconstructs a single-exit frame such as
+`Pick: { if (test()) { prefix(); if (keep()) break Pick; } fallback(2); }`
+as `if (test()) { prefix(); if (!(keep())) { fallback(2); } } else { fallback(2); }`.
+The condition, prefix and guard retain one source occurrence and execute at
+exactly their old points. The small fallback has two exclusive source sites;
+only one runs on any original fallback path. Conditions may mutate, unbox or
+throw. No condition is reevaluated and no selector or flag invariant is added.
+
+The fallback must be one call with simple literals (including signed integral
+literals), identifiers, self/super or field operands, at most 32 tokens/512 characters and one source line. Calls in
+operands, arithmetic, casts and poly expressions refuse the copy. Prefix-owned
+direct declarations refuse to prevent a copied fallback from observing a
+shadowing binding. Nested execution and unsupported syntax refuse globally.
+The sole guarded frame exit is direct, and the fallback ends the exact frame;
+protected constructs are neither split nor crossed. Outer declaration and
+scalar statement scopes retain their braces. Diagnostics mark copied source
+fragments, allowing independent javac comparison of each added method/value/type
+reference against its original binding. Each recovered frame removes one label,
+so the final emitter iteration converges within its source/nesting/label budgets.
+
+`node --test test/smallGuardedFallbackRecovery.test.js` covers seven groups.
+Native independent models compare 12,960 cases across six completion contexts,
+including condition mutation, nullable unboxing, overloads, aliases, partial
+failures, finally priority and monitor release. Publication requires independent
+shape/scope/copy evidence, exact source reconstruction, every retained and
+copied binding, transfer/protection comparison, compilation and byte reversal.
+
 ### Single-pass inner loops
 
 `foldSinglePassInnerLoops` removes an inner `while` whose body cannot fall

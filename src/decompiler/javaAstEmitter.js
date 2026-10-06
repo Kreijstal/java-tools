@@ -19,6 +19,7 @@ const { foldGuardedLocalAssignments: recoverGuardedLocalAssignments } = require(
 const { foldStableGuardedFallbacks: recoverStableGuardedFallbacks } = require('./stableGuardedFallbackRecovery');
 const { foldGuardedAssignmentSequences: recoverGuardedAssignmentSequences } = require('./guardedAssignmentSequenceRecovery');
 const { simplifySelfCasts: recoverSelfCasts, normalizedSelfCastAst } = require('./selfCastRecovery');
+const { foldSmallGuardedFallbacks: recoverSmallGuardedFallbacks } = require('./smallGuardedFallbackRecovery');
 const { recoverArrayIndexIncrements: recoverIndexIncrements } = require('./incrementCaptureRecovery');
 const { foldGuardedAbruptPlainBlockExits: recoverGuardedAbruptExit } = require('./guardedAbruptExitRecovery');
 const { foldGuardedLoopContinuations: recoverLoopContinuation, foldNonrepeatingWhileLoops: recoverNonrepeatingLoops,
@@ -705,6 +706,11 @@ function foldGuardedAssignmentSequences(source, options = {}) {
   try { proof = controlCleanupSource(source); }
   catch (error) { if (error instanceof RangeError) return {source, sequencesFolded: 0}; throw error; }
   return recoverGuardedAssignmentSequences(source, proof, options);
+}
+
+function foldSmallGuardedFallbacks(source, options = {}) {
+  try { return recoverSmallGuardedFallbacks(source, controlCleanupSource(source), options); }
+  catch (error) { if (error instanceof RangeError) return {source, framesRecovered: 0}; throw error; }
 }
 
 function foldSinglePassInnerLoops(source, options = {}) {
@@ -3358,6 +3364,7 @@ module.exports = {
   foldGuardedAssignmentSequences,
   simplifySelfCasts,
   foldSinglePassInnerLoops,
+  foldSmallGuardedFallbacks,
   simplifyPredicateNegations,
   simplifyPredicateGrouping,
   specializePathGuards,
