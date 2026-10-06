@@ -20,6 +20,7 @@ const { foldStableGuardedFallbacks: recoverStableGuardedFallbacks } = require('.
 const { foldGuardedAssignmentSequences: recoverGuardedAssignmentSequences } = require('./guardedAssignmentSequenceRecovery');
 const { simplifySelfCasts: recoverSelfCasts, normalizedSelfCastAst } = require('./selfCastRecovery');
 const { foldSmallGuardedFallbacks: recoverSmallGuardedFallbacks } = require('./smallGuardedFallbackRecovery');
+const { foldTerminalLoopFrames: recoverTerminalLoopFrames } = require('./terminalLoopFrameRecovery');
 const { recoverArrayIndexIncrements: recoverIndexIncrements } = require('./incrementCaptureRecovery');
 const { foldGuardedAbruptPlainBlockExits: recoverGuardedAbruptExit } = require('./guardedAbruptExitRecovery');
 const { foldGuardedLoopContinuations: recoverLoopContinuation, foldNonrepeatingWhileLoops: recoverNonrepeatingLoops,
@@ -706,6 +707,11 @@ function foldGuardedAssignmentSequences(source, options = {}) {
   try { proof = controlCleanupSource(source); }
   catch (error) { if (error instanceof RangeError) return {source, sequencesFolded: 0}; throw error; }
   return recoverGuardedAssignmentSequences(source, proof, options);
+}
+
+function foldTerminalLoopFrames(source, options = {}) {
+  try { return recoverTerminalLoopFrames(source, controlCleanupSource(source), options); }
+  catch (error) { if (error instanceof RangeError) return {source, framesRecovered: 0}; throw error; }
 }
 
 function foldSmallGuardedFallbacks(source, options = {}) {
@@ -3365,6 +3371,7 @@ module.exports = {
   simplifySelfCasts,
   foldSinglePassInnerLoops,
   foldSmallGuardedFallbacks,
+  foldTerminalLoopFrames,
   simplifyPredicateNegations,
   simplifyPredicateGrouping,
   specializePathGuards,

@@ -93,6 +93,33 @@ and six contexts. It checks callback order, partial writes, nullable unboxing,
 NaNs, signed overflow, guard mutations, finally overrides and monitor release.
 Another 55 FP-strict arithmetic cases cover underflow, overflow and signed zero.
 
+### Terminal loop-frame labels
+
+`foldTerminalLoopFrames` recognizes a loop body ending with a plain labeled
+frame followed only by a bare break of that loop. Exiting the frame reaches
+that same final loop exit without any intervening action or protected boundary.
+The existing frame name can therefore label the loop itself; if the loop already
+has a label, the equivalent frame exits merge into it. Nested breaks keep an
+explicit destination. No new label, selector, condition or action is introduced.
+
+Declaration-free frame bodies flatten into the loop body. A frame containing
+direct declarations retains its whole block scope. Loop headers, updates,
+bare breaks/continues, outer named continues, and whole nested/protected
+constructs remain in place. A frame's break inside a finally still overrides
+pending return/throw/continue at the same loop exit. Suffix work, non-loop final
+exits, named continues to a plain frame, unsupported syntax, nested execution
+and source/nesting/label/transfer limits refuse. Diagnostics identify the moved
+or retired label, complete loop/frame extents, original break references and
+terminal exit for independent destination/protected-scope verification.
+
+`node --test test/terminalLoopFrameRecovery.test.js` covers six groups.
+Native independent models compare 11,520 cases across 48 loop/protected/merge
+contexts, including outer updates and guards, nested breaks and continues,
+aliases, overflow, partial failures, returns, throws, finally priority and
+monitor release. Publication requires independently parsed exact frame/loop
+continuations, every binding and transfer/protected scope, explicit label
+identity/ordinal migrations, compilation and byte reversal.
+
 ### Small exclusive guarded fallbacks
 
 `foldSmallGuardedFallbacks` reconstructs a single-exit frame such as
