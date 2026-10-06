@@ -111,18 +111,18 @@ aliases, finally overrides and monitor release. Publication independently
 reattributes primitive stores, exact terminal corridors, all original/copied
 bindings and every surviving transfer/protected scope before export.
 
-### Late cleanup after shared callbacks
+### Late cleanup after shared fallbacks
 
-Shared callback recovery changes a nested branch into complete exclusive arms.
-A previously nonterminal early frame exit can then have an action-free terminal
-corridor. The normal emitter reruns `foldTerminalGuardedFrameExits` after shared
-recovery to express that remaining exit as an inverse guard around its complete
+Shared callback and primitive-store recovery change nested branches into complete
+exclusive arms. A previously nonterminal early frame exit can then have an
+action-free terminal corridor. The normal emitter reruns `foldTerminalGuardedFrameExits` after each shared
+recovery stage to express that remaining exit as an inverse guard around its complete
 suffix. Original predicates/actions stay once; other exits retain their frame.
 Protected/loop/monitor crossings and intervening work still refuse.
 
-`node --test test/sharedGuardedFallbackRecovery.test.js` validates normal emission
-of the final structured form. Its 174,960 native cases compare original, shared
-and final forms with an independent oracle. Publication must reattribute the
+`node --test test/sharedGuardedFallbackRecovery.test.js test/sharedStoreFallbackRecovery.test.js`
+validates normal emission of both final structured forms. Each fixture's 174,960
+native cases compare original, shared and final forms with an independent oracle. Publication must reattribute the
 actual intermediate source with javac and independently prove every consumed
 exit, remaining transfer/protected scope, binding and complete naming object.
 

@@ -4,8 +4,8 @@ const{foldSharedStoreFallbacks:fold,foldTerminalGuardedFrameExits:terminal}=requ
 const fields={owner:'Game',fields:[{name:'direction',type:'int',static:false},{name:'wide',type:'double',static:false},{name:'boxed',type:'Integer',static:false}]};
 const sample=(nested=true)=>'Frame:{'+(nested?'if(outer()){':'')+'if(choose()){if(early())break Frame;prefix();this.direction=1;if(keep())break Frame;}this.direction=-1;'+(nested?'}':'')+'}';
 
-test('normal emission shares a primitive fallback store while retaining the early frame exit',()=>{
- const source=sample(),body=[source];finish(body,[],[],fields);assert.equal(body[0],'Frame:{if(outer()){if(choose()){if(early())break Frame;prefix();this.direction=1;if (!(keep())) {this.direction=-1;}} else {this.direction=-1;}}}');const next=fold(source,{ownedFields:fields,retainDiagnostics:true});assert.equal(next.framesRecovered,1);assert.equal(next.sharedFramesRetained,1);assert.equal(next.labelsRemoved,0);assert.equal(terminal(next.source).labelsRemoved,1);
+test('normal emission finishes shared primitive stores with an ordinary early condition',()=>{
+ const source=sample(),body=[source];finish(body,[],[],fields);assert.equal(body[0],'if(outer()){if(choose()){if (!(early())) {prefix();this.direction=1;if (!(keep())) {this.direction=-1;}}} else {this.direction=-1;}}');const next=fold(source,{ownedFields:fields,retainDiagnostics:true});assert.equal(next.framesRecovered,1);assert.equal(next.sharedFramesRetained,1);assert.equal(next.labelsRemoved,0);assert.equal(terminal(next.source).labelsRemoved,1);
 });
 test('one through eight scoped integral/boolean stores retain order and declaration scopes',()=>{
  for(const fallback of ['x=220;','x=220;y=-2147483648;flag=false;','x=220;'.repeat(8)]){const source='int x=0;int y=0;boolean flag=true;Frame:{if(choose()){if(early())break Frame;prefix();if(keep())break Frame;}'+fallback+'}',next=fold(source,{retainDiagnostics:true});assert.equal(next.framesRecovered,1);assert.equal(next.sharedFramesRetained,1);assert.equal(next.source.split('choose()').length-1,1);assert.equal(next.source.split('keep()').length-1,1);}
