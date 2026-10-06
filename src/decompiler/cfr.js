@@ -3,7 +3,7 @@
 const {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits, foldNonlocalLoopExits, foldLoopElseExitGuards, foldTerminalLoopTails} = require('./javaAstEmitter');
 const {recoverScalarIfDispatches, simplifyPredicateNegations, simplifyDominatedPredicates, finalizeControlFrames, finalizeTerminalSwitchFrames, foldRedundantExitGuards} = require('./javaAstEmitter');
 const {simplifyPredicateGrouping} = require('./javaAstEmitter');
-const {foldScalarSwitchPrefixes, foldBooleanLocalAssignments, foldNaturalLoopExits, foldGuardedLocalAssignments, foldStableGuardedFallbacks, foldGuardedAssignmentSequences, simplifySelfCasts, foldSinglePassInnerLoops, foldSmallGuardedFallbacks, foldTerminalLoopFrames, foldGuardedStoreFallbacks, foldTerminalGuardedFrameExits, foldTerminalFrameLoops, foldSharedGuardedFallbacks, foldSharedStoreFallbacks, foldArithmeticStoreFallbacks} = require('./javaAstEmitter');
+const {foldScalarSwitchPrefixes, foldBooleanLocalAssignments, foldNaturalLoopExits, foldGuardedLocalAssignments, foldStableGuardedFallbacks, foldGuardedAssignmentSequences, simplifySelfCasts, foldSinglePassInnerLoops, foldSmallGuardedFallbacks, foldTerminalLoopFrames, foldGuardedStoreFallbacks, foldTerminalGuardedFrameExits, foldTerminalFrameLoops, foldSharedGuardedFallbacks, foldSharedStoreFallbacks, foldArithmeticStoreFallbacks, foldConditionalStoreFallbacks} = require('./javaAstEmitter');
 
 const fs = require('fs');
 const path = require('path');
@@ -2228,6 +2228,11 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
   const finalGrouping = simplifyPredicateGrouping(source);
   if (finalGrouping.parenthesisPairsRemoved) {
     source = finalGrouping.source; changed = true;
+  }
+  for (;;) {
+    const conditionalStores = foldConditionalStoreFallbacks(source, {parameters, ownedFields});
+    if (!conditionalStores.framesRecovered) break;
+    source = conditionalStores.source; changed = true;
   }
   if (changed) replaceArrayContents(body, source.split('\n'));
 }

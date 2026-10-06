@@ -713,6 +713,11 @@ function foldGuardedAssignmentSequences(source, options = {}) {
   return recoverGuardedAssignmentSequences(source, proof, options);
 }
 
+function foldConditionalStoreFallbacks(source, options = {}) {
+  try { return recoverGuardedStoreFallbacks(source, controlCleanupSource(source), {...options, preserveSharedFrames: true, allowIntegralArithmetic: true, allowConditionalStores: true}); }
+  catch (error) { if (error instanceof RangeError) return {source, framesRecovered: 0}; throw error; }
+}
+
 function foldArithmeticStoreFallbacks(source, options = {}) {
   try { return recoverGuardedStoreFallbacks(source, controlCleanupSource(source), {...options, preserveSharedFrames: true, allowIntegralArithmetic: true}); }
   catch (error) { if (error instanceof RangeError) return {source, framesRecovered: 0}; throw error; }
@@ -3412,6 +3417,7 @@ module.exports = {
   foldSharedGuardedFallbacks,
   foldSharedStoreFallbacks,
   foldArithmeticStoreFallbacks,
+  foldConditionalStoreFallbacks,
   simplifyPredicateNegations,
   simplifyPredicateGrouping,
   specializePathGuards,

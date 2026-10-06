@@ -93,6 +93,26 @@ and six contexts. It checks callback order, partial writes, nullable unboxing,
 NaNs, signed overflow, guard mutations, finally overrides and monitor release.
 Another 55 FP-strict arithmetic cases cover underflow, overflow and signed zero.
 
+### Conditional primitive-store continuations
+
+`foldConditionalStoreFallbacks` keeps a bounded continuation of primitive stores
+and complete if/else trees together. It shares that complete original suffix
+between exclusive arms, preserving every condition, callback, unboxing and write
+once on the original paths. Original association and arithmetic failures remain.
+A continuation has at most eight store leaves, four tree levels, 24 statement
+nodes and the existing 128-token/1-KiB budget. Declarations, transfers, loops,
+protected regions and unsupported stores refuse. Earlier store APIs retain
+their policy. Remaining exits keep their original frame name and scope.
+
+`node --test test/conditionalStoreFallbackRecovery.test.js` covers six groups
+and 1,049,760 native cases across 36 models. Independent oracles compare original,
+shared and subsequently structured forms through nullable tail predicates,
+short-circuit callbacks, mutations, partial writes, zero divisors, overflow,
+aliases, finally overrides and monitor release. Publication independently
+attributes all store leaves and Boolean conditions, checks exact complete-suffix
+copies and every binding/transfer/protected scope, then compiles and reverses
+the full export.
+
 ### Arithmetic fallback stores
 
 `foldArithmeticStoreFallbacks` permits bounded integral arithmetic in primitive
