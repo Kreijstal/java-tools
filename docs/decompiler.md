@@ -102,10 +102,13 @@ source arms execute each original store once on its original paths. Other frame
 exits retain their name and scope; the final reference can retire the frame.
 Scoped local/formal and owned-field evidence is required. Floating, boxed,
 unknown, cast, call, increment, array and conditional operands refuse. Original
-simple-store APIs retain their existing policy.
+simple-store APIs retain their existing policy. Final predicate/grouping cleanup
+runs after arithmetic recovery, so new inverse guards use direct comparisons
+without changing expression association or evaluation order.
 
 `node --test test/arithmeticStoreFallbackRecovery.test.js` checks six groups,
-including 262,440 native comparisons across 36 models. Independent oracles cover
+including 262,440 native comparisons across 36 models. Original, shared and final
+structured forms compare with independent oracles for
 nullable early/keep guards, prefix mutations, volatile reads, overflow, shifts,
 zero divisors, partial writes, aliases, finally overrides and monitor release.
 Publication independently attributes every arithmetic operand, original/copied
