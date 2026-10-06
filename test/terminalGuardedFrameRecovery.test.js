@@ -4,7 +4,7 @@ const{foldTerminalGuardedFrameExits:fold}=require('../src/decompiler/javaAstEmit
 const fixed=source=>{let guards=0,labels=0;for(;;){const next=fold(source,{retainDiagnostics:true});if(!next.guardsRecovered)return{source,guards,labels};source=next.source;guards++;labels+=next.labelsRemoved;}};
 
 test('normal emission guards a complete terminal suffix without copying predicates or actions',()=>{
- const body=['Frame:{before();if(stop())break Frame;work();after();}'];finish(body);assert.equal(body[0],'before();if (!(stop())) {work();after();}');assert.equal(fold(body[0]).guardsRecovered,0);
+ const body=['Frame:{before();if(stop())break Frame;work();after();}'];finish(body);assert.equal(body[0],'before();if (!stop()) {work();after();}');assert.equal(fold(body[0]).guardsRecovered,0);
 });
 test('terminal if arms and declaration/scalar scopes keep every condition once',()=>{
  for(const source of['Frame:{if(outer()){before();if(stop())break Frame;int x=read();work(x);}}',

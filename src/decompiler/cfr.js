@@ -2212,6 +2212,18 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
     if (!storeRemainder.guardsRecovered) break;
     source = storeRemainder.source; changed = true;
   }
+  // Structural recovery introduces inverse guards after the earlier predicate
+  // pass. Finish their operators and condition grouping with scoped types;
+  // keep floating/unknown relations and all operand evaluation order intact.
+  for (;;) {
+    const predicates = simplifyPredicateNegations(source, {parameters, ownedFields});
+    if (!predicates.predicatesSimplified) break;
+    source = predicates.source; changed = true;
+  }
+  const finalGrouping = simplifyPredicateGrouping(source);
+  if (finalGrouping.parenthesisPairsRemoved) {
+    source = finalGrouping.source; changed = true;
+  }
   if (changed) replaceArrayContents(body, source.split('\n'));
 }
 

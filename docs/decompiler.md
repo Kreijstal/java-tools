@@ -93,6 +93,24 @@ and six contexts. It checks callback order, partial writes, nullable unboxing,
 NaNs, signed overflow, guard mutations, finally overrides and monitor release.
 Another 55 FP-strict arithmetic cases cover underflow, overflow and signed zero.
 
+### Final conditions after structural recovery
+
+The normal emitter finishes predicate operators and condition grouping after
+late frame, loop and shared-fallback reconstruction. This expresses exposed
+inverse guards as direct comparisons and removes redundant condition parentheses.
+Scoped local/formal and owned-field descriptors justify integral relational
+complements. Unknown and floating relations retain their original NaN/unboxing
+outcomes; operands, read/call order, short circuits and arithmetic association
+stay intact. This uses the existing generic predicate and grouping proofs.
+
+`node --test test/latePredicateCleanup.test.js test/predicateNegationRecovery.test.js test/predicateGroupingRecovery.test.js`
+checks normal emission, refusal boundaries and independent native oracles for
+boxing identity, nullable unboxing, side effects, overflow, NaNs, volatile fields,
+exceptions, finally overrides and monitor release. Publication separately proves
+exact permitted operator edits and primitive operand types, then compares full
+javac trees before/after grouping modulo parentheses. Every ordinary/label
+binding and transfer/protected scope must remain exact.
+
 ### Shared frames with primitive store fallbacks
 
 `foldSharedStoreFallbacks` extends primitive-store recovery to frames with other

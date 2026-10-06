@@ -8,7 +8,7 @@ const fields={owner:'Game',classQualifierUnshadowed:true,fields:[{name:'flag',ty
 
 test('normal emission recovers terminal nested primitive-store fallbacks with one condition/guard occurrence',()=>{
  const source='int x=0;int y=0;'+frame(),body=[source];finish(body);
- assert.equal(body[0],'int x=0;int y=0;if(outer()){if(choose()){prefix();if (!(keep())) {x=220;y=170;}} else {x=220;y=170;}}');assert.equal(fold(body[0]).framesRecovered,0);
+ assert.equal(body[0],'int x=0;int y=0;if(outer()){if(choose()){prefix();if (!keep()) {x=220;y=170;}} else {x=220;y=170;}}');assert.equal(fold(body[0]).framesRecovered,0);
 });
 test('direct and else-arm corridors preserve fields, prefixes and declaration scopes',()=>{
  for(const source of['Frame:{before();if(choose()){prefix();if(keep())break Frame;}this.flag=false;}',
