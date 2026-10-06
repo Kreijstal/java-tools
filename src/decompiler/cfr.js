@@ -2261,6 +2261,14 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
     if (!statements.guardsRecovered) break;
     source = statements.source; changed = true;
   }
+  // Mixed continuations expose terminal frame remainders after earlier guard
+  // recovery. Keep the complete new remainder on its original paths and in
+  // its original protected scopes; predicates and actions are not copied here.
+  for (;;) {
+    const mixedRemainder = foldTerminalGuardedFrameExits(source);
+    if (!mixedRemainder.guardsRecovered) break;
+    source = mixedRemainder.source; changed = true;
+  }
   if (changed) replaceArrayContents(body, source.split('\n'));
 }
 

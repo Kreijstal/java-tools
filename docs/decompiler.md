@@ -35,9 +35,13 @@ at most eight expression leaves, four conditions, 24 statement nodes, 256 tokens
 and 2 KiB. Declarations, labels, transfers, loops and protected continuation
 constructs refuse. Enclosing try/finally and monitor regions remain intact;
 nested executables, patterns, comments and Unicode translation refuse.
-Earlier single-callback and primitive-store APIs retain their original policies.
+After sharing mixed continuations, the emitter rechecks terminal guarded
+remainders with the existing corridor proof. It keeps their complete suffix
+under the inverse guard, without copying its conditions or actions. Earlier
+single-callback and primitive-store APIs retain their original policies.
 `test/sharedStatementFallbackRecovery.test.js` compares 641,520 native cases
-across 18 contexts against independently written ordered models.
+across 18 contexts, comparing original, shared and final structured forms
+against independently written ordered models.
 
 ## Final control-frame cleanup
 
