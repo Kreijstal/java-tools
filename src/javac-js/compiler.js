@@ -11,6 +11,8 @@ const { Attr } = require('./attr');
 const { Lower } = require('./lower');
 const { Gen } = require('./gen');
 const { ClassGen } = require('./classgen');
+const { JNIWriter } = require('./jni');
+const { generateModuleInfo } = require('./modulegen');
 
 class Compiler {
   constructor(options) {
@@ -75,6 +77,32 @@ class Compiler {
       } catch (e) {
         errors.push({ file: c.unit && c.unit.file, cls: c.flatName, phase: 'gen', error: e });
         if (options.failFast) throw e;
+      }
+    }
+    for (const cu of units) {
+      if (!cu.module || cu.failed) continue;
+      try {
+        const out = path.join(outDir, 'module-info.class');
+        fs.mkdirSync(outDir, { recursive: true });
+        fs.writeFileSync(out, generateModuleInfo(this, cu));
+        written.push(out);
+      } catch (e) {
+        errors.push({ file: cu.file, phase: 'module', error: e });
+        if (options.failFast) throw e;
+      }
+    }
+    // JNI headers (javac -h); nl is the line separator, CRLF on Windows
+    if (options.headerDir) {
+      const jni = new JNIWriter(this);
+      const nl = options.headerNewline || '\n';
+      for (const c of this.classesOf(units.filter((u) => !u.failed))) {
+        if (!this.attr.attributed.has(c) || !jni.needsHeader(c)) continue;
+        try {
+          written.push(jni.write(c, options.headerDir, nl));
+        } catch (e) {
+          errors.push({ file: c.unit && c.unit.file, cls: c.flatName, phase: 'jni', error: e });
+          if (options.failFast) throw e;
+        }
       }
     }
     return { written, errors };

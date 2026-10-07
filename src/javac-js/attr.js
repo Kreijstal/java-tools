@@ -17,6 +17,10 @@ const { forEachChild } = require('./tree-util');
 
 const PRIM = T.PRIM;
 
+function rtUndetOf(fnRaw) {
+  return fnRaw ? fnRaw.type.ret : null;
+}
+
 function unparen(t) {
   while (t && t.tag === 'Parens') t = t.expr;
   return t;
@@ -331,8 +335,8 @@ class Attr {
         if (tree.expr) {
           if (env.lambda && env.lambda.collectReturns) {
             const rt = env.lambda.returnType;
-            const t = this.attribExpr(tree.expr, env, rt && rt.kind !== 'prim' ? rt : (rt && rt.tag !== 'void' ? rt : null));
-            env.lambda.returnTypes.push(t);
+            const t = this.attribExpr(tree.expr, env, rt && rt.kind !== 'prim' ? this.properTarget(rt) : (rt && rt.tag !== 'void' ? rt : null));
+            env.lambda.returnTypes.push(...this.resultTypes(tree.expr, t));
             tree.expr.coerceTo = rt;
           } else {
             this.attribExprCoerce(tree.expr, env, env.returnType);
@@ -1081,6 +1085,7 @@ class Attr {
       else this.noteThisUse(env);
     }
     let mtype = this.instantiate(res, args, pt, env, site, typeargs);
+    tree.retUnconstrained = !!res.retUnconstrained;
     // getClass() has type Class<? extends |T|>
     if (msym.name === 'getClass' && msym.params.length === 0 && msym.owner === this.syms.objectSym) {
       const recv = site || this.thisType(env);
@@ -1164,6 +1169,12 @@ class Attr {
       const i = pending.splice(k, 1)[0];
       this.inferPolyArg(args[i], formalAt(i), ctx, env, ret, pt);
     }
+    // a result type only made of variables nothing constrained (Stream.empty())
+    // says nothing about an enclosing lambda's return type
+    const retVars = [];
+    this.collectIvars(ret, ctx, retVars);
+    res.retUnconstrained = retVars.length > 0 && retVars.every((i) => !ctx.eq[i].length && !ctx.lower[i].length
+      && !ctx.upper[i].some((b) => !this.types.isObject(b)));
     const inst = ctx.resolve();
     const decl = vars;
     const full = this.types.subst(mtype, decl, inst);
@@ -1280,7 +1291,13 @@ class Attr {
     const target = ctx.substInst(formal);
     // attribute the lambda/mref with its (partially) instantiated target
     if (a.poly === 'lambda') {
-      const lamTarget = this.properOrBound(target, ctx);
+      // outputs nothing has constrained yet stay open, so the lambda's
+      // results are typed standalone and then bound them (JLS 18.2.1)
+      const open = [];
+      this.collectIvars(rtUndetOf(fnRaw), ctx, open);
+      const keep = this.returnsFunction(u) ? []
+        : open.filter((i) => !inputIdx.includes(i) && !ctx.inst[i] && !ctx.eq[i].length && !ctx.lower[i].length);
+      const lamTarget = this.properOrBound(target, ctx, keep);
       const fn = this.rs.functionType(lamTarget);
       const rtUndet = fnRaw ? fnRaw.type.ret : null;
       this.attribLambdaWith(u, env, lamTarget, fn, true);
@@ -1372,7 +1389,11 @@ class Attr {
         }
         case 'wildcard': {
           if (!u.bound) return u;
-          if (u.bound.kind === 'tvar' && ctx.idx(u.bound) >= 0) return new T.WildcardType('unbound', null);
+          if (u.bound.kind === 'tvar' && ctx.idx(u.bound) >= 0) {
+            // ? super T with T known to be at least L: the call may assume ? super L
+            if (u.bk === 'super' && lowerOnly && lowerOnly.has(u.bound)) return new T.WildcardType('super', lowerOnly.get(u.bound));
+            return new T.WildcardType('unbound', null);
+          }
           const b = go(u.bound, false);
           return b ? new T.WildcardType(u.bk, b) : new T.WildcardType('unbound', null);
         }
@@ -1387,7 +1408,7 @@ class Attr {
   }
 
   // replace unresolved inference variables by provisional resolutions
-  properOrBound(t, ctx) {
+  properOrBound(t, ctx, keep) {
     if (ctx.isProper(t)) return t;
     const tmp = ctx.inst.slice();
     const visiting = new Set();
@@ -1420,10 +1441,10 @@ class Attr {
     };
     const mentioned = [];
     this.collectIvars(t, ctx, mentioned);
-    for (const i of mentioned) prov(i);
+    for (const i of mentioned) if (!(keep && keep.includes(i))) prov(i);
     const known = [];
     const vals = [];
-    for (let i = 0; i < ctx.ivars.length; i++) if (tmp[i]) { known.push(ctx.ivars[i]); vals.push(tmp[i]); }
+    for (let i = 0; i < ctx.ivars.length; i++) if (tmp[i] && !(keep && keep.includes(i))) { known.push(ctx.ivars[i]); vals.push(tmp[i]); }
     return this.types.subst(t, known, vals);
   }
 
@@ -1827,8 +1848,8 @@ class Attr {
     this.attribCond(tree.cond, env);
     const isPoly = pt && pt.kind !== 'prim' && (this.isPolyBranch(tree.truepart) || this.isPolyBranch(tree.falsepart));
     if (isPoly) {
-      this.attribExprCoerce(tree.truepart, env, pt);
-      this.attribExprCoerce(tree.falsepart, env, pt);
+      // the branch types constrain a lambda's inferred return type (JLS 18.2.1)
+      tree.branchTypes = [this.attribExprCoerce(tree.truepart, env, pt), this.attribExprCoerce(tree.falsepart, env, pt)];
       return pt;
     }
     const tt = this.attribExpr(tree.truepart, env, pt && pt.kind !== 'prim' ? pt : pt);
@@ -1878,7 +1899,10 @@ class Attr {
     if (tt.kind === 'null' && ft.kind === 'null') return T.NULL;
     const bt = tt.kind === 'prim' ? this.types.boxedClass(tt) : tt;
     const bf = ft.kind === 'prim' ? this.types.boxedClass(ft) : ft;
-    if (pt && pt.kind !== 'prim' && (this.isGenericPoly(tree.truepart) || this.isGenericPoly(tree.falsepart))) return pt;
+    if (pt && pt.kind !== 'prim' && (this.isGenericPoly(tree.truepart) || this.isGenericPoly(tree.falsepart))) {
+      tree.branchTypes = [bt, bf];
+      return pt;
+    }
     if (bt.kind === 'null') return bf;
     if (bf.kind === 'null') return bt;
     return this.types.lub([bt, bf]);
@@ -2020,12 +2044,42 @@ class Attr {
       const isVoid = rt && rt.kind === 'prim' && rt.tag === 'void';
       const et = this.attribExpr(tree.body, lenv, isVoid ? null : this.properTarget(rt));
       if (!isVoid) {
-        info.returnTypes.push(et);
+        info.returnTypes.push(...this.resultTypes(tree.body, et));
         tree.body.coerceTo = rt;
       }
     }
     tree.returnTypes = info.returnTypes;
     tree.type = target;
+  }
+
+  // does a lambda return a lambda or method reference (which needs a target)?
+  returnsFunction(lam) {
+    if (lam.body.tag !== 'Block') return this.isPolyBranch(lam.body);
+    let found = false;
+    const walk = (t) => {
+      if (found || !t || typeof t !== 'object') return;
+      if (Array.isArray(t)) { t.forEach(walk); return; }
+      if (t.tag === 'Lambda' || t.tag === 'ClassDecl' || t.tag === 'NewClass') return;
+      if (t.tag === 'Return') { if (t.expr && this.isPolyBranch(t.expr)) found = true; return; }
+      for (const k of Object.keys(t)) {
+        if (k === 'type' || k === 'sym' || k === 'coerceTo' || k === 'pos') continue;
+        const v = t[k];
+        if (v && typeof v === 'object' && (Array.isArray(v) || v.tag)) walk(v);
+      }
+    };
+    walk(lam.body.stats);
+    return found;
+  }
+
+  // types a lambda result expression contributes: the branches of a poly
+  // conditional count separately
+  resultTypes(expr, t) {
+    const u = unparen(expr);
+    if (u.tag === 'Conditional' && u.branchTypes) {
+      return [...this.resultTypes(u.truepart, u.branchTypes[0]), ...this.resultTypes(u.falsepart, u.branchTypes[1])];
+    }
+    if (u.tag === 'Apply' && u.retUnconstrained) return [];
+    return [t];
   }
 
   properTarget(rt) {

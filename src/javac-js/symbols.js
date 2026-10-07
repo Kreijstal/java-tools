@@ -164,6 +164,11 @@ class Symtab {
     const p = this.enterPackage(fullName);
     if (p.exists) return true;
     if (p.classes.size) { p.exists = true; return true; }
+    // a package of the compiled files themselves, or an enclosing package of one
+    const prefix = `${fullName}.`;
+    for (const [n, q] of this.packages) {
+      if (q.classes.size && n.startsWith(prefix)) { p.exists = true; return true; }
+    }
     const rel = fullName.replace(/\./g, '/');
     for (const r of this.sourceRoots) {
       try {
