@@ -28,6 +28,7 @@ const {foldNestedIfConditions: recoverNestedIfConditions} = require('./nestedIfC
 const { foldTerminalFrameLoops: recoverTerminalFrameLoops } = require('./terminalFrameLoopRecovery');
 const { foldTerminalGuardedFrameExits: recoverTerminalGuardedFrames } = require('./terminalGuardedFrameRecovery');
 const {foldLoopFrameCompletion: recoverLoopFrameCompletion} = require('./loopFrameCompletionRecovery');
+const {foldLeadingLoopExitWork: recoverLeadingLoopExitWork} = require('./leadingLoopExitWorkRecovery');
 const {shareDynamicGuardedTails: recoverDynamicGuardedTails} = require('./dynamicGuardedTailRecovery');
 const { foldGuardedStoreFallbacks: recoverGuardedStoreFallbacks } = require('./guardedStoreFallbackRecovery');
 const { foldTerminalLoopFrames: recoverTerminalLoopFrames } = require('./terminalLoopFrameRecovery');
@@ -770,6 +771,11 @@ function foldTerminalGuardedFrameExits(source, options = {}) {
 
 function foldLoopFrameCompletion(source, options = {}) {
   return recoverLoopFrameCompletion(source, controlCleanupSource(source), options);
+}
+
+function foldLeadingLoopExitWork(source, options = {}) {
+  try { return recoverLeadingLoopExitWork(source, controlCleanupSource(source), options); }
+  catch (error) { if (error instanceof RangeError) return {source, loopsRecovered: 0}; throw error; }
 }
 
 function shareDynamicGuardedTails(source, options = {}) {
@@ -3454,6 +3460,7 @@ module.exports = {
   foldTerminalGuardedFrameExits,
   foldLoopFrameCompletion,
   shareDynamicGuardedTails,
+  foldLeadingLoopExitWork,
   foldTerminalFrameLoops,
   foldSharedGuardedFallbacks,
   foldSharedStatementFallbacks,

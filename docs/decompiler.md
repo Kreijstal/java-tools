@@ -1,5 +1,15 @@
 # Structured Decompiler: goto-free control-flow recovery
 
+`CFR_JS_LEADING_LOOP_EXIT_WORK=1` opts into reconstruction of a forever loop
+whose leading guard performs exit-only work before its final loop break. The
+original condition is evaluated once in the header and captured in a Boolean
+local; the untouched body remains in the loop and the untouched exit-only work
+runs only after that leading decision ends the loop. Other breaks skip it.
+Labels, body continues and finally overrides retain their original targets;
+self transfers within exit-only work, captures, ambiguous assignment and unknown
+syntax refuse reconstruction. New locals are scoped to one replacement block.
+The generic default remains unchanged.
+
 `CFR_JS_AVOID_PROVEN_REFERENCE_CAST_BRIDGES=1` opts into removing an
 intermediate `(Object)` bridge when class/array hierarchy metadata proves a
 narrowing reference cast is legal directly. The explicit target cast and its

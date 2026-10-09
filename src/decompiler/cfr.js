@@ -19,7 +19,7 @@ const { structureMethod } = require('./exceptionStructurer');
 const { mergeDuplicateLoopIncrementTails } = require('./loopTailMerge');
 const { partitionStructuredVoidBody } = require('./structuredMethodPartition');
 const {splitPrimitiveLocalLifetimes, splitNestedPrimitiveLocalLifetimes, splitReferenceLocalLifetimes, splitNestedReferenceLocalLifetimes, splitInitializedPrimitiveLocalLifetimes, splitNestedInitializedPrimitiveLocalLifetimes, splitArrayDimensionPrimitiveLocalLifetimes} = require('./primitiveLocalLifetimeRecovery');
-const {foldLoopFrameCompletion, shareDynamicGuardedTails} = require('./javaAstEmitter');
+const {foldLoopFrameCompletion, shareDynamicGuardedTails, foldLeadingLoopExitWork} = require('./javaAstEmitter');
 const { listRegionSplitCandidates, applyRegionSplit } = require('../passes/regionSplit');
 const { jreClassInfo, jreMethodCandidates } = require('../java-frontend/jreMetadata');
 const { JavaParser } = require('../java-frontend/parser');
@@ -2353,6 +2353,14 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
       source = shared.source; changed = true;
     }
   }
+  if (process.env.CFR_JS_LEADING_LOOP_EXIT_WORK === '1') {
+    for (;;) {
+      const exitWork = foldLeadingLoopExitWork(source, {reservedNames: parameterNames});
+      if (!exitWork.loopsRecovered) break;
+      source = exitWork.source; changed = true;
+    }
+  }
+
   if (changed) replaceArrayContents(body, source.split('\n'));
 }
 
