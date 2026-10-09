@@ -34,3 +34,29 @@ test('native reference phases match independent alias and partial-failure models
  `;fs.writeFileSync(path.join(dir,'ReferencePhases.java'),java);run('javac',['--release','8','-d',dir,path.join(dir,'ReferencePhases.java')]);assert.equal(run('java',['-Xmx128m','-cp',dir,'ReferencePhases']),'192000');
  }finally{fs.rmSync(dir,{recursive:true,force:true});}
 });
+
+test('nested reference recovery separates exposed roles but retains incoming loop values',()=>{
+ const{splitNestedReferenceLocalLifetimes:nested}=require('../src/decompiler/primitiveLocalLifetimeRecovery');
+ const source='Object x=null;while(next()){if(ready()){x=first();use(x);}x=second();use(x);}x=third();use(x);',first=split(source),next=nested(first.source,{retainDiagnostics:true});assert.equal(next.localsSplit,1);assert.equal(next.diagnostics.locals[0].nested,true);assert.ok(next.source.includes('xLifetime2=second();use(xLifetime2)'));assert.equal(nested(next.source).localsSplit,0);
+ for(const source of ['Object x=null;while(next()){use(x);x=second();use(x);}','Object x=null;while(next()){if(flag)use(x);x=second();use(x);}','Object x=null;for(int i=0;i<n;i++){use(x);x=second();use(x);}']){assert.equal(split(source).source,source);assert.equal(nested(source).source,source);}
+ assert.equal(nested('Object x=null;x=first();use(x);x=second();use(x);').localsSplit,0,'nested policy retains root-only phases');
+});
+
+test('native nested roles and incoming loop values match independent reference event models',()=>{
+ const{splitNestedReferenceLocalLifetimes:nested}=require('../src/decompiler/primitiveLocalLifetimeRecovery'),dir=fs.mkdtempSync(path.join(os.tmpdir(),'nested-reference-native-'));
+ const run=(cmd,args)=>{const out=path.join(dir,'out'),err=path.join(dir,'err'),fds=[out,err].map(f=>fs.openSync(f,'w'));try{const r=spawnSync(cmd,args,{stdio:['ignore',...fds]});if(r.error)throw r.error;assert.equal(r.status,0,fs.readFileSync(err,'utf8'));return fs.readFileSync(out,'utf8').trim();}finally{fds.forEach(fd=>fs.closeSync(fd));}};
+ const bodies=[
+  'Object x=null;while(index<limit){seen(x);x=choose(second);seen(x);index++;}return snapshot();',
+  'Object x=null;while(index<limit){if(flag){x=choose(first);seen(x);}x=choose(second);seen(x);index++;}x=choose(first);seen(x);return snapshot();',
+ ];
+ const oracles=[
+  'Object incoming=null;while(index<limit){seen(incoming);Object next=choose(second);seen(next);incoming=next;index++;}return snapshot();',
+  'while(index<limit){if(flag){Object a=choose(first);seen(a);}Object b=choose(second);seen(b);index++;}Object ending=choose(first);seen(ending);return snapshot();',
+ ];
+ try{let methods='';for(let i=0;i<bodies.length;i++){const firstPass=split(bodies[i]),r=nested(firstPass.source);if(i===0){assert.equal(firstPass.localsSplit,0);assert.equal(r.localsSplit,0);}else assert.equal(r.localsSplit,1);for(const[name,body]of[['old',bodies[i]],['next',r.source],['oracle',oracles[i]]])methods+=`static String ${name}${i}(int limit,boolean flag){${body}}\n`;}
+ const java=`public class NestedReferencePhases{static Object first,second,lock;static int index,count,failAt;static StringBuilder trace;static final RuntimeException FAILURE=new IllegalStateException(),OVERRIDE=new IllegalStateException();static void event(int n){trace.append(n).append(Thread.holdsLock(lock)?"L":"U");if(count++==failAt)throw FAILURE;}static Object choose(Object x){event(8);return x;}static void seen(Object x){event(x==null?0:x==first?1:2);}static String snapshot(){return index+":"+count+":"+trace;}${methods}
+ static String take(int kind,int variant,int limit,boolean flag,int shape,int mode){first=(shape&1)==0?new Object():null;second=(shape&2)==0?new Object():null;if((shape&4)!=0)second=first;lock=new Object();index=count=0;trace=new StringBuilder();String result;try{synchronized(lock){try{switch(kind){case 0:result=variant==0?old0(limit,flag):variant==1?next0(limit,flag):oracle0(limit,flag);break;case 1:result=variant==0?old1(limit,flag):variant==1?next1(limit,flag):oracle1(limit,flag);break;default:throw new AssertionError();}}finally{event(9);if(mode==1)throw OVERRIDE;}}}catch(Throwable e){result=e==FAILURE?"failure":e==OVERRIDE?"override":e.getClass().getName();}if(Thread.holdsLock(lock))throw new AssertionError("monitor retained");return result+":"+snapshot();}
+ public static void main(String[]args){int cases=0;for(int kind=0;kind<2;kind++)for(int limit=-1;limit<=5;limit++)for(boolean flag:new boolean[]{false,true})for(int shape=0;shape<8;shape++)for(int mode=0;mode<2;mode++)for(int failure=-1;failure<24;failure++){failAt=failure;String expected=take(kind,2,limit,flag,shape,mode);for(int variant=0;variant<2;variant++)if(!expected.equals(take(kind,variant,limit,flag,shape,mode)))throw new AssertionError(kind+":"+variant+":"+limit+":"+failure+":"+expected);cases++;}System.out.println(cases);}}
+ `;fs.writeFileSync(path.join(dir,'NestedReferencePhases.java'),java);run('javac',['--release','8','-d',dir,path.join(dir,'NestedReferencePhases.java')]);assert.equal(run('java',['-Xmx128m','-cp',dir,'NestedReferencePhases']),'11200');
+ }finally{fs.rmSync(dir,{recursive:true,force:true});}
+});

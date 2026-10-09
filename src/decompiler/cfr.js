@@ -18,7 +18,7 @@ const {
 const { structureMethod } = require('./exceptionStructurer');
 const { mergeDuplicateLoopIncrementTails } = require('./loopTailMerge');
 const { partitionStructuredVoidBody } = require('./structuredMethodPartition');
-const {splitPrimitiveLocalLifetimes, splitNestedPrimitiveLocalLifetimes, splitReferenceLocalLifetimes} = require('./primitiveLocalLifetimeRecovery');
+const {splitPrimitiveLocalLifetimes, splitNestedPrimitiveLocalLifetimes, splitReferenceLocalLifetimes, splitNestedReferenceLocalLifetimes} = require('./primitiveLocalLifetimeRecovery');
 const {foldLoopFrameCompletion} = require('./javaAstEmitter');
 const { listRegionSplitCandidates, applyRegionSplit } = require('../passes/regionSplit');
 const { jreClassInfo, jreMethodCandidates } = require('../java-frontend/jreMetadata');
@@ -2328,6 +2328,10 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
   if (process.env.CFR_JS_SPLIT_REFERENCE_LIFETIMES === '1') {
     const references = splitReferenceLocalLifetimes(source, {reservedNames: parameterNames});
     if (references.localsSplit) { source = references.source; changed = true; }
+    if (process.env.CFR_JS_SPLIT_NESTED_REFERENCE_LIFETIMES === '1') {
+      const nested = splitNestedReferenceLocalLifetimes(source, {reservedNames: parameterNames});
+      if (nested.localsSplit) { source = nested.source; changed = true; }
+    }
   }
   if (changed) replaceArrayContents(body, source.split('\n'));
 }

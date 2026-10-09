@@ -1,5 +1,13 @@
 # Structured Decompiler: goto-free control-flow recovery
 
+`CFR_JS_SPLIT_NESTED_REFERENCE_LIFETIMES=1` adds one nested reference pass after
+the initial reference split. It uses the same type, binding and assignment
+contracts, selecting only a block nested in the method. Earlier separation can
+expose independent roles inside a loop or branch. A null initializer outside a
+loop cannot supply a first phase in each iteration: incoming reads keep their
+original reaching value. Each newly separated loop-body phase must define all
+its own reads. The option defaults off and requires reference lifetime recovery.
+
 `CFR_JS_SPLIT_REFERENCE_LIFETIMES=1` optionally separates reused reference locals
 into independently assigned phases. The original uninitialized or literal-null
 declaration stays intact; later phases receive uninitialized declarations of the

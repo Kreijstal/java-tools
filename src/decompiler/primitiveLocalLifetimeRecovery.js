@@ -87,7 +87,11 @@ function splitLocalLifetimes(source, {retainDiagnostics = false, reservedNames =
     // so an iteration cannot borrow a value from an earlier iteration.
     const container = nestedBlocks || referenceLocals ? containingBlock(tree, name, identifiers) : {block: tree, contexts: []};
     if (!container) continue;
-    if (nestedBlocks && !referenceLocals && container.block === tree) continue;
+    if (nestedBlocks && container.block === tree) continue;
+    // A root initializer cannot supply an independent first phase on every
+    // execution of a nested loop body: its incoming value may be from the
+    // previous iteration's later phase. Each iteration must define its reads.
+    const initialAvailable = initialized && !container.contexts.some(c => c.loop);
     const phaseStatements = container.block.statements || [];
     const phaseEnd = blockEnds.get(container.block.range?.startOffset);
     if (phaseEnd == null) continue;
@@ -100,13 +104,13 @@ function splitLocalLifetimes(source, {retainDiagnostics = false, reservedNames =
       const closed = sequence([statement], false, name, container.contexts);
       if (closed) groups.push({start: index, end: index});
       else if (groups.length) groups.at(-1).end = index;
-      else if (initialized && !groups.length) groups.push({start: index, end: index});
+      else if (initialAvailable && !groups.length) groups.push({start: index, end: index});
       else { invalid = true; break; }
     }
     if (invalid || groups.length < 2) continue;
     for (let index = 0; index < groups.length; index++) {
       const group = groups[index];
-      if (sequence(phaseStatements.slice(group.start, group.end + 1), index === 0 && initialized, name, container.contexts)) continue;
+      if (sequence(phaseStatements.slice(group.start, group.end + 1), index === 0 && initialAvailable, name, container.contexts)) continue;
       // A conditional reset may still depend on the incoming value at a later
       // join. Merge it back into the preceding lifetime rather than detach it.
       if (!index) { invalid = true; break; }
@@ -158,6 +162,9 @@ function splitPrimitiveLocalLifetimes(source, options = {}) {
 }
 function splitReferenceLocalLifetimes(source, options = {}) {
   return splitLocalLifetimes(source, {...options, referenceLocals: true});
+}
+function splitNestedReferenceLocalLifetimes(source, options = {}) {
+  return splitLocalLifetimes(source, {...options, referenceLocals: true, nestedBlocks: true});
 }
 
 function containingBlock(tree, name, count) {
@@ -320,5 +327,5 @@ function splitNestedPrimitiveLocalLifetimes(source, options = {}) {
 function independentlyAssignedLocalSequence(statements, name, contexts = []) {
   return sequence(statements, false, name, contexts) !== null;
 }
-module.exports = {splitPrimitiveLocalLifetimes, splitNestedPrimitiveLocalLifetimes, splitReferenceLocalLifetimes,
+module.exports = {splitPrimitiveLocalLifetimes, splitNestedPrimitiveLocalLifetimes, splitReferenceLocalLifetimes, splitNestedReferenceLocalLifetimes,
   independentlyAssignedLocalSequence};
