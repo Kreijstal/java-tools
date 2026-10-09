@@ -2452,6 +2452,35 @@ NaN/infinity casts, nullable arrays and bounds failures, narrowing casts,
 throwing callbacks, finally overrides and monitor release. Diagnostics report
 the operand types and exact operator ranges for independent compiler audits.
 
+### Localizing switch exits with one effectful normal tail
+
+`foldSwitchExitTails` recognizes an exhaustive colon-label switch with exactly
+one direct terminal normal exit. Its original following expression statements
+and final exit to a surrounding plain frame belong to that normal case only.
+The expressions move to that case, retaining their order and one occurrence;
+other frame exits become ordinary switch exits. The final frame exit remains
+after the switch. Selectors, predicates, fallthrough and protected actions stay
+intact. The compiler policy `CFR_JS_SWITCH_EXIT_TAILS=1` is opt-in.
+
+Missing defaults, additional normal exits, implicit final fallthrough, a normal
+exit crossed by protection, top-level case declarations, tail declarations,
+captures and frame exits inside intervening loops/switches refuse recovery.
+Moving the tail cannot change a local's scope or a break's lexical destination.
+At most eight tail expressions, 64 localized exits and 128 case groups are used.
+
+`foldGuardedFrameCompletion` additionally supports `{effectfulGuards: true}`.
+The original conditional arm and complete prefix remain; its direct terminal
+frame exit becomes a false continuation decision after the prefix completes.
+Whole loops, switches and protected prefix actions remain untouched. Prefixes
+with other exits to the same frame refuse. The existing suffix/binding/definite
+assignment proof applies. Compiler use additionally requires
+`CFR_JS_GUARDED_FRAME_PREFIX_EFFECTS=1`; the ordinary policy remains conservative.
+
+Independent native oracles compare 421,200 cases across the original, switch-only
+and complete transformations. Coverage includes nullable/effectful predicates
+and selectors, zero/nonzero flags, fallthrough, aliased/partial stores, overflow,
+failures, finally return/throw overrides and monitor ownership/release.
+
 ### Emitting visible and lossless character literals
 
 Character literals use the ordinary Java escapes for NUL, backspace, tab,

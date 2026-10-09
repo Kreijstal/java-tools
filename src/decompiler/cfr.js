@@ -19,7 +19,7 @@ const { structureMethod } = require('./exceptionStructurer');
 const { mergeDuplicateLoopIncrementTails } = require('./loopTailMerge');
 const { partitionStructuredVoidBody } = require('./structuredMethodPartition');
 const {splitPrimitiveLocalLifetimes, splitNestedPrimitiveLocalLifetimes, splitReferenceLocalLifetimes, splitNestedReferenceLocalLifetimes, splitInitializedPrimitiveLocalLifetimes, splitNestedInitializedPrimitiveLocalLifetimes, splitArrayDimensionPrimitiveLocalLifetimes} = require('./primitiveLocalLifetimeRecovery');
-const {foldLoopFrameCompletion, shareDynamicGuardedTails, foldLeadingLoopExitWork, simplifyNaturalLoopExitCaptures, foldGuardedFrameCompletion, compactLocalBooleanGuards, reindentStructuredSource, foldExhaustiveSwitchFrameExits, foldExhaustiveIfFrameExits} = require('./javaAstEmitter');
+const {foldLoopFrameCompletion, shareDynamicGuardedTails, foldLeadingLoopExitWork, simplifyNaturalLoopExitCaptures, foldGuardedFrameCompletion, compactLocalBooleanGuards, reindentStructuredSource, foldExhaustiveSwitchFrameExits, foldExhaustiveIfFrameExits, foldSwitchExitTails} = require('./javaAstEmitter');
 const { listRegionSplitCandidates, applyRegionSplit } = require('../passes/regionSplit');
 const { jreClassInfo, jreMethodCandidates } = require('../java-frontend/jreMetadata');
 const { JavaParser } = require('../java-frontend/parser');
@@ -2369,9 +2369,17 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
     }
   }
 
+  if (process.env.CFR_JS_SWITCH_EXIT_TAILS === '1') {
+    for (;;) {
+      const tail = foldSwitchExitTails(source);
+      if (!tail.switchesRecovered) break;
+      source = tail.source; changed = true;
+    }
+  }
   if (process.env.CFR_JS_GUARDED_FRAME_COMPLETION === '1') {
     for (;;) {
-      const frame = foldGuardedFrameCompletion(source, {reservedNames: parameterNames});
+      const frame = foldGuardedFrameCompletion(source, {reservedNames: parameterNames,
+        effectfulGuards: process.env.CFR_JS_GUARDED_FRAME_PREFIX_EFFECTS === '1'});
       if (!frame.framesRecovered) break;
       source = frame.source; changed = true;
     }
