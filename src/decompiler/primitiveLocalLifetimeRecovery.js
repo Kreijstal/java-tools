@@ -284,4 +284,8 @@ function statement(node, assigned, name, contexts) {
 function splitNestedPrimitiveLocalLifetimes(source, options = {}) {
   return splitPrimitiveLocalLifetimes(source, {...options, nestedBlocks: true});
 }
-module.exports = {splitPrimitiveLocalLifetimes, splitNestedPrimitiveLocalLifetimes};
+function independentlyAssignedLocalSequence(statements, name, contexts = []) {
+  return sequence(statements, false, name, contexts) !== null;
+}
+module.exports = {splitPrimitiveLocalLifetimes, splitNestedPrimitiveLocalLifetimes,
+  independentlyAssignedLocalSequence};

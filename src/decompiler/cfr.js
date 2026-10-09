@@ -19,6 +19,7 @@ const { structureMethod } = require('./exceptionStructurer');
 const { mergeDuplicateLoopIncrementTails } = require('./loopTailMerge');
 const { partitionStructuredVoidBody } = require('./structuredMethodPartition');
 const {splitPrimitiveLocalLifetimes, splitNestedPrimitiveLocalLifetimes} = require('./primitiveLocalLifetimeRecovery');
+const {foldLoopFrameCompletion} = require('./javaAstEmitter');
 const { listRegionSplitCandidates, applyRegionSplit } = require('../passes/regionSplit');
 const { jreClassInfo, jreMethodCandidates } = require('../java-frontend/jreMetadata');
 const { JavaParser } = require('../java-frontend/parser');
@@ -2282,6 +2283,13 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
     const nestedFallback = foldNestedStableGuardedFallbacks(source, {parameters, fpStrict});
     if (!nestedFallback.framesRecovered) break;
     source = nestedFallback.source; changed = true;
+  }
+  if (process.env.CFR_JS_LOOP_FRAME_COMPLETION === '1') {
+    for (;;) {
+      const completion = foldLoopFrameCompletion(source, {reservedNames: parameterNames});
+      if (!completion.exitsRecovered) break;
+      source = completion.source; changed = true;
+    }
   }
   if (process.env.CFR_JS_SPLIT_PRIMITIVE_LIFETIMES === '1') {
     const lifetimes = splitPrimitiveLocalLifetimes(source, {reservedNames: parameterNames});

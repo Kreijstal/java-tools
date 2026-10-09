@@ -22,6 +22,28 @@ and region-splitting brings the irreducible minority into that class. This is an
 
 ## Independent primitive local lifetimes
 
+`CFR_JS_LOOP_FRAME_COMPLETION=1` optionally expresses a nonlocal frame exit from
+one loop using an initialized boolean completion local, a local loop break and
+guards around every remaining block suffix up to the frame. Existing conditions
+and actions retain one occurrence and their original order. Unentered loops
+leave the completion value true, so their continuation still runs. Other frame
+exits retain their existing target and scope.
+
+Crossed protected regions, switches, a second enclosing loop and captures refuse
+this reconstruction. A suffix needing an uninitialized value from an earlier
+region also refuses unless it assigns that value independently before reading
+it; Java's definite-assignment checker cannot infer arbitrary correlations
+through a newly introduced completion local. Initialized locals retain their
+original initialization and value flow. The option defaults to disabled.
+
+Focused validation compares original/recovered methods with independent native
+loop-outcome oracles, including nullable conditions, partial effects, for-loop
+updates, zero iterations, ordinary local breaks and caller finally overrides:
+
+```sh
+NODE_PATH=/path/to/node_modules JAVA_TOOL_OPTIONS=-XX:-UsePerfData node --test --experimental-test-isolation=none test/loopFrameCompletionRecovery.test.js
+```
+
 `CFR_JS_SPLIT_PRIMITIVE_LIFETIMES=1` enables an optional source reconstruction
 after control-flow recovery. Uninitialized primitive method locals can receive
 separate names in independently defined phases. Each phase must assign its local

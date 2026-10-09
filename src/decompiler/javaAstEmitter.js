@@ -26,6 +26,7 @@ const { foldSharedStatementFallbacks: recoverSharedStatementFallbacks } = requir
 const {foldNestedIfConditions: recoverNestedIfConditions} = require('./nestedIfConditionRecovery');
 const { foldTerminalFrameLoops: recoverTerminalFrameLoops } = require('./terminalFrameLoopRecovery');
 const { foldTerminalGuardedFrameExits: recoverTerminalGuardedFrames } = require('./terminalGuardedFrameRecovery');
+const {foldLoopFrameCompletion: recoverLoopFrameCompletion} = require('./loopFrameCompletionRecovery');
 const { foldGuardedStoreFallbacks: recoverGuardedStoreFallbacks } = require('./guardedStoreFallbackRecovery');
 const { foldTerminalLoopFrames: recoverTerminalLoopFrames } = require('./terminalLoopFrameRecovery');
 const { recoverArrayIndexIncrements: recoverIndexIncrements } = require('./incrementCaptureRecovery');
@@ -763,6 +764,10 @@ function foldTerminalFrameLoops(source, options = {}) {
 function foldTerminalGuardedFrameExits(source, options = {}) {
   try { return recoverTerminalGuardedFrames(source, controlCleanupSource(source), options); }
   catch (error) { if (error instanceof RangeError) return {source, guardsRecovered: 0}; throw error; }
+}
+
+function foldLoopFrameCompletion(source, options = {}) {
+  return recoverLoopFrameCompletion(source, controlCleanupSource(source), options);
 }
 
 function foldGuardedStoreFallbacks(source, options = {}) {
@@ -3436,6 +3441,7 @@ module.exports = {
   foldTerminalLoopFrames,
   foldGuardedStoreFallbacks,
   foldTerminalGuardedFrameExits,
+  foldLoopFrameCompletion,
   foldTerminalFrameLoops,
   foldSharedGuardedFallbacks,
   foldSharedStatementFallbacks,
