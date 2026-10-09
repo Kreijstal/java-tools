@@ -1,5 +1,15 @@
 # Structured Decompiler: goto-free control-flow recovery
 
+`CFR_JS_FLATTEN_STANDALONE_BLOCKS=1` optionally flattens standalone blocks
+after late guard recovery. Only direct block statements qualify, and every
+immediate child must declare nothing in that block or retain its own scope.
+Direct local/type declarations, labels and branch/loop/protected bodies retain
+their braces. Captures, pattern scopes, comments and uncertain syntax refuse
+cleanup. The pass deletes only braces and whitespace, preserving all actions,
+values, exception boundaries and transfer targets. It defaults off.
+
+Focused validation: `NODE_PATH=/path/to/node_modules JAVA_TOOL_OPTIONS=-XX:-UsePerfData node --test --experimental-test-isolation=none test/standaloneBlockRecovery.test.js`.
+
 `CFR_JS_FINAL_LOCAL_GUARDS=1` optionally reapplies captured-local path facts
 after late reconstruction and Boolean cleanup. This action-preserving mode
 removes a true, redundant `if` condition only when its selected arm is a block,

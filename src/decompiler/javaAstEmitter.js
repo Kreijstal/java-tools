@@ -14,6 +14,7 @@ const { simplifyPredicateNegations: simplifyNegations } = require('./predicateNe
 const {simplifyComplementedRelations: recoverComplementedRelations} = require('./complementedRelationRecovery');
 const { simplifyPredicateGrouping: simplifyGrouping } = require('./predicateGroupingRecovery');
 const { specializePathGuards: specializeGuards } = require('./pathGuardRecovery');
+const {flattenStandaloneBlocks: flattenBlocks} = require('./standaloneBlockRecovery');
 const { simplifyDominatedPredicates: simplifyDominated } = require('./dominatedPredicateRecovery');
 const { foldRedundantExitGuards: recoverRedundantExitGuards } = require('./redundantExitGuardRecovery');
 const { foldGuardedLocalAssignments: recoverGuardedLocalAssignments } = require('./guardedLocalAssignmentRecovery');
@@ -768,6 +769,10 @@ function foldTerminalGuardedFrameExits(source, options = {}) {
 
 function foldLoopFrameCompletion(source, options = {}) {
   return recoverLoopFrameCompletion(source, controlCleanupSource(source), options);
+}
+
+function flattenStandaloneBlocks(source, options = {}) {
+  return flattenBlocks(source, controlCleanupSource(source), options);
 }
 
 function foldGuardedStoreFallbacks(source, options = {}) {
@@ -3407,6 +3412,7 @@ function hasUnreachableStatement(statements) {
 }
 
 module.exports = {
+  flattenStandaloneBlocks,
   treeToStatements, emitStatements, rawExpression, rawStatement, hasUnreachableStatement,
   promoteBooleanStackCarriers,
   factorCommonBranchTails,

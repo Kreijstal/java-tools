@@ -1,7 +1,7 @@
 'use strict';
 
 const {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits, foldNonlocalLoopExits, foldLoopElseExitGuards, foldTerminalLoopTails} = require('./javaAstEmitter');
-const {recoverScalarIfDispatches, simplifyPredicateNegations, simplifyDominatedPredicates, finalizeControlFrames, finalizeTerminalSwitchFrames, foldRedundantExitGuards} = require('./javaAstEmitter');
+const {recoverScalarIfDispatches, simplifyPredicateNegations, simplifyDominatedPredicates, finalizeControlFrames, finalizeTerminalSwitchFrames, foldRedundantExitGuards, flattenStandaloneBlocks} = require('./javaAstEmitter');
 const {simplifyPredicateGrouping} = require('./javaAstEmitter');
 const {foldScalarSwitchPrefixes, foldBooleanLocalAssignments, foldNaturalLoopExits, foldGuardedLocalAssignments, foldStableGuardedFallbacks, foldNestedStableGuardedFallbacks, foldGuardedAssignmentSequences, simplifySelfCasts, foldSinglePassInnerLoops, foldSmallGuardedFallbacks, foldTerminalLoopFrames, foldGuardedStoreFallbacks, foldTerminalGuardedFrameExits, foldTerminalFrameLoops, foldSharedGuardedFallbacks, foldSharedStoreFallbacks, foldArithmeticStoreFallbacks, foldConditionalStoreFallbacks, foldNestedIfConditions, foldSharedStatementFallbacks, simplifyComplementedRelations} = require('./javaAstEmitter');
 
@@ -2316,6 +2316,13 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
       const guards = specializePathGuards(source, {parameterNames, preserveActions: true});
       if (!guards.guardsSpecialized) break;
       source = guards.source; changed = true;
+    }
+  }
+  if (process.env.CFR_JS_FLATTEN_STANDALONE_BLOCKS === '1') {
+    for (;;) {
+      const blocks = flattenStandaloneBlocks(source);
+      if (!blocks.blocksFlattened) break;
+      source = blocks.source; changed = true;
     }
   }
   if (changed) replaceArrayContents(body, source.split('\n'));
