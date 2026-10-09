@@ -2452,6 +2452,25 @@ NaN/infinity casts, nullable arrays and bounds failures, narrowing casts,
 throwing callbacks, finally overrides and monitor release. Diagnostics report
 the operand types and exact operator ranges for independent compiler audits.
 
+### Emitting visible and lossless character literals
+
+Character literals use the ordinary Java escapes for NUL, backspace, tab,
+newline, form feed and carriage return. Other C0/C1 controls and DEL use octal
+escapes, keeping source text visible without Unicode preprocessing changing
+structural-parser offsets. Quotes and backslashes retain their normal escapes.
+Printable characters keep their spelling.
+
+Lone UTF-16 surrogates use `\uXXXX` escapes. Writing a raw lone surrogate as UTF-8
+would substitute U+FFFD and change the generated Java value. This formatting
+applies to fields, annotation values, narrow calls, returns and constant String
+character-search arguments; it is a correctness fix with no game profiles or
+runtime policy changes. Existing conservative Unicode-escape recovery rules
+remain in effect.
+
+Focused native tests compile all 65,536 emitted Java character literals and
+compare each with its independent numeric value. An additional decompile /
+recompile fixture covers fields, returns, narrow calls and String search calls.
+
 ### Recovering exhaustive ordered frame decisions
 
 `foldExhaustiveIfFrameExits` recovers a guarded linear decision ladder whose

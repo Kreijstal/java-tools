@@ -6475,14 +6475,20 @@ function shouldRenderCharArgument(ref, descriptor, index, arg) {
   return value >= 0 && value <= 0xffff;
 }
 
+const SIMPLE_JAVA_CHAR_ESCAPES = new Map([[0, '\\0'], [8, '\\b'], [9, '\\t'], [10, '\\n'], [12, '\\f'], [13, '\\r']]);
+
 function formatCharLiteral(codePoint) {
   const ch = String.fromCharCode(codePoint);
+  const value = ch.charCodeAt(0);
+  if (SIMPLE_JAVA_CHAR_ESCAPES.has(value)) return `'${SIMPLE_JAVA_CHAR_ESCAPES.get(value)}'`;
+  // Octal escapes keep controls visible without Java's Unicode preprocessing
+  // changing source offsets. A lone surrogate must be escaped before UTF-8
+  // serialization, which would otherwise replace it with U+FFFD.
+  if (value < 32 || value >= 127 && value <= 159) return `'\\${value.toString(8).padStart(3, '0')}'`;
+  if (value >= 0xd800 && value <= 0xdfff) return `'\\u${value.toString(16).padStart(4, '0')}'`;
   const escaped = ch
     .replace(/\\/g, '\\\\')
-    .replace(/'/g, "\\'")
-    .replace(/\n/g, '\\n')
-    .replace(/\r/g, '\\r')
-    .replace(/\t/g, '\\t');
+    .replace(/'/g, "\\'");
   return `'${escaped}'`;
 }
 
@@ -11299,6 +11305,7 @@ module.exports = {
     detectObfuscationGuards,
     formatDouble,
     formatFloat,
+    formatCharLiteral,
     hasHighConditionalTargetFanIn,
     javaTypeFromInternalName,
     normalizeLegacyClassFile,
