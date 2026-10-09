@@ -6075,7 +6075,7 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
         ? expr('this', type, 100)
         : value.code === 'null'
         ? expr(`(${type}) null`, type, 90)
-        : coerceExpressionForType(value, type));
+        : coerceCheckedReference(value, type, localState.exceptionModel));
       continue;
     }
     if (op === 'instanceof') {
@@ -10813,6 +10813,16 @@ function renderStoreExpression(value) {
   return expr(`new ${literal.elementType}[]{${elements.join(', ')}}`, `${literal.elementType}[]`);
 }
 
+function coerceCheckedReference(value, type, model) {
+  // Consult hierarchy metadata only for a cast the old source already needs.
+  // Retain its target type so overloads and member dispatch stay pinned; do not
+  // add target casts to the default emitter's already-safe widening cases.
+  const useHierarchy = process.env.CFR_JS_AVOID_PROVEN_REFERENCE_CAST_BRIDGES === '1'
+    && !isSourceReferenceTypeAssignable(value.type, type, model)
+    && isSourceReferenceTypeAssignable(type, value.type, model);
+  return coerceExpressionForType(value, type, useHierarchy ? model : null, !useHierarchy);
+}
+
 function coerceExpressionForType(value, targetType, exceptionModel = null, allowWideningReference = true) {
   if (!value) return value;
   const type = simplifyType(targetType);
@@ -10865,7 +10875,12 @@ function coerceExpressionForType(value, targetType, exceptionModel = null, allow
       return { ...value, type };
     }
     const sourceIsKnownReference = !primitive.has(sourceType) && sourceType !== 'Object';
-    const sourceNeedsBridge = !isAssignable
+    // A narrowing cast along a proven hierarchy is legal directly. Keep the
+    // explicit target cast (and its runtime check); only the Object bridge is
+    // unnecessary. Unknown or unrelated types retain the existing bridge.
+    const directNarrowing = process.env.CFR_JS_AVOID_PROVEN_REFERENCE_CAST_BRIDGES === '1'
+      && isSourceReferenceTypeAssignable(type, sourceType, exceptionModel);
+    const sourceNeedsBridge = !isAssignable && !directNarrowing
       && (sourceIsKnownReference || /^stack(?:In|Out)_/.test(value.code));
     const operand = sourceNeedsBridge ? `(Object) ${wrap(value, 90)}` : wrap(value, 90);
     return expr(`(${type}) (${operand})`, type, 90);
@@ -11212,6 +11227,7 @@ module.exports = {
     binaryExpr,
     negateNumericExpression,
     coerceExpressionForType,
+    coerceCheckedReference,
     negateBooleanExpression,
     integralConditionsFromCache,
     resolveStackCarrierAliases,

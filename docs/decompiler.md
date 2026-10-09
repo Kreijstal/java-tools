@@ -1,5 +1,16 @@
 # Structured Decompiler: goto-free control-flow recovery
 
+`CFR_JS_AVOID_PROVEN_REFERENCE_CAST_BRIDGES=1` opts into removing an
+intermediate `(Object)` bridge when class/array hierarchy metadata proves a
+narrowing reference cast is legal directly. The explicit target cast and its
+runtime type check remain; operand evaluation, overload selection and member
+receiver types are unchanged. Unknown/unrelated types retain their bridges.
+Explicit bytecode checkcasts do not use this cleanup for widening conversions.
+The generic default is unchanged. Validate a selected profile independently
+against the emitted source types and recompiled method instructions before
+publishing its output.
+
+
 `CFR_JS_SHARE_DYNAMIC_GUARDED_TAILS=1` optionally shares a complete duplicate
 tail in `if (condition) { prefix; if (guard) { tail; } } else { tail; }`.
 A fresh primitive decision local captures the original condition once; after
