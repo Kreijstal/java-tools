@@ -1,5 +1,15 @@
 # Structured Decompiler: goto-free control-flow recovery
 
+`CFR_JS_COMPACT_LOCAL_BOOLEAN_GUARDS=1` combines a primitive local guard,
+its conditional assignment, and the immediate subsequent guard into an
+ordered conjunction. Conditional writes and RHS failures remain in place;
+only the redundant local read after the assignment disappears. Existing
+assignment conjunctions compose. Boxed/field/ambiguous locals, intervening
+actions, else arms, captures and direct labeled guards refuse.
+`CFR_JS_REINDENT_STRUCTURED_BODIES=1` restores consistent block, switch-case
+and continuation indentation by changing leading horizontal whitespace only.
+Tokens, quoted values and line endings remain exact. Both defaults are off.
+
 `CFR_JS_GUARDED_FRAME_COMPLETION=1` reconstructs a plain labeled frame when
 every exit is a guarded break reached only through lexical block/if/plain-label
 corridors. One Boolean captures each original decision at its original site;

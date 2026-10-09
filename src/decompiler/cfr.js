@@ -19,7 +19,7 @@ const { structureMethod } = require('./exceptionStructurer');
 const { mergeDuplicateLoopIncrementTails } = require('./loopTailMerge');
 const { partitionStructuredVoidBody } = require('./structuredMethodPartition');
 const {splitPrimitiveLocalLifetimes, splitNestedPrimitiveLocalLifetimes, splitReferenceLocalLifetimes, splitNestedReferenceLocalLifetimes, splitInitializedPrimitiveLocalLifetimes, splitNestedInitializedPrimitiveLocalLifetimes, splitArrayDimensionPrimitiveLocalLifetimes} = require('./primitiveLocalLifetimeRecovery');
-const {foldLoopFrameCompletion, shareDynamicGuardedTails, foldLeadingLoopExitWork, simplifyNaturalLoopExitCaptures, foldGuardedFrameCompletion} = require('./javaAstEmitter');
+const {foldLoopFrameCompletion, shareDynamicGuardedTails, foldLeadingLoopExitWork, simplifyNaturalLoopExitCaptures, foldGuardedFrameCompletion, compactLocalBooleanGuards, reindentStructuredSource} = require('./javaAstEmitter');
 const { listRegionSplitCandidates, applyRegionSplit } = require('../passes/regionSplit');
 const { jreClassInfo, jreMethodCandidates } = require('../java-frontend/jreMetadata');
 const { JavaParser } = require('../java-frontend/parser');
@@ -2377,6 +2377,17 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
     }
   }
 
+  if (process.env.CFR_JS_COMPACT_LOCAL_BOOLEAN_GUARDS === '1') {
+    for (;;) {
+      const guards = compactLocalBooleanGuards(source, {reservedNames: parameterNames});
+      if (!guards.guardsCompacted) break;
+      source = guards.source; changed = true;
+    }
+  }
+  if (process.env.CFR_JS_REINDENT_STRUCTURED_BODIES === '1') {
+    const indentation = reindentStructuredSource(source);
+    if (indentation.linesReindented) {source = indentation.source; changed = true;}
+  }
   if (changed) replaceArrayContents(body, source.split('\n'));
 }
 

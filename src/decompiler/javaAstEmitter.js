@@ -29,6 +29,8 @@ const { foldTerminalFrameLoops: recoverTerminalFrameLoops } = require('./termina
 const { foldTerminalGuardedFrameExits: recoverTerminalGuardedFrames } = require('./terminalGuardedFrameRecovery');
 const {foldLoopFrameCompletion: recoverLoopFrameCompletion} = require('./loopFrameCompletionRecovery');
 const {foldGuardedFrameCompletion: recoverGuardedFrameCompletion} = require('./guardedFrameCompletionRecovery');
+const {compactLocalBooleanGuards: recoverLocalBooleanGuards} = require('./localBooleanGuardCompaction');
+const {reindentStructuredSource: recoverStructuredIndentation} = require('./structuredSourceIndentation');
 const {foldLeadingLoopExitWork: recoverLeadingLoopExitWork} = require('./leadingLoopExitWorkRecovery');
 const {simplifyNaturalLoopExitCaptures: recoverNaturalLoopExitCaptures} = require('./naturalLoopExitCaptureCleanup');
 const {shareDynamicGuardedTails: recoverDynamicGuardedTails} = require('./dynamicGuardedTailRecovery');
@@ -778,6 +780,16 @@ function foldLoopFrameCompletion(source, options = {}) {
 function foldGuardedFrameCompletion(source, options = {}) {
   try{return recoverGuardedFrameCompletion(source,controlCleanupSource(source),options);}
   catch(error){if(error instanceof RangeError)return {source,framesRecovered:0};throw error;}
+}
+
+function compactLocalBooleanGuards(source, options = {}) {
+  try {return recoverLocalBooleanGuards(source, controlCleanupSource(source), options);}
+  catch (error) {if (error instanceof RangeError) return {source, guardsCompacted: 0}; throw error;}
+}
+
+function reindentStructuredSource(source, options = {}) {
+  try {return recoverStructuredIndentation(source, controlCleanupSource(source), options);}
+  catch (error) {if (error instanceof RangeError) return {source, linesReindented: 0}; throw error;}
 }
 
 function simplifyNaturalLoopExitCaptures(source, options = {}) {
@@ -3472,6 +3484,8 @@ module.exports = {
   foldTerminalGuardedFrameExits,
   foldLoopFrameCompletion,
   foldGuardedFrameCompletion,
+  compactLocalBooleanGuards,
+  reindentStructuredSource,
   shareDynamicGuardedTails,
   foldLeadingLoopExitWork,
   simplifyNaturalLoopExitCaptures,
