@@ -1,5 +1,16 @@
 # Structured Decompiler: goto-free control-flow recovery
 
+`CFR_JS_SPLIT_ARRAY_DIMENSION_LIFETIMES=1` optionally revisits primitive locals
+used in array-allocation dimensions. Dimension expressions keep their exact
+left-to-right order, including assignments, increments, failures and overflow;
+this pass only adds uninitialized declarations and renames bound local uses.
+Each phase must define every read independently. Literal initializers stay in
+place, and handler/finally/monitor or loop-carried values remain unsplit. Array
+initializers are outside this analysis. Earlier lifetime modes and control-frame
+assignment checks retain their refusal behavior. The option defaults off.
+
+Focused validation: `NODE_PATH=/path/to/node_modules JAVA_TOOL_OPTIONS=-XX:-UsePerfData node --test --experimental-test-isolation=none test/arrayDimensionLifetimeRecovery.test.js test/initializedPrimitiveLifetimeRecovery.test.js test/referenceLocalLifetimeRecovery.test.js test/primitiveLocalLifetimeRecovery.test.js test/nestedPrimitiveLocalLifetimeRecovery.test.js test/loopFrameCompletionRecovery.test.js`.
+
 `CFR_JS_SPLIT_INITIALIZED_PRIMITIVE_LIFETIMES=1` optionally separates primitive
 locals with literal initializers, including signed numeric literals, booleans
 and characters. Original declarations and literal bits remain untouched; later

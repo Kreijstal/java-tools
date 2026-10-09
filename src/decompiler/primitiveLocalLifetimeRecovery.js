@@ -12,7 +12,7 @@ const primitiveTypes = new Set(['boolean', 'byte', 'short', 'char', 'int', 'long
 // Every read in each phase must be dominated by an assignment within that phase;
 // loops include their zero-iteration, break and continue paths. Captures remain
 // outside this reconstruction's contract.
-function splitLocalLifetimes(source, {retainDiagnostics = false, reservedNames = [], nestedBlocks = false, referenceLocals = false, initializedPrimitives = false} = {}) {
+function splitLocalLifetimes(source, {retainDiagnostics = false, reservedNames = [], nestedBlocks = false, referenceLocals = false, initializedPrimitives = false, arrayDimensionLocals = false} = {}) {
   const unchanged = () => ({source, localsSplit: 0, declarationsAdded: 0});
   if (typeof source !== 'string' || /\\u+[0-9a-fA-F]{4}/.test(source)) return unchanged();
   const wrapped = `{\n${source}\n}`;
@@ -73,6 +73,10 @@ function splitLocalLifetimes(source, {retainDiagnostics = false, reservedNames =
       if (annotated) continue;
     }
     const name = variable.name;
+    const arrayUses = nodes.filter(n => n.kind === 'NewArrayExpression' && mentions(n, name));
+    // Keep existing modes' refusal contract. The optional dimension pass only
+    // revisits locals actually used by an array creation expression.
+    if (arrayDimensionLocals ? !arrayUses.length : arrayUses.length) continue;
     // Refuse all shadows, field/method/type spellings and lexical ambiguities.
     if (nodes.filter(n => n.kind === 'VariableDeclarator' && n.name === name).length !== 1) continue;
     const identifiers = nodes.filter(n => n.kind === 'Identifier' && n.name === name).length;
@@ -162,16 +166,20 @@ function splitLocalLifetimes(source, {retainDiagnostics = false, reservedNames =
 }
 
 function splitPrimitiveLocalLifetimes(source, options = {}) {
-  return splitLocalLifetimes(source, {...options, referenceLocals: false, initializedPrimitives: false});
+  return splitLocalLifetimes(source, {...options, referenceLocals: false, initializedPrimitives: false, arrayDimensionLocals: false});
 }
 function splitReferenceLocalLifetimes(source, options = {}) {
-  return splitLocalLifetimes(source, {...options, referenceLocals: true, initializedPrimitives: false});
+  return splitLocalLifetimes(source, {...options, referenceLocals: true, initializedPrimitives: false, arrayDimensionLocals: false});
 }
 function splitNestedReferenceLocalLifetimes(source, options = {}) {
-  return splitLocalLifetimes(source, {...options, referenceLocals: true, initializedPrimitives: false, nestedBlocks: true});
+  return splitLocalLifetimes(source, {...options, referenceLocals: true, initializedPrimitives: false, nestedBlocks: true, arrayDimensionLocals: false});
 }
 function splitInitializedPrimitiveLocalLifetimes(source, options = {}) {
-  return splitLocalLifetimes(source, {...options, referenceLocals: false, initializedPrimitives: true});
+  return splitLocalLifetimes(source, {...options, referenceLocals: false, initializedPrimitives: true, arrayDimensionLocals: false});
+}
+
+function splitArrayDimensionPrimitiveLocalLifetimes(source, options = {}) {
+  return splitLocalLifetimes(source, {...options, referenceLocals: false, initializedPrimitives: true, arrayDimensionLocals: true});
 }
 
 function containingBlock(tree, name, count) {
@@ -239,6 +247,18 @@ function expression(node, assigned, name) {
     case 'FieldAccessExpression': return expr(node.target);
     case 'ArrayAccessExpression': {
       const array = expr(node.array); return array === null ? null : expression(node.index, array, name);
+    }
+    case 'NewArrayExpression': {
+      // This is assignment-flow analysis, not allocation reconstruction. All
+      // dimension expressions remain in place, evaluated left to right before
+      // allocation/negative-size checks. Initializers have a separate contract.
+      if (node.initializer || !Array.isArray(node.dimensions) || !node.dimensions.length) return null;
+      let state = assigned;
+      for (const dimension of node.dimensions) {
+        if (state === null) break;
+        state = expression(dimension, state, name);
+      }
+      return state;
     }
     case 'MethodInvocationExpression':
     case 'NewClassExpression': {
@@ -332,7 +352,10 @@ function splitNestedPrimitiveLocalLifetimes(source, options = {}) {
   return splitPrimitiveLocalLifetimes(source, {...options, nestedBlocks: true});
 }
 function independentlyAssignedLocalSequence(statements, name, contexts = []) {
+  let arrayUse = false;
+  walk(statements, n => { if (n.kind === 'NewArrayExpression' && mentions(n, name)) arrayUse = true; });
+  if (arrayUse) return false; // existing control-frame recovery contract
   return sequence(statements, false, name, contexts) !== null;
 }
-module.exports = {splitPrimitiveLocalLifetimes, splitNestedPrimitiveLocalLifetimes, splitReferenceLocalLifetimes, splitNestedReferenceLocalLifetimes, splitInitializedPrimitiveLocalLifetimes,
+module.exports = {splitPrimitiveLocalLifetimes, splitNestedPrimitiveLocalLifetimes, splitReferenceLocalLifetimes, splitNestedReferenceLocalLifetimes, splitInitializedPrimitiveLocalLifetimes, splitArrayDimensionPrimitiveLocalLifetimes,
   independentlyAssignedLocalSequence};
