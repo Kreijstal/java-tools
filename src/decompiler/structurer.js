@@ -307,7 +307,7 @@ function uniquifyLabels(tree) {
       case 'block':
       case 'loop': {
         const nl = fresh();
-        const inner = [{ old: node.label, fresh: nl }, ...scope];
+        const inner = [{ old: node.label, fresh: nl, t: node.t }, ...scope];
         node.label = nl;
         walk(node.body, inner);
         break;
@@ -330,9 +330,16 @@ function uniquifyLabels(tree) {
         walk(node.body, scope);
         break;
       case 'break':
-      case 'continue': {
+      case 'continue':
+      case 'regionExit': {
         const frame = scope.find((f) => f.old === node.label);
+        if (node.t === 'regionExit' && (!node.label || frame?.t !== 'loop' ||
+            !['break', 'continue'].includes(node.mode))) {
+          throw new Error('exception-region loop exit requires an explicit enclosing loop and transfer mode');
+        }
         if (!frame) throw new Error(`unresolved ${node.t} ${node.label} during label uniquify`);
+        if (node.t === 'continue' && frame.t !== 'loop')
+          throw new Error(`continue target ${node.label} is not a loop`);
         node.label = frame.fresh;
         break;
       }
@@ -468,31 +475,26 @@ function dropTailBreaks(node, tailLabels) {
       return tailLabels.has(node.label) ? { t: 'seq', body: [] } : node;
     case 'block': {
       const inner = new Set([...tailLabels, node.label]);
-      node.body = dropTailBreaks(node.body, inner);
-      return node;
+      return { ...node, body: dropTailBreaks(node.body, inner) };
     }
     case 'seq': {
       const body = node.body || [];
-      node.body = body.map((child, index) => dropTailBreaks(
-        child, index === body.length - 1 ? tailLabels : new Set()));
-      return node;
+      return { ...node, body: body.map((child, index) => dropTailBreaks(
+        child, index === body.length - 1 ? tailLabels : new Set())) };
     }
     case 'if':
-      node.then = dropTailBreaks(node.then, tailLabels);
-      node.els = dropTailBreaks(node.els, tailLabels);
-      return node;
+      return { ...node, then: dropTailBreaks(node.then, tailLabels),
+        els: dropTailBreaks(node.els, tailLabels) };
     case 'loop':
-      node.body = dropTailBreaks(node.body, new Set());
-      return node;
+      return { ...node, body: dropTailBreaks(node.body, new Set()) };
     case 'switch':
-      node.cases = (node.cases || []).map((item) => ({ ...item, body: dropTailBreaks(item.body, new Set()) }));
-      node.dflt = dropTailBreaks(node.dflt, new Set());
-      return node;
+      return { ...node,
+        cases: (node.cases || []).map((item) => ({ ...item, body: dropTailBreaks(item.body, new Set()) })),
+        dflt: dropTailBreaks(node.dflt, new Set()) };
     case 'synchronized':
     case 'try':
-      node.body = dropTailBreaks(node.body, new Set());
-      node.catches = (node.catches || []).map((item) => ({ ...item, body: dropTailBreaks(item.body, new Set()) }));
-      return node;
+      return { ...node, body: dropTailBreaks(node.body, new Set()),
+        catches: (node.catches || []).map((item) => ({ ...item, body: dropTailBreaks(item.body, new Set()) })) };
     default:
       return node;
   }
@@ -550,44 +552,43 @@ function dropUnusedBlockLabels(node) {
   }
 }
 
-function repairEmptyLoopExits(node, loopLabels) {
+function repairEmptyLoopExits(node, frames) {
   if (!node) return node;
   if (node.t === 'regionExit') {
-    const label = loopLabels[loopLabels.length - 1];
-    if (!label || node.mode === 'normal') return { t: 'seq', body: [] };
-    return { t: node.mode === 'continue' ? 'continue' : 'break', label };
+    // Legacy region nodes must identify their loop explicitly. The nearest
+    // lexical loop need not be the original CFG edge's destination, and a
+    // missing destination must never become an inferred break or a no-op.
+    const frame = [...frames].reverse().find(item => item.label === node.label);
+    if (!node.label || frame?.t !== 'loop' ||
+        !['break', 'continue'].includes(node.mode)) {
+      throw new Error('exception-region loop exit requires an explicit enclosing loop and transfer mode');
+    }
+    return { t: node.mode, label: node.label };
   }
-  if (node.t === 'loop') {
-    node.body = repairEmptyLoopExits(node.body, [...loopLabels, node.label]);
-    return node;
+  if (node.t === 'loop' || node.t === 'block') {
+    return { ...node, body: repairEmptyLoopExits(node.body, [...frames, node]) };
   }
   if (node.t === 'if') {
-    const label = loopLabels[loopLabels.length - 1];
-    if (label && isEmptyTree(node.then) && !isEmptyTree(node.els)) node.then = { t: 'break', label };
-    node.then = repairEmptyLoopExits(node.then, loopLabels);
-    node.els = repairEmptyLoopExits(node.els, loopLabels);
-    return node;
+    // An empty arm can mean an ordinary no-op, not an exit from the nearest
+    // loop. Region exits already carry an explicit transfer; never infer one.
+    return { ...node, then: repairEmptyLoopExits(node.then, frames),
+      els: repairEmptyLoopExits(node.els, frames) };
   }
   if (node.t === 'seq') {
     const body = node.body || [];
-    node.body = body.map((child) => repairEmptyLoopExits(child, loopLabels));
+    return { ...node, body: body.map((child) => repairEmptyLoopExits(child, frames)) };
   }
-  else if (node.t === 'block') node.body = repairEmptyLoopExits(node.body, loopLabels);
   else if (node.t === 'switch') {
-    for (const item of node.cases || []) item.body = repairEmptyLoopExits(item.body, loopLabels);
-    node.dflt = repairEmptyLoopExits(node.dflt, loopLabels);
+    return { ...node,
+      cases: (node.cases || []).map(item => ({ ...item, body: repairEmptyLoopExits(item.body, frames) })),
+      dflt: repairEmptyLoopExits(node.dflt, frames) };
   } else if (node.t === 'try') {
-    node.body = repairEmptyLoopExits(node.body, loopLabels);
-    for (const item of node.catches || []) item.body = repairEmptyLoopExits(item.body, loopLabels);
+    return { ...node, body: repairEmptyLoopExits(node.body, frames),
+      catches: (node.catches || []).map(item => ({ ...item, body: repairEmptyLoopExits(item.body, frames) })) };
   } else if (node.t === 'synchronized') {
-    node.body = repairEmptyLoopExits(node.body, loopLabels);
+    return { ...node, body: repairEmptyLoopExits(node.body, frames) };
   }
   return node;
-}
-
-function isEmptyTree(node) {
-  if (!node) return true;
-  return node.t === 'seq' && (node.body || []).every(isEmptyTree);
 }
 
 // ---------------------------------------------------------------------------

@@ -51,7 +51,7 @@ JVM_TEST_CONTINUE_ON_FAILURE=1 npm test     # whole suite; runs everything, list
 bash run-tests.sh test/jitFreeNames.test.js # one file
 bash run-tests.sh jitFreeNames              # same file, by test name
 bash run-tests.sh --skip 'wasm*' -- ...     # skip by glob (or JVM_TEST_SKIP=...)
-npm run test:cfr                            # the six CFR suites
+npm run test:cfr                            # CFR fixture suites and state-machine runtime checks
 npm run test:java-frontend                  # the eight java-frontend suites
 npm run test:all                            # npm test && npm run test:playwright
 ```

@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { structure, printTree, IrreducibleError } = require('../src/decompiler/structurer');
+const { structure, printTree, uniquifyLabels, IrreducibleError } = require('../src/decompiler/structurer');
 
 // Build a CFG from a compact description. Each block: { term }.
 function cfgFrom(blocks) {
@@ -81,7 +81,7 @@ test('straight-line diamond (if/else join) emits the merge once, unlabeled', () 
   assertNoLabeledBlock(src);
 });
 
-test('exception region exit inside a loop exits the loop', () => {
+test('exception region loop exits require an explicit target and transfer mode', () => {
   const src = printTree({
     t: 'loop',
     label: 'L0',
@@ -89,11 +89,73 @@ test('exception region exit inside a loop exits the loop', () => {
       t: 'seq',
       body: [
         { t: 'straight', block: 0 },
-        { t: 'regionExit' },
+        { t: 'regionExit', label: 'L0', mode: 'break' },
       ],
     },
   });
   assert.match(src, /break L0;/);
+  for (const exit of [{t: 'regionExit'}, {t: 'regionExit', mode: 'normal'},
+    {t: 'regionExit', label: 'missing', mode: 'break'},
+    {t: 'regionExit', label: 'L0', mode: 'return'}]) {
+    assert.throws(() => printTree({t: 'loop', label: 'L0', body: exit}),
+      /requires an explicit enclosing loop and transfer mode/);
+  }
+  for (const mode of ['break', 'continue']) {
+    const nested = printTree({t: 'loop', label: 'Outer', body: {
+      t: 'loop', label: 'Inner', body: {t: 'regionExit', label: 'Outer', mode},
+    }});
+    assert.match(nested, new RegExp(`${mode} Outer;`));
+    assert.doesNotMatch(nested, new RegExp(`${mode} Inner;`));
+  }
+});
+
+test('an ordinary empty if arm inside a loop does not infer a loop exit', () => {
+  const tree = { t: 'loop', label: 'L0', body: { t: 'seq', body: [
+    { t: 'if', block: 0, then: { t: 'seq', body: [] }, els: { t: 'straight', block: 1 } },
+    { t: 'straight', block: 2 }, { t: 'continue', label: 'L0' },
+  ] } };
+  const src = printTree(tree);
+  assert.doesNotMatch(src, /break L0;/);
+  assert.match(src, /stmt_2\(\);\n\s*continue L0;/);
+});
+
+test('an explicit region loop exit cannot resolve through a shadowing block', () => {
+  for (const mode of ['break', 'continue']) {
+    const tree = {t: 'loop', label: 'Same', body: {
+      t: 'block', label: 'Same', body: {t: 'regionExit', label: 'Same', mode},
+    }};
+    assert.throws(() => printTree(tree), /requires an explicit enclosing loop and transfer mode/);
+    assert.throws(() => uniquifyLabels(tree), /requires an explicit enclosing loop and transfer mode/);
+  }
+});
+
+test('label uniquification preserves explicit region loop exits', () => {
+  const tree = {t: 'loop', label: 'Outer', body: {
+    t: 'loop', label: 'Inner', body: {t: 'regionExit', label: 'Outer', mode: 'continue'},
+  }};
+  uniquifyLabels(tree);
+  assert.match(printTree(tree), /continue L0;/);
+});
+
+test('a continue to a block is refused before label uniquification', () => {
+  const tree = {t: 'loop', label: 'Same', body: {
+    t: 'block', label: 'Same', body: {t: 'continue', label: 'Same'},
+  }};
+  assert.throws(() => uniquifyLabels(tree), /continue target Same is not a loop/);
+});
+
+test('printing a control tree repeatedly does not mutate its exits', () => {
+  const tree = structure(cfgFrom([
+    { term: { kind: 'fall', target: 1 } },
+    { term: { kind: 'cond', taken: 2, fall: 3 } },
+    { term: { kind: 'goto', target: 3 } },
+    { term: { kind: 'cond', taken: 1, fall: 4 } },
+    { term: { kind: 'return' } },
+  ])).tree;
+  const original = JSON.stringify(tree);
+  const once = printTree(tree);
+  assert.equal(JSON.stringify(tree), original);
+  assert.equal(printTree(tree), once);
 });
 
 test('simple while loop uses continue to the header', () => {

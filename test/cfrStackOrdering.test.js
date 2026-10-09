@@ -455,8 +455,8 @@ test('multi-value operand-stack backedges retain their distinct CFG edges', (t) 
       'MultiValueBackedge',
       MULTI_VALUE_STACK_BACKEDGE,
     );
-    t.match(source, /while \(true\) \{\s*switch \(statePc\)/,
-      'opaque comparison carriers use the exact CFG state machine');
+    t.notOk(source.includes('switch (statePc)'),
+      'explicit operand carriers preserve the distinct comparisons in structured loops');
 
     fs.writeFileSync(path.join(tempDir, 'MultiValueBackedge.java'), source);
     fs.writeFileSync(path.join(tempDir, 'MultiValueBackedgeRunner.java'),
@@ -482,8 +482,8 @@ test('invariant conditional loop fanouts retain their exact CFG edges', (t) => {
     const source = decompileFixture(tempDir,
       'InvariantConditionalBackedgeFanout',
       INVARIANT_CONDITIONAL_BACKEDGE_FANOUT);
-    t.match(source, /while \(true\) \{\s*switch \(statePc\)/,
-      'two-stage invariant latches use the exact CFG state machine');
+    t.notOk(source.includes('statePc'),
+      'handler-free two-stage invariant latches retain labeled loops');
 
     fs.writeFileSync(path.join(tempDir,
       'InvariantConditionalBackedgeFanout.java'), source);
@@ -513,7 +513,7 @@ test('iinc snapshots operand-stack values loaded before the increment', (t) => {
   try {
     const source = decompileFixture(tempDir, 'PostIncrementArrayStore', POST_INCREMENT_ARRAY_STORE);
 
-    t.match(source, /int incrementValue\$\d+ = param1;\s*param1\+\+;\s*param0\[incrementValue\$\d+\] = param2;/,
+    t.match(source, /param0\[param1\+\+\] = param2;/,
       'array index uses the value captured before iinc');
     t.notOk(/param1\+\+;\s*param0\[param1\]/.test(source),
       'array store does not reread the incremented local');

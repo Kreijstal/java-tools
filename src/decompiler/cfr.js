@@ -1,7 +1,13 @@
 'use strict';
 
+const {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits, foldNonlocalLoopExits, foldLoopElseExitGuards, foldTerminalLoopTails} = require('./javaAstEmitter');
+const {recoverScalarIfDispatches, simplifyPredicateNegations, simplifyDominatedPredicates, finalizeControlFrames, finalizeTerminalSwitchFrames, foldRedundantExitGuards} = require('./javaAstEmitter');
+const {simplifyPredicateGrouping} = require('./javaAstEmitter');
+const {foldScalarSwitchPrefixes, foldBooleanLocalAssignments, foldNaturalLoopExits, foldGuardedLocalAssignments, foldStableGuardedFallbacks, foldGuardedAssignmentSequences, simplifySelfCasts, foldSinglePassInnerLoops, foldSmallGuardedFallbacks, foldTerminalLoopFrames, foldGuardedStoreFallbacks, foldTerminalGuardedFrameExits, foldTerminalFrameLoops, foldSharedGuardedFallbacks, foldSharedStoreFallbacks, foldArithmeticStoreFallbacks, foldConditionalStoreFallbacks, foldNestedIfConditions, foldSharedStatementFallbacks, simplifyComplementedRelations} = require('./javaAstEmitter');
+
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const JSZip = require('jszip');
 const { getAST } = require('jvm_parser');
 const { convertJson } = require('../parsing/convert_tree');
@@ -11,10 +17,12 @@ const {
 } = require('./structurer');
 const { structureMethod } = require('./exceptionStructurer');
 const { mergeDuplicateLoopIncrementTails } = require('./loopTailMerge');
+const { partitionStructuredVoidBody } = require('./structuredMethodPartition');
 const { listRegionSplitCandidates, applyRegionSplit } = require('../passes/regionSplit');
 const { jreClassInfo, jreMethodCandidates } = require('../java-frontend/jreMetadata');
 const { JavaParser } = require('../java-frontend/parser');
 const { tokenizeJava } = require('../java-frontend/lexer');
+const { promoteBooleanStackCarriers, factorCommonBranchTails, factorLabeledBlockReturnTails, simplifyControlFrames, removeFallthroughLabelBreaks, localizePlainBlockLoopBreaks, foldLeadingWhileBreakGuards, foldEffectfulPlainBlockExits, simplifyIdentityReferenceCasts, recoverScalarLabelDispatches, specializePathGuards, recoverPostGuardExits, recoverArrayIndexIncrements, foldLabeledBooleanDecisions, foldVoidReturnExits, foldNestedIfGuards, foldLabeledSkipGuards, foldLabeledIfElseExits, foldLabeledExitTrees, foldLabeledGuardTrees, removeDeadRegionSelectors, removeDeadReceiverSnapshots } = require('./javaAstEmitter');
 
 const VERSION = 'CFR-JS 0.4.0';
 const javaStatementParser = new JavaParser();
@@ -317,9 +325,17 @@ function decompileAstRoot(astRoot, options = {}) {
   // class so a call into any sibling resolves).
   const exceptionModel = options.exceptionModel || buildExceptionModel(astRoot.classes || []);
   const scopedOptions = { ...options, exceptionModel };
-  return (astRoot.classes || [])
-    .map((cls) => decompileClassAst(cls, scopedOptions))
-    .join('\n\n');
+  if (options.exceptionModel) return (astRoot.classes || [])
+    .map(cls => decompileClassAst(cls,scopedOptions)).join('\n\n');
+  const parsed = (astRoot.classes || []).map(cls => ({name:cls.className+'.class',astRoot:{classes:[cls]}}));
+  const outputs = parsed.map(entry => {
+    const diagnostics = [];
+    return {name:entry.name.replace(/\.class$/,'.java'), diagnostics,
+      source:decompileClassAst(entry.astRoot.classes[0],{...scopedOptions,diagnostics})};
+  });
+  finalizeIntArgumentBridges(outputs,parsed,scopedOptions,exceptionModel);
+  if (Array.isArray(options.diagnostics)) options.diagnostics.push(...outputs.flatMap(output => output.diagnostics));
+  return outputs.map(output => output.source).join('\n\n');
 }
 
 function detectObfuscationGuards(cls) {
@@ -399,6 +415,7 @@ async function decompilePath(inputPath, options = {}) {
         console.error(`[cfr-class-done] ${Date.now() - started}ms ${file}`);
       }
     }
+    finalizeIntArgumentBridges(outputs,parsed,{...options,inputBaseDir:inputPath},exceptionModel);
     outputs.failures = failures;
     return outputs;
   }
@@ -415,7 +432,7 @@ async function decompilePath(inputPath, options = {}) {
       parsed.push({ name, astRoot: convertParsedClass(result) });
     }
     const exceptionModel = buildExceptionModel(parsed.flatMap((entry) => entry.astRoot.classes || []));
-    return parsed.filter(({ astRoot }) =>
+    const outputs = parsed.filter(({ astRoot }) =>
       !isEnumConstantBodyClass((astRoot.classes || [])[0], exceptionModel)).map(({ name, astRoot }) => {
       const diagnostics = [];
       return {
@@ -424,6 +441,8 @@ async function decompilePath(inputPath, options = {}) {
         diagnostics,
       };
     });
+    finalizeIntArgumentBridges(outputs,parsed,options,exceptionModel);
+    return outputs;
   }
 
   if (!inputPath.toLowerCase().endsWith('.class')) {
@@ -450,7 +469,7 @@ function decompileClassAst(cls, options = {}) {
   }
   const out = [];
   const requiredImports = options.requiredImports || new Set();
-  const renderOptions = { ...options, requiredImports };
+  const renderOptions = { ...options, requiredImports, comparisonHelpers: makeComparisonHelpers(cls) };
   if (!options.omitHeader) {
     out.push('/*');
     out.push(` * Decompiled by ${VERSION}.`);
@@ -534,6 +553,8 @@ function decompileClassAst(cls, options = {}) {
     if (index < methods.length - 1) out.push('');
   });
 
+  appendIntArgumentBridges(out,cls,renderOptions);
+
   if (renderOptions.requiresSneakyThrow) {
     if (methods.length) out.push('');
     out.push('    @SuppressWarnings("unchecked")');
@@ -542,11 +563,39 @@ function decompileClassAst(cls, options = {}) {
     out.push('    }');
   }
 
+  // Speculative CFG analysis can request helpers that the final source never
+  // uses. Emit only helpers called by the accepted method bodies.
+  const acceptedSource = out.join('\n');
+  for (const [opcode, name] of renderOptions.comparisonHelpers.names) {
+    if (!acceptedSource.includes(`${name}(`)) continue;
+    const type = opcode === 'lcmp' ? 'long' : opcode.startsWith('f') ? 'float' : 'double';
+    const lowNaN = opcode.endsWith('l');
+    out.push('', `    ${isInterface ? '' : 'private '}static int ${name}(${type} left, ${type} right) {`,
+      `        return left ${lowNaN ? '>' : '<'} right ? ${lowNaN ? '1' : '-1'} : (left == right ? 0 : ${lowNaN ? '-1' : '1'});`,
+      '    }');
+  }
+
   out.push('}');
   for (const requiredImport of requiredImports) imports.push(`import ${requiredImport};`);
   const uniqueImports = [...new Set(imports)];
   if (uniqueImports.length) out.splice(classDeclarationIndex, 0, ...uniqueImports, '');
   return out.join('\n');
+}
+
+function makeComparisonHelpers(cls) {
+  const reserved = new Set((cls.items || []).map(item => item.method?.name || item.field?.name).filter(Boolean));
+  const names = new Map();
+  return {owner: cls.className, names,
+    name(opcode) {
+      if (!names.has(opcode)) {
+        const base = `$cfr$${opcode}`;
+        let name = base, suffix = 0;
+        while (reserved.has(name)) name = `${base}$${++suffix}`;
+        reserved.add(name); names.set(opcode, name);
+      }
+      return names.get(opcode);
+    },
+  };
 }
 
 function annotationDescriptorType(descriptor) {
@@ -1243,7 +1292,7 @@ function formatMethod(cls, method, options = {}) {
     console.error('[cfr-body-before-locals]', JSON.stringify(body));
   }
   const hasPartitionedState = body.some((line) =>
-    String(line).trim() === 'class $CfrPartitionedState {');
+    ['class $CfrPartitionedState {', 'class $CfrPartitionedBody {'].includes(String(line).trim()));
   if (!hasPartitionedState) {
     removeImpossibleCheckedCatchBlocks(body, options.exceptionModel, code);
     ensureCheckedCatchReachability(body, code, options.exceptionModel);
@@ -1264,6 +1313,9 @@ function formatMethod(cls, method, options = {}) {
     replaceArrayContents(body, normalizedBody);
     ensureMissingSyntheticDeclarations(body);
     widenExceptionLocalsUsedByInstanceof(body, options.exceptionModel);
+    shareExistingExitTails(body, localState.paramNames,
+      params.map((type, index) => ({name: localState.paramNames[index], type: simplifyType(type)})),
+      ownedPredicateFields(cls, options), flags.includes('strictfp'));
   }
   const needsUncheckedExceptionBoundary = methodThrowsTypes(method).length === 0
     && methodCallsUncaughtCheckedException(code, method, options.exceptionModel);
@@ -1401,7 +1453,9 @@ function buildExceptionModel(classes) {
       );
     }
   }
-  return { methodThrows, superOf, interfacesOf, classInfo, sourceNameToInternal, instantiatedTypes };
+  return { methodThrows, superOf, interfacesOf, classInfo, sourceNameToInternal, instantiatedTypes,
+    intArgumentBridges: new Map(), emittedIntArgumentBridges: new Set(),
+    staticCallOwners: new Map(), intArgumentBridgeDirtyOwners: new Set() };
 }
 
 function hasUnimplementedAbstractMethods(cls, model) {
@@ -1611,7 +1665,7 @@ function statementSegments(statement) {
 
 // True when a rendered Java block (a brace-balanced line list) provably completes
 // abruptly on every path — control can never fall off its end. Recurses through
-// if/else, try/catch/finally, and infinite loops so a synthesized trailing
+// if/else, try/catch/finally, synchronized bodies, and infinite loops so a synthesized trailing
 // `return` is only added where the body can actually fall through.
 function bodyCompletesAbruptly(lines) {
   const statements = splitTopLevelStatements(lines);
@@ -1624,6 +1678,12 @@ function statementCompletesAbruptly(statement) {
   if (!trimmed.length) return false;
   const head = trimmed[0];
   if (/^(?:return|throw)\b/.test(head)) return true;
+  if (head === '{') {
+    // Early-exit lowering retains a plain block when removing else would
+    // widen declaration scopes. Such a block can still return on every path.
+    const segments = statementSegments(statement);
+    return segments.length === 1 && bodyCompletesAbruptly(segments[0].body);
+  }
   if (/^if\s*\(/.test(head)) {
     const segments = statementSegments(statement);
     const last = segments[segments.length - 1];
@@ -1636,6 +1696,12 @@ function statementCompletesAbruptly(statement) {
     const last = segments[segments.length - 1];
     if (last && /^\}?\s*finally\s*\{$/.test(last.header) && bodyCompletesAbruptly(last.body)) return true;
     return segments.every((segment) => bodyCompletesAbruptly(segment.body));
+  }
+  if (/^synchronized\s*\(/.test(head)) {
+    // Lock acquisition/release does not add a normal completion path to an
+    // all-paths-return body. Appending a default return here is unreachable.
+    const segments = statementSegments(statement);
+    return segments.length === 1 && bodyCompletesAbruptly(segments[0].body);
   }
   if (/^(?:while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\))\s*\{/.test(head)) {
     const segments = statementSegments(statement);
@@ -1658,6 +1724,7 @@ function formatStaticInitializer(code, localState, cls, options = {}) {
   const missingDeclarations = localState.missingDeclarations(body);
   if (missingDeclarations.length) body.unshift(...missingDeclarations);
   replaceArrayContents(body, normalizeSyntheticVariableScopes(body));
+  shareExistingExitTails(body, [], [], ownedPredicateFields(cls, options));
   assertNoFallback(body, { className: cls.className, methodName: '<clinit>', descriptor: '()V' });
   if (!body.length) return formatBlock('static', body);
 
@@ -1695,6 +1762,520 @@ function formatStaticInitializer(code, localState, cls, options = {}) {
   let helperName = '$cfr$clinit';
   while (methodNames.has(helperName)) helperName += '$';
   return `${formatBlock('static', [`${helperName}();`])}\n\n${formatBlock(`private static void ${helperName}()`, body)}`;
+}
+
+function ownedPredicateFields(cls, options) {
+  const owner = javaTypeFromInternalName(cls.className);
+  let classQualifierUnshadowed = true;
+  const seen = new Set(), pending = [cls];
+  // Java expression-name lookup prefers fields to a same-spelled type. The
+  // qualifier must be known unshadowed across every superclass and interface;
+  // missing external declarations decline only this qualified-static evidence.
+  while (pending.length) {
+    const current = pending.pop();
+    if (seen.has(current.className)) continue;
+    if (seen.size >= 4096 || (current.items || []).some(item => item.type === 'field' && item.field
+        && sourceFieldName(current.className, item.field.name, options) === owner)
+        || [...nestedSourceNames.values()].some(type => type.outer === current.className.replace(/\//g, '.')
+          && type.simpleName === owner)) {
+      classQualifierUnshadowed = false; break;
+    }
+    seen.add(current.className);
+    for (const parent of [current.superClassName, ...(current.interfaces || [])].filter(Boolean)) {
+      if (parent === 'java/lang/Object') continue;
+      const info = options.exceptionModel?.classInfo?.get(parent);
+      if (!info) classQualifierUnshadowed = false;
+      else pending.push(info);
+    }
+  }
+  return {owner, classQualifierUnshadowed, fields: (cls.items || [])
+    .filter(item => item.type === 'field' && item.field && !shouldSkipField(cls, item.field))
+    .map(({field}) => ({name: sourceFieldName(cls.className, field.name, options),
+      type: descriptorToJavaType(field.descriptor), static: (field.flags || []).includes('static')}))};
+}
+
+function shareExistingExitTails(body, parameterNames = [], parameters = [], ownedFields = null, fpStrict = false) {
+  // Normalize escaping JVM locals first: otherwise one cleanup copy may still
+  // declare a slot that the following copy assigns. Exact matching must use
+  // their final source identities, never discard an apparent inline shadow.
+  let source = body.join('\n'), changed = false;
+  for (;;) {
+    const shared = factorLabeledBlockReturnTails(source);
+    if (!shared.branches) break;
+    source = shared.source;
+    changed = true;
+  }
+  for (;;) {
+    const decisions = foldLabeledBooleanDecisions(source);
+    if (!decisions.decisions) break;
+    source = decisions.source;
+    changed = true;
+  }
+  for (;;) {
+    const exits = foldVoidReturnExits(source);
+    if (!exits.frames) break;
+    source = exits.source;
+    changed = true;
+  }
+  for (;;) {
+    const simplified = simplifyControlFrames(source);
+    if (!simplified.labelsRemoved && !simplified.jumpsUnlabeled && !simplified.blocksUnwrapped) break;
+    source = simplified.source;
+    changed = true;
+  }
+  for (;;) {
+    const guards = foldNestedIfGuards(source);
+    if (!guards.guardsFolded) break;
+    source = guards.source;
+    changed = true;
+  }
+  for (;;) {
+    const skips = foldLabeledSkipGuards(source);
+    if (!skips.framesRemoved) break;
+    source = skips.source;
+    changed = true;
+    for (;;) {
+      const guards = foldNestedIfGuards(source);
+      if (!guards.guardsFolded) break;
+      source = guards.source;
+    }
+  }
+  for (;;) {
+    const fallthrough = removeFallthroughLabelBreaks(source);
+    if (!fallthrough.breaksRemoved) break;
+    source = fallthrough.source;
+    changed = true;
+    for (;;) {
+      const simplified = simplifyControlFrames(source);
+      if (!simplified.labelsRemoved && !simplified.jumpsUnlabeled && !simplified.blocksUnwrapped) break;
+      source = simplified.source;
+    }
+  }
+  for (;;) {
+    const alternatives = foldLabeledIfElseExits(source);
+    if (!alternatives.framesRemoved) break;
+    source = alternatives.source;
+    changed = true;
+    for (;;) {
+      const simplified = simplifyControlFrames(source);
+      if (!simplified.labelsRemoved && !simplified.jumpsUnlabeled && !simplified.blocksUnwrapped) break;
+      source = simplified.source;
+    }
+  }
+  for (;;) {
+    const decisions = foldLabeledExitTrees(source);
+    if (!decisions.framesRemoved) break;
+    source = decisions.source;
+    changed = true;
+    for (;;) {
+      const simplified = simplifyControlFrames(source);
+      if (!simplified.labelsRemoved && !simplified.jumpsUnlabeled && !simplified.blocksUnwrapped) break;
+      source = simplified.source;
+    }
+  }
+  for (;;) {
+    const guards = foldLabeledGuardTrees(source);
+    if (!guards.framesRemoved) break;
+    source = guards.source;
+    changed = true;
+    for (;;) {
+      const simplified = simplifyControlFrames(source);
+      if (!simplified.labelsRemoved && !simplified.jumpsUnlabeled && !simplified.blocksUnwrapped) break;
+      source = simplified.source;
+    }
+  }
+  for (;;) {
+    const localized = localizePlainBlockLoopBreaks(source);
+    if (!localized.breaksLocalized) break;
+    source = localized.source;
+    changed = true;
+    for (;;) {
+      const simplified = simplifyControlFrames(source);
+      if (!simplified.labelsRemoved && !simplified.jumpsUnlabeled && !simplified.blocksUnwrapped) break;
+      source = simplified.source;
+    }
+  }
+  const loopGuards = foldLeadingWhileBreakGuards(source, {parameterNames});
+  if (loopGuards.guardsRecovered) {
+    source = loopGuards.source;
+    changed = true;
+  }
+  for (;;) {
+    const conditional = foldEffectfulPlainBlockExits(source);
+    if (!conditional.exitsRecovered) break;
+    source = conditional.source;
+    changed = true;
+    for (;;) {
+      const simplified = simplifyControlFrames(source);
+      if (!simplified.labelsRemoved && !simplified.jumpsUnlabeled && !simplified.blocksUnwrapped) break;
+      source = simplified.source;
+    }
+  }
+  const identityCasts = simplifyIdentityReferenceCasts(source);
+  if (identityCasts.castsRemoved) {
+    source = identityCasts.source;
+    changed = true;
+  }
+  // Recover dispatch only after earlier scope-preserving cleanup is complete.
+  // Its action guards remain verbatim; frame cleanup can safely remove only
+  // the now-redundant switch label, without re-running predicate folding.
+  for (;;) {
+    const dispatch = recoverScalarLabelDispatches(source);
+    if (!dispatch.dispatchesRecovered) break;
+    source = dispatch.source;
+    changed = true;
+    for (;;) {
+      const simplified = simplifyControlFrames(source);
+      if (simplified.source === source) break;
+      source = simplified.source;
+    }
+  }
+  // Path facts apply only to captured local values. Complete all proven guard
+  // rewrites before removing now-unused frames, so no field value is presumed
+  // stable and no existing predicate-folding pass is re-run here.
+  let pathGuardsChanged = false;
+  for (;;) {
+    const guards = specializePathGuards(source, {parameterNames});
+    if (!guards.guardsSpecialized) break;
+    source = guards.source;
+    changed = true;
+    pathGuardsChanged = true;
+  }
+  if (pathGuardsChanged) for (;;) {
+    const simplified = simplifyControlFrames(source);
+    if (simplified.source === source) break;
+    source = simplified.source;
+  }
+  const postGuardExits = recoverPostGuardExits(source, {parameterNames});
+  if (postGuardExits.rewrites) {
+    source = postGuardExits.source;
+    changed = true;
+  }
+  const indexIncrements = recoverArrayIndexIncrements(source, {parameters});
+  if (indexIncrements.capturesFolded) {
+    source = indexIncrements.source;
+    changed = true;
+  }
+  // A nested backedge need not be the arm's final direct statement. Recover
+  // complete guarded loops after other cleanup, using lexical completion and
+  // destination proofs rather than assumptions about game control flags.
+  for (;;) {
+    const loops = foldGuardedLoopContinuations(source, {parameterNames});
+    if (!loops.loopsRecovered) break;
+    source = loops.source;
+    changed = true;
+  }
+  // A braced while whose body cannot fall through or continue to its own
+  // header is a single conditional. Preserve the complete body and every
+  // legal labeled exit; refuse bare own breaks and possibly constant guards.
+  for (;;) {
+    const loops = foldNonrepeatingWhileLoops(source, {parameterNames});
+    if (!loops.conditionalsRecovered) break;
+    source = loops.source;
+    changed = true;
+  }
+  // Direct conditional backedges after a complete prefix are a do-while.
+  // Each rewrite consumes at least one own continue and preserves the ordered
+  // short-circuit tests, complete protected prefix, and abrupt continuation.
+  for (;;) {
+    const loops = foldTrailingLoopContinuations(source, {parameterNames});
+    if (!loops.loopsRecovered) break;
+    source = loops.source;
+    changed = true;
+  }
+  // Complete repeatable prefixes and abrupt continuations need not share an
+  // infinite-loop body. Only normal prefix completion takes the new bare break;
+  // all existing backedges/nonlocal transfers and protected groups stay intact.
+  // The new own break excludes the loop from any subsequent recovery.
+  for (;;) {
+    const exits = foldLoopExitContinuations(source, {parameterNames});
+    if (!exits.continuationsRecovered) break;
+    source = exits.source;
+    changed = true;
+  }
+  // A terminal bare exit can make the original entry/trailing guard explicit.
+  // Preserve early continues and the fallthrough exit rather than silently
+  // turning a partial arm into another iteration. Each loop header changes once.
+  for (;;) {
+    const loops = foldTerminalLoopExits(source, {parameterNames});
+    if (!loops.loopsRecovered) break;
+    source = loops.source;
+    changed = true;
+  }
+  // Leading breaks to enclosing frames can be the negated loop condition.
+  // The same nonlocal break follows the loop; any own break would reach that
+  // continuation incorrectly and is refused. Keep every other destination.
+  for (;;) {
+    const loops = foldNonlocalLoopExits(source, {parameterNames});
+    if (!loops.loopsRecovered) break;
+    source = loops.source;
+    changed = true;
+  }
+  // Keep terminating false-arm effects in the loop, as an explicit exit guard.
+  // Flatten only the true arm's declaration-free outer block; protected groups
+  // and both distinct exit reasons retain their exact original behavior.
+  for (;;) {
+    const loops = foldLoopElseExitGuards(source, {parameterNames});
+    if (!loops.loopsRecovered) break;
+    source = loops.source;
+    changed = true;
+  }
+  // Explicit false-arm exits can expose direct trailing backedges. Run the
+  // terminal proof again so both exit reasons remain inside a do-while body.
+  for (;;) {
+    const loops = foldTerminalLoopExits(source, {parameterNames});
+    if (!loops.loopsRecovered) break;
+    source = loops.source;
+    changed = true;
+  }
+  // Classify immutable captured integers once while retaining the original
+  // effectful case runs and control-flag fallthrough. Never duplicate actions.
+  for (;;) {
+    const dispatch = recoverScalarIfDispatches(source);
+    if (!dispatch.dispatchesRecovered) break;
+    source = dispatch.source;
+    changed = true;
+  }
+  // Finish Boolean cleanup before typed relational cleanup, so grouping does
+  // not depend on when operand types become available. Preserve the existing
+  // source grouping; unknown/floating relations keep their NaN outcomes.
+  for (const complementIntegralRelations of [false, true]) for (;;) {
+    const predicates = simplifyPredicateNegations(source, {parameters, complementIntegralRelations});
+    if (!predicates.predicatesSimplified) break;
+    source = predicates.source;
+    changed = true;
+  }
+  // Branch and short-circuit facts can remove neutral comparisons of a stable
+  // captured int. Keep every unknown atom/action and all completion scopes.
+  for (;;) {
+    const dominated = simplifyDominatedPredicates(source, {parameterNames});
+    if (!dominated.conditionsSimplified) break;
+    source = dominated.source;
+    changed = true;
+  }
+  const finalFrames = finalizeControlFrames(source);
+  if (finalFrames.breaksRemoved) {
+    source = finalFrames.source;
+    changed = true;
+  }
+  const switchFrames = finalizeTerminalSwitchFrames(source);
+  if (switchFrames.breaksLocalized) {
+    source = switchFrames.source;
+    changed = true;
+  }
+  // Localized exits can expose a pure guard whose outcomes share the exact
+  // same lexical transfer. Preserve its captured declaration and initializer.
+  for (;;) {
+    const guards = foldRedundantExitGuards(source, {parameters});
+    if (!guards.guardsRemoved) break;
+    source = guards.source;
+    changed = true;
+  }
+  // Finishing work belongs after a repeatable prefix when the only own break
+  // is the final bare exit. Move that same exit earlier; retain every backedge,
+  // nonlocal transfer, complete protected construct and declaration scope.
+  for (;;) {
+    const tails = foldTerminalLoopTails(source, {parameterNames});
+    if (!tails.tailsHoisted) break;
+    source = tails.source;
+    changed = true;
+  }
+  // Field descriptors prove integral comparison operands without assuming
+  // values, purity or stability. Complement only operators: each field/array
+  // read and receiver stays in its original order, with all possible failures.
+  // Run last so earlier structural decisions retain their existing evidence.
+  if (ownedFields) for (;;) {
+    const predicates = simplifyPredicateNegations(source, {parameters, ownedFields});
+    if (!predicates.predicatesSimplified) break;
+    source = predicates.source;
+    changed = true;
+  }
+  // Finish condition grouping after all operator/structural choices. Keep
+  // identical expression association, numeric/cast operands and call arguments.
+  const grouping = simplifyPredicateGrouping(source);
+  if (grouping.parenthesisPairsRemoved) {
+    source = grouping.source;
+    changed = true;
+  }
+  // Classify a nested suffix after its intact prefix has run. Prefix switches,
+  // selector writes and protected constructs remain outside the new switch;
+  // existing labeled transfers and every guarded fallthrough stay unchanged.
+  for (;;) {
+    const dispatch = recoverScalarIfDispatches(source, {nestedRegions: true});
+    if (!dispatch.dispatchesRecovered) break;
+    source = dispatch.source;
+    changed = true;
+  }
+  // Join terminating cases before an existing primitive-local switch. The
+  // original switch body and targets remain intact; no action is duplicated.
+  for (;;) {
+    const prefixes = foldScalarSwitchPrefixes(source);
+    if (!prefixes.switchesExtended) break;
+    source = prefixes.source;
+    changed = true;
+  }
+  // Boolean literal branches keep a single condition evaluation/unboxing and
+  // primitive-local store. Field and array destinations remain explicit.
+  const booleanAssignments = foldBooleanLocalAssignments(source);
+  if (booleanAssignments.assignmentsFolded) {
+    source = booleanAssignments.source;
+    changed = true;
+  }
+  // At an iteration's end, normal completion already takes the same update
+  // and header. Final-inner-loop breaks can express that continuation locally.
+  for (;;) {
+    const exits = foldNaturalLoopExits(source);
+    if (!exits.loopExitsRecovered) break;
+    source = exits.source;
+    changed = true;
+  }
+  // Late nested dispatch can create a terminal switch after the earlier
+  // switch-frame proof ran. Localize only exits to the same continuation;
+  // case bodies, fallthrough and complete protected constructs stay intact.
+  const lateSwitchFrames = finalizeTerminalSwitchFrames(source);
+  if (lateSwitchFrames.breaksLocalized) {
+    source = lateSwitchFrames.source;
+    changed = true;
+  }
+  // A total primitive guard can select a provisional local value directly.
+  // Preserve the condition's effects and reject dependencies on that store.
+  const guardedAssignments = foldGuardedLocalAssignments(source, {parameters});
+  if (guardedAssignments.assignmentsFolded) {
+    source = guardedAssignments.source;
+    changed = true;
+  }
+  const assignmentSequences = foldGuardedAssignmentSequences(source, {parameters});
+  if (assignmentSequences.sequencesFolded) {
+    source = assignmentSequences.source;
+    changed = true;
+  }
+  // A prefix cannot change a proven primitive-local predicate. Reuse that
+  // predicate to guard the complete fallback, retaining each action once.
+  for (;;) {
+    const fallback = foldStableGuardedFallbacks(source, {parameters, fpStrict});
+    if (!fallback.framesRecovered) break;
+    source = fallback.source;
+    changed = true;
+  }
+  for (;;) {
+    const singlePass = foldSinglePassInnerLoops(source);
+    if (!singlePass.innerLoopsRecovered) break;
+    source = singlePass.source; changed = true;
+  }
+  for (;;) {
+    const smallFallback = foldSmallGuardedFallbacks(source);
+    if (!smallFallback.framesRecovered) break;
+    source = smallFallback.source; changed = true;
+  }
+  for (;;) {
+    const terminalFrame = foldTerminalLoopFrames(source);
+    if (!terminalFrame.framesRecovered) break;
+    source = terminalFrame.source; changed = true;
+  }
+  for (;;) {
+    const stores = foldGuardedStoreFallbacks(source, {parameters, ownedFields});
+    if (!stores.framesRecovered) break;
+    source = stores.source; changed = true;
+  }
+  for (;;) {
+    const guardedFrame = foldTerminalGuardedFrameExits(source);
+    if (!guardedFrame.guardsRecovered) break;
+    source = guardedFrame.source; changed = true;
+  }
+  for (;;) {
+    const frameLoop = foldTerminalFrameLoops(source);
+    if (!frameLoop.framesRecovered) break;
+    source = frameLoop.source; changed = true;
+  }
+  // Source class headers are erased. Casts from this to that exact class add
+  // no type information; other receiver casts retain their binding role.
+  const selfCasts = simplifySelfCasts(source, {selfType: ownedFields && {sourceName: ownedFields.owner, typeParameters: []}});
+  if (selfCasts.castsRemoved) { source = selfCasts.source; changed = true; }
+  for (;;) {
+    const sharedFallback = foldSharedGuardedFallbacks(source);
+    if (!sharedFallback.guardsRecovered) break;
+    source = sharedFallback.source; changed = true;
+  }
+  // Exclusive callback arms expose early exits whose suffix now ends the
+  // frame. Recheck that complete continuation after shared recovery.
+  for (;;) {
+    const sharedRemainder = foldTerminalGuardedFrameExits(source);
+    if (!sharedRemainder.guardsRecovered) break;
+    source = sharedRemainder.source; changed = true;
+  }
+  for (;;) {
+    const sharedStores = foldSharedStoreFallbacks(source, {parameters, ownedFields});
+    if (!sharedStores.framesRecovered) break;
+    source = sharedStores.source; changed = true;
+  }
+  for (;;) {
+    const storeRemainder = foldTerminalGuardedFrameExits(source);
+    if (!storeRemainder.guardsRecovered) break;
+    source = storeRemainder.source; changed = true;
+  }
+  for (;;) {
+    const arithmeticStores = foldArithmeticStoreFallbacks(source, {parameters, ownedFields});
+    if (!arithmeticStores.framesRecovered) break;
+    source = arithmeticStores.source; changed = true;
+  }
+  // Structural recovery introduces inverse guards after the earlier predicate
+  // pass. Finish their operators and condition grouping with scoped types;
+  // keep floating/unknown relations and all operand evaluation order intact.
+  for (;;) {
+    const predicates = simplifyPredicateNegations(source, {parameters, ownedFields});
+    if (!predicates.predicatesSimplified) break;
+    source = predicates.source; changed = true;
+  }
+  const finalGrouping = simplifyPredicateGrouping(source);
+  if (finalGrouping.parenthesisPairsRemoved) {
+    source = finalGrouping.source; changed = true;
+  }
+  for (;;) {
+    const conditionalStores = foldConditionalStoreFallbacks(source, {parameters, ownedFields});
+    if (!conditionalStores.framesRecovered) break;
+    source = conditionalStores.source; changed = true;
+  }
+  for (;;) {
+    const conditionalRemainder = foldTerminalGuardedFrameExits(source);
+    if (!conditionalRemainder.guardsRecovered) break;
+    source = conditionalRemainder.source; changed = true;
+  }
+  for (;;) {
+    const conditionalPredicates = simplifyPredicateNegations(source, {parameters, ownedFields});
+    if (!conditionalPredicates.predicatesSimplified) break;
+    source = conditionalPredicates.source; changed = true;
+  }
+  const conditionalGrouping = simplifyPredicateGrouping(source);
+  if (conditionalGrouping.parenthesisPairsRemoved) {
+    source = conditionalGrouping.source; changed = true;
+  }
+  for (;;) {
+    const nestedConditions = foldNestedIfConditions(source);
+    if (!nestedConditions.ifsMerged) break;
+    source = nestedConditions.source; changed = true;
+  }
+  // A short declaration-free continuation may mix stores and calls. Share its
+  // complete original statements between exclusive arms, keeping each action
+  // once on its original paths and every enclosing protected boundary intact.
+  for (;;) {
+    const statements = foldSharedStatementFallbacks(source);
+    if (!statements.guardsRecovered) break;
+    source = statements.source; changed = true;
+  }
+  // Mixed continuations expose terminal frame remainders after earlier guard
+  // recovery. Keep the complete new remainder on its original paths and in
+  // its original protected scopes; predicates and actions are not copied here.
+  for (;;) {
+    const mixedRemainder = foldTerminalGuardedFrameExits(source);
+    if (!mixedRemainder.guardsRecovered) break;
+    source = mixedRemainder.source; changed = true;
+  }
+  for (;;) {
+    const complementedRelations = simplifyComplementedRelations(source);
+    if (!complementedRelations.comparisonsSimplified) break;
+    source = complementedRelations.source; changed = true;
+  }
+  if (changed) replaceArrayContents(body, source.split('\n'));
 }
 
 function formatBlock(header, body) {
@@ -1919,6 +2500,7 @@ function decompileCode(code, method, cls, localState, options = {}) {
     }
   }
   const preferOwnedStructurer = options.forceOwnedStructurer === true
+    || hasStackPermutationBackedge(codeItemsForSelection)
     || tableHasTrivialCheckedHandler(code)
     // A ladder of conditional branches sharing one exit makes the legacy
     // range recognizer explore overlapping suffixes repeatedly. Obfuscated
@@ -2010,6 +2592,25 @@ function hasHighConditionalTargetFanIn(codeItems, minimumFanIn = 6) {
     targetCounts.set(target, count);
   }
   return false;
+}
+
+// A range recognizer does not carry the operand stack around a loop. Stack
+// permutations on a retreating edge need the owned CFG's explicit join values.
+function hasStackPermutationBackedge(codeItems) {
+  const labels = buildLabelIndex(codeItems);
+  const permutations = new Set(['swap', 'dup_x1', 'dup_x2', 'dup2_x1', 'dup2_x2']);
+  const prefix = [0];
+  for (const item of codeItems) {
+    const instruction = getInstructionFromItem(item);
+    prefix.push(prefix[prefix.length - 1] + (permutations.has(instruction?.op) ? 1 : 0));
+  }
+  return codeItems.some((item, index) => {
+    const instruction = getInstructionFromItem(item);
+    return branchTargetLabels(instruction).some(label => {
+      const target = labels.get(String(label).replace(/:$/, ''));
+      return target != null && target <= index && prefix[index + 1] > prefix[target];
+    });
+  });
 }
 
 function nopNormallyUnreachableBlocks(code) {
@@ -3540,10 +4141,9 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     isCatchAssignable: (subtype, supertype) => isAssignableExceptionType(
       subtype, supertype, options.exceptionModel),
   });
-  if ((!structured || !structured.ok) && codeItems.length > 1000 && !syncHandlers.size) {
-    const normalOnly = structureMethod(codeItems, []);
-    if (normalOnly && normalOnly.ok) structured = normalOnly;
-  }
+  // A failed exception-region reconstruction must retain the original handlers
+  // in the CFG fallback. Structuring only normal edges can look valid Java while
+  // dropping catch retries, recovery effects and exception priority entirely.
   if ((!structured || !structured.ok) && process.env.CFR_JS_DEBUG_STRUCTURER === '1') {
     console.error(`${cls.className}.${method.name}${method.descriptor}: ${structured && structured.reason ? structured.reason : 'structurer returned no result'}`);
   }
@@ -3557,21 +4157,22 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
   // Java source has to materialize operand-stack joins as locals.  On hostile
   // methods with thousands of blocks that can make otherwise valid structured
   // output exceed the classfile's hard 64 KiB Code_attribute limit.  Use the
-  // same typed CFG representation, but partition its state dispatcher into
-  // bounded local-class methods.  This is deliberately selected by bytecode
+  // structured representation in bounded local-class helpers first, and retain
+  // a typed CFG dispatcher when statement boundaries cannot be safely outlined.
+  // This is deliberately selected by bytecode
   // size and source-representable method shape, never by owner/method names.
   //
   // Constructors, instance methods and value-returning methods remain on the
   // ordinary structurer until their receiver/return carriers are supported by
   // the partitioner.  The corpus case which exposed the limit is static void.
-  const partitionOversizedStateMachine = codeItems.length > 5000
+  const partitionOversizedMethod = codeItems.length > 5000
     && (method.flags || []).includes('static')
     && methodReturnType(method) === 'void'
     && !(method.flags || []).includes('synchronized')
     && !syncHandlers.size;
   let stateMachineReason = process.env.CFR_JS_FORCE_STATE_MACHINE === '1'
     ? 'forced by CFR_JS_FORCE_STATE_MACHINE'
-    : (partitionOversizedStateMachine
+    : (partitionOversizedMethod && options.structureOversizedMethods === false
       ? 'partitioned oversized CFG'
       : (normalBranchIntoHandler
       ? 'normal control-flow edge enters an exception handler'
@@ -3728,14 +4329,9 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
       regularPredecessors[successor].push(predecessor.id);
     }
   }
-  // A loop header with two or more live operand values is not a Java
-  // expression join. Obfuscators use this shape to park a comparison beneath
-  // an opaque predicate and branch back to the comparison instruction. The
-  // structured printer can otherwise mistake the two different comparisons
-  // reaching that header for one loop condition, dropping the increment block
-  // or repeating one iteration forever. Keep ordinary one-value accumulator
-  // loops structured, but render these multi-value backedge phis through the
-  // exact CFG state machine.
+  // Multiple live operands require initialized, explicit join carriers. They
+  // do not by themselves require a dispatcher: the CFG structurer preserves
+  // each edge, and evaluate() snapshots overlapping copies before writing them.
   const hasMultiValueStackBackedge = cfg.blocks.some((block) => {
     const predecessors = regularPredecessors[block.id] || [];
     return (entryStacks.get(block.id) || []).length >= 2
@@ -3747,8 +4343,12 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
   // returns to the header or falls through to the same exit. Nesting several
   // such latches inside an exception region gives the Java structurer two
   // source-identical exits from different loops; folding those exits can join
-  // the continuation of one loop to the body of another. Preserve the exact
-  // CFG with the state-machine renderer for this shape. The test is entirely
+  // the continuation of one loop to the body of another. Exception regions
+  // now keep explicit exit-target and owner contracts through composition.
+  // Only a verified contract permits this latch shape to remain structured;
+  // otherwise preserve the exact CFG with the state-machine renderer.
+  // Handler-free methods use the base structurer without region collapse.
+  // The test is entirely
   // structural: a unary int-local condition, the same local in its successor,
   // a lexical backedge, and no assignment to that local inside the loop.
   const conditionalIntLocal = (block) => {
@@ -3796,20 +4396,8 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     }
     return false;
   });
-  // The multi-value backedge state machine cannot represent synchronized
-  // regions (it renders the lowered monitor plumbing as plain code). When a
-  // synchronized method also has this shape, do NOT bail to the fallbacks:
-  // the ordinary owned-structurer rendering (reached with useStateMachine
-  // false) already materializes the backedge operands through stackIn/stackOut
-  // carriers, which is exactly how these methods structured before the state
-  // machine existed. Bailing here instead discards correct structured output
-  // and hard-fails otherwise-valid synchronized methods (e.g. oe.h, ena.a).
-  if (!useStateMachine && hasMultiValueStackBackedge && !syncHandlers.size) {
-    useStateMachine = true;
-    stateMachineReason = 'multi-value operand stack carried across a CFG backedge';
-  }
   if (!useStateMachine && hasInvariantConditionalBackedgeFanout &&
-      !syncHandlers.size) {
+      exceptionTable.length > 0 && !structured.regionExitsVerified && !syncHandlers.size) {
     useStateMachine = true;
     stateMachineReason =
       'invariant conditional fanout carried across a CFG backedge';
@@ -3828,10 +4416,12 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     type === 'RuntimeException' || type === 'java.lang.RuntimeException')
     ? 'RuntimeException' : 'Throwable';
   const declarations = localState.liftAllDeclarations(initializeLiftedLocals);
+  const stackCarrierTypes = new Map();
   for (const block of cfg.blocks) {
     if (!handlerEntries.has(block.headLabel)) {
       const entryValues = entryStacks.get(block.id) || [];
       entryValues.forEach((value, slot) => {
+        stackCarrierTypes.set(stackInName(block.id, slot), simplifyType(value.type));
         requireRenderedTypeImport(options, value.qualifiedType || value.type);
         const tail = getInstructionFromItem(codeItems[block.insns[block.insns.length - 1]]);
         const returnCarrier = useStateMachine || tail && (
@@ -3890,6 +4480,7 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
         const incoming = forwardingPredecessor.exitStack &&
           forwardingPredecessor.exitStack[slot];
         if (incoming && /^stackIn_\d+_\d+$/.test(incoming.code) &&
+            incoming.code !== stackInName(blockId, slot) &&
             simplifyType(incoming.type) === simplifyType(value.type)) {
           forwardedStackIns.add(stackInName(blockId, slot));
           code = incoming.code;
@@ -3938,7 +4529,7 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
       }
     }
 
-    if (regularSuccessors.length) exitStack.forEach((value, slot) => {
+    const storedExitValues = regularSuccessors.length ? exitStack.map((value) => {
       requireRenderedTypeImport(options, value.qualifiedType || value.type);
       const rawStoredValue = renderStoreExpression(value);
       const canonicalSourceType = rawStoredValue && localState.sourceTypeForName(rawStoredValue.code);
@@ -3947,12 +4538,69 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
       const simpleLocalReference = rawStoredValue
         && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(rawStoredValue.code)
         && !primitiveStackTypes.has(targetStackType) && targetStackType !== 'Object';
-      const typedStoredValue = simpleLocalReference
+      // An allocator-owned carrier already has an explicit source declaration.
+      // For an identical reference type, widening it to Object and casting back
+      // only hides a pure copy from the join-alias proof. Ordinary locals and
+      // differing verifier types still need the existing coercion path.
+      const exactReferenceCarrier = simpleLocalReference
+        && stackCarrierTypes.get(rawStoredValue.code) === targetStackType;
+      const typedStoredValue = simpleLocalReference && !exactReferenceCarrier
         ? { ...rawStoredValue, type: 'Object' }
         : (canonicalSourceType ? { ...rawStoredValue, type: canonicalSourceType } : rawStoredValue);
       const rendered = value.pendingNew
         ? expr('null', value.type)
         : coerceExpressionForType(typedStoredValue, value.type);
+      return rendered;
+    }) : [];
+    const assignedCarriers = new Set();
+    for (const successor of regularSuccessors) {
+      (entryStacks.get(successor) || []).forEach((value, slot) => {
+        if (slot < exitStack.length) assignedCarriers.add(stackInName(successor, slot));
+      });
+    }
+    const readsAssignedCarrier = code => [...String(code).matchAll(/\bstackIn_\d+_\d+\b/g)]
+      .some(match => assignedCarriers.has(match[0]));
+    let branchCondition = null;
+    let switchSelector = null;
+    const originalCondition = isConditionalBranch(op)
+      ? conditionForBranch(terminator, stack.slice(), false) : null;
+    const originalSelector = op === 'tableswitch' || op === 'lookupswitch'
+      ? stack[stack.length - 1] : null;
+    const needsSnapshot = storedExitValues.some(value => readsAssignedCarrier(value.code)) ||
+      (originalCondition && readsAssignedCarrier(originalCondition.code)) ||
+      (originalSelector && readsAssignedCarrier(originalSelector.code));
+    if (needsSnapshot) {
+      // Edge stores are a parallel copy. Snapshot in operand order before any
+      // target store, including the consumed condition/selector when it reads
+      // a target. Otherwise a swap loses a value or tests the updated operand.
+      const captured = new Map();
+      storedExitValues.forEach((value, slot) => {
+        const original = exitStack[slot];
+        if (!captured.has(original)) {
+          const name = localState.nextSyntheticName('edgeValue');
+          declarations.push(`${simplifyType(value.type)} ${name};`);
+          lines.push(`${name} = ${value.code};`);
+          captured.set(original, expr(name, value.type));
+        }
+        storedExitValues[slot] = captured.get(original);
+      });
+      if (originalCondition) {
+        const condition = conditionForBranch(terminator,
+          stack.map(value => captured.get(value) || value), false);
+        const name = localState.nextSyntheticName('edgeCondition');
+        declarations.push(`boolean ${name};`);
+        lines.push(`${name} = ${condition.code};`);
+        branchCondition = expr(name, 'boolean');
+      } else if (originalSelector) {
+        const selector = captured.get(originalSelector) || originalSelector;
+        const name = localState.nextSyntheticName('edgeSelector');
+        declarations.push(`${simplifyType(selector.type)} ${name};`);
+        lines.push(`${name} = ${selector.code};`);
+        switchSelector = expr(name, selector.type);
+      }
+    }
+    if (regularSuccessors.length) exitStack.forEach((value, slot) => {
+      const rendered = storedExitValues[slot];
       const targets = regularSuccessors.map((successor) => ({
         successor,
         value: (entryStacks.get(successor) || [])[slot],
@@ -3978,6 +4626,10 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
             `${coerceExpressionForType(outgoing, target.value.type).code};`);
           recordEdgeStackInSource(targetName, firstName);
         }
+        // A single-predecessor successor may forward this carrier. Raw source
+        // expressions describe values before the parallel stores and can now
+        // read overwritten names; expose the post-copy value instead.
+        if (needsSnapshot) exitStack[slot] = outgoing;
       } else {
         // Different verifier types can require distinct coercions. Retain one
         // source-typed carrier so no narrowing performed for one successor is
@@ -3991,24 +4643,30 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
             `${coerceExpressionForType(outgoing, target.value.type).code};`);
           recordEdgeStackInSource(targetName, null);
         }
+        if (needsSnapshot) exitStack[slot] = outgoing;
       }
     });
-    const value = { lines, stack, exitStack, terminator };
+    const value = { lines, stack, exitStack, terminator, branchCondition, switchSelector };
     cache.set(blockId, value);
     evaluating.delete(blockId);
     return value;
   };
 
   let render = {
+    localType(name) {
+      return stackCarrierTypes.get(name) || localState.sourceTypeForName(name);
+    },
     straight(blockId) {
       return evaluate(blockId).lines;
     },
     cond(blockId) {
       const state = evaluate(blockId);
+      if (state.branchCondition) return state.branchCondition.code;
       return conditionForBranch(state.terminator, state.stack.slice(), false).code;
     },
     condInverted(blockId) {
       const state = evaluate(blockId);
+      if (state.branchCondition) return negateBooleanExpression(state.branchCondition).code;
       return conditionForBranch(state.terminator, state.stack.slice(), true).code;
     },
     blockTerminates(blockId) {
@@ -4017,6 +4675,7 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     },
     switchValue(blockId) {
       const state = evaluate(blockId);
+      if (state.switchSelector) return state.switchSelector.code;
       return pop(state.stack.slice()).code;
     },
     syncLock(lockLocal, lockPc) {
@@ -4046,6 +4705,7 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
         return syntheticRender.get(id) ? null : base.condInverted(id);
       },
       blockTerminates: (id) => (syntheticRender.get(id) ? false : base.blockTerminates(id)),
+      localType: (name) => base.localType(name),
       switchValue: (id) => base.switchValue(id),
       syncLock: (lockLocal, lockPc) => base.syncLock(lockLocal, lockPc),
     };
@@ -4056,16 +4716,10 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     if (!useStateMachine && structured && structured.tree) {
       normalizeStructuredCatchNodes(structured.tree, cfg, codeItems, options.exceptionModel);
     }
-    // Large obfuscated initializers can protect thousands of individual basic
-    // blocks with the same wrapper handler. Emitting one Java try/catch per
-    // block overflows javac's exception table before it can write the method.
-    // Keep the normal CFG state machine, but omit those synthetic wrappers for
-    // very large fallbacks. Handler states still need a value for their seeded
-    // exception-stack slot even though normal control flow cannot enter them.
-    const stateMachineExceptionTable = codeItems.length > 1000
-      && !partitionOversizedStateMachine
-      ? []
-      : exceptionTable;
+    // Size alone cannot prove handlers redundant. Keep the exact exception
+    // table when falling back; oversized supported methods are partitioned
+    // below instead of silently removing their protected transfers.
+    const stateMachineExceptionTable = exceptionTable;
     if (!stateMachineExceptionTable.length && handlerEntries.size) {
       declarations.push('Throwable caughtException = null;');
     }
@@ -4075,10 +4729,17 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     // Keep the folded Java statement AST alongside the rendered text: reachability
     // analysis must inspect the AST (dead if-branches already dropped by constant
     // folding), which is what javac sees — not the raw structurer tree.
+    const stateMachineStats = {};
+    const stateMachineConfiguration = {
+      throwOwner: simpleClassName(cls.className || 'Class'),
+      coalesceLinearStates: options.coalesceStateMachineChains
+        ?? (process.env.CFR_JS_COALESCE_STATE_MACHINE_CHAINS !== '0'),
+      stats: stateMachineStats,
+    };
     let statements = useStateMachine ? null : structuredStatements(structured.tree, render);
     let source = useStateMachine
       ? printCfgStateMachine(cfg, render, evaluate, codeItems, stateMachineExceptionTable, declarations,
-        methodReturnType(method))
+        methodReturnType(method), stateMachineConfiguration)
       : emitStatements(statements);
     const hasInvalidJavaSwitch = (text) => /switch\s*\(\s*null\s*\)/.test(text)
       || /^\s*case\s+(?!-?\d+\s*:|'(?:\\.|[^'])+'\s*:)/m.test(text);
@@ -4089,42 +4750,30 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     // prunes unreachable states) instead of shipping invalid Java.
     if (!useStateMachine && (source.includes('unsupported condition') || source.includes('= e;')
       || hasInvalidJavaSwitch(source) || hasInvalidJavaFlow(source) || hasUnreachableStatement(statements))) {
-      const normalOnly = codeItems.length > 1000 && !syncHandlers.size ? structureMethod(codeItems, []) : null;
-      if (normalOnly && normalOnly.ok) {
-        cache.clear();
-        evaluating.clear();
-        forwardedStackIns.clear();
-        edgeStackInSources.clear();
-        statements = structuredStatements(normalOnly.tree, render);
-        source = emitStatements(statements);
+      if (syncHandlers.size) {
+        // Never route a lowered synchronized method through the state
+        // machine — it would emit unsynchronized code. Fall back loudly.
+        return null;
       }
-      if (source.includes('unsupported condition') || source.includes('= e;')
-        || hasInvalidJavaSwitch(source) || hasInvalidJavaFlow(source) || hasUnreachableStatement(statements)) {
-        if (syncHandlers.size) {
-          // Never route a lowered synchronized method through the state
-          // machine — it would emit unsynchronized code. Fall back loudly.
-          return null;
-        }
-        useStateMachine = true;
-        stateMachineReason = 'structured output failed Java source-flow validation';
-        cache.clear();
-        evaluating.clear();
-        forwardedStackIns.clear();
-        edgeStackInSources.clear();
-        // The operand-stack carriers were declared for the structured (nested
-        // loop) rendering, where control flow guarantees each is assigned before
-        // use, so only the return/branch carriers received a default initializer
-        // (line ~3774). The state machine dispatches blocks through a switch, so
-        // javac can no longer prove definite assignment for the rest. Give every
-        // uninitialized carrier its Java default now — harmless for live paths
-        // (the real value overwrites it) and required for the method to compile.
-        for (let d = 0; d < declarations.length; d += 1) {
-          const carrier = /^(.+?)\s+(stackIn_\d+_\d+|stackOut_\d+_\d+);$/.exec(declarations[d]);
-          if (carrier) declarations[d] = `${carrier[1]} ${carrier[2]} = ${defaultValueForType(carrier[1])};`;
-        }
-        source = printCfgStateMachine(cfg, render, evaluate, codeItems, stateMachineExceptionTable, declarations,
-          methodReturnType(method));
+      useStateMachine = true;
+      stateMachineReason = 'structured output failed Java source-flow validation';
+      cache.clear();
+      evaluating.clear();
+      forwardedStackIns.clear();
+      edgeStackInSources.clear();
+      // The operand-stack carriers were declared for the structured (nested
+      // loop) rendering, where control flow guarantees each is assigned before
+      // use, so only the return/branch carriers received a default initializer
+      // (line ~3774). The state machine dispatches blocks through a switch, so
+      // javac can no longer prove definite assignment for the rest. Give every
+      // uninitialized carrier its Java default now — harmless for live paths
+      // (the real value overwrites it) and required for the method to compile.
+      for (let d = 0; d < declarations.length; d += 1) {
+        const carrier = /^(.+?)\s+(stackIn_\d+_\d+|stackOut_\d+_\d+);$/.exec(declarations[d]);
+        if (carrier) declarations[d] = `${carrier[1]} ${carrier[2]} = ${defaultValueForType(carrier[1])};`;
       }
+      source = printCfgStateMachine(cfg, render, evaluate, codeItems, stateMachineExceptionTable, declarations,
+        methodReturnType(method), stateMachineConfiguration);
     }
     declarations.push(...localState.liftAllDeclarations(initializeLiftedLocals));
     const redundantStackInAliases = new Map();
@@ -4153,20 +4802,19 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
           if (source !== target) redundantStackInAliases.set(target, source);
         }
       }
-      const resolveAlias = (name) => {
-        const seen = new Set([name]);
-        let current = name;
-        while (redundantStackInAliases.has(current)) {
-          const next = redundantStackInAliases.get(current);
-          if (seen.has(next)) return name;
-          seen.add(next);
-          current = next;
-        }
-        return current;
-      };
-      for (const [target, source] of redundantStackInAliases) {
-        redundantStackInAliases.set(target, resolveAlias(source));
-      }
+      const resolvedAliases = resolveStackCarrierAliases(redundantStackInAliases,
+        edgeStackInSources, regularPredecessors, stackCarrierTypes);
+      redundantStackInAliases.clear();
+      for (const [target, replacement] of resolvedAliases)
+        redundantStackInAliases.set(target, replacement);
+    }
+    const originalCarrierSource = source;
+    const aliasProof = rewriteStackCarrierReferences(source, redundantStackInAliases);
+    if (!aliasProof.applied) {
+      // Forwarded edge stores can feed aliases. Keep both sets of carriers
+      // when lexical/scope proof fails, rather than leaving an undeclared copy.
+      redundantStackInAliases.clear();
+      forwardedStackIns.clear();
     }
     if (forwardedStackIns.size) {
       const escapedNames = [...forwardedStackIns].map((name) =>
@@ -4174,12 +4822,15 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
       const assignment = new RegExp(`^\\s*(?:${escapedNames.join('|')})\\s*=.*;\\s*$`, 'gm');
       source = source.replace(assignment, '');
     }
-    for (const [target, replacement] of redundantStackInAliases) {
-      const escaped = target.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      source = source.replace(new RegExp(`\\b${escaped}\\b`, 'g'), replacement);
+    const aliases = rewriteStackCarrierReferences(source, redundantStackInAliases);
+    if (aliases.applied) source = aliases.source;
+    else {
+      source = originalCarrierSource;
+      redundantStackInAliases.clear();
+      forwardedStackIns.clear();
     }
     source = source.replace(/^\s*(stackIn_\d+_\d+)\s*=\s*\1;\s*$/gm, '');
-    const lines = source ? source.split('\n') : [];
+    let retainedDeclarations = [];
     if (declarations.length) {
       const eliminatedStackIns = new Set([
         ...forwardedStackIns, ...redundantStackInAliases.keys(),
@@ -4187,11 +4838,69 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
       const uniqueDeclarations = [...new Set(declarations)].filter((declaration) =>
         ![...eliminatedStackIns].some((name) =>
           new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(declaration)));
-      lines.unshift(...uniqueDeclarations);
+      const booleans = useStateMachine ? null : promoteBooleanStackCarriers(
+        source, uniqueDeclarations, stackCarrierTypes, name => localState.sourceTypeForName(name));
+      if (booleans) {
+        source = booleans.source;
+      }
+      retainedDeclarations = booleans ? booleans.declarations : uniqueDeclarations;
     }
+    if (!useStateMachine) {
+      const retainedPrimitiveTypes = new Map();
+      for (const declaration of retainedDeclarations) {
+        const match = /^(boolean|byte|char|short|int|long|float|double) ([A-Za-z_$][\w$]*)(?: = .+)?;$/.exec(declaration);
+        if (match) retainedPrimitiveTypes.set(match[2], match[1]);
+      }
+      source = factorCommonBranchTails(source, {
+        integralConditions: integralConditionsFromCache(cache),
+        // Boolean promotion may have changed an int carrier's declaration.
+        // Use its final type, and never type an eliminated carrier from stale
+        // allocator metadata. Other names must be proven actual JVM locals.
+        localType: name => retainedPrimitiveTypes.get(name)
+          || (stackCarrierTypes.has(name) ? null : localState.sourceTypeForName(name)),
+      }).source;
+    }
+    if (!useStateMachine) {
+      const selectors = removeDeadRegionSelectors(source, retainedDeclarations, structured.selectorDecls);
+      source = selectors.source;
+      retainedDeclarations = selectors.declarations;
+      const receivers = removeDeadReceiverSnapshots(source, retainedDeclarations, stackCarrierTypes.keys());
+      source = receivers.source;
+      retainedDeclarations = receivers.declarations;
+    }
+    let lines = source ? source.split('\n') : [];
+    lines.unshift(...retainedDeclarations);
     if (lines[lines.length - 1] === 'return;') lines.pop();
-    if (partitionOversizedStateMachine) {
-      return partitionVoidStateMachine(lines, method, localState);
+    if (partitionOversizedMethod && !useStateMachine) {
+      const descriptor = parseDescriptor(method.descriptor || '()V');
+      const partitioned = partitionStructuredVoidBody(lines, {
+        parameters: descriptor.params.map((type, index) => ({type: simplifyType(type), name: localState.paramNames[index]})),
+        throwsTypes: methodThrowsTypes(method),
+        parseDeclarations: localDeclarationsFromStatement,
+        stripDeclarationType,
+        typeFromAst: sourceTypeFromAst,
+        sourceBudget: options.structuredPartitionSourceBudget,
+        onFailure: process.env.CFR_JS_DEBUG_STRUCTURER === '1' ? reason =>
+          console.error(`${cls.className}.${method.name}${method.descriptor}: structured partition declined: ${reason}`) : undefined,
+      });
+      if (partitioned) {
+        if (Array.isArray(options.diagnostics)) options.diagnostics.push({
+          kind: 'structuredMethodPartition', className: cls.className,
+          methodName: method.name, descriptor: method.descriptor,
+          helpers: partitioned.helpers, sharedLocals: partitioned.sharedLocals,
+        });
+        return compactBlankSourceLines(partitioned.lines.join('\n')).split('\n');
+      }
+      // A helper boundary must not strand a labeled transfer or a local scope.
+      // Retain the typed CFG representation when closed statement extraction
+      // cannot keep every helper bounded. Rebuild with all original carriers;
+      // structured-only alias elimination above must not affect this fallback.
+      useStateMachine = true;
+      stateMachineReason = 'oversized structured body cannot be safely partitioned';
+      cache.clear(); evaluating.clear(); forwardedStackIns.clear(); edgeStackInSources.clear();
+      source = printCfgStateMachine(cfg, render, evaluate, codeItems, exceptionTable, declarations,
+        methodReturnType(method), stateMachineConfiguration);
+      lines = [...new Set(declarations), ...source.split('\n')];
     }
     if (useStateMachine && Array.isArray(options.diagnostics)) {
       options.diagnostics.push({
@@ -4200,9 +4909,15 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
         methodName: method.name,
         descriptor: method.descriptor,
         reason: stateMachineReason || 'state-machine fallback selected',
+        dispatchStatesBefore: stateMachineStats.statesBefore,
+        dispatchStatesAfter: stateMachineStats.statesAfter,
       });
     }
-    return coalesceDefaultConstructorBody(sinkForInitDeclarations(rewriteWhileLoopsAsFor(lines)), method);
+    if (partitionOversizedMethod) {
+      return partitionVoidStateMachine(lines, method, localState);
+    }
+    const body = coalesceDefaultConstructorBody(sinkForInitDeclarations(rewriteWhileLoopsAsFor(lines)), method);
+    return useStateMachine ? body : compactBlankSourceLines(body.join('\n')).split('\n');
   } catch (err) {
     // Expression reconstruction can still decline stack-carrying joins. The
     // old recognizers remain a safe fallback while that dataflow grows.
@@ -4231,6 +4946,8 @@ function partitionVoidStateMachine(lines, method, localState) {
 
   const declarations = lines.slice(0, loopIndex);
   const fieldLines = [];
+  const fieldTypes = new Map();
+  const initializers = [];
   let entryState = 0;
   for (const raw of declarations) {
     const line = String(raw).trim();
@@ -4238,6 +4955,8 @@ function partitionVoidStateMachine(lines, method, localState) {
     if (!match) return lines;
     const [, type, name, initializer] = match;
     fieldLines.push(`${type} ${name};`);
+    fieldTypes.set(name, type);
+    if (initializer != null) initializers.push(`this.${name} = ${initializer};`);
     if (name === 'statePc' && initializer != null) {
       const parsed = Number(initializer);
       if (Number.isFinite(parsed)) entryState = parsed;
@@ -4259,6 +4978,28 @@ function partitionVoidStateMachine(lines, method, localState) {
     cases.push({ state: Number(start[1]), lines: body });
   }
   if (!cases.length) return lines;
+
+  // Block evaluation binds locals lazily, before liftAllDeclarations discovers
+  // them. Their first stores can therefore still spell declarations inside a
+  // case. Once lifted to carrier fields, these stores must assign those fields;
+  // leaving the declarations would shadow them and later helpers read defaults.
+  // Match parsed declarations, not identifier text in expressions or strings.
+  for (const item of cases) {
+    item.lines = item.lines.flatMap((line) => {
+      const locals = localDeclarationsFromStatement(line);
+      const promoted = locals.filter((local) => fieldTypes.has(local.name));
+      if (!promoted.length) return [line];
+      if (locals.length !== 1 || promoted[0].inCatch || promoted[0].inResource ||
+          promoted[0].type !== fieldTypes.get(promoted[0].name)) {
+        throw new Error('partitioned local cannot safely become a carrier field');
+      }
+      const local = promoted[0];
+      if (!local.initialized) return [];
+      const assignment = stripDeclarationType(line, local.name, local.inFor);
+      if (assignment === line) throw new Error('partitioned local store could not be promoted');
+      return [assignment];
+    });
+  }
 
   // Keep helper bytecode comfortably below 64 KiB even when one source block
   // carries many stack-join stores.  Group by rendered source weight rather
@@ -4285,7 +5026,7 @@ function partitionVoidStateMachine(lines, method, localState) {
   const out = [`class ${className} {`];
   for (const field of fieldLines) out.push(`    ${field}`);
   for (let index = 0; index < parameterTypes.length; index += 1) {
-    out.push(`    final ${parameterTypes[index]} ${parameterNames[index]};`);
+    out.push(`    ${parameterTypes[index]} ${parameterNames[index]};`);
   }
   out.push('    boolean finished;');
 
@@ -4295,7 +5036,10 @@ function partitionVoidStateMachine(lines, method, localState) {
   for (let index = 0; index < parameterTypes.length; index += 1) {
     out.push(`        this.${parameterNames[index]} = initialParam${index};`);
   }
-  out.push(`        this.statePc = ${entryState};`, '    }');
+  for (const initializer of initializers) out.push(`        ${initializer}`);
+  if (!initializers.some((line) => line.startsWith('this.statePc = ')))
+    out.push(`        this.statePc = ${entryState};`);
+  out.push('    }');
 
   const renderCaseLine = (line) => {
     if (line.trim() === 'return;') {
@@ -4444,7 +5188,7 @@ function isAssignableExceptionType(thrownType, catchType, model) {
   return false;
 }
 
-function printCfgStateMachine(cfg, render, evaluate, codeItems, exceptionTable, declarations, returnType) {
+function printCfgStateMachine(cfg, render, evaluate, codeItems, exceptionTable, declarations, returnType, configuration = {}) {
   const blockByPc = new Map();
   for (const block of cfg.blocks) {
     const first = codeItems[block.insns[0]];
@@ -4504,7 +5248,12 @@ function printCfgStateMachine(cfg, render, evaluate, codeItems, exceptionTable, 
     return current;
   };
 
-  const dispatch = (blockId) => {
+  const stateLeaders = new Map();
+  const stateTarget = (target) => {
+    const resolved = resolve(target);
+    return stateLeaders.get(resolved) ?? resolved;
+  };
+  const dispatch = (blockId, inlineTarget = () => null) => {
     const term = cfg.term[blockId];
     if (!term || term.kind === 'return') return [];
     if (term.kind === 'goto' || term.kind === 'fall') {
@@ -4513,11 +5262,19 @@ function printCfgStateMachine(cfg, render, evaluate, codeItems, exceptionTable, 
           ? ['return;']
           : ['throw new IllegalStateException("control fell off non-void method");'];
       }
-      return [`statePc = ${resolve(term.target)};`, 'continue stateLoop;'];
+      return [`statePc = ${stateTarget(term.target)};`, 'continue stateLoop;'];
     }
     if (term.kind === 'cond') {
-      const taken = term.taken == null ? -1 : resolve(term.taken);
-      const fall = term.fall == null ? -1 : resolve(term.fall);
+      const taken = term.taken == null ? -1 : stateTarget(term.taken);
+      const fall = term.fall == null ? -1 : stateTarget(term.fall);
+      const takenBody = inlineTarget(term.taken);
+      const fallBody = inlineTarget(term.fall);
+      if (takenBody || fallBody) {
+        return [`if (${render.cond(blockId)}) {`,
+          ...(takenBody || [`statePc = ${taken};`, 'continue stateLoop;']).map((line) => `    ${line}`),
+          '} else {',
+          ...(fallBody || [`statePc = ${fall};`, 'continue stateLoop;']).map((line) => `    ${line}`), '}'];
+      }
       return [
         `if (${render.cond(blockId)}) {`,
         `    statePc = ${taken};`,
@@ -4528,11 +5285,25 @@ function printCfgStateMachine(cfg, render, evaluate, codeItems, exceptionTable, 
       ];
     }
     if (term.kind === 'switch') {
+      const inlineCases = term.cases.map((item) => inlineTarget(item.target));
+      const inlineDefault = inlineTarget(term.default);
+      if (inlineDefault || inlineCases.some(Boolean)) {
+        const lines = [`switch (${render.switchValue(blockId)}) {`];
+        term.cases.forEach((item, index) => {
+          lines.push(`    case ${item.key}: {`,
+            ...(inlineCases[index] || [`statePc = ${item.target == null ? -1 : stateTarget(item.target)};`,
+              'continue stateLoop;']).map((line) => `        ${line}`), '    }');
+        });
+        lines.push('    default: {',
+          ...(inlineDefault || [`statePc = ${term.default == null ? -1 : stateTarget(term.default)};`,
+            'continue stateLoop;']).map((line) => `        ${line}`), '    }', '}');
+        return lines;
+      }
       const lines = [`switch (${render.switchValue(blockId)}) {`];
       for (const item of term.cases) {
-        lines.push(`    case ${item.key}: statePc = ${item.target == null ? -1 : resolve(item.target)}; break;`);
+        lines.push(`    case ${item.key}: statePc = ${item.target == null ? -1 : stateTarget(item.target)}; break;`);
       }
-      lines.push(`    default: statePc = ${term.default == null ? -1 : resolve(term.default)}; break;`);
+      lines.push(`    default: statePc = ${term.default == null ? -1 : stateTarget(term.default)}; break;`);
       lines.push('}', 'continue stateLoop;');
       return lines;
     }
@@ -4559,12 +5330,138 @@ function printCfgStateMachine(cfg, render, evaluate, codeItems, exceptionTable, 
     for (const t of targets) worklist.push(resolve(t));
   }
 
-  const renderedBlocks = cfg.blocks
-    .filter((block) => reachable.has(block.id))
-    .map((block) => {
-      const info = evaluated.get(block.id);
-      return { block, body: [...info.lines, ...dispatch(block.id)], handlers: info.handlers };
+  // Coalesce straight-line states only when their normal and exceptional
+  // entries prove that no alternate path can start inside the chain. Preserve
+  // handler order/targets exactly, and keep each original block's Java scope.
+  // This changes dispatch scaffolding, not operand-stack stores or operations.
+  const activeBlocks = cfg.blocks.filter((block) => reachable.has(block.id));
+  const activeById = new Map(activeBlocks.map((block) => [block.id, block]));
+  const predecessors = new Map(activeBlocks.map((block) => [block.id, new Set()]));
+  const incomingEdges = new Map(activeBlocks.map((block) => [block.id, 0]));
+  const handlerEntries = new Set();
+  for (const block of activeBlocks) {
+    const term = cfg.term[block.id];
+    const targets = [];
+    if (term?.kind === 'goto' || term?.kind === 'fall') targets.push(term.target);
+    else if (term?.kind === 'cond') targets.push(term.taken, term.fall);
+    else if (term?.kind === 'switch') {
+      targets.push(...term.cases.map((item) => item.target), term.default);
+    }
+    for (const target of targets) {
+      const id = resolve(target);
+      predecessors.get(id)?.add(block.id);
+      if (incomingEdges.has(id)) incomingEdges.set(id, incomingEdges.get(id) + 1);
+    }
+    for (const handler of evaluated.get(block.id).handlers) handlerEntries.add(resolve(handler.target));
+  }
+  const handlerIdentity = (id) => JSON.stringify(evaluated.get(id).handlers.map(
+    (handler) => [handler.catchType, resolve(handler.target)]));
+  // Bound a combined case so partitioning oversized void methods still has
+  // sufficiently small units to keep each generated helper below 64 KiB.
+  const sourceWeight = (id) => evaluated.get(id).lines.reduce(
+    (sum, line) => sum + line.length + 32, 80);
+  const chains = [];
+  for (const block of activeBlocks) {
+    if (stateLeaders.has(block.id)) continue;
+    const chain = [];
+    const handlers = handlerIdentity(block.id);
+    let current = block;
+    let weight = 0;
+    while (current) {
+      chain.push(current);
+      stateLeaders.set(current.id, block.id);
+      weight += sourceWeight(current.id);
+      if (configuration.coalesceLinearStates === false) break;
+      const term = cfg.term[current.id];
+      if (term?.kind !== 'goto' && term?.kind !== 'fall') break;
+      const next = resolve(term.target);
+      const incoming = predecessors.get(next);
+      if (!activeById.has(next) || stateLeaders.has(next) || next === entryState
+        || handlerEntries.has(next) || incoming.size !== 1 || !incoming.has(current.id)
+        || handlerIdentity(next) !== handlers || weight + sourceWeight(next) > 12000) break;
+      current = activeById.get(next);
+    }
+    chains.push(chain);
+  }
+  // Inline single-entry branch regions as ordinary if/switch bodies. A case-
+  // local declaration in the parent could shadow a child's original field or
+  // local binding after nesting, so prove its absence using the owned Java AST.
+  // Unknown syntax is a refusal, never a reason to guess about local scope.
+  const unsafeParentScopes = new Map();
+  const unsafeParentScope = (id) => {
+    if (!unsafeParentScopes.has(id)) {
+      const unsafe = (node) => {
+        if (!node || typeof node !== 'object') return false;
+        if (node.kind === 'LocalVariableDeclarationStatement' || node.kind === 'FormalParameter'
+          || node.kind === 'ClassDeclaration' || String(node.kind).startsWith('Unsupported')) return true;
+        return Object.values(node).some((value) => Array.isArray(value)
+          ? value.some(unsafe) : unsafe(value));
+      };
+      try {
+        unsafeParentScopes.set(id, unsafe(javaStatementParser.parseStatement(
+          '{\n' + evaluated.get(id).lines.join('\n') + '\n}')));
+      } catch (_error) { unsafeParentScopes.set(id, true); }
+    }
+    return unsafeParentScopes.get(id);
+  };
+  const chainById = new Map(chains.map((chain) => [chain[0].id, chain]));
+  const absorbedBranches = new Set();
+  const inlineChildren = new Map();
+  const regionRoots = [];
+  for (const chain of chains) {
+    if (absorbedBranches.has(chain[0].id)) continue;
+    regionRoots.push(chain);
+    if (configuration.coalesceLinearStates === false) continue;
+    let weight = chain.reduce((sum, block) => sum + sourceWeight(block.id), 512);
+    const visit = (parent, depth) => {
+      const tail = parent[parent.length - 1];
+      const term = cfg.term[tail.id];
+      if (depth >= 4 || unsafeParentScope(tail.id)) return;
+      const targets = term?.kind === 'cond' ? [term.taken, term.fall]
+        : term?.kind === 'switch' ? [...term.cases.map((item) => item.target), term.default] : [];
+      for (const target of targets) {
+        const id = resolve(target);
+        const child = chainById.get(stateTarget(id));
+        if (!child || child[0].id <= parent[0].id || id === entryState
+          || handlerEntries.has(id) || incomingEdges.get(id) !== 1
+          || absorbedBranches.has(child[0].id) || handlerIdentity(id) !== handlerIdentity(tail.id)) continue;
+        const childWeight = child.reduce((sum, block) => sum + sourceWeight(block.id), 512);
+        if (weight + childWeight > 12000) continue;
+        weight += childWeight;
+        absorbedBranches.add(child[0].id);
+        if (!inlineChildren.has(tail.id)) inlineChildren.set(tail.id, new Set());
+        inlineChildren.get(tail.id).add(child[0].id);
+        visit(child, depth + 1);
+      }
+    };
+    visit(chain, 0);
+  }
+  const renderChain = (chain) => {
+    const tail = chain[chain.length - 1];
+    const terminal = dispatch(tail.id, (target) => {
+      const child = chainById.get(stateTarget(target));
+      if (!child || !inlineChildren.get(tail.id)?.has(child[0].id)) return null;
+      return [`/* Inlined CFG state: ${child[0].id}. */`, '{',
+        ...renderChain(child).map((line) => `    ${line}`), '}'];
     });
+    if (chain.length === 1) return [...evaluated.get(tail.id).lines, ...terminal];
+    const body = [`/* Sequential CFG blocks: ${chain.map((item) => item.id).join(', ')}. */`];
+    for (let index = 0; index < chain.length; index += 1) {
+      const statements = [...evaluated.get(chain[index].id).lines];
+      if (index === chain.length - 1) statements.push(...terminal);
+      body.push('{', ...statements.map((line) => `    ${line}`), '}');
+    }
+    return body;
+  };
+  const renderedBlocks = regionRoots.map((chain) => {
+    const block = chain[0];
+    const handlers = evaluated.get(block.id).handlers;
+    return { block, body: renderChain(chain), handlers };
+  });
+  if (configuration.stats) {
+    configuration.stats.statesBefore = activeBlocks.length;
+    configuration.stats.statesAfter = renderedBlocks.length;
+  }
   declarations.push('int statePc = ' + entryState + ';');
   if (renderedBlocks.some((item) => item.handlers.length)) declarations.push('Throwable caughtException = null;');
 
@@ -4577,11 +5474,20 @@ function printCfgStateMachine(cfg, render, evaluate, codeItems, exceptionTable, 
     if (handlers.length) {
       const caught = `stateCaught_${block.id}`;
       lines.push(`            } catch (Throwable ${caught}) {`);
-      const dispatchExpression = handlers.slice(0, -1).reduceRight((fallback, handler) =>
-        `(${caught} instanceof ${handler.catchType} ? ${resolve(handler.target)} : ${fallback})`,
-      String(resolve(handlers[handlers.length - 1].target)));
-      lines.push(`                caughtException = ${caught};`);
+      // Only an actual catch-all row accepts an unmatched throwable. Treating
+      // the last typed row as an unconditional default changes uncaught errors
+      // into handler effects or a ClassCastException at the handler's store.
+      const lastHandler = handlers[handlers.length - 1];
+      const catchesAll = ['Throwable', 'java.lang.Throwable'].includes(lastHandler.catchType);
+      const typedHandlers = catchesAll ? handlers.slice(0, -1) : handlers;
+      const dispatchExpression = typedHandlers.reduceRight((fallback, handler) =>
+        `(${caught} instanceof ${handler.catchType} ? ${stateTarget(handler.target)} : ${fallback})`,
+      catchesAll ? String(stateTarget(lastHandler.target)) : '-1');
       lines.push(`                statePc = ${dispatchExpression};`);
+      if (!catchesAll) lines.push('                if (statePc == -1) {',
+        `                    throw ${configuration.throwOwner}.<RuntimeException>$cfr$sneakyThrow(${caught});`,
+        '                }');
+      lines.push(`                caughtException = ${caught};`);
       lines.push('                continue stateLoop;');
       lines.push('            }');
     }
@@ -4708,7 +5614,7 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
 
     if (NEGATE_OPS.has(op)) {
       const value = pop(stack);
-      stack.push(expr(`-${wrap(value, 90)}`, value.type, 90));
+      stack.push(negateNumericExpression(value, primitiveTypeFromOpcode(op)));
       continue;
     }
 
@@ -4722,7 +5628,14 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
     if (COMPARE_OPS.has(op)) {
       const right = pop(stack);
       const left = pop(stack);
-      stack.push(expr(`compare(${left.code}, ${right.code})`, 'int', 100, { compare: { left, right } }));
+      const helpers = localState.comparisonHelpers;
+      const helper = helpers.name(op);
+      const owner = helpers.owner === cls.className ? '' : `${sourceOwnerType(helpers.owner, localState)}.`;
+      // A helper call is already valid Java for arithmetic/arguments/joins.
+      // Its primitive parameters evaluate the two operands once, left first.
+      // Branches retain the opcode and can render a direct comparison instead.
+      stack.push(expr(`${owner}${helper}(${left.code}, ${right.code})`, 'int', 100,
+        { compare: { left, right, opcode: op } }));
       continue;
     }
 
@@ -5221,13 +6134,93 @@ function emitStaticCall(lines, stack, arg, currentInternalClassName, localState)
   const descriptor = parseDescriptor(ref.descriptor);
   const args = popArgs(stack, descriptor.params.length);
   const owner = sourceOwnerType(ref.owner, localState);
-  const renderedArgs = formatCallArguments(ref, descriptor, args, localState && localState.exceptionModel);
-  const call = `${owner}.${sourceMethodName(ref.name)}(${renderedArgs.join(', ')})`;
+  const model = localState && localState.exceptionModel;
+  const bridge = intArgumentBridgeForCall(ref, descriptor, args, model, currentInternalClassName);
+  const renderedArgs = formatCallArguments(ref, bridge ? parseDescriptor(bridge.descriptor) : descriptor, args, model);
+  const call = `${owner}.${bridge ? bridge.name : sourceMethodName(ref.name)}(${renderedArgs.join(', ')})`;
   const returnType = simplifyType(descriptor.returnType);
   if (returnType === 'void') {
     lines.push(`${call};`);
   } else {
     stack.push(expr(call, returnType, 100, { statementExpression: true }));
+  }
+}
+
+// A JVM byte/short/char argument is an int slot: invocation does not execute
+// i2b/i2s/i2c. An obfuscated branch can forward a full-width stack carrier into
+// such a parameter. A source cast would change the value. Keep the original
+// signature, and emit a deterministic int-parameter body for these owned static
+// targets. No virtual dispatch, external declaration or constructor is changed.
+function intArgumentBridgeForCall(ref, descriptor, args, model, callerOwner) {
+  if (!model || !model.intArgumentBridges) return null;
+  const key = `${ref.owner}#${ref.name}#${ref.descriptor}`;
+  if (callerOwner) {
+    if (!model.staticCallOwners.has(key)) model.staticCallOwners.set(key,new Set());
+    model.staticCallOwners.get(key).add(callerOwner);
+  }
+  if (model.intArgumentBridges.has(key)) return model.intArgumentBridges.get(key);
+  const narrow = new Set(['byte', 'short', 'char']);
+  if (!descriptor.params.some((type, index) => narrow.has(type)
+      && args[index] && args[index].type === 'int'
+      && /^stackIn_\d+_\d+$/.test(args[index].code))) return null;
+  const cls = model.classInfo.get(ref.owner);
+  const method = cls && (cls.items || []).map(item => item.method).find(candidate =>
+    candidate && candidate.name === ref.name && candidate.descriptor === ref.descriptor);
+  if (!method || !(method.flags || []).includes('static') || !getCode(method)
+      || (method.flags || []).some(flag => ['native','abstract'].includes(flag))
+      || (cls.flags || []).some(flag => ['interface','enum'].includes(flag))) return null;
+  const suffix = crypto.createHash('sha256').update(ref.name + ref.descriptor).digest('hex').slice(0,12);
+  let name = `$cfr$intArgs$${sourceMethodName(ref.name)}$${suffix}`;
+  const names = new Set((cls.items || []).filter(item => item.method).map(item => sourceMethodName(item.method.name)));
+  while (names.has(name)) name += '$';
+  // Replace primitive parameter descriptors only; array/reference types and
+  // the return descriptor must remain byte-for-byte unchanged.
+  const boundary = ref.descriptor.indexOf(')');
+  const parameterDescriptor = ref.descriptor.slice(1,boundary).replace(/\[*L[^;]+;|\[*[ZBCSIJFD]/g, token =>
+    /^[BSC]$/.test(token) ? 'I' : token);
+  const bridge = {key, owner: ref.owner, name, descriptor: '(' + parameterDescriptor + ref.descriptor.slice(boundary), method};
+  model.intArgumentBridges.set(key,bridge);
+  for (const owner of model.staticCallOwners.get(key) || []) model.intArgumentBridgeDirtyOwners.add(owner);
+  model.intArgumentBridgeDirtyOwners.add(ref.owner);
+  return bridge;
+}
+
+function appendIntArgumentBridges(out, cls, options) {
+  const model = options.exceptionModel;
+  if (!model || !model.intArgumentBridges) return;
+  // Rendering a body can discover another owned target. Iterate to a fixed
+  // point within this class; cross-class discovery is finalized by the driver.
+  const rendered = new Set();
+  for (const [key, bridge] of model.intArgumentBridges) {
+    if (bridge.owner !== cls.className || rendered.has(key)) continue;
+    rendered.add(key);
+    const method = {...bridge.method, name: bridge.name, descriptor: bridge.descriptor,
+      flags: (bridge.method.flags || []).filter(flag => !['bridge','synthetic','varargs'].includes(flag))};
+    out.push('', '    /* Full JVM integer arguments; original narrow signature preserved. */');
+    formatMethod(cls,method,options).split('\n').forEach(line => out.push('    ' + line.replace(/\s+$/g,'')));
+    model.emittedIntArgumentBridges.add(key);
+    if (Array.isArray(options.diagnostics)) options.diagnostics.push({kind:'intArgumentBridge',
+      className:cls.className, methodName:bridge.method.name, descriptor:bridge.method.descriptor,
+      sourceMethodName:bridge.name, sourceDescriptor:bridge.descriptor});
+  }
+}
+
+function finalizeIntArgumentBridges(outputs, parsed, options, model) {
+  const byOwner = new Map(parsed.map(entry => [(entry.astRoot.classes || [])[0]?.className,entry]));
+  for (;;) {
+    const pending = [...model.intArgumentBridges.values()].filter(bridge => !model.emittedIntArgumentBridges.has(bridge.key));
+    const owners = [...new Set([...pending.map(bridge => bridge.owner),...model.intArgumentBridgeDirtyOwners])];
+    if (!owners.length) return;
+    for (const owner of owners) {
+      model.intArgumentBridgeDirtyOwners.delete(owner);
+      const entry = byOwner.get(owner);
+      const output = entry && outputs.find(item => item.name === (entry.name
+        ? entry.name.replace(/\.class$/i,'.java') : javaOutputName(entry.file,options.inputBaseDir)));
+      if (!entry || !output) throw new Error('Cannot emit int argument bridge for ' + owner);
+      const diagnostics = [];
+      output.source = decompileAstRoot(entry.astRoot,{...options, exceptionModel:model, diagnostics});
+      output.diagnostics = diagnostics;
+    }
   }
 }
 
@@ -5430,10 +6423,13 @@ function stringBuilderAppendExpression(receiver, value, targetType) {
   // expression is narrowed explicitly. That changes visible strings (for
   // example, appending 'L' as the decimal text "76").
   const renderedValue = coerceExpressionForType(value, targetType || value.type);
-  const pieces = receiver.stringBuilderPieces ? receiver.stringBuilderPieces.slice() : [];
-  pieces.push(renderedValue);
+  // Only a freshly constructed, completely tracked chain may become a concat.
+  // A parameter, local alias or stack carrier can contain an unknown prefix;
+  // keep its append/toString calls, including their mutations and exceptions.
+  const pieces = receiver.stringBuilderPieces
+    ? [...receiver.stringBuilderPieces, renderedValue] : null;
   return expr(`${wrap(receiver, 100)}.append(${renderedValue.code})`, 'StringBuilder', 100, {
-    stringBuilderPieces: pieces,
+    ...(pieces ? {stringBuilderPieces: pieces} : {}),
   });
 }
 
@@ -6685,6 +7681,76 @@ function loopUpdateStatement(body, label) {
   return { update, drop };
 }
 
+// Moving an update to a for header changes every normal/continue backedge.
+// Prove each such path has exactly one selected update, and every other exit
+// has none. Never lift an update across a handler, monitor or nested loop.
+function canLiftLoopUpdate(body, label, found, variable) {
+  const source = `{\n${body.join('\n')}\n}`;
+  if (/\\u+[0-9a-fA-F]{4}/.test(source)) return false;
+  let parsed;
+  try { parsed = javaStatementParser.parseStatement(source, {requireComplete: true}); }
+  catch (_) { return false; }
+  const selected = new Set();
+  let offset = 2;
+  for (let index = 0; index < body.length; index++) {
+    if (found.drop.includes(index)) selected.add(offset + leadingWhitespace(body[index]).length);
+    offset += body[index].length + 1;
+  }
+  let valid = true;
+  function inspect(node, statement = null) {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) { for (const child of node) inspect(child, statement); return; }
+    if (node.kind?.startsWith('Unsupported') || ['LambdaExpression', 'ClassDeclaration',
+      'InterfaceDeclaration', 'EnumDeclaration', 'RecordDeclaration'].includes(node.kind)
+      || node.kind === 'NewClassExpression' && node.body != null) valid = false;
+    if (node.kind === 'VariableDeclarator' && node.name === variable
+      || node.kind === 'CatchClause' && node.parameter?.name === variable) valid = false;
+    if (node.kind?.endsWith('Statement')) statement = node;
+    const write = node.kind === 'AssignmentExpression' ? node.left
+      : node.kind === 'UnaryExpression' && ['++', '--'].includes(node.operator) ? node.operand : null;
+    if (write?.kind === 'Identifier' && write.name === variable &&
+        !(statement?.kind === 'ExpressionStatement' && statement.expression === node
+          && selected.has(statement.range?.startOffset))) valid = false;
+    for (const [key, child] of Object.entries(node)) if (key !== 'range') inspect(child, statement);
+  }
+  inspect(parsed);
+  if (!valid) return false;
+  const unique = paths => [...new Map(paths.map(path => [`${path.exit}:${path.count}`, path])).values()];
+  const normal = count => [{exit: 'normal', count}];
+  function opaqueSafe(node, nested = 0) {
+    if (!node || typeof node !== 'object') return true;
+    if (Array.isArray(node)) return node.every(child => opaqueSafe(child, nested));
+    if (selected.has(node.range?.startOffset) && node.kind === 'ExpressionStatement') return false;
+    if (node.kind === 'ContinueStatement' && (node.label ? node.label === label : nested === 0)) return false;
+    if (['WhileStatement', 'ForStatement', 'EnhancedForStatement', 'DoWhileStatement'].includes(node.kind)) nested++;
+    return Object.entries(node).every(([key, child]) => key === 'range' || opaqueSafe(child, nested));
+  }
+  function flow(node) {
+    if (node.kind === 'BlockStatement') {
+      let paths = normal(0);
+      for (const child of node.statements) {
+        const next = flow(child); if (!next) return null;
+        paths = unique(paths.flatMap(path => path.exit === 'normal'
+          ? next.map(tail => ({exit: tail.exit, count: Math.min(2, path.count + tail.count)})) : [path]));
+      }
+      return paths;
+    }
+    if (node.kind === 'IfStatement') {
+      const yes = flow(node.consequent), no = node.alternate ? flow(node.alternate) : normal(0);
+      return yes && no ? unique([...yes, ...no]) : null;
+    }
+    if (node.kind === 'ExpressionStatement') return normal(selected.has(node.range?.startOffset) ? 1 : 0);
+    if (node.kind === 'ContinueStatement') return [{exit: node.label && node.label !== label ? 'escape' : 'continue', count: 0}];
+    if (['BreakStatement', 'ReturnStatement', 'ThrowStatement'].includes(node.kind)) return [{exit: 'escape', count: 0}];
+    // These intact constructs may finish normally; abrupt internal paths never
+    // acquire a header update. Refuse any selected update or own continue in
+    // them rather than assuming exception/finally/monitor/loop completion.
+    return opaqueSafe(node) ? normal(0) : null;
+  }
+  const paths = flow(parsed);
+  return paths && paths.every(path => path.count === (['normal', 'continue'].includes(path.exit) ? 1 : 0));
+}
+
 function rewriteWhileLoopsAsFor(lines) {
   const out = lines.slice();
   for (let index = 1; index < out.length; index += 1) {
@@ -6699,7 +7765,7 @@ function rewriteWhileLoopsAsFor(lines) {
     const found = loopUpdateStatement(body, label);
     if (!found) continue;
     const variable = updateVariableName(found.update);
-    if (!variable) continue;
+    if (!variable || !canLiftLoopUpdate(body, label, found, variable)) continue;
     const initMatch = /^(?:(?:[A-Za-z_$][A-Za-z0-9_$]*(?:\[\])?|[A-Za-z_$][A-Za-z0-9_$.<>?, ]+)\s+)?([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*.+;$/
       .exec(String(out[index - 1]).trim());
     if (!initMatch || initMatch[1] !== variable) continue;
@@ -6931,7 +7997,8 @@ function rewriteWhileAsFor(previousLine, loopLines) {
 
   const updateLine = body[body.length - 1].trim();
   const updateVariable = updateVariableName(updateLine);
-  if (!updateVariable) return null;
+  if (!updateVariable || !canLiftLoopUpdate(body, null,
+    {drop: [body.length - 1]}, updateVariable)) return null;
 
   const initMatch = /^(?:(?:[A-Za-z_$][A-Za-z0-9_$]*(?:\[\])?|[A-Za-z_$][A-Za-z0-9_$.<>?, ]+)\s+)?([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*.+;$/.exec(previousLine.trim());
   if (!initMatch || initMatch[1] !== updateVariable) return null;
@@ -7810,7 +8877,8 @@ function conditionForBranch(branch, stack, invert) {
       const newRight = left.type === 'boolean' ? right : intBool;
       return expr(`${wrap(newLeft, 60)} ${operator} ${wrap(newRight, 60, true)}`, 'boolean', 60);
     }
-    return expr(`${wrap(left, 60)} ${operator} ${wrap(right, 60, true)}`, 'boolean', 60);
+    return expr(`${wrap(left, 60)} ${operator} ${wrap(right, 60, true)}`, 'boolean', 60,
+      {integralComparison: true});
   }
 
   if (op === 'ifnull' || op === 'ifnonnull') {
@@ -7825,13 +8893,15 @@ function conditionForBranch(branch, stack, invert) {
     const value = pop(stack);
     const operator = invert ? invertOperator(unaryOps[op]) : unaryOps[op];
     if (value.compare) {
+      if (value.compare.opcode !== 'lcmp') return floatingCompareCondition(value.compare, operator);
       const complementedComparison = simplifyBitwiseComplementComparison(
         value.compare.left,
         operator,
         value.compare.right,
       );
       if (complementedComparison) return complementedComparison;
-      return expr(`${wrap(value.compare.left, 60)} ${operator} ${wrap(value.compare.right, 60)}`, 'boolean', 60);
+      return expr(`${wrap(value.compare.left, 60)} ${operator} ${wrap(value.compare.right, 60)}`, 'boolean', 60,
+        {integralComparison: true});
     }
     if (isBooleanExpression(value) && (op === 'ifeq' || op === 'ifne')) {
       const isTruthy = operator === '!=';
@@ -7848,10 +8918,21 @@ function conditionForBranch(branch, stack, invert) {
     const literalComparison = evaluateLiteralIntegerComparison(
       value, operator, expr('0', 'int', 100, { constantValue: 0 }));
     if (literalComparison !== null) return expr(String(literalComparison), 'boolean', 100);
-    return expr(`${wrap(value, 60)} ${operator} 0`, 'boolean', 60);
+    return expr(`${wrap(value, 60)} ${operator} 0`, 'boolean', 60, {integralComparison: true});
   }
 
   return expr(`/* unsupported condition ${op} */`, 'boolean');
+}
+
+function floatingCompareCondition(comparison, operator) {
+  // fcmpl/dcmpl produce -1 for unordered operands; fcmpg/dcmpg produce +1.
+  // The complemented relation deliberately includes NaN. Inverting it again
+  // must invert the integer cmp result, not replace a Java floating relation.
+  const includesNaN = comparison.opcode.endsWith('l')
+    ? ['<', '<='].includes(operator) : ['>', '>='].includes(operator);
+  const relation = `${wrap(comparison.left, 60)} ${includesNaN ? invertOperator(operator) : operator} ${wrap(comparison.right, 60, true)}`;
+  return expr(includesNaN ? `!(${relation})` : relation, 'boolean', includesNaN ? 90 : 60,
+    {floatingJvmComparison: {...comparison, operator}});
 }
 
 function evaluateLiteralIntegerComparison(left, operator, right) {
@@ -7878,6 +8959,14 @@ function integerLiteralValue(value) {
 
 function simplifyMaterializedBooleanCondition(value, operator) {
   if (!value || !value.code || (operator !== '==' && operator !== '!=')) return null;
+  if (value.conditional) {
+    const {condition, trueValue, falseValue} = value.conditional;
+    if (['0', '1'].includes(trueValue.code) && ['0', '1'].includes(falseValue.code)
+        && trueValue.code !== falseValue.code) {
+      return (trueValue.code === '1') === (operator === '!=')
+        ? condition : negateBooleanExpression(condition);
+    }
+  }
   const nested = simplifyNestedMaterializedBooleanCondition(value, operator);
   if (nested) return nested;
   const match = /^(?:\(([^?]+)\)|([^?]+)) \? ([01]) : ([01])$/.exec(value.code);
@@ -7895,9 +8984,12 @@ function simplifyMaterializedBooleanCondition(value, operator) {
 function simplifyNestedMaterializedBooleanCondition(value, operator) {
   const match = /^(.+?) \? ([01]) : (.+?) \? ([01]) : ([01])$/.exec(value.code);
   if (!match) return null;
-  const firstCondition = expr(match[1], 'boolean', 20);
+  const firstCondition = value.conditional?.condition?.code === match[1]
+    ? value.conditional.condition : expr(match[1], 'boolean', 20);
   const firstValue = materializedIntMeansConditionTrue(match[2], operator);
-  const secondCondition = expr(match[3], 'boolean', 20);
+  const nested = value.conditional?.falseValue?.conditional;
+  const secondCondition = nested?.condition?.code === match[3]
+    ? nested.condition : expr(match[3], 'boolean', 20);
   const secondValue = materializedIntMeansConditionTrue(match[4], operator);
   const finalValue = materializedIntMeansConditionTrue(match[5], operator);
 
@@ -8024,9 +9116,149 @@ function isBracketBalanced(fragment) {
   return depth === 0;
 }
 
+// Removed edge stores can leave hundreds of blank lines. Only compact gaps
+// proven to contain whitespace; token bodies and comment-containing gaps stay
+// byte-exact, including text blocks, diagnostic strings and comment line ends.
+function compactBlankSourceLines(source) {
+  if (/\\u+[0-9a-fA-F]{4}/.test(source)) return source;
+  const {tokens, diagnostics} = tokenizeJava(source);
+  if (diagnostics.length) return source;
+  let output = '', previous = 0;
+  const compact = gap => /^[ \t\r\n\f]*$/.test(gap)
+    ? gap.replace(/\n[ \t\r\f]*(?=\n)/g, '') : gap;
+  for (const token of tokens) {
+    output += compact(source.slice(previous, token.range.startOffset));
+    output += source.slice(token.range.startOffset, token.range.endOffset);
+    previous = token.range.endOffset;
+  }
+  return output + compact(source.slice(previous));
+}
+
+// Alias identities come from the operand-stack allocator, but their spelling
+// may also appear in a diagnostic string, comment, member or method name.
+// Substitute expression identifiers only after complete lexical/scope checks.
+function rewriteStackCarrierReferences(source, aliases) {
+  const unchanged = () => ({source, applied: false});
+  if (!aliases.size) return {source, applied: true};
+  if (/\\u+[0-9a-fA-F]{4}/.test(source) || [...aliases].some(([name, value]) =>
+      !/^stackIn_\d+_\d+$/.test(name) || !/^stackIn_\d+_\d+$/.test(value))) return unchanged();
+  let parsed, tokens;
+  try {
+    parsed = javaStatementParser.parseStatement(`{\n${source}\n}`, {requireComplete: true});
+    const lexed = tokenizeJava(source);
+    if (lexed.diagnostics.length) return unchanged();
+    tokens = lexed.tokens;
+  } catch (_) { return unchanged(); }
+  let blocked = false;
+  function walk(node) {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) {node.forEach(walk);return;}
+    if (node.kind?.startsWith('Unsupported') || aliases.has(node.label)) blocked = true;
+    if (aliases.has(node.name) && ['ClassType', 'VariableDeclarator',
+        'FormalParameter', 'TypeParameter', 'ClassDeclaration',
+        'InterfaceDeclaration', 'EnumDeclaration'].includes(node.kind)) blocked = true;
+    for (const [key, value] of Object.entries(node))
+      if (!['range', 'tokens', 'meta'].includes(key)) walk(value);
+  }
+  walk(parsed);
+  if (blocked) return unchanged();
+  const edits = [];
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index];
+    if (token.kind !== 'identifier' || !aliases.has(token.text)
+        || tokens[index - 1]?.text === '.' || ['(', ':'].includes(tokens[index + 1]?.text)) continue;
+    edits.push({start: token.range.startOffset, end: token.range.endOffset, value: aliases.get(token.text)});
+  }
+  for (const edit of edits.reverse())
+    source = source.slice(0, edit.start) + edit.value + source.slice(edit.end);
+  return {source, applied: true};
+}
+
+// A later phi may name several earlier aliases of the same stack value.
+// Revisit complete incoming-edge proofs until no further copies become aliases.
+// Only same-type allocator carriers qualify; incomplete edges, effects,
+// differing values, self references and alias cycles remain runtime copies.
+function resolveStackCarrierAliases(initialAliases, incomingSources, predecessors, carrierTypes) {
+  const aliases = new Map(initialAliases);
+  const resolve = name => {
+    const seen = new Set([name]);
+    let current = name;
+    while (aliases.has(current)) {
+      const next = aliases.get(current);
+      if (seen.has(next)) return null;
+      seen.add(next);
+      current = next;
+    }
+    return current;
+  };
+  let changed;
+  do {
+    changed = false;
+    for (const [target, state] of incomingSources) {
+      if (aliases.has(target) || state.invalid || state.sources.size < 2) continue;
+      const match = /^stackIn_(\d+)_\d+$/.exec(target);
+      const count = match ? (predecessors[Number(match[1])] || []).length : 0;
+      if (!count || state.edges !== count || !carrierTypes.has(target)) continue;
+      const sources = [...state.sources].map(resolve);
+      const source = sources[0];
+      if (source === null || source === target || !sources.every(value => value === source)
+          || carrierTypes.get(source) !== carrierTypes.get(target)) continue;
+      aliases.set(target, source);
+      changed = true;
+    }
+  } while (changed);
+  const resolved = new Map();
+  for (const [target] of aliases) {
+    const source = resolve(target);
+    if (source !== null && source !== target) resolved.set(target, source);
+  }
+  return resolved;
+}
+
+function integralConditionsFromCache(cache) {
+  const proven = new Set(), ambiguous = new Set(), complements = new Map();
+  const record = (predicate, inverse) => {
+    if (!predicate?.code || !inverse?.code) return;
+    // A textual match is usable only if every occurrence has integral evidence.
+    // An untyped/floating occurrence invalidates both it and its complement.
+    const source = predicate.code.trim(), opposite = inverse.code.trim();
+    const links = complements.get(source) || new Set();
+    links.add(opposite); complements.set(source, links);
+    (predicate.integralComparison === true && inverse.integralComparison === true
+      ? proven : ambiguous).add(source);
+  };
+  for (const state of cache.values()) {
+    if (!state.terminator || !isConditionalBranch(state.terminator.op)) continue;
+    // Reuse already-rendered operands. Do not evaluate blocks again: evaluation
+    // binds names and types in CFG order, even for branches later printed first.
+    const condition = state.branchCondition
+      || conditionForBranch(state.terminator, state.stack.slice(), false);
+    const opposite = negateBooleanExpression(condition);
+    record(condition, opposite);
+    record(opposite, condition);
+  }
+  // Conflicting evidence must not survive under the spelling of an inverse
+  // derived earlier from an integral occurrence with the same source text.
+  const pending = [...ambiguous];
+  for (let index = 0; index < pending.length; index++) {
+    const source = pending[index]; proven.delete(source);
+    for (const opposite of complements.get(source) || []) if (!ambiguous.has(opposite)) {
+      ambiguous.add(opposite); pending.push(opposite);
+    }
+  }
+  return proven;
+}
+
 function negateBooleanExpression(value) {
+  if (value.floatingJvmComparison) {
+    const comparison = value.floatingJvmComparison;
+    return floatingCompareCondition(comparison, invertOperator(comparison.operator));
+  }
   if (value.code === 'true') return expr('false', 'boolean');
   if (value.code === 'false') return expr('true', 'boolean');
+  if (value.code.startsWith('!(') && value.code.endsWith(')')
+      && isBracketBalanced(value.code.slice(2, -1)))
+    return expr(value.code.slice(2, -1), 'boolean', 20);
   if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(value.code)) return expr(`!${value.code}`, 'boolean', 90);
   const comparison = /^(.+) (==|!=|<|<=|>|>=) (.+)$/.exec(value.code);
   // Only invert an operator that is genuinely the TOP-LEVEL comparison. The
@@ -8036,9 +9268,12 @@ function negateBooleanExpression(value) {
   //   ((nm) x).a(a, b, c, stackIn_41_4 != 0, 2, param4)
   // rewrote the ARGUMENT to `== 0`, inverting the lobby list's skip-the-walk
   // flag and leaving the player list clipped to nothing. Balanced brackets on
-  // both sides prove the operator is not nested.
-  if (comparison && isBracketBalanced(comparison[1]) && isBracketBalanced(comparison[3])) {
-    return expr(`${comparison[1]} ${invertOperator(comparison[2])} ${comparison[3]}`, 'boolean', 60);
+  // both sides prove the operator is not nested. Relational inversion also
+  // needs integral type evidence: !(NaN < x) is true, but NaN >= x is false.
+  if (comparison && isBracketBalanced(comparison[1]) && isBracketBalanced(comparison[3])
+      && (['==', '!='].includes(comparison[2]) || value.integralComparison)) {
+    return expr(`${comparison[1]} ${invertOperator(comparison[2])} ${comparison[3]}`, 'boolean', 60,
+      {integralComparison: value.integralComparison});
   }
   return expr(`!${wrap(value, 90)}`, 'boolean', 90);
 }
@@ -8797,6 +10032,7 @@ function makeLocalState(paramTypes, isStatic, code = null, plainRefSlots = null,
   }
 
   return {
+    comparisonHelpers: renderOptions && renderOptions.comparisonHelpers,
     paramNames,
     preserveFieldNames: renderOptions && renderOptions.preserveFieldNames,
     recordConstructorInvocation(target, args) {
@@ -9279,7 +10515,43 @@ function constantExpression(value, op) {
   return expr(String(value), 'Object');
 }
 
+function negateNumericExpression(value, type) {
+  const operand = wrap(value, 90);
+  // Adjacent '-' tokens are pre-decrement in Java, not two JVM negations.
+  // Retain the opcode width separately from inferred field/local types so an
+  // enclosing integral add/subtract can safely expose the original operand.
+  return expr(`-${operand.trimStart().startsWith('-') ? `(${operand})` : operand}`,
+    value.type, 90, {numericNegation: {operand: value, type}});
+}
+
 function binaryExpr(left, symbol, right, type) {
+  if ((type === 'int' || type === 'long') && (symbol === '+' || symbol === '-')) {
+    // Modular JVM arithmetic has x + (-y) == x - y, even at MIN_VALUE.
+    // Only unwrap a tracked negation at the same width; casts discard this
+    // metadata. Never commute the operands or apply this to floating point.
+    while (right.numericNegation?.type === type && integralComplementOperand(right, type) &&
+        integralComplementOperand(right.numericNegation.operand, type)) {
+      right = right.numericNegation.operand;
+      symbol = symbol === '+' ? '-' : '+';
+    }
+    const constant = integralLiteralValue(right, type);
+    const minimum = type === 'long' ? -(1n << 63n) : -2147483648;
+    if (constant !== null && constant < 0 && constant !== minimum) {
+      const positive = -constant;
+      right = expr(type === 'long' ? `${positive}L` : String(positive), type);
+      symbol = symbol === '+' ? '-' : '+';
+    }
+  }
+  // JVM shift distances use five bits for int and six for long. Normalize only
+  // a literal int operand: rewriting an inferred value could discard effects
+  // or a throwing computation, and the result width comes from the opcode.
+  if ((type === 'int' || type === 'long') && ['<<', '>>', '>>>'].includes(symbol)) {
+    const distance = integralLiteralValue(right, 'int');
+    if (distance !== null) {
+      const masked = distance & (type === 'long' ? 63 : 31);
+      right = expr(String(masked), 'int', 100, { constantValue: masked });
+    }
+  }
   if (['&', '|', '^'].includes(symbol) && left.type === 'boolean' && right.type === 'boolean') type = 'boolean';
   if (['&', '|', '^'].includes(symbol) && (left.type === 'boolean') !== (right.type === 'boolean')) {
     left = coerceExpressionForType(left, 'int');
@@ -9287,14 +10559,15 @@ function binaryExpr(left, symbol, right, type) {
   }
   const identity = simplifyIntegralIdentityExpression(left, symbol, right, type);
   if (identity) return identity;
-  if (experimentalConstantEvaluationEnabled()
-    && symbol === '^' && (type === 'int' || type === 'long')) {
-    const leftConstant = integralConstantValue(left, type);
-    const rightConstant = integralConstantValue(right, type);
-    if (leftConstant === minusOneForType(type)) {
+  // JVM int/long XOR with a literal all-ones mask is precisely complement.
+  // This local rewrite does not enable the experimental identity/DCE passes.
+  if (symbol === '^' && (type === 'int' || type === 'long')) {
+    const leftConstant = integralLiteralValue(left, type);
+    const rightConstant = integralLiteralValue(right, type);
+    if (leftConstant === minusOneForType(type) && integralComplementOperand(right, type)) {
       return expr(`~${wrap(right, 90)}`, type, 90, { bitwiseComplement: right });
     }
-    if (rightConstant === minusOneForType(type)) {
+    if (rightConstant === minusOneForType(type) && integralComplementOperand(left, type)) {
       return expr(`~${wrap(left, 90)}`, type, 90, { bitwiseComplement: left });
     }
   }
@@ -9326,7 +10599,7 @@ function simplifyIntegralIdentityExpression(left, symbol, right, type) {
 }
 
 function simplifyBitwiseComplementComparison(left, operator, right) {
-  if (!experimentalConstantEvaluationEnabled()) return null;
+  if (!['==', '!=', '<', '<=', '>', '>='].includes(operator)) return null;
   let value = null;
   let constantExpression = null;
   let normalizedOperator = operator;
@@ -9342,19 +10615,42 @@ function simplifyBitwiseComplementComparison(left, operator, right) {
   }
 
   const type = simplifyType(left && left.bitwiseComplement ? left.type : right.type);
-  if (type !== 'int' && type !== 'long') return null;
-  const constant = integralConstantValue(constantExpression, type);
+  if (!integralComplementOperand(value, type)) return null;
+  // Signed complement reverses order at the same JVM width. Moving a literal
+  // across the comparison cannot reorder effects; inferred constants cannot
+  // provide that guarantee. Casts discard complement identity in the IR.
+  const constant = integralLiteralValue(constantExpression, type);
   if (constant == null) return null;
   const complementedConstant = complementConstant(constant, type);
   const simplifiedOperator = reverseComparisonOperator(normalizedOperator);
   const renderedConstant = type === 'long'
     ? `${String(complementedConstant)}L`
     : String(complementedConstant);
-  return expr(`${wrap(value, 60)} ${simplifiedOperator} ${renderedConstant}`, 'boolean', 60);
+  return expr(`${wrap(value, 60)} ${simplifiedOperator} ${renderedConstant}`, 'boolean', 60,
+    {integralComparison: true});
 }
 
 function experimentalConstantEvaluationEnabled() {
   return process.env.PIPELINE_EXPERIMENTAL_INTERCLASS_DCE === '1';
+}
+
+function integralLiteralValue(value, type) {
+  if (!value || simplifyType(value.type) !== type) return null;
+  if (type === 'int' && /^-?(?:0|[1-9]\d*)$/.test(value.code || '')) {
+    const number = Number(value.code);
+    return Number.isInteger(number) && number >= -2147483648 && number <= 2147483647
+      ? number : null;
+  }
+  if (type === 'long' && /^-?(?:0|[1-9]\d*)L$/.test(value.code || '')) {
+    const number = BigInt(value.code.slice(0, -1));
+    return BigInt.asIntN(64, number) === number ? number : null;
+  }
+  return null;
+}
+
+function integralComplementOperand(value, type) {
+  return type === 'int' ? ['int', 'byte', 'short', 'char'].includes(simplifyType(value?.type))
+    : type === 'long' && simplifyType(value?.type) === 'long';
 }
 
 function integralConstantValue(value, type) {
@@ -9424,9 +10720,7 @@ function conditionalExpr(condition, trueValue, falseValue, type = null) {
 
 function renderStoreExpression(value) {
   if (value && value.compare) {
-    const left = wrap(value.compare.left, 60);
-    const right = wrap(value.compare.right, 60, true);
-    return expr(`(${left} < ${right} ? -1 : (${left} == ${right} ? 0 : 1))`, 'int', 20);
+    return expr(value.code, 'int', value.precedence);
   }
   if (!value || !value.arrayLiteral) return value;
   const literal = value.arrayLiteral;
@@ -9836,9 +11130,15 @@ module.exports = {
   decompilePath,
   buildExceptionModel,
   _internals: {
+    shareExistingExitTails,
     binaryExpr,
+    negateNumericExpression,
     coerceExpressionForType,
     negateBooleanExpression,
+    integralConditionsFromCache,
+    resolveStackCarrierAliases,
+    rewriteStackCarrierReferences,
+    compactBlankSourceLines,
     isBracketBalanced,
     dropUnthrowableProtectedRows,
     isCheckedThrow,
@@ -9853,5 +11153,9 @@ module.exports = {
     javaTypeFromInternalName,
     normalizeLegacyClassFile,
     rewriteDuplicateLocalDeclarations,
+    rewriteWhileLoopsAsFor,
+    rewriteWhileAsFor,
+    printCfgStateMachine,
+    intArgumentBridgeForCall,
   },
 };

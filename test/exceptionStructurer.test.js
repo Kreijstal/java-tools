@@ -2,8 +2,9 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { structureMethod } = require('../src/decompiler/exceptionStructurer');
+const { structureMethod, verifyRegionExitContracts, verifyRegionFlowContracts } = require('../src/decompiler/exceptionStructurer');
 const { printTree } = require('../src/decompiler/structurer');
+const {verifyStructuredFlow} = require('../src/decompiler/structuredFlowVerifier');
 
 // Render a method (codeItems + exception table) and return { ok, src, r }.
 function run(codeItems, exceptionTable) {
@@ -15,6 +16,463 @@ function run(codeItems, exceptionTable) {
 function assertGotoFree(src) {
   assert.ok(!/\bgoto\b/.test(src), `expected no goto in:\n${src}`);
 }
+
+function multiExitResult() {
+  return structureMethod([
+    {labelDef: 'L0:', pc: 0, instruction: 'iload_0'},
+    {pc: 1, instruction: {op: 'ifeq', arg: 'L12'}},
+    {labelDef: 'L4:', pc: 4, instruction: {op: 'goto', arg: 'L16'}},
+    {labelDef: 'L7:', pc: 7, instruction: 'astore_1'},
+    {pc: 8, instruction: {op: 'goto', arg: 'L12'}},
+    {labelDef: 'L12:', pc: 12, instruction: 'return'},
+    // This continuation can throw and must retain its external sink. Pure
+    // forward returns now belong to the try component instead.
+    {labelDef: 'L16:', pc: 16, instruction: 'athrow'},
+  ], [{start_pc: 0, end_pc: 7, handler_pc: 7, catch_type: 'java/lang/Exception'}]);
+}
+
+test('pure forward returns retain their original paths inside the try component', () => {
+  for (const opcode of ['ireturn','lreturn','freturn','dreturn','areturn','return']) {
+    const code = [
+      {labelDef:'L0:',pc:0,instruction:{op:'invokestatic',arg:['Method','X',['work','()V']]}},
+      {pc:3,instruction:'iload_0'},
+      {pc:4,instruction:{op:'ifeq',arg:'L20'}},
+      {labelDef:'L7:',pc:7,instruction:{op:'goto',arg:'L24'}},
+      {labelDef:'L10:',pc:10,instruction:'astore_1'},
+      {pc:11,instruction:'athrow'},
+      {labelDef:'L20:',pc:20,instruction:opcode},
+      {labelDef:'L24:',pc:24,instruction:opcode},
+    ];
+    const result=structureMethod(code,[{start_pc:0,end_pc:10,handler_pc:10,catch_type:'java/lang/RuntimeException'}]);
+    assert.equal(result.ok,true,result.reason);
+    assert.deepEqual(result.selectorDecls,[]);
+    assert.deepEqual(result.regionExitContracts[0].exits,[]);
+    assert.equal(result.regionExitsVerified,true);
+    let component;
+    visitTree(result.tree,node=>{if(node.regionFlowComponent===0)component=node;});
+    let returns=0;visitTree(component,node=>{
+      if(node.t==='straight'&&result.render.straight(node.block).includes(opcode+';'))returns++;
+    });
+    assert.equal(returns,2,'both original return blocks belong to the protected component');
+    const damaged=JSON.parse(JSON.stringify(result.tree));
+    let deleted=false;visitTree(damaged,node=>{
+      if(!deleted&&node.t==='straight'&&result.render.straight(node.block).includes(opcode+';')) {
+        node.block=-1;deleted=true;
+      }
+    });
+    assert.equal(verifyRegionFlowContracts(damaged,result.regionExitContracts),false,
+      'deleting an absorbed return must not pass the original-flow contract');
+  }
+});
+
+function visitTree(node, visit) {
+  if (!node) return;
+  visit(node);
+  if (node.t === 'seq') node.body.forEach(child => visitTree(child, visit));
+  else if (node.t === 'if') { visitTree(node.then, visit); visitTree(node.els, visit); }
+  else if (node.t === 'switch') {
+    node.cases.forEach(item => visitTree(item.body, visit)); visitTree(node.dflt, visit);
+  } else if (['block', 'loop', 'try', 'synchronized'].includes(node.t)) {
+    visitTree(node.body, visit);
+    (node.catches || []).forEach(item => visitTree(item.body, visit));
+  }
+}
+
+function regionNode(result) {
+  let region;
+  visitTree(result.tree, node => { if (node.regionFlowBlock != null) region = node; });
+  assert.ok(region);
+  return region;
+}
+
+function twoHandlerResult() {
+  return structureMethod([
+    {labelDef: 'L0:', pc: 0, instruction: {op: 'invokestatic', arg: ['Method', 'X', ['work', '()V']]}},
+    {labelDef: 'L3:', pc: 3, instruction: {op: 'goto', arg: 'L14'}},
+    {labelDef: 'L6:', pc: 6, instruction: 'astore_0'},
+    {pc: 7, instruction: {op: 'goto', arg: 'L14'}},
+    {labelDef: 'L10:', pc: 10, instruction: 'astore_0'},
+    {pc: 11, instruction: {op: 'goto', arg: 'L14'}},
+    {labelDef: 'L14:', pc: 14, instruction: 'return'},
+  ], [
+    {start_pc: 0, end_pc: 3, handler_pc: 6, catch_type: 'java/lang/IllegalArgumentException'},
+    {start_pc: 0, end_pc: 3, handler_pc: 10, catch_type: 'java/lang/RuntimeException'},
+  ]);
+}
+
+test('shadowed sibling catches cannot gain coverage over an earlier handler', () => {
+  const code = [
+    {labelDef: 'L0:', pc: 0, instruction: {op: 'invokestatic', arg: ['Method', 'X', ['work', '()V']]}},
+    {pc: 3, instruction: {op: 'goto', arg: 'L20'}},
+    {labelDef: 'L6:', pc: 6, instruction: 'astore_0'},
+    {pc: 7, instruction: {op: 'invokestatic', arg: ['Method', 'X', ['cleanup', '()V']]}},
+    {pc: 10, instruction: {op: 'goto', arg: 'L20'}},
+    {labelDef: 'L13:', pc: 13, instruction: 'astore_1'},
+    {pc: 14, instruction: {op: 'invokestatic', arg: ['Method', 'X', ['narrow', '()V']]}},
+    {pc: 17, instruction: {op: 'goto', arg: 'L20'}},
+    {labelDef: 'L20:', pc: 20, instruction: 'return'},
+  ];
+  const table = [
+    {start_pc: 0, end_pc: 3, handler_pc: 6, catch_type: 'java/lang/RuntimeException'},
+    {start_pc: 0, end_pc: 3, handler_pc: 13, catch_type: 'java/lang/IllegalArgumentException'},
+  ];
+  const result = structureMethod(code, table);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /shadowed sibling catch/);
+  for (const [first, second, options] of [
+    ['any', 'ApplicationFailure', {}],
+    ['java/lang/RuntimeException', ['java/io/IOException', 'java/lang/IllegalArgumentException'], {}],
+    ['ApplicationFailure', 'SpecificFailure', {
+      isCatchAssignable: (subtype, supertype) => subtype === supertype ||
+        subtype === 'SpecificFailure' && supertype === 'ApplicationFailure',
+    }],
+  ]) {
+    const priority = table.map((row, index) => ({...row, catch_type: index ? second : first}));
+    const declined = structureMethod(code, priority, options);
+    assert.equal(declined.ok, false);
+    assert.match(declined.reason, /shadowed sibling catch/);
+  }
+  // Specific-before-supertype priority is expressible without widening either
+  // handler's coverage. Genuine enclosing catches have different range sets.
+  [table[0].catch_type, table[1].catch_type] = [table[1].catch_type, table[0].catch_type];
+  const ordered = structureMethod(code, table);
+  assert.equal(ordered.ok, true, ordered.reason);
+  assert.equal(verifyRegionFlowContracts(ordered.tree, ordered.regionExitContracts), true);
+});
+
+test('nested range size cannot override the original exception-table priority', () => {
+  const code = [
+    {labelDef: 'L0:', pc: 0, instruction: {op: 'invokestatic', arg: ['Method', 'X', ['work', '()V']]}},
+    {pc: 3, instruction: {op: 'goto', arg: 'L20'}},
+    {labelDef: 'L6:', pc: 6, instruction: 'astore_0'},
+    {pc: 7, instruction: {op: 'invokestatic', arg: ['Method', 'X', ['cleanup', '()V']]}},
+    {pc: 10, instruction: {op: 'goto', arg: 'L20'}},
+    {labelDef: 'L13:', pc: 13, instruction: 'astore_1'},
+    {pc: 14, instruction: {op: 'goto', arg: 'L20'}},
+    {labelDef: 'L20:', pc: 20, instruction: 'return'},
+  ];
+  const outer = {start_pc: 0, end_pc: 13, handler_pc: 13, catch_type: 'java/lang/RuntimeException'};
+  const inner = {start_pc: 0, end_pc: 3, handler_pc: 6, catch_type: 'java/lang/IllegalArgumentException'};
+  const declined = structureMethod(code, [outer, inner]);
+  assert.equal(declined.ok, false);
+  assert.match(declined.reason, /exception-table priority or coverage changes at throwing pc 0/);
+  const safe = structureMethod(code, [inner, outer]);
+  assert.equal(safe.ok, true, safe.reason);
+  assert.equal(verifyRegionFlowContracts(safe.tree, safe.regionExitContracts), true);
+});
+
+test('split protected ranges cannot inherit the priority of their first table rows', () => {
+  const invoke = pc => ({labelDef: `L${pc}:`, pc,
+    instruction: {op: 'invokestatic', arg: ['Method', 'X', ['work', '()V']]}});
+  const code = [invoke(0), invoke(3),
+    {pc: 6, instruction: {op: 'goto', arg: 'L20'}},
+    {labelDef: 'L10:', pc: 10, instruction: 'astore_0'},
+    {pc: 11, instruction: {op: 'goto', arg: 'L20'}},
+    {labelDef: 'L15:', pc: 15, instruction: 'astore_1'},
+    {pc: 16, instruction: {op: 'goto', arg: 'L20'}},
+    {labelDef: 'L20:', pc: 20, instruction: 'return'},
+  ];
+  const row = (start, end, handler, type) =>
+    ({start_pc: start, end_pc: end, handler_pc: handler, catch_type: type});
+  const table = [
+    row(0, 3, 10, 'java/lang/IllegalArgumentException'),
+    row(0, 3, 15, 'java/lang/RuntimeException'),
+    row(3, 6, 15, 'java/lang/RuntimeException'),
+    row(3, 6, 10, 'java/lang/IllegalArgumentException'),
+  ];
+  const result = structureMethod(code, table);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /exception-table priority or coverage changes at throwing pc 3/);
+  // A handler reached only through an exception is still live and checked.
+  code[1] = {pc: 3, instruction: {op: 'goto', arg: 'L20'}};
+  code[4] = invoke(11);
+  table[2].start_pc = table[3].start_pc = 11;
+  table[2].end_pc = table[3].end_pc = 14;
+  const handlerResult = structureMethod(code, table);
+  assert.equal(handlerResult.ok, false);
+  assert.match(handlerResult.reason, /exception-table priority or coverage changes at throwing pc 11/);
+});
+
+test('normalization must not drop throwing instructions in a self-protected handler', () => {
+  const code = [
+    {labelDef: 'L0:', pc: 0, instruction: 'astore_0'},
+    {pc: 1, instruction: {op: 'invokestatic', arg: ['Method', 'X', ['cleanup', '()V']]}},
+    {labelDef: 'L4:', pc: 4, instruction: 'return'},
+  ];
+  const result = structureMethod(code,
+    [{start_pc: 0, end_pc: 4, handler_pc: 0, catch_type: 'any'}]);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /exception-table priority or coverage changes at throwing pc 1/);
+  code[1] = {pc: 1, instruction: 'nop'};
+  const safe = structureMethod(code,
+    [{start_pc: 0, end_pc: 4, handler_pc: 0, catch_type: 'any'}]);
+  assert.equal(safe.ok, true, safe.reason);
+});
+
+test('handler cleanup outside an enclosing protected range cannot be collapsed into it', () => {
+  const code = [
+    {labelDef: 'L0:', pc: 0, instruction: {op: 'invokestatic', arg: ['Method', 'X', ['work', '()V']]}},
+    {pc: 3, instruction: {op: 'goto', arg: 'L20'}},
+    {labelDef: 'L6:', pc: 6, instruction: 'astore_0'},
+    {pc: 7, instruction: {op: 'invokestatic', arg: ['Method', 'X', ['cleanup', '()V']]}},
+    {pc: 10, instruction: {op: 'goto', arg: 'L20'}},
+    {labelDef: 'L13:', pc: 13, instruction: 'astore_1'},
+    {pc: 14, instruction: {op: 'invokestatic', arg: ['Method', 'X', ['cleanup', '()V']]}},
+    {pc: 17, instruction: 'aload_1'},
+    {pc: 18, instruction: 'athrow'},
+    {labelDef: 'L20:', pc: 20, instruction: 'return'},
+  ];
+  const table = [
+    {start_pc: 0, end_pc: 3, handler_pc: 6, catch_type: 'java/lang/IllegalArgumentException'},
+    {start_pc: 0, end_pc: 3, handler_pc: 13, catch_type: 'any'},
+    {start_pc: 6, end_pc: 7, handler_pc: 13, catch_type: 'any'},
+  ];
+  const result = structureMethod(code, table);
+  assert.equal(result.ok, true, result.reason);
+  // The cleanup at PC 7 is an external continuation, not part of the inner
+  // handler protected by the outer catch. It must have its own exit sink.
+  const first = result.regionExitContracts[0];
+  assert.equal(first.exits.length, 2);
+  assert.ok(first.exits.some(exit => result.render.straight(exit.target).includes('invokestatic;')));
+  // Widening only across a nonthrowing cleanup instruction remains safe.
+  code[3] = {pc: 7, instruction: {op: 'iinc', arg: [2, 1]}};
+  const safe = structureMethod(code, table);
+  assert.equal(safe.ok, true, safe.reason);
+  assert.equal(verifyRegionFlowContracts(safe.tree, safe.regionExitContracts), true);
+});
+
+test('intact components cannot exchange protected-body and catch-arm positions', () => {
+  const result = multiExitResult();
+  const region = regionNode(result);
+  [region.body, region.catches[0].body] = [region.catches[0].body, region.body];
+  // Neither normal component edges nor sink destinations detect this change.
+  assert.equal(verifyRegionExitContracts(result.tree, result.regionExitContracts), true);
+  assert.equal(verifyStructuredFlow(result.tree, result.regionMethodFlow), true);
+  visitTree(result.tree, node => {
+    if (node.regionFlowComponent != null) assert.equal(verifyStructuredFlow(node,
+      result.regionExitContracts[0].components[node.regionFlowComponent]), true);
+  });
+  assert.equal(verifyRegionFlowContracts(result.tree, result.regionExitContracts), false);
+});
+
+test('catch priority and handler-to-type bindings survive composition', () => {
+  for (const mutate of [
+    region => region.catches.reverse(),
+    region => { [region.catches[0].body, region.catches[1].body] =
+      [region.catches[1].body, region.catches[0].body]; },
+  ]) {
+    const result = twoHandlerResult();
+    assert.equal(result.ok, true, result.reason);
+    assert.equal(verifyRegionFlowContracts(result.tree, result.regionExitContracts), true);
+    mutate(regionNode(result));
+    assert.equal(verifyRegionExitContracts(result.tree, result.regionExitContracts), true);
+    assert.equal(verifyRegionFlowContracts(result.tree, result.regionExitContracts), false);
+  }
+});
+
+test('catch-type snapshots are independent of later in-place mutations', () => {
+  for (const mutate of [
+    types => { types[0] = 'java.lang.Throwable'; },
+    types => types.push('java.io.IOException'),
+    types => types.pop(),
+  ]) {
+    const result = multiExitResult();
+    const recorded = JSON.stringify(result.regionExitContracts);
+    mutate(regionNode(result).catches[0].types);
+    assert.equal(JSON.stringify(result.regionExitContracts), recorded);
+    assert.equal(verifyRegionFlowContracts(result.tree, result.regionExitContracts), false);
+  }
+});
+
+test('components cannot escape their owning region or acquire another exception scope', () => {
+  const result = multiExitResult();
+  const region = regionNode(result);
+  const copy = JSON.parse(JSON.stringify(region.body));
+  assert.equal(verifyRegionFlowContracts({t: 'seq', body: [result.tree, copy]},
+    result.regionExitContracts), false);
+  region.body = {t: 'try', body: region.body, catches: []};
+  assert.equal(verifyRegionFlowContracts(result.tree, result.regionExitContracts), false);
+});
+
+test('valid copies and label/parameter renaming retain exception bindings', () => {
+  const result = twoHandlerResult();
+  const copy = JSON.parse(JSON.stringify(result.tree));
+  visitTree(copy, node => {
+    if (node.label) node.label += 'Copy';
+    for (const item of node.catches || []) item.varName += 'Copy';
+  });
+  assert.equal(verifyRegionFlowContracts({t: 'seq', body: [result.tree, copy]},
+    result.regionExitContracts), true);
+  // Each emitted copy is checked independently.
+  let copiedRegion;
+  visitTree(copy, node => { if (node.regionFlowBlock != null) copiedRegion = node; });
+  copiedRegion.catches.reverse();
+  assert.equal(verifyRegionFlowContracts({t: 'seq', body: [result.tree, copy]},
+    result.regionExitContracts), false);
+});
+
+test('source-flow contracts reject deletion of both sink and transfer despite a valid sibling', () => {
+  const result = multiExitResult();
+  assert.equal(result.ok, true, result.reason);
+  assert.equal(verifyRegionFlowContracts(result.tree, result.regionExitContracts), true);
+  let branch;
+  visitTree(result.tree, node => { if (node.t === 'if' && node.block === 0) branch = node; });
+  assert.ok(branch);
+  branch.then = {t: 'seq', body: []};
+  // The catch still reaches this sink, so existence/identity alone accepts it.
+  assert.equal(verifyRegionExitContracts(result.tree, result.regionExitContracts), true);
+  assert.equal(verifyRegionFlowContracts(result.tree, result.regionExitContracts), false);
+});
+
+test('source-flow contracts reject exchanged branches with intact sink identities', () => {
+  const result = multiExitResult();
+  let branch;
+  visitTree(result.tree, node => { if (node.t === 'if' && node.block === 0) branch = node; });
+  assert.ok(branch);
+  [branch.then, branch.els] = [branch.els, branch.then];
+  assert.equal(verifyRegionExitContracts(result.tree, result.regionExitContracts), true);
+  assert.equal(verifyRegionFlowContracts(result.tree, result.regionExitContracts), false);
+});
+
+test('source-flow contracts require every component and reject a damaged duplicate', () => {
+  const result = multiExitResult();
+  let component;
+  visitTree(result.tree, node => { if (node.regionFlowComponent === 0) component = node; });
+  assert.ok(component);
+  delete component.regionFlowComponent;
+  assert.equal(verifyRegionFlowContracts(result.tree, result.regionExitContracts), false);
+  component.regionFlowComponent = 0;
+  const copy = JSON.parse(JSON.stringify(component));
+  copy.body = {t: 'seq', body: []};
+  assert.equal(verifyRegionFlowContracts({t: 'seq', body: [result.tree, copy]},
+    result.regionExitContracts), false);
+});
+
+test('source-flow contracts retain terminal-only try and catch components', () => {
+  const result = structureMethod([
+    {labelDef: 'L0:', pc: 0, instruction: {op: 'invokestatic', arg: ['Method', 'X', ['work', '()V']]}},
+    {pc: 3, instruction: 'return'},
+    {labelDef: 'L4:', pc: 4, instruction: 'astore_0'},
+    {pc: 5, instruction: 'return'},
+  ], [{start_pc: 0, end_pc: 4, handler_pc: 4, catch_type: 'java/lang/Exception'}]);
+  assert.equal(result.ok, true, result.reason);
+  assert.deepEqual(result.regionExitContracts[0].exits, []);
+  assert.equal(verifyRegionFlowContracts(result.tree, result.regionExitContracts), true);
+  visitTree(result.tree, node => {
+    if (node.regionFlowComponent === 0) node.body = [];
+  });
+  assert.equal(verifyRegionExitContracts(result.tree, result.regionExitContracts), true);
+  assert.equal(verifyRegionFlowContracts(result.tree, result.regionExitContracts), false);
+});
+
+test('outer selector routing is checked separately from intact component transfers', () => {
+  const result = multiExitResult();
+  assert.equal(verifyStructuredFlow(result.tree, result.regionMethodFlow), true);
+  let routing;
+  visitTree(result.tree, node => { if (node.t === 'if' && node.block !== 0) routing = node; });
+  assert.ok(routing);
+  [routing.then, routing.els] = [routing.els, routing.then];
+  assert.equal(verifyRegionExitContracts(result.tree, result.regionExitContracts), true);
+  assert.equal(verifyRegionFlowContracts(result.tree, result.regionExitContracts), true);
+  assert.equal(verifyStructuredFlow(result.tree, result.regionMethodFlow), false);
+});
+
+const regionContract = targets => [{owner: 7,
+  exits: targets.map(target => ({sink: target + 10, target}))}];
+const regionTransfer = target => ({t: 'break', label: 'Region', regionExitOwner: 7,
+  regionExitSink: target + 10, regionExitTarget: target});
+const regionExit = target => ({t: 'seq', body: [
+  {t: 'straight', block: target + 10}, regionTransfer(target),
+]});
+
+test('region exit contracts preserve distinct targets through nested loops', () => {
+  const tree = { t: 'block', label: 'Region', regionExitOwner: 7, body: {
+    t: 'loop', label: 'Loop', body: { t: 'if', block: 0, then: regionExit(4), els: regionExit(5) },
+  } };
+  assert.equal(verifyRegionExitContracts(tree, regionContract([4, 5])), true);
+  tree.body.body.then.body[1].label = 'Loop';
+  assert.equal(verifyRegionExitContracts(tree, regionContract([4, 5])), false);
+});
+
+test('region exit contracts refuse missing or unknown continuations', () => {
+  const tree = { t: 'block', label: 'Region', regionExitOwner: 7, body: regionExit(4) };
+  assert.equal(verifyRegionExitContracts(tree, regionContract([4, 5])), false);
+  assert.equal(verifyRegionExitContracts(tree, regionContract([5])), false);
+});
+
+test('region exit contracts reject lost identity and changed transfer kinds', () => {
+  for (const transfer of [
+    {...regionTransfer(4), t: 'continue'},
+    {...regionTransfer(4), regionExitOwner: undefined},
+    {...regionTransfer(4), regionExitTarget: undefined},
+    {...regionTransfer(4), regionExitSink: undefined},
+    {t: 'break', label: 'Region'},
+  ]) {
+    // A valid sibling must not conceal a malformed exit to the same target.
+    const tree = {t: 'block', label: 'Region', regionExitOwner: 7, body: {
+      t: 'if', block: 0, then: {t: 'seq', body: [{t: 'straight', block: 14}, transfer]},
+      els: regionExit(4),
+    }};
+    assert.equal(verifyRegionExitContracts(tree, regionContract([4])), false);
+  }
+});
+
+test('region exits cannot exchange sink destinations while preserving the target set', () => {
+  const contracts = [{owner: 7, exits: [
+    {sink: 10, target: 4}, {sink: 11, target: 5},
+  ]}];
+  const exit = (sink, target) => ({t: 'seq', body: [
+    {t: 'straight', block: sink},
+    {t: 'break', label: 'Region', regionExitOwner: 7, regionExitSink: sink,
+      regionExitTarget: target},
+  ]});
+  const tree = {t: 'block', label: 'Region', regionExitOwner: 7, body: {
+    t: 'if', block: 0, then: exit(10, 5), els: exit(11, 4),
+  }};
+  assert.equal(verifyRegionExitContracts(tree, contracts), false);
+});
+
+test('region transfers require their own immediately preceding sink', () => {
+  for (const body of [
+    regionTransfer(4),
+    {t: 'seq', body: [{t: 'straight', block: 15}, regionTransfer(4)]},
+    {t: 'seq', body: [{t: 'straight', block: 14}, {t: 'straight', block: 0}, regionTransfer(4)]},
+    {t: 'seq', body: [{t: 'straight', block: 14}]},
+  ]) {
+    const tree = {t: 'block', label: 'Region', regionExitOwner: 7, body: {
+      t: 'if', block: 0, then: body, els: regionExit(4),
+    }};
+    assert.equal(verifyRegionExitContracts(tree, regionContract([4])), false);
+  }
+});
+
+test('contracts reject duplicate owners, shared sinks and destination-only legacy metadata', () => {
+  const tree = {t: 'block', label: 'Region', regionExitOwner: 7, body: regionExit(4)};
+  for (const contracts of [
+    [...regionContract([4]), ...regionContract([4])],
+    [{owner: 7, exits: [{sink: 14, target: 4}, {sink: 14, target: 5}]}],
+    [...regionContract([4]), {owner: 8, exits: [{sink: 14, target: 4}]}],
+    [{owner: 7, targets: [4]}],
+  ]) assert.equal(verifyRegionExitContracts(tree, contracts), false);
+});
+
+test('a catch retry into the middle of a try body must not restart its setup', () => {
+  const invoke = (pc, name) => ({ labelDef: `L${pc}:`, pc,
+    instruction: { op: 'invokestatic', arg: ['Method', 'X', [name, '()V']] } });
+  const code = [
+    invoke(0, 'setup'),
+    { pc: 3, instruction: { op: 'goto', arg: 'L4' } },
+    invoke(4, 'step'),
+    { labelDef: 'L7:', pc: 7, instruction: { op: 'goto', arg: 'L15' } },
+    { labelDef: 'L10:', pc: 10, instruction: 'astore_0' },
+    { pc: 11, instruction: { op: 'goto', arg: 'L4' } },
+    { labelDef: 'L15:', pc: 15, instruction: 'return' },
+  ];
+  const result = structureMethod(code,
+    [{ start_pc: 0, end_pc: 7, handler_pc: 10, catch_type: 'java/lang/RuntimeException' }]);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /continuation reenters a different component/);
+});
 
 // ---------------------------------------------------------------------------
 // (a) A single try/catch with straight-line bodies.
@@ -230,6 +688,12 @@ test('trailing synchronized glue does not absorb the next loop lock setup', () =
   assert.ok(syncBody, `expected synchronized body:\n${src}`);
   assert.doesNotMatch(syncBody[1], /astore_1/,
     `lock setup must not rotate into the previous iteration's body:\n${src}`);
+  for (const field of ['lockLocal', 'lockPc']) {
+    const copy = JSON.parse(JSON.stringify(r.tree));
+    visitTree(copy, node => { if (node.t === 'synchronized') node[field]++; });
+    assert.equal(verifyRegionFlowContracts(copy, r.regionExitContracts), false,
+      `synchronized bindings retain ${field}`);
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -266,7 +730,7 @@ test('nested try/catch', () => {
 // try/handler set a synthetic selector local at each exit and an if/else chain
 // after the try dispatches to the right join. (No goto, valid Java.)
 // ---------------------------------------------------------------------------
-test('multi-exit try structures via a selector dispatch', () => {
+test('multi-exit try keeps selector routing for throwing continuations', () => {
   const code = [
     { labelDef: 'L0:', pc: 0, instruction: 'iload_0' },
     { pc: 1, instruction: { op: 'ifeq', arg: 'L12' } },  // exit target #1
@@ -274,8 +738,7 @@ test('multi-exit try structures via a selector dispatch', () => {
     { labelDef: 'L7:', pc: 7, instruction: 'astore_1' },
     { pc: 8, instruction: { op: 'goto', arg: 'L12' } },
     { labelDef: 'L12:', pc: 12, instruction: 'return' },
-    { labelDef: 'L16:', pc: 16, instruction: 'iconst_0' },
-    { pc: 17, instruction: 'return' },
+    { labelDef: 'L16:', pc: 16, instruction: 'athrow' },
   ];
   const et = [{ start_pc: 0, end_pc: 7, handler_pc: 7, catch_type: 'java/lang/Exception' }];
   const r = structureMethod(code, et);
