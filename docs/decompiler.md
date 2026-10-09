@@ -6,6 +6,12 @@ corridors. One Boolean captures each original decision at its original site;
 all remaining block suffixes on that path are guarded, including shared/nested
 suffixes. All predicates/actions remain once. Loop/switch/protected corridors,
 captures, crossing suffix ranges and ambiguous definite assignment refuse.
+An uninitialized local may be read in a guarded remainder when an unconditional
+straight prefix has already assigned it. Its unique declaration must precede
+that assignment and its lexical block must enclose the complete frame. Branches,
+loops, protected regions, shadowed declarations, formal-name conflicts and
+read-before-initialization do not establish this evidence. The original prefix
+and assignment stay intact, including initializer effects and failures.
 Enclosing protection and whole suffix constructs remain intact. The generic
 default is unchanged.
 
