@@ -1,5 +1,12 @@
 # Structured Decompiler: goto-free control-flow recovery
 
+`CFR_JS_EXHAUSTIVE_SWITCH_FRAME_EXITS=1` reconstructs a plain frame whose
+conditional arm contains one exhaustive switch and whose cases all end in
+direct exits to that frame. Cases use local switch breaks; the original
+remainder becomes the predicate's else arm. Predicates, selectors, action
+order and frame scopes remain intact. Missing defaults, fallthrough, crossed
+protection, extra frame/switch exits and captures refuse. The default is off.
+
 `CFR_JS_COMPACT_LOCAL_BOOLEAN_GUARDS=1` combines a primitive local guard,
 its conditional assignment, and the immediate subsequent guard into an
 ordered conjunction. Conditional writes and RHS failures remain in place;
