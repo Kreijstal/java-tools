@@ -1,5 +1,22 @@
 # Structured Decompiler: goto-free control-flow recovery
 
+`CFR_JS_SHARE_DYNAMIC_GUARDED_TAILS=1` optionally shares a complete duplicate
+tail in `if (condition) { prefix; if (guard) { tail; } } else { tail; }`.
+A fresh primitive decision local captures the original condition once; after
+the intact prefix it captures the guard once, then selects the shared tail.
+Neither predicate is repeated across mutations or callbacks. Prefix abrupt
+exits and every enclosing loop/protected/monitor scope remain in place.
+
+Recovery requires identical tail tokens and refuses tail declarations,
+loop/try/monitor boundaries inside the tail, prefix declarations shadowing tail
+uses, uninitialized carrier correlations, captures, patterns, comments and
+unsupported syntax. Source/depth/token bounds apply; small tails keep their
+existing shape. Defaults remain unchanged. Generic native checks include field
+mutation, nullable decisions, partial failures, integer overflow, frame/loop
+exits, finally overrides and monitor release.
+
+Focused command: `NODE_PATH=/path/to/node_modules JAVA_TOOL_OPTIONS=-XX:-UsePerfData node --test --experimental-test-isolation=none test/dynamicGuardedTailRecovery.test.js test/sharedStatementFallbackRecovery.test.js test/sharedGuardedFallbackRecovery.test.js test/terminalGuardedFrameRecovery.test.js test/loopFrameCompletionRecovery.test.js`.
+
 `CFR_JS_SPLIT_NESTED_INITIALIZED_PRIMITIVE_LIFETIMES=1` enables one additional
 nested primitive pass after initialized and optional array-dimension recovery.
 It requires `CFR_JS_SPLIT_INITIALIZED_PRIMITIVE_LIFETIMES=1`. Earlier separation

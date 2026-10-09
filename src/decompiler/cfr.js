@@ -19,7 +19,7 @@ const { structureMethod } = require('./exceptionStructurer');
 const { mergeDuplicateLoopIncrementTails } = require('./loopTailMerge');
 const { partitionStructuredVoidBody } = require('./structuredMethodPartition');
 const {splitPrimitiveLocalLifetimes, splitNestedPrimitiveLocalLifetimes, splitReferenceLocalLifetimes, splitNestedReferenceLocalLifetimes, splitInitializedPrimitiveLocalLifetimes, splitNestedInitializedPrimitiveLocalLifetimes, splitArrayDimensionPrimitiveLocalLifetimes} = require('./primitiveLocalLifetimeRecovery');
-const {foldLoopFrameCompletion} = require('./javaAstEmitter');
+const {foldLoopFrameCompletion, shareDynamicGuardedTails} = require('./javaAstEmitter');
 const { listRegionSplitCandidates, applyRegionSplit } = require('../passes/regionSplit');
 const { jreClassInfo, jreMethodCandidates } = require('../java-frontend/jreMetadata');
 const { JavaParser } = require('../java-frontend/parser');
@@ -2345,6 +2345,13 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
       process.env.CFR_JS_SPLIT_NESTED_INITIALIZED_PRIMITIVE_LIFETIMES === '1') {
     const nested = splitNestedInitializedPrimitiveLocalLifetimes(source, {reservedNames: parameterNames});
     if (nested.localsSplit) { source = nested.source; changed = true; }
+  }
+  if (process.env.CFR_JS_SHARE_DYNAMIC_GUARDED_TAILS === '1') {
+    for (;;) {
+      const shared = shareDynamicGuardedTails(source, {reservedNames: parameterNames});
+      if (!shared.tailsShared) break;
+      source = shared.source; changed = true;
+    }
   }
   if (changed) replaceArrayContents(body, source.split('\n'));
 }
