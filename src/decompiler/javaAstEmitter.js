@@ -28,6 +28,7 @@ const {foldNestedIfConditions: recoverNestedIfConditions} = require('./nestedIfC
 const { foldTerminalFrameLoops: recoverTerminalFrameLoops } = require('./terminalFrameLoopRecovery');
 const { foldTerminalGuardedFrameExits: recoverTerminalGuardedFrames } = require('./terminalGuardedFrameRecovery');
 const {foldLoopFrameCompletion: recoverLoopFrameCompletion} = require('./loopFrameCompletionRecovery');
+const {foldGuardedFrameCompletion: recoverGuardedFrameCompletion} = require('./guardedFrameCompletionRecovery');
 const {foldLeadingLoopExitWork: recoverLeadingLoopExitWork} = require('./leadingLoopExitWorkRecovery');
 const {simplifyNaturalLoopExitCaptures: recoverNaturalLoopExitCaptures} = require('./naturalLoopExitCaptureCleanup');
 const {shareDynamicGuardedTails: recoverDynamicGuardedTails} = require('./dynamicGuardedTailRecovery');
@@ -772,6 +773,11 @@ function foldTerminalGuardedFrameExits(source, options = {}) {
 
 function foldLoopFrameCompletion(source, options = {}) {
   return recoverLoopFrameCompletion(source, controlCleanupSource(source), options);
+}
+
+function foldGuardedFrameCompletion(source, options = {}) {
+  try{return recoverGuardedFrameCompletion(source,controlCleanupSource(source),options);}
+  catch(error){if(error instanceof RangeError)return {source,framesRecovered:0};throw error;}
 }
 
 function simplifyNaturalLoopExitCaptures(source, options = {}) {
@@ -3465,6 +3471,7 @@ module.exports = {
   foldGuardedStoreFallbacks,
   foldTerminalGuardedFrameExits,
   foldLoopFrameCompletion,
+  foldGuardedFrameCompletion,
   shareDynamicGuardedTails,
   foldLeadingLoopExitWork,
   simplifyNaturalLoopExitCaptures,

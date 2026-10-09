@@ -1,5 +1,14 @@
 # Structured Decompiler: goto-free control-flow recovery
 
+`CFR_JS_GUARDED_FRAME_COMPLETION=1` reconstructs a plain labeled frame when
+every exit is a guarded break reached only through lexical block/if/plain-label
+corridors. One Boolean captures each original decision at its original site;
+all remaining block suffixes on that path are guarded, including shared/nested
+suffixes. All predicates/actions remain once. Loop/switch/protected corridors,
+captures, crossing suffix ranges and ambiguous definite assignment refuse.
+Enclosing protection and whole suffix constructs remain intact. The generic
+default is unchanged.
+
 `CFR_JS_SIMPLIFY_NATURAL_LOOP_EXIT_CAPTURES=1` removes a captured natural-exit
 decision when the loop has no own break, the Boolean has no other uses, and
 lexical evidence proves the original condition is not a Java constant
