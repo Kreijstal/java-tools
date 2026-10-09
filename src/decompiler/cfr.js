@@ -19,7 +19,7 @@ const { structureMethod } = require('./exceptionStructurer');
 const { mergeDuplicateLoopIncrementTails } = require('./loopTailMerge');
 const { partitionStructuredVoidBody } = require('./structuredMethodPartition');
 const {splitPrimitiveLocalLifetimes, splitNestedPrimitiveLocalLifetimes, splitReferenceLocalLifetimes, splitNestedReferenceLocalLifetimes, splitInitializedPrimitiveLocalLifetimes, splitNestedInitializedPrimitiveLocalLifetimes, splitArrayDimensionPrimitiveLocalLifetimes} = require('./primitiveLocalLifetimeRecovery');
-const {foldLoopFrameCompletion, shareDynamicGuardedTails, foldLeadingLoopExitWork} = require('./javaAstEmitter');
+const {foldLoopFrameCompletion, shareDynamicGuardedTails, foldLeadingLoopExitWork, simplifyNaturalLoopExitCaptures} = require('./javaAstEmitter');
 const { listRegionSplitCandidates, applyRegionSplit } = require('../passes/regionSplit');
 const { jreClassInfo, jreMethodCandidates } = require('../java-frontend/jreMetadata');
 const { JavaParser } = require('../java-frontend/parser');
@@ -2358,6 +2358,14 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
       const exitWork = foldLeadingLoopExitWork(source, {reservedNames: parameterNames});
       if (!exitWork.loopsRecovered) break;
       source = exitWork.source; changed = true;
+    }
+  }
+
+  if (process.env.CFR_JS_SIMPLIFY_NATURAL_LOOP_EXIT_CAPTURES === '1') {
+    for (;;) {
+      const capture = simplifyNaturalLoopExitCaptures(source, {parameterNames});
+      if (!capture.capturesRemoved) break;
+      source = capture.source; changed = true;
     }
   }
 

@@ -1,5 +1,13 @@
 # Structured Decompiler: goto-free control-flow recovery
 
+`CFR_JS_SIMPLIFY_NATURAL_LOOP_EXIT_CAPTURES=1` removes a captured natural-exit
+decision when the loop has no own break, the Boolean has no other uses, and
+lexical evidence proves the original condition is not a Java constant
+expression. Keep the condition once in a direct while header and retain the
+completion work in its original block. Unknown/final constant expressions,
+other breaks (including finally overrides), ambiguous declarations and
+captures refuse cleanup. The generic default remains unchanged.
+
 `CFR_JS_LEADING_LOOP_EXIT_WORK=1` opts into reconstruction of a forever loop
 whose leading guard performs exit-only work before its final loop break. The
 original condition is evaluated once in the header and captured in a Boolean
