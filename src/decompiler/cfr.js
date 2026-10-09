@@ -3,7 +3,7 @@
 const {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits, foldNonlocalLoopExits, foldLoopElseExitGuards, foldTerminalLoopTails} = require('./javaAstEmitter');
 const {recoverScalarIfDispatches, simplifyPredicateNegations, simplifyDominatedPredicates, finalizeControlFrames, finalizeTerminalSwitchFrames, foldRedundantExitGuards} = require('./javaAstEmitter');
 const {simplifyPredicateGrouping} = require('./javaAstEmitter');
-const {foldScalarSwitchPrefixes, foldBooleanLocalAssignments, foldNaturalLoopExits, foldGuardedLocalAssignments, foldStableGuardedFallbacks, foldGuardedAssignmentSequences, simplifySelfCasts, foldSinglePassInnerLoops, foldSmallGuardedFallbacks, foldTerminalLoopFrames, foldGuardedStoreFallbacks, foldTerminalGuardedFrameExits, foldTerminalFrameLoops, foldSharedGuardedFallbacks, foldSharedStoreFallbacks, foldArithmeticStoreFallbacks, foldConditionalStoreFallbacks, foldNestedIfConditions, foldSharedStatementFallbacks, simplifyComplementedRelations} = require('./javaAstEmitter');
+const {foldScalarSwitchPrefixes, foldBooleanLocalAssignments, foldNaturalLoopExits, foldGuardedLocalAssignments, foldStableGuardedFallbacks, foldNestedStableGuardedFallbacks, foldGuardedAssignmentSequences, simplifySelfCasts, foldSinglePassInnerLoops, foldSmallGuardedFallbacks, foldTerminalLoopFrames, foldGuardedStoreFallbacks, foldTerminalGuardedFrameExits, foldTerminalFrameLoops, foldSharedGuardedFallbacks, foldSharedStoreFallbacks, foldArithmeticStoreFallbacks, foldConditionalStoreFallbacks, foldNestedIfConditions, foldSharedStatementFallbacks, simplifyComplementedRelations} = require('./javaAstEmitter');
 
 const fs = require('fs');
 const path = require('path');
@@ -2274,6 +2274,13 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
     const complementedRelations = simplifyComplementedRelations(source);
     if (!complementedRelations.comparisonsSimplified) break;
     source = complementedRelations.source; changed = true;
+  }
+  // Terminal nested blocks can guard the same complete frame continuation.
+  // Retain other exits and copy only an invariant primitive-local predicate.
+  for (;;) {
+    const nestedFallback = foldNestedStableGuardedFallbacks(source, {parameters, fpStrict});
+    if (!nestedFallback.framesRecovered) break;
+    source = nestedFallback.source; changed = true;
   }
   if (changed) replaceArrayContents(body, source.split('\n'));
 }

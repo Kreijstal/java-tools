@@ -10,7 +10,7 @@ const frame = (prefix = 'hit();', condition = 'enabled', guard = 'flag==0') => `
 
 test('the normal emitter finishes stable guarded fallbacks with actual parameter types', () => {
   const body = frame().split('\n'); finish(body, parameters.map(p => p.name), parameters);
-  assert.equal(body.join('\n'), 'if(enabled){hit();} if (!(enabled) || flag!=0) {fallback();}');
+  assert.equal(body.join('\n'), 'if(enabled){hit();} if (!enabled || flag!=0) {fallback();}');
 });
 
 test('stable primitive predicates express effectful prefixes and fallbacks once', () => {

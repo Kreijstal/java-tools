@@ -741,6 +741,10 @@ function foldSharedStoreFallbacks(source, options = {}) {
   catch (error) { if (error instanceof RangeError) return {source, framesRecovered: 0}; throw error; }
 }
 
+function foldNestedStableGuardedFallbacks(source, options = {}) {
+  return foldStableGuardedFallbacks(source, {...options, nestedContainers: true, preserveSharedFrames: true});
+}
+
 function foldSharedStatementFallbacks(source, options = {}) {
   try { return recoverSharedStatementFallbacks(source, controlCleanupSource(source), options); }
   catch (error) { if (error instanceof RangeError) return {source, guardsRecovered: 0}; throw error; }
@@ -3424,6 +3428,7 @@ module.exports = {
   foldBooleanLocalAssignments,
   foldGuardedLocalAssignments,
   foldStableGuardedFallbacks,
+  foldNestedStableGuardedFallbacks,
   foldGuardedAssignmentSequences,
   simplifySelfCasts,
   foldSinglePassInnerLoops,
