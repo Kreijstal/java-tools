@@ -1,5 +1,15 @@
 # Structured Decompiler: goto-free control-flow recovery
 
+`CFR_JS_FINAL_BOOLEAN_PREDICATES=1` enables an optional final condition cleanup
+after continuation and local-lifetime reconstruction. It reuses the existing
+Boolean-negation and condition-grouping proofs to complement equality, apply
+De Morgan's law, remove double negations in primitive control contexts, and
+remove redundant grouping. Relational comparisons keep their original form;
+ordinary operands, boxed identity comparisons, evaluation order, exceptions and
+protected boundaries stay intact. This option is disabled by default.
+
+Focused validation: `NODE_PATH=/path/to/node_modules JAVA_TOOL_OPTIONS=-XX:-UsePerfData node --test --experimental-test-isolation=none test/predicateNegationRecovery.test.js test/predicateGroupingRecovery.test.js`.
+
 This document records the design, the algorithms, and — importantly — *why* this
 project grew its own control-flow structurer instead of relying on CFR or
 Vineflower. It is written to be read cold, months later, by someone who has

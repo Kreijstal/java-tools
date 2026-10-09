@@ -2299,6 +2299,18 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
       if (nested.localsSplit) { source = nested.source; changed = true; }
     }
   }
+  // Lifetime/continuation recovery can expose Boolean conditions after the
+  // earlier cleanup. Equality complements are exact for primitive, floating
+  // and reference operands; leave relational operators and unknown atoms alone.
+  if (process.env.CFR_JS_FINAL_BOOLEAN_PREDICATES === '1') {
+    for (;;) {
+      const predicates = simplifyPredicateNegations(source, {complementIntegralRelations: false});
+      if (!predicates.predicatesSimplified) break;
+      source = predicates.source; changed = true;
+    }
+    const grouping = simplifyPredicateGrouping(source);
+    if (grouping.parenthesisPairsRemoved) { source = grouping.source; changed = true; }
+  }
   if (changed) replaceArrayContents(body, source.split('\n'));
 }
 
