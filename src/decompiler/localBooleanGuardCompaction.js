@@ -83,8 +83,15 @@ function compactLocalBooleanGuards(source, proof, {retainDiagnostics = false, re
     }
     if (assignments.length && (headEnd < 0 || tokens[headEnd + 1]?.text !== '&&')) continue;
     const segments = [{range: range(first, first)}, {text: ' ('}, {range: conditionRange},
-      {text: ' && ('}, {range: assignmentRange}, {text: ')'}];
-    if (assignments.length) segments.push({range: {start: tokens[headEnd].range.endOffset - 2, end: tokens[nestedClose].range.startOffset - 2}});
+      {text: ' &&\n('}, {range: assignmentRange}, {text: ')'}];
+    let suffix = headEnd + 1, validSuffix = true;
+    for (let index = 0; index < assignments.length; index++) {
+      const begin = suffix + 1, end = closes.get(begin);
+      if (tokens[suffix]?.text !== '&&' || tokens[begin]?.text !== '(' || end === undefined || end >= nestedClose) {validSuffix = false; break;}
+      segments.push({text: ' &&\n'}, {range: range(begin, end)});
+      suffix = end + 1;
+    }
+    if (assignments.length && (!validSuffix || suffix !== nestedClose)) continue;
     segments.push({text: ') '}, {range: bodyRange});
     const replacement = segments.map(s => s.text ?? source.slice(s.range.start, s.range.end)).join('');
     return {source: source.slice(0, whole.start) + replacement + source.slice(whole.end), guardsCompacted: 1,

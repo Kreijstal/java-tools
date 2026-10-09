@@ -16,7 +16,7 @@ test('primitive local guards combine conditional stores in their original order'
     source = result.source; count++;
   }
   assert.equal(count,2);
-  assert.match(source,/if \(\(f\) && \(f=one\(\)\) && \(f=two\(\)\)\)/);
+  assert.ok(source.replace(/\s+/g,'').includes('if((f)&&(f=one())&&(f=two()))'));
   for (const call of ['one()','two()','run()','after(f)']) assert.equal(source.split(call).length-1,1);
 });
 
