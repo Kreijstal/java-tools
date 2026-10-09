@@ -1,5 +1,17 @@
 # Structured Decompiler: goto-free control-flow recovery
 
+`CFR_JS_SPLIT_NESTED_INITIALIZED_PRIMITIVE_LIFETIMES=1` enables one additional
+nested primitive pass after initialized and optional array-dimension recovery.
+It requires `CFR_JS_SPLIT_INITIALIZED_PRIMITIVE_LIFETIMES=1`. Earlier separation
+can confine a local's remaining uses to a smaller block; this pass revisits
+those blocks under the same binding and definite-assignment contracts. Root
+blocks are excluded. Literal initializers remain in place, and loop iterations
+cannot borrow incoming values from an initializer or an earlier iteration.
+Handler/finally/monitor boundaries, captures and ambiguous bindings remain
+protected. Existing defaults are unchanged; the new option defaults off.
+
+Focused validation: `NODE_PATH=/path/to/node_modules JAVA_TOOL_OPTIONS=-XX:-UsePerfData node --test --experimental-test-isolation=none test/nestedInitializedPrimitiveLifetimeRecovery.test.js test/arrayDimensionLifetimeRecovery.test.js test/initializedPrimitiveLifetimeRecovery.test.js test/referenceLocalLifetimeRecovery.test.js test/primitiveLocalLifetimeRecovery.test.js test/nestedPrimitiveLocalLifetimeRecovery.test.js test/loopFrameCompletionRecovery.test.js`.
+
 `CFR_JS_SPLIT_ARRAY_DIMENSION_LIFETIMES=1` optionally revisits primitive locals
 used in array-allocation dimensions. Dimension expressions keep their exact
 left-to-right order, including assignments, increments, failures and overflow;

@@ -178,6 +178,10 @@ function splitInitializedPrimitiveLocalLifetimes(source, options = {}) {
   return splitLocalLifetimes(source, {...options, referenceLocals: false, initializedPrimitives: true, arrayDimensionLocals: false});
 }
 
+function splitNestedInitializedPrimitiveLocalLifetimes(source, options = {}) {
+  return splitInitializedPrimitiveLocalLifetimes(source, {...options, nestedBlocks: true});
+}
+
 function splitArrayDimensionPrimitiveLocalLifetimes(source, options = {}) {
   return splitLocalLifetimes(source, {...options, referenceLocals: false, initializedPrimitives: true, arrayDimensionLocals: true});
 }
@@ -357,5 +361,5 @@ function independentlyAssignedLocalSequence(statements, name, contexts = []) {
   if (arrayUse) return false; // existing control-frame recovery contract
   return sequence(statements, false, name, contexts) !== null;
 }
-module.exports = {splitPrimitiveLocalLifetimes, splitNestedPrimitiveLocalLifetimes, splitReferenceLocalLifetimes, splitNestedReferenceLocalLifetimes, splitInitializedPrimitiveLocalLifetimes, splitArrayDimensionPrimitiveLocalLifetimes,
+module.exports = {splitPrimitiveLocalLifetimes, splitNestedPrimitiveLocalLifetimes, splitReferenceLocalLifetimes, splitNestedReferenceLocalLifetimes, splitInitializedPrimitiveLocalLifetimes, splitNestedInitializedPrimitiveLocalLifetimes, splitArrayDimensionPrimitiveLocalLifetimes,
   independentlyAssignedLocalSequence};
