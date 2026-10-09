@@ -20,6 +20,35 @@ The design guarantee: **for any reducible CFG the structurer emits zero gotos**,
 and region-splitting brings the irreducible minority into that class. This is an
 *algorithmic* property, not a heuristic that happens to work on today's inputs.
 
+## Independent primitive local lifetimes
+
+`CFR_JS_SPLIT_PRIMITIVE_LIFETIMES=1` enables an optional source reconstruction
+after control-flow recovery. Uninitialized primitive method locals can receive
+separate names in independently defined phases. Each phase must assign its local
+before every read, including branch joins, zero-iteration loops, loop updates,
+breaks and labeled continues. A conditional reset that still needs an incoming
+value is merged into the preceding lifetime.
+
+The reconstruction changes identifier bindings and adds declarations without
+initializers. It retains every statement, expression, primitive type, operator
+and effect in its original order. Generated names reserve all source identifiers
+and formal parameter names. Exception/monitor regions, captures, switches,
+unsupported syntax and ambiguous lexical identities are refused. The default
+remains disabled; enabling it changes the source identity and must be recorded
+in reproducible decompiler invocations.
+
+Focused validation:
+
+```sh
+NODE_PATH=/path/to/node_modules JAVA_TOOL_OPTIONS=-XX:-UsePerfData node --test --experimental-test-isolation=none test/primitiveLocalLifetimeRecovery.test.js
+```
+
+Seven groups cover deterministic/idempotent rewriting, joins, loop transfers,
+refusals, unused formal-name collisions and compiler integration. A native
+fixture compares 70,400 original/recovered/oracle cases with signed overflow,
+floating edge values, injected failures, outer finally overrides and monitors.
+This does not establish arbitrary-program equivalence.
+
 ## Bounded mixed statement continuations
 
 `foldSharedStatementFallbacks` extends the final source recovery to short
