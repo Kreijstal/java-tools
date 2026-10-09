@@ -1,5 +1,13 @@
 # Structured Decompiler: goto-free control-flow recovery
 
+`CFR_JS_FINAL_LOCAL_GUARDS=1` optionally reapplies captured-local path facts
+after late reconstruction and Boolean cleanup. This action-preserving mode
+removes a true, redundant `if` condition only when its selected arm is a block,
+there is no discarded arm, and Java completion requires no suffix pruning.
+Original actions, assignments, braces, declarations and protected boundaries
+remain. Mutable/shadowed/boxed/field values cannot establish these facts. The
+option defaults off; the existing broader specialization remains unchanged.
+
 `CFR_JS_FINAL_BOOLEAN_PREDICATES=1` enables an optional final condition cleanup
 after continuation and local-lifetime reconstruction. It reuses the existing
 Boolean-negation and condition-grouping proofs to complement equality, apply

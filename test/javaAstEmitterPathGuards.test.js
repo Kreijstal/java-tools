@@ -3,7 +3,7 @@ const test=require('node:test');
 const fs=require('fs'),path=require('path'),os=require('os'),assert=require('assert/strict'),{spawnSync}=require('child_process');
 const {specializePathGuards:fold}=require('../src/decompiler/javaAstEmitter');
 const {simplifyControlFrames:clean}=require('../src/decompiler/javaAstEmitter');
-function recover(source){let changes=0;for(let limit=0;limit<128;limit++){const next=fold(source);if(!next.guardsSpecialized)break;source=next.source;changes++;}return{source,changes};}
+function recover(source,options={}){let changes=0;for(let limit=0;limit<128;limit++){const next=fold(source,options);if(!next.guardsSpecialized)break;source=next.source;changes++;}return{source,changes};}
 test('native path guards preserve selection, mutations, transfers, cleanup and monitors',()=>{
 const variants=[
  'int guard=mode;if(guard==0){step("A");if(guard==0){step("B");}}step("tail");',
@@ -33,7 +33,7 @@ const variants=[
 const directory=fs.mkdtempSync(path.join(os.tmpdir(),'path-guards-native-')),methods=[];let changed=0;
 function run(command,args){const files=['stdout','stderr'].map(n=>path.join(directory,n)),fds=files.map(f=>fs.openSync(f,'w'));try{const r=spawnSync(command,args,{stdio:['ignore',...fds],timeout:15000,env:{...process.env,JAVA_TOOL_OPTIONS:'-XX:-UsePerfData'}});if(r.error)throw r.error;assert.equal(r.status,0,fs.readFileSync(files[1],'utf8'));return fs.readFileSync(files[0],'utf8');}finally{fds.forEach(fd=>fs.closeSync(fd));}}
 try{
- variants.forEach((source,index)=>{const next=recover(source);if(index>=16&&index<=18)assert.equal(next.changes,0,index+' mutation must invalidate facts');else assert.ok(next.changes>0,index+' should reconstruct');changed+=next.changes;let cleaned=next.source;for(;;){const n=clean(cleaned);if(n.source===cleaned)break;cleaned=n.source;}for(const[name,text]of[['original',source],['rebuilt',next.source],['cleaned',cleaned]])methods.push(`static void ${name}${index}(int mode,int input){${text}}`);});
+ variants.forEach((source,index)=>{const next=recover(source);if(index>=16&&index<=18)assert.equal(next.changes,0,index+' mutation must invalidate facts');else assert.ok(next.changes>0,index+' should reconstruct');changed+=next.changes;let cleaned=next.source;for(;;){const n=clean(cleaned);if(n.source===cleaned)break;cleaned=n.source;}for(const[name,text]of[['original',source],['rebuilt',next.source],['cleaned',cleaned],['preserved',recover(source,{preserveActions:true}).source]])methods.push(`static void ${name}${index}(int mode,int input){${text}}`);});
  const java=`public class PathGuards {
  static StringBuilder trace;static int failures,effects,cleanups,ticks;static Object lock;static final RuntimeException specific=new IllegalArgumentException();static final Error fatal=new AssertionError();
  static void step(String s){trace.append(s).append('/');effects++;if(failures==1&&effects==1||failures==2&&effects==2)throw specific;}
@@ -58,8 +58,8 @@ try{
  oracle(()->cleaned16(0,7),"ok:2:0:A/tail/");
  oracle(()->cleaned22(0,0),"ok:2:0:A/tail/");
  for(failures=0;failures<5;failures++)for(int mode:new int[]{Integer.MIN_VALUE,-1,0,1,7,Integer.MAX_VALUE})for(int input:new int[]{Integer.MIN_VALUE,-1,0,1,7,Integer.MAX_VALUE})for(boolean nullLock:new boolean[]{false,true}){
- ${variants.flatMap((_,i)=>['rebuilt','cleaned'].map(name=>`{String expected=invoke(()->original${i}(mode,input),nullLock),actual=invoke(()->${name}${i}(mode,input),nullLock);if(!expected.equals(actual))throw new AssertionError("${name}${i}:"+failures+":"+mode+":"+input+":"+nullLock+":"+expected+" != "+actual);comparisons++;}`)).join('\n')}
- }if(comparisons!=16560)throw new AssertionError(comparisons);System.out.println("path-guards-native:"+comparisons);
+ ${variants.flatMap((_,i)=>['rebuilt','cleaned','preserved'].map(name=>`{String expected=invoke(()->original${i}(mode,input),nullLock),actual=invoke(()->${name}${i}(mode,input),nullLock);if(!expected.equals(actual))throw new AssertionError("${name}${i}:"+failures+":"+mode+":"+input+":"+nullLock+":"+expected+" != "+actual);comparisons++;}`)).join('\n')}
+ }if(comparisons!=24840)throw new AssertionError(comparisons);System.out.println("path-guards-native:"+comparisons);
  }
  }`;
  const sourceFile=path.join(directory,'PathGuards.java');fs.writeFileSync(sourceFile,java);run('javac',['--release','8','-d',directory,sourceFile]);console.log(run('java',['-cp',directory,'PathGuards']).trim(),'guards reconstructed',changed);
@@ -136,4 +136,19 @@ test('optional diagnostics separate selected bytes from removed predicates and s
  assert.ok(d.removedRanges.some(r=>source.slice(r.start,r.end).includes('guard==0')));
  assert.ok(d.prunedRanges.some(r=>source.slice(r.start,r.end).includes('unreachable')));
  for(const r of d.removedRanges)assert.ok(r.start>=0&&r.end<=source.length&&r.start<=r.end);
+});
+
+test('action preservation removes only proven true block guards and keeps every selected scope',()=>{
+ const source='int guard=mode;if(guard!=0){if(guard!=0){int local=read();use(local);}}';
+ const next=fold(source,{preserveActions:true,retainDiagnostics:true});
+ assert.equal(next.source,'int guard=mode;if(guard!=0){{int local=read();use(local);}}');
+ assert.equal(next.guardsSpecialized,1);assert.equal(next.diagnostics.prunedRanges.length,0);
+ for(const s of [
+  'int guard=mode;if(guard==0){if(guard!=0){work();}}',
+  'int guard=mode;if(guard==0){if(guard==0){work();}else{other();}}',
+  'int guard=mode;if(guard==0){if(guard==0)work();}',
+  'int guard=mode;if(guard==0){if(guard==0){return;}work();}',
+  'int guard=mode;if(guard==0){if(guard==0){work();}guard=1;}',
+ ])assert.equal(fold(s,{preserveActions:true}).source,s);
+ assert.equal(fold(source,{preserveActions:1}).source,source);
 });

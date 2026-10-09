@@ -209,13 +209,15 @@ function discoverPathGuards(source, proof) {
 }
 function specializePathGuards(source, proof, {
   parameterNames = [],
-  retainDiagnostics = false
+  retainDiagnostics = false,
+  preserveActions = false
 } = {}) {
-  const candidates = discoverPathGuards(source, proof).filter(c => !c.discardedDeclarations);
   const unchanged = () => ({
     source,
     guardsSpecialized: 0
   });
+  if (typeof preserveActions !== 'boolean') return unchanged();
+  const candidates = discoverPathGuards(source, proof).filter(c => !c.discardedDeclarations);
   if (!candidates.length) return unchanged();
   if (!proof) return unchanged();
   const {
@@ -437,6 +439,10 @@ function specializePathGuards(source, proof, {
     if (blocked) continue;
     const selected = candidate.known ? chosenIf.consequent : chosenIf.alternate,
       discarded = candidate.known ? chosenIf.alternate : chosenIf.consequent;
+    // The optional late pass retains every original action and selected scope.
+    // Its only deletion is a path-proven pure local condition. Existing callers
+    // retain the broader completion-aware specialization contract.
+    if (preserveActions && (!candidate.known || discarded || selected?.kind !== 'BlockStatement')) continue;
     if (declarations(discarded)) continue;
     const edits = [],
       pruned = [];
@@ -569,7 +575,7 @@ function specializePathGuards(source, proof, {
     }
     try {
       complete(parsed);
-      if (fails) continue;
+      if (fails || preserveActions && pruned.length) continue;
       const start = starts.get(chosenIf.range.startOffset),
         after = end(chosenIf),
         selectedStart = selected ? selected.kind === 'BlockStatement' ? extent(selected)?.open : starts.get(selected.range?.startOffset) : null,

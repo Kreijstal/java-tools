@@ -2311,6 +2311,13 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
     const grouping = simplifyPredicateGrouping(source);
     if (grouping.parenthesisPairsRemoved) { source = grouping.source; changed = true; }
   }
+  if (process.env.CFR_JS_FINAL_LOCAL_GUARDS === '1') {
+    for (;;) {
+      const guards = specializePathGuards(source, {parameterNames, preserveActions: true});
+      if (!guards.guardsSpecialized) break;
+      source = guards.source; changed = true;
+    }
+  }
   if (changed) replaceArrayContents(body, source.split('\n'));
 }
 
