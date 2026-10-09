@@ -1,5 +1,17 @@
 # Structured Decompiler: goto-free control-flow recovery
 
+`CFR_JS_SPLIT_REFERENCE_LIFETIMES=1` optionally separates reused reference locals
+into independently assigned phases. The original uninitialized or literal-null
+declaration stays intact; later phases receive uninitialized declarations of the
+same source type. A selected block must contain every use. It may be a protected
+body, but an analysis cannot carry a value across try/catch/finally or monitor
+boundaries. Conditional/loop reaching values stay together. Captures, shadows,
+ambiguous identifiers, annotated/inferred types and uncertain syntax refuse.
+All original assignments, calls, aliases, nullable effects and exception scopes
+remain. This option defaults off; primitive lifetime defaults stay unchanged.
+
+Focused validation: `NODE_PATH=/path/to/node_modules JAVA_TOOL_OPTIONS=-XX:-UsePerfData node --test --experimental-test-isolation=none test/referenceLocalLifetimeRecovery.test.js test/primitiveLocalLifetimeRecovery.test.js test/nestedPrimitiveLocalLifetimeRecovery.test.js`.
+
 `CFR_JS_FLATTEN_STANDALONE_BLOCKS=1` optionally flattens standalone blocks
 after late guard recovery. Only direct block statements qualify, and every
 immediate child must declare nothing in that block or retain its own scope.
