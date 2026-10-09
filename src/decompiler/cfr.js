@@ -2392,6 +2392,12 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
 }
 
 function formatBlock(header, body) {
+  // Exception boundaries, constructor guards and initializer helpers may be
+  // added after statement recovery. Normalize their final complete scope too.
+  if (process.env.CFR_JS_REINDENT_STRUCTURED_BODIES === '1' && body.length) {
+    const indentation = reindentStructuredSource(body.join('\n'));
+    if (indentation.linesReindented) body = indentation.source.split('\n');
+  }
   const out = [`${header} {`];
   if (body.length) {
     body.forEach((line) => out.push(`    ${line}`));
@@ -11258,6 +11264,7 @@ module.exports = {
   decompilePath,
   buildExceptionModel,
   _internals: {
+    formatBlock,
     shareExistingExitTails,
     binaryExpr,
     negateNumericExpression,
