@@ -19,7 +19,7 @@ const { structureMethod } = require('./exceptionStructurer');
 const { mergeDuplicateLoopIncrementTails } = require('./loopTailMerge');
 const { partitionStructuredVoidBody } = require('./structuredMethodPartition');
 const {splitPrimitiveLocalLifetimes, splitNestedPrimitiveLocalLifetimes, splitReferenceLocalLifetimes, splitNestedReferenceLocalLifetimes, splitInitializedPrimitiveLocalLifetimes, splitNestedInitializedPrimitiveLocalLifetimes, splitArrayDimensionPrimitiveLocalLifetimes} = require('./primitiveLocalLifetimeRecovery');
-const {foldLoopFrameCompletion, shareDynamicGuardedTails, foldLeadingLoopExitWork, simplifyNaturalLoopExitCaptures, foldGuardedFrameCompletion, compactLocalBooleanGuards, reindentStructuredSource, foldExhaustiveSwitchFrameExits} = require('./javaAstEmitter');
+const {foldLoopFrameCompletion, shareDynamicGuardedTails, foldLeadingLoopExitWork, simplifyNaturalLoopExitCaptures, foldGuardedFrameCompletion, compactLocalBooleanGuards, reindentStructuredSource, foldExhaustiveSwitchFrameExits, foldExhaustiveIfFrameExits} = require('./javaAstEmitter');
 const { listRegionSplitCandidates, applyRegionSplit } = require('../passes/regionSplit');
 const { jreClassInfo, jreMethodCandidates } = require('../java-frontend/jreMetadata');
 const { JavaParser } = require('../java-frontend/parser');
@@ -2389,6 +2389,13 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
       const frame=foldExhaustiveSwitchFrameExits(source);
       if(!frame.framesRecovered)break;
       source=frame.source;changed=true;
+    }
+  }
+  if (process.env.CFR_JS_EXHAUSTIVE_IF_FRAME_EXITS === '1') {
+    for (;;) {
+      const frame = foldExhaustiveIfFrameExits(source);
+      if (!frame.framesRecovered) break;
+      source = frame.source; changed = true;
     }
   }
   if (process.env.CFR_JS_REINDENT_STRUCTURED_BODIES === '1') {

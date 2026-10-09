@@ -2452,6 +2452,30 @@ NaN/infinity casts, nullable arrays and bounds failures, narrowing casts,
 throwing callbacks, finally overrides and monitor release. Diagnostics report
 the operand types and exact operator ranges for independent compiler audits.
 
+### Recovering exhaustive ordered frame decisions
+
+`foldExhaustiveIfFrameExits` recovers a guarded linear decision ladder whose
+every arm ends with a direct break to one plain labeled block. Consecutive
+predicates become `else if` arms in their original order, followed by the
+original unconditional tail as an `else` arm. The containing guard's original
+remainder becomes its explicit `else` arm. Original arm braces, predicates,
+stores, declarations, reads and effectful actions remain; no classifier,
+predicate inversion, copied operation or new local is introduced.
+
+The opt-in compiler flag is `CFR_JS_EXHAUSTIVE_IF_FRAME_EXITS=1`, disabled by
+default. Recovery requires 2–64 direct terminal arms and complete terminal
+inner/outer remainders. Extra frame exits, breaks inside protection or other
+control frames, captures, ambiguous lexical destinations and excessive source
+size/depth refuse. Whole protected actions and other transfers remain intact.
+Only the consumed frame exits and label disappear. Empty lines left by a
+standalone terminal break are removed; remaining formatting uses the existing
+structured-body indentation option.
+
+Independent native fixtures compare 46,800 effectful/nullable-predicate,
+alias/partial-store, overflow, failure, finally-override and monitor cases.
+An additional 131,072 cases cover all UTF-16 character values and both Boolean
+return paths in a wide primitive decision ladder, including definite assignment.
+
 ### Recovering captured-integer if dispatches
 
 `recoverScalarIfDispatches` recognizes transparent integer if ladders inside an
