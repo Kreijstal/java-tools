@@ -10,9 +10,9 @@ const primitiveTypes = new Set(['boolean', 'byte', 'short', 'char', 'int', 'long
 // a phase refuse analysis, so no reaching value crosses a handler boundary.
 // Keep all statements, operators, evaluation order, types and aliases intact.
 // Every read in each phase must be dominated by an assignment within that phase;
-// loops include their zero-iteration, break and continue paths. Captures and
-// captures remain outside this reconstruction's contract.
-function splitLocalLifetimes(source, {retainDiagnostics = false, reservedNames = [], nestedBlocks = false, referenceLocals = false} = {}) {
+// loops include their zero-iteration, break and continue paths. Captures remain
+// outside this reconstruction's contract.
+function splitLocalLifetimes(source, {retainDiagnostics = false, reservedNames = [], nestedBlocks = false, referenceLocals = false, initializedPrimitives = false} = {}) {
   const unchanged = () => ({source, localsSplit: 0, declarationsAdded: 0});
   if (typeof source !== 'string' || /\\u+[0-9a-fA-F]{4}/.test(source)) return unchanged();
   const wrapped = `{\n${source}\n}`;
@@ -28,12 +28,13 @@ function splitLocalLifetimes(source, {retainDiagnostics = false, reservedNames =
       end = t.range.endOffset;
     }
   } catch (_) { return unchanged(); }
-  if (referenceLocals && (/\/\/|\/\*/.test(wrapped.slice(tokens.at(-1)?.range.endOffset || 0))
+  const extended = referenceLocals || initializedPrimitives;
+  if (extended && (/\/\/|\/\*/.test(wrapped.slice(tokens.at(-1)?.range.endOffset || 0))
       || typeof retainDiagnostics !== 'boolean' || !Array.isArray(reservedNames))) return unchanged();
   const nodes = [];
   walk(tree, n => nodes.push(n));
   if (nodes.some(n => /^(?:Unsupported|ClassDeclaration|InterfaceDeclaration|EnumDeclaration|RecordDeclaration|LambdaExpression|SwitchStatement|EnhancedForStatement|MethodReferenceExpression)/.test(n.kind)
-      || !referenceLocals && /^(?:TryStatement|SynchronizedStatement)/.test(n.kind)
+      || !extended && /^(?:TryStatement|SynchronizedStatement)/.test(n.kind)
       || n.kind === 'NewClassExpression' && n.body)) return unchanged();
   const statements = tree.statements || [];
   const blockEnds = new Map(), openBlocks = [];
@@ -41,7 +42,7 @@ function splitLocalLifetimes(source, {retainDiagnostics = false, reservedNames =
     if (token.text === '{') openBlocks.push(token.range.startOffset);
     else if (token.text === '}') blockEnds.set(openBlocks.pop(), token.range.startOffset);
   }
-  if (referenceLocals) {
+  if (extended) {
     // Parser-owned try/catch/monitor blocks can omit their brace range. Repair
     // only those bounds from their first direct statement and matched tokens.
     const starts = new Map(tokens.map((t,i) => [t.range.startOffset,i]));
@@ -56,8 +57,11 @@ function splitLocalLifetimes(source, {retainDiagnostics = false, reservedNames =
   const edits = [], added = [], diagnostics = [];
   for (const declaration of declarations) {
     const [variable] = declaration.declarators || [];
-    const initialized = referenceLocals && variable?.initializer?.kind === 'LiteralExpression'
-      && variable.initializer.raw === 'null';
+    const initializer = variable?.initializer;
+    const scalarLiteral = n => n?.kind === 'LiteralExpression' && ['number','boolean','char'].includes(n.literalKind)
+      || n?.kind === 'UnaryExpression' && ['+','-'].includes(n.operator) && n.operand?.kind === 'LiteralExpression' && n.operand.literalKind === 'number';
+    const initialized = referenceLocals && initializer?.kind === 'LiteralExpression' && initializer.raw === 'null'
+      || initializedPrimitives && scalarLiteral(initializer);
     const type = declaration.variableType;
     if (declaration.declarators?.length !== 1 || variable.initializer && !initialized || variable.dimensions
         || declaration.modifiers?.length || declaration.annotations?.length
@@ -85,7 +89,7 @@ function splitLocalLifetimes(source, {retainDiagnostics = false, reservedNames =
     // local. Loop headers and uses after the block therefore keep a reaching
     // value in its enclosing lifetime. Analyze each execution from unassigned,
     // so an iteration cannot borrow a value from an earlier iteration.
-    const container = nestedBlocks || referenceLocals ? containingBlock(tree, name, identifiers) : {block: tree, contexts: []};
+    const container = nestedBlocks || extended ? containingBlock(tree, name, identifiers) : {block: tree, contexts: []};
     if (!container) continue;
     if (nestedBlocks && container.block === tree) continue;
     // A root initializer cannot supply an independent first phase on every
@@ -134,7 +138,7 @@ function splitLocalLifetimes(source, {retainDiagnostics = false, reservedNames =
     }
     diagnostics.push({name, type: typeText, groups: groups.length,
       nested: container.block !== tree, containerStart: container.block.range.startOffset - 2,
-      containerEnd: phaseEnd - 2, ranges, ...(referenceLocals ? {reference: true, initialized} : {})});
+      containerEnd: phaseEnd - 2, ranges, ...(extended ? {reference: referenceLocals, initialized} : {})});
   }
   if (!added.length) return unchanged();
   // Declarations have no initializer and no runtime effect. Append them after
@@ -158,13 +162,16 @@ function splitLocalLifetimes(source, {retainDiagnostics = false, reservedNames =
 }
 
 function splitPrimitiveLocalLifetimes(source, options = {}) {
-  return splitLocalLifetimes(source, {...options, referenceLocals: false});
+  return splitLocalLifetimes(source, {...options, referenceLocals: false, initializedPrimitives: false});
 }
 function splitReferenceLocalLifetimes(source, options = {}) {
-  return splitLocalLifetimes(source, {...options, referenceLocals: true});
+  return splitLocalLifetimes(source, {...options, referenceLocals: true, initializedPrimitives: false});
 }
 function splitNestedReferenceLocalLifetimes(source, options = {}) {
-  return splitLocalLifetimes(source, {...options, referenceLocals: true, nestedBlocks: true});
+  return splitLocalLifetimes(source, {...options, referenceLocals: true, initializedPrimitives: false, nestedBlocks: true});
+}
+function splitInitializedPrimitiveLocalLifetimes(source, options = {}) {
+  return splitLocalLifetimes(source, {...options, referenceLocals: false, initializedPrimitives: true});
 }
 
 function containingBlock(tree, name, count) {
@@ -327,5 +334,5 @@ function splitNestedPrimitiveLocalLifetimes(source, options = {}) {
 function independentlyAssignedLocalSequence(statements, name, contexts = []) {
   return sequence(statements, false, name, contexts) !== null;
 }
-module.exports = {splitPrimitiveLocalLifetimes, splitNestedPrimitiveLocalLifetimes, splitReferenceLocalLifetimes, splitNestedReferenceLocalLifetimes,
+module.exports = {splitPrimitiveLocalLifetimes, splitNestedPrimitiveLocalLifetimes, splitReferenceLocalLifetimes, splitNestedReferenceLocalLifetimes, splitInitializedPrimitiveLocalLifetimes,
   independentlyAssignedLocalSequence};

@@ -1,5 +1,16 @@
 # Structured Decompiler: goto-free control-flow recovery
 
+`CFR_JS_SPLIT_INITIALIZED_PRIMITIVE_LIFETIMES=1` optionally separates primitive
+locals with literal initializers, including signed numeric literals, booleans
+and characters. Original declarations and literal bits remain untouched; later
+independent phases use uninitialized locals of the same primitive width. Each
+selected block contains every use, and an outer initializer cannot supply a
+loop-body phase's incoming value on each iteration. Protected bodies qualify
+only when no reaching value crosses a handler/finally/monitor boundary. Existing
+primitive/reference lifetime defaults remain unchanged. The option defaults off.
+
+Focused validation: `NODE_PATH=/path/to/node_modules JAVA_TOOL_OPTIONS=-XX:-UsePerfData node --test --experimental-test-isolation=none test/initializedPrimitiveLifetimeRecovery.test.js test/referenceLocalLifetimeRecovery.test.js test/primitiveLocalLifetimeRecovery.test.js test/nestedPrimitiveLocalLifetimeRecovery.test.js`.
+
 `CFR_JS_SPLIT_NESTED_REFERENCE_LIFETIMES=1` adds one nested reference pass after
 the initial reference split. It uses the same type, binding and assignment
 contracts, selecting only a block nested in the method. Earlier separation can
