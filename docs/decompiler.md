@@ -49,6 +49,24 @@ fixture compares 70,400 original/recovered/oracle cases with signed overflow,
 floating edge values, injected failures, outer finally overrides and monitors.
 This does not establish arbitrary-program equivalence.
 
+`CFR_JS_SPLIT_NESTED_PRIMITIVE_LIFETIMES=1`, together with the root option,
+adds a second reconstruction inside nested blocks. It chooses the deepest block
+containing every use of a local and checks each execution from an unassigned
+entry state. Uses in a surrounding loop header or after the block prevent that
+separation. Enclosing loop/label contexts remain available when checking breaks
+and continues. The two stages run in a fixed order, preserving the existing root
+reconstruction and deterministic generated names.
+
+The nested tests cover outgoing and iteration-carried values, conditional joins,
+enclosing transfers, formal-name collisions and the explicit compiler options.
+A separate native fixture compares 50,688 original/recovered/oracle cases using
+independent event lists, partial writes, exception identity and finally/monitor
+behavior. Run both lifetime fixtures together:
+
+```sh
+NODE_PATH=/path/to/node_modules JAVA_TOOL_OPTIONS=-XX:-UsePerfData node --test --experimental-test-isolation=none test/primitiveLocalLifetimeRecovery.test.js test/nestedPrimitiveLocalLifetimeRecovery.test.js
+```
+
 ## Bounded mixed statement continuations
 
 `foldSharedStatementFallbacks` extends the final source recovery to short
