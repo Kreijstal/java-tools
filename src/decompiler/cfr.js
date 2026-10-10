@@ -2476,6 +2476,25 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
       }
     }
   }
+  if (process.env.CFR_JS_GUARDED_FRAME_DOMINATING_ASSIGNMENTS === '1' &&
+      process.env.CFR_JS_GUARDED_FRAME_COMPLETION === '1') {
+    // Recognize pre-frame initialization only after established recovery has
+    // allocated its decisions. Existing names and policy defaults stay stable.
+    let recovered = false;
+    const modes = [{dominatingAssignments: true}];
+    if (process.env.CFR_JS_GUARDED_FRAME_PREFIX_EFFECTS === '1') modes.push({dominatingAssignments: true, effectfulGuards: true});
+    if (process.env.CFR_JS_GUARDED_FRAME_ALTERNATES === '1') modes.push({dominatingAssignments: true, effectfulGuards: true, alternateGuards: true, maximumExits: 64});
+    for (const mode of modes) for (;;) {
+      const frame = foldGuardedFrameCompletion(source, {reservedNames: parameterNames, ...mode});
+      if (!frame.framesRecovered) break;
+      source = frame.source; changed = true; recovered = true;
+    }
+    if (recovered && process.env.CFR_JS_COMPACT_LOCAL_BOOLEAN_GUARDS === '1') for (;;) {
+      const guards = compactLocalBooleanGuards(source, {reservedNames: parameterNames});
+      if (!guards.guardsCompacted) break;
+      source = guards.source; changed = true;
+    }
+  }
   if (process.env.CFR_JS_SHARED_SWITCH_FRAME_EXITS === '1') {
     const exits = foldSharedSwitchFrameExits(source);
     if (exits.breaksLocalized) {source = exits.source; changed = true;}

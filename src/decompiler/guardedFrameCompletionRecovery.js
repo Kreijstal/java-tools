@@ -4,9 +4,9 @@ const {independentlyAssignedLocalSequence} = require('./primitiveLocalLifetimeRe
 // Resolve each guarded frame exit locally, then guard all remaining block
 // suffixes on its lexical path. Conditions/actions retain one occurrence.
 // Loops, switches and protected corridors cannot become normal fallthrough.
-function foldGuardedFrameCompletion(source, proof, {retainDiagnostics = false, reservedNames = [], effectfulGuards = false, alternateGuards = false, maximumExits = 16} = {}) {
+function foldGuardedFrameCompletion(source, proof, {retainDiagnostics = false, reservedNames = [], effectfulGuards = false, alternateGuards = false, dominatingAssignments = false, maximumExits = 16} = {}) {
   const unchanged = () => ({source, framesRecovered: 0});
-  if (!proof || typeof retainDiagnostics !== 'boolean' || typeof effectfulGuards !== 'boolean' || typeof alternateGuards !== 'boolean' ||
+  if (!proof || typeof retainDiagnostics !== 'boolean' || typeof effectfulGuards !== 'boolean' || typeof alternateGuards !== 'boolean' || typeof dominatingAssignments !== 'boolean' ||
       !Number.isInteger(maximumExits) || maximumExits < 1 || maximumExits > 64 || !Array.isArray(reservedNames) || reservedNames.some(n=>typeof n!=='string') || source.length>400000) return unchanged();
   const {parsed,tokens,starts,closes,children,labelCounts}=proof;
   if([...labelCounts.values()].some(n=>n!==1))return unchanged();
@@ -25,27 +25,44 @@ function foldGuardedFrameCompletion(source, proof, {retainDiagnostics = false, r
   const bounds=n=>{const open=starts.get(n?.range?.startOffset),close=closes.get(open);return n?.kind==='BlockStatement'&&tokens[open]?.text==='{'&&tokens[close]?.text==='}'?{open,close}:null;};
   const range=(a,b)=>({start:tokens[a].range.startOffset-2,end:tokens[b].range.endOffset-2});
   const occupied=new Set([...reservedNames,...tokens.filter(t=>t.kind==='identifier').map(t=>t.text)]);
-  function prefixAssignments(block){
+  function prefixAssignments(frame){
+    const block=frame.statement;
     const assigned=new Map();
+    function record(statement, owner, dominating=false){
+      const assignment=statement.kind==='ExpressionStatement'?statement.expression:null;
+      if(assignment?.kind!=='AssignmentExpression'||assignment.operator!=='='||assignment.left.kind!=='Identifier')return;
+      const name=assignment.left.name,locals=declarations.get(name)||[];
+      if(dominating&&assigned.has(name)||!uninitialized.has(name)||locals.length!==1||reservedNames.includes(name))return;
+      const declaration=parents.get(locals[0]),scope=parents.get(declaration);
+      if(declaration?.kind!=='LocalVariableDeclarationStatement'||scope?.kind!=='BlockStatement'||!(declaration.range.startOffset<statement.range.startOffset))return;
+      let cursor=owner;while(cursor&&cursor!==scope)cursor=parents.get(cursor);
+      if(cursor!==scope||!independentlyAssignedLocalSequence([statement],name,contexts.get(owner)))return;
+      assigned.set(name,{name,declarationOffset:declaration.range.startOffset-2,assignmentOffset:statement.range.startOffset-2,...(dominating?{dominating:true}:{})});
+    }
     // Every statement in this prefix executes before any possible frame exit.
     // A throwing initializer skips the original and transformed remainder.
     // Do not derive initialization from branches, loops or protected regions.
     for(const statement of block.statements){
       if(!['LocalVariableDeclarationStatement','ExpressionStatement'].includes(statement.kind))break;
-      const assignment=statement.expression;
-      if(assignment?.kind!=='AssignmentExpression'||assignment.operator!=='='||assignment.left.kind!=='Identifier')continue;
-      const name=assignment.left.name,locals=declarations.get(name)||[];
-      if(!uninitialized.has(name)||locals.length!==1||reservedNames.includes(name))continue;
-      const declaration=parents.get(locals[0]),scope=parents.get(declaration);
-      if(declaration?.kind!=='LocalVariableDeclarationStatement'||scope?.kind!=='BlockStatement'||!(declaration.range.startOffset<statement.range.startOffset))continue;
-      let cursor=block;while(cursor&&cursor!==scope)cursor=parents.get(cursor);
-      if(cursor!==scope||!independentlyAssignedLocalSequence([statement],name,contexts.get(block)))continue;
-      assigned.set(name,{name,declarationOffset:declaration.range.startOffset-2,assignmentOffset:statement.range.startOffset-2});
+      record(statement,block);
+    }
+    // A direct earlier sibling executes on every normal entry into this arm.
+    // Keep it in place; this only proves initialization for guarded suffixes.
+    // No case entry, catch/finally entry or protected corridor is inferred.
+    if(dominatingAssignments){let cursor=frame;
+      while(parents.has(cursor)){const owner=parents.get(cursor);if(!owner)break;
+        if(owner.kind==='BlockStatement'){const index=owner.statements.indexOf(cursor);if(index<0)break;for(const statement of owner.statements.slice(0,index))record(statement,owner,true);}
+        else if(owner.kind==='IfStatement'){if(![owner.consequent,owner.alternate].includes(cursor))break;}
+        else if(owner.kind==='LabeledStatement'){if(owner.statement!==cursor)break;}
+        else if(loopKinds.has(owner.kind)){if(owner.body!==cursor)break;}
+        else break;
+        cursor=owner;
+      }
     }
     return assigned;
   }
   for(const frame of frames.sort((a,b)=>b.range.startOffset-a.range.startOffset)){
-    const body=bounds(frame.statement),jumps=refs.get(frame)||[],guards=[],suffixes=new Map(),assigned=prefixAssignments(frame.statement),usedAssignments=new Map();let valid=true;
+    const body=bounds(frame.statement),jumps=refs.get(frame)||[],guards=[],suffixes=new Map(),assigned=prefixAssignments(frame),usedAssignments=new Map();let valid=true;
     if(!body||!frame.statement.statements.length||!jumps.length||jumps.length>maximumExits||tokens[body.close].range.endOffset-frame.range.startOffset>80000)continue;
     for(const jump of jumps){
       if(jump.kind!=='BreakStatement'||jump.label!==frame.label){valid=false;break;}
@@ -96,7 +113,7 @@ function foldGuardedFrameCompletion(source, proof, {retainDiagnostics = false, r
     // At one boundary, close an inner suffix before opening a later suffix.
     edits.sort((a,b)=>b.start-a.start||b.end-a.end||(a.kind==='guard-open'?-1:b.kind==='guard-open'?1:0));let result=source;
     for(const e of edits)result=result.slice(0,e.start)+e.text+result.slice(e.end);
-    return{source:result,framesRecovered:1,jumpsRemoved:guards.length,guardsAdded:sorted.length,...(retainDiagnostics?{diagnostics:{range:range(label,body.close),name,label:frame.label,declarationOffset,guards,suffixes:sorted,prefixAssignments:[...usedAssignments.values()],edits}}:{})};
+    return{source:result,framesRecovered:1,jumpsRemoved:guards.length,guardsAdded:sorted.length,...(retainDiagnostics?{diagnostics:{range:range(label,body.close),name,label:frame.label,declarationOffset,guards,suffixes:sorted,prefixAssignments:[...usedAssignments.values()].filter(p=>!p.dominating),...(dominatingAssignments?{dominatingAssignments:[...usedAssignments.values()].filter(p=>p.dominating)}:{}),edits}}:{})};
   }
   return unchanged();
 }

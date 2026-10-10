@@ -2859,3 +2859,24 @@ Focused native tests compare original, localized and conditional-reconstructed
 forms with an independent model for while/for/do loops, including nullable
 predicates, test/update order, aliased partial stores, overflow, failures, finally
 overrides and monitor ownership.
+
+### Prior assignments for guarded frame remainders
+
+`foldGuardedFrameCompletion` accepts `{dominatingAssignments: true}` to prove
+initialization from direct earlier expression statements in containing blocks.
+The assignment must bind to one uninitialized local whose declaration precedes
+it and whose scope contains the frame. Its right side must be valid from an
+unassigned state. Conditional arms, loop bodies and plain label bodies may lead
+to the containing block; case entries and protected entries stop the search.
+The proof never moves assignments, drops snapshots or infers initialization from
+conditional, loop, catch or finally work. Existing in-frame prefix evidence takes
+precedence. Diagnostics distinguish prior assignments from in-frame prefixes.
+
+The opt-in policy `CFR_JS_GUARDED_FRAME_DOMINATING_ASSIGNMENTS=1` also requires
+the ordinary guarded-frame policy. It runs after established recovery so earlier
+continuation names stay stable, then applies enabled Boolean compaction. Defaults
+and existing prefix diagnostics remain unchanged.
+
+Four focused groups, plus nine existing guarded-frame groups, pass. An independent
+native work oracle covers 35,100 prior-snapshot, aliased-state, nullable-predicate,
+nonzero-flag, overflow, failure, finally-override and monitor cases.
