@@ -2796,11 +2796,13 @@ of the original predicate. Field reads, calls and nullable unboxing happen once,
 in their original order. No predicate purity or control-flag value is assumed.
 
 Both destinations are resolved lexically and must be identical. The earlier arm
-contains only its break, with no alternative. The intervening work contains one
+has no alternative. By default it contains only its break. With
+`{effectfulGuards: true}`, up to eight prefix statements stay in their original
+true-arm scope, and the complete intervening work becomes an explicit else arm. The intervening work contains one
 to 32 statements; top-level declarations refuse rather than changing their
 scope. Complete protected constructs and their pending returns/throws remain
 intact. Source size, region size, token count and traversal depth remain bounded.
-Different destinations, crossed block/protected corridors, extra arm effects,
+Different destinations, crossed block/protected corridors, over-budget arm effects,
 conditional final exits and unsupported captures refuse.
 
 The compiler policy is opt-in: `CFR_JS_SHARED_FRAME_EXIT_GUARDS=1`. It runs after

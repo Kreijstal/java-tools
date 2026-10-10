@@ -2433,7 +2433,7 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
   if (process.env.CFR_JS_SHARED_FRAME_EXIT_GUARDS === '1') {
     let normalized = false;
     for (;;) {
-      const guard = foldSharedFrameExitGuards(source);
+      const guard = foldSharedFrameExitGuards(source, {effectfulGuards: true});
       if (!guard.guardsRecovered) break;
       source = guard.source; changed = true; normalized = true;
     }
