@@ -2378,10 +2378,18 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
   }
   if (process.env.CFR_JS_GUARDED_FRAME_COMPLETION === '1') {
     for (;;) {
-      const frame = foldGuardedFrameCompletion(source, {reservedNames: parameterNames,
-        effectfulGuards: process.env.CFR_JS_GUARDED_FRAME_PREFIX_EFFECTS === '1'});
+      const frame = foldGuardedFrameCompletion(source, {reservedNames: parameterNames});
       if (!frame.framesRecovered) break;
       source = frame.source; changed = true;
+    }
+    // Preserve names already allocated by the ordinary policy. New effectful
+    // candidates must not take their continuation identities first.
+    if (process.env.CFR_JS_GUARDED_FRAME_PREFIX_EFFECTS === '1') {
+      for (;;) {
+        const frame = foldGuardedFrameCompletion(source, {reservedNames: parameterNames, effectfulGuards: true});
+        if (!frame.framesRecovered) break;
+        source = frame.source; changed = true;
+      }
     }
   }
 
