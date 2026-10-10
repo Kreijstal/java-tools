@@ -17,6 +17,7 @@ const {
 } = require('./structurer');
 const { structureMethod } = require('./exceptionStructurer');
 const { mergeDuplicateLoopIncrementTails } = require('./loopTailMerge');
+const {removeUnreachableControlTransfers} = require('./unreachableTransferCleanup');
 const { partitionStructuredVoidBody } = require('./structuredMethodPartition');
 const {splitPrimitiveLocalLifetimes, splitNestedPrimitiveLocalLifetimes, splitReferenceLocalLifetimes, splitNestedReferenceLocalLifetimes, splitInitializedPrimitiveLocalLifetimes, splitNestedInitializedPrimitiveLocalLifetimes, splitArrayDimensionPrimitiveLocalLifetimes} = require('./primitiveLocalLifetimeRecovery');
 const {foldLoopFrameCompletion, shareDynamicGuardedTails, foldLeadingLoopExitWork, simplifyNaturalLoopExitCaptures, foldGuardedFrameCompletion, compactLocalBooleanGuards, foldKnownBooleanAlternatives, simplifyNegatedEqualityValues, reindentStructuredSource, foldExhaustiveSwitchFrameExits, foldExhaustiveIfFrameExits, foldSwitchExitTails, foldSharedFrameExitGuards, foldSharedSwitchFrameExits, foldSharedLoopFrameExits, splitMultilineBlockHeaders, wrapLogicalConditionLines} = require('./javaAstEmitter');
@@ -2284,17 +2285,19 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
     if (!nestedFallback.framesRecovered) break;
     source = nestedFallback.source; changed = true;
   }
-  if (process.env.CFR_JS_LOOP_FRAME_COMPLETION === '1') {
+  // Every generic recovery is automatic. Each pass proves its own scope,
+  // types, evaluation order and transfers, and retains unsupported input.
+  {
     for (;;) {
       const completion = foldLoopFrameCompletion(source, {reservedNames: parameterNames});
       if (!completion.exitsRecovered) break;
       source = completion.source; changed = true;
     }
   }
-  if (process.env.CFR_JS_SPLIT_PRIMITIVE_LIFETIMES === '1') {
+  {
     const lifetimes = splitPrimitiveLocalLifetimes(source, {reservedNames: parameterNames});
     if (lifetimes.localsSplit) { source = lifetimes.source; changed = true; }
-    if (process.env.CFR_JS_SPLIT_NESTED_PRIMITIVE_LIFETIMES === '1') {
+    {
       const nested = splitNestedPrimitiveLocalLifetimes(source, {reservedNames: parameterNames});
       if (nested.localsSplit) { source = nested.source; changed = true; }
     }
@@ -2302,7 +2305,7 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
   // Lifetime/continuation recovery can expose Boolean conditions after the
   // earlier cleanup. Equality complements are exact for primitive, floating
   // and reference operands; leave relational operators and unknown atoms alone.
-  if (process.env.CFR_JS_FINAL_BOOLEAN_PREDICATES === '1') {
+  {
     for (;;) {
       const predicates = simplifyPredicateNegations(source, {complementIntegralRelations: false});
       if (!predicates.predicatesSimplified) break;
@@ -2311,49 +2314,48 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
     const grouping = simplifyPredicateGrouping(source);
     if (grouping.parenthesisPairsRemoved) { source = grouping.source; changed = true; }
   }
-  if (process.env.CFR_JS_FINAL_LOCAL_GUARDS === '1') {
+  {
     for (;;) {
       const guards = specializePathGuards(source, {parameterNames, preserveActions: true});
       if (!guards.guardsSpecialized) break;
       source = guards.source; changed = true;
     }
   }
-  if (process.env.CFR_JS_FLATTEN_STANDALONE_BLOCKS === '1') {
+  {
     for (;;) {
       const blocks = flattenStandaloneBlocks(source);
       if (!blocks.blocksFlattened) break;
       source = blocks.source; changed = true;
     }
   }
-  if (process.env.CFR_JS_SPLIT_REFERENCE_LIFETIMES === '1') {
+  {
     const references = splitReferenceLocalLifetimes(source, {reservedNames: parameterNames});
     if (references.localsSplit) { source = references.source; changed = true; }
-    if (process.env.CFR_JS_SPLIT_NESTED_REFERENCE_LIFETIMES === '1') {
+    {
       const nested = splitNestedReferenceLocalLifetimes(source, {reservedNames: parameterNames});
       if (nested.localsSplit) { source = nested.source; changed = true; }
     }
   }
-  if (process.env.CFR_JS_SPLIT_INITIALIZED_PRIMITIVE_LIFETIMES === '1') {
+  {
     const primitives = splitInitializedPrimitiveLocalLifetimes(source, {reservedNames: parameterNames});
     if (primitives.localsSplit) { source = primitives.source; changed = true; }
   }
-  if (process.env.CFR_JS_SPLIT_ARRAY_DIMENSION_LIFETIMES === '1') {
+  {
     const dimensions = splitArrayDimensionPrimitiveLocalLifetimes(source, {reservedNames: parameterNames});
     if (dimensions.localsSplit) { source = dimensions.source; changed = true; }
   }
-  if (process.env.CFR_JS_SPLIT_INITIALIZED_PRIMITIVE_LIFETIMES === '1' &&
-      process.env.CFR_JS_SPLIT_NESTED_INITIALIZED_PRIMITIVE_LIFETIMES === '1') {
+  {
     const nested = splitNestedInitializedPrimitiveLocalLifetimes(source, {reservedNames: parameterNames});
     if (nested.localsSplit) { source = nested.source; changed = true; }
   }
-  if (process.env.CFR_JS_SHARE_DYNAMIC_GUARDED_TAILS === '1') {
+  {
     for (;;) {
       const shared = shareDynamicGuardedTails(source, {reservedNames: parameterNames});
       if (!shared.tailsShared) break;
       source = shared.source; changed = true;
     }
   }
-  if (process.env.CFR_JS_LEADING_LOOP_EXIT_WORK === '1') {
+  {
     for (;;) {
       const exitWork = foldLeadingLoopExitWork(source, {reservedNames: parameterNames});
       if (!exitWork.loopsRecovered) break;
@@ -2361,7 +2363,7 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
     }
   }
 
-  if (process.env.CFR_JS_SIMPLIFY_NATURAL_LOOP_EXIT_CAPTURES === '1') {
+  {
     for (;;) {
       const capture = simplifyNaturalLoopExitCaptures(source, {parameterNames});
       if (!capture.capturesRemoved) break;
@@ -2369,7 +2371,7 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
     }
   }
 
-  if (process.env.CFR_JS_OPAQUE_CONTROL_DISPATCHES === '1') {
+  {
     for (;;) {
       const dispatch = recoverScalarIfDispatches(source, {nestedRegions: true, opaqueControls: true});
       if (!dispatch.dispatchesRecovered) break;
@@ -2377,14 +2379,14 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
     }
   }
 
-  if (process.env.CFR_JS_SWITCH_EXIT_TAILS === '1') {
+  {
     for (;;) {
       const tail = foldSwitchExitTails(source);
       if (!tail.switchesRecovered) break;
       source = tail.source; changed = true;
     }
   }
-  if (process.env.CFR_JS_GUARDED_FRAME_COMPLETION === '1') {
+  {
     for (;;) {
       const frame = foldGuardedFrameCompletion(source, {reservedNames: parameterNames});
       if (!frame.framesRecovered) break;
@@ -2392,14 +2394,14 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
     }
     // Preserve names already allocated by the ordinary policy. New effectful
     // candidates must not take their continuation identities first.
-    if (process.env.CFR_JS_GUARDED_FRAME_PREFIX_EFFECTS === '1') {
+    {
       for (;;) {
         const frame = foldGuardedFrameCompletion(source, {reservedNames: parameterNames, effectfulGuards: true});
         if (!frame.framesRecovered) break;
         source = frame.source; changed = true;
       }
     }
-    if (process.env.CFR_JS_GUARDED_FRAME_ALTERNATES === '1') {
+    {
       for (;;) {
         const frame = foldGuardedFrameCompletion(source, {reservedNames: parameterNames,
           effectfulGuards: true, alternateGuards: true, maximumExits: 64});
@@ -2409,28 +2411,28 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
     }
   }
 
-  if (process.env.CFR_JS_COMPACT_LOCAL_BOOLEAN_GUARDS === '1') {
+  {
     for (;;) {
       const guards = compactLocalBooleanGuards(source, {reservedNames: parameterNames});
       if (!guards.guardsCompacted) break;
       source = guards.source; changed = true;
     }
   }
-  if (process.env.CFR_JS_EXHAUSTIVE_SWITCH_FRAME_EXITS === '1') {
+  {
     for (;;) {
       const frame=foldExhaustiveSwitchFrameExits(source);
       if(!frame.framesRecovered)break;
       source=frame.source;changed=true;
     }
   }
-  if (process.env.CFR_JS_EXHAUSTIVE_IF_FRAME_EXITS === '1') {
+  {
     for (;;) {
       const frame = foldExhaustiveIfFrameExits(source);
       if (!frame.framesRecovered) break;
       source = frame.source; changed = true;
     }
   }
-  if (process.env.CFR_JS_SHARED_FRAME_EXIT_GUARDS === '1') {
+  {
     let normalized = false;
     for (;;) {
       const guard = foldSharedFrameExitGuards(source, {effectfulGuards: true});
@@ -2439,23 +2441,23 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
     }
     // Allocate fresh decisions after all existing recovery policies, so
     // normalizing a shared exit cannot rename their previous locals.
-    if (normalized && process.env.CFR_JS_GUARDED_FRAME_COMPLETION === '1') {
+    if (normalized) {
       const modes = [{}];
-      if (process.env.CFR_JS_GUARDED_FRAME_PREFIX_EFFECTS === '1') modes.push({effectfulGuards: true});
-      if (process.env.CFR_JS_GUARDED_FRAME_ALTERNATES === '1') modes.push({effectfulGuards: true, alternateGuards: true, maximumExits: 64});
+      modes.push({effectfulGuards: true});
+      modes.push({effectfulGuards: true, alternateGuards: true, maximumExits: 64});
       for (const mode of modes) for (;;) {
         const frame = foldGuardedFrameCompletion(source, {reservedNames: parameterNames, ...mode});
         if (!frame.framesRecovered) break;
         source = frame.source; changed = true;
       }
-      if (process.env.CFR_JS_COMPACT_LOCAL_BOOLEAN_GUARDS === '1') for (;;) {
+      for (;;) {
         const guards = compactLocalBooleanGuards(source, {reservedNames: parameterNames});
         if (!guards.guardsCompacted) break;
         source = guards.source; changed = true;
       }
     }
   }
-  if (process.env.CFR_JS_SHARED_LOOP_FRAME_EXITS === '1') {
+  {
     const exits = foldSharedLoopFrameExits(source);
     if (exits.breaksLocalized) {
       source = exits.source; changed = true;
@@ -2464,10 +2466,10 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
         if (!branch.framesRemoved) break;
         source = branch.source; changed = true;
       }
-      if (process.env.CFR_JS_GUARDED_FRAME_COMPLETION === '1') {
+      {
         const modes = [{}];
-        if (process.env.CFR_JS_GUARDED_FRAME_PREFIX_EFFECTS === '1') modes.push({effectfulGuards: true});
-        if (process.env.CFR_JS_GUARDED_FRAME_ALTERNATES === '1') modes.push({effectfulGuards: true, alternateGuards: true, maximumExits: 64});
+        modes.push({effectfulGuards: true});
+        modes.push({effectfulGuards: true, alternateGuards: true, maximumExits: 64});
         for (const mode of modes) for (;;) {
           const frame = foldGuardedFrameCompletion(source, {reservedNames: parameterNames, ...mode});
           if (!frame.framesRecovered) break;
@@ -2476,98 +2478,99 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
       }
     }
   }
-  if (process.env.CFR_JS_GUARDED_FRAME_DOMINATING_ASSIGNMENTS === '1' &&
-      process.env.CFR_JS_GUARDED_FRAME_COMPLETION === '1') {
+  {
     // Recognize pre-frame initialization only after established recovery has
-    // allocated its decisions. Existing names and policy defaults stay stable.
+    // allocated its decisions. Existing continuation names stay stable.
     let recovered = false;
     const modes = [{dominatingAssignments: true}];
-    if (process.env.CFR_JS_GUARDED_FRAME_PREFIX_EFFECTS === '1') modes.push({dominatingAssignments: true, effectfulGuards: true});
-    if (process.env.CFR_JS_GUARDED_FRAME_ALTERNATES === '1') modes.push({dominatingAssignments: true, effectfulGuards: true, alternateGuards: true, maximumExits: 64});
+    modes.push({dominatingAssignments: true, effectfulGuards: true});
+    modes.push({dominatingAssignments: true, effectfulGuards: true, alternateGuards: true, maximumExits: 64});
     for (const mode of modes) for (;;) {
       const frame = foldGuardedFrameCompletion(source, {reservedNames: parameterNames, ...mode});
       if (!frame.framesRecovered) break;
       source = frame.source; changed = true; recovered = true;
     }
-    if (recovered && process.env.CFR_JS_COMPACT_LOCAL_BOOLEAN_GUARDS === '1') for (;;) {
+    if (recovered) for (;;) {
       const guards = compactLocalBooleanGuards(source, {reservedNames: parameterNames});
       if (!guards.guardsCompacted) break;
       source = guards.source; changed = true;
     }
   }
-  if (process.env.CFR_JS_SCOPED_FRAME_INITIALIZATION === '1') {
+  {
     let recovered = false;
-    if (process.env.CFR_JS_LOOP_FRAME_COMPLETION === '1') for (;;) {
+    for (;;) {
       const frame = foldLoopFrameCompletion(source, {reservedNames: parameterNames, scopedInitialization: true});
       if (!frame.exitsRecovered) break;
       source = frame.source; changed = true; recovered = true;
     }
-    if (process.env.CFR_JS_GUARDED_FRAME_COMPLETION === '1') {
+    {
       const modes = [{scopedInitialization: true, dominatingAssignments: true}];
-      if (process.env.CFR_JS_GUARDED_FRAME_PREFIX_EFFECTS === '1') modes.push({scopedInitialization: true, dominatingAssignments: true, effectfulGuards: true});
-      if (process.env.CFR_JS_GUARDED_FRAME_ALTERNATES === '1') modes.push({scopedInitialization: true, dominatingAssignments: true, effectfulGuards: true, alternateGuards: true, maximumExits: 64});
+      modes.push({scopedInitialization: true, dominatingAssignments: true, effectfulGuards: true});
+      modes.push({scopedInitialization: true, dominatingAssignments: true, effectfulGuards: true, alternateGuards: true, maximumExits: 64});
       for (const mode of modes) for (;;) {
         const frame = foldGuardedFrameCompletion(source, {reservedNames: parameterNames, ...mode});
         if (!frame.framesRecovered) break;
         source = frame.source; changed = true; recovered = true;
       }
     }
-    if (recovered && process.env.CFR_JS_COMPACT_LOCAL_BOOLEAN_GUARDS === '1') for (;;) {
+    if (recovered) for (;;) {
       const guards = compactLocalBooleanGuards(source, {reservedNames: parameterNames});
       if (!guards.guardsCompacted) break;
       source = guards.source; changed = true;
     }
   }
-  if (process.env.CFR_JS_KNOWN_BOOLEAN_ALTERNATIVES === '1') for (;;) {
+  for (;;) {
     const alternative = foldKnownBooleanAlternatives(source, {reservedNames: parameterNames});
     if (!alternative.alternativesRecovered) break;
     source = alternative.source; changed = true;
   }
-  if (process.env.CFR_JS_NEGATED_EQUALITY_VALUES === '1') for (;;) {
+  for (;;) {
     const equality = simplifyNegatedEqualityValues(source);
     if (!equality.equalitiesSimplified) break;
     source = equality.source; changed = true;
   }
-  if (process.env.CFR_JS_PRIMITIVE_BOOLEAN_VALUES === '1') for (;;) {
+  for (;;) {
     const value = simplifyPredicateNegations(source, {parameters, ownedFields,
       complementIntegralRelations: false, primitiveValueDoubleNegations: true});
     if (!value.predicatesSimplified) break;
     source = value.source; changed = true;
   }
-  if (process.env.CFR_JS_BOOLEAN_LOGICAL_VALUES === '1') for (;;) {
+  for (;;) {
     const value = simplifyPredicateNegations(source, {
       complementIntegralRelations: false, booleanValueLogicalNegations: true});
     if (!value.predicatesSimplified) break;
     source = value.source; changed = true;
   }
-  if (process.env.CFR_JS_LATE_NESTED_IF_CONDITIONS === '1') for (;;) {
+  for (;;) {
     const conjunction = foldNestedIfConditions(source);
     if (!conjunction.ifsMerged) break;
     source = conjunction.source; changed = true;
   }
-  if (process.env.CFR_JS_UNIQUE_DECLARATION_BLOCKS === '1') for (;;) {
+  for (;;) {
     const blocks = flattenStandaloneBlocks(source, {uniqueDeclarations: true, declarationsOnly: true, reservedNames: parameterNames});
     if (!blocks.blocksFlattened) break;
     source = blocks.source; changed = true;
   }
-  if (process.env.CFR_JS_SHARED_SWITCH_FRAME_EXITS === '1') {
+  {
     const exits = foldSharedSwitchFrameExits(source);
     if (exits.breaksLocalized) {source = exits.source; changed = true;}
   }
-  if (process.env.CFR_JS_SPLIT_MULTILINE_BLOCK_HEADERS === '1') {
+  {
     const headers = splitMultilineBlockHeaders(source);
     if (headers.headersSplit) {source = headers.source; changed = true;}
   }
-  if (process.env.CFR_JS_CHAIN_LOCAL_BOOLEAN_ASSIGNMENTS === '1') for (;;) {
+  for (;;) {
     const guards = compactLocalBooleanGuards(source, {crossLocalAssignments: true, reservedNames: parameterNames});
     if (!guards.guardsCompacted) break;
     source = guards.source; changed = true;
   }
-  if (process.env.CFR_JS_WRAP_LOGICAL_CONDITIONS === '1') {
+  const transfers = removeUnreachableControlTransfers(source);
+  if (transfers.transfersRemoved) {source = transfers.source; changed = true;}
+  {
     const conditions = wrapLogicalConditionLines(source);
     if (conditions.conditionsWrapped) {source = conditions.source; changed = true;}
   }
-  if (process.env.CFR_JS_REINDENT_STRUCTURED_BODIES === '1') {
+  {
     const indentation = reindentStructuredSource(source);
     if (indentation.linesReindented) {source = indentation.source; changed = true;}
   }
@@ -2577,7 +2580,7 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
 function formatBlock(header, body) {
   // Exception boundaries, constructor guards and initializer helpers may be
   // added after statement recovery. Normalize their final complete scope too.
-  if (process.env.CFR_JS_REINDENT_STRUCTURED_BODIES === '1' && body.length) {
+  if (body.length) {
     const indentation = reindentStructuredSource(body.join('\n'));
     if (indentation.linesReindented) body = indentation.source.split('\n');
   }
@@ -2766,8 +2769,7 @@ function decompileCode(code, method, cls, localState, options = {}) {
     // predecessor) structure as a loop with one increment per arm. Re-share
     // them first so both the range recognizer and the CFG structurer see the
     // single latch the source had. Pure tail merge; see loopTailMerge.js.
-    // CFR_JS_DISABLE_LOOP_TAIL_MERGE=1 keeps the duplicated shape for A/B runs.
-    if (process.env.CFR_JS_DISABLE_LOOP_TAIL_MERGE !== '1') mergeDuplicateLoopIncrementTails(code);
+    mergeDuplicateLoopIncrementTails(code);
     nopNormallyUnreachableBlocks(code);
   }
   const codeItemsForSelection = code.codeItems || [];
@@ -4472,8 +4474,8 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     && methodReturnType(method) === 'void'
     && !(method.flags || []).includes('synchronized')
     && !syncHandlers.size;
-  let stateMachineReason = process.env.CFR_JS_FORCE_STATE_MACHINE === '1'
-    ? 'forced by CFR_JS_FORCE_STATE_MACHINE'
+  let stateMachineReason = options.forceStateMachine === true
+    ? 'forced state-machine test mode'
     : (partitionOversizedMethod && options.structureOversizedMethods === false
       ? 'partitioned oversized CFG'
       : (normalBranchIntoHandler
@@ -5035,7 +5037,7 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     const stateMachineConfiguration = {
       throwOwner: simpleClassName(cls.className || 'Class'),
       coalesceLinearStates: options.coalesceStateMachineChains
-        ?? (process.env.CFR_JS_COALESCE_STATE_MACHINE_CHAINS !== '0'),
+        ?? true,
       stats: stateMachineStats,
     };
     let statements = useStateMachine ? null : structuredStatements(structured.tree, render);
@@ -11047,8 +11049,7 @@ function coerceCheckedReference(value, type, model) {
   // Consult hierarchy metadata only for a cast the old source already needs.
   // Retain its target type so overloads and member dispatch stay pinned; do not
   // add target casts to the default emitter's already-safe widening cases.
-  const useHierarchy = process.env.CFR_JS_AVOID_PROVEN_REFERENCE_CAST_BRIDGES === '1'
-    && !isSourceReferenceTypeAssignable(value.type, type, model)
+  const useHierarchy = !isSourceReferenceTypeAssignable(value.type, type, model)
     && isSourceReferenceTypeAssignable(type, value.type, model);
   return coerceExpressionForType(value, type, useHierarchy ? model : null, !useHierarchy);
 }
@@ -11108,8 +11109,7 @@ function coerceExpressionForType(value, targetType, exceptionModel = null, allow
     // A narrowing cast along a proven hierarchy is legal directly. Keep the
     // explicit target cast (and its runtime check); only the Object bridge is
     // unnecessary. Unknown or unrelated types retain the existing bridge.
-    const directNarrowing = process.env.CFR_JS_AVOID_PROVEN_REFERENCE_CAST_BRIDGES === '1'
-      && isSourceReferenceTypeAssignable(type, sourceType, exceptionModel);
+    const directNarrowing = isSourceReferenceTypeAssignable(type, sourceType, exceptionModel);
     const sourceNeedsBridge = !isAssignable && !directNarrowing
       && (sourceIsKnownReference || /^stack(?:In|Out)_/.test(value.code));
     const operand = sourceNeedsBridge ? `(Object) ${wrap(value, 90)}` : wrap(value, 90);

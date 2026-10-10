@@ -36,12 +36,12 @@ test('native switch and guarded-prefix recovery preserve fallthrough, effects an
  }finally{fs.rmSync(dir,{recursive:true,force:true});}
 });
 
-test('compiler switch tails and effectful prefixes require their opt-in policies',()=>{
- const finish=require('../src/decompiler/cfr')._internals.shareExistingExitTails,keys=['CFR_JS_SWITCH_EXIT_TAILS','CFR_JS_GUARDED_FRAME_COMPLETION','CFR_JS_GUARDED_FRAME_PREFIX_EFFECTS'],old=keys.map(k=>process.env[k]),source='Exit:{if(first()){firstWork();}else if(enabled()){switch(select()){'+Array.from({length:20},(_,i)=>`case ${i}:step(${i});if(stop())break Exit;`).join('')+'case 20:break;default:break Exit;}store();break Exit;}start();}';
- try{keys.forEach(k=>delete process.env[k]);let body=[source];finish(body);const before=body.join('\n');keys.forEach(k=>process.env[k]='1');body=[source];finish(body);assert.notEqual(body.join('\n'),before);assert.ok(!body.join('\n').includes('break Exit'));assert.match(body.join('\n'),/boolean decompiledFrameRemainder/);}finally{keys.forEach((k,i)=>old[i]===undefined?delete process.env[k]:process.env[k]=old[i]);}
+test('compiler recovers switch tails and effectful prefixes by default',()=>{
+ const finish=require('../src/decompiler/cfr')._internals.shareExistingExitTails,source='Exit:{if(first()){firstWork();}else if(enabled()){switch(select()){'+Array.from({length:20},(_,i)=>'case '+i+':step('+i+');if(stop())break Exit;').join('')+'case 20:break;default:break Exit;}store();break Exit;}start();}',body=[source];
+ finish(body);assert.ok(!body.join('\n').includes('break Exit'));assert.match(body.join('\n'),/boolean decompiledFrameRemainder/);
 });
 
-test('new effectful frames preserve continuation names allocated by the ordinary policy',()=>{
- const finish=require('../src/decompiler/cfr')._internals.shareExistingExitTails,key='CFR_JS_GUARDED_FRAME_COMPLETION',extra='CFR_JS_GUARDED_FRAME_PREFIX_EFFECTS',old=[process.env[key],process.env[extra]],source='Old:{if(outer()){prefix();if(stop())break Old;work();}tail();}New:{if(first()){firstWork();}else if(enabled()){effect();break New;}remainder();}';
- try{process.env[key]='1';delete process.env[extra];let body=[source];finish(body);const baseline=body.join('\n');assert.match(baseline,/decompiledFrameRemainder0/);process.env[extra]='1';body=[source];finish(body);const result=body.join('\n');assert.match(result,/decompiledFrameRemainder0 = !\(stop\(\)\)/);assert.match(result,/decompiledFrameRemainder1 = false/);assert.ok(!result.includes('break New'));}finally{for(const[k,v]of[[key,old[0]],[extra,old[1]]])v===undefined?delete process.env[k]:process.env[k]=v;}
+test('automatic effectful recovery preserves previously allocated continuation names',()=>{
+ const finish=require('../src/decompiler/cfr')._internals.shareExistingExitTails,body=['Old:{if(outer()){prefix();if(stop())break Old;work();}tail();}New:{if(first()){firstWork();}else if(enabled()){effect();break New;}remainder();}'];
+ finish(body);const result=body.join('\n');assert.match(result,/decompiledFrameRemainder0 = !\(stop\(\)\)/);assert.match(result,/decompiledFrameRemainder1 = false/);assert.ok(!result.includes('break New'));
 });

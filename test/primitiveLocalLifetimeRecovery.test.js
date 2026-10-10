@@ -50,13 +50,9 @@ test('labeled continue targets, short-circuit assignments, primitive types and n
  assert.ok(constructor.startsWith('this(7); int x; int xLifetime1;'));
 });
 
-test('compiler option is explicit and reserves unused formal names',()=>{
- const{shareExistingExitTails:finish}=require('../src/decompiler/cfr')._internals;
- const previous=process.env.CFR_JS_SPLIT_PRIMITIVE_LIFETIMES;
- const source='int x;\nx=first();use(x);x=second();use(x);';
- try{delete process.env.CFR_JS_SPLIT_PRIMITIVE_LIFETIMES;const body=[source];finish(body);assert.equal(body.join('\n'),source);
-  process.env.CFR_JS_SPLIT_PRIMITIVE_LIFETIMES='1';finish(body,['xLifetime1']);assert.match(body.join('\n'),/int xLifetime2;/);
- }finally{if(previous===undefined)delete process.env.CFR_JS_SPLIT_PRIMITIVE_LIFETIMES;else process.env.CFR_JS_SPLIT_PRIMITIVE_LIFETIMES=previous;}
+test('compiler separates primitive phases and reserves formal names by default',()=>{
+ const{shareExistingExitTails:finish}=require('../src/decompiler/cfr')._internals,body=['int x;\nx=first();use(x);x=second();use(x);'];
+ finish(body,['xLifetime1']);assert.match(body.join('\n'),/int xLifetime2;/);
 });
 
 test('native phases match an independent event oracle including throws and outer finally effects',()=>{

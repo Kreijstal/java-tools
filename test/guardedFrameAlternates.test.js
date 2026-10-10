@@ -23,7 +23,7 @@ test('native alternatives preserve nullable predicates, protected prefix effects
  `;fs.writeFileSync(dir+'/AlternateOracle.java',java);run('javac',['--release','8','-d',dir,dir+'/AlternateOracle.java']);assert.equal(run('java',['-Xmx128m','-cp',dir,'AlternateOracle']),'50544');
  }finally{fs.rmSync(dir,{recursive:true,force:true});}
 });
-test('compiler alternate recovery is opt-in and preserves prior continuation names',()=>{
- const finish=require('../src/decompiler/cfr')._internals.shareExistingExitTails,keys=['CFR_JS_GUARDED_FRAME_COMPLETION','CFR_JS_GUARDED_FRAME_PREFIX_EFFECTS','CFR_JS_GUARDED_FRAME_ALTERNATES'],old=keys.map(k=>process.env[k]),s='Old:{if(outer()){prefix();if(stop())break Old;work();}tail();}New:{if(first()){firstWork();break New;}else other();remainder();}';
- try{process.env[keys[0]]='1';process.env[keys[1]]='1';delete process.env[keys[2]];let body=[s];finish(body);assert.ok(body.join('\n').includes('break New'));process.env[keys[2]]='1';body=[s];finish(body);assert.ok(!body.join('\n').includes('break New'));assert.match(body.join('\n'),/decompiledFrameRemainder0 = !\(stop\(\)\)/);assert.match(body.join('\n'),/decompiledFrameRemainder1 = false/);}finally{keys.forEach((k,i)=>old[i]===undefined?delete process.env[k]:process.env[k]=old[i]);}
+test('compiler recovers alternate arms and preserves prior decisions by default',()=>{
+ const finish=require('../src/decompiler/cfr')._internals.shareExistingExitTails,s='Old:{if(outer()){prefix();if(stop())break Old;work();}tail();}New:{if(first()){firstWork();break New;}else other();remainder();}',body=[s];
+ finish(body);const result=body.join('\n');assert.ok(!result.includes('break New'));assert.match(result,/decompiledFrameRemainder0 = !\(stop\(\)\)/);assert.match(result,/decompiledFrameRemainder1 = false/);
 });

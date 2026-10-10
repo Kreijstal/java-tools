@@ -49,7 +49,7 @@ test('wide character decisions retain definite assignment and every primitive in
  } finally {fs.rmSync(dir,{recursive:true,force:true});}
 });
 
-test('compiler ladder recovery is opt-in',()=>{
- const finish=require('../src/decompiler/cfr')._internals.shareExistingExitTails,key='CFR_JS_EXHAUSTIVE_IF_FRAME_EXITS',old=process.env[key],s='Exit:{if(ready()){'+Array.from({length:27},(_,i)=>'if(choice('+i+')){step('+i+');break Exit;}').join('')+'last();break Exit;}fallback();}';
- try{delete process.env[key];let body=[s];finish(body);const baseline=body.join('\n');process.env[key]='1';body=[s];finish(body);assert.notEqual(body.join('\n'),baseline);assert.ok(body.join('\n').includes('else'));}finally{if(old===undefined)delete process.env[key];else process.env[key]=old;}
+test('compiler reconstructs exhaustive ladders by default',()=>{
+ const finish=require('../src/decompiler/cfr')._internals.shareExistingExitTails,s='Exit:{if(ready()){'+Array.from({length:27},(_,i)=>'if(choice('+i+')){step('+i+');break Exit;}').join('')+'last();break Exit;}fallback();}',body=[s];
+ finish(body);assert.ok(!body.join('\n').includes('break Exit'));assert.ok(body.join('\n').includes('else'));
 });

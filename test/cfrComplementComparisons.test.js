@@ -63,7 +63,7 @@ function run(command, args, directory) {
 
 test('original JVM and rebuilt complements match signed boundaries, calls and exceptions', () => withoutExperimental(() => {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-complements-'));
-  const previous = process.env.CFR_JS_FORCE_STATE_MACHINE;
+
   try {
     const constants = ['MIN_VALUE', '-129', '-1', '0', '1', '5', '127', '128', 'MAX_VALUE'];
     const operators = ['==', '!=', '<', '<=', '>', '>='];
@@ -118,8 +118,8 @@ test('original JVM and rebuilt complements match signed boundaries, calls and ex
     assert.equal(expected.trim().split('\n').length, 220 * 16);
     assert.match(expected, /IllegalArgumentException/);
     for (const forced of [false, true]) {
-      if (forced) process.env.CFR_JS_FORCE_STATE_MACHINE = '1'; else delete process.env.CFR_JS_FORCE_STATE_MACHINE;
-      const source = decompileClassFile(path.join(native, 'ComplementCases.class'));
+
+      const source = decompileClassFile(path.join(native, 'ComplementCases.class'), {forceStateMachine: forced});
       assertNoFallback(source);
       assert.doesNotMatch(source, /\^ -1(?:L)?\b/);
       assert.match(source, /Effects\.intValue\(\w+\) \+ 0/);
@@ -132,8 +132,7 @@ test('original JVM and rebuilt complements match signed boundaries, calls and ex
       assert.equal(run('java', ['-cp', rebuilt, 'ComplementRunner'], rebuilt), expected);
     }
   } finally {
-    if (previous === undefined) delete process.env.CFR_JS_FORCE_STATE_MACHINE;
-    else process.env.CFR_JS_FORCE_STATE_MACHINE = previous;
+
     fs.rmSync(temporary, {recursive:true, force:true});
   }
 }));

@@ -36,7 +36,7 @@ test('native opaque controls match independent dispatch, conditional stores and 
  `;fs.writeFileSync(dir+'/OpaqueOracle.java',java);run('javac',['--release','8','-d',dir,dir+'/OpaqueOracle.java']);assert.equal(run('java',['-Xmx128m','-cp',dir,'OpaqueOracle']),'27324');
  }finally{fs.rmSync(dir,{recursive:true,force:true});}
 });
-test('compiler opaque-control dispatch recovery is explicitly opt-in',()=>{
- const finish=require('../src/decompiler/cfr')._internals.shareExistingExitTails,key='CFR_JS_OPAQUE_CONTROL_DISPATCHES',old=process.env[key],s='try{int selected=read();Frame:{'+ladder('try{while(more()){work();}}finally{cleanup();}').replace('fallback();','{if(guard()){if(other()){first();break Frame;}second();break Frame;}tail();}')+'}after();}finally{finish();}';
- try{delete process.env[key];let body=[s];finish(body);assert.ok(!body.join('\n').includes('switch'));process.env[key]='1';body=[s];finish(body);assert.match(body.join('\n'),/switch \(selected\)/);}finally{old===undefined?delete process.env[key]:process.env[key]=old;}
+test('compiler recovers proved opaque dispatches by default',()=>{
+ const finish=require('../src/decompiler/cfr')._internals.shareExistingExitTails,s='try{int selected=read();Frame:{'+ladder('try{while(more()){work();}}finally{cleanup();}').replace('fallback();','{if(guard()){if(other()){first();break Frame;}second();break Frame;}tail();}')+'}after();}finally{finish();}',body=[s];
+ finish(body);assert.match(body.join('\n'),/switch \(selected\)/);
 });

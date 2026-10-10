@@ -26,7 +26,7 @@ test('native nested switch exits match an independent pending-completion model',
  `;fs.writeFileSync(dir+'/SharedSwitchOracle.java',java);run('javac',['--release','8','-d',dir,dir+'/SharedSwitchOracle.java']);assert.equal(run('java',['-Xmx128m','-cp',dir,'SharedSwitchOracle']),'174960');
  }finally{fs.rmSync(dir,{recursive:true,force:true});}
 });
-test('compiler nested-exit and block-header policies are explicitly opt-in',()=>{
- const finish=require('../src/decompiler/cfr')._internals.shareExistingExitTails,keys=['CFR_JS_SHARED_SWITCH_FRAME_EXITS','CFR_JS_SPLIT_MULTILINE_BLOCK_HEADERS'],old=keys.map(k=>process.env[k]),s='F:{switch(a){default:switch(b){default:if(test())break F;work();}break;}}if(test()){one();\ntwo();\n}';
- try{keys.forEach(k=>delete process.env[k]);let body=[s];finish(body);assert.ok(body.join('\n').includes('break F'));keys.forEach(k=>process.env[k]='1');body=[s];finish(body);assert.ok(!body.join('\n').includes('break F'));assert.ok(body.join('\n').includes('{\none();'));}finally{keys.forEach((k,i)=>old[i]===undefined?delete process.env[k]:process.env[k]=old[i]);}
+test('compiler recovers nested switch exits and formats block headers by default',()=>{
+ const finish=require('../src/decompiler/cfr')._internals.shareExistingExitTails,body=['F:{switch(a){default:switch(b){default:if(test())break F;work();}break;}}if(test()){one();\ntwo();\n}'];
+ finish(body);assert.ok(!body.join('\n').includes('break F'));assert.match(body.join('\n'),/\{\n\s*one\(\);/);
 });

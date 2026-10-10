@@ -23,7 +23,7 @@ function run(command,args,directory) {
 
 test('nested numeric negation preserves values, locals, literal boundaries and effect order',()=>{
   const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'cfr-numeric-negation-'));
-  const previous=process.env.CFR_JS_FORCE_STATE_MACHINE;
+
   try {
     const native=path.join(temporary,'native');fs.mkdirSync(native);
     const cases=[['int','I','i',1],['long','J','l',2],['float','F','f',1],['double','D','d',2]];
@@ -126,9 +126,8 @@ test('nested numeric negation preserves values, locals, literal boundaries and e
     const expected=run('java',['-cp',native,'NegationRunner'],native);
     assert.equal(expected.trim().split('\n').length,137);
     for(const forced of [false,true]) {
-      if(forced) process.env.CFR_JS_FORCE_STATE_MACHINE='1';
-      else delete process.env.CFR_JS_FORCE_STATE_MACHINE;
-      const source=decompileClassFile(classFile);assertNoFallback(source);
+
+      const source=decompileClassFile(classFile, {forceStateMachine: forced});assertNoFallback(source);
       assert.doesNotMatch(source,/--param0|--2147483648|--9223372036854775808/);
       const rebuilt=path.join(temporary,forced?'forced':'structured');fs.mkdirSync(rebuilt);
       for(const [name,text] of Object.entries({NumericNegation:source,Effects:effects,NegationRunner:driver}))
@@ -138,8 +137,7 @@ test('nested numeric negation preserves values, locals, literal boundaries and e
       assert.equal(run('java',['-cp',rebuilt,'NegationRunner'],rebuilt),expected);
     }
   } finally {
-    if(previous===undefined) delete process.env.CFR_JS_FORCE_STATE_MACHINE;
-    else process.env.CFR_JS_FORCE_STATE_MACHINE=previous;
+
     fs.rmSync(temporary,{recursive:true,force:true});
   }
 });
@@ -224,7 +222,7 @@ test('attributed source audit accepts integral signs and rejects changes outside
 
 test('signed-term reconstruction matches native modular arithmetic and evaluation failures',()=>{
   const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'cfr-signed-terms-'));
-  const previous=process.env.CFR_JS_FORCE_STATE_MACHINE;
+
   try {
     const native=path.join(temporary,'native');fs.mkdirSync(native);
     let assembly='.version 49 0\n.class public super SignedTerms\n.super java/lang/Object\n';
@@ -328,8 +326,8 @@ test('signed-term reconstruction matches native modular arithmetic and evaluatio
     run('javac',['--release','8','-classpath',native,'-d',native,path.join(native,'SignedEffects.java'),path.join(native,'SignedRunner.java')],native);
     const expected=run('java',['-cp',native,'SignedRunner'],native);assert.match(expected,/complete:10175\n$/);
     for(const forced of [false,true]) {
-      if(forced)process.env.CFR_JS_FORCE_STATE_MACHINE='1';else delete process.env.CFR_JS_FORCE_STATE_MACHINE;
-      const source=decompileClassFile(classFile);assertNoFallback(source);
+
+      const source=decompileClassFile(classFile, {forceStateMachine: forced});assertNoFallback(source);
       for(const type of ['int','long'])for(const original of ['add','sub'])for(let count=0;count<=4;count++) {
         const body=source.match(new RegExp(`\\b${type}${original}${count}\\([^)]*\\) \\{([\\s\\S]*?)\\n    \\}`))?.[1];
         const symbol=(original==='add')!==(count%2===1)?'+':'-';
@@ -341,14 +339,14 @@ test('signed-term reconstruction matches native modular arithmetic and evaluatio
       assert.equal(run('java',['-cp',rebuilt,'SignedRunner'],rebuilt),expected);
     }
   } finally {
-    if(previous===undefined)delete process.env.CFR_JS_FORCE_STATE_MACHINE;else process.env.CFR_JS_FORCE_STATE_MACHINE=previous;
+
     fs.rmSync(temporary,{recursive:true,force:true});
   }
 });
 
 test('literal shift distances use the opcode width and preserve dynamic operand effects',()=>{
   const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'cfr-shift-distances-'));
-  const previous=process.env.CFR_JS_FORCE_STATE_MACHINE;
+
   const distances=[-2147483648,-2147483647,-449443480,-1230457200,-65,-64,-63,-33,-32,-31,
     -1,0,1,8,16,31,32,33,63,64,65,2147483647];
   try {
@@ -443,8 +441,8 @@ test('literal shift distances use the opcode width and preserve dynamic operand 
     const expected=run('java',['-cp',native,'ShiftRunner'],native);
     assert.match(expected,/complete:12162\n$/);
     for(const forced of [false,true]) {
-      if(forced)process.env.CFR_JS_FORCE_STATE_MACHINE='1';else delete process.env.CFR_JS_FORCE_STATE_MACHINE;
-      const source=decompileClassFile(classFile);assertNoFallback(source);
+
+      const source=decompileClassFile(classFile, {forceStateMachine: forced});assertNoFallback(source);
       // Exact source assertions prevent a semantically valid but still opaque
       // unchanged emission from passing the native comparison.
       for(const [type,width] of [['int',31],['long',63]])for(const [suffix,symbol] of [['Left','<<'],['Right','>>'],['Unsigned','>>>']]) {
@@ -463,7 +461,7 @@ test('literal shift distances use the opcode width and preserve dynamic operand 
       assert.equal(run('java',['-cp',rebuilt,'ShiftRunner'],rebuilt),expected);
     }
   } finally {
-    if(previous===undefined)delete process.env.CFR_JS_FORCE_STATE_MACHINE;else process.env.CFR_JS_FORCE_STATE_MACHINE=previous;
+
     fs.rmSync(temporary,{recursive:true,force:true});
   }
 });

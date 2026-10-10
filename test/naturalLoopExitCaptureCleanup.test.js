@@ -48,6 +48,6 @@ test('native direct loops match an independent model under nullable tests, early
  }finally{fs.rmSync(d,{recursive:true,force:true});}
 });
 
-test('compiler cleanup is opt-in and retains captured decisions by default',()=>{
- const finish=require('../src/decompiler/cfr')._internals.shareExistingExitTails,key='CFR_JS_SIMPLIFY_NATURAL_LOOP_EXIT_CAPTURES',old=process.env[key];try{delete process.env[key];let b=[source];finish(b,['n','limit']);const prior=b.join('\n');process.env[key]='1';b=[source];finish(b,['n','limit']);assert.notEqual(b.join('\n'),prior);assert.ok(!b.join('\n').includes('done'));}finally{if(old===undefined)delete process.env[key];else process.env[key]=old;}
+test('compiler removes unnecessary natural-exit captures by default',()=>{
+ const finish=require('../src/decompiler/cfr')._internals.shareExistingExitTails,body=[source];finish(body,['n','limit']);assert.ok(!body.join('\n').includes('done'));
 });

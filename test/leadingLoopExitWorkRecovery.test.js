@@ -23,8 +23,9 @@ test('unsafe self exits, ambiguous assignment, captures and unsupported input re
  ])assert.equal(fold(s).source,s,s);
  const source='while(true){if(end()){finish();break;}work();}';assert.equal(fold(source,{reservedNames:null}).loopsRecovered,0);assert.equal(fold(source,{retainDiagnostics:1}).loopsRecovered,0);assert.ok(fold(source,{reservedNames:['decompiledNaturalLoopExit0']}).source.includes('decompiledNaturalLoopExit1'));
 });
-test('compiler integration is opt-in',()=>{
- const finish=require('../src/decompiler/cfr')._internals.shareExistingExitTails,key='CFR_JS_LEADING_LOOP_EXIT_WORK',old=process.env[key],s='while(true){if(end()){finish();break;}if(stop())break;work();}';try{delete process.env[key];let b=[s];finish(b);const prior=b.join('\n');process.env[key]='1';b=[s];finish(b);assert.notEqual(b.join('\n'),prior);assert.ok(b.join('\n').includes('decompiledNaturalLoopExit0'));}finally{if(old===undefined)delete process.env[key];else process.env[key]=old;}
+test('compiler recovers leading loop exit work by default',()=>{
+ const finish=require('../src/decompiler/cfr')._internals.shareExistingExitTails,body=['while(true){if(end()){finish();break;}if(stop())break;work();}'];
+ finish(body);assert.ok(body.join('\n').includes('decompiledNaturalLoopExit0'));
 });
 test('native exit-only work matches independent outcomes under nullable guards and protected overrides',()=>{
  const directory=fs.mkdtempSync(path.join(os.tmpdir(),'leading-loop-exit-native-'));

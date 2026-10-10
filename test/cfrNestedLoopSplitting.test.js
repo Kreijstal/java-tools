@@ -21,7 +21,7 @@ function run(command, args, directory) {
 for (const branch of ['ordinary', 'reversed', 'switch']) {
   test(`protected nested cycles retain effect order and catches: ${branch}`, () => {
     const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-nested-cycles-'));
-    const previous = process.env.CFR_JS_FORCE_STATE_MACHINE;
+
     try {
       const native = path.join(temporary, 'native');
       fs.mkdirSync(native);
@@ -54,10 +54,9 @@ for (const branch of ['ordinary', 'reversed', 'switch']) {
       assert.equal(expected.trim().split('\n').length, 140);
       assert.match(expected, /-30000/); // first effect throws before updating result
       for (const forced of [false, true]) {
-        if (forced) process.env.CFR_JS_FORCE_STATE_MACHINE = '1';
-        else delete process.env.CFR_JS_FORCE_STATE_MACHINE;
+
         const diagnostics = [];
-        const source = decompileClassFile(classFile, {diagnostics});
+        const source = decompileClassFile(classFile, {diagnostics, forceStateMachine: forced});
         assertNoFallback(source);
         assert.equal(source.includes('switch (statePc)'), forced, JSON.stringify(diagnostics));
         assert.match(source, /catch \(/);
@@ -72,8 +71,7 @@ for (const branch of ['ordinary', 'reversed', 'switch']) {
         assert.equal(run('java', ['-cp', rebuilt, 'NestedRunner'], rebuilt), expected);
       }
     } finally {
-      if (previous === undefined) delete process.env.CFR_JS_FORCE_STATE_MACHINE;
-      else process.env.CFR_JS_FORCE_STATE_MACHINE = previous;
+
       fs.rmSync(temporary, {recursive: true, force: true});
     }
   });

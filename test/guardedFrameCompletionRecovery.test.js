@@ -1,6 +1,16 @@
 'use strict';
 const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),os=require('node:os'),path=require('node:path'),{spawnSync}=require('node:child_process');
 const{foldGuardedFrameCompletion:fold}=require('../src/decompiler/javaAstEmitter');
+test('locals assigned across frame exits retain definite assignment after the frame',()=>{
+ const source='String selected;Frame:{if(first()){snapshot();if(second()){selected=preferred();break Frame;}}selected=fallback();}consume(selected);';
+ for(const options of [{effectfulGuards:true},{effectfulGuards:true,alternateGuards:true},
+  {effectfulGuards:true,dominatingAssignments:true,scopedInitialization:true}]){
+  assert.equal(fold(source,options).source,source);
+  assert.equal(fold(source,options).framesRecovered,0);
+ }
+ const initialized=source.replace('String selected;','String selected=null;');
+ assert.equal(fold(initialized,{effectfulGuards:true}).framesRecovered,1);
+});
 test('nested frame exits capture original decisions and guard all remaining suffixes',()=>{
  const s='Frame:{if(outer()){prefix();if(stop())break Frame;work();if(done())break Frame;}rest();}after();',r=fold(s,{retainDiagnostics:true});assert.equal(r.framesRecovered,1);assert.equal(r.jumpsRemoved,2);assert.equal(r.guardsAdded,2);assert.ok(!r.source.includes('Frame:'));for(const t of ['outer()','prefix()','stop()','work()','done()','rest()','after()'])assert.equal(r.source.split(t).length-1,1,t);let expected=s;for(const e of r.diagnostics.edits)expected=expected.slice(0,e.start)+e.text+expected.slice(e.end);assert.equal(expected,r.source);assert.equal(fold(r.source).framesRecovered,0);
 });
@@ -139,4 +149,7 @@ test('native multiple exits match independent ordered outcomes under nulls, writ
  }finally{fs.rmSync(dir,{recursive:true,force:true});}
 });
 
-test('compiler frame completion is opt-in',()=>{const finish=require('../src/decompiler/cfr')._internals.shareExistingExitTails,key='CFR_JS_GUARDED_FRAME_COMPLETION',old=process.env[key],source='Frame:{if(outer()){prefix();if(stop())break Frame;work();}tail();}';try{delete process.env[key];let body=[source];finish(body);const prior=body.join('\n');process.env[key]='1';body=[source];finish(body);assert.notEqual(body.join('\n'),prior);assert.ok(body.join('\n').includes('decompiledFrameRemainder0'));}finally{if(old===undefined)delete process.env[key];else process.env[key]=old;}});
+test('compiler recovers guarded frame completion by default',()=>{
+ const finish=require('../src/decompiler/cfr')._internals.shareExistingExitTails,body=['Frame:{if(outer()){prefix();if(stop())break Frame;work();}tail();}'];
+ finish(body);assert.ok(!body.join('\n').includes('break Frame'));assert.ok(body.join('\n').includes('decompiledFrameRemainder0'));
+});

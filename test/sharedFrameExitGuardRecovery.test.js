@@ -32,7 +32,7 @@ test('native shared exits and combined continuation recovery match an independen
  `;fs.writeFileSync(dir+'/SharedExitOracle.java',java);run('javac',['--release','8','-d',dir,dir+'/SharedExitOracle.java']);assert.equal(run('java',['-Xmx128m','-cp',dir,'SharedExitOracle']),'58320');
  }finally{fs.rmSync(dir,{recursive:true,force:true});}
 });
-test('compiler shared-exit normalization is opt-in and preserves existing decision identities',()=>{
- const finish=require('../src/decompiler/cfr')._internals.shareExistingExitTails,keys=['CFR_JS_SHARED_FRAME_EXIT_GUARDS','CFR_JS_GUARDED_FRAME_COMPLETION','CFR_JS_GUARDED_FRAME_PREFIX_EFFECTS'],old=keys.map(k=>process.env[k]),s='Old:{if(outer()){prefix();if(stop())break Old;work();}tail();}New:{if(first()){prefix();if(test())break New;work();break New;}tail();}';
- try{process.env[keys[1]]='1';process.env[keys[2]]='1';delete process.env[keys[0]];let body=[s];finish(body);assert.ok(body.join('\n').includes('break New'));process.env[keys[0]]='1';body=[s];finish(body);assert.ok(!body.join('\n').includes('break New'));assert.match(body.join('\n'),/decompiledFrameRemainder0 = !\(stop\(\)\)/);assert.match(body.join('\n'),/decompiledFrameRemainder1 = false/);}finally{keys.forEach((k,i)=>old[i]===undefined?delete process.env[k]:process.env[k]=old[i]);}
+test('compiler normalizes shared exits and preserves decision identities by default',()=>{
+ const finish=require('../src/decompiler/cfr')._internals.shareExistingExitTails,body=['Old:{if(outer()){prefix();if(stop())break Old;work();}tail();}New:{if(first()){prefix();if(test())break New;work();break New;}tail();}'];
+ finish(body);const result=body.join('\n');assert.ok(!result.includes('break New'));assert.match(result,/decompiledFrameRemainder0 = !\(stop\(\)\)/);assert.match(result,/decompiledFrameRemainder1 = false/);
 });

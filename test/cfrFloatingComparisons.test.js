@@ -117,7 +117,7 @@ function driver(className) {
 for (const [stored, interfaceClass] of [[false, false], [true, false], [true, true]]) {
   test(`JVM comparison ${stored ? 'stored values' : 'branches'} preserve NaN, zero and effects${interfaceClass ? ' in interfaces' : ''}`, () => {
     const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-floating-comparisons-'));
-    const previous = process.env.CFR_JS_FORCE_STATE_MACHINE;
+
     try {
       const native = path.join(temporary, 'native'); fs.mkdirSync(native);
       const name = interfaceClass ? 'ComparisonInterface' : 'ComparisonCases';
@@ -133,8 +133,8 @@ for (const [stored, interfaceClass] of [[false, false], [true, false], [true, tr
       assert.match(expected, /IllegalArgumentException:true:L\n/);
       assert.match(expected, /IllegalArgumentException:true:LR\n/);
       for (const forced of [false, true]) {
-        if (forced) process.env.CFR_JS_FORCE_STATE_MACHINE = '1'; else delete process.env.CFR_JS_FORCE_STATE_MACHINE;
-        const source = decompileClassFile(classFile); assertNoFallback(source);
+
+        const source = decompileClassFile(classFile, {forceStateMachine: forced}); assertNoFallback(source);
         const rebuilt = path.join(temporary, forced ? 'forced' : 'structured'); fs.mkdirSync(rebuilt);
         for (const [file, text] of Object.entries({[name]: source, Effects: effects, ComparisonRunner: runner}))
           fs.writeFileSync(path.join(rebuilt, file + '.java'), text);
@@ -151,8 +151,7 @@ for (const [stored, interfaceClass] of [[false, false], [true, false], [true, tr
         }
       }
     } finally {
-      if (previous === undefined) delete process.env.CFR_JS_FORCE_STATE_MACHINE;
-      else process.env.CFR_JS_FORCE_STATE_MACHINE = previous;
+
       fs.rmSync(temporary, {recursive: true, force: true});
     }
   });

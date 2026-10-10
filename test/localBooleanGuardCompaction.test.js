@@ -81,13 +81,14 @@ test('native compound guards preserve flag stores on partial failure and skip nu
   } finally {fs.rmSync(dir,{recursive:true,force:true});}
 });
 
-test('compiler guard compaction and indentation are independently opt-in', () => {
-  const finish=require('../src/decompiler/cfr')._internals.shareExistingExitTails, keys=['CFR_JS_COMPACT_LOCAL_BOOLEAN_GUARDS','CFR_JS_REINDENT_STRUCTURED_BODIES'], old=keys.map(k=>process.env[k]);
-  try{keys.forEach(k=>delete process.env[k]);const s='boolean f=true;\nif(f){\nf=one();\nif(f){\nrun();\n}\n}',body=[s];finish(body);const baseline=body.join('\n');process.env[keys[0]]='1';const compact=[s];finish(compact);assert.notEqual(compact.join('\n'),baseline);process.env[keys[1]]='1';const formatted=[s];finish(formatted);assert.match(formatted.join('\n'),/\n  run\(\)/);}finally{keys.forEach((k,i)=>old[i]===undefined?delete process.env[k]:process.env[k]=old[i]);}
+test('compiler compacts guards and indents their work by default',()=>{
+ const finish=require('../src/decompiler/cfr')._internals.shareExistingExitTails,body=['boolean f=true;\nif(f){\nf=one();\nif(f){\nrun();\n}\n}'];
+ finish(body);assert.match(body.join('\n'),/f=one\(\)/);assert.match(body.join('\n'),/\n  run\(\)/);assert.equal((body.join('\n').match(/if\s*\(/g)||[]).length,1);
 });
 
-test('final rendering normalizes wrappers introduced after statement recovery',()=>{
- const {formatBlock}=require('../src/decompiler/cfr')._internals,key='CFR_JS_REINDENT_STRUCTURED_BODIES',old=process.env[key];
+test('final rendering normalizes later wrappers without changing tokens or input',()=>{
+ const {formatBlock}=require('../src/decompiler/cfr')._internals;
  const body=['try {','    boolean flag=true;','    if(flag) {','        work();','    }','} catch (RuntimeException e) {','    throw e;','}'];
- try{delete process.env[key];const baseline=formatBlock('void run()',body);process.env[key]='1';const result=formatBlock('void run()',body);assert.notEqual(result,baseline);assert.match(result,/\n      boolean flag=true;/);assert.match(result,/\n        work\(\);/);assert.deepEqual(tokenizeJava(result).tokens.map(t=>t.text),tokenizeJava(baseline).tokens.map(t=>t.text));assert.equal(body[1],'    boolean flag=true;');}finally{if(old===undefined)delete process.env[key];else process.env[key]=old;}
+ const result=formatBlock('void run()',body);assert.match(result,/\n      boolean flag=true;/);assert.match(result,/\n        work\(\);/);
+ assert.deepEqual(tokenizeJava(result).tokens.map(t=>t.text),tokenizeJava('void run(){'+body.join('\n')+'}').tokens.map(t=>t.text));assert.equal(body[1],'    boolean flag=true;');
 });

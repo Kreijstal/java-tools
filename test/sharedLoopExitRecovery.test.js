@@ -25,7 +25,7 @@ test('native while/for/do exits preserve tests, updates and protected pending co
  `;fs.writeFileSync(dir+'/SharedLoopOracle.java',java);run('javac',['--release','8','-d',dir,dir+'/SharedLoopOracle.java']);assert.equal(run('java',['-Xmx128m','-cp',dir,'SharedLoopOracle']),'74358');
  }finally{fs.rmSync(dir,{recursive:true,force:true});}
 });
-test('late compiler loop continuation recovery remains opt-in',()=>{
- const finish=require('../src/decompiler/cfr')._internals.shareExistingExitTails,key='CFR_JS_SHARED_LOOP_FRAME_EXITS',old=process.env[key],s='F:{prefix();if(first()){while(next()){work();if(stop())break F;}break F;}tail();}after();';
- try{delete process.env[key];let body=[s];finish(body);assert.ok(body.join('\n').includes('break F'));process.env[key]='1';body=[s];finish(body);assert.ok(!body.join('\n').includes('break F'));assert.ok(body.join('\n').includes('else'));}finally{old===undefined?delete process.env[key]:process.env[key]=old;}
+test('compiler recovers late loop continuations by default',()=>{
+ const finish=require('../src/decompiler/cfr')._internals.shareExistingExitTails,body=['F:{prefix();if(first()){while(next()){work();if(stop())break F;}break F;}tail();}after();'];
+ finish(body);assert.ok(!body.join('\n').includes('break F'));assert.equal(body.join('\n').split('tail();').length-1,1);assert.match(body.join('\n'),/decompiledFrameCompleted0/);
 });

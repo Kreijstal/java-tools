@@ -27,14 +27,9 @@ test('enclosing label and loop contexts survive abrupt nested phases',()=>{
  for(const source of ['int x;for(int i=0;i<n;i++){x=1;use(x);try{x=2;use(x);}finally{use(x);}}','int x;for(int i=0;i<n;i++){x=1;use(x);Runnable r=()->use(x);x=2;use(x);}'])assert.equal(split(source).source,source);
 });
 
-test('nested compiler option requires the root option and reserves formal names',()=>{
- const {shareExistingExitTails:finish}=require('../src/decompiler/cfr')._internals;
- const keys=['CFR_JS_SPLIT_PRIMITIVE_LIFETIMES','CFR_JS_SPLIT_NESTED_PRIMITIVE_LIFETIMES'],previous=keys.map(k=>process.env[k]);
- const source='int x;for(int i=0;i<n;i++){if(first){x=1;use(x);}if(second){x=2;use(x);}}';
- try{delete process.env[keys[0]];process.env[keys[1]]='1';let body=[source];finish(body);assert.equal(body.join('\n'),source);
-  process.env[keys[0]]='1';delete process.env[keys[1]];body=[source];finish(body);assert.equal(body.join('\n'),source);
-  process.env[keys[1]]='1';finish(body,['xLifetime1']);assert.match(body.join('\n'),/int xLifetime2;/);
- }finally{keys.forEach((key,i)=>{if(previous[i]===undefined)delete process.env[key];else process.env[key]=previous[i];});}
+test('compiler separates nested phases and reserves formal names by default',()=>{
+ const {shareExistingExitTails:finish}=require('../src/decompiler/cfr')._internals,body=['int x;for(int i=0;i<n;i++){if(first){x=1;use(x);}if(second){x=2;use(x);}}'];
+ finish(body,['xLifetime1']);assert.match(body.join('\n'),/int xLifetime2;/);
 });
 
 test('native nested phases match independent event lists, partial writes and finally overrides',()=>{

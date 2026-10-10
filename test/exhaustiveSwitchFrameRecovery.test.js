@@ -47,7 +47,7 @@ test('native switch scopes preserve nullable guards/selectors, alias stores and 
  }finally{fs.rmSync(dir,{recursive:true,force:true});}
 });
 
-test('compiler exhaustive-switch reconstruction is opt-in',()=>{
- const finish=require('../src/decompiler/cfr')._internals.shareExistingExitTails,key='CFR_JS_EXHAUSTIVE_SWITCH_FRAME_EXITS',old=process.env[key],s='Exit:{if(test()){switch(x){case 1:one();break Exit;default:other();break Exit;}}fallback();}';
- try{delete process.env[key];let body=[s];finish(body);const baseline=body.join('\n');process.env[key]='1';body=[s];finish(body);assert.notEqual(body.join('\n'),baseline);assert.ok(body.join('\n').includes('else'));}finally{if(old===undefined)delete process.env[key];else process.env[key]=old;}
+test('compiler reconstructs exhaustive switches by default',()=>{
+ const finish=require('../src/decompiler/cfr')._internals.shareExistingExitTails,s='Exit:{if(test()){switch(x){case 1:one();break Exit;default:other();break Exit;}}fallback();}',body=[s];
+ finish(body);assert.ok(!body.join('\n').includes('break Exit'));assert.ok(body.join('\n').includes('else'));
 });

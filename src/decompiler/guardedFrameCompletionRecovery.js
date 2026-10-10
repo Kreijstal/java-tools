@@ -65,6 +65,20 @@ function foldGuardedFrameCompletion(source, proof, {retainDiagnostics = false, r
   for(const frame of frames.sort((a,b)=>b.range.startOffset-a.range.startOffset)){
     const body=bounds(frame.statement),jumps=refs.get(frame)||[],guards=[],suffixes=new Map(),assigned=prefixAssignments(frame),usedAssignments=new Map(),priorAssignments=new Map();let valid=true;
     if(!body||!frame.statement.statements.length||!jumps.length||jumps.length>maximumExits||tokens[body.close].range.endOffset-frame.range.startOffset>80000)continue;
+    // Java can prove a local assigned at every labeled exit, but cannot infer
+    // that a new continuation Boolean selects exactly one assigning arm. Keep
+    // that frame when an initially unassigned local also escapes its scope,
+    // unless a straight prefix already assigns it on every normal entry.
+    const frameEnd=tokens[body.close].range.endOffset;
+    const escapingUnassigned=[...uninitialized].some(name=>{
+      const locals=declarations.get(name)||[];
+      const declaration=locals.length===1?parents.get(locals[0]):null;
+      if(assigned.has(name)||locals.length!==1||declaration?.range?.startOffset>=frame.range.startOffset)return false;
+      const inside=tokens.some(token=>token.kind==='identifier'&&token.text===name
+        &&token.range.startOffset>frame.range.startOffset&&token.range.startOffset<frameEnd);
+      return inside&&tokens.some(token=>token.kind==='identifier'&&token.text===name&&token.range.startOffset>=frameEnd);
+    });
+    if(escapingUnassigned)continue;
     for(const jump of jumps){
       if(jump.kind!=='BreakStatement'||jump.label!==frame.label){valid=false;break;}
       let guard=parents.get(jump),effectful=false;

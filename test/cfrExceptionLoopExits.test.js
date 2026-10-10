@@ -25,7 +25,7 @@ function run(command, args, directory) {
 
 test('nonthrowing return tails preserve values, effects, shared joins, lock exits and outside failures', () => {
   const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'cfr-region-return-tails-'));
-  const previous=process.env.CFR_JS_FORCE_STATE_MACHINE;
+
   try {
     const native=path.join(temporary,'native');fs.mkdirSync(native);
     let assembly='.version 49 0\n.class public super ReturnTails\n.super java/lang/Object\n';
@@ -186,8 +186,8 @@ test('nonthrowing return tails preserve values, effects, shared joins, lock exit
     run('javac',['--release','8','-classpath',native,'-d',native,...['ReturnEffects','ReturnLocks','ReturnTailRunner'].map(name=>path.join(native,name+'.java'))],native);
     const expected=run('java',['-cp',native,'ReturnTailRunner'],native);assert.match(expected,/complete:795\n$/);
     for(const forced of [false,true]) {
-      if(forced)process.env.CFR_JS_FORCE_STATE_MACHINE='1';else delete process.env.CFR_JS_FORCE_STATE_MACHINE;
-      const source=decompileClassFile(classFile);assertNoFallback(source);
+
+      const source=decompileClassFile(classFile, {forceStateMachine: forced});assertNoFallback(source);
       if(!forced) {
         const body=name=>source.match(new RegExp('public static [^\\n]+ '+name+'\\([^)]*\\) \\{([\\s\\S]*?)(?=\\n    public static|\\n})'))?.[1];
         assert.ok(body('choose')&&!body('choose').includes('decompiledRegionSelector'),'pure returns do not allocate a selector');
@@ -200,22 +200,22 @@ test('nonthrowing return tails preserve values, effects, shared joins, lock exit
       // fixture uses the original lock helper as a native dependency. Only the
       // normal reconstruction is used for the lock-exit differential proof.
       let lockSource=locks;
-      if(forced)assert.throws(()=>decompileClassFile(path.join(native,'ReturnLocks.class')),
+      if(forced)assert.throws(()=>decompileClassFile(path.join(native,'ReturnLocks.class'), {forceStateMachine: forced}),
         /fallback marker[^\n]*monitorenter/);
-      else {lockSource=decompileClassFile(path.join(native,'ReturnLocks.class'));assertNoFallback(lockSource);}
+      else {lockSource=decompileClassFile(path.join(native,'ReturnLocks.class'), {forceStateMachine: forced});assertNoFallback(lockSource);}
       for(const [name,text] of Object.entries({ReturnTails:source,ReturnEffects:effects,ReturnLocks:lockSource,ReturnTailRunner:driver}))fs.writeFileSync(path.join(rebuilt,name+'.java'),text);
       run('javac',['--release','8','-d',rebuilt,...['ReturnTails','ReturnEffects','ReturnLocks','ReturnTailRunner'].map(name=>path.join(rebuilt,name+'.java'))],rebuilt);
       assert.equal(run('java',['-cp',rebuilt,'ReturnTailRunner'],rebuilt),expected);
     }
   } finally {
-    if(previous===undefined)delete process.env.CFR_JS_FORCE_STATE_MACHINE;else process.env.CFR_JS_FORCE_STATE_MACHINE=previous;
+
     fs.rmSync(temporary,{recursive:true,force:true});
   }
 });
 
 test('handler cleanup cannot enter a shadowed sibling catch during a loop exit', () => {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-shadowed-loop-exits-'));
-  const previous = process.env.CFR_JS_FORCE_STATE_MACHINE;
+
   try {
     const effects = `class Effects {
       static StringBuilder trace; static Throwable failed;
@@ -328,10 +328,9 @@ test('handler cleanup cannot enter a shadowed sibling catch during a loop exit',
       if (shadowed) assert.doesNotMatch(expected, /,N/);
       else assert.match(expected, /,N/);
       for (const forced of [false, true]) {
-        if (forced) process.env.CFR_JS_FORCE_STATE_MACHINE = '1';
-        else delete process.env.CFR_JS_FORCE_STATE_MACHINE;
+
         const diagnostics = [];
-        const source = decompileClassFile(classFile, {diagnostics});
+        const source = decompileClassFile(classFile, {diagnostics, forceStateMachine: forced});
         assertNoFallback(source);
         const rebuilt = path.join(native, forced ? 'forced' : 'ordinary');
         fs.mkdirSync(rebuilt);
@@ -349,15 +348,14 @@ test('handler cleanup cannot enter a shadowed sibling catch during a loop exit',
       }
     }
   } finally {
-    if (previous === undefined) delete process.env.CFR_JS_FORCE_STATE_MACHINE;
-    else process.env.CFR_JS_FORCE_STATE_MACHINE = previous;
+
     fs.rmSync(temporary, {recursive: true, force: true});
   }
 });
 
 test('loop exits preserve table priority between nested protected ranges', () => {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-nested-priority-loop-exits-'));
-  const previous = process.env.CFR_JS_FORCE_STATE_MACHINE;
+
   try {
     const effects = `class Effects {
       static StringBuilder trace; static Throwable failed;
@@ -467,10 +465,9 @@ test('loop exits preserve table priority between nested protected ranges', () =>
       if (outerFirst) assert.doesNotMatch(expected, /,I/);
       else assert.match(expected, /,I/);
       for (const forced of [false, true]) {
-        if (forced) process.env.CFR_JS_FORCE_STATE_MACHINE = '1';
-        else delete process.env.CFR_JS_FORCE_STATE_MACHINE;
+
         const diagnostics = [];
-        const source = decompileClassFile(classFile, {diagnostics});
+        const source = decompileClassFile(classFile, {diagnostics, forceStateMachine: forced});
         assertNoFallback(source);
         const rebuilt = path.join(native, forced ? 'forced' : 'ordinary');
         fs.mkdirSync(rebuilt);
@@ -487,15 +484,14 @@ test('loop exits preserve table priority between nested protected ranges', () =>
       }
     }
   } finally {
-    if (previous === undefined) delete process.env.CFR_JS_FORCE_STATE_MACHINE;
-    else process.env.CFR_JS_FORCE_STATE_MACHINE = previous;
+
     fs.rmSync(temporary, {recursive: true, force: true});
   }
 });
 
 test('finally cleanup preserves pending loop exits, returns and throwable identity', () => {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-finally-loop-exits-'));
-  const previous = process.env.CFR_JS_FORCE_STATE_MACHINE;
+
   try {
     const original = `public class FinallyLoopExits {
       public static int compute(int mode, int throwAt, int cleanupAt) {
@@ -564,10 +560,9 @@ test('finally cleanup preserves pending loop exits, returns and throwable identi
     assert.match(expected, /IllegalArgumentException:true/);
     assert.doesNotMatch(expected, /:false:/);
     for (const forced of [false, true]) {
-      if (forced) process.env.CFR_JS_FORCE_STATE_MACHINE = '1';
-      else delete process.env.CFR_JS_FORCE_STATE_MACHINE;
+
       const diagnostics = [];
-      const source = decompileClassFile(path.join(native, 'FinallyLoopExits.class'), {diagnostics});
+      const source = decompileClassFile(path.join(native, 'FinallyLoopExits.class'), {diagnostics, forceStateMachine: forced});
       assertNoFallback(source);
       assert.equal(source.includes('switch (statePc)'), forced, JSON.stringify(diagnostics));
       const rebuilt = path.join(temporary, forced ? 'forced' : 'structured');
@@ -590,15 +585,14 @@ test('finally cleanup preserves pending loop exits, returns and throwable identi
         `${forced ? 'forced' : 'structured'} cleanup scenario ${index}: ${JSON.stringify(diagnostics)}`));
     }
   } finally {
-    if (previous === undefined) delete process.env.CFR_JS_FORCE_STATE_MACHINE;
-    else process.env.CFR_JS_FORCE_STATE_MACHINE = previous;
+
     fs.rmSync(temporary, {recursive: true, force: true});
   }
 });
 
 test('try and catch exits preserve nested-loop destinations and effect order', () => {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-exception-loop-exits-'));
-  const previous = process.env.CFR_JS_FORCE_STATE_MACHINE;
+
   try {
     const original = `public class ExceptionLoopExits {
       public static int compute(int mode, int throwAt) {
@@ -660,10 +654,9 @@ test('try and catch exits preserve nested-loop destinations and effect order', (
     assert.equal(expected.trim().split('\n').length, 252);
     assert.match(expected, /IllegalArgumentException/);
     for (const forced of [false, true]) {
-      if (forced) process.env.CFR_JS_FORCE_STATE_MACHINE = '1';
-      else delete process.env.CFR_JS_FORCE_STATE_MACHINE;
+
       const diagnostics = [];
-      const source = decompileClassFile(path.join(native, 'ExceptionLoopExits.class'), {diagnostics});
+      const source = decompileClassFile(path.join(native, 'ExceptionLoopExits.class'), {diagnostics, forceStateMachine: forced});
       assertNoFallback(source);
       assert.equal(source.includes('switch (statePc)'), forced, JSON.stringify(diagnostics));
       assert.match(source, /catch \(/);
@@ -677,15 +670,14 @@ test('try and catch exits preserve nested-loop destinations and effect order', (
       assert.equal(run('java', ['-cp', rebuilt, 'LoopExitRunner'], rebuilt), expected);
     }
   } finally {
-    if (previous === undefined) delete process.env.CFR_JS_FORCE_STATE_MACHINE;
-    else process.env.CFR_JS_FORCE_STATE_MACHINE = previous;
+
     fs.rmSync(temporary, {recursive: true, force: true});
   }
 });
 
 test('ordered catch arms preserve inner and outer exits and uncaught exception effects', () => {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-ordered-catch-loop-exits-'));
-  const previous = process.env.CFR_JS_FORCE_STATE_MACHINE;
+
   try {
     const original = `public class OrderedCatchLoopExits {
       public static int compute(int mode, int throwAt, int errorKind) {
@@ -770,10 +762,9 @@ test('ordered catch arms preserve inner and outer exits and uncaught exception e
     assert.match(expected, /,A/);
     assert.match(expected, /,R/);
     for (const forced of [false, true]) {
-      if (forced) process.env.CFR_JS_FORCE_STATE_MACHINE = '1';
-      else delete process.env.CFR_JS_FORCE_STATE_MACHINE;
+
       const diagnostics = [];
-      const source = decompileClassFile(path.join(native, 'OrderedCatchLoopExits.class'), {diagnostics});
+      const source = decompileClassFile(path.join(native, 'OrderedCatchLoopExits.class'), {diagnostics, forceStateMachine: forced});
       assertNoFallback(source);
       assert.equal(source.includes('switch (statePc)'), forced, JSON.stringify(diagnostics));
       const rebuilt = path.join(temporary, forced ? 'forced' : 'structured');
@@ -796,8 +787,7 @@ test('ordered catch arms preserve inner and outer exits and uncaught exception e
         `${forced ? 'forced' : 'structured'} scenario ${index}`));
     }
   } finally {
-    if (previous === undefined) delete process.env.CFR_JS_FORCE_STATE_MACHINE;
-    else process.env.CFR_JS_FORCE_STATE_MACHINE = previous;
+
     fs.rmSync(temporary, {recursive: true, force: true});
   }
 });
@@ -831,7 +821,7 @@ test('for recovery proves all backedges and preserves protected updates', () => 
 
 test('protected counter backedges visit every entry and match native failure effects', () => {
   const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'cfr-protected-counter-'));
-  const previous=process.env.CFR_JS_FORCE_STATE_MACHINE;
+
   try {
     const native=path.join(temporary,'native');fs.mkdirSync(native);
     const assembly=`.version 49 0
@@ -903,8 +893,8 @@ test('protected counter backedges visit every entry and match native failure eff
     run('javac',['--release','8','-cp',native,'-d',native,...['CounterEffects','CounterRunner'].map(name=>path.join(native,name+'.java'))],native);
     const expected=run('java',['-cp',native,'CounterRunner'],native);assert.match(expected,/counter-complete:600\n$/);
     for(const forced of [false,true]) {
-      if(forced)process.env.CFR_JS_FORCE_STATE_MACHINE='1';else delete process.env.CFR_JS_FORCE_STATE_MACHINE;
-      const source=decompileClassFile(classFile);assertNoFallback(source);
+
+      const source=decompileClassFile(classFile, {forceStateMachine: forced});assertNoFallback(source);
       assert.equal(source.includes('switch (statePc)'),forced);
       const rebuilt=path.join(temporary,forced?'forced':'structured');fs.mkdirSync(rebuilt);
       for(const [name,text] of Object.entries({ProtectedCounter:source,CounterEffects:effects,CounterRunner:driver}))fs.writeFileSync(path.join(rebuilt,name+'.java'),text);
@@ -912,7 +902,7 @@ test('protected counter backedges visit every entry and match native failure eff
       assert.equal(run('java',['-cp',rebuilt,'CounterRunner'],rebuilt),expected);
     }
   } finally {
-    if(previous===undefined)delete process.env.CFR_JS_FORCE_STATE_MACHINE;else process.env.CFR_JS_FORCE_STATE_MACHINE=previous;
+
     fs.rmSync(temporary,{recursive:true,force:true});
   }
 });

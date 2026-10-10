@@ -68,7 +68,7 @@ Lreturn: pop\n areturn`,
 
 for(const fixture of permutations) test(`parallel edge values and consumed selector: ${fixture.name}`,()=>{
   const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'cfr-parallel-backedge-'));
-  const previous=process.env.CFR_JS_FORCE_STATE_MACHINE;
+
   try {
     const native=path.join(temporary,'native');fs.mkdirSync(native);
     const file=path.join(native,fixture.name+'.class');
@@ -87,8 +87,8 @@ for(const fixture of permutations) test(`parallel edge values and consumed selec
     const expected=run('java',['-cp',native,'Runner'],native);
     assert.equal(expected.trim().split('\n').length,fixture.lines);
     for(const forced of [false,true]) {
-      if(forced) process.env.CFR_JS_FORCE_STATE_MACHINE='1';else delete process.env.CFR_JS_FORCE_STATE_MACHINE;
-      const source=decompileClassFile(file);assertNoFallback(source);
+
+      const source=decompileClassFile(file, {forceStateMachine: forced});assertNoFallback(source);
       assert.equal(source.includes('switch (statePc)'),forced);
       const rebuilt=path.join(temporary,forced?'forced':'structured');fs.mkdirSync(rebuilt);
       fs.writeFileSync(path.join(rebuilt,fixture.name+'.java'),source);
@@ -97,7 +97,7 @@ for(const fixture of permutations) test(`parallel edge values and consumed selec
       assert.equal(run('java',['-cp',rebuilt,'Runner'],rebuilt),expected);
     }
   } finally {
-    if(previous===undefined)delete process.env.CFR_JS_FORCE_STATE_MACHINE;else process.env.CFR_JS_FORCE_STATE_MACHINE=previous;
+
     fs.rmSync(temporary,{recursive:true,force:true});
   }
 });
@@ -105,7 +105,7 @@ for(const fixture of permutations) test(`parallel edge values and consumed selec
 for(const branch of ['ordinary','reversed','switch']) for(const protection of [false,true])
 test(`multi-value comparisons preserve effects: ${branch}, protected=${protection}`,()=>{
   const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'cfr-multi-comparisons-'));
-  const previous=process.env.CFR_JS_FORCE_STATE_MACHINE;
+
   try {
     const native=path.join(temporary,'native');fs.mkdirSync(native);
     const decision=branch==='switch'?`lookupswitch\n 0 : Lsecond\n default : Lcondition\nLsecond:`
@@ -151,8 +151,8 @@ Lreturn: return
     const expected=run('java',['-cp',native,'Runner'],native);
     assert.equal(expected.trim().split('\n').length,500);
     for(const forced of [false,true]) {
-      if(forced)process.env.CFR_JS_FORCE_STATE_MACHINE='1';else delete process.env.CFR_JS_FORCE_STATE_MACHINE;
-      const source=decompileClassFile(file,{forceOwnedStructurer:true});assertNoFallback(source);
+
+      const source=decompileClassFile(file,{forceOwnedStructurer:true, forceStateMachine: forced});assertNoFallback(source);
       assert.equal(source.includes('switch (statePc)'),forced);
       const rebuilt=path.join(temporary,forced?'forced':'structured');fs.mkdirSync(rebuilt);
       for(const [name,text] of Object.entries({MultiComparisons:source,Effects:effects,Runner:driver}))fs.writeFileSync(path.join(rebuilt,name+'.java'),text);
@@ -160,7 +160,7 @@ Lreturn: return
       assert.equal(run('java',['-cp',rebuilt,'Runner'],rebuilt),expected);
     }
   } finally {
-    if(previous===undefined)delete process.env.CFR_JS_FORCE_STATE_MACHINE;else process.env.CFR_JS_FORCE_STATE_MACHINE=previous;
+
     fs.rmSync(temporary,{recursive:true,force:true});
   }
 });
@@ -202,7 +202,7 @@ test('blank carrier lines compact without changing comments, literals or Unicode
 
 for(const protection of [false,true]) test(`typed multi-level joins preserve snapshots, identity and failures: protected=${protection}`,()=>{
   const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'cfr-typed-join-'));
-  const previous=process.env.CFR_JS_FORCE_STATE_MACHINE;
+
   try {
     const native=path.join(temporary,'native');fs.mkdirSync(native);
     const file=path.join(native,'TypedJoin.class');
@@ -247,8 +247,8 @@ Lend: areturn
     run('javac',['--release','8','-cp',native,'-d',native,path.join(native,'Effects.java'),path.join(native,'Runner.java')],native);
     const expected=run('java',['-cp',native,'Runner'],native);assert.equal(expected.trim().split('\n').length,360);
     for(const forced of [false,true]) {
-      if(forced)process.env.CFR_JS_FORCE_STATE_MACHINE='1';else delete process.env.CFR_JS_FORCE_STATE_MACHINE;
-      const source=decompileClassFile(file,{forceOwnedStructurer:true});assertNoFallback(source);
+
+      const source=decompileClassFile(file,{forceOwnedStructurer:true, forceStateMachine: forced});assertNoFallback(source);
       assert.equal(source.includes('switch (statePc)'),forced);
       if(!forced) {
         const stringCarriers=source.match(/String stackIn_\d+_\d+/g)||[];
@@ -261,7 +261,7 @@ Lend: areturn
       assert.equal(run('java',['-cp',rebuilt,'Runner'],rebuilt),expected);
     }
   } finally {
-    if(previous===undefined)delete process.env.CFR_JS_FORCE_STATE_MACHINE;else process.env.CFR_JS_FORCE_STATE_MACHINE=previous;
+
     fs.rmSync(temporary,{recursive:true,force:true});
   }
 });

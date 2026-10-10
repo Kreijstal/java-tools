@@ -29,10 +29,9 @@ function run(command, args, directory) {
 for (const padding of [0, 1100]) for (const forced of [false, true]) {
 test(`a catch resuming inside a try preserves setup: padding=${padding}, forced=${forced}`, () => {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-catch-reentry-'));
-  const previous = process.env.CFR_JS_FORCE_STATE_MACHINE;
+
   try {
-    if (forced) process.env.CFR_JS_FORCE_STATE_MACHINE = '1';
-    else delete process.env.CFR_JS_FORCE_STATE_MACHINE;
+
     const native = path.join(temporary, 'native');
     fs.mkdirSync(native);
     const classFile = path.join(native, 'CatchReentry.class');
@@ -84,7 +83,7 @@ Ldone:
     assert.equal(expected, '1,1');
     const diagnostics = [];
     const source = decompileClassFile(classFile,
-      {diagnostics, preserveFieldNames: new Set(['COUNT'])});
+      {diagnostics, preserveFieldNames: new Set(['COUNT']), forceStateMachine: forced});
     assertNoFallback(source);
     const rebuilt = path.join(temporary, 'rebuilt');
     fs.mkdirSync(rebuilt);
@@ -97,11 +96,10 @@ Ldone:
     assert.match(source, /switch \(statePc\)/);
     assert.match(source, /catch \(/);
     assert.match(JSON.stringify(diagnostics), forced
-      ? /forced by CFR_JS_FORCE_STATE_MACHINE/
+      ? /forced state-machine test mode/
       : /continuation reenters a different component/);
   } finally {
-    if (previous === undefined) delete process.env.CFR_JS_FORCE_STATE_MACHINE;
-    else process.env.CFR_JS_FORCE_STATE_MACHINE = previous;
+
     fs.rmSync(temporary, {recursive: true, force: true});
   }
 });
@@ -134,7 +132,7 @@ for (const protection of ['none', 'combined', 'separate', 'multiExit']) {
   for (const reversed of [false, true]) {
     test(`two-loop invariant fanout: protection=${protection}, reversed=${reversed}`, () => {
       const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-invariant-fanout-'));
-      const previous = process.env.CFR_JS_FORCE_STATE_MACHINE;
+
       try {
         const native = path.join(temporary, 'native');
         fs.mkdirSync(native);
@@ -225,14 +223,19 @@ public class FanoutRunner {
         run('javac', ['--release', '8', '-cp', native, '-d', native, nativeDriver], native);
         const expected = run('java', ['-cp', native, 'FanoutRunner'], native);
         for (const forced of [false, true]) {
-          if (forced) process.env.CFR_JS_FORCE_STATE_MACHINE = '1';
-          else delete process.env.CFR_JS_FORCE_STATE_MACHINE;
+
           const diagnostics = [];
           const source = decompileClassFile(classFile,
-            {diagnostics, preserveFieldNames: new Set(['FLAG'])});
+            {diagnostics, preserveFieldNames: new Set(['FLAG']), forceStateMachine: forced});
           assertNoFallback(source);
-          assert.equal(source.includes('switch (statePc)'), forced);
-          if (protectedRegion && !forced) {
+          // A combined range crosses handler coverage at a throwing store.
+          // The priority proof correctly refuses this shape even before the
+          // automatic readability pipeline; retain the supported fallback.
+          const expectedFallback = forced || protection === 'combined';
+          assert.equal(source.includes('switch (statePc)'), expectedFallback);
+          if (protection === 'combined' && !forced)
+            assert.ok(diagnostics.some(item => /exception-table priority or coverage changes/.test(item.reason)));
+          if (protectedRegion && !expectedFallback) {
             assert.match(source, /try \{/);
             assert.match(source, /catch \(/);
           }
@@ -246,8 +249,7 @@ public class FanoutRunner {
           assert.equal(run('java', ['-cp', rebuilt, 'FanoutRunner'], rebuilt), expected);
         }
       } finally {
-        if (previous === undefined) delete process.env.CFR_JS_FORCE_STATE_MACHINE;
-        else process.env.CFR_JS_FORCE_STATE_MACHINE = previous;
+
         fs.rmSync(temporary, {recursive: true, force: true});
       }
     });

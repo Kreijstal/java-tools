@@ -37,11 +37,10 @@ test('binding/assignment ambiguity, unsupported tail scopes and malformed option
  assert.equal(share(source).tailsShared,0,'small tails do not introduce decision locals by default');
  assert.ok(fold(source,{reservedNames:['decompiledSharedTail0']}).source.includes('decompiledSharedTail1'));
 });
-test('the compiler option is opt-in and keeps its existing default output',()=>{
- const finish=require('../src/decompiler/cfr')._internals.shareExistingExitTails,key='CFR_JS_SHARE_DYNAMIC_GUARDED_TAILS',old=process.env[key];
- const tail='one();two();three();four();five();six();seven();eight();',source='if(condition()){prefix();if(guard()){'+tail+'}}else{'+tail+'}';
- try{delete process.env[key];let body=[source];finish(body);const before=body.join('\n');process.env[key]='1';body=[source];finish(body);assert.notEqual(body.join('\n'),before);assert.ok(body.join('\n').includes('decompiledSharedTail0'));}
- finally{if(old===undefined)delete process.env[key];else process.env[key]=old;}
+test('compiler shares proved dynamic tails by default',()=>{
+ const finish=require('../src/decompiler/cfr')._internals.shareExistingExitTails;
+ const tail='one();two();three();four();five();six();seven();eight();',source='if(condition()){prefix();if(guard()){'+tail+'}}else{'+tail+'}',body=[source];
+ finish(body);assert.ok(body.join('\n').includes('decompiledSharedTail0'));
 });
 test('native shared tails match independent outcomes under mutation, nulls, failures and protected exits',()=>{
  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'dynamic-tail-native-'));

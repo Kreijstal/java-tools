@@ -171,7 +171,7 @@ test('native original and forced fallback variants agree on loops, switch, excep
       for (int i = -2; i <= 3; i++) System.out.println(compute(i) + ":" + effects);
     }
   }`;
-  const previous = process.env.CFR_JS_FORCE_STATE_MACHINE;
+
   try {
     const original = path.join(temporary, 'original');
     fs.mkdirSync(original);
@@ -179,20 +179,19 @@ test('native original and forced fallback variants agree on loops, switch, excep
     fs.writeFileSync(file, source);
     run('javac', ['--release', '8', '-d', original, file], original);
     const expected = run('java', ['-cp', original, 'NativeStateFixture'], original);
-    process.env.CFR_JS_FORCE_STATE_MACHINE = '1';
+
     for (const enabled of [false, true]) {
       const directory = path.join(temporary, String(enabled));
       fs.mkdirSync(directory);
       const generated = decompileClassFile(path.join(original, 'NativeStateFixture.class'),
-        {coalesceStateMachineChains: enabled});
+        {coalesceStateMachineChains: enabled, forceStateMachine: true});
       const java = path.join(directory, 'NativeStateFixture.java');
       fs.writeFileSync(java, generated);
       run('javac', ['--release', '8', '-d', directory, java], directory);
       assert.equal(run('java', ['-cp', directory, 'NativeStateFixture'], directory), expected);
     }
   } finally {
-    if (previous === undefined) delete process.env.CFR_JS_FORCE_STATE_MACHINE;
-    else process.env.CFR_JS_FORCE_STATE_MACHINE = previous;
+
     fs.rmSync(temporary, {recursive: true, force: true});
   }
 });

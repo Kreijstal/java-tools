@@ -322,19 +322,13 @@ test('CFR-JS reports state-machine fallback structurally', (t) => {
     const classPath = path.join(tempDir, 'StructuredFeatureTest.class');
     const diagnostics = [];
     assembleJasminSource(STRUCTURED_FEATURES_JASMIN, classPath);
-    const previous = process.env.CFR_JS_FORCE_STATE_MACHINE;
-    process.env.CFR_JS_FORCE_STATE_MACHINE = '1';
-    let source;
-    try {
-      source = decompileClassFile(classPath, { diagnostics, forceOwnedStructurer: true });
-    } finally {
-      if (previous === undefined) delete process.env.CFR_JS_FORCE_STATE_MACHINE;
-      else process.env.CFR_JS_FORCE_STATE_MACHINE = previous;
-    }
+
+
+    const source = decompileClassFile(classPath, {diagnostics, forceOwnedStructurer: true, forceStateMachine: true});
 
     t.ok(source.includes('stateLoop: while (true)'), 'forced fallback emits the state-machine form');
     t.ok(diagnostics.length > 0, 'fallback is reported without parsing generated source');
     t.ok(diagnostics.every((item) => item.kind === 'stateMachineFallback'
-      && item.reason === 'forced by CFR_JS_FORCE_STATE_MACHINE'), 'diagnostics retain method-level fallback reasons');
+      && item.reason === 'forced state-machine test mode'), 'diagnostics retain method-level fallback reasons');
   });
 });

@@ -1,23 +1,45 @@
 # Structured Decompiler: goto-free control-flow recovery
 
-`CFR_JS_EXHAUSTIVE_SWITCH_FRAME_EXITS=1` reconstructs a plain frame whose
+## Automatic generic readability
+
+The decompiler applies its generic control-flow reconstruction, lifetime
+separation, predicate/cast cleanup and formatting without feature flags.
+Each recovery retains its existing proof requirements and refuses unsupported
+input. Loop-latch sharing and fallback-state coalescing are automatic too.
+Retired `CFR_JS_*` transformation switches no longer change generated code.
+Debug/profile variables only report diagnostics. Explicit internal fallback
+options are used by regression tests, not required by callers or the CLI.
+
+Game names, symbol maps and source/relocation policies belong in the consuming
+workflow. The compiler does not select recovery rules by application identity.
+Old export provenance records the settings used for those historical builds;
+it is not a configuration recipe for the current compiler.
+
+Focused default integration checks:
+
+```sh
+NODE_PATH=/path/to/node_modules node --test --experimental-test-isolation=none \
+  test/cfrDefaultReadability.test.js test/unreachableTransferCleanup.test.js
+```
+
+`foldExhaustiveSwitchFrameExits` reconstructs a plain frame whose
 conditional arm contains one exhaustive switch and whose cases all end in
 direct exits to that frame. Cases use local switch breaks; the original
 remainder becomes the predicate's else arm. Predicates, selectors, action
 order and frame scopes remain intact. Missing defaults, fallthrough, crossed
-protection, extra frame/switch exits and captures refuse. The default is off.
+protection, extra frame/switch exits and captures refuse. The compiler applies this recovery automatically after its proof succeeds.
 
-`CFR_JS_COMPACT_LOCAL_BOOLEAN_GUARDS=1` combines a primitive local guard,
+`compactLocalBooleanGuards` combines a primitive local guard,
 its conditional assignment, and the immediate subsequent guard into an
 ordered conjunction. Conditional writes and RHS failures remain in place;
 only the redundant local read after the assignment disappears. Existing
 assignment conjunctions compose. Boxed/field/ambiguous locals, intervening
 actions, else arms, captures and direct labeled guards refuse.
-`CFR_JS_REINDENT_STRUCTURED_BODIES=1` restores consistent block, switch-case
+`reindentStructuredSource` restores consistent block, switch-case
 and continuation indentation by changing leading horizontal whitespace only.
-Tokens, quoted values and line endings remain exact. Both defaults are off.
+Tokens, quoted values and line endings remain exact. The compiler applies this recovery automatically after its proof succeeds.
 
-`CFR_JS_GUARDED_FRAME_COMPLETION=1` reconstructs a plain labeled frame when
+`foldGuardedFrameCompletion` reconstructs a plain labeled frame when
 every exit is a guarded break reached only through lexical block/if/plain-label
 corridors. One Boolean captures each original decision at its original site;
 all remaining block suffixes on that path are guarded, including shared/nested
@@ -29,18 +51,22 @@ that assignment and its lexical block must enclose the complete frame. Branches,
 loops, protected regions, shadowed declarations, formal-name conflicts and
 read-before-initialization do not establish this evidence. The original prefix
 and assignment stay intact, including initializer effects and failures.
-Enclosing protection and whole suffix constructs remain intact. The generic
-default is unchanged.
+Enclosing protection and whole suffix constructs remain intact. The compiler
+applies this recovery automatically. It retains a frame when a local assigned
+inside its arms is also used afterwards without proven prefix initialization:
+Java cannot infer definite assignment from the new continuation Boolean.
+Reconstruction also removes an effect-free synthetic break/continue immediately
+after an unconditional abrupt statement, preserving enclosing protected scopes.
 
-`CFR_JS_SIMPLIFY_NATURAL_LOOP_EXIT_CAPTURES=1` removes a captured natural-exit
+`simplifyNaturalLoopExitCaptures` removes a captured natural-exit
 decision when the loop has no own break, the Boolean has no other uses, and
 lexical evidence proves the original condition is not a Java constant
 expression. Keep the condition once in a direct while header and retain the
 completion work in its original block. Unknown/final constant expressions,
 other breaks (including finally overrides), ambiguous declarations and
-captures refuse cleanup. The generic default remains unchanged.
+captures refuse cleanup. This recovery is applied automatically when its proof succeeds.
 
-`CFR_JS_LEADING_LOOP_EXIT_WORK=1` opts into reconstruction of a forever loop
+`foldLeadingLoopExitWork` performs reconstruction of a forever loop
 whose leading guard performs exit-only work before its final loop break. The
 original condition is evaluated once in the header and captured in a Boolean
 local; the untouched body remains in the loop and the untouched exit-only work
@@ -48,20 +74,20 @@ runs only after that leading decision ends the loop. Other breaks skip it.
 Labels, body continues and finally overrides retain their original targets;
 self transfers within exit-only work, captures, ambiguous assignment and unknown
 syntax refuse reconstruction. New locals are scoped to one replacement block.
-The generic default remains unchanged.
+This recovery is applied automatically when its proof succeeds.
 
-`CFR_JS_AVOID_PROVEN_REFERENCE_CAST_BRIDGES=1` opts into removing an
+`coerceCheckedReference` performs removing an
 intermediate `(Object)` bridge when class/array hierarchy metadata proves a
 narrowing reference cast is legal directly. The explicit target cast and its
 runtime type check remain; operand evaluation, overload selection and member
 receiver types are unchanged. Unknown/unrelated types retain their bridges.
 Explicit bytecode checkcasts do not use this cleanup for widening conversions.
-The generic default is unchanged. Validate a selected profile independently
+This recovery is applied automatically when its proof succeeds. Validate a selected profile independently
 against the emitted source types and recompiled method instructions before
 publishing its output.
 
 
-`CFR_JS_SHARE_DYNAMIC_GUARDED_TAILS=1` optionally shares a complete duplicate
+`shareDynamicGuardedTails` shares a complete duplicate
 tail in `if (condition) { prefix; if (guard) { tail; } } else { tail; }`.
 A fresh primitive decision local captures the original condition once; after
 the intact prefix it captures the guard once, then selects the shared tail.
@@ -78,49 +104,49 @@ exits, finally overrides and monitor release.
 
 Focused command: `NODE_PATH=/path/to/node_modules JAVA_TOOL_OPTIONS=-XX:-UsePerfData node --test --experimental-test-isolation=none test/dynamicGuardedTailRecovery.test.js test/sharedStatementFallbackRecovery.test.js test/sharedGuardedFallbackRecovery.test.js test/terminalGuardedFrameRecovery.test.js test/loopFrameCompletionRecovery.test.js`.
 
-`CFR_JS_SPLIT_NESTED_INITIALIZED_PRIMITIVE_LIFETIMES=1` enables one additional
+`splitNestedInitializedPrimitiveLocalLifetimes` enables one additional
 nested primitive pass after initialized and optional array-dimension recovery.
-It requires `CFR_JS_SPLIT_INITIALIZED_PRIMITIVE_LIFETIMES=1`. Earlier separation
+It requires `splitInitializedPrimitiveLocalLifetimes`. Earlier separation
 can confine a local's remaining uses to a smaller block; this pass revisits
 those blocks under the same binding and definite-assignment contracts. Root
 blocks are excluded. Literal initializers remain in place, and loop iterations
 cannot borrow incoming values from an initializer or an earlier iteration.
 Handler/finally/monitor boundaries, captures and ambiguous bindings remain
-protected. Existing defaults are unchanged; the new option defaults off.
+protected. The compiler applies this pass after initial lifetime recovery.
 
 Focused validation: `NODE_PATH=/path/to/node_modules JAVA_TOOL_OPTIONS=-XX:-UsePerfData node --test --experimental-test-isolation=none test/nestedInitializedPrimitiveLifetimeRecovery.test.js test/arrayDimensionLifetimeRecovery.test.js test/initializedPrimitiveLifetimeRecovery.test.js test/referenceLocalLifetimeRecovery.test.js test/primitiveLocalLifetimeRecovery.test.js test/nestedPrimitiveLocalLifetimeRecovery.test.js test/loopFrameCompletionRecovery.test.js`.
 
-`CFR_JS_SPLIT_ARRAY_DIMENSION_LIFETIMES=1` optionally revisits primitive locals
+`splitArrayDimensionPrimitiveLocalLifetimes` revisits primitive locals
 used in array-allocation dimensions. Dimension expressions keep their exact
 left-to-right order, including assignments, increments, failures and overflow;
 this pass only adds uninitialized declarations and renames bound local uses.
 Each phase must define every read independently. Literal initializers stay in
 place, and handler/finally/monitor or loop-carried values remain unsplit. Array
 initializers are outside this analysis. Earlier lifetime modes and control-frame
-assignment checks retain their refusal behavior. The option defaults off.
+assignment checks retain their refusal behavior. The compiler applies this recovery automatically after its proof succeeds.
 
 Focused validation: `NODE_PATH=/path/to/node_modules JAVA_TOOL_OPTIONS=-XX:-UsePerfData node --test --experimental-test-isolation=none test/arrayDimensionLifetimeRecovery.test.js test/initializedPrimitiveLifetimeRecovery.test.js test/referenceLocalLifetimeRecovery.test.js test/primitiveLocalLifetimeRecovery.test.js test/nestedPrimitiveLocalLifetimeRecovery.test.js test/loopFrameCompletionRecovery.test.js`.
 
-`CFR_JS_SPLIT_INITIALIZED_PRIMITIVE_LIFETIMES=1` optionally separates primitive
+`splitInitializedPrimitiveLocalLifetimes` separates primitive
 locals with literal initializers, including signed numeric literals, booleans
 and characters. Original declarations and literal bits remain untouched; later
 independent phases use uninitialized locals of the same primitive width. Each
 selected block contains every use, and an outer initializer cannot supply a
 loop-body phase's incoming value on each iteration. Protected bodies qualify
 only when no reaching value crosses a handler/finally/monitor boundary. Existing
-primitive/reference lifetime defaults remain unchanged. The option defaults off.
+primitive/reference lifetime defaults remain unchanged. The compiler applies this recovery automatically after its proof succeeds.
 
 Focused validation: `NODE_PATH=/path/to/node_modules JAVA_TOOL_OPTIONS=-XX:-UsePerfData node --test --experimental-test-isolation=none test/initializedPrimitiveLifetimeRecovery.test.js test/referenceLocalLifetimeRecovery.test.js test/primitiveLocalLifetimeRecovery.test.js test/nestedPrimitiveLocalLifetimeRecovery.test.js`.
 
-`CFR_JS_SPLIT_NESTED_REFERENCE_LIFETIMES=1` adds one nested reference pass after
+`splitNestedReferenceLocalLifetimes` adds one nested reference pass after
 the initial reference split. It uses the same type, binding and assignment
 contracts, selecting only a block nested in the method. Earlier separation can
 expose independent roles inside a loop or branch. A null initializer outside a
 loop cannot supply a first phase in each iteration: incoming reads keep their
 original reaching value. Each newly separated loop-body phase must define all
-its own reads. The option defaults off and requires reference lifetime recovery.
+its own reads. The compiler applies the nested pass after reference lifetime recovery.
 
-`CFR_JS_SPLIT_REFERENCE_LIFETIMES=1` optionally separates reused reference locals
+`splitReferenceLocalLifetimes` separates reused reference locals
 into independently assigned phases. The original uninitialized or literal-null
 declaration stays intact; later phases receive uninitialized declarations of the
 same source type. A selected block must contain every use. It may be a protected
@@ -128,29 +154,29 @@ body, but an analysis cannot carry a value across try/catch/finally or monitor
 boundaries. Conditional/loop reaching values stay together. Captures, shadows,
 ambiguous identifiers, annotated/inferred types and uncertain syntax refuse.
 All original assignments, calls, aliases, nullable effects and exception scopes
-remain. This option defaults off; primitive lifetime defaults stay unchanged.
+remain. The compiler applies this pass after primitive lifetime recovery.
 
 Focused validation: `NODE_PATH=/path/to/node_modules JAVA_TOOL_OPTIONS=-XX:-UsePerfData node --test --experimental-test-isolation=none test/referenceLocalLifetimeRecovery.test.js test/primitiveLocalLifetimeRecovery.test.js test/nestedPrimitiveLocalLifetimeRecovery.test.js`.
 
-`CFR_JS_FLATTEN_STANDALONE_BLOCKS=1` optionally flattens standalone blocks
+`flattenStandaloneBlocks` flattens standalone blocks
 after late guard recovery. Only direct block statements qualify, and every
 immediate child must declare nothing in that block or retain its own scope.
 Direct local/type declarations, labels and branch/loop/protected bodies retain
 their braces. Captures, pattern scopes, comments and uncertain syntax refuse
 cleanup. The pass deletes only braces and whitespace, preserving all actions,
-values, exception boundaries and transfer targets. It defaults off.
+values, exception boundaries and transfer targets. This recovery runs automatically.
 
 Focused validation: `NODE_PATH=/path/to/node_modules JAVA_TOOL_OPTIONS=-XX:-UsePerfData node --test --experimental-test-isolation=none test/standaloneBlockRecovery.test.js`.
 
-`CFR_JS_FINAL_LOCAL_GUARDS=1` optionally reapplies captured-local path facts
+`specializePathGuards` reapplies captured-local path facts
 after late reconstruction and Boolean cleanup. This action-preserving mode
 removes a true, redundant `if` condition only when its selected arm is a block,
 there is no discarded arm, and Java completion requires no suffix pruning.
 Original actions, assignments, braces, declarations and protected boundaries
 remain. Mutable/shadowed/boxed/field values cannot establish these facts. The
-option defaults off; the existing broader specialization remains unchanged.
+pass runs automatically; the existing broader specialization remains unchanged.
 
-`CFR_JS_FINAL_BOOLEAN_PREDICATES=1` enables an optional final condition cleanup
+`simplifyPredicateNegations` enables a final condition cleanup
 after continuation and local-lifetime reconstruction. It reuses the existing
 Boolean-negation and condition-grouping proofs to complement equality, apply
 De Morgan's law, remove double negations in primitive control contexts, and
@@ -182,7 +208,7 @@ and region-splitting brings the irreducible minority into that class. This is an
 
 ## Independent primitive local lifetimes
 
-`CFR_JS_LOOP_FRAME_COMPLETION=1` optionally expresses a nonlocal frame exit from
+`foldLoopFrameCompletion` expresses a nonlocal frame exit from
 one loop using an initialized boolean completion local, a local loop break and
 guards around every remaining block suffix up to the frame. Existing conditions
 and actions retain one occurrence and their original order. Unentered loops
@@ -194,7 +220,7 @@ this reconstruction. A suffix needing an uninitialized value from an earlier
 region also refuses unless it assigns that value independently before reading
 it; Java's definite-assignment checker cannot infer arbitrary correlations
 through a newly introduced completion local. Initialized locals retain their
-original initialization and value flow. The option defaults to disabled.
+original initialization and value flow. The compiler applies this recovery automatically.
 
 Focused validation compares original/recovered methods with independent native
 loop-outcome oracles, including nullable conditions, partial effects, for-loop
@@ -204,7 +230,7 @@ updates, zero iterations, ordinary local breaks and caller finally overrides:
 NODE_PATH=/path/to/node_modules JAVA_TOOL_OPTIONS=-XX:-UsePerfData node --test --experimental-test-isolation=none test/loopFrameCompletionRecovery.test.js
 ```
 
-`CFR_JS_SPLIT_PRIMITIVE_LIFETIMES=1` enables an optional source reconstruction
+`splitPrimitiveLocalLifetimes` enables an source reconstruction
 after control-flow recovery. Uninitialized primitive method locals can receive
 separate names in independently defined phases. Each phase must assign its local
 before every read, including branch joins, zero-iteration loops, loop updates,
@@ -231,7 +257,7 @@ fixture compares 70,400 original/recovered/oracle cases with signed overflow,
 floating edge values, injected failures, outer finally overrides and monitors.
 This does not establish arbitrary-program equivalence.
 
-`CFR_JS_SPLIT_NESTED_PRIMITIVE_LIFETIMES=1`, together with the root option,
+`splitNestedPrimitiveLocalLifetimes`, together with the root option,
 adds a second reconstruction inside nested blocks. It chooses the deepest block
 containing every use of a local and checks each execution from an unassigned
 entry state. Uses in a surrounding loop header or after the block prevent that
@@ -379,7 +405,7 @@ completion. Intermediate blocks contain no declarations or actions to move.
 Comments, Unicode translation, nested executables, patterns and oversized chains
 refuse reconstruction. Chains have at most 32 conditions and 40 KiB of source.
 
-`CFR_JS_LATE_NESTED_IF_CONDITIONS=1` retries this same proof after the
+`foldNestedIfConditions` retries this same proof after the
 optional frame, Boolean continuation and value-predicate passes. These passes
 can introduce new sole-child chains after the earlier conjunction recovery has
 finished. The retry precedes the final shared-switch exit and indentation
@@ -802,7 +828,7 @@ yet verified.
 
 ### Finishing work after repeatable loop prefixes
 
-`simplifyPredicateNegations` optionally accepts `ownedFields: {owner, fields}`,
+`simplifyPredicateNegations` accepts `ownedFields: {owner, fields}`,
 where each field has its emitted `name`, Java `type` and Boolean `static` flag.
 CFR supplies only declarations on the current class, using the original field
 descriptors and the same spelling policy as field emission. Direct `this.field`
@@ -1187,9 +1213,8 @@ nodes or parse failures prevent branch nesting. Otherwise moving a child under
 a parent could silently bind its field access to a parent's local variable.
 Generated block comments record original CFG block IDs for traceability.
 
-The default is enabled. For comparison, use
-`CFR_JS_COALESCE_STATE_MACHINE_CHAINS=0`, or pass
-`coalesceStateMachineChains: false` to `decompileClassFile`. This gate controls
+The default is enabled. Internal comparison tests can pass
+`coalesceStateMachineChains: false` to `decompileClassFile`. This test option controls
 both straight-line coalescing and branch nesting. Fallback diagnostics include
 `dispatchStatesBefore` and `dispatchStatesAfter`, including methods subsequently
 split into local-class helpers.
@@ -2470,7 +2495,7 @@ flag. Loops, protected corridors, ambiguous initialization and other unsafe
 prefix exits remain conservative.
 
 `maximumExits` defaults to 16 and accepts only integers from 1 to 64. Compiler
-use requires the opt-in `CFR_JS_GUARDED_FRAME_ALTERNATES=1` with the existing
+use applies alternate-guard recovery after the existing
 guarded-frame policy. Ordinary and effectful-prefix candidates run first to
 preserve their established continuation names. The alternate pass uses the
 64-exit bound; source size, depth and suffix limits remain in place.
@@ -2488,7 +2513,7 @@ and final exit to a surrounding plain frame belong to that normal case only.
 The expressions move to that case, retaining their order and one occurrence;
 other frame exits become ordinary switch exits. The final frame exit remains
 after the switch. Selectors, predicates, fallthrough and protected actions stay
-intact. The compiler policy `CFR_JS_SWITCH_EXIT_TAILS=1` is opt-in.
+intact. The compiler policy `foldSwitchExitTails` is automatic.
 
 Missing defaults, additional normal exits, implicit final fallthrough, a normal
 exit crossed by protection, top-level case declarations, tail declarations,
@@ -2502,7 +2527,7 @@ frame exit becomes a false continuation decision after the prefix completes.
 Whole loops, switches and protected prefix actions remain untouched. Prefixes
 with other exits to the same frame refuse. The existing suffix/binding/definite
 assignment proof applies. Compiler use additionally requires
-`CFR_JS_GUARDED_FRAME_PREFIX_EFFECTS=1`; the ordinary policy remains conservative.
+`foldGuardedFrameCompletion`; the ordinary policy remains conservative.
 
 Independent native oracles compare 421,200 cases across the original, switch-only
 and complete transformations. Coverage includes nullable/effectful predicates
@@ -2538,7 +2563,7 @@ remainder becomes its explicit `else` arm. Original arm braces, predicates,
 stores, declarations, reads and effectful actions remain; no classifier,
 predicate inversion, copied operation or new local is introduced.
 
-The opt-in compiler flag is `CFR_JS_EXHAUSTIVE_IF_FRAME_EXITS=1`, disabled by
+The automatic compiler recovery is `foldExhaustiveIfFrameExits`, applied by
 default. Recovery requires 2–64 direct terminal arms and complete terminal
 inner/outer remainders. Extra frame exits, breaks inside protection or other
 control frames, captures, ambiguous lexical destinations and excessive source
@@ -2768,8 +2793,8 @@ remain unfinished or unverified.
 
 `recoverScalarIfDispatches(source, {nestedRegions: true, opaqueControls: true})`
 can retain complete switches and protected loop actions while classifying an
-unchanged captured primitive integer. The compiler policy is opt-in:
-`CFR_JS_OPAQUE_CONTROL_DISPATCHES=1`. Existing recovery defaults stay unchanged.
+unchanged captured primitive integer. The compiler policy is automatic:
+`recoverScalarLabelDispatches`. All earlier proof requirements stay intact.
 
 Some parser block nodes inside protected constructs omit their source range.
 This policy recovers a local declaration's lexical scope from its nearest
@@ -2811,7 +2836,7 @@ intact. Source size, region size, token count and traversal depth remain bounded
 Different destinations, crossed block/protected corridors, over-budget arm effects,
 conditional final exits and unsupported captures refuse.
 
-The compiler policy is opt-in: `CFR_JS_SHARED_FRAME_EXIT_GUARDS=1`. It runs after
+The compiler policy is automatic: `foldSharedFrameExitGuards`. It runs after
 existing recoveries, then retries the already enabled guarded-frame and local
 Boolean compaction policies. Existing decision identities retain their naming
 order; newly exposed continuations receive fresh names. Game priorities, naming
@@ -2833,14 +2858,14 @@ cleanup, loops, nonfinal case fallthrough and other continuations refuse.
 The original predicates, case bodies, selectors and protected actions stay in
 place. Original inner cleanup still runs on the abrupt exit. An unused frame's
 label is removed while retaining its original block scope. Diagnostics account
-for each changed target and removed label. The compiler policy is opt-in:
-`CFR_JS_SHARED_SWITCH_FRAME_EXITS=1`.
+for each changed target and removed label. The compiler policy is automatic:
+`foldSharedSwitchFrameExits`.
 
 `splitMultilineBlockHeaders(source)` replaces only horizontal trivia after an
 opening brace when the body already spans lines and its first token shares the
 header line. Quoted values and every Java token remain exact; single-line bodies
 stay intact. Reindentation can then align that first statement with the rest of
-the body. The opt-in policy is `CFR_JS_SPLIT_MULTILINE_BLOCK_HEADERS=1`.
+the body. The automatic recovery is `splitMultilineBlockHeaders`.
 
 Focused native fixtures compare old and localized switches with an independent
 pending-completion model across selector callbacks, nullable predicates, partial
@@ -2854,7 +2879,7 @@ break to the same frame. It skips the loop update/test on the same path as befor
 Intermediate work, cleanup, another loop, switches and other destinations refuse.
 All original inner protected actions remain on the abrupt exit.
 
-The opt-in compiler policy is `CFR_JS_SHARED_LOOP_FRAME_EXITS=1`. It runs after
+The automatic compiler recovery is `foldSharedLoopFrameExits`. It runs after
 existing reconstruction, then retries the existing single-exit if/else proof and
 already enabled guarded-frame policies. It preserves existing decision names.
 No selector computation, callback, field read/store or unused snapshot is copied.
@@ -2878,7 +2903,7 @@ The proof never moves assignments, drops snapshots or infers initialization from
 conditional, loop, catch or finally work. Existing in-frame prefix evidence takes
 precedence. Diagnostics distinguish prior assignments from in-frame prefixes.
 
-The opt-in policy `CFR_JS_GUARDED_FRAME_DOMINATING_ASSIGNMENTS=1` also requires
+The automatic recovery `foldGuardedFrameCompletion` also requires
 the ordinary guarded-frame policy. It runs after established recovery so earlier
 continuation names stay stable, then applies enabled Boolean compaction. Defaults
 and existing prefix diagnostics remain unchanged.
@@ -2904,7 +2929,7 @@ exit contributes to assignment state for later reads. A break/continue that
 bypasses initialization cannot establish later availability. Existing primitive
 lifetime splitting and default frame policies retain their prior refusal.
 
-The compiler opt-in `CFR_JS_SCOPED_FRAME_INITIALIZATION=1` retries enabled loop
+The automatic compiler recovery `foldLoopFrameCompletion` retries enabled loop
 completion, then enabled guarded-frame policies, after established recovery has
 allocated its decisions. No old predicate, snapshot or action is copied or moved.
 All existing restrictions on crossed cleanup, switches and extra loops remain.
@@ -2931,7 +2956,7 @@ stops at loops and protected entries. A declaration inside a loop can establish
 truth for that iteration. Writes in another initializer, the decision condition,
 or its earlier true-arm work refuse; so do boxing, shadowing, captures,
 nonadjacent guards and existing alternatives. Local block scope remains intact.
-The compiler opt-in is `CFR_JS_KNOWN_BOOLEAN_ALTERNATIVES=1`, applied after
+The automatic compiler recovery is `foldKnownBooleanAlternatives`, applied after
 established reconstruction without introducing or renaming decisions.
 
 Four focused and six existing Boolean-compaction groups pass. An independent
@@ -2952,8 +2977,8 @@ negation chain whose base is equality without exposing an unknown boxed atom.
 
 Ordering comparisons retain NaNs; logical combinations and arbitrary double
 negations remain unchanged. In particular, `Object x = !!boxedBoolean` cannot
-become a direct reference assignment. The compiler opt-in is
-`CFR_JS_NEGATED_EQUALITY_VALUES=1`, applied after established reconstruction.
+become a direct reference assignment. The automatic compiler recovery is
+`simplifyNegatedEqualityValues`, applied after established reconstruction.
 
 Four focused and 15 existing predicate groups pass. An independent native oracle
 covers 25,920 numeric/reference/boxed comparisons, NaN payloads, signed zero,
@@ -2972,9 +2997,10 @@ Boxed/unknown atoms, inherited fields, out-of-scope locals, shadowed names and
 unproven class qualifiers retain their original unboxing and null failures.
 Both original parentheses and the single operand evaluation remain.
 
-The compiler opt-in is `CFR_JS_PRIMITIVE_BOOLEAN_VALUES=1`, applied after
+The automatic compiler recovery is `simplifyPredicateNegations`, applied after
 established reconstruction with the method's formal and owning-field metadata.
-The default control-condition mode remains unchanged. The value mode does not
+The helper retains its separate control-condition mode; the compiler also
+applies value cleanup. The value mode does not
 normalize other Boolean predicates or infer arbitrary call return types.
 
 Four focused and 15 existing predicate groups pass. Independent native work
@@ -2984,14 +3010,15 @@ overrides and monitor ownership. Separate refusal cases retain boxed values.
 
 ### Boolean logical values and mixed precedence
 
-`CFR_JS_BOOLEAN_LOGICAL_VALUES=1` applies the existing predicate-negation
+`simplifyPredicateNegations` applies the existing predicate-negation
 proof to parenthesized negations of `&&` and `||` in value contexts. Its helper
 mode is `{booleanValueLogicalNegations: true, complementIntegralRelations: false}`.
 A short-circuit operator produces a primitive Boolean, so the result's boxing
 and overload selection remain unchanged. Complete atoms retain their evaluation
 order, reference equality, assignments, unboxing and failures. Unknown boxed
 value double negations, eager bitwise operators and unrelated expressions stay
-outside this mode. Value modes are mutually exclusive and disabled by default.
+outside this mode. The helper value modes are mutually exclusive; the compiler
+invokes both separately.
 
 The shared recovery now preserves mixed precedence explicitly. Complementing
 `!(a || b && c)` requires `!a && (!b || !c)`, and complementing
@@ -3014,12 +3041,13 @@ promoted name must have exactly one declaration in the enclosing executable,
 be absent from the reserved formal names, and have no matching identifier token
 outside its original block. Qualified outside occurrences also refuse; string
 contents do not resolve as Java identifiers. Initializers, declarations, stores
-and all work retain their exact order and source tokens. The option is disabled
-by default. Duplicate names, uncertain lookup, captures, nested executables,
+and all work retain their exact order and source tokens. The compiler enables
+this mode after the declaration-free cleanup. Duplicate names, uncertain lookup,
+captures, nested executables,
 comments and unsupported source refuse the proof.
 
 `{declarationsOnly: true}` selects only wrappers with direct declarations.
-`CFR_JS_UNIQUE_DECLARATION_BLOCKS=1` uses that selection late, after continuation
+`flattenStandaloneBlocks` uses that selection late, after continuation
 and predicate reconstruction, before the final shared-switch and indentation
 passes. Branch, loop, label, try/catch/finally and monitor bodies remain intact;
 only their independently proved standalone child scopes may be removed.
@@ -3041,8 +3069,8 @@ condition between its two outer semicolons. Braced and scalar do-while tails
 use the same while-header handling. Existing multiline conditions stay exact.
 The shared proof refuses comments, Unicode translation and unsupported input.
 
-`CFR_JS_WRAP_LOGICAL_CONDITIONS=1` enables this formatting after block/header
-recovery and before structured indentation. The default policy is unchanged.
+`wrapLogicalConditionLines` runs automatically after block/header recovery and
+before structured indentation.
 The formatter reaches a fixed point after one pass. Independent token/AST
 comparison and no-debug class-byte identity can verify this whitespace-only
 policy without duplicating runtime behavior tests. Source line metadata changes
@@ -3062,10 +3090,10 @@ in order. Only the immediate primitive-local read disappears.
 The same proof joins a bounded conjunction suffix of assignments to other
 independently proved Boolean locals. Each store remains conditional and at its
 original evaluation point. Unknown/eager suffixes, scope barriers, duplicate
-names, intervening effects and unsupported executables refuse. Defaults retain
-the earlier same-local contract.
+names, intervening effects and unsupported executables refuse. The helper default
+retains the earlier same-local contract; the compiler also invokes cross-local recovery.
 
-`CFR_JS_CHAIN_LOCAL_BOOLEAN_ASSIGNMENTS=1` runs this proof after established
+`compactLocalBooleanGuards` runs this proof after established
 recovery and before final condition-line formatting and indentation.
 `node --test --experimental-test-isolation=none test/crossLocalBooleanGuards.test.js test/localBooleanGuardCompaction.test.js`
 passes ten groups, including 171,072 new native cases compared with independent

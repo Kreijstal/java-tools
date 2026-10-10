@@ -94,7 +94,7 @@ const driver = `class BuilderRunner { public static void main(String[] args) {
 
 for (const forced of [false, true]) test(`builder prefixes and mutations survive joins and catches: forced=${forced}`, () => {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-builder-joins-'));
-  const previous = process.env.CFR_JS_FORCE_STATE_MACHINE;
+
   try {
     const native = path.join(temporary, 'native'); fs.mkdirSync(native);
     const classFile = path.join(native, 'BuilderJoins.class');
@@ -106,17 +106,15 @@ for (const forced of [false, true]) test(`builder prefixes and mutations survive
     run('javac', ['--release', '8', '-cp', native, '-d', native, driverFile], native);
     const expected = run('java', ['-cp', native, 'BuilderRunner'], native);
     assert.equal(expected, 'prefix:null\nfailure(null)\nprefix:present\nfailure({...})\nseedA\nseedAB\nseedAB\n');
-    if (forced) process.env.CFR_JS_FORCE_STATE_MACHINE = '1';
-    else delete process.env.CFR_JS_FORCE_STATE_MACHINE;
-    const source = decompileClassFile(classFile, {forceOwnedStructurer: true});
+
+    const source = decompileClassFile(classFile, {forceOwnedStructurer: true, forceStateMachine: forced});
     assertNoFallback(source);
     const rebuilt = path.join(temporary, 'rebuilt'); fs.mkdirSync(rebuilt);
     const javaFile = path.join(rebuilt, 'BuilderJoins.java'); fs.writeFileSync(javaFile, source);
     run('javac', ['--release', '8', '-d', rebuilt, javaFile, driverFile], rebuilt);
     assert.equal(run('java', ['-cp', rebuilt, 'BuilderRunner'], rebuilt), expected);
   } finally {
-    if (previous === undefined) delete process.env.CFR_JS_FORCE_STATE_MACHINE;
-    else process.env.CFR_JS_FORCE_STATE_MACHINE = previous;
+
     fs.rmSync(temporary, {recursive: true, force: true});
   }
 });

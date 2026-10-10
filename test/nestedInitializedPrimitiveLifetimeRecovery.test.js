@@ -16,14 +16,9 @@ test('second nested passes retain loop incoming values, handler reads and condit
  'int x=0;while(next()){x=one();use(x);Runnable r=()->use(x);x=two();use(x);}',
  'int x=0;while(next()){x=one();Object a=new int[x];x=two();use(x);}'])assert.equal(split(source).source,source,source);
 });
-test('the nested compiler flag requires initialized recovery and leaves defaults unchanged',()=>{
- const finish=require('../src/decompiler/cfr')._internals.shareExistingExitTails;
- const keys=['CFR_JS_SPLIT_INITIALIZED_PRIMITIVE_LIFETIMES','CFR_JS_SPLIT_NESTED_INITIALIZED_PRIMITIVE_LIFETIMES'],old=keys.map(k=>process.env[k]);
- const source='int x=0;try{if(first){x=1;use(x);x=2;use(x);}if(second){x=3;use(x);x=4;use(x);}}finally{finish();}';
- try{delete process.env[keys[0]];process.env[keys[1]]='1';let body=[source];finish(body);assert.equal(body.join('\n'),source);
-  process.env[keys[0]]='1';delete process.env[keys[1]];body=[source];finish(body);const before=body.join('\n');
-  process.env[keys[1]]='1';body=[source];finish(body);assert.notEqual(body.join('\n'),before);assert.ok(body.join('\n').includes('xLifetime1Lifetime1'));
- }finally{keys.forEach((k,i)=>{if(old[i]===undefined)delete process.env[k];else process.env[k]=old[i];});}
+test('compiler separates nested initialized phases by default',()=>{
+ const finish=require('../src/decompiler/cfr')._internals.shareExistingExitTails,body=['int x=0;try{if(first){x=1;use(x);x=2;use(x);}if(second){x=3;use(x);x=4;use(x);}}finally{finish();}'];
+ finish(body);assert.ok(body.join('\n').includes('xLifetime1Lifetime1'));
 });
 test('native nested literal roles preserve independent event traces, float bits, failures and monitors',()=>{
  const directory=fs.mkdtempSync(path.join(os.tmpdir(),'nested-initialized-native-'));
