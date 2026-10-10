@@ -26,8 +26,8 @@ function load(a, i) {
   if (a instanceof Int16Array) return u < a.length ? a[u] : OOB;
   if (a instanceof Float64Array) return u < a.length ? a[u] : OOB;
   if (a instanceof BigInt64Array) return u < a.length ? a[u] : OOB;
-  if (a.elements) return u < a.length ? a.elements[u] : OOB;
-  return u < a.length ? a[u] : OOB;
+  if (a && a.elements) return u < a.length ? a.elements[u] : OOB;
+  return a && u < a.length ? a[u] : OOB;
 }
 
 function store(a, i, v) {
@@ -40,21 +40,13 @@ function store(a, i, v) {
   if (a instanceof Int16Array) { if (u < a.length) { a[u] = v; return true; } return false; }
   if (a instanceof Float64Array) { if (u < a.length) { a[u] = v; return true; } return false; }
   if (a instanceof BigInt64Array) { if (u < a.length) { a[u] = v; return true; } return false; }
-  if (a.elements) { if (u < a.length) { a.elements[u] = v; return true; } return false; }
-  if (u < a.length) { a[u] = v; return true; }
+  if (a && a.elements) { if (u < a.length) { a.elements[u] = v; return true; } return false; }
+  if (a && u < a.length) { a[u] = v; return true; }
   return false;
 }
 
 function len(a) {
-  if (Array.isArray(a)) return a.length;
-  if (a instanceof Int32Array) return a.length;
-  if (a instanceof Int8Array) return a.length;
-  if (a instanceof Float32Array) return a.length;
-  if (a instanceof Uint16Array) return a.length;
-  if (a instanceof Int16Array) return a.length;
-  if (a instanceof Float64Array) return a.length;
-  if (a instanceof BigInt64Array) return a.length;
-  return a.length;
+  return a ? a.length : 0;
 }
 
 module.exports = { OOB, load, store, len };
