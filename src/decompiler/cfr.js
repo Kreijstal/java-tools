@@ -19,7 +19,7 @@ const { structureMethod } = require('./exceptionStructurer');
 const { mergeDuplicateLoopIncrementTails } = require('./loopTailMerge');
 const { partitionStructuredVoidBody } = require('./structuredMethodPartition');
 const {splitPrimitiveLocalLifetimes, splitNestedPrimitiveLocalLifetimes, splitReferenceLocalLifetimes, splitNestedReferenceLocalLifetimes, splitInitializedPrimitiveLocalLifetimes, splitNestedInitializedPrimitiveLocalLifetimes, splitArrayDimensionPrimitiveLocalLifetimes} = require('./primitiveLocalLifetimeRecovery');
-const {foldLoopFrameCompletion, shareDynamicGuardedTails, foldLeadingLoopExitWork, simplifyNaturalLoopExitCaptures, foldGuardedFrameCompletion, compactLocalBooleanGuards, reindentStructuredSource, foldExhaustiveSwitchFrameExits, foldExhaustiveIfFrameExits, foldSwitchExitTails} = require('./javaAstEmitter');
+const {foldLoopFrameCompletion, shareDynamicGuardedTails, foldLeadingLoopExitWork, simplifyNaturalLoopExitCaptures, foldGuardedFrameCompletion, compactLocalBooleanGuards, reindentStructuredSource, foldExhaustiveSwitchFrameExits, foldExhaustiveIfFrameExits, foldSwitchExitTails, foldSharedFrameExitGuards} = require('./javaAstEmitter');
 const { listRegionSplitCandidates, applyRegionSplit } = require('../passes/regionSplit');
 const { jreClassInfo, jreMethodCandidates } = require('../java-frontend/jreMetadata');
 const { JavaParser } = require('../java-frontend/parser');
@@ -2428,6 +2428,31 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
       const frame = foldExhaustiveIfFrameExits(source);
       if (!frame.framesRecovered) break;
       source = frame.source; changed = true;
+    }
+  }
+  if (process.env.CFR_JS_SHARED_FRAME_EXIT_GUARDS === '1') {
+    let normalized = false;
+    for (;;) {
+      const guard = foldSharedFrameExitGuards(source);
+      if (!guard.guardsRecovered) break;
+      source = guard.source; changed = true; normalized = true;
+    }
+    // Allocate fresh decisions after all existing recovery policies, so
+    // normalizing a shared exit cannot rename their previous locals.
+    if (normalized && process.env.CFR_JS_GUARDED_FRAME_COMPLETION === '1') {
+      const modes = [{}];
+      if (process.env.CFR_JS_GUARDED_FRAME_PREFIX_EFFECTS === '1') modes.push({effectfulGuards: true});
+      if (process.env.CFR_JS_GUARDED_FRAME_ALTERNATES === '1') modes.push({effectfulGuards: true, alternateGuards: true, maximumExits: 64});
+      for (const mode of modes) for (;;) {
+        const frame = foldGuardedFrameCompletion(source, {reservedNames: parameterNames, ...mode});
+        if (!frame.framesRecovered) break;
+        source = frame.source; changed = true;
+      }
+      if (process.env.CFR_JS_COMPACT_LOCAL_BOOLEAN_GUARDS === '1') for (;;) {
+        const guards = compactLocalBooleanGuards(source, {reservedNames: parameterNames});
+        if (!guards.guardsCompacted) break;
+        source = guards.source; changed = true;
+      }
     }
   }
   if (process.env.CFR_JS_REINDENT_STRUCTURED_BODIES === '1') {

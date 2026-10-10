@@ -10,6 +10,7 @@ const { JavaParser } = require('../java-frontend/parser');
 const { tokenizeJava } = require('../java-frontend/lexer');
 const { recoverScalarLabelDispatches: recoverScalarDispatch } = require('./scalarDispatchRecovery');
 const { recoverScalarIfDispatches: recoverIfDispatch } = require('./scalarIfDispatchRecovery');
+const {foldSharedFrameExitGuards: recoverSharedFrameExitGuards} = require('./sharedFrameExitGuardRecovery');
 const { simplifyPredicateNegations: simplifyNegations } = require('./predicateNegationRecovery');
 const {simplifyComplementedRelations: recoverComplementedRelations} = require('./complementedRelationRecovery');
 const { simplifyPredicateGrouping: simplifyGrouping } = require('./predicateGroupingRecovery');
@@ -798,6 +799,10 @@ function foldExhaustiveSwitchFrameExits(source, options = {}) {
 function foldExhaustiveIfFrameExits(source, options = {}) {
   try {return recoverExhaustiveIfFrames(source, controlCleanupSource(source), options);}
   catch (error) {if (error instanceof RangeError) return {source, framesRecovered: 0}; throw error;}
+}
+
+function foldSharedFrameExitGuards(source, options = {}) {
+  return recoverSharedFrameExitGuards(source, controlCleanupSource(source), options);
 }
 
 function foldSwitchExitTails(source, options = {}) {
@@ -3506,6 +3511,7 @@ module.exports = {
   foldExhaustiveSwitchFrameExits,
   foldExhaustiveIfFrameExits,
   foldSwitchExitTails,
+  foldSharedFrameExitGuards,
   reindentStructuredSource,
   shareDynamicGuardedTails,
   foldLeadingLoopExitWork,

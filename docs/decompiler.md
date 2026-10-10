@@ -2786,3 +2786,30 @@ The focused native test compares original and reconstructed methods with an
 independent direct-dispatch model across protected loop effects, nested switches,
 permission callbacks, nullable predicates, aliased partial stores, arithmetic
 overflow, failures, finally overrides and monitor ownership.
+
+### Guarding work before a shared plain-frame exit
+
+`foldSharedFrameExitGuards(source)` recognizes a direct guarded break and a
+later terminal break to the same plain frame in one statement block. It keeps
+that terminal break and guards the complete intervening work with the inverse
+of the original predicate. Field reads, calls and nullable unboxing happen once,
+in their original order. No predicate purity or control-flag value is assumed.
+
+Both destinations are resolved lexically and must be identical. The earlier arm
+contains only its break, with no alternative. The intervening work contains one
+to 32 statements; top-level declarations refuse rather than changing their
+scope. Complete protected constructs and their pending returns/throws remain
+intact. Source size, region size, token count and traversal depth remain bounded.
+Different destinations, crossed block/protected corridors, extra arm effects,
+conditional final exits and unsupported captures refuse.
+
+The compiler policy is opt-in: `CFR_JS_SHARED_FRAME_EXIT_GUARDS=1`. It runs after
+existing recoveries, then retries the already enabled guarded-frame and local
+Boolean compaction policies. Existing decision identities retain their naming
+order; newly exposed continuations receive fresh names. Game priorities, naming
+rules and source/native proof metadata stay in the consuming repository.
+
+Focused native fixtures compare the original, normalized and combined forms
+with an independent direct model across nullable predicates, loop callbacks,
+aliased partial stores, arithmetic overflow, zero/nonzero flags, exceptions,
+finally overrides and monitor ownership.
