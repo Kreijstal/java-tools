@@ -1,23 +1,24 @@
 'use strict';
 const {independentlyAssignedLocalSequence} = require('./primitiveLocalLifetimeRecovery');
+const {priorLocalAssignment} = require('./priorLocalAssignmentProof');
 
 // Replace a nonlocal frame exit from one loop with a local loop exit and an
 // explicit completion flag. Guard each remaining block suffix on the path to
 // the frame. No old predicate or action is copied. Protected/outer-loop
 // corridors refuse: finally can override a pending transfer, and a second loop
 // could evaluate another condition after the old frame would already be gone.
-function foldLoopFrameCompletion(source, proof, {retainDiagnostics = false, reservedNames = []} = {}) {
+function foldLoopFrameCompletion(source, proof, {retainDiagnostics = false, reservedNames = [], scopedInitialization = false} = {}) {
   const unchanged = () => ({source, exitsRecovered: 0, labelsRemoved: 0});
-  if (!proof || typeof retainDiagnostics !== 'boolean' || source.length > 400000) return unchanged();
+  if (!proof || typeof retainDiagnostics !== 'boolean' || typeof scopedInitialization !== 'boolean' || source.length > 400000 || !Array.isArray(reservedNames) || reservedNames.some(n=>typeof n!=='string')) return unchanged();
   const {parsed,tokens,starts,closes,children,labelCounts} = proof;
   const loops = new Set(['WhileStatement','ForStatement','EnhancedForStatement','DoWhileStatement']);
   const parents = new Map(), targets = new Map(), references = new Map(), jumps = [],
-    uninitialized = new Set(), contexts = new Map();
+    uninitialized = new Set(), contexts = new Map(), declarations = new Map();
   let refused = false;
   function visit(node, parent = null, labels = [], activeLoops = [], breaks = []) {
     parents.set(node,parent);
     contexts.set(node,[...labels.map(n=>({node:n,label:n.label})),...activeLoops.map(n=>({node:n,loop:true}))]);
-    if(node.kind==='VariableDeclarator'&&!node.initializer)uninitialized.add(node.name);
+    if(node.kind==='VariableDeclarator'){declarations.set(node.name,[...(declarations.get(node.name)||[]),node]);if(!node.initializer)uninitialized.add(node.name);}
     if (/ClassDeclaration|InterfaceDeclaration|EnumDeclaration|RecordDeclaration|MethodDeclaration|ConstructorDeclaration|LambdaExpression|AnonymousClass|Pattern/.test(node.kind || '') || node.kind === 'NewClassExpression' && node.body != null) refused = true;
     if (['BreakStatement','ContinueStatement'].includes(node.kind)) {
       const target = node.label ? labels.slice().reverse().find(n=>n.label===node.label)
@@ -51,7 +52,7 @@ function foldLoopFrameCompletion(source, proof, {retainDiagnostics = false, rese
       cursor=parents.get(cursor);
     }
     if(!valid||!loop)continue;
-    const suffixes=[],corridor=[];
+    const suffixes=[],corridor=[],priorAssignments=new Map();
     cursor=loop;
     while(cursor!==frame.statement) {
       const parent=parents.get(cursor);if(!parent){valid=false;break;}
@@ -62,7 +63,7 @@ function foldLoopFrameCompletion(source, proof, {retainDiagnostics = false, rese
           const first=starts.get(parent.statements[index+1].range?.startOffset);
           if(first==null){valid=false;break;}
           const remainder=parent.statements.slice(index+1);
-          if([...uninitialized].some(name=>!independentlyAssignedLocalSequence(remainder,name,contexts.get(parent)))){valid=false;break;}
+          if([...uninitialized].some(name=>{if(independentlyAssignedLocalSequence(remainder,name,contexts.get(parent),{postTestLoops:scopedInitialization}))return false;if(scopedInitialization){const prior=priorLocalAssignment(cursor,name,{parents,declarations,contexts,reservedNames});if(prior){priorAssignments.set(name+':'+prior.entryOffset,prior);return false;}}return true;})){valid=false;break;}
           suffixes.push({start:tokens[first].range.startOffset-2,end:tokens[bounds.close].range.startOffset-2,statements:parent.statements.length-index-1});
         }
       }else if(parent.kind==='IfStatement') {
@@ -96,7 +97,7 @@ function foldLoopFrameCompletion(source, proof, {retainDiagnostics = false, rese
     let result=source;
     for(const edit of edits)result=result.slice(0,edit.start)+edit.text+result.slice(edit.end);
     return {source:result,exitsRecovered:1,labelsRemoved:Number(!retained),guardsAdded:suffixes.length,
-      ...(retainDiagnostics?{diagnostics:{frameRange:range(starts.get(frame.range.startOffset),frameBody.close),loopStart:loop.range.startOffset-2,jumpRange,name,suffixes,corridorKinds:corridor,labelRetained:retained,edits}}:{})};
+      ...(retainDiagnostics?{diagnostics:{frameRange:range(starts.get(frame.range.startOffset),frameBody.close),loopStart:loop.range.startOffset-2,jumpRange,name,suffixes,corridorKinds:corridor,labelRetained:retained,...(scopedInitialization?{priorAssignments:[...priorAssignments.values()]}:{}),edits}}:{})};
   }
   return unchanged();
 }

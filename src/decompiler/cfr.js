@@ -2495,6 +2495,29 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
       source = guards.source; changed = true;
     }
   }
+  if (process.env.CFR_JS_SCOPED_FRAME_INITIALIZATION === '1') {
+    let recovered = false;
+    if (process.env.CFR_JS_LOOP_FRAME_COMPLETION === '1') for (;;) {
+      const frame = foldLoopFrameCompletion(source, {reservedNames: parameterNames, scopedInitialization: true});
+      if (!frame.exitsRecovered) break;
+      source = frame.source; changed = true; recovered = true;
+    }
+    if (process.env.CFR_JS_GUARDED_FRAME_COMPLETION === '1') {
+      const modes = [{scopedInitialization: true, dominatingAssignments: true}];
+      if (process.env.CFR_JS_GUARDED_FRAME_PREFIX_EFFECTS === '1') modes.push({scopedInitialization: true, dominatingAssignments: true, effectfulGuards: true});
+      if (process.env.CFR_JS_GUARDED_FRAME_ALTERNATES === '1') modes.push({scopedInitialization: true, dominatingAssignments: true, effectfulGuards: true, alternateGuards: true, maximumExits: 64});
+      for (const mode of modes) for (;;) {
+        const frame = foldGuardedFrameCompletion(source, {reservedNames: parameterNames, ...mode});
+        if (!frame.framesRecovered) break;
+        source = frame.source; changed = true; recovered = true;
+      }
+    }
+    if (recovered && process.env.CFR_JS_COMPACT_LOCAL_BOOLEAN_GUARDS === '1') for (;;) {
+      const guards = compactLocalBooleanGuards(source, {reservedNames: parameterNames});
+      if (!guards.guardsCompacted) break;
+      source = guards.source; changed = true;
+    }
+  }
   if (process.env.CFR_JS_SHARED_SWITCH_FRAME_EXITS === '1') {
     const exits = foldSharedSwitchFrameExits(source);
     if (exits.breaksLocalized) {source = exits.source; changed = true;}

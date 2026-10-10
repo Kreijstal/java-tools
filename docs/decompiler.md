@@ -2880,3 +2880,31 @@ and existing prefix diagnostics remain unchanged.
 Four focused groups, plus nine existing guarded-frame groups, pass. An independent
 native work oracle covers 35,100 prior-snapshot, aliased-state, nullable-predicate,
 nonzero-flag, overflow, failure, finally-override and monitor cases.
+
+
+### Scoped initialization for frame remainders
+
+Both guarded-frame and loop-frame completion support `{scopedInitialization:
+true}`. Each guarded remainder may use a direct prior assignment in its original
+branch or containing block. The assignment binds to one uninitialized local,
+precedes the remainder on every normal entry, and remains in place. Its right
+side must be valid from an unassigned state; conditional assignments, shadowed
+locals, self reads and case/catch/finally/protected entry inference refuse.
+
+Assignment flow additionally recognizes post-test loops under this option.
+The body executes before the condition; normal and continue paths must initialize
+all condition reads. Break paths skip the condition, and every possible normal
+exit contributes to assignment state for later reads. A break/continue that
+bypasses initialization cannot establish later availability. Existing primitive
+lifetime splitting and default frame policies retain their prior refusal.
+
+The compiler opt-in `CFR_JS_SCOPED_FRAME_INITIALIZATION=1` retries enabled loop
+completion, then enabled guarded-frame policies, after established recovery has
+allocated its decisions. No old predicate, snapshot or action is copied or moved.
+All existing restrictions on crossed cleanup, switches and extra loops remain.
+
+Four focused groups include independent javac assignment judgments and 202,500
+native comparisons with separate branch, loop-completion and post-test work
+oracles. Nullable predicates, prior primitive/reference snapshots, aliases,
+nonzero flags, overflow, partial failures, finally overrides and monitor ownership
+are covered. Nineteen existing frame groups also pass with their defaults.

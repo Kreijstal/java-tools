@@ -1,12 +1,13 @@
 'use strict';
 const {independentlyAssignedLocalSequence} = require('./primitiveLocalLifetimeRecovery');
+const {priorLocalAssignment} = require('./priorLocalAssignmentProof');
 
 // Resolve each guarded frame exit locally, then guard all remaining block
 // suffixes on its lexical path. Conditions/actions retain one occurrence.
 // Loops, switches and protected corridors cannot become normal fallthrough.
-function foldGuardedFrameCompletion(source, proof, {retainDiagnostics = false, reservedNames = [], effectfulGuards = false, alternateGuards = false, dominatingAssignments = false, maximumExits = 16} = {}) {
+function foldGuardedFrameCompletion(source, proof, {retainDiagnostics = false, reservedNames = [], effectfulGuards = false, alternateGuards = false, dominatingAssignments = false, scopedInitialization = false, maximumExits = 16} = {}) {
   const unchanged = () => ({source, framesRecovered: 0});
-  if (!proof || typeof retainDiagnostics !== 'boolean' || typeof effectfulGuards !== 'boolean' || typeof alternateGuards !== 'boolean' || typeof dominatingAssignments !== 'boolean' ||
+  if (!proof || typeof retainDiagnostics !== 'boolean' || typeof effectfulGuards !== 'boolean' || typeof alternateGuards !== 'boolean' || typeof dominatingAssignments !== 'boolean' || typeof scopedInitialization !== 'boolean' ||
       !Number.isInteger(maximumExits) || maximumExits < 1 || maximumExits > 64 || !Array.isArray(reservedNames) || reservedNames.some(n=>typeof n!=='string') || source.length>400000) return unchanged();
   const {parsed,tokens,starts,closes,children,labelCounts}=proof;
   if([...labelCounts.values()].some(n=>n!==1))return unchanged();
@@ -62,7 +63,7 @@ function foldGuardedFrameCompletion(source, proof, {retainDiagnostics = false, r
     return assigned;
   }
   for(const frame of frames.sort((a,b)=>b.range.startOffset-a.range.startOffset)){
-    const body=bounds(frame.statement),jumps=refs.get(frame)||[],guards=[],suffixes=new Map(),assigned=prefixAssignments(frame),usedAssignments=new Map();let valid=true;
+    const body=bounds(frame.statement),jumps=refs.get(frame)||[],guards=[],suffixes=new Map(),assigned=prefixAssignments(frame),usedAssignments=new Map(),priorAssignments=new Map();let valid=true;
     if(!body||!frame.statement.statements.length||!jumps.length||jumps.length>maximumExits||tokens[body.close].range.endOffset-frame.range.startOffset>80000)continue;
     for(const jump of jumps){
       if(jump.kind!=='BreakStatement'||jump.label!==frame.label){valid=false;break;}
@@ -79,7 +80,7 @@ function foldGuardedFrameCompletion(source, proof, {retainDiagnostics = false, r
         ...(effectful?{effectful:true,prefixRange:range(cc+2,jf-1)}:{}),...(guard.alternate?{alternate:true}:{})};
       let child=guard;
       while(child!==frame.statement){const parent=parents.get(child);if(!parent){valid=false;break;}
-        if(parent.kind==='BlockStatement'){const b=bounds(parent),index=parent.statements.indexOf(child);if(!b||index<0){valid=false;break;}const rest=parent.statements.slice(index+1);if(rest.length){if([...uninitialized].some(name=>{if(independentlyAssignedLocalSequence(rest,name,contexts.get(parent)))return false;const prefix=assigned.get(name);if(!prefix)return true;usedAssignments.set(name,prefix);return false;})){valid=false;break;}const sf=starts.get(rest[0].range.startOffset);if(sf===undefined){valid=false;break;}const s={start:tokens[sf].range.startOffset-2,end:tokens[b.close].range.startOffset-2,statements:rest.length};suffixes.set(s.start+':'+s.end,s);}}
+        if(parent.kind==='BlockStatement'){const b=bounds(parent),index=parent.statements.indexOf(child);if(!b||index<0){valid=false;break;}const rest=parent.statements.slice(index+1);if(rest.length){if([...uninitialized].some(name=>{if(independentlyAssignedLocalSequence(rest,name,contexts.get(parent),{postTestLoops:scopedInitialization}))return false;const prefix=assigned.get(name);if(prefix){usedAssignments.set(name,prefix);return false;}if(scopedInitialization){const prior=priorLocalAssignment(child,name,{parents,declarations,contexts,reservedNames});if(prior){priorAssignments.set(name+':'+prior.entryOffset,prior);return false;}}return true;})){valid=false;break;}const sf=starts.get(rest[0].range.startOffset);if(sf===undefined){valid=false;break;}const s={start:tokens[sf].range.startOffset-2,end:tokens[b.close].range.startOffset-2,statements:rest.length};suffixes.set(s.start+':'+s.end,s);}}
         else if(parent.kind==='IfStatement'){if(![parent.consequent,parent.alternate].includes(child)){valid=false;break;}}
         else if(parent.kind==='LabeledStatement'){if(parent.statement!==child||!bounds(child)){valid=false;break;}}
         else{valid=false;break;}
@@ -113,7 +114,7 @@ function foldGuardedFrameCompletion(source, proof, {retainDiagnostics = false, r
     // At one boundary, close an inner suffix before opening a later suffix.
     edits.sort((a,b)=>b.start-a.start||b.end-a.end||(a.kind==='guard-open'?-1:b.kind==='guard-open'?1:0));let result=source;
     for(const e of edits)result=result.slice(0,e.start)+e.text+result.slice(e.end);
-    return{source:result,framesRecovered:1,jumpsRemoved:guards.length,guardsAdded:sorted.length,...(retainDiagnostics?{diagnostics:{range:range(label,body.close),name,label:frame.label,declarationOffset,guards,suffixes:sorted,prefixAssignments:[...usedAssignments.values()].filter(p=>!p.dominating),...(dominatingAssignments?{dominatingAssignments:[...usedAssignments.values()].filter(p=>p.dominating)}:{}),edits}}:{})};
+    return{source:result,framesRecovered:1,jumpsRemoved:guards.length,guardsAdded:sorted.length,...(retainDiagnostics?{diagnostics:{range:range(label,body.close),name,label:frame.label,declarationOffset,guards,suffixes:sorted,prefixAssignments:[...usedAssignments.values()].filter(p=>!p.dominating),...(dominatingAssignments?{dominatingAssignments:[...usedAssignments.values()].filter(p=>p.dominating)}:{}),...(scopedInitialization?{priorAssignments:[...priorAssignments.values()]}:{}),edits}}:{})};
   }
   return unchanged();
 }

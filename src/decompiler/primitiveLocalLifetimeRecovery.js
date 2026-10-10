@@ -273,11 +273,11 @@ function expression(node, assigned, name) {
     default: return null;
   }
 }
-function sequence(statements, assigned, name, contexts) {
+function sequence(statements, assigned, name, contexts, postTestLoops = false) {
   let state = {normal: assigned, exits: []};
   for (const node of statements) {
     if (state.normal === null) return null; // unreachable tails are not reconstructed
-    const next = statement(node, state.normal, name, contexts);
+    const next = statement(node, state.normal, name, contexts, postTestLoops);
     if (!next) return null;
     state = {normal: next.normal, exits: [...state.exits, ...next.exits]};
   }
@@ -287,13 +287,13 @@ function merge(states) {
   const normal = states.map(s => s.normal).filter(s => s !== null);
   return {normal: normal.length ? normal.every(Boolean) : null, exits: states.flatMap(s => s.exits)};
 }
-function statement(node, assigned, name, contexts) {
+function statement(node, assigned, name, contexts, postTestLoops = false) {
   if (!node) return null;
   const simple = value => value === null ? null : {normal: value, exits: []};
   const evalExpr = n => expression(n, assigned, name);
   switch (node.kind) {
     case 'EmptyStatement': return simple(assigned);
-    case 'BlockStatement': return sequence(node.statements || [], assigned, name, contexts);
+    case 'BlockStatement': return sequence(node.statements || [], assigned, name, contexts, postTestLoops);
     case 'ExpressionStatement': return simple(evalExpr(node.expression));
     case 'LocalVariableDeclarationStatement': {
       let state = assigned;
@@ -302,11 +302,11 @@ function statement(node, assigned, name, contexts) {
     }
     case 'IfStatement': {
       const condition = evalExpr(node.condition); if (condition === null) return null;
-      const a = statement(node.consequent, condition, name, contexts), b = node.alternate ? statement(node.alternate, condition, name, contexts) : simple(condition);
+      const a = statement(node.consequent, condition, name, contexts, postTestLoops), b = node.alternate ? statement(node.alternate, condition, name, contexts, postTestLoops) : simple(condition);
       return a && b ? merge([a,b]) : null;
     }
     case 'LabeledStatement': {
-      const body = statement(node.statement, assigned, name, [...contexts, {node, label: node.label}]);
+      const body = statement(node.statement, assigned, name, [...contexts, {node, label: node.label}], postTestLoops);
       if (!body) return null;
       const exits = body.exits.filter(e => e.target === node);
       if (exits.some(e => e.kind !== 'break')) return null;
@@ -319,12 +319,25 @@ function statement(node, assigned, name, contexts) {
       let entry = assigned;
       if (node.kind === 'ForStatement') {
         const init = node.initializer;
-        if (init?.kind === 'LocalVariableDeclarationStatement') { const s = statement(init, entry, name, contexts); if (!s) return null; entry = s.normal; }
+        if (init?.kind === 'LocalVariableDeclarationStatement') { const s = statement(init, entry, name, contexts, postTestLoops); if (!s) return null; entry = s.normal; }
         else { entry = expression(init, entry, name); if (entry === null) return null; }
       }
-      if (node.kind === 'DoWhileStatement') return null;
+      if (node.kind === 'DoWhileStatement') {
+        if (!postTestLoops) return null;
+        const body = statement(node.body, entry, name, [...contexts, {node, loop: true}], postTestLoops);
+        if (!body) return null;
+        const own = body.exits.filter(e => e.target === node);
+        const tests = [body.normal, ...own.filter(e => e.kind === 'continue').map(e => e.assigned)]
+          .filter(s => s !== null).map(s => expression(node.condition, s, name));
+        if (tests.some(s => s === null)) return null;
+        // No zero-iteration entry. Breaks skip the test; normal/continue paths
+        // test after the body. Assignment is monotonic on later iterations.
+        const result = merge([...tests.map(simple), ...own.filter(e => e.kind === 'break').map(e => simple(e.assigned))]);
+        result.exits = body.exits.filter(e => e.target !== node);
+        return result;
+      }
       const tested = expression(node.condition, entry, name); if (tested === null) return null;
-      const body = statement(node.body, tested, name, [...contexts, {node, loop: true}]); if (!body) return null;
+      const body = statement(node.body, tested, name, [...contexts, {node, loop: true}], postTestLoops); if (!body) return null;
       const own = body.exits.filter(e => e.target === node);
       for (const s of [body.normal, ...own.filter(e => e.kind === 'continue').map(e => e.assigned)].filter(s => s !== null)) {
         const updated = expression(node.update, s, name);
@@ -355,11 +368,12 @@ function statement(node, assigned, name, contexts) {
 function splitNestedPrimitiveLocalLifetimes(source, options = {}) {
   return splitPrimitiveLocalLifetimes(source, {...options, nestedBlocks: true});
 }
-function independentlyAssignedLocalSequence(statements, name, contexts = []) {
+function independentlyAssignedLocalSequence(statements, name, contexts = [], {postTestLoops = false} = {}) {
+  if (typeof postTestLoops !== 'boolean') return false;
   let arrayUse = false;
   walk(statements, n => { if (n.kind === 'NewArrayExpression' && mentions(n, name)) arrayUse = true; });
   if (arrayUse) return false; // existing control-frame recovery contract
-  return sequence(statements, false, name, contexts) !== null;
+  return sequence(statements, false, name, contexts, postTestLoops) !== null;
 }
 module.exports = {splitPrimitiveLocalLifetimes, splitNestedPrimitiveLocalLifetimes, splitReferenceLocalLifetimes, splitNestedReferenceLocalLifetimes, splitInitializedPrimitiveLocalLifetimes, splitNestedInitializedPrimitiveLocalLifetimes, splitArrayDimensionPrimitiveLocalLifetimes,
   independentlyAssignedLocalSequence};
