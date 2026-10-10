@@ -19,7 +19,7 @@ const { structureMethod } = require('./exceptionStructurer');
 const { mergeDuplicateLoopIncrementTails } = require('./loopTailMerge');
 const { partitionStructuredVoidBody } = require('./structuredMethodPartition');
 const {splitPrimitiveLocalLifetimes, splitNestedPrimitiveLocalLifetimes, splitReferenceLocalLifetimes, splitNestedReferenceLocalLifetimes, splitInitializedPrimitiveLocalLifetimes, splitNestedInitializedPrimitiveLocalLifetimes, splitArrayDimensionPrimitiveLocalLifetimes} = require('./primitiveLocalLifetimeRecovery');
-const {foldLoopFrameCompletion, shareDynamicGuardedTails, foldLeadingLoopExitWork, simplifyNaturalLoopExitCaptures, foldGuardedFrameCompletion, compactLocalBooleanGuards, reindentStructuredSource, foldExhaustiveSwitchFrameExits, foldExhaustiveIfFrameExits, foldSwitchExitTails, foldSharedFrameExitGuards, foldSharedSwitchFrameExits, foldSharedLoopFrameExits, splitMultilineBlockHeaders} = require('./javaAstEmitter');
+const {foldLoopFrameCompletion, shareDynamicGuardedTails, foldLeadingLoopExitWork, simplifyNaturalLoopExitCaptures, foldGuardedFrameCompletion, compactLocalBooleanGuards, foldKnownBooleanAlternatives, reindentStructuredSource, foldExhaustiveSwitchFrameExits, foldExhaustiveIfFrameExits, foldSwitchExitTails, foldSharedFrameExitGuards, foldSharedSwitchFrameExits, foldSharedLoopFrameExits, splitMultilineBlockHeaders} = require('./javaAstEmitter');
 const { listRegionSplitCandidates, applyRegionSplit } = require('../passes/regionSplit');
 const { jreClassInfo, jreMethodCandidates } = require('../java-frontend/jreMetadata');
 const { JavaParser } = require('../java-frontend/parser');
@@ -2517,6 +2517,11 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
       if (!guards.guardsCompacted) break;
       source = guards.source; changed = true;
     }
+  }
+  if (process.env.CFR_JS_KNOWN_BOOLEAN_ALTERNATIVES === '1') for (;;) {
+    const alternative = foldKnownBooleanAlternatives(source, {reservedNames: parameterNames});
+    if (!alternative.alternativesRecovered) break;
+    source = alternative.source; changed = true;
   }
   if (process.env.CFR_JS_SHARED_SWITCH_FRAME_EXITS === '1') {
     const exits = foldSharedSwitchFrameExits(source);

@@ -34,6 +34,7 @@ const { foldTerminalGuardedFrameExits: recoverTerminalGuardedFrames } = require(
 const {foldLoopFrameCompletion: recoverLoopFrameCompletion} = require('./loopFrameCompletionRecovery');
 const {foldGuardedFrameCompletion: recoverGuardedFrameCompletion} = require('./guardedFrameCompletionRecovery');
 const {compactLocalBooleanGuards: recoverLocalBooleanGuards} = require('./localBooleanGuardCompaction');
+const {foldKnownBooleanAlternatives: recoverKnownBooleanAlternatives} = require('./knownBooleanAlternativeRecovery');
 const {reindentStructuredSource: recoverStructuredIndentation} = require('./structuredSourceIndentation');
 const {foldExhaustiveSwitchFrameExits: recoverExhaustiveSwitchFrames} = require('./exhaustiveSwitchFrameRecovery');
 const {foldExhaustiveIfFrameExits: recoverExhaustiveIfFrames} = require('./exhaustiveIfFrameRecovery');
@@ -792,6 +793,11 @@ function foldGuardedFrameCompletion(source, options = {}) {
 function compactLocalBooleanGuards(source, options = {}) {
   try {return recoverLocalBooleanGuards(source, controlCleanupSource(source), options);}
   catch (error) {if (error instanceof RangeError) return {source, guardsCompacted: 0}; throw error;}
+}
+
+function foldKnownBooleanAlternatives(source, options = {}) {
+  try {return recoverKnownBooleanAlternatives(source, controlCleanupSource(source), options);}
+  catch (error) {if (error instanceof RangeError) return {source, alternativesRecovered: 0};throw error;}
 }
 
 function foldExhaustiveSwitchFrameExits(source, options = {}) {
@@ -3533,6 +3539,7 @@ module.exports = {
   foldLoopFrameCompletion,
   foldGuardedFrameCompletion,
   compactLocalBooleanGuards,
+  foldKnownBooleanAlternatives,
   foldExhaustiveSwitchFrameExits,
   foldExhaustiveIfFrameExits,
   foldSwitchExitTails,

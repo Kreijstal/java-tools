@@ -2908,3 +2908,27 @@ native comparisons with separate branch, loop-completion and post-test work
 oracles. Nullable predicates, prior primitive/reference snapshots, aliases,
 nonzero flags, overflow, partial failures, finally overrides and monitor ownership
 are covered. Nineteen existing frame groups also pass with their defaults.
+
+
+### Known-true Boolean alternatives
+
+`foldKnownBooleanAlternatives` replaces an immediately following local Boolean
+remainder guard with an `else` arm when that Boolean is known true before the
+preceding decision. The original complete true arm must end in a simple false
+store to that same bound primitive local. The predicate, complete true/false
+blocks, declaration and false store stay in place; one redundant local read is
+removed. Later stores and reads retain their original values.
+
+Entry truth comes from a prior literal-true declaration without intervening
+writes, or a containing positive guard on that same primitive local. The proof
+stops at loops and protected entries. A declaration inside a loop can establish
+truth for that iteration. Writes in another initializer, the decision condition,
+or its earlier true-arm work refuse; so do boxing, shadowing, captures,
+nonadjacent guards and existing alternatives. Local block scope remains intact.
+The compiler opt-in is `CFR_JS_KNOWN_BOOLEAN_ALTERNATIVES=1`, applied after
+established reconstruction without introducing or renaming decisions.
+
+Four focused and six existing Boolean-compaction groups pass. An independent
+native work oracle compares 324,000 initializer/positive-guard cases across
+nullable predicates, later Boolean stores, aliases, nonzero flags, overflow,
+partial failures, finally overrides and monitor ownership.
