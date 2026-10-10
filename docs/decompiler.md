@@ -2932,3 +2932,24 @@ Four focused and six existing Boolean-compaction groups pass. An independent
 native work oracle compares 324,000 initializer/positive-guard cases across
 nullable predicates, later Boolean stores, aliases, nonzero flags, overflow,
 partial failures, finally overrides and monitor ownership.
+
+
+### Negated equality values
+
+`simplifyNegatedEqualityValues` complements `==`/`!=` beneath an explicit
+parenthesized logical negation in any value context. Equality produces a
+primitive Boolean for numeric, Boolean and reference operands. Both operands,
+evaluation/unboxing order, overload selection, boxing and original parentheses
+remain; only the negation and equality operator spelling change. Left-associated
+equality chains complement their root operator. Repeated calls can simplify a
+negation chain whose base is equality without exposing an unknown boxed atom.
+
+Ordering comparisons retain NaNs; logical combinations and arbitrary double
+negations remain unchanged. In particular, `Object x = !!boxedBoolean` cannot
+become a direct reference assignment. The compiler opt-in is
+`CFR_JS_NEGATED_EQUALITY_VALUES=1`, applied after established reconstruction.
+
+Four focused and 15 existing predicate groups pass. An independent native oracle
+covers 25,920 numeric/reference/boxed comparisons, NaN payloads, signed zero,
+nullable unboxing, primitive overload selection, canonical boxing, callbacks,
+partial failures, finally overrides and monitor ownership.
