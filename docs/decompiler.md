@@ -2452,6 +2452,28 @@ NaN/infinity casts, nullable arrays and bounds failures, narrowing casts,
 throwing callbacks, finally overrides and monitor release. Diagnostics report
 the operand types and exact operator ranges for independent compiler audits.
 
+### Retaining alternatives in guarded frame reconstruction
+
+`foldGuardedFrameCompletion` supports `{alternateGuards: true}`. A selected
+terminal exit in a conditional's true arm becomes a false continuation decision
+at the same site, preserving the complete original conditional and its
+alternative. Effectful true-arm prefixes remain intact when enabled. The
+condition is never reevaluated or inverted and alternative work is never copied.
+Complete original suffixes use the existing independently bound continuation
+flag. Loops, protected corridors, ambiguous initialization and other unsafe
+prefix exits remain conservative.
+
+`maximumExits` defaults to 16 and accepts only integers from 1 to 64. Compiler
+use requires the opt-in `CFR_JS_GUARDED_FRAME_ALTERNATES=1` with the existing
+guarded-frame policy. Ordinary and effectful-prefix candidates run first to
+preserve their established continuation names. The alternate pass uses the
+64-exit bound; source size, depth and suffix limits remain in place.
+
+Four focused groups cover intact alternatives, pure/effectful/mixed decisions,
+finite budgets, refusal cases and compiler ordering. Independent native models
+compare 50,544 nullable-predicate, partial/aliased-store, overflow, failure,
+finally-override and monitor cases with an early-return work oracle.
+
 ### Localizing switch exits with one effectful normal tail
 
 `foldSwitchExitTails` recognizes an exhaustive colon-label switch with exactly

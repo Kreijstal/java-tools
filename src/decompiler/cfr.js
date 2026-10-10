@@ -2391,6 +2391,14 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
         source = frame.source; changed = true;
       }
     }
+    if (process.env.CFR_JS_GUARDED_FRAME_ALTERNATES === '1') {
+      for (;;) {
+        const frame = foldGuardedFrameCompletion(source, {reservedNames: parameterNames,
+          effectfulGuards: true, alternateGuards: true, maximumExits: 64});
+        if (!frame.framesRecovered) break;
+        source = frame.source; changed = true;
+      }
+    }
   }
 
   if (process.env.CFR_JS_COMPACT_LOCAL_BOOLEAN_GUARDS === '1') {

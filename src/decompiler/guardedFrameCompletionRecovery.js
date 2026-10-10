@@ -4,9 +4,10 @@ const {independentlyAssignedLocalSequence} = require('./primitiveLocalLifetimeRe
 // Resolve each guarded frame exit locally, then guard all remaining block
 // suffixes on its lexical path. Conditions/actions retain one occurrence.
 // Loops, switches and protected corridors cannot become normal fallthrough.
-function foldGuardedFrameCompletion(source, proof, {retainDiagnostics = false, reservedNames = [], effectfulGuards = false} = {}) {
+function foldGuardedFrameCompletion(source, proof, {retainDiagnostics = false, reservedNames = [], effectfulGuards = false, alternateGuards = false, maximumExits = 16} = {}) {
   const unchanged = () => ({source, framesRecovered: 0});
-  if (!proof || typeof retainDiagnostics !== 'boolean' || typeof effectfulGuards !== 'boolean' || !Array.isArray(reservedNames) || reservedNames.some(n=>typeof n!=='string') || source.length>400000) return unchanged();
+  if (!proof || typeof retainDiagnostics !== 'boolean' || typeof effectfulGuards !== 'boolean' || typeof alternateGuards !== 'boolean' ||
+      !Number.isInteger(maximumExits) || maximumExits < 1 || maximumExits > 64 || !Array.isArray(reservedNames) || reservedNames.some(n=>typeof n!=='string') || source.length>400000) return unchanged();
   const {parsed,tokens,starts,closes,children,labelCounts}=proof;
   if([...labelCounts.values()].some(n=>n!==1))return unchanged();
   const loopKinds=new Set(['WhileStatement','ForStatement','EnhancedForStatement','DoWhileStatement']),parents=new Map(),refs=new Map(),frames=[],uninitialized=new Set(),declarations=new Map(),contexts=new Map();let refused=false;
@@ -45,7 +46,7 @@ function foldGuardedFrameCompletion(source, proof, {retainDiagnostics = false, r
   }
   for(const frame of frames.sort((a,b)=>b.range.startOffset-a.range.startOffset)){
     const body=bounds(frame.statement),jumps=refs.get(frame)||[],guards=[],suffixes=new Map(),assigned=prefixAssignments(frame.statement),usedAssignments=new Map();let valid=true;
-    if(!body||!frame.statement.statements.length||!jumps.length||jumps.length>16||tokens[body.close].range.endOffset-frame.range.startOffset>80000)continue;
+    if(!body||!frame.statement.statements.length||!jumps.length||jumps.length>maximumExits||tokens[body.close].range.endOffset-frame.range.startOffset>80000)continue;
     for(const jump of jumps){
       if(jump.kind!=='BreakStatement'||jump.label!==frame.label){valid=false;break;}
       let guard=parents.get(jump),effectful=false;
@@ -53,11 +54,12 @@ function foldGuardedFrameCompletion(source, proof, {retainDiagnostics = false, r
         effectful=guard.statements.length>1;
         if(!effectful||effectfulGuards)guard=parents.get(guard);
       }
-      if(guard?.kind!=='IfStatement'||guard.alternate||!(guard.consequent===jump||guard.consequent?.kind==='BlockStatement'&&guard.consequent.statements.at(-1)===jump&&(!effectful||effectfulGuards))){valid=false;break;}
+      if(guard?.kind!=='IfStatement'||guard.alternate&&!alternateGuards||!(guard.consequent===jump||guard.consequent?.kind==='BlockStatement'&&guard.consequent.statements.at(-1)===jump&&(!effectful||effectfulGuards))){valid=false;break;}
       if(effectful&&jumps.some(other=>{if(other===jump)return false;let n=parents.get(other);while(n&&n!==guard.consequent)n=parents.get(n);return n===guard.consequent;})){valid=false;break;}
       const first=starts.get(guard.range.startOffset),cc=closes.get(first+1),jf=starts.get(jump.range.startOffset),braced=guard.consequent.kind==='BlockStatement',last=braced?closes.get(cc+1):jf+2;
       if(tokens[first]?.text!=='if'||tokens[first+1]?.text!=='('||tokens[jf]?.text!=='break'||tokens[jf+1]?.text!==frame.label||tokens[jf+2]?.text!==';'||braced&&(!effectful&&jf!==cc+2||effectful&&jf<=cc+2||jf+3!==last)||!braced&&jf!==cc+1){valid=false;break;}
-      const info={range:range(first,last),conditionRange:range(first+1,cc),jumpRange:range(jf,jf+2),corridorKinds:[],...(effectful?{effectful:true,prefixRange:range(cc+2,jf-1)}:{})};
+      const info={range:range(first,last),conditionRange:range(first+1,cc),jumpRange:range(jf,jf+2),corridorKinds:[],
+        ...(effectful?{effectful:true,prefixRange:range(cc+2,jf-1)}:{}),...(guard.alternate?{alternate:true}:{})};
       let child=guard;
       while(child!==frame.statement){const parent=parents.get(child);if(!parent){valid=false;break;}
         if(parent.kind==='BlockStatement'){const b=bounds(parent),index=parent.statements.indexOf(child);if(!b||index<0){valid=false;break;}const rest=parent.statements.slice(index+1);if(rest.length){if([...uninitialized].some(name=>{if(independentlyAssignedLocalSequence(rest,name,contexts.get(parent)))return false;const prefix=assigned.get(name);if(!prefix)return true;usedAssignments.set(name,prefix);return false;})){valid=false;break;}const sf=starts.get(rest[0].range.startOffset);if(sf===undefined){valid=false;break;}const s={start:tokens[sf].range.startOffset-2,end:tokens[b.close].range.startOffset-2,statements:rest.length};suffixes.set(s.start+':'+s.end,s);}}
@@ -74,7 +76,7 @@ function foldGuardedFrameCompletion(source, proof, {retainDiagnostics = false, r
     let n=0,name;do{name='decompiledFrameRemainder'+n++;}while(occupied.has(name));
     const label=starts.get(frame.range.startOffset),first=starts.get(frame.statement.statements[0].range.startOffset),declarationOffset=tokens[first].range.startOffset-2,indent=source.slice(source.lastIndexOf('\n',declarationOffset-1)+1,declarationOffset),newline=/^[ \t]*$/.test(indent)&&source.slice(declarationOffset,tokens[body.close].range.startOffset-2).includes('\n')?'\n'+indent:'';
     const edits=[{start:tokens[label].range.startOffset-2,end:tokens[body.open].range.startOffset-2,text:'',kind:'label'},{start:declarationOffset,end:declarationOffset,text:`boolean ${name} = true;`+newline,kind:'declaration'}];
-    for(const g of guards)edits.push(g.effectful
+    for(const g of guards)edits.push(g.effectful||g.alternate
       ?{...g.jumpRange,text:`${name} = false;`,kind:'effect-decision',conditionRange:g.conditionRange,prefixRange:g.prefixRange}
       :{...g.range,text:`${name} = !`+source.slice(g.conditionRange.start,g.conditionRange.end)+';',kind:'decision',conditionRange:g.conditionRange});
     const indents=new Map();
