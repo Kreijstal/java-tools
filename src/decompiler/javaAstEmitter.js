@@ -11,6 +11,8 @@ const { tokenizeJava } = require('../java-frontend/lexer');
 const { recoverScalarLabelDispatches: recoverScalarDispatch } = require('./scalarDispatchRecovery');
 const { recoverScalarIfDispatches: recoverIfDispatch } = require('./scalarIfDispatchRecovery');
 const {foldSharedFrameExitGuards: recoverSharedFrameExitGuards} = require('./sharedFrameExitGuardRecovery');
+const {foldSharedSwitchFrameExits: recoverSharedSwitchFrameExits} = require('./sharedSwitchExitRecovery');
+const {splitMultilineBlockHeaders: recoverMultilineBlockHeaders} = require('./multilineBlockHeaderRecovery');
 const { simplifyPredicateNegations: simplifyNegations } = require('./predicateNegationRecovery');
 const {simplifyComplementedRelations: recoverComplementedRelations} = require('./complementedRelationRecovery');
 const { simplifyPredicateGrouping: simplifyGrouping } = require('./predicateGroupingRecovery');
@@ -799,6 +801,14 @@ function foldExhaustiveSwitchFrameExits(source, options = {}) {
 function foldExhaustiveIfFrameExits(source, options = {}) {
   try {return recoverExhaustiveIfFrames(source, controlCleanupSource(source), options);}
   catch (error) {if (error instanceof RangeError) return {source, framesRecovered: 0}; throw error;}
+}
+
+function splitMultilineBlockHeaders(source, options = {}) {
+  return recoverMultilineBlockHeaders(source, controlCleanupSource(source), options);
+}
+
+function foldSharedSwitchFrameExits(source, options = {}) {
+  return recoverSharedSwitchFrameExits(source, controlCleanupSource(source), options);
 }
 
 function foldSharedFrameExitGuards(source, options = {}) {
@@ -3512,6 +3522,8 @@ module.exports = {
   foldExhaustiveIfFrameExits,
   foldSwitchExitTails,
   foldSharedFrameExitGuards,
+  foldSharedSwitchFrameExits,
+  splitMultilineBlockHeaders,
   reindentStructuredSource,
   shareDynamicGuardedTails,
   foldLeadingLoopExitWork,

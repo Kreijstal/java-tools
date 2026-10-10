@@ -19,7 +19,7 @@ const { structureMethod } = require('./exceptionStructurer');
 const { mergeDuplicateLoopIncrementTails } = require('./loopTailMerge');
 const { partitionStructuredVoidBody } = require('./structuredMethodPartition');
 const {splitPrimitiveLocalLifetimes, splitNestedPrimitiveLocalLifetimes, splitReferenceLocalLifetimes, splitNestedReferenceLocalLifetimes, splitInitializedPrimitiveLocalLifetimes, splitNestedInitializedPrimitiveLocalLifetimes, splitArrayDimensionPrimitiveLocalLifetimes} = require('./primitiveLocalLifetimeRecovery');
-const {foldLoopFrameCompletion, shareDynamicGuardedTails, foldLeadingLoopExitWork, simplifyNaturalLoopExitCaptures, foldGuardedFrameCompletion, compactLocalBooleanGuards, reindentStructuredSource, foldExhaustiveSwitchFrameExits, foldExhaustiveIfFrameExits, foldSwitchExitTails, foldSharedFrameExitGuards} = require('./javaAstEmitter');
+const {foldLoopFrameCompletion, shareDynamicGuardedTails, foldLeadingLoopExitWork, simplifyNaturalLoopExitCaptures, foldGuardedFrameCompletion, compactLocalBooleanGuards, reindentStructuredSource, foldExhaustiveSwitchFrameExits, foldExhaustiveIfFrameExits, foldSwitchExitTails, foldSharedFrameExitGuards, foldSharedSwitchFrameExits, splitMultilineBlockHeaders} = require('./javaAstEmitter');
 const { listRegionSplitCandidates, applyRegionSplit } = require('../passes/regionSplit');
 const { jreClassInfo, jreMethodCandidates } = require('../java-frontend/jreMetadata');
 const { JavaParser } = require('../java-frontend/parser');
@@ -2454,6 +2454,14 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
         source = guards.source; changed = true;
       }
     }
+  }
+  if (process.env.CFR_JS_SHARED_SWITCH_FRAME_EXITS === '1') {
+    const exits = foldSharedSwitchFrameExits(source);
+    if (exits.breaksLocalized) {source = exits.source; changed = true;}
+  }
+  if (process.env.CFR_JS_SPLIT_MULTILINE_BLOCK_HEADERS === '1') {
+    const headers = splitMultilineBlockHeaders(source);
+    if (headers.headersSplit) {source = headers.source; changed = true;}
   }
   if (process.env.CFR_JS_REINDENT_STRUCTURED_BODIES === '1') {
     const indentation = reindentStructuredSource(source);

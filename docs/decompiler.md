@@ -2815,3 +2815,27 @@ Focused native fixtures compare the original, normalized and combined forms
 with an independent direct model across nullable predicates, loop callbacks,
 aliased partial stores, arithmetic overflow, zero/nonzero flags, exceptions,
 finally overrides and monitor ownership.
+
+### Shared continuations through nested switches
+
+`foldSharedSwitchFrameExits(source)` localizes a plain-frame break to its nearest
+switch when normal completion from that switch reaches the same continuation
+through only terminal blocks, if arms, final-case fallthrough or one direct bare
+break to an enclosing switch. Every destination is resolved lexically. Work,
+cleanup, loops, nonfinal case fallthrough and other continuations refuse.
+
+The original predicates, case bodies, selectors and protected actions stay in
+place. Original inner cleanup still runs on the abrupt exit. An unused frame's
+label is removed while retaining its original block scope. Diagnostics account
+for each changed target and removed label. The compiler policy is opt-in:
+`CFR_JS_SHARED_SWITCH_FRAME_EXITS=1`.
+
+`splitMultilineBlockHeaders(source)` replaces only horizontal trivia after an
+opening brace when the body already spans lines and its first token shares the
+header line. Quoted values and every Java token remain exact; single-line bodies
+stay intact. Reindentation can then align that first statement with the rest of
+the body. The opt-in policy is `CFR_JS_SPLIT_MULTILINE_BLOCK_HEADERS=1`.
+
+Focused native fixtures compare old and localized switches with an independent
+pending-completion model across selector callbacks, nullable predicates, partial
+aliased stores, overflow, failures, finally overrides and monitor ownership.
