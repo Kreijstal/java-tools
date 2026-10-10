@@ -2757,3 +2757,30 @@ Sources compile; ordered 19,591 declarations/119,181 references/388 overrides
 and diagnostics remain unchanged. The 21 large method spans (10 with block
 labels) remain. Larger reconstructions and full-game/browser/phone acceptance
 remain unfinished or unverified.
+
+### Opaque control actions in integer dispatches
+
+`recoverScalarIfDispatches(source, {nestedRegions: true, opaqueControls: true})`
+can retain complete switches and protected loop actions while classifying an
+unchanged captured primitive integer. The compiler policy is opt-in:
+`CFR_JS_OPAQUE_CONTROL_DISPATCHES=1`. Existing recovery defaults stay unchanged.
+
+Some parser block nodes inside protected constructs omit their source range.
+This policy recovers a local declaration's lexical scope from its nearest
+balanced brace pair, only when the attributed AST parent is a block. It never
+infers the type from a spelling or extends the declaration's scope.
+
+Opaque action bytes stay together, preserving selector evaluations, callbacks,
+loop headers/updates, catch/finally and monitor scopes. Every retained bare break
+must target a control frame within that same action. Classifier writes anywhere
+in the suffix still refuse. Nested switches retain their original selector and
+complete case bodies; their normal completion is checked before adding an exit.
+Loops currently require a runtime condition containing a method call, and must
+remain inside a supported opaque action. Unconditional loops, unknown constant
+completion, declaration scope merges and external bare exits refuse. Existing
+source, region, classifier, action, nesting and attempt budgets still apply.
+
+The focused native test compares original and reconstructed methods with an
+independent direct-dispatch model across protected loop effects, nested switches,
+permission callbacks, nullable predicates, aliased partial stores, arithmetic
+overflow, failures, finally overrides and monitor ownership.

@@ -2369,6 +2369,14 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
     }
   }
 
+  if (process.env.CFR_JS_OPAQUE_CONTROL_DISPATCHES === '1') {
+    for (;;) {
+      const dispatch = recoverScalarIfDispatches(source, {nestedRegions: true, opaqueControls: true});
+      if (!dispatch.dispatchesRecovered) break;
+      source = dispatch.source; changed = true;
+    }
+  }
+
   if (process.env.CFR_JS_SWITCH_EXIT_TAILS === '1') {
     for (;;) {
       const tail = foldSwitchExitTails(source);

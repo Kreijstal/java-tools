@@ -4,9 +4,9 @@
 // Keep all effectful actions and flag guards, in their original lexical order.
 // Accept only paths that are contiguous runs or leave the existing plain label;
 // never duplicate a shared action or assume another guard's value.
-function recoverScalarIfDispatches(source, proof, {retainDiagnostics = false, nestedRegions = false, switchPrefixes = false} = {}) {
+function recoverScalarIfDispatches(source, proof, {retainDiagnostics = false, nestedRegions = false, switchPrefixes = false, opaqueControls = false} = {}) {
   const unchanged = () => ({source, dispatchesRecovered: 0});
-  if (!proof || typeof retainDiagnostics !== 'boolean' || typeof nestedRegions !== 'boolean' || typeof switchPrefixes !== 'boolean'
+  if (!proof || typeof retainDiagnostics !== 'boolean' || typeof nestedRegions !== 'boolean' || typeof switchPrefixes !== 'boolean' || typeof opaqueControls !== 'boolean'
       || source.length > 400000) return unchanged();
   const {wrapped, parsed, tokens, starts, closes, children, labelCounts} = proof;
   const loops = new Set(['WhileStatement', 'ForStatement', 'DoWhileStatement', 'EnhancedForStatement']);
@@ -33,7 +33,17 @@ function recoverScalarIfDispatches(source, proof, {retainDiagnostics = false, ne
     if (['VariableDeclarator', 'FormalParameter'].includes(node.kind)) names.set(node.name, (names.get(node.name) || 0) + 1);
     if (node.kind === 'LocalVariableDeclarationStatement' && parent?.kind === 'BlockStatement'
         && node.variableType?.kind === 'PrimitiveType' && node.variableType.name === 'int' && !node.annotations?.length) {
-      const close = closes.get(starts.get(parent.range?.startOffset)), end = semicolon(node);
+      // Some protected block nodes have no source range. A declaration whose
+      // AST parent is a block still has exactly one nearest enclosing brace
+      // pair. Recover that lexical scope without inventing a type or lifetime.
+      let open = starts.get(parent.range?.startOffset);
+      if (open === undefined && opaqueControls) {
+        const first = starts.get(node.range?.startOffset);
+        for (const [begin, end] of closes)
+          if (tokens[begin].text === '{' && begin < first && first < end
+              && (open === undefined || begin > open)) open = begin;
+      }
+      const close = closes.get(open), end = semicolon(node);
       if (close !== undefined && end !== null) for (const variable of node.declarators)
         if (!variable.dimensions) locals.set(variable.name, {start: tokens[end].range.endOffset, end: tokens[close].range.startOffset});
     }
@@ -66,6 +76,12 @@ function recoverScalarIfDispatches(source, proof, {retainDiagnostics = false, ne
     if (node.kind === 'EmptyStatement') return tokens[first]?.text === ';' ? first : null;
     if (node.kind === 'IfStatement') return finish(node.alternate || node.consequent);
     if (node.kind === 'SynchronizedStatement') return closes.get(closes.get(first + 1) + 1);
+    if (node.kind === 'SwitchStatement' && opaqueControls) {
+      const open = closes.get(first + 1) + 1, end = closes.get(open);
+      if (tokens[first]?.text !== 'switch' || tokens[open]?.text !== '{' || tokens[end]?.text !== '}'
+          || (node.groups || []).some(g => g.labels.some(l => l.separator !== ':'))) return null;
+      return end;
+    }
     if (node.kind === 'TryStatement') {
       let end = closes.get(first + 1);
       if (tokens[first + 1]?.text !== '{' || end === undefined) return null;
@@ -100,6 +116,20 @@ function recoverScalarIfDispatches(source, proof, {retainDiagnostics = false, ne
       return final && (body || catches.some(Boolean));
     }
     if (node.kind === 'SynchronizedStatement') return normal(node.body);
+    if (node.kind === 'SwitchStatement' && opaqueControls) {
+      const groups = node.groups || [];
+      if (!groups.some(g => g.labels.some(l => l.labelKind === 'default'))) return true;
+      for (let index = 0; index < groups.length; index++) {
+        let reachable = true;
+        for (const statement of groups[index].statements) {
+          if (!reachable) { invalid = true; return false; }
+          if (statement.kind === 'BreakStatement' && targets.get(statement) === node) return true;
+          reachable = normal(statement);
+        }
+        if (reachable && index === groups.length - 1) return true;
+      }
+      return false;
+    }
     return true;
   }
   function comparison(node) {
@@ -211,8 +241,18 @@ function recoverScalarIfDispatches(source, proof, {retainDiagnostics = false, ne
     walk(dispatch, node => {
       // Do not merge declaration scopes or change destinations of bare breaks.
       // Inner control frames are opaque until a separate proof supports them.
-      if (['LocalVariableDeclarationStatement', 'LabeledStatement', 'SwitchStatement', ...loops].includes(node.kind)
-          || node.kind === 'BreakStatement' && !node.label) refused = true;
+      if (['LocalVariableDeclarationStatement', 'LabeledStatement'].includes(node.kind)
+          || !opaqueControls && (node.kind === 'SwitchStatement' || loops.has(node.kind) || node.kind === 'BreakStatement' && !node.label)) refused = true;
+      if (opaqueControls && loops.has(node.kind)) {
+        // Only preserve opaque loops with a nonconstant runtime condition.
+        // A method call cannot be a Java constant expression; unconditional
+        // loops need a separate completion proof before adding switch exits.
+        let dynamic = false;
+        if (node.condition) walk(node.condition, child => {
+          if (child.kind === 'MethodInvocationExpression') dynamic = true;
+        });
+        if (!dynamic) refused = true;
+      }
       if (node.kind === 'IfStatement') {
         const test = comparison(node.condition), local = locals.get(test?.name);
         if (test && names.get(test.name) === 1 && local && initial.range.startOffset >= local.start
@@ -255,6 +295,16 @@ function recoverScalarIfDispatches(source, proof, {retainDiagnostics = false, ne
         }
         const end = finish(node), first = starts.get(node.range?.startOffset);
         if (end == null || first === undefined) return null;
+        if (opaqueControls) {
+          let changedTarget = false;
+          walk(node, child => {
+            if (child.kind !== 'BreakStatement' || child.label) return;
+            let target = targets.get(child);
+            while (target && target !== node) target = parents.get(target);
+            if (target !== node) changedTarget = true;
+          });
+          if (changedTarget) return null;
+        }
         const action = {node, first, end, normal: normal(node), ownExit: node.kind === 'BreakStatement' && targets.get(node) === frame};
         actions.push(action); return {action: actions.length - 1};
       }
