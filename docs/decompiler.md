@@ -2839,3 +2839,23 @@ the body. The opt-in policy is `CFR_JS_SPLIT_MULTILINE_BLOCK_HEADERS=1`.
 Focused native fixtures compare old and localized switches with an independent
 pending-completion model across selector callbacks, nullable predicates, partial
 aliased stores, overflow, failures, finally overrides and monitor ownership.
+
+### Shared continuations after loops
+
+`foldSharedLoopFrameExits(source)` localizes a plain-frame break to the nearest
+loop when that loop's normal continuation is empty or consists only of a direct
+break to the same frame. It skips the loop update/test on the same path as before.
+Intermediate work, cleanup, another loop, switches and other destinations refuse.
+All original inner protected actions remain on the abrupt exit.
+
+The opt-in compiler policy is `CFR_JS_SHARED_LOOP_FRAME_EXITS=1`. It runs after
+existing reconstruction, then retries the existing single-exit if/else proof and
+already enabled guarded-frame policies. It preserves existing decision names.
+No selector computation, callback, field read/store or unused snapshot is copied.
+`foldLabeledIfElseExits` now supports optional diagnostics for independent source
+certificates; its default behavior and return shape remain unchanged.
+
+Focused native tests compare original, localized and conditional-reconstructed
+forms with an independent model for while/for/do loops, including nullable
+predicates, test/update order, aliased partial stores, overflow, failures, finally
+overrides and monitor ownership.

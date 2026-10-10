@@ -19,7 +19,7 @@ const { structureMethod } = require('./exceptionStructurer');
 const { mergeDuplicateLoopIncrementTails } = require('./loopTailMerge');
 const { partitionStructuredVoidBody } = require('./structuredMethodPartition');
 const {splitPrimitiveLocalLifetimes, splitNestedPrimitiveLocalLifetimes, splitReferenceLocalLifetimes, splitNestedReferenceLocalLifetimes, splitInitializedPrimitiveLocalLifetimes, splitNestedInitializedPrimitiveLocalLifetimes, splitArrayDimensionPrimitiveLocalLifetimes} = require('./primitiveLocalLifetimeRecovery');
-const {foldLoopFrameCompletion, shareDynamicGuardedTails, foldLeadingLoopExitWork, simplifyNaturalLoopExitCaptures, foldGuardedFrameCompletion, compactLocalBooleanGuards, reindentStructuredSource, foldExhaustiveSwitchFrameExits, foldExhaustiveIfFrameExits, foldSwitchExitTails, foldSharedFrameExitGuards, foldSharedSwitchFrameExits, splitMultilineBlockHeaders} = require('./javaAstEmitter');
+const {foldLoopFrameCompletion, shareDynamicGuardedTails, foldLeadingLoopExitWork, simplifyNaturalLoopExitCaptures, foldGuardedFrameCompletion, compactLocalBooleanGuards, reindentStructuredSource, foldExhaustiveSwitchFrameExits, foldExhaustiveIfFrameExits, foldSwitchExitTails, foldSharedFrameExitGuards, foldSharedSwitchFrameExits, foldSharedLoopFrameExits, splitMultilineBlockHeaders} = require('./javaAstEmitter');
 const { listRegionSplitCandidates, applyRegionSplit } = require('../passes/regionSplit');
 const { jreClassInfo, jreMethodCandidates } = require('../java-frontend/jreMetadata');
 const { JavaParser } = require('../java-frontend/parser');
@@ -2452,6 +2452,27 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
         const guards = compactLocalBooleanGuards(source, {reservedNames: parameterNames});
         if (!guards.guardsCompacted) break;
         source = guards.source; changed = true;
+      }
+    }
+  }
+  if (process.env.CFR_JS_SHARED_LOOP_FRAME_EXITS === '1') {
+    const exits = foldSharedLoopFrameExits(source);
+    if (exits.breaksLocalized) {
+      source = exits.source; changed = true;
+      for (;;) {
+        const branch = foldLabeledIfElseExits(source);
+        if (!branch.framesRemoved) break;
+        source = branch.source; changed = true;
+      }
+      if (process.env.CFR_JS_GUARDED_FRAME_COMPLETION === '1') {
+        const modes = [{}];
+        if (process.env.CFR_JS_GUARDED_FRAME_PREFIX_EFFECTS === '1') modes.push({effectfulGuards: true});
+        if (process.env.CFR_JS_GUARDED_FRAME_ALTERNATES === '1') modes.push({effectfulGuards: true, alternateGuards: true, maximumExits: 64});
+        for (const mode of modes) for (;;) {
+          const frame = foldGuardedFrameCompletion(source, {reservedNames: parameterNames, ...mode});
+          if (!frame.framesRecovered) break;
+          source = frame.source; changed = true;
+        }
       }
     }
   }

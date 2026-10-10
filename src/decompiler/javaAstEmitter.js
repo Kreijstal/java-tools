@@ -12,6 +12,7 @@ const { recoverScalarLabelDispatches: recoverScalarDispatch } = require('./scala
 const { recoverScalarIfDispatches: recoverIfDispatch } = require('./scalarIfDispatchRecovery');
 const {foldSharedFrameExitGuards: recoverSharedFrameExitGuards} = require('./sharedFrameExitGuardRecovery');
 const {foldSharedSwitchFrameExits: recoverSharedSwitchFrameExits} = require('./sharedSwitchExitRecovery');
+const {foldSharedLoopFrameExits: recoverSharedLoopFrameExits} = require('./sharedLoopExitRecovery');
 const {splitMultilineBlockHeaders: recoverMultilineBlockHeaders} = require('./multilineBlockHeaderRecovery');
 const { simplifyPredicateNegations: simplifyNegations } = require('./predicateNegationRecovery');
 const {simplifyComplementedRelations: recoverComplementedRelations} = require('./complementedRelationRecovery');
@@ -805,6 +806,10 @@ function foldExhaustiveIfFrameExits(source, options = {}) {
 
 function splitMultilineBlockHeaders(source, options = {}) {
   return recoverMultilineBlockHeaders(source, controlCleanupSource(source), options);
+}
+
+function foldSharedLoopFrameExits(source, options = {}) {
+  return recoverSharedLoopFrameExits(source, controlCleanupSource(source), options);
 }
 
 function foldSharedSwitchFrameExits(source, options = {}) {
@@ -2273,10 +2278,10 @@ function foldLabeledSkipGuards(source) {
 // A direct conditional branch ending in the only break to a plain block has
 // an existing alternate: every following statement in that block. Keep both
 // branches and the enclosing declaration scope, replacing only the transfer.
-function foldLabeledIfElseExits(source) {
+function foldLabeledIfElseExits(source, {retainDiagnostics = false} = {}) {
   const unchanged = () => ({source, framesRemoved: 0, jumpsRemoved: 0, guardsRecovered: 0});
   const proof = controlCleanupSource(source);
-  if (!proof) return unchanged();
+  if (!proof || typeof retainDiagnostics !== 'boolean') return unchanged();
   const {wrapped, parsed, tokens, starts, closes, children, labelCounts} = proof;
   const references = new Map(), loops = new Set(['WhileStatement', 'ForStatement', 'EnhancedForStatement', 'DoWhileStatement']);
   let refused = false;
@@ -2321,7 +2326,7 @@ function foldLabeledIfElseExits(source) {
             return start > open && start < close;
           })) ? {open, close} : null;
   }
-  const edits = [];
+  const edits = [], selections = [];
   let guardsRecovered = 0;
   function find(node) {
     if (node.kind === 'LabeledStatement' && node.statement?.kind === 'BlockStatement'
@@ -2366,6 +2371,16 @@ function foldLabeledIfElseExits(source) {
           replacement = branchBytes + (multiline ? indent : '') + '} else {' + suffix;
         }
         const prefixBytes = wrapped.slice(tokens[frame.open].range.endOffset, tokens[branchStart].range.startOffset);
+        const span = (first, last) => ({start: tokens[first].range.startOffset - 2, end: tokens[last].range.endOffset - 2});
+        selections.push({label: node.label, frameRange: span(start, frame.close), bodyRange: span(frame.open, frame.close),
+          prefixRange: {start: tokens[frame.open].range.endOffset - 2, end: tokens[branchStart].range.startOffset - 2},
+          branchStart: tokens[branchStart].range.startOffset - 2, conditionRange: span(branchStart + 1, headerEnd),
+          armOpen: span(extent.open, extent.open), armClose: span(extent.close, extent.close),
+          trueRange: {start: tokens[extent.open].range.endOffset - 2, end: tokens[jumpStart].range.startOffset - 2},
+          jumpRange: span(jumpStart, jumpStart + 2),
+          falseRange: {start: tokens[extent.close].range.endOffset - 2, end: tokens[frame.close].range.startOffset - 2},
+          prefixStatements: index, trueStatements: body.statements.length - 1, falseStatements: statements.length - index - 1,
+          inverted: body.statements.length === 1});
         edits.push({start: tokens[start].range.startOffset, end: tokens[frame.close].range.endOffset,
           text: '{' + prefixBytes + replacement + (multiline ? '\n' + frameIndent : '') + '}'});
         return;
@@ -2379,7 +2394,7 @@ function foldLabeledIfElseExits(source) {
   if (edits.some((edit, index) => index && edits[index - 1].end > edit.start)) return unchanged();
   let output = wrapped;
   for (const edit of edits.slice().reverse()) output = output.slice(0, edit.start) + edit.text + output.slice(edit.end);
-  return {source: output.slice(2, -2), framesRemoved: edits.length, jumpsRemoved: edits.length, guardsRecovered};
+  return {source: output.slice(2, -2), framesRemoved: edits.length, jumpsRemoved: edits.length, guardsRecovered, ...(retainDiagnostics ? {diagnostics: {edits: edits.map(e=>({...e,start:e.start-2,end:e.end-2})),selections}} : {})};
 }
 
 // Multiple conditional exits can describe an ordered decision tree. Each
@@ -3523,6 +3538,7 @@ module.exports = {
   foldSwitchExitTails,
   foldSharedFrameExitGuards,
   foldSharedSwitchFrameExits,
+  foldSharedLoopFrameExits,
   splitMultilineBlockHeaders,
   reindentStructuredSource,
   shareDynamicGuardedTails,
