@@ -2981,3 +2981,27 @@ Four focused and 15 existing predicate groups pass. Independent native work
 oracles cover 3,888 primitive parameter/local/array/volatile-field cases,
 canonical boxing, primitive overload choice, callback/index failures, finally
 overrides and monitor ownership. Separate refusal cases retain boxed values.
+
+### Boolean logical values and mixed precedence
+
+`CFR_JS_BOOLEAN_LOGICAL_VALUES=1` applies the existing predicate-negation
+proof to parenthesized negations of `&&` and `||` in value contexts. Its helper
+mode is `{booleanValueLogicalNegations: true, complementIntegralRelations: false}`.
+A short-circuit operator produces a primitive Boolean, so the result's boxing
+and overload selection remain unchanged. Complete atoms retain their evaluation
+order, reference equality, assignments, unboxing and failures. Unknown boxed
+value double negations, eager bitwise operators and unrelated expressions stay
+outside this mode. Value modes are mutually exclusive and disabled by default.
+
+The shared recovery now preserves mixed precedence explicitly. Complementing
+`!(a || b && c)` requires `!a && (!b || !c)`, and complementing
+`!(a && b || c)` requires `(!a || !b) && !c`. A bare logical child gets its
+own parentheses when its operator differs from its parent. This repair also
+applies to the existing control-condition mode; parenthesized children retain
+their original boundaries.
+
+`node --test --experimental-test-isolation=none test/booleanLogicalValueRecovery.test.js test/predicateNegationRecovery.test.js test/primitiveBooleanValueRecovery.test.js`
+passes 23 groups. The four new groups include 699,840 native comparisons with
+independent branch-based oracles for nullable Boolean callbacks, primitive
+overload choice, canonical boxing, mixed precedence, NaNs, reference identity,
+assignments, partial failures, finally overrides, catch paths and monitor release.

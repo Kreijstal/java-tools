@@ -4,9 +4,13 @@
 // complements and double negation preserve short-circuit order and unboxing.
 // Keep arbitrary atoms verbatim. Relational complements require scoped
 // primitive integral operands; unknown and floating operands retain NaNs.
-function simplifyPredicateNegations(source, proof, {retainDiagnostics = false, parameters = [], complementIntegralRelations = true, ownedFields = null, primitiveValueDoubleNegations = false} = {}) {
+function simplifyPredicateNegations(source, proof, {retainDiagnostics = false, parameters = [], complementIntegralRelations = true,
+  ownedFields = null, primitiveValueDoubleNegations = false, booleanValueLogicalNegations = false} = {}) {
   const unchanged = () => ({source, predicatesSimplified: 0});
-  if (!proof || typeof retainDiagnostics !== 'boolean' || typeof complementIntegralRelations !== 'boolean' || typeof primitiveValueDoubleNegations !== 'boolean' || !Array.isArray(parameters) || source.length > 400000) return unchanged();
+  if (!proof || typeof retainDiagnostics !== 'boolean' || typeof complementIntegralRelations !== 'boolean'
+      || typeof primitiveValueDoubleNegations !== 'boolean' || typeof booleanValueLogicalNegations !== 'boolean'
+      || (primitiveValueDoubleNegations && booleanValueLogicalNegations) || !Array.isArray(parameters)
+      || source.length > 400000) return unchanged();
   const {wrapped, parsed, tokens, starts, closes, children} = proof;
   const edits = [], counts = {doubleNegations: 0, equalityComplements: 0, deMorganOperators: 0, booleanLiterals: 0, relationalComplements: 0};
   const relationalComparisons = [];
@@ -177,7 +181,18 @@ function simplifyPredicateNegations(source, proof, {retainDiagnostics = false, p
       }
       if (['==', '!='].includes(node.operator)) { counts.equalityComplements++; return; }
       counts.deMorganOperators++;
-      inverse(node.left, first, index, depth + 1); inverse(node.right, index + 1, end, depth + 1); return;
+      function invertChild(child, begin, finish) {
+        // Complementing || to && reverses its precedence relative to a bare
+        // && child. Retain that child's original association explicitly.
+        // Existing parenthesized children already carry their own boundary.
+        if (child.kind === 'BinaryExpression' && ['&&', '||'].includes(child.operator)
+            && child.operator !== node.operator) {
+          edits.push({start: tokens[begin].range.startOffset - 2, end: tokens[begin].range.startOffset - 2, text: '('},
+            {start: tokens[finish - 1].range.endOffset - 2, end: tokens[finish - 1].range.endOffset - 2, text: ')'});
+        }
+        inverse(child, begin, finish, depth + 1);
+      }
+      invertChild(node.left, first, index); invertChild(node.right, index + 1, end); return;
     }
     if (node.kind === 'LiteralExpression' && ['true', 'false'].includes(node.raw)) {
       if (end !== first + 1 || tokens[first].text !== node.raw) { invalid = true; return; }
@@ -204,7 +219,7 @@ function simplifyPredicateNegations(source, proof, {retainDiagnostics = false, p
     }
   }
   walk(parsed, node => {
-    if (primitiveValueDoubleNegations) return;
+    if (primitiveValueDoubleNegations || booleanValueLogicalNegations) return;
     if (!node.condition) return;
     const first = starts.get(node.range?.startOffset);
     let open;
@@ -228,6 +243,28 @@ function simplifyPredicateNegations(source, proof, {retainDiagnostics = false, p
     }
     visit(node.condition, begin, end);
   });
+  if (booleanValueLogicalNegations) {
+    const {JavaParser} = require('../java-frontend/parser');
+    const valueParser = new JavaParser();
+    for (let index = 0; index < tokens.length - 3; index++) {
+      if (tokens[index].text !== '!' || tokens[index + 1].text !== '(') continue;
+      const close = closes.get(index + 1);
+      if (close === undefined) continue;
+      let first = index + 2, end = close;
+      while (tokens[first]?.text === '(' && closes.get(first) === end - 1) {first++;end--;}
+      if (first >= end) continue;
+      let expression;
+      try {expression = valueParser.parseExpression(source.slice(tokens[first].range.startOffset - 2,
+        tokens[end - 1].range.endOffset - 2), {requireComplete: true});} catch (_) {continue;}
+      // A short-circuit operator always produces a primitive Boolean. Each
+      // inverted child remains in a Boolean operand context, including unknown
+      // boxed atoms whose unboxing and null failures must remain observable.
+      if (expression?.kind !== 'BinaryExpression' || !['&&', '||'].includes(expression.operator)) continue;
+      replace(index, ''); inverse(expression, first, end, 0); predicates++;
+      // Retry nested values from the new source rather than overlapping edits.
+      break;
+    }
+  }
   if (primitiveValueDoubleNegations) {
     const {JavaParser} = require('../java-frontend/parser');
     const valueParser = new JavaParser();

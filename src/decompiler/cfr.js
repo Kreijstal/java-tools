@@ -2534,6 +2534,12 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
     if (!value.predicatesSimplified) break;
     source = value.source; changed = true;
   }
+  if (process.env.CFR_JS_BOOLEAN_LOGICAL_VALUES === '1') for (;;) {
+    const value = simplifyPredicateNegations(source, {
+      complementIntegralRelations: false, booleanValueLogicalNegations: true});
+    if (!value.predicatesSimplified) break;
+    source = value.source; changed = true;
+  }
   if (process.env.CFR_JS_LATE_NESTED_IF_CONDITIONS === '1') for (;;) {
     const conjunction = foldNestedIfConditions(source);
     if (!conjunction.ifsMerged) break;
