@@ -2953,3 +2953,25 @@ Four focused and 15 existing predicate groups pass. An independent native oracle
 covers 25,920 numeric/reference/boxed comparisons, NaN payloads, signed zero,
 nullable unboxing, primitive overload selection, canonical boxing, callbacks,
 partial failures, finally overrides and monitor ownership.
+
+
+### Primitive Boolean value double negations
+
+`simplifyPredicateNegations` accepts `{primitiveValueDoubleNegations: true}`
+for a separate value-only mode. It removes a parenthesized pair of logical
+negations only when the operand is a proven primitive Boolean. Scoped unique
+locals, primitive formals, explicit primitive casts, Boolean array components
+and exact declared fields reuse the existing conservative type evidence.
+Boxed/unknown atoms, inherited fields, out-of-scope locals, shadowed names and
+unproven class qualifiers retain their original unboxing and null failures.
+Both original parentheses and the single operand evaluation remain.
+
+The compiler opt-in is `CFR_JS_PRIMITIVE_BOOLEAN_VALUES=1`, applied after
+established reconstruction with the method's formal and owning-field metadata.
+The default control-condition mode remains unchanged. The value mode does not
+normalize other Boolean predicates or infer arbitrary call return types.
+
+Four focused and 15 existing predicate groups pass. Independent native work
+oracles cover 3,888 primitive parameter/local/array/volatile-field cases,
+canonical boxing, primitive overload choice, callback/index failures, finally
+overrides and monitor ownership. Separate refusal cases retain boxed values.

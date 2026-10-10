@@ -4,9 +4,9 @@
 // complements and double negation preserve short-circuit order and unboxing.
 // Keep arbitrary atoms verbatim. Relational complements require scoped
 // primitive integral operands; unknown and floating operands retain NaNs.
-function simplifyPredicateNegations(source, proof, {retainDiagnostics = false, parameters = [], complementIntegralRelations = true, ownedFields = null} = {}) {
+function simplifyPredicateNegations(source, proof, {retainDiagnostics = false, parameters = [], complementIntegralRelations = true, ownedFields = null, primitiveValueDoubleNegations = false} = {}) {
   const unchanged = () => ({source, predicatesSimplified: 0});
-  if (!proof || typeof retainDiagnostics !== 'boolean' || typeof complementIntegralRelations !== 'boolean' || !Array.isArray(parameters) || source.length > 400000) return unchanged();
+  if (!proof || typeof retainDiagnostics !== 'boolean' || typeof complementIntegralRelations !== 'boolean' || typeof primitiveValueDoubleNegations !== 'boolean' || !Array.isArray(parameters) || source.length > 400000) return unchanged();
   const {wrapped, parsed, tokens, starts, closes, children} = proof;
   const edits = [], counts = {doubleNegations: 0, equalityComplements: 0, deMorganOperators: 0, booleanLiterals: 0, relationalComplements: 0};
   const relationalComparisons = [];
@@ -94,6 +94,7 @@ function simplifyPredicateNegations(source, proof, {retainDiagnostics = false, p
     }
     if (node.kind === 'CastExpression') return sourceType(node.castType);
     if (node.kind === 'LiteralExpression') {
+      if (node.literalKind === 'boolean') return 'boolean';
       if (node.literalKind === 'char') return 'char';
       const raw = (node.raw || '').replace(/_/g, '');
       if (node.literalKind === 'number' && /^(?:0[xX][0-9a-fA-F]+|0[bB][01]+|[0-9]+)[lL]?$/.test(raw))
@@ -203,6 +204,7 @@ function simplifyPredicateNegations(source, proof, {retainDiagnostics = false, p
     }
   }
   walk(parsed, node => {
+    if (primitiveValueDoubleNegations) return;
     if (!node.condition) return;
     const first = starts.get(node.range?.startOffset);
     let open;
@@ -226,6 +228,27 @@ function simplifyPredicateNegations(source, proof, {retainDiagnostics = false, p
     }
     visit(node.condition, begin, end);
   });
+  if (primitiveValueDoubleNegations) {
+    const {JavaParser} = require('../java-frontend/parser');
+    const valueParser = new JavaParser();
+    for (let index = 0; index < tokens.length - 3; index++) {
+      if (tokens[index].text !== '!' || tokens[index + 1].text !== '(') continue;
+      const close = closes.get(index + 1);
+      if (close === undefined) continue;
+      let first = index + 2, end = close;
+      while (tokens[first]?.text === '(' && closes.get(first) === end - 1) {first++;end--;}
+      if (tokens[first]?.text !== '!') continue;
+      let inner;
+      try {inner = valueParser.parseExpression(source.slice(tokens[first].range.startOffset - 2,
+        tokens[end - 1].range.endOffset - 2), {requireComplete: true});} catch (_) {continue;}
+      if (inner?.kind !== 'UnaryExpression' || inner.operator !== '!' || inner.prefix !== true ||
+          operandType(inner.operand, tokens[index].range.startOffset) !== 'boolean') continue;
+      replace(index, '');replace(first, '');counts.doubleNegations++;predicates++;
+      // Nested chains are considered again from their new source. This avoids
+      // overlapping edits and retains one primitive operand evaluation.
+      break;
+    }
+  }
   if (invalid || !predicates || edits.length > 4096) return unchanged();
   edits.sort((a, b) => a.start - b.start || a.end - b.end);
   if (edits.some((edit, index) => index && edits[index - 1].end > edit.start)) return unchanged();

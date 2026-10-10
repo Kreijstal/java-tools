@@ -2528,6 +2528,12 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
     if (!equality.equalitiesSimplified) break;
     source = equality.source; changed = true;
   }
+  if (process.env.CFR_JS_PRIMITIVE_BOOLEAN_VALUES === '1') for (;;) {
+    const value = simplifyPredicateNegations(source, {parameters, ownedFields,
+      complementIntegralRelations: false, primitiveValueDoubleNegations: true});
+    if (!value.predicatesSimplified) break;
+    source = value.source; changed = true;
+  }
   if (process.env.CFR_JS_SHARED_SWITCH_FRAME_EXITS === '1') {
     const exits = foldSharedSwitchFrameExits(source);
     if (exits.breaksLocalized) {source = exits.source; changed = true;}
