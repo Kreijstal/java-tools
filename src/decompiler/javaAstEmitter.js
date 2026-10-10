@@ -14,6 +14,7 @@ const {foldSharedFrameExitGuards: recoverSharedFrameExitGuards} = require('./sha
 const {foldSharedSwitchFrameExits: recoverSharedSwitchFrameExits} = require('./sharedSwitchExitRecovery');
 const {foldSharedLoopFrameExits: recoverSharedLoopFrameExits} = require('./sharedLoopExitRecovery');
 const {splitMultilineBlockHeaders: recoverMultilineBlockHeaders} = require('./multilineBlockHeaderRecovery');
+const {wrapLogicalConditionLines: recoverLogicalConditionLines} = require('./logicalConditionLineRecovery');
 const { simplifyPredicateNegations: simplifyNegations } = require('./predicateNegationRecovery');
 const {simplifyComplementedRelations: recoverComplementedRelations} = require('./complementedRelationRecovery');
 const { simplifyPredicateGrouping: simplifyGrouping } = require('./predicateGroupingRecovery');
@@ -818,6 +819,10 @@ function foldExhaustiveIfFrameExits(source, options = {}) {
 
 function splitMultilineBlockHeaders(source, options = {}) {
   return recoverMultilineBlockHeaders(source, controlCleanupSource(source), options);
+}
+
+function wrapLogicalConditionLines(source, options = {}) {
+  return recoverLogicalConditionLines(source, controlCleanupSource(source), options);
 }
 
 function foldSharedLoopFrameExits(source, options = {}) {
@@ -3554,6 +3559,7 @@ module.exports = {
   foldSharedSwitchFrameExits,
   foldSharedLoopFrameExits,
   splitMultilineBlockHeaders,
+  wrapLogicalConditionLines,
   reindentStructuredSource,
   shareDynamicGuardedTails,
   foldLeadingLoopExitWork,

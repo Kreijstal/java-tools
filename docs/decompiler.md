@@ -3030,3 +3030,20 @@ independent work oracles for nullable callbacks, snapshots, reference aliases,
 volatile state, overflow, index failures, loop continues, labeled breaks,
 finally overrides and monitor release. The existing suite checks another
 38,880 native cases and preserves the default declaration-scope refusal.
+
+### Logical condition lines
+
+`wrapLogicalConditionLines` replaces only horizontal trivia after `&&` and
+`||` in a single-line control header with newlines. It preserves every token,
+parenthesis, operand, literal and statement boundary. Reserved `if`, `while`
+and `for` keywords identify headers; a traditional for loop selects only the
+condition between its two outer semicolons. Braced and scalar do-while tails
+use the same while-header handling. Existing multiline conditions stay exact.
+The shared proof refuses comments, Unicode translation and unsupported input.
+
+`CFR_JS_WRAP_LOGICAL_CONDITIONS=1` enables this formatting after block/header
+recovery and before structured indentation. The default policy is unchanged.
+The formatter reaches a fixed point after one pass. Independent token/AST
+comparison and no-debug class-byte identity can verify this whitespace-only
+policy without duplicating runtime behavior tests. Source line metadata changes
+as expected when compiling with debug information enabled.

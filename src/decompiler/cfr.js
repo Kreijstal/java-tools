@@ -19,7 +19,7 @@ const { structureMethod } = require('./exceptionStructurer');
 const { mergeDuplicateLoopIncrementTails } = require('./loopTailMerge');
 const { partitionStructuredVoidBody } = require('./structuredMethodPartition');
 const {splitPrimitiveLocalLifetimes, splitNestedPrimitiveLocalLifetimes, splitReferenceLocalLifetimes, splitNestedReferenceLocalLifetimes, splitInitializedPrimitiveLocalLifetimes, splitNestedInitializedPrimitiveLocalLifetimes, splitArrayDimensionPrimitiveLocalLifetimes} = require('./primitiveLocalLifetimeRecovery');
-const {foldLoopFrameCompletion, shareDynamicGuardedTails, foldLeadingLoopExitWork, simplifyNaturalLoopExitCaptures, foldGuardedFrameCompletion, compactLocalBooleanGuards, foldKnownBooleanAlternatives, simplifyNegatedEqualityValues, reindentStructuredSource, foldExhaustiveSwitchFrameExits, foldExhaustiveIfFrameExits, foldSwitchExitTails, foldSharedFrameExitGuards, foldSharedSwitchFrameExits, foldSharedLoopFrameExits, splitMultilineBlockHeaders} = require('./javaAstEmitter');
+const {foldLoopFrameCompletion, shareDynamicGuardedTails, foldLeadingLoopExitWork, simplifyNaturalLoopExitCaptures, foldGuardedFrameCompletion, compactLocalBooleanGuards, foldKnownBooleanAlternatives, simplifyNegatedEqualityValues, reindentStructuredSource, foldExhaustiveSwitchFrameExits, foldExhaustiveIfFrameExits, foldSwitchExitTails, foldSharedFrameExitGuards, foldSharedSwitchFrameExits, foldSharedLoopFrameExits, splitMultilineBlockHeaders, wrapLogicalConditionLines} = require('./javaAstEmitter');
 const { listRegionSplitCandidates, applyRegionSplit } = require('../passes/regionSplit');
 const { jreClassInfo, jreMethodCandidates } = require('../java-frontend/jreMetadata');
 const { JavaParser } = require('../java-frontend/parser');
@@ -2557,6 +2557,10 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
   if (process.env.CFR_JS_SPLIT_MULTILINE_BLOCK_HEADERS === '1') {
     const headers = splitMultilineBlockHeaders(source);
     if (headers.headersSplit) {source = headers.source; changed = true;}
+  }
+  if (process.env.CFR_JS_WRAP_LOGICAL_CONDITIONS === '1') {
+    const conditions = wrapLogicalConditionLines(source);
+    if (conditions.conditionsWrapped) {source = conditions.source; changed = true;}
   }
   if (process.env.CFR_JS_REINDENT_STRUCTURED_BODIES === '1') {
     const indentation = reindentStructuredSource(source);
