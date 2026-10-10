@@ -379,6 +379,12 @@ completion. Intermediate blocks contain no declarations or actions to move.
 Comments, Unicode translation, nested executables, patterns and oversized chains
 refuse reconstruction. Chains have at most 32 conditions and 40 KiB of source.
 
+`CFR_JS_LATE_NESTED_IF_CONDITIONS=1` retries this same proof after the
+optional frame, Boolean continuation and value-predicate passes. These passes
+can introduce new sole-child chains after the earlier conjunction recovery has
+finished. The retry precedes the final shared-switch exit and indentation
+passes; it changes neither the proof nor the default policy.
+
 `node --test test/nestedIfConditionRecovery.test.js` checks seven groups,
 including 3,280,500 native cases across 18 models. Original, joined and grouped
 forms compare with independent ordered oracles for nullable Boolean callbacks,
