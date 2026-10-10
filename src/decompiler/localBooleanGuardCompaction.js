@@ -3,9 +3,9 @@
 // A primitive local's assignment value is exactly the value of the immediate
 // subsequent local read. Combine that read with the preceding short circuit,
 // keeping every assignment conditional and every RHS at its original site.
-function compactLocalBooleanGuards(source, proof, {retainDiagnostics = false, reservedNames = []} = {}) {
+function compactLocalBooleanGuards(source, proof, {retainDiagnostics = false, reservedNames = [], crossLocalAssignments = false} = {}) {
   const unchanged = () => ({source, guardsCompacted: 0});
-  if (!proof || typeof retainDiagnostics !== 'boolean' || !Array.isArray(reservedNames) ||
+  if (!proof || typeof retainDiagnostics !== 'boolean' || typeof crossLocalAssignments !== 'boolean' || !Array.isArray(reservedNames) ||
       reservedNames.some(name => typeof name !== 'string') || source.length > 400000) return unchanged();
   const {parsed, tokens, starts, closes, children} = proof;
   const parents = new Map(), declarations = new Map(), candidates = [];
@@ -35,25 +35,28 @@ function compactLocalBooleanGuards(source, proof, {retainDiagnostics = false, re
     while (cursor && cursor !== scope) cursor = parents.get(cursor);
     return cursor === scope;
   }
-  function chain(node, name) {
+  function chain(node, name, site) {
     node = peel(node);
     if (node?.kind === 'Identifier' && node.name === name) return [];
     if (node?.kind !== 'BinaryExpression' || node.operator !== '&&') return null;
-    const prefix = chain(node.left, name), assignment = peel(node.right);
+    const prefix = chain(node.left, name, site), assignment = peel(node.right);
     if (!prefix || assignment?.kind !== 'AssignmentExpression' || assignment.operator !== '=' ||
-        assignment.left?.kind !== 'Identifier' || assignment.left.name !== name) return null;
+        assignment.left?.kind !== 'Identifier' || (crossLocalAssignments
+          ? !localBoolean(assignment.left.name, site) : assignment.left.name !== name)) return null;
     return [...prefix, assignment];
   }
   const range = (first, last) => ({start: tokens[first].range.startOffset - 2, end: tokens[last].range.endOffset - 2});
   for (const outer of candidates.sort((a, b) => b.range.startOffset - a.range.startOffset)) {
     const condition = peel(outer.condition), block = outer.consequent;
-    if (condition?.kind !== 'Identifier' || !localBoolean(condition.name, outer) ||
+    if ((!crossLocalAssignments && (condition?.kind !== 'Identifier' || !localBoolean(condition.name, outer))) ||
         block?.kind !== 'BlockStatement' || block.statements.length !== 2) continue;
-    const [statement, inner] = block.statements, assignment = statement.expression, name = condition.name;
+    const [statement, inner] = block.statements, assignment = statement.expression,
+      name = crossLocalAssignments ? assignment?.left?.name : condition.name;
     if (statement.kind !== 'ExpressionStatement' || assignment?.kind !== 'AssignmentExpression' ||
         assignment.operator !== '=' || assignment.left?.kind !== 'Identifier' || assignment.left.name !== name ||
+        (crossLocalAssignments && !localBoolean(name, outer)) ||
         inner.kind !== 'IfStatement' || inner.alternate || inner.consequent?.kind !== 'BlockStatement') continue;
-    const assignments = chain(inner.condition, name);
+    const assignments = chain(inner.condition, name, outer);
     if (!assignments || assignments.length > 32) continue;
     const first = starts.get(outer.range.startOffset), conditionClose = closes.get(first + 1),
       open = starts.get(block.range.startOffset), close = closes.get(open),

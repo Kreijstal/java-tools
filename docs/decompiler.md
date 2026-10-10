@@ -3047,3 +3047,27 @@ The formatter reaches a fixed point after one pass. Independent token/AST
 comparison and no-debug class-byte identity can verify this whitespace-only
 policy without duplicating runtime behavior tests. Source line metadata changes
 as expected when compiling with debug information enabled.
+
+### Ordered assignments to distinct Boolean locals
+
+`compactLocalBooleanGuards` accepts `{crossLocalAssignments: true, reservedNames}`
+for `if (condition) { flag = expression; if (flag) { work; } }` even when the
+outer condition does not read the assigned flag. The result is
+`if ((condition) && (flag = expression)) { work; }`. The flag must be a unique,
+visible primitive Boolean local, not a formal, field, boxed value or capture.
+Both guards have no else; the intermediate block contains only the assignment
+and immediate guard. Complete predicates, assignment RHSs and deepest work stay
+in order. Only the immediate primitive-local read disappears.
+
+The same proof joins a bounded conjunction suffix of assignments to other
+independently proved Boolean locals. Each store remains conditional and at its
+original evaluation point. Unknown/eager suffixes, scope barriers, duplicate
+names, intervening effects and unsupported executables refuse. Defaults retain
+the earlier same-local contract.
+
+`CFR_JS_CHAIN_LOCAL_BOOLEAN_ASSIGNMENTS=1` runs this proof after established
+recovery and before final condition-line formatting and indentation.
+`node --test --experimental-test-isolation=none test/crossLocalBooleanGuards.test.js test/localBooleanGuardCompaction.test.js`
+passes ten groups, including 171,072 new native cases compared with independent
+branch oracles for mutable locals, nullable callbacks, unboxing, short circuits,
+partial failures, catch/finally paths and monitor release.

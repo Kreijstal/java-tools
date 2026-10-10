@@ -2558,6 +2558,11 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
     const headers = splitMultilineBlockHeaders(source);
     if (headers.headersSplit) {source = headers.source; changed = true;}
   }
+  if (process.env.CFR_JS_CHAIN_LOCAL_BOOLEAN_ASSIGNMENTS === '1') for (;;) {
+    const guards = compactLocalBooleanGuards(source, {crossLocalAssignments: true, reservedNames: parameterNames});
+    if (!guards.guardsCompacted) break;
+    source = guards.source; changed = true;
+  }
   if (process.env.CFR_JS_WRAP_LOGICAL_CONDITIONS === '1') {
     const conditions = wrapLogicalConditionLines(source);
     if (conditions.conditionsWrapped) {source = conditions.source; changed = true;}
