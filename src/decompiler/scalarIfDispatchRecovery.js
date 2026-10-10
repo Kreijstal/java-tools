@@ -251,7 +251,14 @@ function recoverScalarIfDispatches(source, proof, {retainDiagnostics = false, ne
         if (node.condition) walk(node.condition, child => {
           if (child.kind === 'MethodInvocationExpression') dynamic = true;
         });
-        if (!dynamic) refused = true;
+        if (!dynamic || node.kind === 'DoWhileStatement') refused = true;
+      }
+      if (opaqueControls && node.kind === 'BreakStatement' && !node.label
+          && targets.get(node)?.kind === 'SwitchStatement'
+          && parents.get(node)?.kind !== 'SwitchBlockStatementGroup') {
+        // A conditional/protected exit can make an otherwise abrupt switch
+        // complete normally. Do not infer termination from its last statement.
+        refused = true;
       }
       if (node.kind === 'IfStatement') {
         const test = comparison(node.condition), local = locals.get(test?.name);

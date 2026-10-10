@@ -2776,8 +2776,10 @@ must target a control frame within that same action. Classifier writes anywhere
 in the suffix still refuse. Nested switches retain their original selector and
 complete case bodies; their normal completion is checked before adding an exit.
 Loops currently require a runtime condition containing a method call, and must
-remain inside a supported opaque action. Unconditional loops, unknown constant
-completion, declaration scope merges and external bare exits refuse. Existing
+remain inside a supported opaque action. Do-while loops and conditional or
+protected exits to an opaque switch refuse until their normal completion can be
+proved. Unconditional loops, unknown constant completion, declaration scope
+merges and external bare exits also refuse. Existing
 source, region, classifier, action, nesting and attempt budgets still apply.
 
 The focused native test compares original and reconstructed methods with an
