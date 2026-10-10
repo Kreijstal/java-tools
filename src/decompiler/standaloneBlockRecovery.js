@@ -3,26 +3,46 @@
 // A block used as a direct block statement contributes no scope when all its
 // immediate children retain their own scopes or declare nothing. Keep branch,
 // loop, label and protected bodies intact. Edit only braces and whitespace.
-function flattenStandaloneBlocks(source, proof, {retainDiagnostics = false} = {}) {
+function flattenStandaloneBlocks(source, proof, {retainDiagnostics = false, uniqueDeclarations = false, declarationsOnly = false, reservedNames = []} = {}) {
   const unchanged = () => ({source, blocksFlattened: 0});
-  if (!proof || typeof retainDiagnostics !== 'boolean' || source.length > 400000) return unchanged();
+  if (!proof || typeof retainDiagnostics !== 'boolean' || typeof uniqueDeclarations !== 'boolean' || typeof declarationsOnly !== 'boolean'
+      || (declarationsOnly && !uniqueDeclarations)
+      || !Array.isArray(reservedNames) || reservedNames.some(name => typeof name !== 'string' || !/^[A-Za-z_$][\w$]*$/.test(name))
+      || source.length > 400000) return unchanged();
   const {parsed, tokens, starts, closes, children} = proof;
   const nondeclaring = new Set(['BlockStatement', 'LabeledStatement', 'IfStatement',
     'WhileStatement', 'ForStatement', 'EnhancedForStatement', 'DoWhileStatement',
     'SwitchStatement', 'TryStatement', 'SynchronizedStatement', 'ExpressionStatement',
     'ReturnStatement', 'ThrowStatement', 'BreakStatement', 'ContinueStatement', 'EmptyStatement', 'AssertStatement']);
   const candidates = [];
+  const declarations = new Map(), reserved = new Set(reservedNames);
+  function countDeclarations(node, depth = 0) {
+    if (depth > 128) return;
+    if (node.kind === 'VariableDeclarator') declarations.set(node.name, (declarations.get(node.name) || 0) + 1);
+    children(node, child => countDeclarations(child, depth + 1));
+  }
+  if (uniqueDeclarations) countDeclarations(parsed);
   let refused = false;
   function visit(node, parent = null, depth = 0) {
     if (depth > 128 || /Unsupported|ClassDeclaration|InterfaceDeclaration|EnumDeclaration|RecordDeclaration|MethodDeclaration|ConstructorDeclaration|LambdaExpression|AnonymousClass|Pattern/.test(node.kind || '')
         || node.kind === 'NewClassExpression' && node.body != null) { refused = true; return; }
     if (node.kind === 'BlockStatement' && parent?.kind === 'BlockStatement'
-        && parent.statements.includes(node) && node.statements.every(s => nondeclaring.has(s.kind)
+        && parent.statements.includes(node) && node.statements.every(s => (nondeclaring.has(s.kind)
+          || uniqueDeclarations && s.kind === 'LocalVariableDeclarationStatement')
           && !(s.kind === 'LabeledStatement' && !nondeclaring.has(s.statement?.kind)))) {
       const open = starts.get(node.range?.startOffset), close = closes.get(open);
-      if (tokens[open]?.text === '{' && tokens[close]?.text === '}')
+      const names = node.statements.filter(s => s.kind === 'LocalVariableDeclarationStatement')
+        .flatMap(s => s.declarators.map(d => d.name));
+      // Broadening a local scope must not create a collision or change lookup
+      // anywhere in the enclosing executable. Refuse even qualified outside
+      // occurrences; matching string contents are not Java identifier uses.
+      const start = tokens[open]?.range.startOffset, end = tokens[close]?.range.endOffset;
+      const independent = names.every(name => declarations.get(name) === 1 && !reserved.has(name)
+        && !tokens.some(t => t.text === name && (t.range.startOffset < start || t.range.endOffset > end)));
+      if (tokens[open]?.text === '{' && tokens[close]?.text === '}' && independent && (!declarationsOnly || names.length))
         candidates.push({start: tokens[open].range.startOffset - 2,
-          end: tokens[close].range.endOffset - 2, statements: node.statements.length});
+          end: tokens[close].range.endOffset - 2, statements: node.statements.length,
+          ...(names.length ? {declarations: names} : {})});
     }
     children(node, child => visit(child, node, depth + 1));
   }

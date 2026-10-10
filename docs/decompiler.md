@@ -3005,3 +3005,28 @@ passes 23 groups. The four new groups include 699,840 native comparisons with
 independent branch-based oracles for nullable Boolean callbacks, primitive
 overload choice, canonical boxing, mixed precedence, NaNs, reference identity,
 assignments, partial failures, finally overrides, catch paths and monitor release.
+
+### Standalone blocks with independent declarations
+
+`flattenStandaloneBlocks` accepts `{uniqueDeclarations: true, reservedNames}`
+to remove standalone block wrappers that contain local declarations. Every
+promoted name must have exactly one declaration in the enclosing executable,
+be absent from the reserved formal names, and have no matching identifier token
+outside its original block. Qualified outside occurrences also refuse; string
+contents do not resolve as Java identifiers. Initializers, declarations, stores
+and all work retain their exact order and source tokens. The option is disabled
+by default. Duplicate names, uncertain lookup, captures, nested executables,
+comments and unsupported source refuse the proof.
+
+`{declarationsOnly: true}` selects only wrappers with direct declarations.
+`CFR_JS_UNIQUE_DECLARATION_BLOCKS=1` uses that selection late, after continuation
+and predicate reconstruction, before the final shared-switch and indentation
+passes. Branch, loop, label, try/catch/finally and monitor bodies remain intact;
+only their independently proved standalone child scopes may be removed.
+
+`node --test --experimental-test-isolation=none test/uniqueDeclarationBlocks.test.js test/standaloneBlockRecovery.test.js`
+passes nine groups. The four new groups include 116,640 native cases with
+independent work oracles for nullable callbacks, snapshots, reference aliases,
+volatile state, overflow, index failures, loop continues, labeled breaks,
+finally overrides and monitor release. The existing suite checks another
+38,880 native cases and preserves the default declaration-scope refusal.

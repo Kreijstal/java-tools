@@ -2545,6 +2545,11 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
     if (!conjunction.ifsMerged) break;
     source = conjunction.source; changed = true;
   }
+  if (process.env.CFR_JS_UNIQUE_DECLARATION_BLOCKS === '1') for (;;) {
+    const blocks = flattenStandaloneBlocks(source, {uniqueDeclarations: true, declarationsOnly: true, reservedNames: parameterNames});
+    if (!blocks.blocksFlattened) break;
+    source = blocks.source; changed = true;
+  }
   if (process.env.CFR_JS_SHARED_SWITCH_FRAME_EXITS === '1') {
     const exits = foldSharedSwitchFrameExits(source);
     if (exits.breaksLocalized) {source = exits.source; changed = true;}
