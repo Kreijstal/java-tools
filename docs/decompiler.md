@@ -72,6 +72,9 @@ must all be abrupt, or a proved abrupt finally must override their completion.
 This also removes unreachable empty/Boolean/null/numeric return footers while
 retaining callback expressions, ordinary reads, internal comments and every
 original protected operation and finally boundary.
+Final method emission repeats this proof for a trailing return synthesized
+after reconstruction, so late exception wrappers cannot reintroduce a dead
+default footer. Reachable returns and unsupported expressions remain intact.
 
 Stable guarded fallbacks retain a labeled assignment join when splitting it
 would put initially unassigned outputs behind independent conditions. Java

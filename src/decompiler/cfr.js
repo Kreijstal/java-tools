@@ -2581,6 +2581,13 @@ function formatBlock(header, body) {
   // Exception boundaries, constructor guards and initializer helpers may be
   // added after statement recovery. Normalize their final complete scope too.
   if (body.length) {
+    // Default return footers can be synthesized after the earlier transfer
+    // cleanup. Apply the same AST proof to their final protected scope; an
+    // ordinary reachable return or an unsupported expression remains intact.
+    if (/^return\b/.test(String(body[body.length - 1]).trim())) {
+      const transfers = removeUnreachableControlTransfers(body.join('\n'));
+      if (transfers.transfersRemoved) body = transfers.source.split('\n');
+    }
     const indentation = reindentStructuredSource(body.join('\n'));
     if (indentation.linesReindented) body = indentation.source.split('\n');
   }
