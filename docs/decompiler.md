@@ -67,7 +67,11 @@ reparses source positions and strictly shortens the source; real loop endpoints
 remain intact.
 An if/else whose complete arms both cannot complete normally also makes its
 following transfer unreachable. Ordinary blocks use only their last statement;
-labeled blocks and protected constructs do not supply guessed exit proofs.
+labeled blocks do not supply guessed exit proofs. Complete try/catch endings
+must all be abrupt, or a proved abrupt finally must override their completion.
+This also removes unreachable empty/Boolean/null/numeric return footers while
+retaining callback expressions, ordinary reads, internal comments and every
+original protected operation and finally boundary.
 
 Stable guarded fallbacks retain a labeled assignment join when splitting it
 would put initially unassigned outputs behind independent conditions. Java

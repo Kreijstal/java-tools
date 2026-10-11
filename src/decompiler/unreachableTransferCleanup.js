@@ -7,6 +7,8 @@ const parser = new JavaParser();
 // break immediately after it. Both transfers belonged to the same block; the
 // second has no execution path. Literal endless loops without an own break
 // likewise cannot reach a following transfer. Remove only those dead transfers.
+// Literal/empty synthetic return footers are also safe after complete abrupt
+// alternatives or protected completion; calls, reads and comments are retained.
 function removeUnreachableControlTransfersPass(source) {
   const unchanged = () => ({source, transfersRemoved: 0});
   if (typeof source !== 'string' || source.length > 400000 || /\\u+[0-9a-fA-F]{4}/.test(source)) return unchanged();
@@ -28,6 +30,8 @@ function removeUnreachableControlTransfersPass(source) {
   const edits = [];
   const abrupt = new Set(['BreakStatement', 'ContinueStatement', 'ReturnStatement', 'ThrowStatement']);
   const transfers = new Set(['BreakStatement', 'ContinueStatement']);
+  const literalReturn = node => node.kind === 'ReturnStatement' && (!node.expression ||
+    node.expression.kind === 'LiteralExpression' && ['boolean', 'null', 'number'].includes(node.expression.literalKind));
   const loops = new Set(['WhileStatement', 'ForStatement', 'DoWhileStatement', 'EnhancedForStatement']);
   const captured = node => /ClassDeclaration|MethodDeclaration|ConstructorDeclaration|LambdaExpression|AnonymousClass/.test(node.kind || '')
     || node.kind === 'NewClassExpression' && node.body != null;
@@ -46,6 +50,9 @@ function removeUnreachableControlTransfersPass(source) {
     }
     if (statement.kind === 'IfStatement') return !!statement.alternate &&
       neverCompletesNormally(statement.consequent) && neverCompletesNormally(statement.alternate);
+    if (statement.kind === 'TryStatement') return (
+      (statement.finallyBlock && neverCompletesNormally(statement.finallyBlock)) ||
+      (neverCompletesNormally(statement.block) && (statement.catches || []).every(clause => neverCompletesNormally(clause.body))));
     const labels = [];
     while (statement.kind === 'LabeledStatement') {labels.push(statement.label);statement = statement.statement;}
     let condition = statement.condition;
@@ -71,12 +78,16 @@ function removeUnreachableControlTransfersPass(source) {
       const statements = node.statements || [];
       for (let i = 1; i < statements.length; i++) {
         const statement = statements[i];
-        if (!neverCompletesNormally(statements[i - 1]) || !transfers.has(statement.kind)) continue;
+        if (!neverCompletesNormally(statements[i - 1]) || !(transfers.has(statement.kind) || literalReturn(statement))) continue;
         const start = statement.range?.startOffset - 2;
         // Parser ranges end at the keyword/label; include the terminating token.
         const end = source.indexOf(';', start) + 1;
         if (!(start >= 0 && end > start && end <= source.length)) continue;
-        if (!/^(?:break|continue)(?:\s+[A-Za-z_$][\w$]*)?\s*;$/.test(source.slice(start, end))) continue;
+        const text = source.slice(start, end);
+        if (statement.kind === 'ReturnStatement') {
+          if (!/^return\b[^;]*;$/.test(text) || /\/\*|\/\//.test(text) ||
+              text.slice(6, -1).trim() !== (statement.expression?.raw || '')) continue;
+        } else if (!/^(?:break|continue)(?:\s+[A-Za-z_$][\w$]*)?\s*;$/.test(text)) continue;
         edits.push({start, end});
       }
     }
