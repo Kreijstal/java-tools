@@ -6521,9 +6521,12 @@ function finalizeIntArgumentBridges(outputs, parsed, options, model) {
       const output = entry && outputs.find(item => item.name === (entry.name
         ? entry.name.replace(/\.class$/i,'.java') : javaOutputName(entry.file,options.inputBaseDir)));
       if (!entry || !output) throw new Error('Cannot emit int argument bridge for ' + owner);
+      const started = Date.now();
+      if (process.env.CFR_JS_PROFILE_CLASSES === '1') console.error(`[cfr-bridge-start] ${owner} pending=${pending.length}`);
       const diagnostics = [];
       output.source = decompileAstRoot(entry.astRoot,{...options, exceptionModel:model, diagnostics});
       output.diagnostics = diagnostics;
+      if (process.env.CFR_JS_PROFILE_CLASSES === '1') console.error(`[cfr-bridge-done] ${Date.now()-started}ms ${owner}`);
     }
   }
 }
