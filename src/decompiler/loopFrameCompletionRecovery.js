@@ -44,6 +44,18 @@ function foldLoopFrameCompletion(source, proof, {retainDiagnostics = false, rese
     const frame=targets.get(jump),frameBody=blockBounds(frame?.statement),jumpFirst=starts.get(jump.range?.startOffset);
     if (frame?.kind!=='LabeledStatement'||!frameBody||!frame.statement.statements.length
         || tokens[jumpFirst]?.text!=='break'||tokens[jumpFirst+1]?.text!==frame.label||tokens[jumpFirst+2]?.text!==';') continue;
+    // A loop exit and the frame's normal tail may each assign an output.
+    // Capturing completion in a Boolean loses javac's proof at that join.
+    // Only an independently proved assignment before frame entry permits an
+    // initially unassigned output to be consumed after the reconstructed frame.
+    const frameEnd=tokens[frameBody.close].range.endOffset;
+    if([...uninitialized].some(name=>{
+      const locals=declarations.get(name)||[],declaration=locals.length===1?parents.get(locals[0]):null;
+      if(locals.length!==1||!(declaration?.range?.startOffset<frame.range.startOffset)||
+          priorLocalAssignment(frame,name,{parents,declarations,contexts,reservedNames}))return false;
+      return tokens.some(token=>token.kind==='identifier'&&token.text===name&&token.range.startOffset>frame.range.startOffset&&token.range.startOffset<frameEnd)&&
+        tokens.some(token=>token.kind==='identifier'&&token.text===name&&token.range.startOffset>=frameEnd);
+    }))continue;
     let cursor=parents.get(jump),loop=null,valid=true;
     while(cursor && cursor!==frame) {
       if(loops.has(cursor.kind)){loop=cursor;break;}

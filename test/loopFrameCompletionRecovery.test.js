@@ -32,6 +32,16 @@ test('guarded suffixes refuse lost definite assignment and permit independent in
  const independent='int value;Frame:{while(next()){if(stop())break Frame;}value=read();use(value);}';
  assert.equal(fold(independent).exitsRecovered,1);
 });
+test('outputs assigned on loop exits retain definite assignment after the frame',()=>{
+ const source='int value;Frame:{if(active){while(true){value=read(fail);break Frame;}}value=0;}return value;';
+ const next=fold(source);assert.equal(next.exitsRecovered,0);assert.equal(next.source,source);
+ for(const initialized of[source.replace('int value;','int value=-1;'),source.replace('int value;','int value;value=-1;')])assert.equal(fold(initialized).exitsRecovered,1);
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'loop-output-assignment-'));const run=(cmd,args)=>{const r=spawnSync(cmd,args,{encoding:'utf8'});assert.equal(r.status,0,r.stderr||r.stdout);return r.stdout.trim();};
+ try{
+  fs.writeFileSync(path.join(dir,'LoopOutput.java'),`public class LoopOutput{static StringBuilder trace;static int read(boolean fail){trace.append('R');if(fail)throw new IllegalStateException();return 42;}static int old(boolean active,boolean fail){${source}}static int next(boolean active,boolean fail){${next.source}}static String take(boolean readable,boolean active,boolean fail){trace=new StringBuilder();try{return (readable?next(active,fail):old(active,fail))+":"+trace;}catch(IllegalStateException failure){return "failure:"+trace;}}public static void main(String[]args){int cases=0;for(boolean active:new boolean[]{false,true})for(boolean fail:new boolean[]{false,true}){if(!take(false,active,fail).equals(take(true,active,fail)))throw new AssertionError();cases++;}System.out.println(cases);}}`);
+  run('javac',['--release','8','-d',dir,path.join(dir,'LoopOutput.java')]);assert.equal(run('java',['-cp',dir,'LoopOutput']),'4');
+ }finally{fs.rmSync(dir,{recursive:true,force:true});}
+});
 test('native completion flags match independent loop outcomes and preserve caller finally priority',()=>{
  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'loop-frame-native-'));const run=(cmd,args)=>{const out=path.join(dir,'out'),err=path.join(dir,'err'),fds=[out,err].map(f=>fs.openSync(f,'w'));try{const r=spawnSync(cmd,args,{stdio:['ignore',...fds]});if(r.error)throw r.error;assert.equal(r.status,0,fs.readFileSync(err,'utf8'));return fs.readFileSync(out,'utf8').trim();}finally{fds.forEach(fd=>fs.closeSync(fd));}};
  const contexts=[s=>s,s=>`try{${s}}finally{event(9);if(mode==1)return snapshot();if(mode==2)throw OVERRIDE;}`,s=>`synchronized(lock){event(8);${s}}`,s=>`try{${s}}catch(IllegalStateException e){event(7);if(e!=FAILURE)throw e;}finally{event(9);}`];
