@@ -61,6 +61,10 @@ The same cleanup handles literal endless loops (`while (true)`, `for (;;)` and
 `do ... while (true)`) only when no break can reach that loop's endpoint. Nested
 loop/switch breaks do not exit the enclosing loop; labeled own breaks and even
 syntactically present `if (false) break` prevent this recovery.
+The cleanup repeats after removing inner dead transfers: a removed inner break
+can establish that an enclosing loop also cannot complete normally. Each pass
+reparses source positions and strictly shortens the source; real loop endpoints
+remain intact.
 
 Stable guarded fallbacks retain a labeled assignment join when splitting it
 would put initially unassigned outputs behind independent conditions. Java

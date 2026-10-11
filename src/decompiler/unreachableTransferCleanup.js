@@ -7,7 +7,7 @@ const parser = new JavaParser();
 // break immediately after it. Both transfers belonged to the same block; the
 // second has no execution path. Literal endless loops without an own break
 // likewise cannot reach a following transfer. Remove only those dead transfers.
-function removeUnreachableControlTransfers(source) {
+function removeUnreachableControlTransfersPass(source) {
   const unchanged = () => ({source, transfersRemoved: 0});
   if (typeof source !== 'string' || source.length > 400000 || /\\u+[0-9a-fA-F]{4}/.test(source)) return unchanged();
   let root;
@@ -85,6 +85,20 @@ function removeUnreachableControlTransfers(source) {
   for (const edit of edits.sort((a, b) => b.start - a.start))
     result = result.slice(0, edit.start) + result.slice(edit.end);
   return {source: result, transfersRemoved: edits.length};
+}
+
+function removeUnreachableControlTransfers(source) {
+  let current = source, transfersRemoved = 0;
+  for (;;) {
+    const next = removeUnreachableControlTransfersPass(current);
+    if (!next.transfersRemoved) return {source: current, transfersRemoved};
+    // Removing an inner synthetic break can prove that its enclosing literal
+    // loop never completes normally. Reparse offsets and repeat that proof;
+    // every successful pass strictly shortens the source, so it terminates.
+    if (next.source.length >= current.length) return {source: current, transfersRemoved};
+    current = next.source;
+    transfersRemoved += next.transfersRemoved;
+  }
 }
 
 module.exports = {removeUnreachableControlTransfers};
