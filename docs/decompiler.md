@@ -57,6 +57,15 @@ inside its arms is also used afterwards without proven prefix initialization:
 Java cannot infer definite assignment from the new continuation Boolean.
 Reconstruction also removes an effect-free synthetic break/continue immediately
 after an unconditional abrupt statement, preserving enclosing protected scopes.
+The same cleanup handles literal endless loops (`while (true)`, `for (;;)` and
+`do ... while (true)`) only when no break can reach that loop's endpoint. Nested
+loop/switch breaks do not exit the enclosing loop; labeled own breaks and even
+syntactically present `if (false) break` prevent this recovery.
+
+Stable guarded fallbacks retain a labeled assignment join when splitting it
+would put initially unassigned outputs behind independent conditions. Java
+does not infer the relationship between those predicates. Subsequent proved
+recovery may use explicit else arms; no arbitrary null initialization is added.
 
 `simplifyNaturalLoopExitCaptures` removes a captured natural-exit
 decision when the loop has no own break, the Boolean has no other uses, and

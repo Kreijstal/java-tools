@@ -15,11 +15,13 @@ function foldStableGuardedFallbacks(source, proof, {parameters = [], fpStrict = 
   if (labelCounts.size > 256 || [...labelCounts.values()].some(count => count !== 1)) return unchanged();
   const primitive = primitiveExpressionProof(proof, parameters);
   if (!primitive) return unchanged();
-  const frames = [], blocks = [], references = new Map(), parents = new Map();
+  const frames = [], blocks = [], references = new Map(), parents = new Map(), uninitialized = new Map();
   let refused = false;
   function walk(node, visit, parent = null) { visit(node, parent); children(node, child => walk(child, visit, node)); }
   walk(parsed, (node, parent) => {
     parents.set(node, parent);
+    if (node.kind === 'VariableDeclarator' && !node.initializer)
+      uninitialized.set(node.name, [...(uninitialized.get(node.name) || []), parent]);
     if (node.kind === 'LabeledStatement') frames.push(node);
     if (node.kind === 'BlockStatement') blocks.push(node);
     if (['BreakStatement', 'ContinueStatement'].includes(node.kind) && node.label)
@@ -100,6 +102,14 @@ function foldStableGuardedFallbacks(source, proof, {parameters = [], fpStrict = 
         });
         walk(guard.condition, node => {if (node.kind === 'Identifier') guardReads.add(node.name);});
         const copied = prefix.length > 0;
+        // A labeled join can establish definite assignment from either the
+        // prefix's early exit or the fallback. Two independent if statements
+        // lose that Java proof, even when their predicates cover every path.
+        // Preserve the join for initially unassigned outputs used afterward.
+        if ([...writes].some(name => (uninitialized.get(name) || []).some(declaration =>
+            declaration?.range?.startOffset < tokens[first].range.startOffset) &&
+            tokens.some(token => token.kind === 'identifier' && token.text === name &&
+              token.range.startOffset >= tokens[containerBounds.close].range.endOffset))) continue;
         if (copied && (primitive.pureType(branch.condition, tokens[first].range.startOffset) !== 'boolean'
             || uncertainFloatingArithmetic || [...conditionReads].some(name => writes.has(name))) || [...guardReads].some(name => declared.has(name))) continue;
         const outerNegative = negative(branch.condition, first + 1, conditionClose, copied);

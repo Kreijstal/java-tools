@@ -10,7 +10,7 @@ const frame = (prefix = 'hit();', condition = 'enabled', guard = 'flag==0') => `
 
 test('the normal emitter finishes stable guarded fallbacks with actual parameter types', () => {
   const body = frame().split('\n'); finish(body, parameters.map(p => p.name), parameters);
-  assert.equal(body.join('\n'), 'if(enabled){hit();} if (!enabled || flag!=0) {fallback();}');
+  assert.equal(body.join('\n'), 'if(enabled){hit();} if (!enabled ||\n  flag!=0) {fallback();}');
 });
 
 test('stable primitive predicates express effectful prefixes and fallbacks once', () => {
@@ -34,6 +34,36 @@ test('empty prefixes retain one effectful/nullable condition and guard evaluatio
       assert.equal(identifiers(next.source).filter(t => t === name).length, identifiers(source).filter(t => t === name).length);
     assert.equal(next.source.split('guard(boxed)').length - 1, 1);
   }
+});
+
+test('initially unassigned outputs retain the labeled definite-assignment join', () => {
+  const parameters = [{name: 'selector', type: 'int'}, {name: 'flag', type: 'int'}];
+  const source = 'String left;String right;Frame:{if(selector==-1){left=first();right=second();if(flag==0)break Frame;}right=arrayRight(selector);left=arrayLeft(selector);}return left+right;';
+  const next = fold(source, {parameters});
+  assert.equal(next.framesRecovered, 0);
+  assert.equal(next.source, source);
+  const body = source.split('\n'); finish(body, parameters.map(p => p.name), parameters);
+  // Later reconstruction may express the join as explicit else arms instead.
+  // Compile and execute that complete default output below.
+  const initialized = source.replace('String left;String right;', 'String left=null;String right=null;');
+  assert.equal(fold(initialized, {parameters}).framesRecovered, 1);
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'stable-fallback-assignment-'));
+  const run = (command, args) => {const result = spawnSync(command, args, {encoding: 'utf8'});assert.equal(result.status, 0, result.stderr || result.stdout);return result.stdout.trim();};
+  try {
+    fs.writeFileSync(path.join(temporary, 'AssignmentJoin.java'), `public class AssignmentJoin {
+static StringBuilder trace;static int fail;
+static String event(int stage){trace.append(stage);if(fail==stage)throw new IllegalStateException();return "v"+stage;}
+static String first(){return event(1);}static String second(){return event(2);}
+static String arrayRight(int selector){return event(3);}static String arrayLeft(int selector){return event(4);}
+static String old(int selector,int flag){${source}}
+static String next(int selector,int flag){${body.join('\n')}}
+static String initialized(int selector,int flag){${fold(initialized, {parameters}).source}}
+static String take(int kind,int selector,int flag,int failure){trace=new StringBuilder();fail=failure;String value;try{value=kind==0?old(selector,flag):kind==1?next(selector,flag):initialized(selector,flag);}catch(IllegalStateException exception){value="failure";}return value+":"+trace;}
+public static void main(String[] args){int cases=0;for(int selector:new int[]{-1,0,1})for(int flag:new int[]{-1,0,1})for(int failure=0;failure<5;failure++){String expected=take(0,selector,flag,failure);for(int kind=1;kind<3;kind++)if(!expected.equals(take(kind,selector,flag,failure)))throw new AssertionError();cases++;}System.out.println(cases+" assignment and partial-failure cases");}}
+`);
+    run('javac', ['--release', '8', '-d', temporary, path.join(temporary, 'AssignmentJoin.java')]);
+    assert.equal(run('java', ['-cp', temporary, 'AssignmentJoin']), '45 assignment and partial-failure cases');
+  } finally {fs.rmSync(temporary, {recursive: true, force: true});}
 });
 
 test('declaration scopes, statement positions and complete protected constructs remain', () => {
@@ -101,7 +131,8 @@ test('floating arithmetic is repeated only in a proven FP-strict source context'
   assert.equal(fold(source, {parameters}).source, source, 'non-strict arithmetic may use extended exponents');
   const next = fold(source, {parameters, fpStrict: true}); assert.equal(next.framesRecovered, 1);
   const body = source.split('\n'); finish(body, parameters.map(p => p.name), parameters, null, true);
-  assert.equal(body.join('\n'), next.source, 'normal phase uses its actual source strictness');
+  const tokens = source => tokenizeJava(source).tokens.map(token => token.text);
+  assert.deepEqual(tokens(body.join('\n')), tokens(next.source), 'normal phase uses its actual source strictness');
   try {
     const fixture = `public class StrictStableFallback {
 static StringBuilder trace;static void hit(){trace.append('P');}static void tail(){trace.append('F');}

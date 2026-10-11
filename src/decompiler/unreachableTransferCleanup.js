@@ -5,7 +5,8 @@ const parser = new JavaParser();
 
 // Reconstruction can remove a guard around a continue, exposing a synthetic
 // break immediately after it. Both transfers belonged to the same block; the
-// second has no execution path. Remove only such effect-free transfers.
+// second has no execution path. Literal endless loops without an own break
+// likewise cannot reach a following transfer. Remove only those dead transfers.
 function removeUnreachableControlTransfers(source) {
   const unchanged = () => ({source, transfersRemoved: 0});
   if (typeof source !== 'string' || source.length > 400000 || /\\u+[0-9a-fA-F]{4}/.test(source)) return unchanged();
@@ -27,6 +28,35 @@ function removeUnreachableControlTransfers(source) {
   const edits = [];
   const abrupt = new Set(['BreakStatement', 'ContinueStatement', 'ReturnStatement', 'ThrowStatement']);
   const transfers = new Set(['BreakStatement', 'ContinueStatement']);
+  const loops = new Set(['WhileStatement', 'ForStatement', 'DoWhileStatement', 'EnhancedForStatement']);
+  const captured = node => /ClassDeclaration|MethodDeclaration|ConstructorDeclaration|LambdaExpression|AnonymousClass/.test(node.kind || '')
+    || node.kind === 'NewClassExpression' && node.body != null;
+  const children = (node, callback) => {
+    for (const [key, child] of Object.entries(node)) {
+      if (['range', 'meta', 'tokens', 'kind'].includes(key)) continue;
+      if (Array.isArray(child)) child.forEach(value => {if (value && typeof value === 'object') callback(value);});
+      else if (child && typeof child === 'object') callback(child);
+    }
+  };
+  function neverCompletesNormally(statement) {
+    if (abrupt.has(statement.kind)) return true;
+    const labels = [];
+    while (statement.kind === 'LabeledStatement') {labels.push(statement.label);statement = statement.statement;}
+    let condition = statement.condition;
+    while (condition?.kind === 'ParenthesizedExpression') condition = condition.expression;
+    if (!['WhileStatement', 'ForStatement', 'DoWhileStatement'].includes(statement.kind) ||
+        !(statement.kind === 'ForStatement' && !condition || condition?.kind === 'LiteralExpression' && condition.raw === 'true')) return false;
+    const loop = statement;
+    let exits = false;
+    function inspect(node, target = loop) {
+      if (captured(node)) return;
+      if (node.kind === 'BreakStatement' && (node.label ? labels.includes(node.label) : target === loop)) exits = true;
+      if (node !== loop && (loops.has(node.kind) || node.kind === 'SwitchStatement')) target = node;
+      children(node, child => inspect(child, target));
+    }
+    inspect(loop);
+    return !exits;
+  }
   function visit(node) {
     if (!node || typeof node !== 'object') return;
     if (/ClassDeclaration|MethodDeclaration|ConstructorDeclaration|LambdaExpression|AnonymousClass/.test(node.kind || '')) return;
@@ -35,7 +65,7 @@ function removeUnreachableControlTransfers(source) {
       const statements = node.statements || [];
       for (let i = 1; i < statements.length; i++) {
         const statement = statements[i];
-        if (!abrupt.has(statements[i - 1].kind) || !transfers.has(statement.kind)) continue;
+        if (!neverCompletesNormally(statements[i - 1]) || !transfers.has(statement.kind)) continue;
         const start = statement.range?.startOffset - 2;
         // Parser ranges end at the keyword/label; include the terminating token.
         const end = source.indexOf(';', start) + 1;
