@@ -61,6 +61,15 @@ test('nested endless loops remove newly exposed dead transfers to a fixed point'
   assert.equal(clean(reachable).source, reachable, 'genuine nested exits still reach the later breaks');
 });
 
+test('complete alternatives prove only transfers after two abrupt arms unreachable', () => {
+  const source = 'Outer:while(flag){if(choice){while(true){break Outer;}}else{while(true){continue Outer;}}break;}';
+  assert.equal(clean(source).transfersRemoved, 1);
+  assert.equal(clean(source).source, source.replace('}break;}', '}}'));
+  for (const reachable of ['while(flag){if(choice){while(true){if(stop())break;}}else{return;}break;}',
+    'while(flag){if(choice){Exit:{break Exit;}}else{return;}break;}',
+    'while(flag){if(choice){return;}break;}']) assert.equal(clean(reachable).source, reachable);
+});
+
 test('a reconstructed endless scan compiles and preserves effects and failures', () => {
   const source = 'int index=0;while(enter){while(true){if(index>=stop)return trace.toString();switch(index){case 0:event(index++,fail);break;default:event(index++,fail);} }break;}return trace.toString();';
   const next = clean(source);
@@ -68,6 +77,8 @@ test('a reconstructed endless scan compiles and preserves effects and failures',
   const nestedSource = 'int index=0;Outer:while(enter){while(true){while(true){if(index>=stop)return trace.toString();event(index++,fail);continue Outer;}break;}break;}return trace.toString();';
   const nested = clean(nestedSource);
   assert.equal(nested.transfersRemoved, 2);
+  const alternatives = clean('int index=0;Outer:while(enter){if(index%2==0){while(true){if(index>=stop)return trace.toString();event(index++,fail);continue Outer;}}else{while(true){if(index>=stop)return trace.toString();event(index++,fail);continue Outer;}}break;}return trace.toString();');
+  assert.equal(alternatives.transfersRemoved, 1);
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'infinite-transfer-native-'));
   const run = (command, args) => {const result = spawnSync(command, args, {encoding: 'utf8'});assert.equal(result.status, 0, result.stderr || result.stdout);return result.stdout.trim();};
   try {
@@ -75,9 +86,10 @@ test('a reconstructed endless scan compiles and preserves effects and failures',
 static StringBuilder trace;static void event(int index,int fail){trace.append(index);if(index==fail)throw new IllegalStateException();}
 static String next(boolean enter,int stop,int fail){${next.source}}
 static String nested(boolean enter,int stop,int fail){${nested.source}}
+static String alternatives(boolean enter,int stop,int fail){${alternatives.source}}
 static String oracle(boolean enter,int stop,int fail){if(enter)for(int index=0;index<stop;index++)event(index,fail);return trace.toString();}
-static String take(int variant,boolean enter,int stop,int fail){trace=new StringBuilder();try{return variant==0?oracle(enter,stop,fail):variant==1?next(enter,stop,fail):nested(enter,stop,fail);}catch(IllegalStateException exception){return "failure:"+trace;}}
-public static void main(String[] args){int cases=0;for(boolean enter:new boolean[]{false,true})for(int stop=-1;stop<5;stop++)for(int fail=-1;fail<5;fail++){for(int variant=1;variant<3;variant++)if(!take(variant,enter,stop,fail).equals(take(0,enter,stop,fail)))throw new AssertionError();cases++;}System.out.println(cases+" scan cases");}}
+static String take(int variant,boolean enter,int stop,int fail){trace=new StringBuilder();try{return variant==0?oracle(enter,stop,fail):variant==1?next(enter,stop,fail):variant==2?nested(enter,stop,fail):alternatives(enter,stop,fail);}catch(IllegalStateException exception){return "failure:"+trace;}}
+public static void main(String[] args){int cases=0;for(boolean enter:new boolean[]{false,true})for(int stop=-1;stop<5;stop++)for(int fail=-1;fail<5;fail++){for(int variant=1;variant<4;variant++)if(!take(variant,enter,stop,fail).equals(take(0,enter,stop,fail)))throw new AssertionError();cases++;}System.out.println(cases+" scan cases");}}
 `);
     run('javac', ['--release', '8', '-d', temporary, path.join(temporary, 'EndlessScan.java')]);
     assert.equal(run('java', ['-cp', temporary, 'EndlessScan']), '72 scan cases');

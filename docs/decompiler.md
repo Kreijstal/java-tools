@@ -65,6 +65,9 @@ The cleanup repeats after removing inner dead transfers: a removed inner break
 can establish that an enclosing loop also cannot complete normally. Each pass
 reparses source positions and strictly shortens the source; real loop endpoints
 remain intact.
+An if/else whose complete arms both cannot complete normally also makes its
+following transfer unreachable. Ordinary blocks use only their last statement;
+labeled blocks and protected constructs do not supply guessed exit proofs.
 
 Stable guarded fallbacks retain a labeled assignment join when splitting it
 would put initially unassigned outputs behind independent conditions. Java

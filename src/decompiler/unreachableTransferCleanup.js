@@ -40,6 +40,12 @@ function removeUnreachableControlTransfersPass(source) {
   };
   function neverCompletesNormally(statement) {
     if (abrupt.has(statement.kind)) return true;
+    if (statement.kind === 'BlockStatement') {
+      const last = statement.statements?.at(-1);
+      return !!last && neverCompletesNormally(last);
+    }
+    if (statement.kind === 'IfStatement') return !!statement.alternate &&
+      neverCompletesNormally(statement.consequent) && neverCompletesNormally(statement.alternate);
     const labels = [];
     while (statement.kind === 'LabeledStatement') {labels.push(statement.label);statement = statement.statement;}
     let condition = statement.condition;
