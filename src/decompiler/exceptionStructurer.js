@@ -797,13 +797,34 @@ function structureMethodImpl(codeItems, exceptionTable, opts = {}) {
   const origBlocks = methodCfg.blocks;
   const render = makeRender(codeItems, origBlocks);
 
-  // No exception table: the base structurer handles everything.
+  // No exception table: retain original action/condition identities when a
+  // bounded split is needed. Labels still identify distinct emitted copies.
+  // The edge proof uses the unsplit graph, never the graph we just rewrote.
   if (!exceptionTable || exceptionTable.length === 0) {
     try {
       const { tree } = structure(methodCfg);
       return { ok: true, tree, render };
     } catch (err) {
-      if (err instanceof IrreducibleError) return { ok: false, reason: `irreducible: ${err.message}` };
+      if (err instanceof IrreducibleError) {
+        const split = splitIrreducibleTerms(methodCfg.term, methodCfg.entry);
+        if (!split) return { ok: false, reason: `plain CFG exceeds controlled-splitting limits: ${err.message}` };
+        try {
+          const result = structure({n: split.terms.length, entry: methodCfg.entry,
+            term: split.terms, succ: succFromTerms(split.terms),
+            succAll: succAllFromTerms(split.terms)});
+          const tree = remapTreeBlocks(result.tree, id => split.origins[id]);
+          const flow = {entry: methodCfg.entry,
+            blocks: methodCfg.term.map((term, block) => ({block, term}))};
+          if (!verifyStructuredFlow(tree, flow))
+            return {ok: false, reason: 'plain CFG splitting changed its source control-flow edges'};
+          return {ok: true, tree, render, normalFlowVerified: true,
+            splitBlocks: split.terms.length - methodCfg.n};
+        } catch (retryError) {
+          if (retryError instanceof IrreducibleError)
+            return {ok: false, reason: `plain CFG remains irreducible after controlled splitting: ${retryError.message}`};
+          throw retryError;
+        }
+      }
       return { ok: false, reason: `internal: ${err.message}` };
     }
   }

@@ -10,6 +10,18 @@ Retired `CFR_JS_*` transformation switches no longer change generated code.
 Debug/profile variables only report diagnostics. Explicit internal fallback
 options are used by regression tests, not required by callers or the CLI.
 
+Plain methods with irreducible normal control flow now use the bounded node
+splitting already used for exception components. Emitted copies retain their
+original action and condition block identities while loop/frame labels remain
+distinct. The independent flow verifier compares every copy with the unsplit
+source edges before accepting the result. Term/round limits and failed proofs
+retain the typed dispatcher fallback. This extension applies only when there
+is no exception table; protected-region entry checks remain unchanged.
+
+Focused native validation covers alternating multi-entry loops, integer
+wrapping, observable action order and uncaught failures:
+`NODE_PATH=/path/to/node_modules node --test --experimental-test-isolation=none test/cfrPlainIrreducibleSplitting.test.js test/exceptionStructurer.test.js`.
+
 Game names, symbol maps and source/relocation policies belong in the consuming
 workflow. The compiler does not select recovery rules by application identity.
 Old export provenance records the settings used for those historical builds;
