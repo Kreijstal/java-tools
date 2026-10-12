@@ -22,6 +22,34 @@ Focused native validation covers alternating multi-entry loops, integer
 wrapping, observable action order and uncaught failures:
 `NODE_PATH=/path/to/node_modules node --test --experimental-test-isolation=none test/cfrPlainIrreducibleSplitting.test.js test/exceptionStructurer.test.js`.
 
+The control-flow proof can be understood as a finite simulation certificate.
+Map each copied block to its original. Check the entry, block kind, both
+conditional successors, every switch key/default and every unconditional
+successor under that mapping. Every copied action/test retains its source
+identity. Induction on execution steps then preserves all finite block traces;
+the same step relation preserves divergent executions and the position of an
+uncaught failure, provided block operations themselves remain unchanged.
+`verifyStructuredFlow` separately reconstructs the statement tree's transfers
+and checks every reachable occurrence against the original graph, including
+branch polarity and destinations through enclosing labels. It rejects silent
+transfer cycles instead of treating them as source actions.
+
+Two small certificate examples, including deliberate corruption of a copied
+branch, run with `node --test test/controlFlowProofConcept.test.js`. This is a
+control-flow proof, not a proof of Java expression folding, operand-stack
+materialization, or exception-region reconstruction. Native original/rebuilt
+fixtures remain necessary at those boundaries. Protected regions also require
+their independent coverage, handler-priority and exit-contract checks.
+
+Relevant algorithms are Ramsey's [Beyond Relooper](https://www.cs.tufts.edu/~nr/pubs/relooper.pdf)
+(2022), which explains dominator-based structuring and node splitting, and
+[CF-GKAT](https://arxiv.org/abs/2411.13220) (2025), which gives an automata-based
+decision procedure for abstract guarded trace equivalence with nonlocal control
+flow. The implementation here retains exact source block/test identities and
+checks a stronger local edge correspondence; it does not implement CF-GKAT or
+claim a complete JVM equivalence decision procedure. Bounded duplication may
+refuse a graph even when an unbounded construction exists.
+
 Game names, symbol maps and source/relocation policies belong in the consuming
 workflow. The compiler does not select recovery rules by application identity.
 Old export provenance records the settings used for those historical builds;
