@@ -34,6 +34,13 @@ and checks every reachable occurrence against the original graph, including
 branch polarity and destinations through enclosing labels. It rejects silent
 transfer cycles instead of treating them as source actions.
 
+This certificate now runs in the production node splitter through
+`verifyCopiedFlow`, before a split graph is returned to either the plain-method
+or exception-component structurer. It validates all original identities and
+every copied transition, independently of how the splitter chose its regions.
+Invalid certificates return no split and retain the existing fallback. The
+structured-tree edge verifier remains a separate gate after reconstruction.
+
 Two small certificate examples, including deliberate corruption of a copied
 branch, run with `node --test test/controlFlowProofConcept.test.js`. This is a
 control-flow proof, not a proof of Java expression folding, operand-stack

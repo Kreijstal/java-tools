@@ -43,6 +43,7 @@ const {
   succAllOfTerm,
 } = require('./structurer');
 const {verifyStructuredFlow} = require('./structuredFlowVerifier');
+const {verifyCopiedFlow} = require('./copiedFlowVerifier');
 
 // A sentinel returned by the internal helpers to unwind a graceful bail without
 // throwing through the recursion.
@@ -475,7 +476,10 @@ function splitIrreducibleTerms(inputTerms, entry, options = {}) {
       // Stable node order gives reproducible primary entries and clone IDs.
       pending.push(...children.reverse());
     }
-    if (!candidate) return round ? { terms, origins } : null;
+    if (!candidate) {
+      const result = {terms, origins};
+      return round && verifyCopiedFlow(inputTerms, entry, result) ? result : null;
+    }
     if (round === maxRounds || terms.length + candidate.component.length > maxTerms) return null;
     const primary = candidate.entries.find((item) => item.node === entry)
       || candidate.entries.slice().sort((a, b) => b.externalPreds - a.externalPreds || a.node - b.node)[0];

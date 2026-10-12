@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const {splitIrreducibleTerms} = require('../src/decompiler/exceptionStructurer');
 const {structure, succOfTerm, succAllOfTerm, IrreducibleError} = require('../src/decompiler/structurer');
 const {verifyStructuredFlow} = require('../src/decompiler/structuredFlowVerifier');
+const {verifyCopiedFlow} = require('../src/decompiler/copiedFlowVerifier');
 
 const loop = [
   {kind: 'cond', taken: 1, fall: 2},
@@ -66,6 +67,7 @@ for (const [name, terms] of [['two loop entrances', loop], ['switch/default loop
     const split = splitIrreducibleTerms(terms, 0);
     assert.ok(split);
     proveCopies(terms, split);
+    assert.equal(verifyCopiedFlow(terms, 0, split), true);
     const flow = {entry: 0, blocks: terms.map((term, block) => ({block, term}))};
     assert.equal(verifyStructuredFlow(sourceTree(split.terms, split.origins), flow), true);
     const broken = structuredClone(split);
@@ -74,6 +76,27 @@ for (const [name, terms] of [['two loop entrances', loop], ['switch/default loop
     [broken.terms[copy].taken, broken.terms[copy].fall] =
       [broken.terms[copy].fall, broken.terms[copy].taken];
     assert.throws(() => proveCopies(terms, broken), assert.AssertionError);
+    assert.equal(verifyCopiedFlow(terms, 0, broken), false);
     assert.equal(verifyStructuredFlow(sourceTree(broken.terms, broken.origins), flow), false);
   });
 }
+
+test('production certificate refuses invalid identities, edges, kinds and switch outcomes', () => {
+  for (const mutate of [
+    split => {split.origins[0] = 1;},
+    split => {split.origins.pop();},
+    split => {split.origins[7] = -1;},
+    split => {split.terms[7].kind = 'return';},
+    split => {split.terms[0].cases[0].key = 17;},
+    split => {split.terms[0].default = split.terms.length;},
+    split => {split.terms[0].cases.pop();},
+  ]) {
+    const split = splitIrreducibleTerms(switched, 0);
+    mutate(split);
+    assert.equal(verifyCopiedFlow(switched, 0, split), false);
+  }
+  assert.equal(verifyCopiedFlow(switched, -1, splitIrreducibleTerms(switched, 0)), false);
+  assert.equal(verifyCopiedFlow(switched, 0, null), false);
+  const foreign = [{kind: 'unknown'}];
+  assert.equal(verifyCopiedFlow(foreign, 0, {terms: foreign, origins: [0]}), false);
+});
