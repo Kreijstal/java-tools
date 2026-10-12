@@ -669,6 +669,115 @@ const NONTHROWING = new Set([
 
 function canThrow(op) { return !NONTHROWING.has(op); }
 
+// A shared terminal catch may protect disconnected normal-flow components.
+// Keep throwing gaps outside their own tries; give each component its actual
+// unique normal entry, even when that entry is not its lowest bytecode PC.
+// Handler bodies may be emitted twice, but each exceptional path runs one copy.
+function partitionFragmentedGroups(groups, cfg, codeItems, syncHandlers) {
+  // Lock-exit regions have their own logical range and ownership rules. Do not
+  // partition any part of those methods with the ordinary-catch recovery.
+  if (syncHandlers?.size) return groups;
+  const pc = block => codeItems[cfg.blocks[block].insns[0]].pc;
+  // Coverage intervals require authoritative, strictly ordered bytecode PCs.
+  // Other IR front ends retain the existing conservative reconstruction.
+  if (cfg.blocks.some((block, index) => !Number.isSafeInteger(pc(block.id))
+      || index && pc(block.id) <= pc(cfg.blocks[index - 1].id))) return groups;
+  const byPc = new Map(cfg.blocks.map(block => [pc(block.id), block.id]));
+  const handlerPcs = new Set(groups.flatMap(group => group.catches.map(c => c.handler_pc)));
+  const roots = [cfg.entry, ...[...handlerPcs].map(value => byPc.get(value)).filter(value => value != null)];
+  const live = livenessFrom({ids: cfg.blocks.map(block => block.id), term: cfg.term}, roots);
+  const protectedPc = value => groups.some(group => inAnyRange(value, group.ranges));
+  const result = [];
+  for (const group of groups) {
+    const overlapsAnother = groups.some(other => other !== group && group.ranges.some(a =>
+      other.ranges.some(b => a.start_pc < b.end_pc && b.start_pc < a.end_pc)));
+    // Changing a nested group's span can change its ordering relative to an
+    // overlapping catch. Leave that case to the existing exact-priority path.
+    if (group.ranges.length < 2 || overlapsAnother) {
+      result.push(group);continue;
+    }
+    const handlers = new Set();
+    let terminal = true;
+    for (const c of group.catches) {
+      const entry = byPc.get(c.handler_pc);
+      if (entry == null) {terminal = false;break;}
+      const pending = [entry], seen = new Set();
+      while (pending.length && terminal) {
+        const block = pending.pop();
+        if (seen.has(block)) continue;
+        seen.add(block);handlers.add(block);
+        if (pc(block) !== c.handler_pc && handlerPcs.has(pc(block))) {terminal = false;break;}
+        if (cfg.blocks[block].insns.some(i => protectedPc(codeItems[i].pc))) {terminal = false;break;}
+        pending.push(...succOfTerm(cfg.term[block]));
+      }
+      if ([...seen].some(block => !succOfTerm(cfg.term[block]).length
+          && cfg.term[block].kind !== 'return')) terminal = false;
+      // Only acyclic terminal handlers can be retained for another component.
+      const degrees = new Map([...seen].map(block => [block, 0]));
+      for (const block of seen) for (const target of succOfTerm(cfg.term[block]))
+        if (seen.has(target)) degrees.set(target, degrees.get(target) + 1);
+      const ready = [...seen].filter(block => degrees.get(block) === 0);let removed = 0;
+      while (ready.length) {
+        const block = ready.pop();removed++;
+        for (const target of succOfTerm(cfg.term[block])) if (degrees.has(target)) {
+          degrees.set(target, degrees.get(target) - 1);if (!degrees.get(target)) ready.push(target);
+        }
+      }
+      if (removed !== seen.size) terminal = false;
+    }
+    if (!terminal || [...handlers].some(block => cfg.blocks.some(predecessor =>
+      !handlers.has(predecessor.id) && live[predecessor.id]
+      && succOfTerm(cfg.term[predecessor.id]).includes(block)))) {result.push(group);continue;}
+    const members = new Set();
+    for (const block of cfg.blocks) {
+      if (!live[block.id] || handlers.has(block.id) || handlerPcs.has(pc(block.id))) continue;
+      const inside = inAnyRange(pc(block.id), group.ranges);
+      const pureGap = pc(block.id) >= group.start_pc && pc(block.id) < group.end_pc
+        && block.insns.every(i => !canThrow(insnOp(codeItems[i])));
+      if (inside || pureGap) members.add(block.id);
+    }
+    const neighbors = new Map([...members].map(block => [block, []]));
+    for (const block of members) for (const target of succOfTerm(cfg.term[block])) if (members.has(target)) {
+      neighbors.get(block).push(target);neighbors.get(target).push(block);
+    }
+    const components = [], visited = new Set();
+    for (const start of members) {
+      if (visited.has(start)) continue;
+      const component = new Set(), pending = [start];
+      while (pending.length) {const block = pending.pop();if (visited.has(block)) continue;
+        visited.add(block);component.add(block);pending.push(...neighbors.get(block));}
+      if ([...component].some(block => inAnyRange(pc(block), group.ranges))) components.push(component);
+    }
+    const handlerInstructions = [...handlers].reduce((sum, block) => sum + cfg.blocks[block].insns.length, 0);
+    if (components.length < 2 || components.length > 16
+        || handlers.size * (components.length - 1) > Math.min(256, cfg.n * 3)
+        || handlerInstructions * (components.length - 1) > Math.min(256, codeItems.length)) {result.push(group);continue;}
+    const fragments = [];
+    for (const component of components) {
+      const entries = new Set();
+      if (component.has(cfg.entry)) entries.add(cfg.entry);
+      for (const block of cfg.blocks) if (live[block.id] && !component.has(block.id))
+        for (const target of succOfTerm(cfg.term[block.id])) if (component.has(target)) entries.add(target);
+      if (entries.size !== 1) {terminal = false;break;}
+      const ranges = [];
+      for (const block of component) {
+        const end = block + 1 < cfg.n ? pc(block + 1) : group.end_pc;
+        for (const range of group.ranges) {
+          const start_pc = Math.max(pc(block), range.start_pc), end_pc = Math.min(end, range.end_pc);
+          if (start_pc < end_pc) ranges.push({start_pc, end_pc});
+        }
+      }
+      if (!ranges.length) {terminal = false;break;}
+      fragments.push({...group, start_pc: Math.min(...ranges.map(r => r.start_pc)),
+        end_pc: Math.max(...ranges.map(r => r.end_pc)), ranges,
+        entry_pc: pc([...entries][0]), bodyPcs: new Set([...component].map(pc)),
+        sharedTerminalHandler: true});
+    }
+    result.push(...(terminal ? fragments : [group]));
+  }
+  return result;
+}
+
 /** Blocks reachable from the method entry over normal (non-exception) edges. */
 function reachableFrom(cfg) {
   const seen = new Array(cfg.n).fill(false);
@@ -842,8 +951,9 @@ function structureMethodImpl(codeItems, exceptionTable, opts = {}) {
 }
 
 function structureWithExceptions(codeItems, exceptionTable, methodCfg, render, opts = {}) {
-  const { groups } = normalizeTable(
+  const normalized = normalizeTable(
     exceptionTable, opts.syncHandlers || null, opts.isCatchAssignable || null);
+  const groups = partitionFragmentedGroups(normalized.groups, methodCfg, codeItems, opts.syncHandlers);
   // Innermost first, with later equal-size ranges processed first so a handler
   // cannot absorb an unstructured copy of finally cleanup as its continuation.
   const ordered = groups.slice().sort((a, b) =>
@@ -1026,7 +1136,7 @@ function processGroup(work, group, ctx, commit) {
   };
 
   // Boundaries must land on block leaders: the try entry and each handler entry.
-  let tryEntry = localOfStartPc(group.start_pc);
+  let tryEntry = localOfStartPc(group.entry_pc ?? group.start_pc);
   if (tryEntry < 0) {
     return new Bail(`try start ${group.start_pc} does not land on a block boundary (leaders: ${work.startPc.join(', ')})`);
   }
@@ -1081,7 +1191,7 @@ function processGroup(work, group, ctx, commit) {
     // can own several disjoint ranges (notably try-with-resources cleanup); the
     // gap between them may call close() and must not be caught by that same
     // cleanup handler or the resource is closed a second time.
-    const insideProtectedBody = isSynchronizedGroup
+    const insideProtectedBody = group.bodyPcs ? group.bodyPcs.has(work.startPc[i]) : isSynchronizedGroup
       ? inLogicalTryRange(work.startPc[i], group)
       : inAnyRange(work.startPc[i], group.ranges || []);
     if (reachable[i] && !dominatedByHandler && insideProtectedBody) tryset.add(i);
@@ -1342,7 +1452,15 @@ function processGroup(work, group, ctx, commit) {
   ctx.regionExitContracts.push({ owner: superId,
     exits: [...exitTargets].map(([sink, target]) => ({sink, target})), components,
     bindings: regionComponentBindings(tryNode, superId) });
-  commit(collapseRegion(work, region, superId, group.start_pc, exits, ctx));
+  // A later disconnected body still needs the same terminal handler. Its
+  // original blocks remain unreachable on normal method flow and are copied
+  // only into the catches, whose source-flow contracts remain independent.
+  const consumed = new Set(region);
+  if (group.sharedTerminalHandler) for (let i = 0; i < group.catches.length; i++) {
+    if (ctx.pendingGroups.some(next => next.catches.some(c => c.handler_pc === group.catches[i].handler_pc)))
+      for (const block of handlerSets[i]) consumed.delete(block);
+  }
+  commit(collapseRegion(work, consumed, superId, group.start_pc, exits, ctx));
   return undefined;
 }
 

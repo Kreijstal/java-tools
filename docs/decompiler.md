@@ -48,6 +48,34 @@ materialization, or exception-region reconstruction. Native original/rebuilt
 fixtures remain necessary at those boundaries. Protected regions also require
 their independent coverage, handler-priority and exit-contract checks.
 
+Fragmented protected ranges sharing a terminal catch can now become separate
+`try` regions automatically. The exception structurer partitions their normal
+flow into connected components, each with one actual external entry. An entry
+need not be the component's lowest bytecode address: a protected retry can
+precede a loop header reached initially through an unprotected throwing read.
+That read remains outside both reconstructed catches. Only nonthrowing gap
+blocks can join a component.
+
+Shared handlers must terminate, have no normal incoming edges, be acyclic and
+have no protected instructions. Synchronized methods and groups overlapping
+another protected group retain the existing reconstruction. Duplication is
+limited to 16 components, 256 extra handler blocks and 256 extra handler
+instructions, with tighter limits relative to the original method size.
+Every live throwing instruction must still have the original ordered catch
+signature. Each emitted try/catch retains its own source-flow and exit
+contracts; outer routing is verified after composition. A failed gate retains
+the existing fallback rather than widening a catch or dropping an edge.
+
+`test/cfrFragmentedTerminalCatch.test.js` checks independent catch contracts and
+refuses retrying/protected handlers. Its native fixture compares original JVM
+bytecode, rebuilt Java and an independent reference on 56 cases, including
+failures in the outside read, protected retries and uncaught fatal errors.
+Focused validation also covers monitor exits and overlapping catch priority:
+
+```sh
+NODE_PATH=/path/to/node_modules node --test --experimental-test-isolation=none test/cfrFragmentedTerminalCatch.test.js test/cfrExceptionLoopExits.test.js test/exceptionStructurer.test.js
+```
+
 Relevant algorithms are Ramsey's [Beyond Relooper](https://www.cs.tufts.edu/~nr/pubs/relooper.pdf)
 (2022), which explains dominator-based structuring and node splitting, and
 [CF-GKAT](https://arxiv.org/abs/2411.13220) (2025), which gives an automata-based
