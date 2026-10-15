@@ -19,14 +19,14 @@ test('declarations, lexical executables, protected suffixes, transfers and budge
  for(const source of ['F:{if(a){int value=0;if(g)break F;}work(value);}', 'F:{try{if(a){work();if(g)break F;}one();two();}finally{cleanup();}}','F:{if(a){work();if(g)break F;}one();two();}// comment\n','F:{if(a){work();if(g)break F;}one();two();}\\u000a','F:{if(a){work();if(g)break F;}one();two();}'+' '.repeat(400001)])assert.equal(fold(source).guardsRecovered,0);
 });
 test('normal emitter uses mixed statement recovery after earlier store and callback passes',()=>{
- const body=['F:{if(first()){before();if(guard())break F;}obj.x=read();after(obj.x);}'];finish(body);assert.equal(body[0],'if(first()){before();if (!(guard())) {obj.x=read();after(obj.x);}} else {obj.x=read();after(obj.x);}');
+ const body=['F:{if(first()){before();if(guard())break F;}obj.x=read();after(obj.x);}'];finish(body);assert.equal(body[0],'if(first()){before();if (!guard()) {obj.x=read();after(obj.x);}} else {obj.x=read();after(obj.x);}');
 });
 test('multiple recoveries keep one evaluation per original path without assuming stable predicates',()=>{
  let s='F:{if(a){if(b){work();if(g)break F;}one();if(h)break F;}two();three();}';let count=0;for(;;){const n=fold(s);if(!n.guardsRecovered)break;s=n.source;count++;}assert.equal(count,2);assert.ok(!s.includes('break F'));assert.equal(fold(s).guardsRecovered,0);
 });
 test('normal emission finishes an earlier shared exit after mixed continuations become exclusive',()=>{
  const body=['F:{if(a){if(skip())break F;before();if(guard())break F;}obj.x=read();after(obj.x);}'];finish(body);
- assert.equal(body[0],'if(a){if (!(skip())) {before();if (!(guard())) {obj.x=read();after(obj.x);}}} else {obj.x=read();after(obj.x);}');
+ assert.equal(body[0],'if (!a) {obj.x=read();after(obj.x);} else if (!skip()) {before();if (!guard()) {obj.x=read();after(obj.x);}}');
  assert.ok(!body[0].includes('break F'));
 });
 test('native mixed continuations preserve callbacks, nullable conditions, boxing, aliasing and abrupt completion',()=>{

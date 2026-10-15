@@ -30,6 +30,7 @@ const { foldSmallGuardedFallbacks: recoverSmallGuardedFallbacks } = require('./s
 const { foldSharedGuardedFallbacks: recoverSharedFallbacks } = require('./sharedGuardedFallbackRecovery');
 const { foldSharedStatementFallbacks: recoverSharedStatementFallbacks } = require('./sharedStatementFallbackRecovery');
 const {foldNestedIfConditions: recoverNestedIfConditions} = require('./nestedIfConditionRecovery');
+const {flattenElseIfChains: recoverElseIfChains} = require('./elseIfChainRecovery');
 const { foldTerminalFrameLoops: recoverTerminalFrameLoops } = require('./terminalFrameLoopRecovery');
 const { foldTerminalGuardedFrameExits: recoverTerminalGuardedFrames } = require('./terminalGuardedFrameRecovery');
 const {foldLoopFrameCompletion: recoverLoopFrameCompletion} = require('./loopFrameCompletionRecovery');
@@ -742,6 +743,11 @@ function simplifyComplementedRelations(source, options = {}) {
 function foldNestedIfConditions(source, options = {}) {
   try { return recoverNestedIfConditions(source, controlCleanupSource(source), options); }
   catch (error) { if (error instanceof RangeError) return {source, ifsMerged: 0}; throw error; }
+}
+
+function flattenElseIfChains(source, options = {}) {
+  try { return recoverElseIfChains(source, controlCleanupSource(source), options); }
+  catch (error) { if (error instanceof RangeError) return {source, blocksRemoved: 0, decisionsRotated: 0}; throw error; }
 }
 
 function foldConditionalStoreFallbacks(source, options = {}) {
@@ -3571,6 +3577,7 @@ module.exports = {
   foldArithmeticStoreFallbacks,
   foldConditionalStoreFallbacks,
   foldNestedIfConditions,
+  flattenElseIfChains,
   simplifyComplementedRelations,
   simplifyPredicateNegations,
   simplifyPredicateGrouping,

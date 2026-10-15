@@ -2,7 +2,7 @@
 
 const {foldGuardedLoopContinuations, foldNonrepeatingWhileLoops, foldTrailingLoopContinuations, foldLoopExitContinuations, foldTerminalLoopExits, foldNonlocalLoopExits, foldLoopElseExitGuards, foldTerminalLoopTails} = require('./javaAstEmitter');
 const {recoverScalarIfDispatches, simplifyPredicateNegations, simplifyDominatedPredicates, finalizeControlFrames, finalizeTerminalSwitchFrames, foldRedundantExitGuards, flattenStandaloneBlocks} = require('./javaAstEmitter');
-const {simplifyPredicateGrouping} = require('./javaAstEmitter');
+const {simplifyPredicateGrouping, flattenElseIfChains} = require('./javaAstEmitter');
 const {foldScalarSwitchPrefixes, foldBooleanLocalAssignments, foldNaturalLoopExits, foldGuardedLocalAssignments, foldStableGuardedFallbacks, foldNestedStableGuardedFallbacks, foldGuardedAssignmentSequences, simplifySelfCasts, foldSinglePassInnerLoops, foldSmallGuardedFallbacks, foldTerminalLoopFrames, foldGuardedStoreFallbacks, foldTerminalGuardedFrameExits, foldTerminalFrameLoops, foldSharedGuardedFallbacks, foldSharedStoreFallbacks, foldArithmeticStoreFallbacks, foldConditionalStoreFallbacks, foldNestedIfConditions, foldSharedStatementFallbacks, simplifyComplementedRelations} = require('./javaAstEmitter');
 
 const fs = require('fs');
@@ -2528,6 +2528,26 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
     const equality = simplifyNegatedEqualityValues(source);
     if (!equality.equalitiesSimplified) break;
     source = equality.source; changed = true;
+  }
+  // Finish decision structure after frame recovery. Intact leaf blocks retain
+  // their bindings and protected regions; subsequent predicate cleanup handles
+  // the complete negations introduced when an inverted decision is rotated.
+  {
+    let recovered = false;
+    for (;;) {
+      const chains = flattenElseIfChains(source);
+      if (!chains.blocksRemoved) break;
+      source = chains.source; changed = true; recovered = true;
+    }
+    if (recovered) {
+      for (;;) {
+        const predicates = simplifyPredicateNegations(source, {parameters, ownedFields,
+          complementIntegralRelations: false});
+        if (!predicates.predicatesSimplified) break;
+        source = predicates.source;
+      }
+      source = simplifyPredicateGrouping(source).source;
+    }
   }
   for (;;) {
     const value = simplifyPredicateNegations(source, {parameters, ownedFields,

@@ -8,7 +8,7 @@ test('maximal sole-if chains become ordered conjunctions while keeping the deepe
  const multiline='if(a) {\n  if(b) {\n    before();\n    work();\n  }\n}';assert.equal(fold(multiline).source,'if ((a) && (b)) {\n  before();\n  work();\n}');
 });
 test('normal emission merges a complete chain after prior control reconstruction',()=>{
- const body=['Frame:{if(first())break Frame;if(second())break Frame;work();}'];finish(body);assert.equal(body[0],'if ((!first()) && (!second())) {work();}');
+ const body=['Frame:{if(first())break Frame;if(second())break Frame;work();}'];finish(body);assert.equal(body.join('\n'),'if (!first() &&\n  !second()) {work();}');
 });
 test('conditions preserve identity, calls, assignments, arithmetic association and protected bodies',()=>{
  const source='if(a||read()){if((boxed==other)&&probe()){try{synchronized(lock){work();}}finally{cleanup();}}}';
