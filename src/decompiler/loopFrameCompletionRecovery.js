@@ -33,6 +33,24 @@ function foldLoopFrameCompletion(source, proof, {retainDiagnostics = false, rese
   }
   visit(parsed);
   if (refused || [...labelCounts.values()].some(n=>n!==1)) return unchanged();
+  // Candidate exits can share a large frame. Index occurrences once rather
+  // than rescanning every token for every local at every candidate exit.
+  const occurrences = new Map(), outputAssignmentHazards = new Map();
+  for (const token of tokens) {
+    if (token.kind !== 'identifier') continue;
+    if (!occurrences.has(token.text)) occurrences.set(token.text, []);
+    occurrences.get(token.text).push(token.range.startOffset);
+  }
+  function occursWithin(name, first, end = Infinity) {
+    const offsets = occurrences.get(name) || [];
+    let low = 0, high = offsets.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (offsets[middle] < first) low = middle + 1;
+      else high = middle;
+    }
+    return low < offsets.length && offsets[low] < end;
+  }
   const blockBounds = node => {
     const open=starts.get(node?.range?.startOffset),close=closes.get(open);
     return node?.kind==='BlockStatement' && tokens[open]?.text==='{' && tokens[close]?.text==='}' ? {open,close} : null;
@@ -49,13 +67,15 @@ function foldLoopFrameCompletion(source, proof, {retainDiagnostics = false, rese
     // Only an independently proved assignment before frame entry permits an
     // initially unassigned output to be consumed after the reconstructed frame.
     const frameEnd=tokens[frameBody.close].range.endOffset;
-    if([...uninitialized].some(name=>{
-      const locals=declarations.get(name)||[],declaration=locals.length===1?parents.get(locals[0]):null;
-      if(locals.length!==1||!(declaration?.range?.startOffset<frame.range.startOffset)||
-          priorLocalAssignment(frame,name,{parents,declarations,contexts,reservedNames}))return false;
-      return tokens.some(token=>token.kind==='identifier'&&token.text===name&&token.range.startOffset>frame.range.startOffset&&token.range.startOffset<frameEnd)&&
-        tokens.some(token=>token.kind==='identifier'&&token.text===name&&token.range.startOffset>=frameEnd);
-    }))continue;
+    if (!outputAssignmentHazards.has(frame)) {
+      outputAssignmentHazards.set(frame, [...uninitialized].some(name=>{
+        const locals=declarations.get(name)||[],declaration=locals.length===1?parents.get(locals[0]):null;
+        if(locals.length!==1||!(declaration?.range?.startOffset<frame.range.startOffset)||
+            priorLocalAssignment(frame,name,{parents,declarations,contexts,reservedNames}))return false;
+        return occursWithin(name, frame.range.startOffset + 1, frameEnd) && occursWithin(name, frameEnd);
+      }));
+    }
+    if (outputAssignmentHazards.get(frame)) continue;
     let cursor=parents.get(jump),loop=null,valid=true;
     while(cursor && cursor!==frame) {
       if(loops.has(cursor.kind)){loop=cursor;break;}

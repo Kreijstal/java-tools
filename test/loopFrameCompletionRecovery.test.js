@@ -2,6 +2,42 @@
 const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),os=require('node:os'),path=require('node:path'),{spawnSync}=require('node:child_process');
 const{foldLoopFrameCompletion:fold}=require('../src/decompiler/javaAstEmitter');
 
+test('shared refused exits inspect token occurrences with linear work', t => {
+ const {JavaParser}=require('../src/java-frontend/parser');
+ const {tokenizeJava}=require('../src/java-frontend/lexer');
+ const {foldLoopFrameCompletion:recover}=require('../src/decompiler/loopFrameCompletionRecovery');
+ function measure(size) {
+  const source=Array.from({length:size},(_,i)=>`int unused${i};`).join('')+
+   'Frame:{try{while(ready()){'+Array.from({length:size},(_,i)=>`if(stop${i}())break Frame;`).join('')+
+   '}}finally{cleanup();}tail();}';
+  const wrapped='{\n'+source+'\n',parsed=new JavaParser().parseStatement(wrapped,{requireComplete:true});
+  const lexical=tokenizeJava(wrapped).tokens.filter(t=>!['whitespace','eof'].includes(t.kind));
+  const starts=new Map(lexical.map((token,index)=>[token.range.startOffset,index]));
+  const closes=new Map(),stack=[],labelCounts=new Map();
+  lexical.forEach((token,index)=>{
+   if('([{'.includes(token.text))stack.push(index);
+   else if(')]}'.includes(token.text))closes.set(stack.pop(),index);
+  });
+  const children=(node,visit)=>{
+   for(const[key,child]of Object.entries(node)){
+    if(['range','meta','tokens','kind'].includes(key))continue;
+    if(Array.isArray(child))child.forEach(value=>value&&typeof value==='object'&&visit(value));
+    else if(child&&typeof child==='object')visit(child);
+   }
+  };
+  function inspect(node){if(node.kind==='LabeledStatement')labelCounts.set(node.label,(labelCounts.get(node.label)||0)+1);children(node,inspect);}
+  inspect(parsed);
+  let reads=0;
+  const tokens=lexical.map(token=>new Proxy(token,{get(target,key){reads++;return Reflect.get(target,key);}}));
+  const result=recover(source,{parsed,tokens,starts,closes,children,labelCounts});
+  assert.equal(result.exitsRecovered,0);assert.equal(result.source,source,'protected corridor remains refused');
+  return reads;
+ }
+ const small=measure(32),large=measure(64);
+ t.diagnostic(`token property reads for 32/64 locals and exits: ${small}/${large}`);
+ assert.ok(large<small*3,`doubling declarations and exits must not multiply token scans: ${small} -> ${large}`);
+});
+
 test('one loop exit guards the complete frame remainder without copying old expressions',()=>{
  const source='Frame:{if(active()){while(next()){before();if(stop())break Frame;after();}}snapshot();}outside();';const r=fold(source,{retainDiagnostics:true});assert.equal(r.exitsRecovered,1);assert.equal(r.labelsRemoved,1);assert.equal(r.guardsAdded,1);assert.ok(!r.source.includes('break Frame'));for(const name of ['active()','next()','before()','stop()','after()','snapshot()','outside()'])assert.equal(r.source.split(name).length-1,1,name);
  assert.match(r.source,/if \(decompiledFrameCompleted0\) \{snapshot\(\);\}/);assert.equal(source.slice(r.diagnostics.jumpRange.start,r.diagnostics.jumpRange.end),'break Frame;');
