@@ -1,5 +1,7 @@
 'use strict';
 
+const { buildCfg } = require('./splitArrayReachingLocal');
+
 function runSplitTypedAliasCopyLocals(astRoot, options = {}) {
   let rewrites = 0;
   for (const cls of astRoot.classes || []) {
@@ -19,12 +21,26 @@ function splitCode(code, options = {}) {
   const items = code.codeItems;
   if (items.length > (options.maxMethodItems || 10000)) return 0;
   const refs = labelReferencesWithSources(code);
-  const candidates = collectCandidates(code, refs, options);
+  let candidates = collectCandidates(code, refs, options);
   const maxCandidates = options.maxCandidates || 16;
   if (candidates.length === 0 || candidates.length > maxCandidates) return 0;
+  // Subroutines have return-address edges that buildCfg does not model.
+  if (items.some(item => /^(?:jsr|jsr_w|ret)$/.test(op(item) || ''))) return 0;
+  const labels = new Set(items.map(item => trimLabel(item && item.labelDef)).filter(Boolean));
+  if (items.some(item =>
+    (/^(?:table|lookup)switch$/.test(op(item) || '') && branchTargets(item).length === 0) ||
+    branchTargets(item).some(label => !labels.has(trimLabel(label))))) return 0;
+  const cfg = buildCfg(code, { instructionGranularity: true, targets: branchTargets });
+  candidates = candidates.filter(candidate =>
+    hasClosedLifetime(code, cfg, candidate.sourceStore, candidate.loads) &&
+    (!candidate.aliasStore || hasClosedLifetime(code, cfg, candidate.aliasStore, candidate.loads)));
 
   let rewrites = 0;
+  const claimed = new Set();
   for (const candidate of candidates) {
+    const changedItems = [candidate.sourceStore, candidate.aliasStore, ...candidate.loads].filter(Boolean);
+    if (changedItems.some(item => claimed.has(item))) continue;
+    for (const item of changedItems) claimed.add(item);
     const fresh = allocateLocal(code);
     candidate.sourceStore.instruction = storeRef(fresh);
     if (candidate.aliasStore) candidate.aliasStore.instruction = storeRef(fresh);
@@ -34,6 +50,36 @@ function splitCode(code, options = {}) {
     rewrites += 1;
   }
   return rewrites;
+}
+
+// Explore both states of one definition: it is either the current value of the
+// original slot, or it is not. A moved definition must reach exactly the loads
+// moved with it, including loads earlier in bytecode order through backedges.
+// Conversely, no other definition (or parameter value) may reach a moved load.
+// Instruction-sized blocks also keep exception edges before later overwrites;
+// a whole-block outgoing state would miss a handler reading the earlier value.
+function hasClosedLifetime(code, cfg, store, loads) {
+  const items = code.codeItems;
+  const local = astoreLocal(store);
+  const selected = new Set(loads.filter(item => aloadLocal(item) === local));
+  const visited = new Set();
+  const work = [[cfg.blocks[0].id, false]];
+  for (let cursor = 0; cursor < work.length; cursor += 1) {
+    const [id, current] = work[cursor];
+    const key = `${id}:${current}`;
+    if (visited.has(key)) continue;
+    visited.add(key);
+    const block = cfg.byId.get(id);
+    const item = items[block.start];
+    if (aloadLocal(item) === local && selected.has(item) !== current) return false;
+    const primitive = primitiveStoreLocal(item);
+    const wide = /^(?:l|d)store(?:_[0-3])?$/.test(op(item) || '');
+    const writes = astoreLocal(item) === local || primitive === local || iincLocal(item) === local ||
+      (wide && Number(primitive) + 1 === Number(local));
+    const next = writes ? item === store : current;
+    for (const successor of block.successors) work.push([successor, next]);
+  }
+  return true;
 }
 
 function collectCandidates(code, refs, options) {
@@ -296,7 +342,18 @@ function hasIncomingBranchFromOutside(items, refs, start, end) {
 function branchTargets(item) {
   const insn = item && item.instruction;
   if (!insn || typeof insn !== 'object') return [];
-  if (!insn.op || (!insn.op.startsWith('if') && insn.op !== 'goto' && insn.op !== 'jsr')) return [];
+  if (insn.op === 'lookupswitch') {
+    const value = insn.arg;
+    if (!value || !Array.isArray(value.pairs) || typeof value.defaultLabel !== 'string' ||
+        !value.pairs.every(pair => Array.isArray(pair) && typeof pair[1] === 'string')) return [];
+    return [value.defaultLabel, ...value.pairs.map(pair => pair[1])];
+  }
+  if (insn.op === 'tableswitch') {
+    if (!Array.isArray(insn.labels) || typeof insn.defaultLbl !== 'string' ||
+        !insn.labels.every(label => typeof label === 'string')) return [];
+    return [insn.defaultLbl, ...insn.labels];
+  }
+  if (!insn.op || (!insn.op.startsWith('if') && insn.op !== 'goto' && insn.op !== 'goto_w' && insn.op !== 'jsr')) return [];
   return typeof insn.arg === 'string' ? [insn.arg] : [];
 }
 

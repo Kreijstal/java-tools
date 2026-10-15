@@ -347,14 +347,15 @@ function transferBlock(block, startState, defAt, defs) {
   return state;
 }
 
-function buildCfg(code) {
+function buildCfg(code, { instructionGranularity = false, targets = branchTargets } = {}) {
   const items = code.codeItems;
   const labelToIndex = buildLabelIndex(items);
   const leaders = new Set([0]);
   for (let i = 0; i < items.length; i += 1) {
+    if (instructionGranularity) leaders.add(i);
     const itemOp = op(items[i]);
     if (!itemOp) continue;
-    for (const target of branchTargets(items[i])) {
+    for (const target of targets(items[i])) {
       const targetIndex = labelToIndex.get(trimLabel(target));
       if (targetIndex != null) leaders.add(targetIndex);
     }
@@ -393,7 +394,7 @@ function buildCfg(code) {
       continue;
     }
     const itemOp = op(items[last]);
-    for (const target of branchTargets(items[last])) {
+    for (const target of targets(items[last])) {
       const targetIndex = labelToIndex.get(trimLabel(target));
       addEdge(block, byId.get(indexToBlock.get(targetIndex)));
     }
