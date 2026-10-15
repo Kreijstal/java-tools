@@ -17,6 +17,7 @@ const {
 } = require('./structurer');
 const { structureMethod } = require('./exceptionStructurer');
 const { mergeDuplicateLoopIncrementTails } = require('./loopTailMerge');
+const {recoverPreloadedLoopEntries} = require('./preloadedLoopEntryRecovery');
 const {removeUnreachableControlTransfers} = require('./unreachableTransferCleanup');
 const { partitionStructuredVoidBody } = require('./structuredMethodPartition');
 const {splitPrimitiveLocalLifetimes, splitNestedPrimitiveLocalLifetimes, splitReferenceLocalLifetimes, splitNestedReferenceLocalLifetimes, splitInitializedPrimitiveLocalLifetimes, splitNestedInitializedPrimitiveLocalLifetimes, splitArrayDimensionPrimitiveLocalLifetimes} = require('./primitiveLocalLifetimeRecovery');
@@ -1208,6 +1209,9 @@ function formatMethod(cls, method, options = {}) {
   const params = descriptor.params || [];
   const returnType = descriptor.returnType || 'void';
   const code = getCode(method);
+  // Normalize duplicated local producers before local/stack analysis. This
+  // uses incoming-edge proofs, not external class, method or offset selectors.
+  recoverPreloadedLoopEntries(code);
   let localState = makeLocalState(params.map(simplifyType), isStatic, code, null,
     options.exceptionModel, options);
 
