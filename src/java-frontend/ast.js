@@ -165,6 +165,41 @@ function assertKnownKind(kind) {
   }
 }
 
+// Only the parser can construct through this private ownership context. Public
+// factories retain their defensive copies; parser results are detached once at
+// the API boundary instead of recopying every completed expression prefix.
+const parserFactories = new WeakMap();
+
+function cleanOwnedFields(value, owned) {
+  if (owned.has(value)) return value;
+  if (Array.isArray(value)) return value.map(child => cleanOwnedFields(child, owned));
+  if (!isPlainObject(value)) return value;
+  const out = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (child !== undefined) out[key] = cleanOwnedFields(child, owned);
+  }
+  return out;
+}
+
+function detachParsedTree(value) {
+  const container = item => Array.isArray(item) ? new Array(item.length) : isPlainObject(item) ? {} : item;
+  const root = container(value);
+  if (root === value) return value;
+  const work = [[value, root]];
+  while (work.length) {
+    const [input, output] = work.pop();
+    const entries = Array.isArray(input)
+      ? Array.from({length: input.length}, (_, index) => index).filter(index => index in input).map(index => [index, input[index]])
+      : Object.entries(input).filter(([, child]) => child !== undefined);
+    for (const [key, child] of entries) {
+      const copy = container(child);
+      output[key] = copy;
+      if (copy !== child) work.push([child, copy]);
+    }
+  }
+  return root;
+}
+
 function createNode(kind, fields = {}, meta = undefined) {
   assertKnownKind(kind);
   if (!isPlainObject(fields)) {
@@ -174,13 +209,16 @@ function createNode(kind, fields = {}, meta = undefined) {
     throw new TypeError('AST node fields must not contain a kind property');
   }
 
-  const node = { kind, ...omitUndefined(fields) };
+  const owned = parserFactories.get(this);
+  const clean = owned ? value => cleanOwnedFields(value, owned) : omitUndefined;
+  const node = { kind, ...clean(fields) };
   if (typeof meta !== 'undefined') {
     if (!isPlainObject(meta)) {
       throw new TypeError('AST node metadata must be a plain object');
     }
-    node.meta = omitUndefined(meta);
+    node.meta = clean(meta);
   }
+  if (owned) owned.add(node);
   return node;
 }
 
@@ -217,7 +255,7 @@ function isAstDocument(value) {
 }
 
 function range(startOffset, endOffset, start = null, end = null) {
-  return createNode('SourceRange', {
+  return createNode.call(this, 'SourceRange', {
     startOffset,
     endOffset,
     start,
@@ -226,7 +264,7 @@ function range(startOffset, endOffset, start = null, end = null) {
 }
 
 function diagnostic(code, message, severity = 'error', sourceRange = null) {
-  return createNode('Diagnostic', {
+  return createNode.call(this, 'Diagnostic', {
     code,
     message,
     severity,
@@ -235,11 +273,11 @@ function diagnostic(code, message, severity = 'error', sourceRange = null) {
 }
 
 function modifier(name) {
-  return createNode('Modifier', { name });
+  return createNode.call(this, 'Modifier', { name });
 }
 
 function unsupportedNode(fields = {}) {
-  return createNode('UnsupportedNode', {
+  return createNode.call(this, 'UnsupportedNode', {
     reason: fields.reason || null,
     phase: fields.phase || null,
     feature: fields.feature || null,
@@ -250,7 +288,7 @@ function unsupportedNode(fields = {}) {
 }
 
 function compilationUnit(fields = {}) {
-  return createNode('CompilationUnit', {
+  return createNode.call(this, 'CompilationUnit', {
     packageDeclaration: fields.packageDeclaration || null,
     imports: fields.imports || [],
     typeDeclarations: fields.typeDeclarations || [],
@@ -259,11 +297,11 @@ function compilationUnit(fields = {}) {
 }
 
 function packageDeclaration(name, annotations = []) {
-  return createNode('PackageDeclaration', { name, annotations });
+  return createNode.call(this, 'PackageDeclaration', { name, annotations });
 }
 
 function importDeclaration(name, fields = {}) {
-  return createNode('ImportDeclaration', {
+  return createNode.call(this, 'ImportDeclaration', {
     name,
     isStatic: Boolean(fields.isStatic),
     isWildcard: Boolean(fields.isWildcard),
@@ -271,7 +309,7 @@ function importDeclaration(name, fields = {}) {
 }
 
 function classDeclaration(name, fields = {}) {
-  return createNode('ClassDeclaration', {
+  return createNode.call(this, 'ClassDeclaration', {
     name,
     modifiers: fields.modifiers || [],
     annotations: fields.annotations || [],
@@ -287,7 +325,7 @@ function classDeclaration(name, fields = {}) {
 }
 
 function interfaceDeclaration(name, fields = {}) {
-  return createNode('InterfaceDeclaration', {
+  return createNode.call(this, 'InterfaceDeclaration', {
     name,
     modifiers: fields.modifiers || [],
     annotations: fields.annotations || [],
@@ -299,7 +337,7 @@ function interfaceDeclaration(name, fields = {}) {
 }
 
 function enumDeclaration(name, fields = {}) {
-  return createNode('EnumDeclaration', {
+  return createNode.call(this, 'EnumDeclaration', {
     name,
     modifiers: fields.modifiers || [],
     annotations: fields.annotations || [],
@@ -310,7 +348,7 @@ function enumDeclaration(name, fields = {}) {
 }
 
 function recordDeclaration(name, fields = {}) {
-  return createNode('RecordDeclaration', {
+  return createNode.call(this, 'RecordDeclaration', {
     name,
     modifiers: fields.modifiers || [],
     annotations: fields.annotations || [],
@@ -322,7 +360,7 @@ function recordDeclaration(name, fields = {}) {
 }
 
 function fieldDeclaration(fieldType, declarators, fields = {}) {
-  return createNode('FieldDeclaration', {
+  return createNode.call(this, 'FieldDeclaration', {
     modifiers: fields.modifiers || [],
     annotations: fields.annotations || [],
     fieldType,
@@ -331,7 +369,7 @@ function fieldDeclaration(fieldType, declarators, fields = {}) {
 }
 
 function variableDeclarator(name, fields = {}) {
-  return createNode('VariableDeclarator', {
+  return createNode.call(this, 'VariableDeclarator', {
     name,
     dimensions: fields.dimensions || 0,
     initializer: fields.initializer || null,
@@ -339,7 +377,7 @@ function variableDeclarator(name, fields = {}) {
 }
 
 function methodDeclaration(name, returnType, fields = {}) {
-  return createNode('MethodDeclaration', {
+  return createNode.call(this, 'MethodDeclaration', {
     name,
     modifiers: fields.modifiers || [],
     annotations: fields.annotations || [],
@@ -353,7 +391,7 @@ function methodDeclaration(name, returnType, fields = {}) {
 }
 
 function constructorDeclaration(name, fields = {}) {
-  return createNode('ConstructorDeclaration', {
+  return createNode.call(this, 'ConstructorDeclaration', {
     name,
     modifiers: fields.modifiers || [],
     annotations: fields.annotations || [],
@@ -366,7 +404,7 @@ function constructorDeclaration(name, fields = {}) {
 }
 
 function formalParameter(name, parameterType, fields = {}) {
-  return createNode('FormalParameter', {
+  return createNode.call(this, 'FormalParameter', {
     name,
     parameterType,
     modifiers: fields.modifiers || [],
@@ -376,15 +414,15 @@ function formalParameter(name, parameterType, fields = {}) {
 }
 
 function primitiveType(name, annotations = []) {
-  return createNode('PrimitiveType', { name, annotations });
+  return createNode.call(this, 'PrimitiveType', { name, annotations });
 }
 
 function voidType(annotations = []) {
-  return createNode('VoidType', { annotations });
+  return createNode.call(this, 'VoidType', { annotations });
 }
 
 function classType(name, fields = {}) {
-  return createNode('ClassType', {
+  return createNode.call(this, 'ClassType', {
     name,
     packageName: fields.packageName || null,
     enclosingType: fields.enclosingType || null,
@@ -394,11 +432,11 @@ function classType(name, fields = {}) {
 }
 
 function arrayType(componentType, dimensions = 1, annotations = []) {
-  return createNode('ArrayType', { componentType, dimensions, annotations });
+  return createNode.call(this, 'ArrayType', { componentType, dimensions, annotations });
 }
 
 function typeVariable(name, fields = {}) {
-  return createNode('TypeVariable', {
+  return createNode.call(this, 'TypeVariable', {
     name,
     bounds: fields.bounds || [],
     annotations: fields.annotations || [],
@@ -406,7 +444,7 @@ function typeVariable(name, fields = {}) {
 }
 
 function wildcardType(fields = {}) {
-  return createNode('WildcardType', {
+  return createNode.call(this, 'WildcardType', {
     boundKind: fields.boundKind || null,
     boundType: fields.boundType || null,
     annotations: fields.annotations || [],
@@ -414,35 +452,35 @@ function wildcardType(fields = {}) {
 }
 
 function blockStatement(statements = []) {
-  return createNode('BlockStatement', { statements });
+  return createNode.call(this, 'BlockStatement', { statements });
 }
 
 function returnStatement(expression = null) {
-  return createNode('ReturnStatement', { expression });
+  return createNode.call(this, 'ReturnStatement', { expression });
 }
 
 function expressionStatement(expression) {
-  return createNode('ExpressionStatement', { expression });
+  return createNode.call(this, 'ExpressionStatement', { expression });
 }
 
 function identifier(name) {
-  return createNode('Identifier', { name });
+  return createNode.call(this, 'Identifier', { name });
 }
 
 function qualifiedName(parts) {
-  return createNode('QualifiedName', { parts });
+  return createNode.call(this, 'QualifiedName', { parts });
 }
 
 function literalExpression(value, literalKind, raw = null) {
-  return createNode('LiteralExpression', { value, literalKind, raw });
+  return createNode.call(this, 'LiteralExpression', { value, literalKind, raw });
 }
 
 function binaryExpression(operator, left, right) {
-  return createNode('BinaryExpression', { operator, left, right });
+  return createNode.call(this, 'BinaryExpression', { operator, left, right });
 }
 
 function methodInvocationExpression(fields = {}) {
-  return createNode('MethodInvocationExpression', {
+  return createNode.call(this, 'MethodInvocationExpression', {
     target: fields.target || null,
     typeArguments: fields.typeArguments || [],
     name: fields.name,
@@ -490,3 +528,11 @@ module.exports = {
   binaryExpression,
   methodInvocationExpression,
 };
+
+// Non-enumerable so the public frontend's AST factory exports stay unchanged.
+Object.defineProperty(module.exports, '_createParserFactory', {value() {
+  const factory = {...module.exports};
+  parserFactories.set(factory, new WeakSet());
+  Object.defineProperty(factory, '_finishTree', {value: detachParsedTree});
+  return factory;
+}});

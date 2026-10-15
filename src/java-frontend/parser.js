@@ -1,6 +1,6 @@
 'use strict';
 
-const ast = require('./ast');
+const ast = require('./ast')._createParserFactory();
 const { tokenizeJava, translateUnicodeEscapes } = require('./lexer');
 const { NotImplementedJavaFrontendError } = require('./errors');
 
@@ -1959,7 +1959,9 @@ function parseCompilationUnit(source, options = {}) {
     throw new TypeError('Java source must be a string');
   }
   const parser = new ParserImpl(source, options);
-  return parser.parseDocument();
+  const document = parser.parseDocument();
+  document.root = ast._finishTree(document.root);
+  return document;
 }
 
 function parseJava(source, options = {}) {
@@ -1977,42 +1979,42 @@ class JavaParser {
 
   parsePackageDeclaration(source, options = {}) {
     const parser = new ParserImpl(source, { ...this.options, ...options });
-    return parser.parsePackageDeclaration();
+    return ast._finishTree(parser.parsePackageDeclaration());
   }
 
   parseImportDeclaration(source, options = {}) {
     const parser = new ParserImpl(source, { ...this.options, ...options });
-    return parser.parseImportDeclaration();
+    return ast._finishTree(parser.parseImportDeclaration());
   }
 
   parseTypeDeclaration(source, options = {}) {
     const parser = new ParserImpl(source, { ...this.options, ...options });
     const prefix = parser.parseModifiersAndAnnotations();
-    return parser.parseTypeDeclaration(prefix);
+    return ast._finishTree(parser.parseTypeDeclaration(prefix));
   }
 
   parseClassDeclaration(source, options = {}) {
     const parser = new ParserImpl(source, { ...this.options, ...options });
     const prefix = parser.parseModifiersAndAnnotations();
-    return parser.parseClassDeclaration(prefix);
+    return ast._finishTree(parser.parseClassDeclaration(prefix));
   }
 
   parseInterfaceDeclaration(source, options = {}) {
     const parser = new ParserImpl(source, { ...this.options, ...options });
     const prefix = parser.parseModifiersAndAnnotations();
-    return parser.parseInterfaceDeclaration(prefix);
+    return ast._finishTree(parser.parseInterfaceDeclaration(prefix));
   }
 
   parseEnumDeclaration(source, options = {}) {
     const parser = new ParserImpl(source, { ...this.options, ...options });
     const prefix = parser.parseModifiersAndAnnotations();
-    return parser.parseEnumDeclaration(prefix);
+    return ast._finishTree(parser.parseEnumDeclaration(prefix));
   }
 
   parseRecordDeclaration(source, options = {}) {
     const parser = new ParserImpl(source, { ...this.options, ...options });
     const prefix = parser.parseModifiersAndAnnotations();
-    return parser.parseRecordDeclaration(prefix);
+    return ast._finishTree(parser.parseRecordDeclaration(prefix));
   }
 
   parseMethodDeclaration() {
@@ -2029,22 +2031,22 @@ class JavaParser {
     if (options.requireComplete && !parser.eof) {
       throw new SyntaxError('trailing tokens after Java statement');
     }
-    return statement;
+    return ast._finishTree(statement);
   }
 
   parseExpression(source, options = {}) {
     const parser = new ParserImpl(source, { ...this.options, ...options });
-    return parser.unsupportedExpression(parser.tokens);
+    return ast._finishTree(parser.unsupportedExpression(parser.tokens));
   }
 
   parseType(source, options = {}) {
     const parser = new ParserImpl(source, { ...this.options, ...options });
-    return parser.typeFromTokens(parser.tokens);
+    return ast._finishTree(parser.typeFromTokens(parser.tokens));
   }
 
   parseAnnotation(source, options = {}) {
     const parser = new ParserImpl(source, { ...this.options, ...options });
-    return parser.parseAnnotation();
+    return ast._finishTree(parser.parseAnnotation());
   }
 
   parseModuleDeclaration() {
