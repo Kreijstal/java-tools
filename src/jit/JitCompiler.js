@@ -12150,17 +12150,23 @@ class JitCompiler {
     const classData = this.jvm.classes[className];
     if (!classData) return null;
     const method = this.jvm.findMethod(classData, methodName, descriptor);
-    if (!method || !(method.flags || []).includes("static")) return null;
+    if (!method || !(method.flags || []).includes("static") ||
+        (method.flags || []).some(flag =>
+          ["synchronized", "native", "abstract"].includes(flag))) return null;
+    // The structured emitter guards an uninitialized owner at the original
+    // invoke PC. Preparation may therefore plan the intrinsic without running
+    // <clinit>; after initialization the same body avoids canonical call frames.
+    if (!classInitialized &&
+        this.jvm.findClassNameForMethod(method) !== className) return null;
     let parsed;
     try { parsed = parseDescriptor(descriptor); } catch (_) { return null; }
     const intrinsic = this.getSynchronousIntrinsic(method, descriptor);
     if (!intrinsic?.jvmDirectKind) return null;
-    if (!classInitialized) return null;
     return {
       kind: intrinsic.jvmDirectKind,
       paramCount: parsed.params.length,
       returnsVoid: parsed.returnType === "void",
-      initializationOwner: null,
+      requiresInitializationGuard: !classInitialized,
     };
   }
 

@@ -1706,6 +1706,8 @@ class JvmSsaBlockRenderer {
         if (inline?.className) directStaticOwners.add(inline.className);
         const directIntrinsic = directJre || !isStatic || inline
           ? null : this.jit.getCompileTimeSynchronousIntrinsic(instruction);
+        const intrinsicInitializationSite = directIntrinsic?.requiresInitializationGuard
+          ? this.jit.registerSyncCallSite(op, instruction, method, index) : null;
         const directCheckedLeaf = directJre || !isStatic || inline ||
           directIntrinsic ? null :
           this.jit.getCompileTimeCheckedLeaf(instruction, method);
@@ -1742,6 +1744,7 @@ class JvmSsaBlockRenderer {
           inline,
           inlineInitializationSite,
           directIntrinsic,
+          intrinsicInitializationSite,
           directCheckedLeaf,
           checkedLeafCaptureCacheId,
           selfRecursive,
@@ -6273,6 +6276,13 @@ class JvmSsaBlockRenderer {
           } else if (site.directIntrinsic?.kind === "primitiveArrayCopy" &&
               site.directIntrinsic.paramCount === 5 && site.directIntrinsic.returnsVoid) {
             const callStack = [...stack];
+            if (site.intrinsicInitializationSite !== null && site.intrinsicInitializationSite !== undefined) {
+              lines.push(st`if (!${capturedSyncCallSite(site.intrinsicInitializationSite)}.initializationToken.initialized) {`,
+                ...materializeLines(callStack, index).map(line => `  ${line}`),
+                st`  helpers.skipJitOnce(frame);`,
+                returnStmt("  ", e`{ deopt: true, transient: true, reason: 'cold structured intrinsic' }`),
+                blockEnd(""));
+            }
             const args = new Array(5);
             for (let argument = args.length - 1; argument >= 0; argument -= 1) {
               args[argument] = pop();
