@@ -6,6 +6,42 @@ const Frame = require('../src/core/frame');
 const Stack = require('../src/core/stack');
 const compileFixture = makeJavaFixtureCompiler('adaptive-partition-');
 
+test('adaptive entries partition without an enable flag', async t => {
+  const operations=Array.from({length:40},(_,k)=>`s=child(s)+${k};`).join('\n');
+  const classpath=compileFixture(t,'DefaultPartition',`public class DefaultPartition {
+    static int seen;
+    public static int child(int s) {seen++;return s+1;}
+    public static int run(int n,int s) { for(int i=0;i<n;i++){${operations}} return s; }
+  }`);
+  // Lower generic size budgets keep the fixture compact; no feature opt-in.
+  const jvm=new JVM({classpath,jit:{compileWorker:false,structuredSsa:true,
+    ordinaryAdaptiveFramelessPositional:true,compiledCallChains:true,
+    structuredLinearPartitionUnitBytes:16384,structuredLinearPartitionSegmentBytes:4096,
+    structuredLinearPartitionMinimumSegmentBytes:1024}});
+  await jvm.loadClassByName('DefaultPartition');
+  jvm._setClassInitializationState('DefaultPartition','INITIALIZED');
+  const child=await jvm.findMethodInHierarchy('DefaultPartition','child','(I)I');
+  jvm.jit.codegenCache.set(child,jvm.jit.structuredSsa.compile(child));
+  const method=await jvm.findMethodInHierarchy('DefaultPartition','run','(II)I');
+  jvm.jit.preparedCodegenMethods.add(method);
+  const generated=jvm.jit.structuredSsa.compile(method);
+  t.ok(generated?.jvmAdaptivePartitionedSegmentCount>0,`default body actually partitions (${
+    generated?.jvmAdaptiveGeneratedBody?.toString().length} source chars)`);
+  if(!generated){t.end();return;}
+  const restored=jvm.jit.materializeGeneratedResult(jvm.jit.serializeGeneratedResult(generated),method);
+  t.ok(restored,'default partition transports');
+  for(const body of [generated,restored]){
+    jvm.classes.DefaultPartition.staticFields.set('seen:I',0);
+    const frame=new Frame(method);frame.className='DefaultPartition';frame.locals.splice(0,2,2,17);
+    const thread={status:'runnable',callStack:new Stack()};thread.callStack.push(frame);
+    jvm._nextEventLoopYieldAt=Infinity;
+    t.equal(body(frame,thread,jvm.jit,false).value,1657,'default partition preserves result');
+    t.equal(jvm.classes.DefaultPartition.staticFields.get('seen:I'),80,'all child effects occur once');
+    t.equal(thread.callStack.size(),0,'default partition retires canonical frame');
+  }
+  t.end();
+});
+
 for (const [explicitFrameSpills, sharedMaterializer] of [[false,false],[true,false],[false,true]]) test(`partitioned adaptive entries preserve execution and worker transport (explicit spills ${explicitFrameSpills}, shared materializer ${sharedMaterializer})`, async t => {
   const operations = Array.from({length: 80}, (_, k) =>
     `s = (s * 31) ^ a[(i + ${k}) & 7];`).join('\n');

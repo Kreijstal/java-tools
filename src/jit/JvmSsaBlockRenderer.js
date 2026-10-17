@@ -747,15 +747,18 @@ class JvmSsaBlockRenderer {
     this.perLoopPollBudgetsEnabled =
       options.structuredPerLoopPollBudgets === true ||
       environment.JVM_ENABLE_STRUCTURED_PER_LOOP_POLL_BUDGETS === "1";
+    // Bound proven straight-line optimization units automatically. Large
+    // unsplit adaptive bodies can otherwise stay in the host baseline tier.
+    // The partitioner refuses opaque/unsafe boundaries and retains their body.
     this.linearPartitionEnabled =
-      options.structuredLinearPartition === true ||
+      options.structuredLinearPartition !== false ||
       environment.JVM_ENABLE_STRUCTURED_LINEAR_PARTITION === "1";
     this.linearPartitionUnitBytes = Math.max(16384, Math.min(262144,
       Number(options.structuredLinearPartitionUnitBytes ??
-        environment.JVM_STRUCTURED_LINEAR_PARTITION_UNIT_BYTES) || 49152));
+        environment.JVM_STRUCTURED_LINEAR_PARTITION_UNIT_BYTES) || 98304));
     this.linearPartitionSegmentBytes = Math.max(4096, Math.min(131072,
       Number(options.structuredLinearPartitionSegmentBytes ??
-        environment.JVM_STRUCTURED_LINEAR_PARTITION_SEGMENT_BYTES) || 32768));
+        environment.JVM_STRUCTURED_LINEAR_PARTITION_SEGMENT_BYTES) || 49152));
     this.linearPartitionMinimumSegmentBytes = Math.max(1024, Math.min(32768,
       Number(options.structuredLinearPartitionMinimumSegmentBytes ??
         environment.JVM_STRUCTURED_LINEAR_PARTITION_MINIMUM_SEGMENT_BYTES) ||
