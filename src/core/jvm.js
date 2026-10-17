@@ -1458,7 +1458,7 @@ class JVM {
           this.jit.codegenCache.get(left.method)
             ?.jvmStructuredGuardedBooleanSiteCount)));
       }
-      return applyPreparationPolicy(methods, preparationPolicy);
+      return applyPreparationPolicy(methods, preparationPolicy, this.classes);
     };
     let methods = collect();
     let completed = 0;

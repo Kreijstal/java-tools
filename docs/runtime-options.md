@@ -7,6 +7,17 @@
 profile selection and source/patch identity checks. The JVM applies the ordered
 list and limit without game-specific knowledge.
 
+`entryMethods` optionally selects a preparation scope before applying priorities
+and limits. Supply exact entry identities; unknown entries are errors. Selection
+follows bytecode calls, active class uses and class initializer dependencies,
+including virtual/interface implementations on types allocated by reachable
+code. Later-discovered allocations revisit earlier virtual sites. Selection does
+not execute class initializers or delete bytecode. It is a preparation scope,
+not a whole-program reachability proof: native callbacks, reflective/dynamic
+targets and classes loaded later can reach methods outside it. Those methods
+retain normal execution fallbacks; inspect runtime compilation counters when
+assessing coverage. Omitting `entryMethods` preserves full preparation.
+
 `wasmLoopsOnly` defaults to `true`. Set it to `false` to include selected
 methods without loops in Wasm preparation, using the callee compilation
 protocol. This lets a measured dependency list prepare small helpers that keep
