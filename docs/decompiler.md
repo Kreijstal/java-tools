@@ -76,6 +76,19 @@ Focused validation also covers monitor exits and overlapping catch priority:
 NODE_PATH=/path/to/node_modules node --test --experimental-test-isolation=none test/cfrFragmentedTerminalCatch.test.js test/cfrExceptionLoopExits.test.js test/exceptionStructurer.test.js
 ```
 
+Exception normalization also removes fully shadowed handler/type cases before
+nesting regions. Every catch alternative must be covered by earlier compatible
+catches over its complete range set. With authoritative instruction PCs, gaps
+containing only nonthrowing glue are harmless; unknown ancestry or potentially
+throwing gaps retain the catch. A partly live case keeps all its original ranges
+so removing a shadowed fragment cannot reverse nesting order. Monitor-handler
+rows stay under monitor lowering's ownership. The final priority check compares
+observable first-match routing against the original table, and the independent
+region-flow and exit contracts remain mandatory. Native loop-exit fixtures
+exercise default reconstruction and the retained dispatcher; fragmented-catch
+fixtures add 5,000 original/recompiled scenario comparisons covering early
+returns, throwing cleanup, failures outside the catches and throwable identity.
+
 Relevant algorithms are Ramsey's [Beyond Relooper](https://www.cs.tufts.edu/~nr/pubs/relooper.pdf)
 (2022), which explains dominator-based structuring and node splitting, and
 [CF-GKAT](https://arxiv.org/abs/2411.13220) (2025), which gives an automata-based

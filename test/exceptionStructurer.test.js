@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { structureMethod, verifyRegionExitContracts, verifyRegionFlowContracts } = require('../src/decompiler/exceptionStructurer');
+const { structureMethod, normalizeTable, verifyRegionExitContracts, verifyRegionFlowContracts } = require('../src/decompiler/exceptionStructurer');
 const { printTree } = require('../src/decompiler/structurer');
 const {verifyStructuredFlow} = require('../src/decompiler/structuredFlowVerifier');
 
@@ -117,21 +117,28 @@ test('shadowed sibling catches cannot gain coverage over an earlier handler', ()
     {start_pc: 0, end_pc: 3, handler_pc: 13, catch_type: 'java/lang/IllegalArgumentException'},
   ];
   const result = structureMethod(code, table);
-  assert.equal(result.ok, false);
-  assert.match(result.reason, /shadowed sibling catch/);
+  assert.equal(result.ok, true, result.reason);
+  assert.equal(verifyRegionFlowContracts(result.tree, result.regionExitContracts), true);
+  assert.doesNotMatch(printTree(result.tree, result.render), /narrow|IllegalArgumentException/);
   for (const [first, second, options] of [
     ['any', 'ApplicationFailure', {}],
-    ['java/lang/RuntimeException', ['java/io/IOException', 'java/lang/IllegalArgumentException'], {}],
     ['ApplicationFailure', 'SpecificFailure', {
       isCatchAssignable: (subtype, supertype) => subtype === supertype ||
         subtype === 'SpecificFailure' && supertype === 'ApplicationFailure',
     }],
   ]) {
     const priority = table.map((row, index) => ({...row, catch_type: index ? second : first}));
-    const declined = structureMethod(code, priority, options);
-    assert.equal(declined.ok, false);
-    assert.match(declined.reason, /shadowed sibling catch/);
+    const recovered = structureMethod(code, priority, options);
+    assert.equal(recovered.ok, true, recovered.reason);
+    assert.equal(recovered.regionExitContracts[0].components.length, 2,
+      'only the protected body and the reachable handler survive');
   }
+  // A partially shadowed multi-catch still has a reachable alternative. Keep
+  // the existing refusal rather than dropping that handler or widening it.
+  const partial = structureMethod(code, [table[0], {...table[1],
+    catch_type: ['java/io/IOException', 'java/lang/IllegalArgumentException']}]);
+  assert.equal(partial.ok, false);
+  assert.match(partial.reason, /shadowed sibling catch/);
   // Specific-before-supertype priority is expressible without widening either
   // handler's coverage. Genuine enclosing catches have different range sets.
   [table[0].catch_type, table[1].catch_type] = [table[1].catch_type, table[0].catch_type];
@@ -153,12 +160,69 @@ test('nested range size cannot override the original exception-table priority', 
   ];
   const outer = {start_pc: 0, end_pc: 13, handler_pc: 13, catch_type: 'java/lang/RuntimeException'};
   const inner = {start_pc: 0, end_pc: 3, handler_pc: 6, catch_type: 'java/lang/IllegalArgumentException'};
-  const declined = structureMethod(code, [outer, inner]);
+  const recovered = structureMethod(code, [outer, inner]);
+  assert.equal(recovered.ok, true, recovered.reason);
+  assert.doesNotMatch(printTree(recovered.tree, recovered.render), /IllegalArgumentException/);
+  // Unknown ancestry cannot justify eliminating a reachable inner catch.
+  const declined = structureMethod(code, [outer, {...inner, catch_type: 'ApplicationFailure'}]);
   assert.equal(declined.ok, false);
   assert.match(declined.reason, /exception-table priority or coverage changes at throwing pc 0/);
   const safe = structureMethod(code, [inner, outer]);
   assert.equal(safe.ok, true, safe.reason);
   assert.equal(verifyRegionFlowContracts(safe.tree, safe.regionExitContracts), true);
+});
+
+test('shadow coverage is the union of earlier ranges for every caught type', () => {
+  const row = (start, end, handler, type) =>
+    ({start_pc: start, end_pc: end, handler_pc: handler, catch_type: type});
+  // Independent four-cell coverage oracle: a single missing cell must keep
+  // the later catch. Adjacent earlier rows may jointly cover its whole body.
+  for (const [earlier, later, subsumed] of [
+    ['java/lang/Exception', 'java/lang/RuntimeException', true],
+    ['java/lang/RuntimeException', 'java/lang/IllegalArgumentException', true],
+    ['any', 'UnknownFailure', true],
+    ['java/lang/RuntimeException', 'java/io/IOException', false],
+    ['UnknownFailure', 'OtherFailure', false],
+    ['java/lang/Exception', ['java/lang/RuntimeException', 'java/lang/Error'], false],
+  ]) for (let mask = 0; mask < 16; mask++) {
+    const table = [];
+    for (let pc = 0; pc < 4; pc++) if (mask & (1 << pc))
+      table.push(row(pc, pc + 1, 10, earlier));
+    table.push(row(0, 4, 20, later));
+    const before = JSON.stringify(table);
+    const {groups} = normalizeTable(table);
+    assert.equal(groups.some(group => group.catches.some(item => item.handler_pc === 20)),
+      !(subsumed && mask === 15), JSON.stringify({earlier, later, mask}));
+    assert.equal(JSON.stringify(table), before, 'normalization does not mutate input rows');
+  }
+});
+
+test('a partly live catch retains its complete range set and monitor ownership', () => {
+  const table = [
+    {start_pc: 0, end_pc: 4, handler_pc: 10, catch_type: 'java/lang/Exception'},
+    {start_pc: 0, end_pc: 4, handler_pc: 20, catch_type: 'java/lang/RuntimeException'},
+    {start_pc: 10, end_pc: 14, handler_pc: 20, catch_type: 'java/lang/RuntimeException'},
+  ];
+  const {groups} = normalizeTable(table);
+  assert.deepEqual(groups.find(group => group.catches[0].handler_pc === 20).ranges,
+    [{start_pc: 0, end_pc: 4}, {start_pc: 10, end_pc: 14}]);
+  const shadowed = table.slice(0, 2);
+  assert.equal(normalizeTable(shadowed).groups.length, 1);
+  assert.equal(normalizeTable(shadowed, new Map([[10, {}]])).groups.length, 2,
+    'monitor lowering retains ownership of its original catch rows');
+});
+
+test('uncovered nonthrowing glue requires authoritative instruction PCs', () => {
+  const table = [
+    {start_pc: 0, end_pc: 2, handler_pc: 10, catch_type: 'java/lang/Exception'},
+    {start_pc: 0, end_pc: 4, handler_pc: 20, catch_type: 'java/lang/RuntimeException'},
+  ];
+  const invoke = {pc: 0, instruction: {op: 'invokestatic', arg: ['Method', 'X', ['work', '()V']]}};
+  const glue = {pc: 2, instruction: 'return'};
+  assert.equal(normalizeTable(table, null, null, [invoke, glue]).groups.length, 1);
+  for (const code of [[invoke, {...invoke, pc: 2}], [invoke, {instruction: 'return'}],
+    [glue, invoke], [invoke, {...glue, pc: 0}]])
+    assert.equal(normalizeTable(table, null, null, code).groups.length, 2);
 });
 
 test('split protected ranges cannot inherit the priority of their first table rows', () => {
@@ -613,9 +677,19 @@ test('catch fallthrough into an enclosing protected tail does not become a retry
   const { ok, src, r } = run(code, et);
   assert.ok(ok, r.reason || 'nested handler ranges should structure');
   assertGotoFree(src);
-  assert.equal((src.match(/try \{/g) || []).length, 2, `expected nested tries:\n${src}`);
+  assert.equal((src.match(/try \{/g) || []).length, 1, `only the reachable catch remains:\n${src}`);
+  assert.doesNotMatch(src, /RuntimeException/);
   assert.match(src, /catch \(java\.lang\.Throwable[^]*?areturn;/);
   assert.doesNotMatch(src, /decompiledRegionSelector/);
+  // An effectful continuation in the otherwise uncovered tail makes the
+  // outer catch reachable; its complete range and nesting must then survive.
+  code.find(item => item.pc === 103).instruction = {
+    op: 'invokestatic', arg: ['Method', 'X', ['tail', '()Ljava/lang/Object;']],
+  };
+  const liveTail = run(code, et);
+  assert.equal(liveTail.ok, true, liveTail.r.reason);
+  assert.match(liveTail.src, /RuntimeException/);
+  assert.equal((liveTail.src.match(/try \{/g) || []).length, 2);
 });
 
 // ---------------------------------------------------------------------------

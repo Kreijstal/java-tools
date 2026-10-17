@@ -67,10 +67,18 @@ const REGION_EXIT_LABEL = 'RegionExit';
  * order (source catch order / JVM priority). Returns `{ groups }` or throws a
  * Bail for a shape we don't handle.
  */
-function normalizeTable(exceptionTable, syncHandlers, isCatchAssignable = null) {
+function normalizeTable(exceptionTable, syncHandlers, isCatchAssignable = null, codeItems = null) {
   const isSyncHandler = (handlerPc) => !!(syncHandlers && syncHandlers.has(handlerPc));
   const rows = [];
-  for (const e of exceptionTable) {
+  // An earlier covering catch can make a later row unreachable even when
+  // their bytecode ranges differ. Retaining that row creates a false nested
+  // try whose apparent range size reverses JVM handler priority. Remove only
+  // handlers covered for every catch alternative at every throwing PC (or
+  // every protected PC when instruction metadata is unavailable). Monitor
+  // lowering owns its handler rows and deliberately keeps the existing path.
+  const activeRows = syncHandlers?.size ? exceptionTable
+    : removeFullyShadowedHandlers(exceptionTable, isCatchAssignable, codeItems);
+  for (const e of activeRows) {
     // 1. Drop a handler that lives inside its own protected range (CFR's
     //    ValidException): carving it into its own try would loop forever.
     if (e.start_pc === e.handler_pc) continue;
@@ -240,6 +248,44 @@ function catchTypesSubsumes(earlierTypes, laterTypes, isCatchAssignable = null) 
       laterType.replace(/\./g, '/'), earlierType.replace(/\./g, '/'))) return true;
     return (CATCH_TYPE_ANCESTORS.get(laterType) || []).includes(earlierType);
   }));
+}
+
+function removeFullyShadowedHandlers(rows, isCatchAssignable, codeItems) {
+  const key = row => JSON.stringify([row.handler_pc, renderCatchTypes(row.catch_type)]);
+  const retained = new Set();
+  const instructions = codeItems?.filter(item => item.instruction);
+  // A gap containing only nonthrowing glue does not make a catch reachable.
+  // Without authoritative bytecode PCs, require full interval coverage instead.
+  const throwingPcs = instructions && instructions.every((item, index) =>
+    Number.isSafeInteger(item.pc) && (!index || item.pc > instructions[index - 1].pc))
+    ? instructions.filter(item => canThrow(insnOp(item))).map(item => item.pc) : null;
+  rows.forEach((row, index) => {
+    if (!Number.isSafeInteger(row.start_pc) || !Number.isSafeInteger(row.end_pc)
+        || row.start_pc >= row.end_pc) {retained.add(key(row));return;}
+    const covered = renderCatchTypes(row.catch_type).every(type => {
+      const ranges = rows.slice(0, index).filter(earlier =>
+        Number.isSafeInteger(earlier.start_pc) && Number.isSafeInteger(earlier.end_pc)
+        && earlier.start_pc < earlier.end_pc
+        && earlier.start_pc < row.end_pc && earlier.end_pc > row.start_pc
+        && catchTypesSubsumes(renderCatchTypes(earlier.catch_type), [type], isCatchAssignable))
+        .map(earlier => [earlier.start_pc, earlier.end_pc]).sort((a, b) => a[0] - b[0]);
+      if (!ranges.length) return false;
+      let end = row.start_pc;
+      const gaps = [];
+      for (const [start, nextEnd] of ranges) {
+        if (start > end) gaps.push({start_pc: end, end_pc: start});
+        end = Math.max(end, nextEnd);
+        if (end >= row.end_pc) break;
+      }
+      if (end < row.end_pc) gaps.push({start_pc: end, end_pc: row.end_pc});
+      return throwingPcs ? !throwingPcs.some(pc => inAnyRange(pc, gaps)) : !gaps.length;
+    });
+    if (!covered) retained.add(key(row));
+  });
+  // A live catch keeps its complete range set, including shadowed fragments.
+  // Those fragments anchor its nesting relative to an earlier inner catch;
+  // deleting just one can reverse the groups' range-size ordering.
+  return rows.filter(row => retained.has(key(row)));
 }
 
 // ---------------------------------------------------------------------------
@@ -952,7 +998,7 @@ function structureMethodImpl(codeItems, exceptionTable, opts = {}) {
 
 function structureWithExceptions(codeItems, exceptionTable, methodCfg, render, opts = {}) {
   const normalized = normalizeTable(
-    exceptionTable, opts.syncHandlers || null, opts.isCatchAssignable || null);
+    exceptionTable, opts.syncHandlers || null, opts.isCatchAssignable || null, codeItems);
   const groups = partitionFragmentedGroups(normalized.groups, methodCfg, codeItems, opts.syncHandlers);
   // Innermost first, with later equal-size ranges processed first so a handler
   // cannot absorb an unstructured copy of finally cleanup as its continuation.
@@ -966,14 +1012,23 @@ function structureWithExceptions(codeItems, exceptionTable, methodCfg, render, o
   // moving an alternative across another handler must retain exact routing.
   const signature = rows => {
     const catches = [];
+    const earlierTypes = [];
     for (const row of rows) {
+      // Compare observable first-match routing, not unreachable suffix rows.
+      // Unknown ancestry remains ordered: it is never assumed disjoint or
+      // shadowed. This also checks the normalized table against the original
+      // table after the whole-range shadow proof above.
+      const types = renderCatchTypes(row.catch_type).filter(type =>
+        !catchTypesSubsumes(earlierTypes, [type], opts.isCatchAssignable));
+      if (!types.length) continue;
       let last = catches[catches.length - 1];
       if (!last || last.handler !== row.handler_pc) {
         last = {handler: row.handler_pc, types: []};
         catches.push(last);
       }
-      for (const type of renderCatchTypes(row.catch_type))
+      for (const type of types)
         if (!last.types.includes(type)) last.types.push(type);
+      earlierTypes.push(...types);
     }
     for (const item of catches) item.types = item.types.filter(type =>
       !item.types.some(other => other !== type &&

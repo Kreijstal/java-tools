@@ -344,7 +344,7 @@ test('handler cleanup cannot enter a shadowed sibling catch during a loop exit',
         assert.equal(actualLines.length, expectedLines.length);
         expectedLines.forEach((line, index) => assert.equal(actualLines[index], line,
           `${first} before ${second}, forced=${forced}, scenario=${index}`));
-        assert.equal(source.includes('switch (statePc)'), forced || shadowed, JSON.stringify(diagnostics));
+        assert.equal(source.includes('switch (statePc)'), forced, JSON.stringify(diagnostics));
       }
     }
   } finally {
@@ -480,13 +480,122 @@ test('loop exits preserve table priority between nested protected ranges', () =>
         assert.equal(actualLines.length, expectedLines.length);
         expectedLines.forEach((line, index) => assert.equal(actualLines[index], line,
           `outerFirst=${outerFirst}, forced=${forced}, scenario=${index}`));
-        assert.equal(source.includes('switch (statePc)'), forced || outerFirst, JSON.stringify(diagnostics));
+        assert.equal(source.includes('switch (statePc)'), forced, JSON.stringify(diagnostics));
       }
     }
   } finally {
 
     fs.rmSync(temporary, {recursive: true, force: true});
   }
+});
+
+test('fragmented shadow coverage keeps throwing handler tails and outside failures', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-fragmented-shadow-'));
+  try {
+    const effects = `class FragmentEffects {
+      static String trace; static Throwable last;
+      @SuppressWarnings("unchecked")
+      static <T extends Throwable> RuntimeException raise(Throwable error) throws T {throw (T)error;}
+      static void fail(int kind) {
+        if(kind==0)return;
+        last=kind==1?new IllegalArgumentException():kind==2?new IllegalStateException():
+          kind==3?new AssertionError():new java.io.IOException();
+        throw FragmentEffects.<RuntimeException>raise(last);
+      }
+      static void work(int kind,int stage){trace+="W"+stage;fail(kind);}
+      static void cleanup(int kind){trace+="C";fail(kind);}
+      static void outer(Throwable error){if(error!=last)throw new AssertionError("identity");trace+="O";}
+      static void tail(int kind){trace+="T";fail(kind);}
+    }`;
+    const driver = `class FragmentRunner {public static void main(String[] args) {
+      int count=0;
+      for(int choice=0;choice<2;choice++)for(int first=0;first<5;first++)
+        for(int second=0;second<5;second++)for(int cleanup=0;cleanup<5;cleanup++)
+          for(int tail=0;tail<5;tail++) {
+            FragmentEffects.trace="";FragmentEffects.last=null;String result;
+            try{result=""+FragmentedCatches.compute(choice,first,second,cleanup,tail);}
+            catch(Throwable error){result=error.getClass().getSimpleName()+":"+(error==FragmentEffects.last);}
+            System.out.println(choice+":"+first+":"+second+":"+cleanup+":"+tail+":"+result+":"+FragmentEffects.trace);
+            count++;
+          }
+      if(count!=1250)throw new AssertionError("coverage");
+    }}`;
+    for (const cleanupThrows of [false, true]) {
+      const native = path.join(temporary, cleanupThrows ? 'throwing' : 'pure');fs.mkdirSync(native);
+      const assembly = `.version 49 0
+        .class public super FragmentedCatches
+        .super java/lang/Object
+        .method public static compute : (IIIII)I
+          .code stack 2 locals 7
+          .catch java/lang/Exception from Lfirst to LfirstEnd using Lhandler
+          .catch java/lang/Exception from Lsecond to Lhandler using Lhandler
+          .catch java/lang/RuntimeException from Lsecond to LouterEnd using Louter
+          iconst_0
+          istore 5
+        Lfirst:
+          iload_1
+          iconst_1
+          invokestatic Method FragmentEffects work (II)V
+          iload_0
+          ifeq Lsecond
+          bipush 7
+        LfirstEnd:
+          ireturn
+        Lsecond:
+          iload_2
+          iconst_2
+          invokestatic Method FragmentEffects work (II)V
+          bipush 5
+          istore 5
+          goto Lafter
+        Lhandler:
+          astore 6
+          ${cleanupThrows ? 'iload_3\n invokestatic Method FragmentEffects cleanup (I)V' : ''}
+          bipush -7
+          istore 5
+        LouterEnd:
+          goto Lafter
+        Louter:
+          astore 6
+          aload 6
+          invokestatic Method FragmentEffects outer (Ljava/lang/Throwable;)V
+          bipush -9
+          istore 5
+        Lafter:
+          iload 4
+          invokestatic Method FragmentEffects tail (I)V
+          iload 5
+          ireturn
+          .end code
+        .end method
+        .end class`;
+      const classFile = path.join(native, 'FragmentedCatches.class');
+      assembleJasminSource(assembly, classFile);
+      const names = ['FragmentedCatches', 'FragmentEffects', 'FragmentRunner'];
+      for (const [name, source] of Object.entries({FragmentEffects: effects, FragmentRunner: driver}))
+        fs.writeFileSync(path.join(native, name + '.java'), source);
+      run('javac', ['--release', '8', '-cp', native, '-d', native,
+        ...names.slice(1).map(name => path.join(native, name + '.java'))], native);
+      const expected = run('java', ['-Xverify:all', '-cp', native, 'FragmentRunner'], native);
+      assert.equal(expected.trim().split('\n').length, 1250);
+      assert.doesNotMatch(expected, /:false:/);
+      assert.equal(expected.includes('CO'), cleanupThrows);
+      for (const forced of [false, true]) {
+        const diagnostics = [];
+        const source = decompileClassFile(classFile, {diagnostics, forceStateMachine: forced});
+        assertNoFallback(source);
+        assert.equal(diagnostics.some(item => item.kind === 'stateMachineFallback'), forced || cleanupThrows,
+          'only the proven shadowed handler is removed: ' + JSON.stringify(diagnostics));
+        if (!forced && !cleanupThrows) assert.doesNotMatch(source, /switch \(statePc\)|FragmentEffects\.outer/);
+        const rebuilt = path.join(native, forced ? 'forced' : 'ordinary');fs.mkdirSync(rebuilt);
+        for (const [name, text] of Object.entries({FragmentedCatches: source,
+          FragmentEffects: effects, FragmentRunner: driver})) fs.writeFileSync(path.join(rebuilt, name + '.java'), text);
+        run('javac', ['--release', '8', '-d', rebuilt,
+          ...names.map(name => path.join(rebuilt, name + '.java'))], rebuilt);
+        assert.equal(run('java', ['-Xverify:all', '-cp', rebuilt, 'FragmentRunner'], rebuilt), expected);
+      }
+    }
+  } finally {fs.rmSync(temporary, {recursive: true, force: true});}
 });
 
 test('finally cleanup preserves pending loop exits, returns and throwable identity', () => {
