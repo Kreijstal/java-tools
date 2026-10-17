@@ -755,10 +755,10 @@ class JvmSsaBlockRenderer {
       environment.JVM_ENABLE_STRUCTURED_LINEAR_PARTITION === "1";
     this.linearPartitionUnitBytes = Math.max(16384, Math.min(262144,
       Number(options.structuredLinearPartitionUnitBytes ??
-        environment.JVM_STRUCTURED_LINEAR_PARTITION_UNIT_BYTES) || 98304));
+        environment.JVM_STRUCTURED_LINEAR_PARTITION_UNIT_BYTES) || 49152));
     this.linearPartitionSegmentBytes = Math.max(4096, Math.min(131072,
       Number(options.structuredLinearPartitionSegmentBytes ??
-        environment.JVM_STRUCTURED_LINEAR_PARTITION_SEGMENT_BYTES) || 49152));
+        environment.JVM_STRUCTURED_LINEAR_PARTITION_SEGMENT_BYTES) || 24576));
     this.linearPartitionMinimumSegmentBytes = Math.max(1024, Math.min(32768,
       Number(options.structuredLinearPartitionMinimumSegmentBytes ??
         environment.JVM_STRUCTURED_LINEAR_PARTITION_MINIMUM_SEGMENT_BYTES) ||
