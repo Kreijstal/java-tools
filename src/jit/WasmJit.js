@@ -3568,6 +3568,7 @@ class WasmJit {
       primary.retv = instance.exports.retv || null;
       primary.runv = instance.exports.runv || null;
       primary.canonicalRun=instance.exports.canonicalRun||null;
+      primary.canonicalHeapRun=instance.exports.canonicalHeapRun||null;
       primary.canonicalFuel=instance.exports.canonicalFuel||null;
       primary.canonicalEntries=instance.exports.canonicalEntries||null;
       if(primary.canonicalRun)instance.exports.canonicalOwner.value=primary.directFrameContext;

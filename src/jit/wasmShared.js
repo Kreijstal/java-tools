@@ -590,9 +590,10 @@ function takeWasmReturnValue(meta) {
 // block 0 and the nested-call fuel budget, run the main function, then push
 // the retv global so a wasm->wasm caller receives [status, value] without
 // any JS boundary. Mirrors the JS bridges' full[] tail exactly.
-function runvWrapperBody(paramCount, mainIdx, retvType) {
+function runvWrapperBody(paramCount, mainIdx, retvType, heapParameterCount = 0) {
   const out = [0]; // no locals
   for (let i = 0; i < paramCount; i++) out.push(OP.local_get, ...uleb(i));
+  for (let i = 0; i < heapParameterCount; i++) out.push(OP.i32_const, ...sleb(-2), OP.i32_const, 0);
   out.push(OP.i32_const, ...sleb(0));
   out.push(OP.i32_const, ...sleb(100_000_000));
   out.push(OP.call, ...uleb(mainIdx));
@@ -607,7 +608,7 @@ function runvWrapperBody(paramCount, mainIdx, retvType) {
 // Direct canonical wrapper returns status, invocation id, owner, and value.
 // The main body captures/clears the active id before any guest work. Its
 // spill imports use that local id, so recursive calls cannot overwrite it.
-function canonicalRunWrapperBody(paramCount, mainIdx, retvType, globals, readyIdx, recordIdx) {
+function canonicalRunWrapperBody(paramCount, mainIdx, retvType, globals, readyIdx, recordIdx, heapParameterCount = 0) {
   const id=paramCount, status=paramCount+1;
   const out=[1,2,T.i32]; // two i32 locals
   out.push(OP.call,...uleb(readyIdx),OP.i32_eqz,OP.if,0x40,
@@ -625,6 +626,7 @@ function canonicalRunWrapperBody(paramCount, mainIdx, retvType, globals, readyId
     (out, body, handler) => emitTryTableJsTag(out, body, handler, recordIdx);
   emitCatch(out,body=>{
     for(let i=0;i<paramCount;i++)body.push(OP.local_get,...uleb(i));
+    for(let i=0;i<heapParameterCount;i++)body.push(OP.i32_const,...sleb(-2),OP.i32_const,0);
     body.push(OP.i32_const,0,OP.global_get,...uleb(globals+3),
       OP.call,...uleb(mainIdx),OP.local_set,...uleb(status));
   },body=>body.push(OP.i32_const,...sleb(-5),OP.local_set,...uleb(status)));
@@ -646,7 +648,7 @@ function specokGlobalEntry() {
 
 function assembleModule({ importDecls, mainParams, mainResults, declared, body, profilerName,
   importMemory, retvType, runvWrapper, specokGlobal, importTable, sigTypes,
-  canonicalFrameExport, importCanonicalTable, importJsTag }) {
+  canonicalFrameExport, importCanonicalTable, importJsTag, parameterArrayABI = [] }) {
   const typeKey = (p, r) => `${p.join(',')}|${r.join(',')}`;
   const types = [];
   const typeIndex = new Map();
@@ -716,34 +718,59 @@ function assembleModule({ importDecls, mainParams, mainResults, declared, body, 
   // supplied inside) and returns [status, value] for direct wasm->wasm
   // callers. Only real method modules ask for it: their main signature is
   // (params..., blk, fuel) -> [status].
-  const paramOnly = runvWrapper ? mainParams.slice(0, mainParams.length - 2) : [];
-  const runvType = runvWrapper
-    ? internType(paramOnly, retvType ? [T.i32, retvType] : [T.i32]) : 0;
-  const runvBody = runvWrapper
-    ? runvWrapperBody(paramOnly.length, mainIdx, retvType) : [];
-  const runvName = [...'runv'].map((c) => c.charCodeAt(0));
+  const heapParameterCount = parameterArrayABI.length;
+  const paramOnly = runvWrapper ? mainParams.slice(0, mainParams.length - 2 - heapParameterCount * 2) : [];
+  if (heapParameterCount && (!runvWrapper || !canonicalFrameExport ||
+      new Set(parameterArrayABI).size !== heapParameterCount ||
+      parameterArrayABI.some(i => !Number.isInteger(i) || i < 0 || paramOnly[i] !== T.ref) ||
+      mainParams.slice(paramOnly.length, -2).some(t => t !== T.i32))) {
+    throw new TypeError('invalid parameter array ABI');
+  }
+  const functionTypes = [mainType], functionBodies = [funcBody];
+  const addFunction = (params, results, bytes) => {
+    const index = mainIdx + functionTypes.length;
+    functionTypes.push(internType(params, results)); functionBodies.push(bytes);
+    return index;
+  };
+  let runIdx = mainIdx;
+  if (heapParameterCount) {
+    // Existing JS/frame entry remains (Java arguments, block, fuel). A -2
+    // base asks the body to query its original reference at the original
+    // entry point; -1 continues to mean a captured non-heap array.
+    const wrapper = [0];
+    for (let i = 0; i < paramOnly.length; i++) wrapper.push(OP.local_get, ...uleb(i));
+    for (let i = 0; i < heapParameterCount; i++) wrapper.push(OP.i32_const, ...sleb(-2), OP.i32_const, 0);
+    wrapper.push(OP.local_get, ...uleb(paramOnly.length),
+      OP.local_get, ...uleb(paramOnly.length + 1), OP.call, ...uleb(mainIdx), OP.end);
+    runIdx = addFunction([...paramOnly, T.i32, T.i32], mainResults, wrapper);
+  }
   const exportEntries = [
-    [exportName.length, ...exportName, 0x00, ...uleb(mainIdx)],
-    ...(runvWrapper
-      ? [[runvName.length, ...runvName, 0x00, ...uleb(mainIdx + 1)]] : []),
+    [exportName.length, ...exportName, 0x00, ...uleb(runIdx)],
     ...(retvType ? [[retvName.length, ...retvName, 0x03, 0]] : []),
-    ...(specokGlobal
-      ? [[specokName.length, ...specokName, 0x03, ...uleb(specokIdx)]] : []),
+    ...(specokGlobal ? [[specokName.length, ...specokName, 0x03, ...uleb(specokIdx)]] : []),
   ];
-  const functionTypes = [mainType];
-  const functionBodies = [funcBody];
-  if(runvWrapper){functionTypes.push(runvType);functionBodies.push(runvBody);}
+  const exportFunction = (name, index) => {
+    const bytes = [...name].map(c => c.charCodeAt(0));
+    exportEntries.push([bytes.length, ...bytes, 0, ...uleb(index)]);
+  };
+  if (runvWrapper) exportFunction('runv', addFunction(paramOnly,
+    retvType ? [T.i32, retvType] : [T.i32],
+    runvWrapperBody(paramOnly.length, mainIdx, retvType, heapParameterCount)));
   if(canonicalFrameExport){
     const globals=(retvType?1:0)+(specokGlobal?1:0);
-    const directType=internType(paramOnly,[T.i32,T.i32,T.ref,...(retvType?[retvType]:[])]);
-    const directBody=canonicalRunWrapperBody(paramOnly.length,mainIdx,retvType,globals,
-      canonicalFrameExport.readyIdx, canonicalFrameExport.recordIdx);
-    const name=[...'canonicalRun'].map(c=>c.charCodeAt(0));
-    exportEntries.push([name.length,...name,0,...uleb(mainIdx+functionTypes.length)]);
+    const results=[T.i32,T.i32,T.ref,...(retvType?[retvType]:[])];
+    exportFunction('canonicalRun',addFunction(paramOnly,results,
+      canonicalRunWrapperBody(paramOnly.length,mainIdx,retvType,globals,
+        canonicalFrameExport.readyIdx,canonicalFrameExport.recordIdx,heapParameterCount)));
+    if (heapParameterCount) {
+      const expanded = [...paramOnly, ...parameterArrayABI.flatMap(() => [T.i32, T.i32])];
+      exportFunction('canonicalHeapRun',addFunction(expanded,results,
+        canonicalRunWrapperBody(expanded.length,mainIdx,retvType,globals,
+          canonicalFrameExport.readyIdx,canonicalFrameExport.recordIdx)));
+    }
     for(const [label,index] of [['canonicalOwner',globals+2],['canonicalFuel',globals+3],['canonicalEntries',globals+1]]){
       const bytes=[...label].map(c=>c.charCodeAt(0));exportEntries.push([bytes.length,...bytes,3,...uleb(index)]);
     }
-    functionTypes.push(directType);functionBodies.push(directBody);
   }
   const functionSection=[...uleb(functionTypes.length),...functionTypes.flatMap(uleb)];
   const codeSection=[...uleb(functionBodies.length),...functionBodies.flatMap(b=>[...uleb(b.length),...b])];

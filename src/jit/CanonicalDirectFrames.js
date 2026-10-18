@@ -68,7 +68,7 @@ class CanonicalDirectLinks {
       !'L['.includes(meta.retChar) &&
       (!meta.frameEntryOnly || meta.booleanStaticSpillProof);
   }
-  allocate(key, params, results, fallback) {
+  allocate(key, params, results, fallback, parameterArrayABI = []) {
     // The existing bridge is the fallback until a proved callee publishes.
     // -6 requests the old deopt-flag check; normal raw exports return -1.
     const imports = [{name:'fallback',params,results}];
@@ -92,7 +92,7 @@ class CanonicalDirectLinks {
     const slot = this.freeSlots.length?this.freeSlots.pop():this.table.length;
     if(slot===this.table.length)this.table.grow(1);
     this.table.set(slot,stub);
-    const binding = {slot,stub,key,params};
+    const binding = {slot,stub,key,params,parameterArrayABI:parameterArrayABI.slice()};
     this.bySlot.set(slot,binding);
     let list=this.bindings.get(key);
     if(!list)this.bindings.set(key,list=[]);
@@ -113,10 +113,16 @@ class CanonicalDirectLinks {
   }
   publish(st) {
     if(!st.key)return;
-    const fn=CanonicalDirectLinks.eligible(st)?st.meta.canonicalRun:null;
+    const eligible=CanonicalDirectLinks.eligible(st);
     for(const binding of this.bindings.get(st.key)||[]){
+      const arrays=binding.parameterArrayABI;
+      const fn=eligible ? arrays.length ? st.meta.canonicalHeapRun : st.meta.canonicalRun : null;
+      const javaCount=binding.params.length-2*arrays.length;
       let slot=0;
-      const identity=fn && st.meta.paramSlots.length===binding.params.length &&
+      const identity=fn && st.meta.paramSlots.length===javaCount &&
+        (!arrays.length || arrays.length===st.meta.parameterArrayABI?.length &&
+          arrays.every((index,i)=>index===st.meta.parameterArrayABI[i]) &&
+          binding.params.slice(javaCount).every(type=>type===T.i32)) &&
         st.meta.paramSlots.every((p,i)=>{
           const at=slot;slot+=(binding.params[i]===T.i64||binding.params[i]===T.f64)?2:1;
           return p.slot===at&&p.t===binding.params[i];

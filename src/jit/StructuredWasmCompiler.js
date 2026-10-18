@@ -52,6 +52,11 @@ const {
 const Frame = require('../core/frame');
 
 const KIND_T = { I: T.i32, J: T.i64, F: T.f32, D: T.f64, A: T.ref };
+function primitiveArrayParameters(descriptor) {
+  const parameters = descriptor.slice(1, descriptor.indexOf(')'))
+    .match(/\[*L[^;]+;|\[*[ZBCSIJFD]/g) || [];
+  return parameters.flatMap((type, index) => /^\[[ZBCSIJFD]$/.test(type) ? [index] : []);
+}
 // Diagnostic A/B: clear (rather than leave stale) every slot a mid-method
 // exit's spill filter drops. See emitSpillResume.
 const CLEAR_DROPPED = typeof process !== 'undefined'
@@ -255,7 +260,7 @@ class StructuredWasmCompiler {
         // Leave execution state (box, method, JVM, links) and returned metadata
         // intact; dropping these roots also covers refused translations.
         for (const key of [
-          'fn', 'cfg', 'items', 'originalItems', 'localOf', 'arrayCaches',
+          'fn', 'cfg', 'items', 'originalItems', 'localOf', 'arrayCaches', 'heapParamLocals',
           'fieldArrayOwners', 'sharedFieldArrayGroups', 'arrayReaderGenerations', 'primitiveCopyZeroEntry',
           'fieldCaches', 'castCaches', 'objCaches', 'linkSlotByNode', 'canonicalSlotByNode',
           'deoptableSites', 'linkSlotSites', 'fusedGuardOfLoad',
@@ -410,19 +415,30 @@ class StructuredWasmCompiler {
     if (this.paramSlots.some((p) => p.t === undefined)) throw new Unsupported('param kind');
     this.localOf = new Map();
     fn.params.forEach((p, i) => this.localOf.set(p, i));
-    this.blkLocal = fn.params.length;
-    this.fuelLocal = fn.params.length + 1;
+    const directFlags=this.method.flags||[];
+    const directEligible = this.wasmJit.canonicalDirectCallsEnabled &&
+      supportsWasmTryTable() && directFlags.includes('static') &&
+      !directFlags.includes('synchronized') &&
+      !['<init>','<clinit>'].includes(this.method.name) &&
+      !'L['.includes(parseMethodDescriptor(this.method.descriptor).ret);
+    this.parameterArrayABI = directEligible && this.jvm.wasmHeap &&
+      process.env.JVM_WASM_HEAP_ARRAYS !== '0'
+      ? primitiveArrayParameters(this.method.descriptor) : [];
+    // Do not capture fn in a callback here: retained runtime imports share
+    // this lexical environment and must not keep the SSA graph alive.
+    this.heapParamLocals = new Map();
+    for (let ordinal=0; ordinal<this.parameterArrayABI.length; ordinal++) {
+      const index=this.parameterArrayABI[ordinal], base=fn.params.length+2*ordinal;
+      this.heapParamLocals.set(fn.params[index],{base,len:base+1});
+    }
+    this.blkLocal = fn.params.length + 2*this.parameterArrayABI.length;
+    this.fuelLocal = this.blkLocal + 1;
     this.usedCanonicalTable=this.wasmJit.canonicalDirectCallsEnabled;
     this.canonicalLifetime=this.usedCanonicalTable?{fallbacks:[],metadata:null}:null;
     this.canonicalSlots=[];
     this.declared = [];
-    this.nextLocal = fn.params.length + 2;
-    const directFlags=this.method.flags||[];
-    this.directFrames = this.wasmJit.canonicalDirectCallsEnabled &&
-      supportsWasmTryTable() && directFlags.includes('static') &&
-      !directFlags.includes('synchronized') &&
-      !['<init>','<clinit>'].includes(this.method.name) &&
-      !'L['.includes(parseMethodDescriptor(this.method.descriptor).ret)
+    this.nextLocal = this.fuelLocal + 1;
+    this.directFrames = directEligible
       ? new DirectFrameContext(this.jvm,this.method,this.className,this.box) : null;
     // A handler-free leaf can throw only through its runtime imports. Record
     // those exceptions in its own box before the canonical wrapper catches
@@ -658,7 +674,8 @@ class StructuredWasmCompiler {
 
     const bytes = assembleModule({
       importDecls: this.importDecls,
-      mainParams: [...this.paramSlots.map((p) => p.t), T.i32, T.i32],
+      mainParams: [...this.paramSlots.map((p) => p.t),
+        ...this.parameterArrayABI.flatMap(() => [T.i32,T.i32]), T.i32, T.i32],
       mainResults: [T.i32],
       declared: this.declared,
       body,
@@ -674,6 +691,7 @@ class StructuredWasmCompiler {
         recordIdx:this.jsTagEh ? this.jsTagRecordIdx : undefined} : null,
       importJsTag: this.jsTagEh,
       importCanonicalTable: !!this.usedCanonicalTable,
+      parameterArrayABI: this.parameterArrayABI,
     });
 
     const blockOfItem = new Map();
@@ -751,6 +769,7 @@ class StructuredWasmCompiler {
       importObject: { env },
       box: this.box,
       directFrameContext: this.directFrames,
+      parameterArrayABI: this.parameterArrayABI.slice(),
       canonicalDirectSites: this.canonicalSlotByNode?.size || 0,
       canonicalSlots: this.canonicalSlots.slice(),
       canonicalLifetime:this.canonicalLifetime,
@@ -1834,6 +1853,15 @@ class StructuredWasmCompiler {
       for (let i = 0; i < node.args.length; i += 1) out.push(...use(i));
       if(call.canonical){
         const c=call.canonical;
+        for (const cache of c.arrays || []) {
+          if (!cache.parameter) {
+            // A cold callee must retain ordinary invocation/class-init order.
+            // Its owner guard will refuse the call, so do not query a new
+            // array reference while readiness is false.
+            out.push(...this.lazyArrayCacheFill(cache,c.arrayOwnerReady));
+          }
+          out.push(OP.local_get,...uleb(cache.base),OP.local_get,...uleb(cache.len));
+        }
         out.push(OP.i32_const,...sleb(c.slot),OP.call_indirect,...uleb(c.type),
           0x00);
         if(node.kind!=='V')out.push(OP.local_set,...uleb(this.mustLocal(node)));
@@ -2045,14 +2073,15 @@ class StructuredWasmCompiler {
   arrayCacheFor(arrValue) {
     let entry = this.arrayCaches.get(arrValue.id);
     if (!entry) {
-      const base = this.nextLocal++;
-      this.declared.push(T.i32);
-      const len = this.nextLocal++;
-      this.declared.push(T.i32);
+      const incoming = this.heapParamLocals.get(arrValue);
+      const base = incoming ? incoming.base : this.nextLocal++;
+      if (!incoming) this.declared.push(T.i32);
+      const len = incoming ? incoming.len : this.nextLocal++;
+      if (!incoming) this.declared.push(T.i32);
       const parameter = this.fn.params.includes(arrValue);
       const filled = parameter ? null : this.nextLocal++;
       if (!parameter) this.declared.push(T.i32);
-      entry = { base, len, filled, parameter, value: arrValue };
+      entry = { base, len, filled, parameter, incoming:!!incoming, value: arrValue };
       this.arrayCaches.set(arrValue.id, entry);
     }
     return entry;
@@ -2060,17 +2089,26 @@ class StructuredWasmCompiler {
 
   arrayCacheFill(cache) {
     const arr = this.useOf(cache.value);
-    return [
+    const query = [
       ...arr, OP.call, ...uleb(this.abaseIdx), OP.local_set, ...uleb(cache.base),
       ...arr, OP.call, ...uleb(this.alen0Idx), OP.local_set, ...uleb(cache.len),
+    ];
+    return [
+      ...(cache.incoming ? [OP.local_get,...uleb(cache.base),OP.i32_const,...sleb(-2),
+        OP.i32_eq,OP.if,0x40,...query,OP.end] : query),
       ...(cache.copyKind === undefined ? [] : [
         ...arr, OP.call, ...uleb(this.copyKindIdx), OP.local_set, ...uleb(cache.copyKind),
       ]),
     ];
   }
 
-  lazyArrayCacheFill(cache) {
+  lazyArrayCacheFill(cache, ownerReadyIdx) {
     if (cache.parameter) return [];
+    const whenReady = body => ownerReadyIdx === undefined ? body :
+      [OP.call,...uleb(ownerReadyIdx),OP.if,0x40,...body,
+        // A refused fill must never forward an old/default pointer. The
+        // callee can query the original reference after initialization.
+        OP.else,OP.i32_const,...sleb(-2),OP.local_set,...uleb(cache.base),OP.end];
     if (cache.sharedField) {
       const {group, readerGeneration, generation} = cache.sharedField;
       const copy = (source, target) => [OP.local_get, ...uleb(source),
@@ -2080,6 +2118,7 @@ class StructuredWasmCompiler {
         OP.local_get, ...uleb(generation),
         OP.local_get, ...uleb(readerGeneration), OP.i64_ne, OP.i32_or,
         OP.if, 0x40,
+          ...whenReady([
           OP.local_get, ...uleb(group.filled),
           OP.local_get, ...uleb(group.generation),
           OP.local_get, ...uleb(readerGeneration), OP.i64_eq, OP.i32_and,
@@ -2093,13 +2132,14 @@ class StructuredWasmCompiler {
           OP.end,
           ...copy(readerGeneration, generation),
           OP.i32_const, ...sleb(1), OP.local_set, ...uleb(cache.filled),
+          ]),
         OP.end,
       ];
     }
     return [
       OP.local_get, ...uleb(cache.filled), OP.i32_eqz, OP.if, 0x40,
-      ...this.arrayCacheFill(cache),
-      OP.i32_const, ...sleb(1), OP.local_set, ...uleb(cache.filled), OP.end,
+      ...whenReady([...this.arrayCacheFill(cache),
+        OP.i32_const, ...sleb(1), OP.local_set, ...uleb(cache.filled)]), OP.end,
     ];
   }
 
@@ -2536,6 +2576,18 @@ class StructuredWasmCompiler {
         directMeta.paramSlots.every(p=>argPosBySlot.get(p.slot)!==undefined &&
           p.t===wParams[argPosBySlot.get(p.slot)]);
       if(identity && !calleeSt?.synchronized){
+        const arrayIndices=this.heap && supportsWasmTryTable() ? primitiveArrayParameters(descriptor) : [];
+        const arrayCount=arrayIndices.length;
+        const arrays=[];
+        for(const index of arrayIndices) arrays.push(this.arrayCacheFor(node.args[index]));
+        const expandedParams=[...wParams,...arrayIndices.flatMap(()=>[T.i32,T.i32])];
+        let arrayOwnerReady;
+        if(arrays.length){
+          this.heapImports();
+          arrayOwnerReady=this.addImport(
+            `array_owner_ready_${className}`.replace(/[^\w]/g,'_'),[],[T.i32],
+            this.jvm.getClassInitializationToken(className).wasmReadinessGuard(),true);
+        }
         const scratch=new Map(),dummy=dummyRet(ret);
         let bound=calleeSt,boundEpoch=-1;
         const fallback=(...args)=>{
@@ -2545,15 +2597,16 @@ class StructuredWasmCompiler {
             if(bound)this.wasmJit.canonicalDirectLinks.publish(bound);
           }
           if(!bound || !(bound.callee||bound).meta){this.box.deoptFlag=1;return dummy;}
-          return this.runNested(bound,className,args,argPosBySlot,scratch,dummy);
+          return this.runNested(bound,className,
+            arrayCount?args.slice(0,params.length):args,argPosBySlot,scratch,dummy);
         };
         let direct=this.canonicalSlotByNode?.get(node);
         if(direct===undefined){
           // The stub's JS call crosses an indirect table, so the caller's
           // ordinary import wrapper cannot record its exception for catch_all.
           const recordedFallback = this.ehMethod && !this.jsTagEh
-            ? ehRecordingImport(fallback, wParams.length, this.box) : fallback;
-          direct=this.wasmJit.canonicalDirectLinks.allocate(key,wParams,results,recordedFallback);
+            ? ehRecordingImport(fallback, expandedParams.length, this.box) : fallback;
+          direct=this.wasmJit.canonicalDirectLinks.allocate(key,expandedParams,results,recordedFallback,arrayIndices);
           (this.canonicalSlotByNode||=new Map()).set(node,direct);
           this.canonicalSlots.push(direct);
           this.canonicalLifetime.fallbacks.push(recordedFallback);
@@ -2564,10 +2617,10 @@ class StructuredWasmCompiler {
         binding.slot=direct;
         this.usedCanonicalTable=true;
         this.canonicalDirectSites=(this.canonicalDirectSites||0)+1;
-        const type=this.internSig(wParams,[T.i32,T.i32,T.ref,...results]);
+        const type=this.internSig(expandedParams,[T.i32,T.i32,T.ref,...results]);
         const consumeIdx=this.addImport('canonical_exit',[T.i32,T.i32,T.ref],[T.i32],
           (status,id,owner)=>this.consumeDirectExit(status,id,owner));
-        return {canonical:{slot:direct,type,consumeIdx},writes,deoptable:true};
+        return {canonical:{slot:direct,type,consumeIdx,arrays,arrayOwnerReady},writes,deoptable:true};
       }
     }
     // UNKNOWN: the callee owns no module yet. Emit a late-bound call rather
