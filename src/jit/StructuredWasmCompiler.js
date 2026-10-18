@@ -285,7 +285,7 @@ class StructuredWasmCompiler {
           'deoptableSites', 'linkSlotSites', 'canonicalCompactSlots', 'emptyCopySites', 'fusedGuardOfLoad',
           'fusedGuardArms', 'fusedFieldReads', 'rematLoads', 'inlinedInitializationGuards', 'heapReadinessGuards',
           'labelIndex', 'origIdx', 'deoptStubs', 'deoptBlocks', 'declared',
-          'frames', 'guardSites', 'liveRanges', 'demoteBlockersByBlock',
+          'frames', 'guardSites', 'liveRanges', 'demoteBlockersByBlock', 'frameLocalLiveness', 'omittedFrameSlots',
           'importDecls', 'importFns', 'importIndexByName', 'globalImportDecls', 'importedGlobals', 'emptyCopyGlobals', 'sigTypes', 'sigTypeIndex',
           'stringConstantImports',
         ]) {
@@ -377,6 +377,8 @@ class StructuredWasmCompiler {
     this.cfg = cfg;
     this.items = items;
     this.originalItems = codeAttr.code.codeItems;
+    this.frameLocalLiveness=require('../analysis/frameLocalLiveness').frameLocalLiveness(codeAttr.code);
+    this.booleanStaticCaptures=booleanStaticCaptures(this.method);
 
     // Receiver-load / guard pairs eligible for fusion into one crossing. The
     // safety argument is entirely in the adjacency test: the two nodes must be
@@ -659,7 +661,6 @@ class StructuredWasmCompiler {
 
     this.prepareSharedFieldArrayCaches();
 
-    this.booleanStaticCaptures = booleanStaticCaptures(this.method);
     this.booleanStaticSpillProof = true;
     this.booleanStaticSpillSites = 0;
     const body = [];
@@ -830,6 +831,9 @@ class StructuredWasmCompiler {
       linkBindings: this.linkBindings,
       linkSlots: this.linkSlots,
       blockCount: cfg.n,
+      frameSpillSlotsOmitted:this.omittedFrameSlots?.size || 0,
+      frameLivenessProved:!!this.frameLocalLiveness,
+      frameLivenessStorageBytes:this.frameLocalLiveness?.storageBytes || 0,
       fullyCompiled: normalFlowFullyCompiled && table.length === 0,
       normalFlowFullyCompiled,
       booleanStaticSpillProof: this.booleanStaticCaptures.length > 0 &&
@@ -1244,6 +1248,15 @@ class StructuredWasmCompiler {
     out.push(OP.end);
   }
 
+  shouldSpillFrameLocal(slot,itemIndex,kind) {
+    // Boolean captures also participate in the existing specialization
+    // metadata contract; retain them independently of bytecode liveness.
+    if(!this.frameLocalLiveness || this.frameLocalLiveness.has(itemIndex,slot) ||
+        this.booleanStaticCaptures?.some(c=>c.slot===slot && itemIndex>c.storeIndex))return true;
+    (this.omittedFrameSlots ||= new Set()).add(kind+':'+itemIndex+':'+slot);
+    return false;
+  }
+
   recordBooleanStaticSpill(slotState, itemIndex, spills) {
     if (!this.booleanStaticCaptures?.length) return;
     this.booleanStaticSpillSites += 1;
@@ -1309,12 +1322,16 @@ class StructuredWasmCompiler {
 
   emitSpillResume(blockId, out, stub = null) {
     const block = this.blockOf(blockId);
+    const resumeIndex=stub?stub.resumeIdx:this.resumeItemOf(blockId);
     const spills = [];
     const dropped = [];
     const droppedSlots = [];
+    const deadSlots=[];
     for (const [slot, value] of block.slotDefsIn || []) {
       const t = KIND_T[value.kind];
-      if (t === undefined || value.op === 'undef') { // dead or conflicted
+      const dead=!this.shouldSpillFrameLocal(slot,resumeIndex,'resume');
+      if(dead)deadSlots.push(slot);
+      if (t === undefined || value.op === 'undef' || dead) {
         dropped.push(`${slot}:${value.op}/${String(value.kind)}`);
         droppedSlots.push(slot);
         continue;
@@ -1323,19 +1340,18 @@ class StructuredWasmCompiler {
     }
     this.recordBooleanStaticSpill(block.slotDefsIn,
       stub ? stub.resumeIdx : this.resumeItemOf(blockId), spills);
-    if (spills.length || (CLEAR_DROPPED && droppedSlots.length)) {
+    if (spills.length || deadSlots.length || (CLEAR_DROPPED && droppedSlots.length)) {
       const slots = spills.map((s) => s.slot);
-      const clear = CLEAR_DROPPED ? droppedSlots : null;
+      const clear = CLEAR_DROPPED ? droppedSlots : deadSlots;
       const box = this.box;
       const idx = this.addImport(
         `spill_h${blockId}`, [...spills.map((s) => s.t),...(this.directFrames?[T.i32]:[])], [],
         (...values) => {
           const locals = (this.directFrames ? this.directFrames.frame(values.pop()) : box.frame).locals;
           for (let i = 0; i < slots.length; i += 1) locals[slots[i]] = values[i];
-          // JVM_WASM_CLEAR_DROPPED=1: a slot the filter dropped keeps whatever
-          // the last user of this (reused) frame left in it. Clearing turns a
-          // plausible stale value into an obvious absent one, so an unsound
-          // drop fails loudly instead of decoding garbage.
+          // Clear proved-dead values in reused frames. The diagnostic flag
+          // additionally clears conflicted/unkinded drops to expose stale
+          // values that would otherwise conceal an incorrect spill.
           if (clear) for (let i = 0; i < clear.length; i += 1) locals[clear[i]] = undefined;
         },
       );
@@ -1530,11 +1546,13 @@ class StructuredWasmCompiler {
       () => (box.pendingException !== null ? 1 : 0))));
     out.push(OP.if, 0x40);
     const spills = [];
+    const deadSlots=[];
     for (const [slot, value] of slotState || []) {
-      const t = KIND_T[value.kind];
-      if (t === undefined || value.op === 'undef') continue; // dead or conflicted
       // spliced callee locals do not exist in the caller's Frame
       if (this.ehOrigIdx && slot >= this.callerLocals) continue;
+      if(!this.shouldSpillFrameLocal(slot,site.resumeIdx,'exception')){deadSlots.push(slot);continue;}
+      const t = KIND_T[value.kind];
+      if (t === undefined || value.op === 'undef') continue; // dead or conflicted
       spills.push({ slot, value, t });
     }
     const slots = spills.map((s) => s.slot);
@@ -1545,6 +1563,7 @@ class StructuredWasmCompiler {
       (...values) => {
         const frame = this.directFrames ? this.directFrames.frame(values.pop()) : box.frame;
         for (let i = 0; i < slots.length; i += 1) frame.locals[slots[i]] = values[i];
+        for(const slot of deadSlots)frame.locals[slot]=undefined;
         frame.pc = resumeIdx;
         box.throwPc = pc;
       },
@@ -3381,21 +3400,27 @@ class StructuredWasmCompiler {
     // locals as of the call, from the SSA snapshot (same filter as EH spill)
     const spills = [];
     const droppedSlots = [];
+    const deadSlots=[];
     for (const [slot, value] of node.slotState || []) {
       const t = KIND_T[value.kind];
-      if (t === undefined || value.op === 'undef') { // dead or conflicted
+      const resumeIndex=reexecute?site.resumeIdx:site.resumeIdx+1;
+      const dead=!this.shouldSpillFrameLocal(slot,resumeIndex,'call');
+      if(dead)deadSlots.push(slot);
+      if (t === undefined || value.op === 'undef' || dead) {
         droppedSlots.push(slot);
         continue;
       }
       spills.push({ slot, value, t });
     }
     this.recordBooleanStaticSpill(node.slotState, site.resumeIdx, spills);
-    if (spills.length || (CLEAR_DROPPED && droppedSlots.length)) {
+    if (spills.length || deadSlots.length || (CLEAR_DROPPED && droppedSlots.length)) {
       const slots = spills.map((s) => s.slot);
-      const clear = CLEAR_DROPPED ? droppedSlots : null;
+      const clear = CLEAR_DROPPED ? droppedSlots : deadSlots;
       const box = this.box;
       const idx = this.addImport(
-        `call_spill_${site.resumeIdx}`, [...spills.map((s) => s.t),...(this.directFrames?[T.i32]:[])], [],
+        // The retry point includes handler dependencies which may be dead
+        // after the call. Their signatures and clear plans cannot be shared.
+        `call_spill_${site.resumeIdx}_${reexecute?'retry':'after'}`, [...spills.map((s) => s.t),...(this.directFrames?[T.i32]:[])], [],
         (...values) => {
           const locals = (this.directFrames ? this.directFrames.frame(values.pop()) : box.frame).locals;
           for (let i = 0; i < slots.length; i += 1) locals[slots[i]] = values[i];

@@ -7,7 +7,8 @@ const compile = require('./javaFixture').makeJavaFixtureCompiler('structured-ret
 
 const analysisKeys = ['labelIndex', 'origIdx', 'deoptStubs', 'deoptBlocks',
   'declared', 'frames', 'guardSites', 'liveRanges', 'demoteBlockersByBlock',
-  'importDecls', 'importFns', 'importIndexByName', 'sigTypes', 'sigTypeIndex'];
+  'importDecls', 'importFns', 'importIndexByName', 'sigTypes', 'sigTypeIndex',
+  'frameLocalLiveness', 'omittedFrameSlots'];
 
 test('structured compiler releases emission plans while imports remain executable', async t => {
   const classpath = compile(t, 'RetainedWasm', `
