@@ -34,9 +34,7 @@ function copyPattern(width, element='i') {
   move(1);add('goto','forwardTail');mark('forwardReturn');add('return');
   return ops.map(([op,...args])=>[op,...(op==='goto'||op.startsWith('if_')?[labels.get(args[0])]:args)]);
 }
-function recognizePrimitiveCopy(method) {
-  if(!['([II[III)V','([BI[BII)V'].includes(method.descriptor) || !method.flags?.includes('static') ||
-      method.flags.includes('synchronized'))return null;
+function normalizedCopyCode(method) {
   const code=method.attributes.find(a=>a.type==='code')?.code;
   if(!code || code.exceptionTable?.length)return null;
   const instructions=[],labels=new Map();
@@ -48,10 +46,18 @@ function recognizePrimitiveCopy(method) {
     const op=getOp(insn),local=/^(aload|iload|istore)_([0-3])$/.exec(op);
     if(local)return [local[1],Number(local[2])];
     if(['aload','iload','istore'].includes(op))return [op,Number(insn.varnum??insn.arg)];
+    if(op==='bipush'||op==='sipush')return [op,Number(insn.arg)];
     if(op==='iinc')return [op,Number(insn.varnum),Number(insn.incr)];
     if(op==='goto'||op.startsWith('if_'))return [op,labels.get(String(insn.arg).replace(/:$/,''))];
     return [op];
   });
+  return actual;
+}
+function recognizePrimitiveCopy(method) {
+  if(!['([II[III)V','([BI[BII)V'].includes(method.descriptor) || !method.flags?.includes('static') ||
+      method.flags.includes('synchronized'))return null;
+  const actual=normalizedCopyCode(method);
+  if(!actual)return null;
   for(let width=2;width<=16;width++){
     const expected=copyPattern(width,method.descriptor==='([BI[BII)V'?'b':'i');
     if(actual.length===expected.length && actual.every((op,i)=>
@@ -73,18 +79,37 @@ function byteHeapCopyEligible(heap,array) {
   return heapCopyKind(heap,array)===0x11;
 }
 
-function emitPrimitiveCopyEntry(compiler) {
+function emitPrimitiveCopyEntry(compiler,structured) {
   const byte=compiler.method.descriptor==='([BI[BII)V';
   const enabled=byte?compiler.wasmJit.primitiveByteCopyEntryEnabled:compiler.wasmJit.primitiveArrayCopyEntryEnabled;
-  if(!enabled || !compiler.heap ||
+  if(!['([II[III)V','([BI[BII)V'].includes(compiler.method.descriptor) ||
+      !compiler.method.flags?.includes('static') || compiler.method.flags.includes('synchronized') || !compiler.heap ||
       compiler.demoted.size || compiler.deoptBlocks.size)return [];
   const plan=recognizePrimitiveCopy(compiler.method);
-  if(!plan || compiler.fn.params.length!==5)return [];
+  if(compiler.fn.params.length!==5)return [];
+  const empty=plan || require('./emptyPrimitiveCopyProof').proveEmptyPrimitiveCopy(normalizedCopyCode(compiler.method));
+  if(!empty)return [];
+  // Each original instruction can enter at most all structured loop headers.
+  // Overestimate rather than bypass an existing low-fuel continuation.
+  const fuelBound=plan?2:Math.max(2,empty.steps*Math.max(1,structured.loopHeaders.size));
   const source=compiler.arrayCacheFor(compiler.fn.params[0]);
   const target=compiler.arrayCacheFor(compiler.fn.params[2]);
   if(!source.parameter||!target.parameter)return [];
   const get=local=>[OP.local_get,...uleb(local)];
   const use=index=>compiler.useOf(compiler.fn.params[index]);
+  // For nonnegative source positions, zero count reaches neither loop body
+  // and its signed end-index arithmetic cannot wrap. Avoid all array metadata
+  // lookups, including for null parameters. Preserve low-fuel loop exits.
+  compiler.primitiveCopyZeroEntry=[
+    ...get(compiler.blkLocal),OP.i32_eqz,
+    ...use(4),OP.i32_eqz,OP.i32_and,
+    ...use(1),OP.i32_const,0,OP.i32_ge_s,OP.i32_and,
+    ...get(compiler.fuelLocal),OP.i32_const,...sleb(fuelBound),OP.i32_gt_s,OP.i32_and,
+    OP.if,0x40,OP.i32_const,...sleb(-1),STRUCTURED_RETURN,OP.end,
+  ];
+  compiler.primitiveCopyZeroProof=true;
+  compiler.primitiveCopyZeroFuel=fuelBound;
+  if(!enabled||!plan)return [];
   const width=[OP.i32_const,byte?0:2,OP.i32_shl];
   const address=(cache,index)=>[...get(cache.base),...use(index),...width,OP.i32_add];
   const range=(cache,index)=>[...get(cache.len),...use(index),OP.i32_ge_u,
@@ -109,16 +134,6 @@ function emitPrimitiveCopyEntry(compiler) {
     ...address(target,3),...address(source,1),...use(4),...width,
     0xfc,0x0a,0x00,0x00,
     OP.i32_const,...sleb(-1),STRUCTURED_RETURN,OP.end,
-  ];
-  // For nonnegative source positions, zero count reaches neither loop body
-  // and its signed end-index arithmetic cannot wrap. Avoid all array metadata
-  // lookups, including for null parameters. Preserve low-fuel loop exits.
-  compiler.primitiveCopyZeroEntry=[
-    ...get(compiler.blkLocal),OP.i32_eqz,
-    ...use(4),OP.i32_eqz,OP.i32_and,
-    ...use(1),OP.i32_const,0,OP.i32_ge_s,OP.i32_and,
-    ...get(compiler.fuelLocal),OP.i32_const,2,OP.i32_gt_s,OP.i32_and,
-    OP.if,0x40,OP.i32_const,...sleb(-1),STRUCTURED_RETURN,OP.end,
   ];
   compiler.primitiveCopyEntryUnroll=plan.width;
   compiler.primitiveCopyEntryBytes=out.length+compiler.primitiveCopyZeroEntry.length;

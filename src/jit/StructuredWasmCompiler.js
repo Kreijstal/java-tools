@@ -27,7 +27,7 @@ const { buildCfgFromCode, structure, IrreducibleError, succOfTerm, succAllOfTerm
 const { splitIrreducibleTerms } = require('../decompiler/exceptionStructurer');
 const { buildSsa } = require('../analysis/opgraph/ssa');
 const {
-  T, OP, TRUNC_SAT, STRUCTURED_RETURN, CAPTURE_DIRECT_ID, uleb, sleb, f32bytes, f64bytes,
+  T, OP, TRUNC_SAT, STRUCTURED_RETURN, CAPTURE_DIRECT_ID, definedGlobal, uleb, sleb, f32bytes, f64bytes,
   emitTryTableCatchAll, supportsWasmTryTable, emitTryTableJsTag, supportsWasmJsTag,
   wasmProfilerName, parseMethodDescriptor, descToWasm, getOp,
   BRANCH_COND, BRANCH_ZERO, ICONST, BIN_OPS, ARRAY_LOAD, ARRAY_STORE,
@@ -193,6 +193,8 @@ class StructuredWasmCompiler {
     this.linkSlots = [];
     if(this.canonicalSlots?.length)this.wasmJit.canonicalDirectLinks.release(this.canonicalSlots);
     this.canonicalSlots=[];
+    this.globalImportDecls=[];
+    this.importedGlobals={};
     if(this.canonicalLifetime)this.canonicalLifetime.fallbacks=[];
   }
 
@@ -280,11 +282,11 @@ class StructuredWasmCompiler {
           'fn', 'cfg', 'items', 'originalItems', 'localOf', 'arrayCaches', 'heapParamLocals',
           'fieldArrayOwners', 'sharedFieldArrayGroups', 'arrayReaderGenerations', 'primitiveCopyZeroEntry',
           'fieldCaches', 'castCaches', 'objCaches', 'linkSlotByNode', 'canonicalSlotByNode',
-          'deoptableSites', 'linkSlotSites', 'canonicalCompactSlots', 'fusedGuardOfLoad',
+          'deoptableSites', 'linkSlotSites', 'canonicalCompactSlots', 'emptyCopySites', 'fusedGuardOfLoad',
           'fusedGuardArms', 'fusedFieldReads', 'rematLoads', 'inlinedInitializationGuards', 'heapReadinessGuards',
           'labelIndex', 'origIdx', 'deoptStubs', 'deoptBlocks', 'declared',
           'frames', 'guardSites', 'liveRanges', 'demoteBlockersByBlock',
-          'importDecls', 'importFns', 'importIndexByName', 'sigTypes', 'sigTypeIndex',
+          'importDecls', 'importFns', 'importIndexByName', 'globalImportDecls', 'importedGlobals', 'emptyCopyGlobals', 'sigTypes', 'sigTypeIndex',
           'stringConstantImports',
         ]) {
           // Clear roots without changing the runtime import receiver's shape.
@@ -456,6 +458,8 @@ class StructuredWasmCompiler {
     this.usedCanonicalTable=false;
     this.canonicalLifetime=this.wasmJit.canonicalDirectCallsEnabled?{fallbacks:[],metadata:null}:null;
     this.canonicalSlots=[];
+    this.globalImportDecls=[];
+    this.importedGlobals={};
     this.declared = [];
     this.nextLocal = this.fuelLocal + 1;
     this.directFrames = directEligible
@@ -482,6 +486,8 @@ class StructuredWasmCompiler {
       }, true);
     }
     if(this.directFrames){
+      this.globalImportDecls.push({name:'canonical_fuel',type:T.i32,mutable:true});
+      this.importedGlobals.canonical_fuel=new WebAssembly.Global({value:'i32',mutable:true},100_000_000);
       this.directIdLocal=this.nextLocal++;
       this.declared.push(T.i32);
       const token=this.jvm.getClassInitializationToken(this.className);
@@ -688,7 +694,7 @@ class StructuredWasmCompiler {
     for (const cache of this.arrayCaches.values()) {
       if (cache.parameter) arrayEntry.push(...this.arrayCacheFill(cache));
     }
-    const primitiveCopyEntry = require('./primitiveArrayCopyEntry').emitPrimitiveCopyEntry(this);
+    const primitiveCopyEntry = require('./primitiveArrayCopyEntry').emitPrimitiveCopyEntry(this,structured);
     const intZeroClearEntry = require('./intZeroClearEntry').emitIntZeroClearEntry(this);
     body.unshift(...(this.primitiveCopyZeroEntry || []), ...arrayEntry, ...primitiveCopyEntry, ...intZeroClearEntry);
     if(this.directFrames){
@@ -712,12 +718,13 @@ class StructuredWasmCompiler {
       sigTypes: this.sigTypes,
       canonicalFrameExport: this.directFrames ? {readyIdx:this.directOwnerReadyIdx,
         readyAddress:this.directOwnerReadyAddress,
-        compact:!!this.compactExitLinks,
+        fuelImportIndex:0,compact:!!this.compactExitLinks,
         inlineCompact:true,idLocal:this.directIdLocal,
         recordIdx:this.jsTagEh ? this.jsTagRecordIdx : undefined} : null,
       importJsTag: this.jsTagEh,
       importCanonicalTable: !!this.usedCanonicalTable,
       parameterArrayABI: this.parameterArrayABI,
+      globalImportDecls:this.globalImportDecls,
     });
 
     const blockOfItem = new Map();
@@ -792,12 +799,15 @@ class StructuredWasmCompiler {
     }
     return {
       bytes,
-      importObject: { env },
+      importObject: { env:{...env,...this.importedGlobals} },
       box: this.box,
       directFrameContext: this.directFrames,
+      hostOwnedCanonicalFuel:this.importedGlobals.canonical_fuel||null,
+      canonicalOwnerReadyAddress:this.directOwnerReadyAddress,
       parameterArrayABI: this.parameterArrayABI.slice(),
       canonicalDirectSites: this.canonicalSlotByNode?.size || 0,
       canonicalCompactSites:this.canonicalCompactSlots?.size || 0,
+      canonicalEmptyCopySites:this.emptyCopySites?.size || 0,
       canonicalCompactOwnerTag:this.compactExitLinks ? this.wasmJit.canonicalDirectLinks.identity : null,
       canonicalSlots: this.canonicalSlots.slice(),
       canonicalLifetime:this.canonicalLifetime,
@@ -861,6 +871,8 @@ class StructuredWasmCompiler {
           cfg.blocks[id].insns.filter((i) => items[i] && items[i].instruction).length, 0),
       boxedCount: 0,
       fieldCacheCount: this.fieldCaches.size,
+      primitiveCopyZeroProof:!!this.primitiveCopyZeroProof,
+      primitiveCopyZeroFuel:this.primitiveCopyZeroFuel||0,
       primitiveCopyEntryUnroll: this.primitiveCopyEntryUnroll || 0,
       primitiveCopyEntryBytes: this.primitiveCopyEntryBytes || 0,
       intZeroClearEntryBytes: this.intZeroClearEntryBytes || 0,
@@ -1426,14 +1438,14 @@ class StructuredWasmCompiler {
       // Numeric values also use the cheaper ret_* import for JS entries.
       // References use only retv, consumed/cleared by both JS and runv callers;
       // copying them into box.ret would retain the last returned object.
-      out.push(...this.useOf(value), OP.global_set, ...uleb(0));
+      out.push(...this.useOf(value), ...definedGlobal(OP.global_set,0));
       if (t !== T.ref) {
         // Direct scalar calls return the exported global in their native ABI.
         // Only ordinary JS entries need the legacy box.ret import callback.
         if (this.canonicalNonThrowingNormalFlow || this.canonicalRecordedLeaf) {
           out.push(OP.local_get, ...uleb(this.directIdLocal), OP.i32_eqz, OP.if, 0x40);
         }
-        out.push(OP.global_get, ...uleb(0), OP.call,
+        out.push(...definedGlobal(OP.global_get,0), OP.call,
           ...uleb(this.importIndexByName.get(`ret_${sig(t)}`)));
         if (this.canonicalNonThrowingNormalFlow || this.canonicalRecordedLeaf) out.push(OP.end);
       }
@@ -1886,6 +1898,16 @@ class StructuredWasmCompiler {
         }
         this.deoptableSites.add(node.itemIdx);
       }
+      const empty=call.canonical?.emptyCopy;
+      if(empty){
+        // SSA has already evaluated the arguments in Java order. Deferred
+        // array reads are excluded when the guard is created below.
+        out.push(...use(4),OP.i32_eqz,...use(1),OP.i32_const,0,OP.i32_ge_s,OP.i32_and,
+          OP.i32_const,...sleb(empty.address),OP.i32_load,2,0,OP.i32_and,
+          OP.global_get,...uleb(empty.fuelIndex),OP.i32_const,...sleb(empty.fuelBound),OP.i32_gt_s,OP.i32_and,
+          OP.i32_const,...sleb(empty.readyAddress),OP.i32_load,2,0,OP.i32_and,
+          OP.i32_eqz,OP.if,0x40);
+      }
       for (let i = 0; i < node.args.length; i += 1) out.push(...use(i));
       if(call.canonical){
         const c=call.canonical;
@@ -1916,6 +1938,7 @@ class StructuredWasmCompiler {
         out.push(OP.end);
         this.emitCallExitStub(node,site,unders,false,out);
         out.push(OP.end,OP.end);
+        if(empty)out.push(OP.end);
         out.push(...this.callFieldCacheKills(call));
         if(node.kind!=='V')out.push(...this.cacheKillsFor(node.id));
         return;
@@ -1944,7 +1967,7 @@ class StructuredWasmCompiler {
           // (zeroed on class load, re-armed by entry revalidation).
           out.push(OP.local_get, ...uleb(argScr[0]), OP.ref_is_null, OP.i32_eqz);
           if (dl.specMono) {
-            out.push(OP.global_get, ...uleb(dl.specokIdx), OP.i32_and);
+            out.push(...definedGlobal(OP.global_get,dl.specokIdx), OP.i32_and);
           }
         }
         if (dl.initializationGuardIdx !== undefined) {
@@ -2656,13 +2679,31 @@ class StructuredWasmCompiler {
         binding.canonicalDirect=true;
         binding.lateBound=!linked;
         binding.slot=direct;
+        let emptyCopy;
+        if(this.heap && ret==='V' && node.args.length===5 &&
+            !node.args.some(arg=>this.rematLoads?.has(arg))){
+          const guard=this.wasmJit.canonicalDirectLinks.enableEmptyCopy(direct,this.heap,calleeSt);
+          if(guard){
+            const globals=this.emptyCopyGlobals ||= new Map();
+            let fuelIndex=globals.get(guard.fuel);
+            if(fuelIndex===undefined){
+              fuelIndex=this.globalImportDecls.length;
+              const name='empty_copy_fuel_'+fuelIndex;
+              this.globalImportDecls.push({name,type:T.i32,mutable:true});
+              this.importedGlobals[name]=guard.fuel;globals.set(guard.fuel,fuelIndex);
+            }
+            emptyCopy={address:guard.address,readyAddress:guard.readyAddress,fuelIndex,fuelBound:guard.fuelBound};
+            (this.emptyCopySites ||= new Set()).add(direct);
+            this.wasmJit.canonicalDirectLinks.publish(calleeSt);
+          }
+        }
         this.usedCanonicalTable=true;
         this.canonicalDirectSites=(this.canonicalDirectSites||0)+1;
         const type=this.internSig(expandedParams,[T.i32,...(compact?[]:[T.i32,T.ref]),...results]);
         const consumeIdx=compact ? this.addImport('canonical_compact_exit',[T.i32],[T.i32],
           status=>this.consumeCompactExit(status)) : this.addImport('canonical_exit',[T.i32,T.i32,T.ref],[T.i32],
           (status,id,owner)=>this.consumeDirectExit(status,id,owner));
-        return {canonical:{slot:direct,type,consumeIdx,arrays,arrayOwnerReady,compact},writes,deoptable:true};
+        return {canonical:{slot:direct,type,consumeIdx,arrays,arrayOwnerReady,compact,emptyCopy},writes,deoptable:true};
       }
     }
     // UNKNOWN: the callee owns no module yet. Emit a late-bound call rather

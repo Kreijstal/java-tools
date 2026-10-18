@@ -11,6 +11,8 @@ const CAT2 = new Set([T.i64, T.f64]);
 // Immediates can contain any opcode byte, including the byte for return.
 const STRUCTURED_RETURN=Object.freeze({kind:'structured return'});
 const CAPTURE_DIRECT_ID=Object.freeze({kind:'capture direct invocation'});
+const DEFINED_GLOBAL=Symbol('defined Wasm global');
+const definedGlobal=(op,index)=>[{kind:DEFINED_GLOBAL,op,index}];
 
 const OP = {
   unreachable: 0x00, block: 0x02, loop: 0x03, if: 0x04, else: 0x05,
@@ -594,17 +596,17 @@ function takeWasmReturnValue(meta) {
 // block 0 and the nested-call fuel budget, run the main function, then push
 // the retv global so a wasm->wasm caller receives [status, value] without
 // any JS boundary. Mirrors the JS bridges' full[] tail exactly.
-function runvWrapperBody(paramCount, mainIdx, retvType, heapParameterCount = 0) {
+function runvWrapperBody(paramCount, mainIdx, retvType, heapParameterCount = 0, retvIndex = 0) {
   const out = [0]; // no locals
   for (let i = 0; i < paramCount; i++) out.push(OP.local_get, ...uleb(i));
   for (let i = 0; i < heapParameterCount; i++) out.push(OP.i32_const, ...sleb(-2), OP.i32_const, 0);
   out.push(OP.i32_const, ...sleb(0));
   out.push(OP.i32_const, ...sleb(100_000_000));
   out.push(OP.call, ...uleb(mainIdx));
-  if (retvType) out.push(OP.global_get, ...uleb(0));
+  if (retvType) out.push(OP.global_get, ...uleb(retvIndex));
   // The returned externref is already on the operand stack. A long-lived
   // module must not keep a second owning reference in its result scratch.
-  if (retvType === T.ref) out.push(OP.ref_null, T.ref, OP.global_set, ...uleb(0));
+  if (retvType === T.ref) out.push(OP.ref_null, T.ref, OP.global_set, ...uleb(retvIndex));
   out.push(OP.end);
   return out;
 }
@@ -612,7 +614,7 @@ function runvWrapperBody(paramCount, mainIdx, retvType, heapParameterCount = 0) 
 // Direct canonical wrapper returns status, invocation id, owner, and value.
 // The main body captures/clears the active id before any guest work. Its
 // spill imports use that local id, so recursive calls cannot overwrite it.
-function canonicalRunWrapperBody(paramCount, mainIdx, retvType, globals, readyIdx, recordIdx, heapParameterCount = 0, readyAddress, compact = false) {
+function canonicalRunWrapperBody(paramCount, mainIdx, retvType, globals, readyIdx, recordIdx, heapParameterCount = 0, readyAddress, compact = false, retvIndex = 0, fuelIndex = globals + 3) {
   const id=paramCount, status=paramCount+1;
   const out=[1,2,T.i32]; // two i32 locals
   out.push(...(readyAddress===undefined ? [OP.call,...uleb(readyIdx)] :
@@ -633,32 +635,34 @@ function canonicalRunWrapperBody(paramCount, mainIdx, retvType, globals, readyId
   emitCatch(out,body=>{
     for(let i=0;i<paramCount;i++)body.push(OP.local_get,...uleb(i));
     for(let i=0;i<heapParameterCount;i++)body.push(OP.i32_const,...sleb(-2),OP.i32_const,0);
-    body.push(OP.i32_const,0,OP.global_get,...uleb(globals+3),
+    body.push(OP.i32_const,0,OP.global_get,...uleb(fuelIndex),
       OP.call,...uleb(mainIdx),OP.local_set,...uleb(status));
   },body=>body.push(OP.i32_const,...sleb(-5),OP.local_set,...uleb(status)));
   out.push(OP.local_get,...uleb(status));
   if(!compact)out.push(OP.local_get,...uleb(id),OP.global_get,...uleb(globals+2));
-  if(retvType)out.push(OP.global_get,0);
+  if(retvType)out.push(OP.global_get,...uleb(retvIndex));
   out.push(OP.end);
   return out;
 }
 
-function structuredBodyBytes(body,frame,globals,returnValue=false) {
+function structuredBodyBytes(body,frame,globals,returnValue=false,globalBase=0) {
   const out=[];
   for(const byte of body){
     if(byte===STRUCTURED_RETURN){
-      if(returnValue)out.push(OP.global_get,0);
+      if(returnValue)out.push(OP.global_get,...uleb(globalBase));
       out.push(OP.return);
     }else if(byte===CAPTURE_DIRECT_ID){
       if(!Number.isInteger(frame?.idLocal))throw TypeError('missing canonical invocation local');
       if(!frame.inline)out.push(OP.global_get,...uleb(globals),OP.local_set,...uleb(frame.idLocal),
         OP.i32_const,0,OP.global_set,...uleb(globals));
+    }else if(byte?.kind===DEFINED_GLOBAL){
+      out.push(byte.op,...uleb(globalBase+byte.index));
     }else out.push(byte);
   }
   return out;
 }
 
-function inlineCompactBody(paramCount,missingHeap,mainParams,declared,body,retvType,globals,frame) {
+function inlineCompactBody(paramCount,missingHeap,mainParams,declared,body,retvType,globals,frame,retvIndex=0,fuelIndex=globals+3) {
   const locals=[...Array(missingHeap*2+2).fill(T.i32),...declared];
   const out=[...uleb(locals.length),...locals.flatMap(t=>[1,t])];
   out.push(...(frame.readyAddress===undefined ? [OP.call,...uleb(frame.readyIdx)] :
@@ -670,14 +674,14 @@ function inlineCompactBody(paramCount,missingHeap,mainParams,declared,body,retvT
     OP.global_get,...uleb(globals+1),OP.i32_const,1,OP.i32_add,OP.local_tee,...uleb(frame.idLocal),
     OP.i32_eqz,OP.if,0x40,OP.i32_const,1,OP.local_set,...uleb(frame.idLocal),OP.end,
     OP.local_get,...uleb(frame.idLocal),OP.global_set,...uleb(globals+1),
-    OP.global_get,...uleb(globals+3),OP.local_set,...uleb(mainParams.length-1));
+    OP.global_get,...uleb(fuelIndex),OP.local_set,...uleb(mainParams.length-1));
   for(let i=0;i<missingHeap;i++)out.push(OP.i32_const,...sleb(-2),OP.local_set,...uleb(paramCount+2*i));
   const emitCatch=frame.recordIdx==null ? emitTryTableCatchAll :
     (out,body,handler)=>emitTryTableJsTag(out,body,handler,frame.recordIdx);
-  emitCatch(out,native=>native.push(...structuredBodyBytes(body.slice(0,-1),{...frame,inline:true},globals,!!retvType)),
+  emitCatch(out,native=>native.push(...structuredBodyBytes(body.slice(0,-1),{...frame,inline:true},globals,!!retvType,retvIndex)),
     handler=>{
       handler.push(OP.i32_const,...sleb(-5));
-      if(retvType)handler.push(OP.global_get,0);
+      if(retvType)handler.push(OP.global_get,...uleb(retvIndex));
       handler.push(OP.return);
     });
   out.push(OP.unreachable,OP.end);
@@ -695,13 +699,18 @@ function specokGlobalEntry() {
 
 function assembleModule({ importDecls, mainParams, mainResults, declared, body, profilerName,
   importMemory, retvType, runvWrapper, specokGlobal, importTable, sigTypes,
-  canonicalFrameExport, importCanonicalTable, importJsTag, parameterArrayABI = [] }) {
+  canonicalFrameExport, importCanonicalTable, importJsTag, parameterArrayABI = [], globalImportDecls = [] }) {
   if (canonicalFrameExport?.readyAddress !== undefined &&
       (!importMemory || !Number.isInteger(canonicalFrameExport.readyAddress) ||
        canonicalFrameExport.readyAddress < 0 || canonicalFrameExport.readyAddress > 0x7ffffff8 ||
        (canonicalFrameExport.readyAddress & 3))) {
     throw new TypeError('canonical readiness address requires aligned imported memory');
   }
+  const globalBase=globalImportDecls.length;
+  const importedFuel=canonicalFrameExport?.fuelImportIndex;
+  if(importedFuel!==undefined && (!Number.isInteger(importedFuel) || importedFuel<0 ||
+      globalImportDecls[importedFuel]?.type!==T.i32 || !globalImportDecls[importedFuel]?.mutable))
+    throw TypeError('canonical fuel requires an imported mutable i32 global');
   const typeKey = (p, r) => `${p.join(',')}|${r.join(',')}`;
   const types = [];
   const typeIndex = new Map();
@@ -740,6 +749,10 @@ function assembleModule({ importDecls, mainParams, mainResults, declared, body, 
     const nameBytes = [...d.name].map((c) => c.charCodeAt(0));
     importEntries.push([3, 0x65, 0x6e, 0x76, ...uleb(nameBytes.length), ...nameBytes, 0x00, ...uleb(ti)]);
   }
+  for(const d of globalImportDecls){
+    const name=[...d.name].map(c=>c.charCodeAt(0));
+    importEntries.push([3,0x65,0x6e,0x76,...uleb(name.length),...name,3,d.type,d.mutable?1:0]);
+  }
   if (importJsTag) {
     const ti = internType([T.ref], []);
     // Tags have a separate index space; existing function indices stay fixed.
@@ -752,8 +765,8 @@ function assembleModule({ importDecls, mainParams, mainResults, declared, body, 
   const section = (id, content) => [id, ...uleb(content.length), ...content];
   const vec = (entries) => [...uleb(entries.length), ...entries.flat()];
   const localDecls = [...uleb(declared.length), ...declared.flatMap((t) => [1, t])];
-  const canonicalGlobals=(retvType?1:0)+(specokGlobal?1:0);
-  const funcBody = [...localDecls, ...structuredBodyBytes(body,canonicalFrameExport,canonicalGlobals)];
+  const canonicalGlobals=globalBase+(retvType?1:0)+(specokGlobal?1:0);
+  const funcBody = [...localDecls, ...structuredBodyBytes(body,canonicalFrameExport,canonicalGlobals,false,globalBase)];
   const exportName = [...'run'].map((c) => c.charCodeAt(0));
   const profilerNameSection = profilerName
     ? wasmFunctionNameSection(mainIdx, profilerName) : [];
@@ -761,13 +774,13 @@ function assembleModule({ importDecls, mainParams, mainResults, declared, body, 
     ...(retvType ? [retvGlobalEntry(retvType)] : []),
     ...(specokGlobal ? [specokGlobalEntry()] : []),
     ...(canonicalFrameExport ? [retvGlobalEntry(T.i32), retvGlobalEntry(T.i32),
-      retvGlobalEntry(T.ref), [T.i32,1,OP.i32_const,...sleb(100_000_000),OP.end]] : []),
+      retvGlobalEntry(T.ref), ...(importedFuel===undefined?[[T.i32,1,OP.i32_const,...sleb(100_000_000),OP.end]]:[])] : []),
   ];
   const globalSection = globalEntries.length
     ? section(6, [globalEntries.length, ...globalEntries.flat()]) : [];
   const retvName = [...'retv'].map((c) => c.charCodeAt(0));
   const specokName = [...'specok'].map((c) => c.charCodeAt(0));
-  const specokIdx = retvType ? 1 : 0;
+  const specokIdx = globalBase+(retvType ? 1 : 0);
   // The runv wrapper takes the java params only (block 0 / fuel are
   // supplied inside) and returns [status, value] for direct wasm->wasm
   // callers. Only real method modules ask for it: their main signature is
@@ -800,7 +813,7 @@ function assembleModule({ importDecls, mainParams, mainResults, declared, body, 
   }
   const exportEntries = [
     [exportName.length, ...exportName, 0x00, ...uleb(runIdx)],
-    ...(retvType ? [[retvName.length, ...retvName, 0x03, 0]] : []),
+    ...(retvType ? [[retvName.length, ...retvName, 0x03, ...uleb(globalBase)]] : []),
     ...(specokGlobal ? [[specokName.length, ...specokName, 0x03, ...uleb(specokIdx)]] : []),
   ];
   const exportFunction = (name, index) => {
@@ -809,20 +822,21 @@ function assembleModule({ importDecls, mainParams, mainResults, declared, body, 
   };
   if (runvWrapper) exportFunction('runv', addFunction(paramOnly,
     retvType ? [T.i32, retvType] : [T.i32],
-    runvWrapperBody(paramOnly.length, mainIdx, retvType, heapParameterCount)));
+    runvWrapperBody(paramOnly.length, mainIdx, retvType, heapParameterCount,globalBase)));
   if(canonicalFrameExport){
-    const globals=(retvType?1:0)+(specokGlobal?1:0);
+    const globals=canonicalGlobals;
+    const fuelIndex=importedFuel ?? globals+3;
     const results=[T.i32,T.i32,T.ref,...(retvType?[retvType]:[])];
     exportFunction('canonicalRun',addFunction(paramOnly,results,
       canonicalRunWrapperBody(paramOnly.length,mainIdx,retvType,globals,
         canonicalFrameExport.readyIdx,canonicalFrameExport.recordIdx,heapParameterCount,
-        canonicalFrameExport.readyAddress)));
+        canonicalFrameExport.readyAddress,false,globalBase,fuelIndex)));
     if (heapParameterCount) {
       const expanded = [...paramOnly, ...parameterArrayABI.flatMap(() => [T.i32, T.i32])];
       exportFunction('canonicalHeapRun',addFunction(expanded,results,
         canonicalRunWrapperBody(expanded.length,mainIdx,retvType,globals,
           canonicalFrameExport.readyIdx,canonicalFrameExport.recordIdx,0,
-          canonicalFrameExport.readyAddress)));
+          canonicalFrameExport.readyAddress,false,globalBase,fuelIndex)));
     }
     if(canonicalFrameExport.compact){
       const compactResults=[T.i32,...(retvType?[retvType]:[])];
@@ -832,12 +846,12 @@ function assembleModule({ importDecls, mainParams, mainResults, declared, body, 
       const compactEntry=(name,params,missingHeap)=>{
         let bytes,inline=false;
         if(canonicalFrameExport.inlineCompact && body[0]===CAPTURE_DIRECT_ID && body.at(-1)===OP.end){
-          const candidate=inlineCompactBody(params.length,missingHeap,mainParams,declared,body,retvType,globals,canonicalFrameExport);
+          const candidate=inlineCompactBody(params.length,missingHeap,mainParams,declared,body,retvType,globals,canonicalFrameExport,globalBase,fuelIndex);
           if(candidate.length<=remaining){bytes=candidate;inline=true;remaining-=candidate.length;}
         }
         bytes ||= canonicalRunWrapperBody(params.length,mainIdx,retvType,globals,
           canonicalFrameExport.readyIdx,canonicalFrameExport.recordIdx,missingHeap,
-          canonicalFrameExport.readyAddress,true);
+          canonicalFrameExport.readyAddress,true,globalBase,fuelIndex);
         const index=addFunction(params,compactResults,bytes);exportFunction(name,index);
         if(inline)exportFunction(name.replace('Compact','InlineCompact'),index);
       };
@@ -847,7 +861,7 @@ function assembleModule({ importDecls, mainParams, mainResults, declared, body, 
       }
       compactEntry('canonicalCompactRun',paramOnly,heapParameterCount);
     }
-    for(const [label,index] of [['canonicalOwner',globals+2],['canonicalFuel',globals+3],['canonicalEntries',globals+1]]){
+    for(const [label,index] of [['canonicalOwner',globals+2],['canonicalFuel',fuelIndex],['canonicalEntries',globals+1]]){
       const bytes=[...label].map(c=>c.charCodeAt(0));exportEntries.push([bytes.length,...bytes,3,...uleb(index)]);
     }
   }
@@ -993,7 +1007,7 @@ function capturesBooleanStatic(method) {
 }
 
 module.exports = {
-  T, CAT2, OP, TRUNC_SAT, STRUCTURED_RETURN, CAPTURE_DIRECT_ID,
+  T, CAT2, OP, TRUNC_SAT, STRUCTURED_RETURN, CAPTURE_DIRECT_ID, definedGlobal,
   uleb, sleb, f32bytes, f64bytes,
   emitTryTableCatchAll, supportsWasmTryTable, emitTryTableJsTag, supportsWasmJsTag,
   wasmProfilerName, wasmFunctionNameSection,

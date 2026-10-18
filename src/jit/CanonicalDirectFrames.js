@@ -113,12 +113,30 @@ class CanonicalDirectLinks {
     list.push(binding);
     return slot;
   }
+  enableEmptyCopy(slot,heap,st) {
+    const binding=this.bySlot.get(slot),meta=st?.meta;
+    if(!binding || !CanonicalDirectLinks.eligible(st) || !meta.primitiveCopyZeroProof ||
+        !meta.hostOwnedCanonicalFuel || meta.hostOwnedCanonicalFuel!==meta.canonicalFuel ||
+        !Number.isInteger(meta.canonicalOwnerReadyAddress))return null;
+    if(binding.emptyCopy)return binding.emptyCopy;
+    const address=heap.allocObject(8);
+    if(address<0)return null;
+    // Only the independent host global survives replacement. Importing a
+    // module-defined global here would retain the entire retired module.
+    const guard={heap,address,fuel:meta.hostOwnedCanonicalFuel,readyAddress:meta.canonicalOwnerReadyAddress,fuelBound:meta.primitiveCopyZeroFuel};
+    binding.emptyCopy=guard;
+    return guard;
+  }
   release(slots) {
     for(const slot of slots||[]){
       const binding=this.bySlot.get(slot);if(!binding)continue;
       const list=this.bindings.get(binding.key);
       list.splice(list.indexOf(binding),1);
       if(!list.length)this.bindings.delete(binding.key);
+      if(binding.emptyCopy){
+        const {heap,address}=binding.emptyCopy;
+        heap.i32[address>>2]=0;heap.free(address,8);
+      }
       this.bySlot.delete(slot);this.table.set(slot,null);this.freeSlots.push(slot);
     }
   }
@@ -145,10 +163,17 @@ class CanonicalDirectLinks {
           return p.slot===at&&p.t===binding.params[i];
         });
       this.table.set(binding.slot,identity?fn:binding.stub);
+      const guard=binding.emptyCopy;
+      if(guard)guard.heap.i32[guard.address>>2]=identity && !!st.meta.primitiveCopyZeroProof &&
+        st.meta.hostOwnedCanonicalFuel===guard.fuel && st.meta.canonicalFuel===guard.fuel &&
+        st.meta.canonicalOwnerReadyAddress===guard.readyAddress && st.meta.primitiveCopyZeroFuel===guard.fuelBound ? 1 : 0;
     }
   }
   withdraw(key) {
-    for(const binding of this.bindings.get(key)||[])this.table.set(binding.slot,binding.stub);
+    for(const binding of this.bindings.get(key)||[]){
+      if(binding.emptyCopy)binding.emptyCopy.heap.i32[binding.emptyCopy.address>>2]=0;
+      this.table.set(binding.slot,binding.stub);
+    }
   }
 }
 module.exports={DirectFrameContext,CanonicalDirectLinks};
