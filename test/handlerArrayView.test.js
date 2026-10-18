@@ -35,8 +35,7 @@ test('handler-only null diagnostics do not disable normal array views', async t 
   for (const enabled of [false, true]) {
     for (const [caseIndex, [name, nullArray, count]] of cases.entries()) {
       const j = new JVM({ classpath: dir, jit: { enabled, compileWorker: false,
-        wasm: false, warmupThreshold: 0, structuredSsa: true,
-        normalPathArrayOptionality: true } });
+        wasm: false, warmupThreshold: 0, structuredSsa: true } });
       await j.preloadClasspathClasses();
       j._setClassInitializationState('HandlerArrayView', 'INITIALIZED');
       const descriptor = name === 'sibling' ? '([I[I[I)V' : '([I[II)V';

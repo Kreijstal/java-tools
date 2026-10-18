@@ -642,7 +642,7 @@ class JvmSsaBlockRenderer {
         ? options.structuredSharedFieldAccessMinCodeItems : 0;
     this.compactRestoringValueCalls = options.structuredCompactRestoringValueCalls !== false;
     this.wideCaptureFreeRestoring = options.structuredWideCaptureFreeRestoring === true;
-    this.normalPathArrayOptionality = options.normalPathArrayOptionality === true;
+    this.normalPathArrayOptionality = options.normalPathArrayOptionality !== false;
     this.compactFieldCacheInvalidationCount = 0;
     this.coarseCountedLoopSafePointsEnabled =
       options.structuredCoarseCountedLoopSafePoints !== false &&
