@@ -58,7 +58,12 @@ class CanonicalDirectLinks {
     const meta = st?.meta;
     return st?.status === 'ready' && !st.synchronized && !st.linkVetoed &&
       meta?.canonicalRun && meta.normalFlowFullyCompiled &&
-      (meta.usedEh || meta.canonicalNonThrowingNormalFlow || meta.canonicalRecordedNormalFlow) &&
+      // A native JS-tag wrapper records the exact throwable even when it
+      // comes through another Wasm export. Handler-free callers therefore
+      // do not need a JavaScript bridge just because they contain calls.
+      // Without that wrapper retain the narrower leaf/recorded-import proof.
+      (meta.usedEh || meta.canonicalNonThrowingNormalFlow || meta.canonicalRecordedNormalFlow ||
+        meta.nativeJsExceptionTags) &&
       !meta.boxedCount && !(meta.specSites?.length) && !meta.speculations &&
       !'L['.includes(meta.retChar) &&
       (!meta.frameEntryOnly || meta.booleanStaticSpillProof);

@@ -119,3 +119,59 @@ test('canonical leaf imports retain throw identity and count recorded calls',t=>
  t.equal(reg.box.pendingException,guest,'guest classification is retained');
  t.end();
 });
+
+test('native JS-tag callers link without materializing successful invocations',async t=>{
+ const {supportsWasmJsTag}=require('../src/jit/wasmShared');
+ if(!supportsWasmJsTag()){t.pass('engine retains the existing bridge');t.end();return;}
+ const compile=require('./javaFixture').makeJavaFixtureCompiler('canonical-caller-');
+ const classpath=compile(t,'DirectCallerProof',`public class DirectCallerProof {
+   static int effects;
+   static int read(int[] a) { effects++; return a[0]; }
+   static int relay(int[] a) { return read(a)+3; }
+   static int repeat(int[] a,int n) { int s=0; for(int i=0;i<n;i++)s+=relay(a); return s; }
+ }`);
+ const {JVM}=require('../src/core/jvm');
+ const j=new JVM({classpath,wasmHeap:true,jit:{compileWorker:false,wasmStructured:true,
+   wasm:{canonicalEhLinks:true,canonicalDirectCalls:true,canonicalLeafCalls:true,
+     nativeJsExceptionTags:true}}});
+ await j.preloadClasspathClasses();
+ j.classInitializationState.set('DirectCallerProof','INITIALIZED');
+ const w=j.jit.wasmJit;
+ const states={};
+ for(const [name,desc] of [['read','([I)I'],['relay','([I)I'],['repeat','([II)I']]){
+   const method=j.findMethod(j.classes.DirectCallerProof,name,desc);
+   const st=w.methodState({method});w.compile({method,className:'DirectCallerProof'},st,{asCallee:true});
+   t.equal(st.status,'ready',st.lastCompileError||name+' compiles');states[name]=st;
+ }
+ const links=w.canonicalDirectLinks,repeat=states.repeat;
+ t.ok(repeat.meta.normalFlowFullyCompiled,'loop caller has complete normal flow');
+ t.notOk(repeat.meta.usedEh,'caller has no local exception handler');
+ t.notOk(repeat.meta.canonicalRecordedNormalFlow,'caller does not qualify as a recorded leaf');
+ t.ok(CanonicalDirectLinks.eligible(repeat),'native payload capture permits direct caller publication');
+ const slot=links.allocate(repeat.key,[T.ref,T.i32],[T.i32],()=>{throw Error('unexpected bridge');});
+ links.publish(repeat);
+ const array=j.wasmHeap.alloc('[I',1);array[0]=5;
+ const result=links.table.get(slot)(array,4);
+ t.equal(result[0],-1,'nested handler-free calls return normally');
+ t.equal(result[3],32,'native result is exact');
+ for(const st of Object.values(states))t.equal(st.meta.directFrameContext.createdFrames,0,
+   st.method.name+' allocates no canonical frame on normal return');
+ const effects=j.classes.DirectCallerProof.staticFields;
+ t.equal(effects.get('effects:I'),4,'each inner call runs once');
+ const thrown=links.table.get(slot)(null,4);
+ t.equal(thrown[0],-5,'nested exception unwinds as an exception, not a retry');
+ t.equal(thrown[2].box.lastThrown.type,'java/lang/NullPointerException','original guest exception reaches the caller wrapper');
+ t.equal(effects.get('effects:I'),5,'the failing call is never replayed');
+ const marker=Error('host array getter'),host=Object.assign([0],{type:'[I'});
+ Object.defineProperty(host,0,{get(){throw marker;}});
+ const hostThrown=links.table.get(slot)(host,4);
+ t.equal(hostThrown[0],-5,'a nested host error unwinds through the native wrapper');
+ t.equal(hostThrown[2].box.lastThrown,marker,'host throwable identity survives every direct call');
+ t.equal(effects.get('effects:I'),6,'the host-failing call runs exactly once');
+ for(const st of Object.values(states))t.equal(st.meta.directFrameContext.frames.size,0,
+   st.method.name+' retains no frame after exception propagation');
+ const meta=repeat.meta;
+ t.notOk(CanonicalDirectLinks.eligible({...repeat,meta:{...meta,nativeJsExceptionTags:false}}),
+   'handler-free calls still require exact payload capture on older engines');
+ links.release([slot]);t.end();
+});

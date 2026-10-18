@@ -19,20 +19,112 @@ function normalize(method) {
   return [op];
  });
 }
+// Interpret only straight-line local arithmetic and zero stores. Local copies
+// and dead initializations have no observable effects, so the proof does not
+// depend on javac's temporary-slot allocation or a decompiler's spelling.
+const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+const constant = n => ['constant', n];
+function offset(value, delta) {
+ if (value?.[0] === 'constant') return constant((value[1] + delta) | 0);
+ if (value?.[0] === 'offset') return offset(value[1], value[2] + delta);
+ return delta === 0 ? value : ['offset', value, delta];
+}
+function straightLine(code, from, end, locals) {
+ const stack = [], stores = [], inputs = new Set(), writes = new Set();
+ const pop = () => { if (!stack.length) throw Error('empty proof stack'); return stack.pop(); };
+ try {
+  for (let i = from; i < end; i++) {
+   const [op, arg, by] = code[i];
+   if (op === 'const') stack.push(constant(arg));
+   else if (op === 'iload') {
+    if (!locals.has(arg)) return null;
+    if (!writes.has(arg)) inputs.add(arg);
+    stack.push(locals.get(arg));
+   } else if (op === 'istore') { locals.set(arg, pop()); writes.add(arg); }
+   else if (op === 'iinc') {
+    if (!locals.has(arg)) return null;
+    if (!writes.has(arg)) inputs.add(arg);
+    locals.set(arg, offset(locals.get(arg), by));
+    writes.add(arg);
+   } else if (op === 'getstatic') stack.push(['field', arg]);
+   else if (op === 'iadd' || op === 'isub' || op === 'imul') {
+    const right = pop(), left = pop();
+    if (op === 'iadd' && right[0] === 'constant') stack.push(offset(left, right[1]));
+    else if (op === 'isub' && right[0] === 'constant') stack.push(offset(left, -right[1]));
+    else if (op === 'imul') stack.push(['multiply', left, right]);
+    else return null;
+   } else if (op === 'iastore') {
+    const value = pop(), index = pop(), array = pop();
+    stores.push({array, index, value});
+   } else return null;
+  }
+ } catch (_) { return null; }
+ return stack.length ? null : {stores, inputs, writes};
+}
 function recognizeIntZeroClear(method) {
- if(method.descriptor!=='()V'||!method.flags?.includes('static')||method.flags.includes('synchronized'))return null;
- const a=normalize(method);if(!a||a.length<30)return null;
- const width=a[5]?.[1]+1,dims=[a[2]?.[1],a[3]?.[1]],array=a[11]?.[1];
- const valid=(f,d)=>Array.isArray(f)&&f[0]==='Field'&&Array.isArray(f[2])&&f[2][1]===d;
- if(!Number.isInteger(width)||width<2||width>16||!dims.every(f=>valid(f,'I'))||!valid(array,'[I')||dims.some(f=>f[1]!==array[1]))return null;
- const e=[],labels=new Map(),add=(...x)=>e.push(x),mark=n=>labels.set(n,e.length);
- const store=()=>{add('getstatic',array);add('iload',0);add('iinc',0,1);add('const',0);add('iastore');};
- add('const',0);add('istore',0);add('getstatic',dims[0]);add('getstatic',dims[1]);add('imul');add('const',width-1);add('isub');add('istore',1);
- mark('bulk');add('iload',0);add('iload',1);add('if_icmpge','tailSetup');for(let i=0;i<width;i++)store();add('goto','bulk');
- mark('tailSetup');add('iinc',1,width-1);mark('tail');add('iload',0);add('iload',1);add('if_icmpge','done');store();add('goto','tail');mark('done');add('return');
- for(const x of e)if(x[0]==='goto'||x[0].startsWith('if_'))x[1]=labels.get(x[1]);
- if(JSON.stringify(a)!==JSON.stringify(e))return null;
- return {width,dims,array};
+ if(method.descriptor !== '()V' || !method.flags?.includes('static') ||
+    method.flags.includes('synchronized')) return null;
+ const a = normalize(method);
+ if (!a) return null;
+ // Exactly two ordinary counted loops: an unrolled body followed by its
+ // scalar tail. All other instructions must pass the straight-line proof.
+ const backs = a.map((x, i) => x[0] === 'goto' && x[1] < i ? [x[1], i] : null).filter(Boolean);
+ if (backs.length !== 2) return null;
+ const [[head, back], [tail, tailBack]] = backs;
+ const loop = (h, b) => a[h]?.[0] === 'iload' && a[h+1]?.[0] === 'iload' &&
+   a[h+2]?.[0] === 'if_icmpge' && a[h+2][1] === b+1;
+ if (!(head < back && back < tail && tail < tailBack) ||
+     !loop(head, back) || !loop(tail, tailBack) ||
+     !same(a[head], a[tail]) || !same(a[head+1], a[tail+1]) ||
+     tailBack+2 !== a.length || a.at(-1)[0] !== 'return') return null;
+ const index = a[head][1], bound = a[head+1][1];
+ if (index === bound) return null;
+ const entry = new Map();
+ const initial = straightLine(a, 0, head, entry);
+ if (!initial || initial.stores.length || !same(entry.get(index), constant(0))) return null;
+ const base = ['bulkIndex'];
+ const body = new Map(entry); body.set(index, base);
+ const bulk = straightLine(a, head+3, back, body), stores = bulk?.stores;
+ const width = stores?.length;
+ if (!(width >= 2 && width <= 16) || !same(body.get(index), offset(base, width)) ||
+     !same(body.get(bound), entry.get(bound))) return null;
+ if ([...bulk.inputs].some(slot => slot !== index &&
+     !same(body.get(slot), entry.get(slot)))) return null;
+ const array = stores[0].array;
+ if (!stores.every((s, i) => same(s.array, array) && same(s.index, offset(base, i)) &&
+     same(s.value, constant(0)))) return null;
+ const threshold = entry.get(bound);
+ if (threshold?.[0] !== 'offset' || threshold[2] !== 1-width ||
+     threshold[1]?.[0] !== 'multiply') return null;
+ const dims = threshold[1].slice(1);
+ const validField = (f, descriptor) => f?.[0] === 'field' &&
+   Array.isArray(f[1]) && f[1][0] === 'Field' && f[1][2]?.[1] === descriptor;
+ if (!validField(array, '[I') || !dims.every(f => validField(f, 'I')) ||
+     dims.some(f => f[1][1] !== array[1][1])) return null;
+ // Even a discarded static read can initialize a different class. The
+ // compact entry only guards and reads the dependencies proved here.
+ const dependencies = [array[1], ...dims.map(f => f[1])];
+ if (a.some(([op, field]) => op === 'getstatic' &&
+     !dependencies.some(expected => same(field, expected)))) return null;
+ // A tail setup may update the bound and temporary locals, but must not
+ // change the first index that the unrolled loop left unfilled.
+ const afterBulk = ['afterBulk'], tailEntry = new Map(entry);
+ // The bulk loop may run zero, one, or many times. A temporary it writes
+ // has no single known value at the tail, even when its first iteration did.
+ for (const slot of bulk.writes) tailEntry.set(slot, ['afterBulkLocal', slot]);
+ tailEntry.set(index, afterBulk); tailEntry.set(bound, entry.get(bound));
+ const setup = straightLine(a, back+1, tail, tailEntry);
+ if (!setup || setup.stores.length || !same(tailEntry.get(index), afterBulk) ||
+     !same(tailEntry.get(bound), threshold[1])) return null;
+ const tailBase = ['tailIndex'], tailBody = new Map(tailEntry);
+ tailBody.set(index, tailBase);
+ const remainder = straightLine(a, tail+3, tailBack, tailBody);
+ if (!remainder || remainder.stores.length !== 1 || !same(remainder.stores[0].array, array) ||
+     !same(remainder.stores[0].index, tailBase) || !same(remainder.stores[0].value, constant(0)) ||
+     !same(tailBody.get(index), offset(tailBase, 1)) || !same(tailBody.get(bound), threshold[1]) ||
+     [...remainder.inputs].some(slot => slot !== index &&
+       !same(tailBody.get(slot), tailEntry.get(slot)))) return null;
+ return {width, dims:dims.map(f => f[1]), array:array[1]};
 }
 function emitIntZeroClearEntry(c) {
  if(!c.wasmJit.intZeroClearEntryEnabled||!c.heap||c.demoted.size||c.deoptBlocks.size)return [];

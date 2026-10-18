@@ -525,6 +525,13 @@ class StructuredWasmCompiler {
     // Unsupported demotes just that block to an exit stub instead of
     // rejecting the method.
     const treeBlocks = collectTreeBlocks(structured.tree);
+    // A call-free normal path cannot run guest callbacks that reset class
+    // readiness. Test all its static dependencies before any guest effects,
+    // then keep those checks out of its loop bodies. A cold dependency only
+    // deopts to the original entry; it never initializes an untaken branch.
+    // Allocations and monitor operations keep their existing local guards.
+    this.leafInitializationGuards = [...treeBlocks].every(id =>
+      this.blockOf(id).body.every(node => !/^(invoke|new|monitor)/.test(node.op)));
     // A scalar return block containing only total integer operations has no
     // observable exception path. Reporter handlers do not change that proof.
     // Keep calls, memory operations, division, branches, and loops excluded.
@@ -793,6 +800,7 @@ class StructuredWasmCompiler {
         getOp(item.instruction)?.startsWith('invoke')),
       initializationGuardTokens: [...(this.staticInitializationGuards || [])]
         .map(name => this.jvm.getClassInitializationToken(name)),
+      entryInitializationGuards: this.inlinedInitializationGuards.size,
       slotSites: this.linkSlotSites.size,
       directLinks: this.directLinks || 0,
       directStaticLinks: this.directStaticLinks || 0,
@@ -1397,7 +1405,8 @@ class StructuredWasmCompiler {
       if (field.initializationIdx != null) initializationGuards.add(field.initializationIdx);
     }
     for (const idx of initializationGuards) {
-      if (this.origIdx && this.origIdx[this.cfg.blocks[blockId].insns[0]] === -1) {
+      if (this.leafInitializationGuards ||
+          this.origIdx && this.origIdx[this.cfg.blocks[blockId].insns[0]] === -1) {
         this.inlinedInitializationGuards.add(idx);
         continue;
       }
