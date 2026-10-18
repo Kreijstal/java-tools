@@ -9,6 +9,69 @@ function raw(fn){
   body:[OP.i32_const,...sleb(-1),OP.i32_const,1,OP.ref_null,T.ref,OP.local_get,0,OP.call,0,OP.end]});
  return new WebAssembly.Instance(new WebAssembly.Module(bytes),{env:{value:fn}}).exports.run;
 }
+
+test('canonical leaves release replaced metadata and mixed callers retain correct table indices',async t=>{
+ const {supportsWasmTryTable}=require('../src/jit/wasmShared');
+ if(!supportsWasmTryTable()){t.pass('engine retains its existing bridge');t.end();return;}
+ const {makeJavaFixtureCompiler}=require('./javaFixture'),{JVM}=require('../src/core/jvm');
+ const compile=makeJavaFixtureCompiler('canonical-leaf-retention-');
+ const classpath=compile(t,'CanonicalLeafLifetime',
+  'public class CanonicalLeafLifetime {'+
+  'static int sum(int[] a,int n){int s=0;for(int i=0;i<n;i++)s+=a[i];return s;}'+
+  'static int caller(int[] a,int n){return sum(a,n)+1;}'+
+  'static int[] identity(int[] a){for(int i=0;i<1;i++)a[i]+=0;return a;}'+
+  'static int rawOnly(int[] a,int n){int[] b=identity(a);return b[0];}'+
+  'static int mixed(int[] a,int n){int[] b=identity(a);return sum(b,n)+b[0];}'+
+  '}');
+ const j=new JVM({classpath,wasmHeap:true,jit:{enabled:false,compileWorker:false,
+  retainCompilerDiagnostics:false,wasmStructured:true,wasmRelaxedReferenceReturns:true,
+  wasm:{deepInline:false,maxInlineCalleeItems:1,noOnDemandCalleeCompile:true,
+    canonicalDirectCalls:true,canonicalEhLinks:true,canonicalLeafCalls:true,nativeJsExceptionTags:true}}});
+ await j.preloadClasspathClasses();j.classInitializationState.set('CanonicalLeafLifetime','INITIALIZED');
+ const w=j.jit.wasmJit,prepare=(name,descriptor='([II)I')=>{
+  const method=j.findMethod(j.classes.CanonicalLeafLifetime,name,descriptor),st=w.methodState({method});
+  w.compile({method,className:'CanonicalLeafLifetime'},st,{asCallee:true});
+  t.equal(st.status,'ready',st.lastCompileError||name+' compiles');return st;
+ };
+ const leaf=prepare('sum'),caller=prepare('caller'),rawOnly=prepare('rawOnly'),mixed=prepare('mixed');
+ t.equal(Object.hasOwn(leaf.meta.importObject.env,'ctab'),false,'a leaf imports no unused canonical table');
+ t.equal(Object.hasOwn(caller.meta.importObject.env,'ctab'),true,'a real canonical caller keeps its table');
+ t.equal(Object.hasOwn(rawOnly.meta.importObject.env,'ctab'),false,'a raw-only caller does not reserve table zero for canonical calls');
+ t.equal(Object.hasOwn(rawOnly.meta.importObject.env,'ltab'),true,'raw-only call keeps its late-bound table');
+ t.equal(Object.hasOwn(mixed.meta.importObject.env,'ctab'),true,'mixed caller discovers its canonical table');
+ t.equal(Object.hasOwn(mixed.meta.importObject.env,'ltab'),true,'mixed caller also keeps its raw table');
+ prepare('identity','([I)[I');
+ const a=j.wasmHeap.alloc('[I',4);a.type='[I';a.set([2,3,5,7]);
+ const run=st=>{
+  const frame=new Frame(st.method);frame.className='CanonicalLeafLifetime';frame.locals[0]=a;frame.locals[1]=4;
+  st.meta.box.frame=frame;
+  try{const status=st.run(a,4,0,1000000);t.equal(status,-1,'linked call completes');return st.meta.box.ret;}
+  finally{st.meta.box.frame=null;}
+ };
+ t.equal(run(caller),18,'canonical caller returns the exact result');
+ t.equal(run(rawOnly),2,'raw-only table is indexed correctly');
+ t.equal(run(mixed),19,'discovery fixes both table indices before final emission');
+ const metadata=[],owners=[];
+ for(let i=0;i<3;i++){
+  metadata.push(new WeakRef(leaf.meta));owners.push(new WeakRef(leaf.meta.directFrameContext));
+  w.compile({method:leaf.method,className:'CanonicalLeafLifetime'},leaf,{asCallee:true});
+  t.equal(run(caller),18,'replacement remains callable');
+ }
+ // Dispatcher OSR companions can intentionally pin their original direct
+ // imports. Retire those callers as well before asking the old leaf to die.
+ for(const state of [caller,rawOnly,mixed])
+  w.compile({method:state.method,className:'CanonicalLeafLifetime'},state,{asCallee:true});
+ t.equal(run(caller),18,'refreshed caller uses the current leaf');
+ t.equal(run(mixed),19,'refreshed mixed caller keeps both link contracts');
+ if(global.gc){
+  for(let i=0;i<8;i++){await new Promise(setImmediate);global.gc();}
+  t.deepEqual(metadata.map(ref=>ref.deref()===undefined),[true,true,true],
+    'live callers retain no superseded leaf metadata');
+  t.deepEqual(owners.map(ref=>ref.deref()===undefined),[true,true,true],
+    'live callers retain no superseded leaf frame owner');
+ }
+ t.end();
+});
 test('canonical direct table changes targets without changing the fallback contract',t=>{
  const links=new CanonicalDirectLinks(),calls=[];
  const fallback=x=>{calls.push(x);return x+7;};

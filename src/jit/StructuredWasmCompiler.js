@@ -433,8 +433,11 @@ class StructuredWasmCompiler {
     }
     this.blkLocal = fn.params.length + 2*this.parameterArrayABI.length;
     this.fuelLocal = this.blkLocal + 1;
-    this.usedCanonicalTable=this.wasmJit.canonicalDirectCallsEnabled;
-    this.canonicalLifetime=this.usedCanonicalTable?{fallbacks:[],metadata:null}:null;
+    // Discovery marks actual canonical calls before final emission. A leaf
+    // must not import the shared table merely because the option is enabled:
+    // that unnecessary connection can retain its superseded instance.
+    this.usedCanonicalTable=false;
+    this.canonicalLifetime=this.wasmJit.canonicalDirectCallsEnabled?{fallbacks:[],metadata:null}:null;
     this.canonicalSlots=[];
     this.declared = [];
     this.nextLocal = this.fuelLocal + 1;
