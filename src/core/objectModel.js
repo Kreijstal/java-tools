@@ -379,6 +379,10 @@ function makeSlabFields(jvm, layout) {
   const fields = Object.create(layout.proto);
   fields[BASE_KEY] = base;
   for (const key of layout.refKeys) fields[key] = null;
+  // Track the storage container: it can outlive its Java wrapper through
+  // reflection/host references. Registry callbacks run between host turns;
+  // compiled raw bases are invocation-local and are not cached across yields.
+  jvm.wasmHeap.trackObject?.(fields, base, layout.size);
   return fields;
 }
 

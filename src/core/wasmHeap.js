@@ -1,8 +1,8 @@
 'use strict';
 
 // Linear heap for primitive Java arrays (JVM_WASM_HEAP=1): each array is a
-// TypedArray view over one fixed-size WebAssembly.Memory, bump-allocated and
-// never freed. JS/interpreter code indexes the view exactly like the plain
+// TypedArray view over one WebAssembly.Memory. Dead registered storage returns
+// to exact-size free lists. JS/interpreter code indexes the view like the plain
 // arrays it replaces (TypedArray coercion matches Java element semantics),
 // while compiled wasm can read `view.wasmBase` once per run and then access
 // elements with raw loads/stores. When the bump pointer runs out, allocation falls back to ordinary
@@ -112,8 +112,10 @@ class WasmHeap {
     this.stats = { bumped: 0, reused: 0, freed: 0, freeBytes: 0,
       arrayBumped: 0, arrayReused: 0, arrayFreed: 0, arrayFreeBytes: 0,
       arrayReclaimed: 0 };
+    this.objectAllocations = new Map();
     this.registry = reclaimEnabled()
-      ? new FinalizationRegistry((held) => this.reclaimExtent(held))
+      ? new FinalizationRegistry((held) => held.kind === 'object'
+        ? this.reclaimObject(held) : this.reclaimExtent(held))
       : null;
     // Typed views for object-field access. These are internal to this file and
     // to objectModel's slab accessors, which read `heap.i32` on every access
@@ -228,6 +230,12 @@ class WasmHeap {
     if (!(base > 0)) return false;
     const size = (bytes + 7) & ~7;
     if (size <= 0 || size > MAX_BINNED_BYTES) return false;
+    const tracked = this.objectAllocations.get(base);
+    if (tracked) {
+      if (tracked.bytes !== size) return false;
+      this.objectAllocations.delete(base);
+      this.registry?.unregister(tracked);
+    }
     const key = size >> 3;
     let bin = this.freeBins.get(key);
     if (!bin) { bin = []; this.freeBins.set(key, bin); }
@@ -235,6 +243,28 @@ class WasmHeap {
     this.stats.freed += 1;
     this.stats.freeBytes += size;
     return true;
+  }
+
+  // Reclaim object sizes supported by the existing bounded free bins.
+  // The held record contains no reference to the field container or wrapper.
+  trackObject(fields, base, bytes) {
+    const size = (bytes + 7) & ~7;
+    if (!this.registry || !fields || typeof fields !== 'object' ||
+        !Number.isInteger(base) || !Number.isInteger(bytes) || !(base > 0) ||
+        (base & 7) || bytes <= 0 || bytes > MAX_BINNED_BYTES ||
+        size <= 0 || size > MAX_BINNED_BYTES ||
+        base + size > this.top || this.objectAllocations.has(base)) return false;
+    const record = {kind: 'object', base, bytes: size};
+    this.objectAllocations.set(base, record);
+    this.registry.register(fields, record, record);
+    return true;
+  }
+
+  reclaimObject(record) {
+    // Explicit frees or reuse may precede a queued finalizer. The old
+    // allocation must never release a replacement occupying the same address.
+    if (this.objectAllocations.get(record.base) !== record) return false;
+    return this.free(record.base, record.bytes);
   }
 
   // Bytes the bump pointer has handed out, and what is parked in free lists.

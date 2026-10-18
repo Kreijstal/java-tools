@@ -2,8 +2,8 @@
 
 // Size-class free lists for object slabs (docs/refactor.md 2.2, "the first
 // allocation foundation"). These test the allocator only. Nothing here decides
-// which guest objects are dead -- that is the separate liveness half of
-// Phase 2, and free() deliberately has no caller in the runtime yet.
+// which guest objects are dead; automatic container reclamation is tested
+// separately in objectSlabReclamation.test.js.
 
 const test = require('tape');
 const { WasmHeap } = require('../src/core/wasmHeap');
