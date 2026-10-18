@@ -1,5 +1,5 @@
 'use strict';
-const {T,OP,uleb,sleb,getOp}=require('./wasmShared');
+const {T,OP,STRUCTURED_RETURN,uleb,sleb,getOp}=require('./wasmShared');
 const {heapCopyKind}=require('./WasmArrayCopy');
 const {addFieldImport}=require('./wasmRuntimeImports');
 function normalize(method) {
@@ -149,14 +149,14 @@ function emitIntZeroClearEntry(c) {
   ...get(n),...iconst(0),OP.i32_ge_s,...get(n),...iconst(1048576),OP.i32_le_s,OP.i32_and,OP.if,0x40,
   ...get(n),...iconst(plan.width),OP.i32_div_s,...get(n),...iconst(plan.width),OP.i32_rem_s,OP.i32_add,...iconst(2),OP.i32_add,...set(cost),
   ...get(c.fuelLocal),...get(cost),OP.i32_gt_s,OP.if,0x40,
-  ...get(n),OP.i32_eqz,OP.if,0x40,...get(c.fuelLocal),...get(cost),OP.i32_sub,...set(c.fuelLocal),...iconst(-1),OP.return,OP.end,
+  ...get(n),OP.i32_eqz,OP.if,0x40,...get(c.fuelLocal),...get(cost),OP.i32_sub,...set(c.fuelLocal),...iconst(-1),STRUCTURED_RETURN,OP.end,
   OP.call,...uleb(array.idx),...set(arrayLocal),
   ...get(arrayLocal),OP.call,...uleb(kind),OP.if,0x40,
   ...get(arrayLocal),OP.call,...uleb(c.abaseIdx),...set(base),
   ...get(arrayLocal),OP.call,...uleb(c.alen0Idx),...set(length),
   ...get(length),...get(n),OP.i32_ge_u,OP.if,0x40,
   ...get(base),...iconst(0),...get(n),...iconst(2),OP.i32_shl,0xfc,0x0b,0x00,
-  ...get(c.fuelLocal),...get(cost),OP.i32_sub,...set(c.fuelLocal),...get(n),OP.call,...uleb(count),...iconst(-1),OP.return,
+  ...get(c.fuelLocal),...get(cost),OP.i32_sub,...set(c.fuelLocal),...get(n),OP.call,...uleb(count),...iconst(-1),STRUCTURED_RETURN,
   OP.end,OP.end,OP.end,OP.end,OP.end];
  c.intZeroClearEntryBytes=out.length;c.intZeroClearEntryUnroll=plan.width;c.usedHeap=true;
  return out;

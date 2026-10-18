@@ -52,7 +52,20 @@ class CanonicalDirectLinks {
     this.bindings = new Map();
     this.bySlot = new Map();
     this.freeSlots = [];
+    this.identity=Symbol('canonical direct links');
+    this.pendingExit=null;
     this.finalizer = new FinalizationRegistry(slots=>this.release(slots));
+  }
+  publishExit(owner,id,status) {
+    // Native callers consume this synchronously before any other guest call.
+    // A weak owner keeps legacy/unconsumed exits from pinning retired modules.
+    this.pendingExit={owner:new WeakRef(owner),id,status};
+  }
+  takeExit(status) {
+    const transfer=this.pendingExit;this.pendingExit=null;
+    const owner=transfer?.owner.deref();
+    if(!owner || transfer.status!==status)throw Error('compact Wasm exit without its exact owner');
+    return {owner,id:transfer.id};
   }
   static eligible(st) {
     const meta = st?.meta;
@@ -68,7 +81,7 @@ class CanonicalDirectLinks {
       !'L['.includes(meta.retChar) &&
       (!meta.frameEntryOnly || meta.booleanStaticSpillProof);
   }
-  allocate(key, params, results, fallback, parameterArrayABI = []) {
+  allocate(key, params, results, fallback, parameterArrayABI = [], compact = false) {
     // The existing bridge is the fallback until a proved callee publishes.
     // -6 requests the old deopt-flag check; normal raw exports return -1.
     const imports = [{name:'fallback',params,results}];
@@ -76,11 +89,12 @@ class CanonicalDirectLinks {
     for(let i=0;i<params.length;i++)body.push(OP.local_get,...uleb(i));
     body.push(OP.call,0);
     if(results.length)body.push(OP.local_set,...uleb(params.length));
-    body.push(OP.i32_const,...sleb(-6),OP.i32_const,0,OP.ref_null,T.ref);
+    body.push(OP.i32_const,...sleb(-6));
+    if(!compact)body.push(OP.i32_const,0,OP.ref_null,T.ref);
     if(results.length)body.push(OP.local_get,...uleb(params.length));
     body.push(OP.end);
     const bytes = assembleModule({importDecls:imports,mainParams:params,
-      mainResults:[T.i32,T.i32,T.ref,...results],declared:results,body});
+      mainResults:[T.i32,...(compact?[]:[T.i32,T.ref]),...results],declared:results,body});
     const weakFallback=new WeakRef(fallback);
     const invokeFallback=(...args)=>{
       const fn=weakFallback.deref();
@@ -92,7 +106,7 @@ class CanonicalDirectLinks {
     const slot = this.freeSlots.length?this.freeSlots.pop():this.table.length;
     if(slot===this.table.length)this.table.grow(1);
     this.table.set(slot,stub);
-    const binding = {slot,stub,key,params,parameterArrayABI:parameterArrayABI.slice()};
+    const binding = {slot,stub,key,params,compact,parameterArrayABI:parameterArrayABI.slice()};
     this.bySlot.set(slot,binding);
     let list=this.bindings.get(key);
     if(!list)this.bindings.set(key,list=[]);
@@ -116,7 +130,10 @@ class CanonicalDirectLinks {
     const eligible=CanonicalDirectLinks.eligible(st);
     for(const binding of this.bindings.get(st.key)||[]){
       const arrays=binding.parameterArrayABI;
-      const fn=eligible ? arrays.length ? st.meta.canonicalHeapRun : st.meta.canonicalRun : null;
+      const compatible=eligible && (!binding.compact || st.meta.canonicalCompactOwnerTag===this.identity);
+      const fn=compatible ? binding.compact
+        ? arrays.length ? st.meta.canonicalCompactHeapRun : st.meta.canonicalCompactRun
+        : arrays.length ? st.meta.canonicalHeapRun : st.meta.canonicalRun : null;
       const javaCount=binding.params.length-2*arrays.length;
       let slot=0;
       const identity=fn && st.meta.paramSlots.length===javaCount &&

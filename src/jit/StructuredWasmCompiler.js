@@ -27,7 +27,7 @@ const { buildCfgFromCode, structure, IrreducibleError, succOfTerm, succAllOfTerm
 const { splitIrreducibleTerms } = require('../decompiler/exceptionStructurer');
 const { buildSsa } = require('../analysis/opgraph/ssa');
 const {
-  T, OP, TRUNC_SAT, uleb, sleb, f32bytes, f64bytes,
+  T, OP, TRUNC_SAT, STRUCTURED_RETURN, CAPTURE_DIRECT_ID, uleb, sleb, f32bytes, f64bytes,
   emitTryTableCatchAll, supportsWasmTryTable, emitTryTableJsTag, supportsWasmJsTag,
   wasmProfilerName, parseMethodDescriptor, descToWasm, getOp,
   BRANCH_COND, BRANCH_ZERO, ICONST, BIN_OPS, ARRAY_LOAD, ARRAY_STORE,
@@ -280,7 +280,7 @@ class StructuredWasmCompiler {
           'fn', 'cfg', 'items', 'originalItems', 'localOf', 'arrayCaches', 'heapParamLocals',
           'fieldArrayOwners', 'sharedFieldArrayGroups', 'arrayReaderGenerations', 'primitiveCopyZeroEntry',
           'fieldCaches', 'castCaches', 'objCaches', 'linkSlotByNode', 'canonicalSlotByNode',
-          'deoptableSites', 'linkSlotSites', 'fusedGuardOfLoad',
+          'deoptableSites', 'linkSlotSites', 'canonicalCompactSlots', 'fusedGuardOfLoad',
           'fusedGuardArms', 'fusedFieldReads', 'rematLoads', 'inlinedInitializationGuards', 'heapReadinessGuards',
           'labelIndex', 'origIdx', 'deoptStubs', 'deoptBlocks', 'declared',
           'frames', 'guardSites', 'liveRanges', 'demoteBlockersByBlock',
@@ -470,11 +470,15 @@ class StructuredWasmCompiler {
         getOp(item.instruction)?.startsWith('invoke')));
     this.jsTagEh = Boolean(this.wasmJit.nativeJsExceptionTagsEnabled &&
       (this.ehMethod || this.directFrames) && supportsWasmJsTag());
+    this.compactExitLinks=this.jsTagEh && this.directFrames
+      ? new WeakRef(this.wasmJit.canonicalDirectLinks) : null;
     if (this.jsTagEh) {
       const box = this.box;
+      const owner=this.directFrames,links=this.compactExitLinks;
       this.jsTagRecordIdx = this.addImport('record_js_exception', [T.ref], [], e => {
         box.lastThrown = e;
         box.pendingException = isGuestThrow(e) ? e : null;
+        links?.deref()?.publishExit(owner,0,-5);
       }, true);
     }
     if(this.directFrames){
@@ -688,10 +692,7 @@ class StructuredWasmCompiler {
     const intZeroClearEntry = require('./intZeroClearEntry').emitIntZeroClearEntry(this);
     body.unshift(...(this.primitiveCopyZeroEntry || []), ...arrayEntry, ...primitiveCopyEntry, ...intZeroClearEntry);
     if(this.directFrames){
-      const ret=parseMethodDescriptor(this.method.descriptor).ret;
-      const globals=(ret==='V'?0:1)+(this.usesSpecok?1:0);
-      body.unshift(OP.global_get,...uleb(globals),OP.local_set,...uleb(this.directIdLocal),
-        OP.i32_const,0,OP.global_set,...uleb(globals));
+      body.unshift(CAPTURE_DIRECT_ID);
     }
 
     const bytes = assembleModule({
@@ -711,6 +712,8 @@ class StructuredWasmCompiler {
       sigTypes: this.sigTypes,
       canonicalFrameExport: this.directFrames ? {readyIdx:this.directOwnerReadyIdx,
         readyAddress:this.directOwnerReadyAddress,
+        compact:!!this.compactExitLinks,
+        inlineCompact:true,idLocal:this.directIdLocal,
         recordIdx:this.jsTagEh ? this.jsTagRecordIdx : undefined} : null,
       importJsTag: this.jsTagEh,
       importCanonicalTable: !!this.usedCanonicalTable,
@@ -794,6 +797,8 @@ class StructuredWasmCompiler {
       directFrameContext: this.directFrames,
       parameterArrayABI: this.parameterArrayABI.slice(),
       canonicalDirectSites: this.canonicalSlotByNode?.size || 0,
+      canonicalCompactSites:this.canonicalCompactSlots?.size || 0,
+      canonicalCompactOwnerTag:this.compactExitLinks ? this.wasmJit.canonicalDirectLinks.identity : null,
       canonicalSlots: this.canonicalSlots.slice(),
       canonicalLifetime:this.canonicalLifetime,
       paramSlots: this.paramSlots,
@@ -1256,8 +1261,9 @@ class StructuredWasmCompiler {
   markDirectExit(status,out) {
     if(!this.directFrames)return;
     const context=this.directFrames;
+    const links=this.compactExitLinks;
     const idx=this.addImport('canonical_exit_spill',[T.i32,T.i32],[],
-      (id,status)=>context.exit(id,status));
+      (id,status)=>{context.exit(id,status);if(id)links?.deref()?.publishExit(context,id,status);});
     out.push(OP.local_get,...uleb(this.directIdLocal),OP.i32_const,...sleb(status),
       OP.call,...uleb(idx));
   }
@@ -1279,6 +1285,12 @@ class StructuredWasmCompiler {
     box.pendingFrames=deeper?[...deeper,frame]:[frame];
     box.canonicalFrameHandoff=true;
     return 2;
+  }
+
+  consumeCompactExit(status) {
+    if(status===-4 || status===-6)return this.consumeDirectExit(status,0,null);
+    const {owner,id}=this.wasmJit.canonicalDirectLinks.takeExit(status);
+    return this.consumeDirectExit(status,id,owner);
   }
 
   emitSpillResume(blockId, out, stub = null) {
@@ -1331,7 +1343,7 @@ class StructuredWasmCompiler {
         out.push(...this.useOf(def), ...this.framePush(t));
       }
       this.markDirectExit(stub.resumeIdx,out);
-      out.push(OP.i32_const, ...sleb(stub.resumeIdx), OP.return);
+      out.push(OP.i32_const, ...sleb(stub.resumeIdx), STRUCTURED_RETURN);
       return;
     }
     const resumeItem = this.resumeItemOf(blockId);
@@ -1339,7 +1351,7 @@ class StructuredWasmCompiler {
     this.spillSlots.set(resumeItem,
       { slots: spills.map((s) => s.slot), dropped });
     this.markDirectExit(resumeItem,out);
-    out.push(OP.i32_const, ...sleb(resumeItem), OP.return);
+    out.push(OP.i32_const, ...sleb(resumeItem), STRUCTURED_RETURN);
   }
 
   // The ORIGINAL caller item index the interpreter resumes at for this
@@ -1426,7 +1438,7 @@ class StructuredWasmCompiler {
         if (this.canonicalNonThrowingNormalFlow || this.canonicalRecordedLeaf) out.push(OP.end);
       }
     }
-    out.push(OP.i32_const, ...sleb(-1), OP.return);
+    out.push(OP.i32_const, ...sleb(-1), STRUCTURED_RETURN);
   }
 
   emitBlockBody(blockId, out) {
@@ -1527,7 +1539,7 @@ class StructuredWasmCompiler {
     if(this.directFrames)out.push(OP.local_get,...uleb(this.directIdLocal));
     out.push(OP.call, ...uleb(idx));
     this.markDirectExit(-3,out);
-    out.push(OP.i32_const, ...sleb(-3), OP.return);
+    out.push(OP.i32_const, ...sleb(-3), STRUCTURED_RETURN);
     out.push(OP.end);
     out.push(OP.call, ...uleb(this.addImport('eh_rethrow', [], [],
       () => { throw box.lastThrown; })));
@@ -1889,13 +1901,16 @@ class StructuredWasmCompiler {
         out.push(OP.i32_const,...sleb(c.slot),OP.call_indirect,...uleb(c.type),
           0x00);
         if(node.kind!=='V')out.push(OP.local_set,...uleb(this.mustLocal(node)));
-        const owner=this.nextLocal++,id=this.nextLocal++,status=this.nextLocal++;
-        this.declared.push(T.ref,T.i32,T.i32);
-        out.push(OP.local_set,...uleb(owner),OP.local_set,...uleb(id),
-          OP.local_tee,...uleb(status),OP.i32_const,...sleb(-1),OP.i32_ne,
-          OP.if,0x40,
-          OP.local_get,...uleb(status),OP.local_get,...uleb(id),OP.local_get,...uleb(owner),
-          OP.call,...uleb(c.consumeIdx),OP.local_tee,...uleb(status),OP.if,0x40,
+        const status=this.nextLocal++;this.declared.push(T.i32);
+        let owner,id;
+        if(!c.compact){
+          owner=this.nextLocal++;id=this.nextLocal++;this.declared.push(T.ref,T.i32);
+          out.push(OP.local_set,...uleb(owner),OP.local_set,...uleb(id));
+        }
+        out.push(OP.local_tee,...uleb(status),OP.i32_const,...sleb(-1),OP.i32_ne,
+          OP.if,0x40,OP.local_get,...uleb(status));
+        if(!c.compact)out.push(OP.local_get,...uleb(id),OP.local_get,...uleb(owner));
+        out.push(OP.call,...uleb(c.consumeIdx),OP.local_tee,...uleb(status),OP.if,0x40,
           OP.local_get,...uleb(status),OP.i32_const,1,OP.i32_eq,OP.if,0x40);
         this.emitCallExitStub(node,site,unders,true,out);
         out.push(OP.end);
@@ -2600,6 +2615,7 @@ class StructuredWasmCompiler {
         directMeta.paramSlots.every(p=>argPosBySlot.get(p.slot)!==undefined &&
           p.t===wParams[argPosBySlot.get(p.slot)]);
       if(identity && !calleeSt?.synchronized){
+        const compact=this.jsTagEh;
         const arrayIndices=this.heap && supportsWasmTryTable() ? primitiveArrayParameters(descriptor) : [];
         const arrayCount=arrayIndices.length;
         const arrays=[];
@@ -2630,9 +2646,10 @@ class StructuredWasmCompiler {
           // ordinary import wrapper cannot record its exception for catch_all.
           const recordedFallback = this.ehMethod && !this.jsTagEh
             ? ehRecordingImport(fallback, expandedParams.length, this.box) : fallback;
-          direct=this.wasmJit.canonicalDirectLinks.allocate(key,expandedParams,results,recordedFallback,arrayIndices);
+          direct=this.wasmJit.canonicalDirectLinks.allocate(key,expandedParams,results,recordedFallback,arrayIndices,compact);
           (this.canonicalSlotByNode||=new Map()).set(node,direct);
           this.canonicalSlots.push(direct);
+          if(compact)(this.canonicalCompactSlots ||= new Set()).add(direct);
           this.canonicalLifetime.fallbacks.push(recordedFallback);
           if(calleeSt)this.wasmJit.canonicalDirectLinks.publish(calleeSt);
         }
@@ -2641,10 +2658,11 @@ class StructuredWasmCompiler {
         binding.slot=direct;
         this.usedCanonicalTable=true;
         this.canonicalDirectSites=(this.canonicalDirectSites||0)+1;
-        const type=this.internSig(expandedParams,[T.i32,T.i32,T.ref,...results]);
-        const consumeIdx=this.addImport('canonical_exit',[T.i32,T.i32,T.ref],[T.i32],
+        const type=this.internSig(expandedParams,[T.i32,...(compact?[]:[T.i32,T.ref]),...results]);
+        const consumeIdx=compact ? this.addImport('canonical_compact_exit',[T.i32],[T.i32],
+          status=>this.consumeCompactExit(status)) : this.addImport('canonical_exit',[T.i32,T.i32,T.ref],[T.i32],
           (status,id,owner)=>this.consumeDirectExit(status,id,owner));
-        return {canonical:{slot:direct,type,consumeIdx,arrays,arrayOwnerReady},writes,deoptable:true};
+        return {canonical:{slot:direct,type,consumeIdx,arrays,arrayOwnerReady,compact},writes,deoptable:true};
       }
     }
     // UNKNOWN: the callee owns no module yet. Emit a late-bound call rather
@@ -3321,7 +3339,7 @@ class StructuredWasmCompiler {
       }
     }
     this.markDirectExit(reexecute ? site.resumeIdx : site.resumeIdx+1,out);
-    out.push(OP.i32_const, ...sleb(reexecute ? site.resumeIdx : site.resumeIdx + 1), OP.return);
+    out.push(OP.i32_const, ...sleb(reexecute ? site.resumeIdx : site.resumeIdx + 1), STRUCTURED_RETURN);
   }
 
   constSeq(op, node) {

@@ -1,5 +1,5 @@
 "use strict";
-const {T,OP,uleb,sleb,getOp}=require('./wasmShared');
+const {T,OP,STRUCTURED_RETURN,uleb,sleb,getOp}=require('./wasmShared');
 const {heapCopyKind}=require('./WasmArrayCopy');
 
 // Recognize the entire forward/reverse unrolled primitive-array copy, including
@@ -108,7 +108,7 @@ function emitPrimitiveCopyEntry(compiler) {
     OP.i32_and,OP.if,0x40,
     ...address(target,3),...address(source,1),...use(4),...width,
     0xfc,0x0a,0x00,0x00,
-    OP.i32_const,...sleb(-1),OP.return,OP.end,
+    OP.i32_const,...sleb(-1),STRUCTURED_RETURN,OP.end,
   ];
   // For nonnegative source positions, zero count reaches neither loop body
   // and its signed end-index arithmetic cannot wrap. Avoid all array metadata
@@ -118,7 +118,7 @@ function emitPrimitiveCopyEntry(compiler) {
     ...use(4),OP.i32_eqz,OP.i32_and,
     ...use(1),OP.i32_const,0,OP.i32_ge_s,OP.i32_and,
     ...get(compiler.fuelLocal),OP.i32_const,2,OP.i32_gt_s,OP.i32_and,
-    OP.if,0x40,OP.i32_const,...sleb(-1),OP.return,OP.end,
+    OP.if,0x40,OP.i32_const,...sleb(-1),STRUCTURED_RETURN,OP.end,
   ];
   compiler.primitiveCopyEntryUnroll=plan.width;
   compiler.primitiveCopyEntryBytes=out.length+compiler.primitiveCopyZeroEntry.length;

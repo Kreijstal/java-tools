@@ -7,6 +7,10 @@
 
 const T = { i32: 0x7f, i64: 0x7e, f32: 0x7d, f64: 0x7c, ref: 0x6f };
 const CAT2 = new Set([T.i64, T.f64]);
+// Structured emission markers are identities, never numeric byte patterns.
+// Immediates can contain any opcode byte, including the byte for return.
+const STRUCTURED_RETURN=Object.freeze({kind:'structured return'});
+const CAPTURE_DIRECT_ID=Object.freeze({kind:'capture direct invocation'});
 
 const OP = {
   unreachable: 0x00, block: 0x02, loop: 0x03, if: 0x04, else: 0x05,
@@ -608,12 +612,13 @@ function runvWrapperBody(paramCount, mainIdx, retvType, heapParameterCount = 0) 
 // Direct canonical wrapper returns status, invocation id, owner, and value.
 // The main body captures/clears the active id before any guest work. Its
 // spill imports use that local id, so recursive calls cannot overwrite it.
-function canonicalRunWrapperBody(paramCount, mainIdx, retvType, globals, readyIdx, recordIdx, heapParameterCount = 0, readyAddress) {
+function canonicalRunWrapperBody(paramCount, mainIdx, retvType, globals, readyIdx, recordIdx, heapParameterCount = 0, readyAddress, compact = false) {
   const id=paramCount, status=paramCount+1;
   const out=[1,2,T.i32]; // two i32 locals
   out.push(...(readyAddress===undefined ? [OP.call,...uleb(readyIdx)] :
     [OP.i32_const,...sleb(readyAddress),OP.i32_load,2,0]),OP.i32_eqz,OP.if,0x40,
-    OP.i32_const,...sleb(-4),OP.i32_const,0,OP.ref_null,T.ref);
+    OP.i32_const,...sleb(-4));
+  if(!compact)out.push(OP.i32_const,0,OP.ref_null,T.ref);
   if(retvType)out.push(...(retvType===T.i64?[OP.i64_const,0]:
     retvType===T.f32?[OP.f32_const,0,0,0,0]:
     retvType===T.f64?[OP.f64_const,0,0,0,0,0,0,0,0]:[OP.i32_const,0]));
@@ -631,10 +636,51 @@ function canonicalRunWrapperBody(paramCount, mainIdx, retvType, globals, readyId
     body.push(OP.i32_const,0,OP.global_get,...uleb(globals+3),
       OP.call,...uleb(mainIdx),OP.local_set,...uleb(status));
   },body=>body.push(OP.i32_const,...sleb(-5),OP.local_set,...uleb(status)));
-  out.push(OP.local_get,...uleb(status),OP.local_get,...uleb(id),
-    OP.global_get,...uleb(globals+2));
+  out.push(OP.local_get,...uleb(status));
+  if(!compact)out.push(OP.local_get,...uleb(id),OP.global_get,...uleb(globals+2));
   if(retvType)out.push(OP.global_get,0);
   out.push(OP.end);
+  return out;
+}
+
+function structuredBodyBytes(body,frame,globals,returnValue=false) {
+  const out=[];
+  for(const byte of body){
+    if(byte===STRUCTURED_RETURN){
+      if(returnValue)out.push(OP.global_get,0);
+      out.push(OP.return);
+    }else if(byte===CAPTURE_DIRECT_ID){
+      if(!Number.isInteger(frame?.idLocal))throw TypeError('missing canonical invocation local');
+      if(!frame.inline)out.push(OP.global_get,...uleb(globals),OP.local_set,...uleb(frame.idLocal),
+        OP.i32_const,0,OP.global_set,...uleb(globals));
+    }else out.push(byte);
+  }
+  return out;
+}
+
+function inlineCompactBody(paramCount,missingHeap,mainParams,declared,body,retvType,globals,frame) {
+  const locals=[...Array(missingHeap*2+2).fill(T.i32),...declared];
+  const out=[...uleb(locals.length),...locals.flatMap(t=>[1,t])];
+  out.push(...(frame.readyAddress===undefined ? [OP.call,...uleb(frame.readyIdx)] :
+    [OP.i32_const,...sleb(frame.readyAddress),OP.i32_load,2,0]),OP.i32_eqz,OP.if,0x40,
+    OP.i32_const,...sleb(-4));
+  if(retvType)out.push(...(retvType===T.i64?[OP.i64_const,0]:
+    retvType===T.f32?[OP.f32_const,0,0,0,0]:retvType===T.f64?[OP.f64_const,0,0,0,0,0,0,0,0]:[OP.i32_const,0]));
+  out.push(OP.return,OP.end,
+    OP.global_get,...uleb(globals+1),OP.i32_const,1,OP.i32_add,OP.local_tee,...uleb(frame.idLocal),
+    OP.i32_eqz,OP.if,0x40,OP.i32_const,1,OP.local_set,...uleb(frame.idLocal),OP.end,
+    OP.local_get,...uleb(frame.idLocal),OP.global_set,...uleb(globals+1),
+    OP.global_get,...uleb(globals+3),OP.local_set,...uleb(mainParams.length-1));
+  for(let i=0;i<missingHeap;i++)out.push(OP.i32_const,...sleb(-2),OP.local_set,...uleb(paramCount+2*i));
+  const emitCatch=frame.recordIdx==null ? emitTryTableCatchAll :
+    (out,body,handler)=>emitTryTableJsTag(out,body,handler,frame.recordIdx);
+  emitCatch(out,native=>native.push(...structuredBodyBytes(body.slice(0,-1),{...frame,inline:true},globals,!!retvType)),
+    handler=>{
+      handler.push(OP.i32_const,...sleb(-5));
+      if(retvType)handler.push(OP.global_get,0);
+      handler.push(OP.return);
+    });
+  out.push(OP.unreachable,OP.end);
   return out;
 }
 
@@ -706,7 +752,8 @@ function assembleModule({ importDecls, mainParams, mainResults, declared, body, 
   const section = (id, content) => [id, ...uleb(content.length), ...content];
   const vec = (entries) => [...uleb(entries.length), ...entries.flat()];
   const localDecls = [...uleb(declared.length), ...declared.flatMap((t) => [1, t])];
-  const funcBody = [...localDecls, ...body];
+  const canonicalGlobals=(retvType?1:0)+(specokGlobal?1:0);
+  const funcBody = [...localDecls, ...structuredBodyBytes(body,canonicalFrameExport,canonicalGlobals)];
   const exportName = [...'run'].map((c) => c.charCodeAt(0));
   const profilerNameSection = profilerName
     ? wasmFunctionNameSection(mainIdx, profilerName) : [];
@@ -776,6 +823,29 @@ function assembleModule({ importDecls, mainParams, mainResults, declared, body, 
         canonicalRunWrapperBody(expanded.length,mainIdx,retvType,globals,
           canonicalFrameExport.readyIdx,canonicalFrameExport.recordIdx,0,
           canonicalFrameExport.readyAddress)));
+    }
+    if(canonicalFrameExport.compact){
+      const compactResults=[T.i32,...(retvType?[retvType]:[])];
+      // Bound duplicate code across both native entries. The original body
+      // and legacy wrappers remain the supported fallback for larger methods.
+      let remaining=16384;
+      const compactEntry=(name,params,missingHeap)=>{
+        let bytes,inline=false;
+        if(canonicalFrameExport.inlineCompact && body[0]===CAPTURE_DIRECT_ID && body.at(-1)===OP.end){
+          const candidate=inlineCompactBody(params.length,missingHeap,mainParams,declared,body,retvType,globals,canonicalFrameExport);
+          if(candidate.length<=remaining){bytes=candidate;inline=true;remaining-=candidate.length;}
+        }
+        bytes ||= canonicalRunWrapperBody(params.length,mainIdx,retvType,globals,
+          canonicalFrameExport.readyIdx,canonicalFrameExport.recordIdx,missingHeap,
+          canonicalFrameExport.readyAddress,true);
+        const index=addFunction(params,compactResults,bytes);exportFunction(name,index);
+        if(inline)exportFunction(name.replace('Compact','InlineCompact'),index);
+      };
+      if(heapParameterCount){
+        const expanded=[...paramOnly,...parameterArrayABI.flatMap(()=>[T.i32,T.i32])];
+        compactEntry('canonicalCompactHeapRun',expanded,0);
+      }
+      compactEntry('canonicalCompactRun',paramOnly,heapParameterCount);
     }
     for(const [label,index] of [['canonicalOwner',globals+2],['canonicalFuel',globals+3],['canonicalEntries',globals+1]]){
       const bytes=[...label].map(c=>c.charCodeAt(0));exportEntries.push([bytes.length,...bytes,3,...uleb(index)]);
@@ -923,7 +993,7 @@ function capturesBooleanStatic(method) {
 }
 
 module.exports = {
-  T, CAT2, OP, TRUNC_SAT,
+  T, CAT2, OP, TRUNC_SAT, STRUCTURED_RETURN, CAPTURE_DIRECT_ID,
   uleb, sleb, f32bytes, f64bytes,
   emitTryTableCatchAll, supportsWasmTryTable, emitTryTableJsTag, supportsWasmJsTag,
   wasmProfilerName, wasmFunctionNameSection,

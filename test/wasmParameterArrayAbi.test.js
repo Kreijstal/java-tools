@@ -106,10 +106,10 @@ test('compiled callers forward array metadata without per-callee JavaScript quer
  t.equal(sum.meta.importStats.get('abase')||0,0,'one hundred callee entries query no bases');
  t.equal(sum.meta.importStats.get('alen0')||0,0,'one hundred callee entries query no lengths');
  t.equal(sum.meta.directFrameContext.createdFrames,0,'normal calls allocate no canonical frames');
- const heapExport=sum.meta.canonicalHeapRun;
- sum.meta.canonicalHeapRun=null;h.w.canonicalDirectLinks.publish(sum);
+ const heapExport=sum.meta.canonicalHeapRun,compactHeapExport=sum.meta.canonicalCompactHeapRun;
+ sum.meta.canonicalHeapRun=null;sum.meta.canonicalCompactHeapRun=null;h.w.canonicalDirectLinks.publish(sum);
  t.equal(h.run(root,a,4,3).value,51,'an unavailable expanded export retains the legacy Java-argument fallback');
- sum.meta.canonicalHeapRun=heapExport;h.w.canonicalDirectLinks.publish(sum);
+ sum.meta.canonicalHeapRun=heapExport;sum.meta.canonicalCompactHeapRun=compactHeapExport;h.w.canonicalDirectLinks.publish(sum);
  const b=h.array([11,13]);t.equal(h.run(root,b,2,3).value,72,'a fresh invocation uses its new array and length');
  const plain=Object.assign([17,19],{type:'[I'});
  t.equal(h.run(root,plain,2,4).value,144,'captured non-heap storage retains imported element access');
