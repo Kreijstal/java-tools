@@ -1,4 +1,5 @@
 "use strict";
+const {makeNativeStaticCell}=require('./nativeStaticCell');
 
 // Static field storage for one class.  It is a Map keyed by
 // "name:descriptor" (the historical representation every loader, interpreter
@@ -7,17 +8,18 @@
 // property access instead of a string-keyed Map lookup on every access.
 //
 // Once a cell exists for a key it is the value of record: generated code
-// writes `cell.value` directly (a Map.set per static write was 2% of a Deko
-// Bloko frame, on top of the get per read), and every Map-side reader below
-// consults the cell first, so a Map reader observes exactly what the last
-// writer stored whichever side wrote it. The Map keeps owning key existence
+// writes `cell.value` directly without a keyed Map operation, and each reader
+// below observes the same value, including canonical native integer storage. It
+// therefore observes what the last writer stored in any tier. The Map owns
+// key existence
 // (`has`, `keys`, `size`) and the value of keys that no cell has claimed.
 // `present` mirrors that membership so resolved writers can avoid a keyed
 // lookup while still restoring a key after deletion or a cold first write.
 class StaticFieldStore extends Map {
-  constructor(entries) {
+  constructor(entries,nativeIntegers=false) {
     super();
     this.cells = new Map();
+    this.nativeIntegers=!!nativeIntegers;
     if (entries) {
       for (const [key, value] of entries) this.set(key, value);
     }
@@ -26,7 +28,9 @@ class StaticFieldStore extends Map {
   cell(key) {
     let cell = this.cells.get(key);
     if (!cell) {
-      cell = { value: super.get(key), present: super.has(key) };
+      cell = this.nativeIntegers && typeof key==='string' && /:[ZBCSI]$/.test(key)
+        ? makeNativeStaticCell(super.get(key),super.has(key))
+        : { value: super.get(key), present: super.has(key) };
       this.cells.set(key, cell);
       // Once the cell owns the value, the Map only tracks membership. Keeping
       // its original value would retain replaced arrays/objects indefinitely.

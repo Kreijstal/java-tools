@@ -281,7 +281,7 @@ class StructuredWasmCompiler {
         for (const key of [
           'fn', 'cfg', 'items', 'originalItems', 'localOf', 'arrayCaches', 'heapParamLocals',
           'fieldArrayOwners', 'sharedFieldArrayGroups', 'arrayReaderGenerations', 'primitiveCopyZeroEntry',
-          'fieldCaches', 'castCaches', 'objCaches', 'linkSlotByNode', 'canonicalSlotByNode',
+          'fieldCaches', 'castCaches', 'objCaches', 'nativeStaticCells', 'staticFieldAccessors', 'nativeStaticSites', 'linkSlotByNode', 'canonicalSlotByNode',
           'deoptableSites', 'linkSlotSites', 'canonicalCompactSlots', 'emptyCopySites', 'fusedGuardOfLoad',
           'fusedGuardArms', 'fusedFieldReads', 'rematLoads', 'inlinedInitializationGuards', 'heapReadinessGuards',
           'labelIndex', 'origIdx', 'deoptStubs', 'deoptBlocks', 'declared',
@@ -808,6 +808,8 @@ class StructuredWasmCompiler {
       canonicalDirectSites: this.canonicalSlotByNode?.size || 0,
       canonicalCompactSites:this.canonicalCompactSlots?.size || 0,
       canonicalEmptyCopySites:this.emptyCopySites?.size || 0,
+      nativeStaticReadSites:this.nativeStaticSites?.get('read')?.size || 0,
+      nativeStaticWriteSites:this.nativeStaticSites?.get('write')?.size || 0,
       canonicalCompactOwnerTag:this.compactExitLinks ? this.wasmJit.canonicalDirectLinks.identity : null,
       canonicalSlots: this.canonicalSlots.slice(),
       canonicalLifetime:this.canonicalLifetime,
@@ -1762,7 +1764,7 @@ class StructuredWasmCompiler {
         // cached instance path skips the null check: a filled flag proves
         // this exact SSA value already loaded this field successfully
         const loadSeq = isStatic
-          ? [OP.call, ...uleb(field.idx)]
+          ? this.nativeStaticRead(field)
           : [...(receiver || use(0)), OP.call, ...uleb(field.idx)];
         // Dependent caches (arrays/fields keyed on a reader's value) are
         // killed on the refill path only — a hit reproduces the entry's
@@ -1788,13 +1790,18 @@ class StructuredWasmCompiler {
         }
         return;
       }
-      if (receiver) {
-        out.push(...receiver);
-        for (let i = 1; i < node.args.length; i += 1) out.push(...use(i));
-      } else {
-        for (let i = 0; i < node.args.length; i += 1) out.push(...use(i));
+      if(isStatic && !isGet && field.native){
+        this.nativeStaticWrite(field,use(0),out);
+      }else{
+        if (receiver) {
+          out.push(...receiver);
+          for (let i = 1; i < node.args.length; i += 1) out.push(...use(i));
+        } else {
+          for (let i = 0; i < node.args.length; i += 1) out.push(...use(i));
+        }
+        if(isStatic && isGet)out.push(...this.nativeStaticRead(field));
+        else out.push(OP.call, ...uleb(field.idx));
       }
-      out.push(OP.call, ...uleb(field.idx));
       if (!isGet) {
         out.push(...this.killSeqWhere((entry) => (
           entry.kind === (isStatic ? 's' : 'f') && entry.killKey === killKey)));
@@ -2328,6 +2335,38 @@ class StructuredWasmCompiler {
       ...raw,
       OP.else, ...viaImport, OP.end,
     ];
+  }
+
+  nativeStaticFieldAddress(cell) {
+    if(!this.heap || !cell)return null;
+    const cells=this.nativeStaticCells ||= new Map();
+    if(!cells.has(cell))cells.set(cell,require('../core/nativeStaticCell').bindNativeStaticCell(cell,this.heap));
+    const native=cells.get(cell);
+    if(native){this.heapImports();this.usedHeap=true;}
+    return native;
+  }
+
+  nativeStaticRead(field) {
+    if(!field.native)return [OP.call,...uleb(field.idx)];
+    const sites=this.nativeStaticSites ||= new Map();
+    if(!sites.has('read'))sites.set('read',new Set());sites.get('read').add(field.idx);
+    const address=field.native.address;
+    return [OP.i32_const,...sleb(address),OP.i32_load,2,0,OP.i32_const,1,OP.i32_and,OP.if,T.i32,
+      OP.i32_const,...sleb(address+4),OP.i32_load,2,0,
+      OP.else,OP.call,...uleb(field.idx),OP.end];
+  }
+
+  nativeStaticWrite(field,value,out) {
+    const sites=this.nativeStaticSites ||= new Map();
+    if(!sites.has('write'))sites.set('write',new Set());sites.get('write').add(field.idx);
+    // Evaluate the operand before selecting the storage arm, exactly once.
+    const scratch=this.nextLocal++;this.declared.push(T.i32);
+    const address=field.native.address;
+    out.push(...value,OP.local_set,...uleb(scratch),
+      OP.i32_const,...sleb(address),OP.i32_load,2,0,OP.i32_const,2,OP.i32_and,OP.if,0x40,
+      OP.i32_const,...sleb(address+4),OP.local_get,...uleb(scratch),OP.i32_store,2,0,
+      OP.i32_const,...sleb(address+8),OP.i32_const,0,OP.i32_store,2,0,
+      OP.else,OP.local_get,...uleb(scratch),OP.call,...uleb(field.idx),OP.end);
   }
 
   fieldCacheFor(cacheKey, t, killKey, kind, recvId) {

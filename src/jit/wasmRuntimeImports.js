@@ -355,11 +355,21 @@ function addFieldImport(reg, jvm, ins, isStaticOp, isGet, elementOf = null) {
         `static_ready_${currentClassName}`.replace(/[^\w]/g, '_'),token);
       (reg.staticInitializationGuards ||= new Set()).add(currentClassName);
     }
-    const access = bindStaticFieldAccessors(container, key, t);
+    // Import names are deduplicated. Keep the first actual cell even when a
+    // host resolver subsequently returns a different cell for the same name.
+    const bindings=reg.staticFieldAccessors ||= new Map();
+    let access=bindings.get(name);
+    if(!access){access=bindStaticFieldAccessors(container,key,t);bindings.set(name,access);}
+    const declaration=jvm.classes[currentClassName]?.ast?.classes?.[0]?.items?.find(item=>
+      item.type==='field' && item.field?.name===fieldName && item.field.descriptor===descriptor)?.field;
+    const native=t===T.i32 && declaration?.flags?.includes('static') &&
+      !declaration.flags.includes('volatile') && reg.nativeStaticFieldAddress
+      ? reg.nativeStaticFieldAddress(access.cell) : null;
     return {
       t,
       name,
       initializationIdx,
+      native,
       idx: isGet
         ? reg.addImport(name, [], [t], access.get)
         : reg.addImport(name, [t], [], access.set),

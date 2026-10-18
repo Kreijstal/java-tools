@@ -1304,7 +1304,7 @@ class MethodTranslator {
         for (const key of [
           'items', 'labelIndex', 'blockStarts', 'slotTypes', 'declared',
           'localOfSlot', 'stackLocals', 'entryStacks', 'fieldCaches',
-          'importDecls', 'importFns', 'importIndexByName', 'stringConstantImports',
+          'importDecls', 'importFns', 'importIndexByName', 'staticFieldAccessors', 'stringConstantImports',
         ]) {
           // Clear roots without changing the runtime import receiver's shape.
           if (Object.hasOwn(this, key)) this[key] = undefined;

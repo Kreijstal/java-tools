@@ -14,7 +14,7 @@ function bindStaticFieldAccessors(container, key, type) {
     if (cell.present === true) cell.value = value;
     else container.set(key, value);
   } : value => container.set(key, value);
-  return {get, set};
+  return {get, set, cell};
 }
 
 module.exports = {bindStaticFieldAccessors};

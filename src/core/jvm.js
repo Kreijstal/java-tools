@@ -501,7 +501,7 @@ class JVM {
       // Handle static field overrides
       if (classOverrides.staticFields) {
         if (!this.jre[className].staticFields) {
-          this.jre[className].staticFields = new StaticFieldStore();
+          this.jre[className].staticFields = new StaticFieldStore(undefined,!!this.wasmHeap);
         }
         for (const [fieldName, fieldValue] of Object.entries(
           classOverrides.staticFields,
@@ -2886,7 +2886,7 @@ class JVM {
     try {
       const classData = await loadClassByPath(classFilePath, options);
       if (classData) {
-        classData.staticFields = new StaticFieldStore();
+        classData.staticFields = new StaticFieldStore(undefined,!!this.wasmHeap);
         this.classes[classData.ast.classes[0].className] = classData;
       }
       return classData;
@@ -2895,7 +2895,7 @@ class JVM {
       try {
         const classData = loadConvertedClass(classFilePath, options);
         if (classData) {
-          classData.staticFields = new StaticFieldStore();
+          classData.staticFields = new StaticFieldStore(undefined,!!this.wasmHeap);
           this.classes[classData.ast.classes[0].className] = classData;
         }
         return classData;
@@ -2927,7 +2927,7 @@ class JVM {
     const classData = {
       ast: convertedAst,
       constantPool: rawAst.constantPool,
-      staticFields: new StaticFieldStore(),
+      staticFields: new StaticFieldStore(undefined,!!this.wasmHeap),
     };
 
     this.classes[classData.ast.classes[0].className] = classData;
@@ -3314,7 +3314,7 @@ class JVM {
       // Initialize static fields with default values first
       if (!classData.staticFields || !classData.staticFieldsInitialized) {
         if (!classData.staticFields) {
-          classData.staticFields = new StaticFieldStore();
+          classData.staticFields = new StaticFieldStore(undefined,!!this.wasmHeap);
         }
         classData.staticFieldsInitialized = true;
 
