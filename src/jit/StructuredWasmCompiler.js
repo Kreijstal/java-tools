@@ -231,6 +231,23 @@ class StructuredWasmCompiler {
     return idx;
   }
 
+  addReadinessGuard(name,token) {
+    const address=this.heap ? token.wasmReadinessAddress?.(this.heap) : undefined;
+    if(address!==undefined){
+      this.usedHeap=true;
+      const guards=this.heapReadinessGuards ||= new Map();
+      if(!guards.has(address))guards.set(address,Object.freeze({address}));
+      return guards.get(address);
+    }
+    return this.addImport(name,[],[T.i32],
+      token.wasmReadinessGuard?.() || (()=>token.initialized?1:0),true);
+  }
+
+  readinessSeq(guard) {
+    return typeof guard==='number' ? [OP.call,...uleb(guard)] :
+      [OP.i32_const,...sleb(guard.address),OP.i32_load,2,0];
+  }
+
   translate() {
     const inlineEnabled = process.env.JVM_WASM_INLINE !== '0';
     try {
@@ -264,7 +281,7 @@ class StructuredWasmCompiler {
           'fieldArrayOwners', 'sharedFieldArrayGroups', 'arrayReaderGenerations', 'primitiveCopyZeroEntry',
           'fieldCaches', 'castCaches', 'objCaches', 'linkSlotByNode', 'canonicalSlotByNode',
           'deoptableSites', 'linkSlotSites', 'fusedGuardOfLoad',
-          'fusedGuardArms', 'fusedFieldReads', 'rematLoads', 'inlinedInitializationGuards',
+          'fusedGuardArms', 'fusedFieldReads', 'rematLoads', 'inlinedInitializationGuards', 'heapReadinessGuards',
           'labelIndex', 'origIdx', 'deoptStubs', 'deoptBlocks', 'declared',
           'frames', 'guardSites', 'liveRanges', 'demoteBlockersByBlock',
           'importDecls', 'importFns', 'importIndexByName', 'sigTypes', 'sigTypeIndex',
@@ -464,8 +481,11 @@ class StructuredWasmCompiler {
       this.directIdLocal=this.nextLocal++;
       this.declared.push(T.i32);
       const token=this.jvm.getClassInitializationToken(this.className);
-      this.directOwnerReadyIdx=this.addImport('canonical_owner_ready',[],[T.i32],
-        token.wasmReadinessGuard(),true);
+      this.directOwnerReadyAddress=process.env.JVM_WASM_HEAP_ARRAYS!=='0' && this.jvm.wasmHeap
+        ? token.wasmReadinessAddress?.(this.jvm.wasmHeap) : undefined;
+      if(this.directOwnerReadyAddress===undefined)
+        this.directOwnerReadyIdx=this.addImport('canonical_owner_ready',[],[T.i32],
+          token.wasmReadinessGuard(),true);
     }
 
     addRuntimeImports(this, this.box);
@@ -486,7 +506,7 @@ class StructuredWasmCompiler {
     this.fieldArrayOwners = this.wasmJit.sharedFieldArrayCachesEnabled ? new Map() : null;
     this.sharedFieldArrayGroups = null;
     this.arrayReaderGenerations = null;
-    this.usedHeap = false;
+    this.usedHeap = this.directOwnerReadyAddress!==undefined;
 
     // Field-value caches (ported from the dispatcher tier, SSA-keyed).
     // Instance caches key on the receiver's SSA value id: an SSA value is
@@ -563,9 +583,8 @@ class StructuredWasmCompiler {
     this.inlinedInitializationGuards = new Set();
     for (const owner of coldStaticInlineOwners) {
       const token = this.jvm.getClassInitializationToken(owner);
-      const idx = this.addImport(
-        `inline_static_ready_${owner}`.replace(/[^\w]/g, '_'), [], [T.i32],
-        token.wasmReadinessGuard?.() || (() => token.initialized ? 1 : 0),true);
+      const idx = this.addReadinessGuard(
+        `inline_static_ready_${owner}`.replace(/[^\w]/g, '_'),token);
       this.inlinedInitializationGuards.add(idx);
       (this.staticInitializationGuards ||= new Set()).add(owner);
     }
@@ -645,7 +664,7 @@ class StructuredWasmCompiler {
     // the original entry, where interpretation preserves initialization order.
     // This only tests readiness; it never runs a class initializer early.
     for (const idx of this.inlinedInitializationGuards) {
-      body.push(OP.call, ...uleb(idx), OP.i32_eqz, OP.if, 0x40);
+      body.push(...this.readinessSeq(idx), OP.i32_eqz, OP.if, 0x40);
       this.emitSpillResume(cfg.entry, body);
       body.push(OP.end);
     }
@@ -691,6 +710,7 @@ class StructuredWasmCompiler {
       importTable: this.usedLinkTable,
       sigTypes: this.sigTypes,
       canonicalFrameExport: this.directFrames ? {readyIdx:this.directOwnerReadyIdx,
+        readyAddress:this.directOwnerReadyAddress,
         recordIdx:this.jsTagEh ? this.jsTagRecordIdx : undefined} : null,
       importJsTag: this.jsTagEh,
       importCanonicalTable: !!this.usedCanonicalTable,
@@ -823,6 +843,7 @@ class StructuredWasmCompiler {
       initializationGuardTokens: [...(this.staticInitializationGuards || [])]
         .map(name => this.jvm.getClassInitializationToken(name)),
       entryInitializationGuards: this.inlinedInitializationGuards.size,
+      heapReadinessGuardCount: this.heapReadinessGuards?.size || 0,
       slotSites: this.linkSlotSites.size,
       directLinks: this.directLinks || 0,
       directStaticLinks: this.directStaticLinks || 0,
@@ -1432,7 +1453,7 @@ class StructuredWasmCompiler {
         this.inlinedInitializationGuards.add(idx);
         continue;
       }
-      out.push(OP.call, ...uleb(idx), OP.i32_eqz, OP.if, 0x40);
+      out.push(...this.readinessSeq(idx), OP.i32_eqz, OP.if, 0x40);
       this.emitSpillResume(blockId, out);
       out.push(OP.end);
     }
@@ -1912,7 +1933,7 @@ class StructuredWasmCompiler {
           }
         }
         if (dl.initializationGuardIdx !== undefined) {
-          out.push(OP.call, ...uleb(dl.initializationGuardIdx), OP.i32_and);
+          out.push(...this.readinessSeq(dl.initializationGuardIdx), OP.i32_and);
         }
         out.push(OP.if, 0x40);
         for (const local of argScr) out.push(OP.local_get, ...uleb(local));
@@ -2108,7 +2129,7 @@ class StructuredWasmCompiler {
   lazyArrayCacheFill(cache, ownerReadyIdx) {
     if (cache.parameter) return [];
     const whenReady = body => ownerReadyIdx === undefined ? body :
-      [OP.call,...uleb(ownerReadyIdx),OP.if,0x40,...body,
+      [...this.readinessSeq(ownerReadyIdx),OP.if,0x40,...body,
         // A refused fill must never forward an old/default pointer. The
         // callee can query the original reference after initialization.
         OP.else,OP.i32_const,...sleb(-2),OP.local_set,...uleb(cache.base),OP.end];
@@ -2587,9 +2608,9 @@ class StructuredWasmCompiler {
         let arrayOwnerReady;
         if(arrays.length){
           this.heapImports();
-          arrayOwnerReady=this.addImport(
-            `array_owner_ready_${className}`.replace(/[^\w]/g,'_'),[],[T.i32],
-            this.jvm.getClassInitializationToken(className).wasmReadinessGuard(),true);
+          arrayOwnerReady=this.addReadinessGuard(
+            `array_owner_ready_${className}`.replace(/[^\w]/g,'_'),
+            this.jvm.getClassInitializationToken(className));
         }
         const scratch=new Map(),dummy=dummyRet(ret);
         let bound=calleeSt,boundEpoch=-1;

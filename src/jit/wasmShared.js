@@ -608,10 +608,11 @@ function runvWrapperBody(paramCount, mainIdx, retvType, heapParameterCount = 0) 
 // Direct canonical wrapper returns status, invocation id, owner, and value.
 // The main body captures/clears the active id before any guest work. Its
 // spill imports use that local id, so recursive calls cannot overwrite it.
-function canonicalRunWrapperBody(paramCount, mainIdx, retvType, globals, readyIdx, recordIdx, heapParameterCount = 0) {
+function canonicalRunWrapperBody(paramCount, mainIdx, retvType, globals, readyIdx, recordIdx, heapParameterCount = 0, readyAddress) {
   const id=paramCount, status=paramCount+1;
   const out=[1,2,T.i32]; // two i32 locals
-  out.push(OP.call,...uleb(readyIdx),OP.i32_eqz,OP.if,0x40,
+  out.push(...(readyAddress===undefined ? [OP.call,...uleb(readyIdx)] :
+    [OP.i32_const,...sleb(readyAddress),OP.i32_load,2,0]),OP.i32_eqz,OP.if,0x40,
     OP.i32_const,...sleb(-4),OP.i32_const,0,OP.ref_null,T.ref);
   if(retvType)out.push(...(retvType===T.i64?[OP.i64_const,0]:
     retvType===T.f32?[OP.f32_const,0,0,0,0]:
@@ -649,6 +650,12 @@ function specokGlobalEntry() {
 function assembleModule({ importDecls, mainParams, mainResults, declared, body, profilerName,
   importMemory, retvType, runvWrapper, specokGlobal, importTable, sigTypes,
   canonicalFrameExport, importCanonicalTable, importJsTag, parameterArrayABI = [] }) {
+  if (canonicalFrameExport?.readyAddress !== undefined &&
+      (!importMemory || !Number.isInteger(canonicalFrameExport.readyAddress) ||
+       canonicalFrameExport.readyAddress < 0 || canonicalFrameExport.readyAddress > 0x7ffffff8 ||
+       (canonicalFrameExport.readyAddress & 3))) {
+    throw new TypeError('canonical readiness address requires aligned imported memory');
+  }
   const typeKey = (p, r) => `${p.join(',')}|${r.join(',')}`;
   const types = [];
   const typeIndex = new Map();
@@ -761,12 +768,14 @@ function assembleModule({ importDecls, mainParams, mainResults, declared, body, 
     const results=[T.i32,T.i32,T.ref,...(retvType?[retvType]:[])];
     exportFunction('canonicalRun',addFunction(paramOnly,results,
       canonicalRunWrapperBody(paramOnly.length,mainIdx,retvType,globals,
-        canonicalFrameExport.readyIdx,canonicalFrameExport.recordIdx,heapParameterCount)));
+        canonicalFrameExport.readyIdx,canonicalFrameExport.recordIdx,heapParameterCount,
+        canonicalFrameExport.readyAddress)));
     if (heapParameterCount) {
       const expanded = [...paramOnly, ...parameterArrayABI.flatMap(() => [T.i32, T.i32])];
       exportFunction('canonicalHeapRun',addFunction(expanded,results,
         canonicalRunWrapperBody(expanded.length,mainIdx,retvType,globals,
-          canonicalFrameExport.readyIdx,canonicalFrameExport.recordIdx)));
+          canonicalFrameExport.readyIdx,canonicalFrameExport.recordIdx,0,
+          canonicalFrameExport.readyAddress)));
     }
     for(const [label,index] of [['canonicalOwner',globals+2],['canonicalFuel',globals+3],['canonicalEntries',globals+1]]){
       const bytes=[...label].map(c=>c.charCodeAt(0));exportEntries.push([bytes.length,...bytes,3,...uleb(index)]);

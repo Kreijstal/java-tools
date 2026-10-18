@@ -5,6 +5,39 @@ const {JVM}=require('../src/core/jvm');
 const Frame=require('../src/core/frame');
 const {recognizeIntZeroClear}=require('../src/jit/intZeroClearEntry');
 
+test('bulk clear keeps live cold-dependency readiness without a callable import',async t=>{
+ const compile=makeJavaFixtureCompiler('cold-zero-clear-word-');
+ const classpath=compile(t,'ColdClearWordProof',`public class ColdClearWordProof {
+  static void clear(){int i=0,n=ColdClearData.width*ColdClearData.height-3;
+   while(i<n){ColdClearData.data[i++]=0;ColdClearData.data[i++]=0;
+    ColdClearData.data[i++]=0;ColdClearData.data[i++]=0;}
+   n+=3;while(i<n)ColdClearData.data[i++]=0;}
+ }class ColdClearData {static int width,height;static int[] data;}`);
+ const j=new JVM({classpath,wasmHeap:true,jit:{enabled:false,compileWorker:false,
+  wasmStructured:true,wasm:{intZeroClearEntry:true}}});
+ await j.preloadClasspathClasses();j.classInitializationState.set('ColdClearWordProof','INITIALIZED');
+ const method=j.findMethod(j.classes.ColdClearWordProof,'clear','()V'),w=j.jit.wasmJit,st=w.methodState({method});
+ w.compile({method,className:'ColdClearWordProof'},st,{asCallee:true});
+ t.equal(st.status,'ready',st.lastCompileError||'cold dependency compiles');
+ t.ok(st.meta?.intZeroClearEntryBytes>0,'cold dependency keeps its bulk entry');
+ t.equal(st.meta?.heapReadinessGuardCount,1,'ordinary and bulk paths share one readiness cell');
+ const run=()=>{const frame=new Frame(method);frame.className='ColdClearWordProof';st.meta.box.frame=frame;
+  try{return st.run(0,1000000);}finally{st.meta.box.frame=null;}};
+ t.equal(run(),0,'cold fast entry returns through ordinary initialization handling');
+ const fields=j.classes.ColdClearData.staticFields;
+ t.equal(fields.size,0,'compilation and refusal run no static initializer');
+ const a=j.wasmHeap.alloc('[I',5);a.fill(7);
+ fields.set('width:I',4);fields.set('height:I',1);fields.set('data:[I',a);
+ j.classInitializationState.set('ColdClearData','INITIALIZED');
+ t.equal(run(),-1,'same module runs after dependency initialization');
+ t.deepEqual([...a],[0,0,0,0,7],'bulk clear preserves the exact boundary');
+ t.equal(st.meta.box.intZeroClearCalls,1,'warm execution uses bulk clear');
+ a.fill(9);j.classInitializationState.set('ColdClearData','ERRONEOUS');
+ t.equal(run(),0,'same bulk entry observes reset');
+ t.deepEqual([...a],[9,9,9,9,9],'reset precedes all stores');
+ t.end();
+});
+
 test('zero-fill proof survives copied indices and preserves checked fallbacks',async t=>{
  const compile=makeJavaFixtureCompiler('int-zero-clear-');
  const body=copied=>`int i=0, n=width*height-3;

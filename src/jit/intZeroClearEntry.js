@@ -144,7 +144,7 @@ function emitIntZeroClearEntry(c) {
  const calls=()=>imports.flatMap(f=>[OP.call,...uleb(f.idx)]);
  const guards=[...get(c.blkLocal),OP.i32_eqz];
  const readiness=imports[0].initializationIdx;
- if(readiness!==null)guards.push(OP.call,...uleb(readiness),OP.i32_and);
+ if(readiness!==null)guards.push(...c.readinessSeq(readiness),OP.i32_and);
  const out=[...guards,OP.if,0x40,...calls(),OP.i32_mul,...set(n),
   ...get(n),...iconst(0),OP.i32_ge_s,...get(n),...iconst(1048576),OP.i32_le_s,OP.i32_and,OP.if,0x40,
   ...get(n),...iconst(plan.width),OP.i32_div_s,...get(n),...iconst(plan.width),OP.i32_rem_s,OP.i32_add,...iconst(2),OP.i32_add,...set(cost),

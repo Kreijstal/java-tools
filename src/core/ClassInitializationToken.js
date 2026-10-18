@@ -25,12 +25,41 @@ class ClassInitializationToken {
     this._initialized = state === 'INITIALIZED';
     this._wasmReady = null;
     this._wasmGuard = null;
+    this._heapReadiness = null;
+    this._heapReadinessAddresses = null;
   }
 
   get initialized() { return this._initialized; }
   set initialized(value) {
     this._initialized = Boolean(value);
     if (this._wasmReady) this._wasmReady.value = this._initialized ? 1 : 0;
+    if (this._heapReadiness) {
+      let retained = 0;
+      for (const entry of this._heapReadiness) {
+        const memory = entry.memory.deref();
+        if (!memory) continue;
+        // An imported memory may outlive its heap wrapper. Use its current
+        // buffer after growth without retaining abandoned heaps or memories.
+        new Int32Array(memory.buffer,entry.address,1)[0] = this._initialized ? 1 : 0;
+        this._heapReadiness[retained++] = entry;
+      }
+      this._heapReadiness.length = retained;
+    }
+  }
+
+  wasmReadinessAddress(heap) {
+    // A custom guard may have observable behavior beyond this token's flag.
+    // It must retain the original callable path.
+    if (this.wasmReadinessGuard !== defaultReadinessGuard ||
+        typeof WeakRef !== 'function' || !heap?.memory) return undefined;
+    const known = this._heapReadinessAddresses?.get(heap.memory);
+    if (known !== undefined) return known;
+    const address = heap.allocObject(8);
+    if (!Number.isInteger(address) || address < 0 || address > 0x7ffffff8) return undefined;
+    heap.i32[address >>> 2] = this._initialized ? 1 : 0;
+    (this._heapReadinessAddresses ||= new WeakMap()).set(heap.memory,address);
+    (this._heapReadiness ||= []).push({memory:new WeakRef(heap.memory),address});
+    return address;
   }
 
   wasmReadinessGuard() {
@@ -45,5 +74,7 @@ class ClassInitializationToken {
     return this._wasmGuard;
   }
 }
+
+const defaultReadinessGuard = ClassInitializationToken.prototype.wasmReadinessGuard;
 
 module.exports = ClassInitializationToken;
