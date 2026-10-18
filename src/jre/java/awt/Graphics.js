@@ -2,20 +2,7 @@
 const awtFramework = require('../../../platform/awt.js');
 
 let frameCount = 0;
-const COLOR_SWIZZLE_WASM = new Uint8Array([
-  0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60,
-  0x01, 0x7f, 0x00, 0x03, 0x02, 0x01, 0x00, 0x05, 0x03, 0x01, 0x00, 0x01,
-  0x07, 0x14, 0x02, 0x06, 0x6d, 0x65, 0x6d, 0x6f, 0x72, 0x79, 0x02, 0x00,
-  0x07, 0x73, 0x77, 0x69, 0x7a, 0x7a, 0x6c, 0x65, 0x00, 0x00, 0x0a, 0x4f,
-  0x01, 0x4d, 0x01, 0x02, 0x7f, 0x02, 0x40, 0x03, 0x40, 0x20, 0x01, 0x20,
-  0x00, 0x4f, 0x0d, 0x01, 0x20, 0x01, 0x41, 0x02, 0x74, 0x28, 0x02, 0x00,
-  0x21, 0x02, 0x20, 0x01, 0x41, 0x02, 0x74, 0x41, 0x80, 0x80, 0x80, 0x78,
-  0x20, 0x02, 0x41, 0xff, 0x01, 0x71, 0x41, 0x10, 0x74, 0x72, 0x20, 0x02,
-  0x41, 0x80, 0xfe, 0x03, 0x71, 0x72, 0x20, 0x02, 0x41, 0x10, 0x76, 0x41,
-  0xff, 0x01, 0x71, 0x72, 0x36, 0x02, 0x00, 0x20, 0x01, 0x41, 0x01, 0x6a,
-  0x21, 0x01, 0x0c, 0x00, 0x0b, 0x0b, 0x0b,
-]);
-let colorSwizzleWasm;
+const {trySwizzleRgbToRgba32} = require('../../../utils/raster');
 
 function compileWebGlShader(gl, type, source) {
   const shader = gl.createShader(type);
@@ -136,39 +123,6 @@ function createWebGlPresenter(width, height, targetCanvas = null) {
   };
 }
 
-function swizzleRgbToImageData(output, pixels, count) {
-  const source = pixels && pixels.elements ? pixels.elements : pixels;
-  // Wasm only wins when its staging copy can consume an existing typed view.
-  // Converting a large JavaScript Array with Array.from().slice() allocated
-  // two full framebuffer copies per presentation and caused periodic GC
-  // stalls. Plain Java arrays use the single-pass output loop below instead.
-  const typedSource = ArrayBuffer.isView(source) &&
-    typeof source.subarray === 'function';
-  if (!typedSource || count < 65536 || typeof WebAssembly === 'undefined') {
-    return false;
-  }
-  try {
-    if (colorSwizzleWasm === undefined) {
-      const instance = new WebAssembly.Instance(
-        new WebAssembly.Module(COLOR_SWIZZLE_WASM));
-      colorSwizzleWasm = instance.exports;
-    }
-    if (!colorSwizzleWasm) return false;
-    const requiredBytes = count * 4;
-    const memory = colorSwizzleWasm.memory;
-    if (memory.buffer.byteLength < requiredBytes) {
-      memory.grow(Math.ceil((requiredBytes - memory.buffer.byteLength) / 65536));
-    }
-    const staging = new Uint32Array(memory.buffer, 0, count);
-    staging.set(source.length === count ? source : source.subarray(0, count));
-    colorSwizzleWasm.swizzle(count);
-    output.set(staging);
-    return true;
-  } catch (_) {
-    colorSwizzleWasm = null;
-    return false;
-  }
-}
 
 function dumpFrame(pixels, width, height, jvm) {
   if (typeof process === 'undefined' || !process.env || !process.env.JVM_FRAME_DIR) return;
@@ -371,7 +325,7 @@ function presentSoftSurface(jvm, comp) {
       comp._presentPixels32 = new Uint32Array(comp._presentImageData.data.buffer);
     }
     const output = comp._presentPixels32;
-    const usedWasmSwizzle = swizzleRgbToImageData(output, pixels, count);
+    const usedWasmSwizzle = trySwizzleRgbToRgba32(output, pixels, count);
     if (usedWasmSwizzle) {
       if (stats) stats.wasmSwizzles += 1;
     } else {

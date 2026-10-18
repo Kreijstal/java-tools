@@ -12,6 +12,7 @@ const { setFileProvider } = require('../core/classLoader');
 const awtFramework = require('./awt');
 const audioPlatform = require('./audio');
 const legacyPlatform = require('./legacy');
+const raster = require('../utils/raster');
 const { decompileClassBytes } = require('../decompiler/cfr');
 const { compileJavaSource, compileJavaFiles } = require('../java-frontend/compiler');
 const { assembleJasminBytes } = require('../utils/jasminAssembly');
@@ -733,7 +734,8 @@ module.exports = {
   javaTools: browserJavaTools,
   awtFramework,
   audioPlatform,
-  legacyPlatform
+  legacyPlatform,
+  raster
 };
 
 // Also make available as global for direct script inclusion
@@ -746,7 +748,8 @@ if (typeof window !== 'undefined') {
     BrowserFileProvider,
     javaTools: browserJavaTools,
     audioPlatform,
-    legacyPlatform
+    legacyPlatform,
+    raster
   };
   window.awtFramework = awtFramework;
   // Register the browser javax.sound backend as part of the runtime bundle.
