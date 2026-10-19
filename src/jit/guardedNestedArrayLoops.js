@@ -10,10 +10,47 @@ function pureInt(node) {
     ['iinc','ineg','i2c','i2b','i2s','bipush','sipush'].includes(node.op) ||
     (node.op==='ldc' && Number.isInteger(node.imm)));
 }
-function unitStep(phi,header,body) {
+function unitStep(phi,header,region,latches) {
   if(phi?.op!=='phi' || phi.kind!=='I' || phi.block!==header.id)return false;
-  const next=phi.args[header.predIds.indexOf(body.id)];
-  return next?.op==='iinc' && next.block===body.id && next.args[0]===phi && next.imm?.delta===1;
+  return latches.every(id=>{
+    const next=phi.args[header.predIds.indexOf(id)];
+    return next?.op==='iinc' && region.has(next.block) && next.args[0]===phi && next.imm?.delta===1;
+  });
+}
+function successors(block) {
+  const term=block.term;
+  if(term.kind==='goto'||term.kind==='fall')return [term.target];
+  if(term.kind==='cond' && term.args.every(a=>a.kind==='I'))return [term.taken,term.fall];
+  return null;
+}
+// A body may fork, but every path must reach a header backedge, never an
+// early exit or another cycle. This makes the exact header-poll count n+1.
+function bodyRegion(c,header,entry,exit) {
+  const region=new Set(),pending=[entry];let instructions=0;
+  while(pending.length) {
+    const id=pending.pop();if(id===header.id||region.has(id))continue;
+    const block=c.fn.blocks[id];
+    if(id===exit || !block || region.size>=16 ||
+        (instructions+=block.body.length)>256 || block.phis.some(p=>p.kind!=='I'))return null;
+    const next=successors(block);if(!next)return null;
+    region.add(id);pending.push(...next);
+  }
+  const latches=header.predIds.filter(id=>region.has(id));
+  if(!latches.length || latches.length!==header.predIds.length-1)return null;
+  for(const id of region)if(c.fn.blocks[id].predIds.some(p=>!region.has(p) &&
+      !(id===entry&&p===header.id)))return null;
+  // Kahn's check refuses cycles even if a different branch could reach the header.
+  const degree=new Map([...region].map(id=>[id,0]));
+  for(const id of region)for(const next of successors(c.fn.blocks[id]))
+    if(region.has(next))degree.set(next,degree.get(next)+1);
+  const ready=[...region].filter(id=>!degree.get(id));let visited=0;
+  while(ready.length) {
+    const id=ready.pop();visited++;
+    for(const next of successors(c.fn.blocks[id]))if(region.has(next)) {
+      degree.set(next,degree.get(next)-1);if(!degree.get(next))ready.push(next);
+    }
+  }
+  return visited===region.size?{region,latches}:null;
 }
 function children(node) {
   if(node.t==='seq')return node.body;
@@ -24,43 +61,45 @@ function children(node) {
 }
 function planFor(c,node,headerId) {
   const header=c.fn.blocks[headerId],term=header?.term;
-  if(!header || header.body.length || header.predIds.length!==2 ||
+  if(!header || header.body.length || header.predIds.length<2 || header.predIds.length>8 ||
       header.phis.length>32 || header.phis.some(p=>p.kind!=='I') ||
-      term?.insnOp!=='ifge' || term.args.length!==1)return null;
-  const body=c.fn.blocks[term.fall],counter=term.args[0];
-  if(!body || term.taken===headerId || term.taken===body.id ||
-      body.predIds.length!==1 || body.predIds[0]!==headerId ||
-      body.term.kind!=='goto' || body.term.target!==headerId ||
-      body.body.length>96 || !unitStep(counter,header,body))return null;
+      !['ifge','iflt'].includes(term?.insnOp) || term.args.length!==1)return null;
+  const entry=term.insnOp==='ifge'?term.fall:term.taken;
+  const exit=term.insnOp==='ifge'?term.taken:term.fall,counter=term.args[0];
+  if(entry===headerId || entry===exit)return null;
+  const body=bodyRegion(c,header,entry,exit);if(!body)return null;
+  const {region,latches}=body;
+  if(!unitStep(counter,header,region,latches))return null;
   const fields=new Set(),caches=new Set(),memoryNodes=new Set(),fieldNodes=new Set(),ranges=[];
-  for(const value of body.body) {
+  for(const id of region)for(const value of c.fn.blocks[id].body) {
     if(value.op==='getstatic' && value.kind==='A' && value.imm?.[2]?.[1]==='[I') {
       const field=[...c.fieldCaches.values()].find(f=>f.kind==='s' && f.t===T.ref && f.readerIds.has(value.id));
       if(!field)return null;
       fields.add(field);fieldNodes.add(value.id);
     } else if(value.op==='iaload'||value.op==='iastore') {
       const array=value.args[0],index=value.args[1],cache=c.arrayCaches.get(array.id);
-      if(array.op!=='getstatic' || array.block!==body.id ||
-          !unitStep(index,header,body) || !cache || cache.parameter || cache.sharedField)return null;
+      if(!cache || cache.sharedField ||
+          !(cache.parameter || array.op==='getstatic' && region.has(array.block)) ||
+          !unitStep(index,header,region,latches))return null;
       caches.add(cache);memoryNodes.add(value.id);
       if(!ranges.some(r=>r.cache===cache&&r.index===index))ranges.push({cache,index});
     } else if(!pureInt(value))return null;
   }
   if(!memoryNodes.size || fields.size>4 || caches.size>4)return null;
-  // Cloned exit code must not re-enter this loop except through its one body
-  // backedge. Keep the region small and free of other loops/conditions/effects.
+  // Internal branches are pure integer tests. Cloned exit code remains small
+  // and cannot introduce another path back into this loop.
   const pending=[node.body];let size=0,backedges=0;
   while(pending.length) {
-    const part=pending.pop();if(!part || ++size>32)return null;
-    if(part.t==='loop'||part.t==='switch'||(part.t==='if'&&part.block!==headerId))return null;
+    const part=pending.pop();if(!part || ++size>64)return null;
+    if(part.t==='loop'||part.t==='switch'||(part.t==='if'&&part.block!==headerId&&!region.has(part.block)))return null;
     if((part.t==='continue'||part.t==='break')&&part.label===node.label)backedges++;
-    if(part.t==='straight' && part.block!==headerId && part.block!==body.id) {
+    if(part.t==='straight' && part.block!==headerId && !region.has(part.block)) {
       const block=c.fn.blocks[part.block];
       if(!block || !block.body.every(pureInt) || !['goto','fall','return'].includes(block.term.kind))return null;
     }
     pending.push(...children(part));
   }
-  if(backedges!==1)return null;
+  if(backedges!==latches.length)return null;
   return {header:headerId,counter,fields,caches,ranges,memoryNodes,fieldNodes};
 }
 
@@ -85,9 +124,10 @@ function prepare(c,structured) {
 
 function trip(c,plan) { return [...iconst(0),...c.useOf(plan.counter),OP.i32_sub]; }
 function guard(c,plan) {
-  const combine=parts=>parts.flatMap((p,i)=>i?[...p,OP.i32_and]:p);
+  const combine=parts=>parts.length?parts.flatMap((p,i)=>i?[...p,OP.i32_and]:p):iconst(1);
   const ready=[...plan.fields].map(f=>get(f.filledLocal));
-  ready.push(...[...plan.caches].map(cache=>get(cache.filled)));
+  // Parameter metadata has already been captured by the ordinary entry code.
+  ready.push(...[...plan.caches].filter(cache=>!cache.parameter).map(cache=>get(cache.filled)));
   const checks=[];
   for(const {cache,index} of plan.ranges) {
     const end=()=>[...c.useOf(index),OP.i64_extend_i32_u,...trip(c,plan),OP.i64_extend_i32_u,OP.i64_add];
@@ -112,7 +152,7 @@ function emit(c,node,header,out,env) {
   const previous=c.activeGuardedLoopPlan,depth=c.frames.length,fast=[],cold=[];
   try {
     c.frames.push({label:null});c.activeGuardedLoopPlan=plan;
-    // A two-block counted loop polls once for every body iteration and once
+    // A counted loop polls once for every body iteration and once
     // at its final failed test. The guard proves none can exhaust fuel.
     fast.push(...get(c.fuelLocal),...trip(c,plan),...iconst(1),OP.i32_add,OP.i32_sub,
       OP.local_set,...uleb(c.fuelLocal));
