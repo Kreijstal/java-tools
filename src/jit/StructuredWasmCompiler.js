@@ -282,6 +282,7 @@ class StructuredWasmCompiler {
           'fn', 'cfg', 'items', 'originalItems', 'localOf', 'arrayCaches', 'heapParamLocals',
           'fieldArrayOwners', 'sharedFieldArrayGroups', 'arrayReaderGenerations', 'primitiveCopyZeroEntry',
           'fieldCaches', 'castCaches', 'objCaches', 'nativeStaticCells', 'staticFieldAccessors', 'nativeStaticSites', 'linkSlotByNode', 'canonicalSlotByNode',
+          'guardedNestedArrayLoopPlans','loweringGuardedLoopHeaders','activeGuardedLoopPlan',
           'deoptableSites', 'linkSlotSites', 'canonicalCompactSlots', 'emptyCopySites', 'fusedGuardOfLoad',
           'fusedGuardArms', 'fusedFieldReads', 'rematLoads', 'inlinedInitializationGuards', 'heapReadinessGuards',
           'labelIndex', 'origIdx', 'deoptStubs', 'deoptBlocks', 'declared',
@@ -660,6 +661,8 @@ class StructuredWasmCompiler {
     }
 
     this.prepareSharedFieldArrayCaches();
+    this.guardedNestedArrayLoopPlans=require('./guardedNestedArrayLoops').prepare(this,structured);
+    this.guardedNestedArrayLoopCount=0;this.guardedNestedArrayLoopBytes=0;
 
     this.booleanStaticSpillProof = true;
     this.booleanStaticSpillSites = 0;
@@ -906,6 +909,8 @@ class StructuredWasmCompiler {
       parameterArrayCacheCount: [...this.arrayCaches.values()]
         .filter((cache) => cache.parameter).length,
       parameterHeapSpecializationBytes,
+      guardedNestedArrayLoopCount:this.guardedNestedArrayLoopCount||0,
+      guardedNestedArrayLoopBytes:this.guardedNestedArrayLoopBytes||0,
       irreducibleSplitBlocks:this.irreducibleSplitBlocks || 0,
       importStats: this.importStats || null,
     };
@@ -998,11 +1003,13 @@ class StructuredWasmCompiler {
       }
       case 'loop': {
         const header = headerOfLabel(node.label);
+        if(require('./guardedNestedArrayLoops').emit(this,node,header,out,env))return;
         out.push(OP.loop, 0x40);
         this.frames.push({ label: node.label });
         // A loop spliced from a callee has no caller pc to exit at; the
         // inliner admits only provably counted loops there (countedBackEdge).
-        if (!(this.origIdx && this.origIdx[this.cfg.blocks[header].insns[0]] === -1)) {
+        if (this.activeGuardedLoopPlan?.header!==header &&
+            !(this.origIdx && this.origIdx[this.cfg.blocks[header].insns[0]] === -1)) {
           this.emitFuelCheck(header, out);
         }
         this.lowerNode(node.body, out, env);
@@ -1800,7 +1807,8 @@ class StructuredWasmCompiler {
             OP.local_set, ...uleb(entry.arrayGeneration));
         }
         for (const id of entry.readerIds) onMiss.push(...this.cacheKillsFor(id));
-        out.push(...this.cachedReadSeq(entry, loadSeq, onMiss));
+        out.push(...(this.activeGuardedLoopPlan?.fieldNodes.has(node.id)
+          ? [OP.local_get,...uleb(entry.valLocal)] : this.cachedReadSeq(entry, loadSeq, onMiss)));
         if (node.kind !== 'V') out.push(OP.local_set, ...uleb(this.mustLocal(node)));
         const generation = this.arrayReaderGenerations?.get(node.id);
         if (generation !== undefined) {
@@ -2281,6 +2289,9 @@ class StructuredWasmCompiler {
         ...uleb(this.importIndexByName.get(
           arrayLoadImportName(this, node.op, importT)))];
     const heapOp = [OP[acc.op], ...uleb(acc.shift), ...uleb(0)];
+    if(this.activeGuardedLoopPlan?.memoryNodes.has(node.id)) {
+      return [...addr,...(storeSeq||[]),...heapOp];
+    }
     if (this.parameterHeapAccess && c.parameter) {
       return [...bounds, ...addr, ...(storeSeq || []), ...heapOp];
     }
