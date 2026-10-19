@@ -1,6 +1,7 @@
 "use strict";
 const {T,OP,STRUCTURED_RETURN,uleb,sleb,getOp}=require('./wasmShared');
 const {heapCopyKind}=require('./WasmArrayCopy');
+const bufferLength=Object.getOwnPropertyDescriptor(ArrayBuffer.prototype,'byteLength').get;
 
 // Recognize the entire forward/reverse unrolled primitive-array copy, including
 // branch destinations, local numbers, and every increment. A signature or
@@ -63,6 +64,13 @@ function recognizePrimitiveCopy(method) {
     if(actual.length===expected.length && actual.every((op,i)=>
       op.length===expected[i].length && op.every((v,k)=>v===expected[i][k])))return {width};
   }
+  for(let width=2;width<=16;width++){
+    if(require('./copyControlFlowProof').equivalentCopyControlFlow(actual,
+      copyPattern(width,method.descriptor==='([BI[BII)V'?'b':'i'))){
+      // Extra blocks must not weaken the original low-fuel continuation.
+      return {width,controlFlowEquivalent:true,proofInstructions:actual.length};
+    }
+  }
   return null;
 }
 
@@ -91,7 +99,9 @@ function emitPrimitiveCopyEntry(compiler,structured) {
   if(!empty)return [];
   // Each original instruction can enter at most all structured loop headers.
   // Overestimate rather than bypass an existing low-fuel continuation.
-  const fuelBound=plan?2:Math.max(2,empty.steps*Math.max(1,structured.loopHeaders.size));
+  const fuelScale=plan?.controlFlowEquivalent
+    ? plan.proofInstructions*Math.max(1,structured.loopHeaders.size) : 1;
+  const fuelBound=plan?2*fuelScale:Math.max(2,empty.steps*Math.max(1,structured.loopHeaders.size));
   const source=compiler.arrayCacheFor(compiler.fn.params[0]);
   const target=compiler.arrayCacheFor(compiler.fn.params[2]);
   if(!source.parameter||!target.parameter)return [];
@@ -110,26 +120,55 @@ function emitPrimitiveCopyEntry(compiler,structured) {
   compiler.primitiveCopyZeroProof=true;
   compiler.primitiveCopyZeroFuel=fuelBound;
   if(!enabled||!plan)return [];
+  // Preserve the ordering of raw scalar accesses on shared storage. The
+  // intrinsic also recognizes a shared buffer from another realm.
+  if(!byte)try{bufferLength.call(compiler.heap.memory.buffer);}catch(_){return [];}
   const width=[OP.i32_const,byte?0:2,OP.i32_shl];
   const address=(cache,index)=>[...get(cache.base),...use(index),...width,OP.i32_add];
   const range=(cache,index)=>[...get(cache.len),...use(index),OP.i32_ge_u,
     ...get(cache.len),...use(index),OP.i32_sub,...use(4),OP.i32_ge_u,OP.i32_and];
-  const kind=compiler.addImport(byte?'primitive_copy_byte_heap':'primitive_copy_int_heap',[T.ref],[T.i32],
-    byte?array=>byteHeapCopyEligible(compiler.heap,array)?1:0:
-      array=>heapCopyKind(compiler.heap,array)===0x54?1:0);
+  const kind=byte?compiler.addImport('primitive_copy_byte_heap',[T.ref],[T.i32],
+    array=>byteHeapCopyEligible(compiler.heap,array)?1:0):null;
+  const wideStart=(cache,index)=>[...get(cache.base),OP.i64_extend_i32_u,
+    ...use(index),OP.i64_extend_i32_u,OP.i64_const,2,OP.i64_shl,OP.i64_add];
+  const wideEnd=(cache,index)=>[...wideStart(cache,index),...use(4),OP.i64_extend_i32_u,
+    OP.i64_const,2,OP.i64_shl,OP.i64_add];
+  // The original compiled integer loop already selects raw i32 accesses from
+  // these captured caches. Prove the entire physical range too: forged host
+  // metadata must retain the scalar path's wrapping addresses and partial
+  // stores before a trap. i64 arithmetic cannot wrap an i32 byte address.
+  const eligibility=(index,cache)=>byte?[...use(index),OP.call,...uleb(kind)]:[
+    ...get(cache.base),OP.i32_const,0,OP.i32_ge_s,
+    ...wideEnd(cache,index+1),OP.memory_size,0,OP.i64_extend_i32_u,
+    OP.i64_const,16,OP.i64_shl,OP.i64_le_u,OP.i32_and];
+  const same=[...use(0),...use(2),OP.call,...uleb(compiler.importIndexByName.get('ref_eq'))];
+  const sameBase=[...get(source.base),...get(target.base),OP.i32_eq];
+  const alias=byte?[
+    ...same,...address(target,3),...address(source,1),...use(4),...width,OP.i32_add,OP.i32_ge_u,OP.i32_or,
+    ...address(source,1),...address(target,3),...use(4),...width,OP.i32_add,OP.i32_ge_u,OP.i32_or,
+  ]:[
+    ...wideStart(target,3),...wideEnd(source,1),OP.i64_ge_u,
+    ...wideStart(source,1),...wideEnd(target,3),OP.i64_ge_u,OP.i32_or,
+    OP.if,T.i32,
+      // A host getter can give two captures of the same Java reference
+      // different bases. Equal Java indices then return without copying.
+      ...use(1),...use(3),OP.i32_eq,...sameBase,OP.i32_eqz,OP.i32_and,
+      OP.if,T.i32,...same,OP.i32_eqz,OP.else,OP.i32_const,1,OP.end,
+    OP.else,...sameBase,...same,OP.i32_and,OP.end,
+  ];
   const out=[
     ...get(compiler.blkLocal),OP.i32_eqz,
-    ...use(0),OP.call,...uleb(kind),OP.i32_and,
-    ...use(2),OP.call,...uleb(kind),OP.i32_and,
+    ...eligibility(0,source),OP.i32_and,
+    ...eligibility(2,target),OP.i32_and,
     ...range(source,1),OP.i32_and,...range(target,3),OP.i32_and,
     // Keep large copies in the fuel-polled loop; bound one bulk operation.
     OP.i32_const,...sleb(16384),...use(4),OP.i32_ge_u,OP.i32_and,
-    ...get(compiler.fuelLocal),...use(4),OP.i32_const,2,OP.i32_add,OP.i32_gt_s,OP.i32_and,
+    ...get(compiler.fuelLocal),
+    ...(fuelScale===1?[]:[OP.i32_const,...sleb(fuelScale),OP.i32_div_s]),
+    ...use(4),OP.i32_const,2,OP.i32_add,OP.i32_gt_s,OP.i32_and,
     // Distinct Java arrays normally occupy disjoint heap ranges. Host-made
     // overlapping views must keep the original forward-copy semantics.
-    ...use(0),...use(2),OP.call,...uleb(compiler.importIndexByName.get('ref_eq')),
-    ...address(target,3),...address(source,1),...use(4),...width,OP.i32_add,OP.i32_ge_u,OP.i32_or,
-    ...address(source,1),...address(target,3),...use(4),...width,OP.i32_add,OP.i32_ge_u,OP.i32_or,
+    ...alias,
     OP.i32_and,OP.if,0x40,
     ...address(target,3),...address(source,1),...use(4),...width,
     0xfc,0x0a,0x00,0x00,

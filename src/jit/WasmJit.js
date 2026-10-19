@@ -2613,7 +2613,7 @@ class WasmJit {
     this.canonicalEhLinksEnabled = wasmOptions.canonicalEhLinks === true;
     this.canonicalDirectCallsEnabled = wasmOptions.canonicalDirectCalls === true;
     this.canonicalLeafCallsEnabled = wasmOptions.canonicalLeafCalls === true;
-    this.primitiveArrayCopyEntryEnabled = wasmOptions.primitiveArrayCopyEntry === true;
+    this.primitiveArrayCopyEntryEnabled = wasmOptions.primitiveArrayCopyEntry !== false;
     this.intZeroClearEntryEnabled = wasmOptions.intZeroClearEntry === true;
     this.nativeJsExceptionTagsEnabled = wasmOptions.nativeJsExceptionTags === true;
     this.nativeInstanceExitsEnabled = wasmOptions.nativeInstanceExits === true;
