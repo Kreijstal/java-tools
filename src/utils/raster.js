@@ -1,40 +1,52 @@
 'use strict';
 
 const {OP,T,uleb,sleb} = require('../jit/wasmShared');
+const {memoryForBuffer} = require('../core/wasmHeap');
 const littleEndian = new Uint8Array(new Uint32Array([0x01020304]).buffer)[0] === 4;
 let swizzler;
 let staging;
+let externalModule;
+const externalSwizzlers = new WeakMap();
+const intPrototype = Int32Array.prototype, uintPrototype = Uint32Array.prototype;
+const typedPrototype = Object.getPrototypeOf(intPrototype);
+const typedLength = Object.getOwnPropertyDescriptor(typedPrototype,'length').get;
+const typedBuffer = Object.getOwnPropertyDescriptor(typedPrototype,'buffer').get;
+const typedOffset = Object.getOwnPropertyDescriptor(typedPrototype,'byteOffset').get;
 
 // The staging buffer belongs to the presenter, never to the guest. Convert
 // four packed RGB integers at a time, then handle the final zero to three.
-function swizzleModule(simd) {
+function swizzleModule(simd, external = false) {
   const section = (id,bytes) => [id,...uleb(bytes.length),...bytes];
   const get = n => [OP.local_get,n];
   const iconst = n => [OP.i32_const,...sleb(n)];
-  const advance = n => [...get(1),...iconst(n),OP.i32_add,OP.local_set,1];
+  const count = external ? 1 : 0, offset = external ? 2 : 1, limit = external ? 3 : 2;
+  const input = () => [...get(offset),...(external ? [...get(0),OP.i32_add] : [])];
+  const storeArg = align => external ? [align|0x40,1,0] : [align,0];
+  const advance = n => [...get(offset),...iconst(n),OP.i32_add,OP.local_set,offset];
   const body = [1,2,T.i32]; // byte offset and exclusive byte limit
   if (simd) body.push(
-    ...get(0),...iconst(-4),OP.i32_and,...iconst(2),OP.i32_shl,OP.local_set,2,
+    ...get(count),...iconst(-4),OP.i32_and,...iconst(2),OP.i32_shl,OP.local_set,limit,
     OP.block,0x40,OP.loop,0x40,
-    ...get(1),...get(2),OP.i32_ge_u,OP.br_if,1,
-    ...get(1),...get(1),0xfd,0,4,0,...get(1),0xfd,0,4,0,
+    ...get(offset),...get(limit),OP.i32_ge_u,OP.br_if,1,
+    ...get(offset),...input(),0xfd,0,4,0,...input(),0xfd,0,4,0,
     0xfd,0x0d,2,1,0,3,6,5,4,7,10,9,8,11,14,13,12,15, // i8x16.shuffle
     0xfd,0x0c,0,0,0,255,0,0,0,255,0,0,0,255,0,0,0,255, // v128.const alpha
-    0xfd,0x50,0xfd,0x0b,4,0, // v128.or; v128.store
+    0xfd,0x50,0xfd,0x0b,...storeArg(4), // v128.or; v128.store
     ...advance(16),OP.br,0,OP.end,OP.end);
-  body.push(...get(0),...iconst(2),OP.i32_shl,OP.local_set,2,
+  body.push(...get(count),...iconst(2),OP.i32_shl,OP.local_set,limit,
     OP.block,0x40,OP.loop,0x40,
-    ...get(1),...get(2),OP.i32_ge_u,OP.br_if,1,
-    ...get(1),...iconst(-16777216),
-    ...get(1),OP.i32_load,2,0,...iconst(255),OP.i32_and,...iconst(16),OP.i32_shl,OP.i32_or,
-    ...get(1),OP.i32_load,2,0,...iconst(65280),OP.i32_and,OP.i32_or,
-    ...get(1),OP.i32_load,2,0,...iconst(16),OP.i32_shr_u,...iconst(255),OP.i32_and,OP.i32_or,
-    OP.i32_store,2,0,...advance(4),OP.br,0,OP.end,OP.end,OP.end);
+    ...get(offset),...get(limit),OP.i32_ge_u,OP.br_if,1,
+    ...get(offset),...iconst(-16777216),
+    ...input(),OP.i32_load,2,0,...iconst(255),OP.i32_and,...iconst(16),OP.i32_shl,OP.i32_or,
+    ...input(),OP.i32_load,2,0,...iconst(65280),OP.i32_and,OP.i32_or,
+    ...input(),OP.i32_load,2,0,...iconst(16),OP.i32_shr_u,...iconst(255),OP.i32_and,OP.i32_or,
+    OP.i32_store,...storeArg(2),...advance(4),OP.br,0,OP.end,OP.end,OP.end);
   return new Uint8Array([
     0,97,115,109,1,0,0,0,
-    ...section(1,[1,0x60,1,T.i32,0]),
+    ...section(1,[1,0x60,external?2:1,...(external?[T.i32]:[]),T.i32,0]),
+    ...(external ? section(2,[1,3,...stringBytes('env'),6,...stringBytes('source'),2,0,1]) : []),
     ...section(3,[1,0]),...section(5,[1,0,1]),
-    ...section(7,[2,6,...stringBytes('memory'),2,0,7,...stringBytes('swizzle'),0,0]),
+    ...section(7,[2,6,...stringBytes('memory'),2,external?1:0,7,...stringBytes('swizzle'),0,0]),
     ...section(10,[1,...uleb(body.length),...body]),
   ]);
 }
@@ -53,25 +65,68 @@ function getSwizzler() {
   return swizzler;
 }
 
+function externalSource(source, count) {
+  if (!ArrayBuffer.isView(source)) return null;
+  const proto = Object.getPrototypeOf(source);
+  // The old exact-size TypedArray.set path uses intrinsic element storage.
+  // Leave custom length/subarray behavior to that path, without invoking new
+  // getters during discovery of the owning memory.
+  if ((proto !== intPrototype && proto !== uintPrototype) ||
+      Object.hasOwn(source,'length') || Object.hasOwn(proto,'length') ||
+      Object.getPrototypeOf(proto) !== typedPrototype ||
+      Object.getOwnPropertyDescriptor(typedPrototype,'length')?.get !== typedLength ||
+      typedLength.call(source) !== count) return null;
+  const buffer = typedBuffer.call(source), memory = memoryForBuffer(buffer);
+  return memory?.buffer === buffer ? memory : null;
+}
+
+function getExternalSwizzler(memory) {
+  if (externalSwizzlers.has(memory)) return externalSwizzlers.get(memory);
+  let state = null;
+  try {
+    if (externalModule === undefined) {
+      externalModule = null;
+      const vector = swizzleModule(true,true), scalar = swizzleModule(false,true);
+      const bytes = WebAssembly.validate(vector) ? vector : scalar;
+      if (WebAssembly.validate(bytes)) externalModule = new WebAssembly.Module(bytes);
+    }
+    if (externalModule) state = {native:new WebAssembly.Instance(externalModule,
+      {env:{source:memory}}).exports, staging:null};
+  } catch (_) { /* Unsupported multi-memory or allocation keeps staging. */ }
+  externalSwizzlers.set(memory,state);
+  return state;
+}
+
 function trySwizzleRgbToRgba32(output, pixels, count) {
   const source = pixels && pixels.elements ? pixels.elements : pixels;
   if (!littleEndian || count < 65536 || !Number.isInteger(count) ||
       count > 0x1fffffff || !(source instanceof Int32Array || source instanceof Uint32Array) ||
       source.length < count || !(output instanceof Uint32Array) || output.length < count) return false;
-  const native = getSwizzler();
-  if (!native) return false;
+  let sourceMemory, external;
   try {
+    sourceMemory = externalSource(source,count);
+    external = sourceMemory && getExternalSwizzler(sourceMemory);
+    const native = external ? external.native : getSwizzler();
+    if (!native) return false;
     const memory = native.memory, required = count * 4;
     if (memory.buffer.byteLength < required)
       memory.grow(Math.ceil((required - memory.buffer.byteLength) / 65536));
-    if (!staging || staging.buffer !== memory.buffer || staging.length !== count)
-      staging = new Uint32Array(memory.buffer,0,count);
-    staging.set(source.length === count ? source : source.subarray(0,count));
-    native.swizzle(count);
-    output.set(staging);
+    if (external) {
+      if (!external.staging || external.staging.buffer !== memory.buffer || external.staging.length !== count)
+        external.staging = new Uint32Array(memory.buffer,0,count);
+      native.swizzle(typedOffset.call(source),count);
+      output.set(external.staging);
+    } else {
+      if (!staging || staging.buffer !== memory.buffer || staging.length !== count)
+        staging = new Uint32Array(memory.buffer,0,count);
+      staging.set(source.length === count ? source : source.subarray(0,count));
+      native.swizzle(count);
+      output.set(staging);
+    }
     return true;
   } catch (_) {
-    swizzler = null; staging = null;
+    if (external) externalSwizzlers.set(sourceMemory,null);
+    else { swizzler = null; staging = null; }
     return false;
   }
 }

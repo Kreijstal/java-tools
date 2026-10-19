@@ -52,6 +52,10 @@ const MAX_BINNED_BYTES = 4096;
 // _takeExtent). Small on purpose: past a few entries, bumping is cheaper than
 // hunting.
 const EXTENT_SCAN_LIMIT = 8;
+// Presenters can read a genuine heap view through its owning Memory without
+// staging a second copy. Weak keys do not keep a closed VM's memory alive.
+const memoryByBuffer = new WeakMap();
+function memoryForBuffer(buffer) { return memoryByBuffer.get(buffer); }
 
 // Design A reclamation (docs/phase2-representation.md 7-8). A guest array's
 // identity is the JS TypedArray view, so the host GC already knows when the
@@ -61,10 +65,12 @@ const EXTENT_SCAN_LIMIT = 8;
 // reclamation scheme that does not move that number is not worth its overhead.
 //
 // Soundness rests on an audited property: no global, field cache, or cross-run
-// structure holds a bare `wasmBase`. The only consumer outside this file takes
-// the array reference and returns its base (`abase`), so the view is reachable
-// whenever a base exists. A future cache of `abase` results across a
-// suspension point would break this.
+// structure holds a bare `wasmBase`. Compiled accesses pair invocation-local
+// bases with array references. The presenter also passes a transient view
+// offset to a synchronous native kernel with no guest allocation or yield;
+// array finalizers cannot recycle that extent during the kernel. Its cache
+// retains only the owning Memory, never an array offset. A bare-base cache
+// across a suspension point would break this.
 function reclaimEnabled() {
   try {
     return typeof process !== "undefined" && process.env &&
@@ -133,6 +139,7 @@ class WasmHeap {
   // growTo has a guard.
   refreshViews() {
     const buffer = this.memory.buffer;
+    memoryByBuffer.set(buffer, this.memory);
     this.i32 = new Int32Array(buffer);
     this.f64 = new Float64Array(buffer);
     this.i64 = new BigInt64Array(buffer);
@@ -419,4 +426,4 @@ function isJavaArray(v) {
   return Array.isArray(v) || (ArrayBuffer.isView(v) && !(v instanceof DataView));
 }
 
-module.exports = { WasmHeap, isJavaArray };
+module.exports = { WasmHeap, isJavaArray, memoryForBuffer };
