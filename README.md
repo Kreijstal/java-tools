@@ -176,6 +176,32 @@ oversized regions retain the normal dispatch path. Direct source emission is
 disabled when per-method profiling is enabled so call-site counters remain
 available.
 
+The structured Wasm inliner uses proven receiver types as well as the loaded
+class hierarchy. An unchanged `this` is bounded by its declaring class; a
+successful `checkcast` bounds the receiver by the cast type. These facts narrow
+virtual/interface target selection before the inline limit is applied, including
+inside inlined bodies, so unrelated sibling implementations do not block a
+specialization. Casts still execute, nullable receivers retain their guards,
+and class-load revalidation watches the narrower hierarchy for new overrides.
+The proof stops at ambiguous branches, calls and stack shuffles; those sites
+retain the existing target-selection and fallback rules. This analysis runs
+automatically without an additional option.
+
+Shared SSA graphs expose a lazy `fn.referenceFacts` analysis from
+`src/analysis/opgraph/referenceFacts.js`. `get(value)` returns nullness, Java
+reference upper bounds and any proven exact allocation type; `at(value, node)`
+adds facts valid before that instruction (`at(value, blockId)` queries the
+terminator). Copies share their SSA value, phis merge incoming facts, and normal
+edges carry null-check proofs. Handler locals remain opaque and loop re-entry
+kills facts about fresh definitions. Bounded analysis falls back to unknown.
+The analysis reuses SSA def-use links, compresses cast-identity chains, and
+checks its sparse-state budget while propagating individual switch edges.
+The call inliner uses these facts for receiver types through locals and joins;
+the structured Wasm emitter uses them for redundant null conditions and
+known-null casts. Facts stay with the temporary graph and are never installed
+or transported with compiled bodies. This is intraprocedural analysis; method
+return bounds currently come from descriptors rather than inferred summaries.
+
 Verified handler-free integer loops also have a scalar tier. It derives CFG and
 operand-stack depths from bytecode, keeps used locals and stack expressions in
 JavaScript scalars, and emits bounded backedge safe points that reconstruct the

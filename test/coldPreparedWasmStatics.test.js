@@ -88,12 +88,16 @@ test(`cold Wasm static accesses preserve initialization (structured=${structured
       frame.className = 'ColdPreparedInherited';
       frame.locals[0] = choose; frame.locals[1] = 17;
       thread.callStack.items.length = 0; thread.callStack.push(frame);
-      wasm.execute(frame, thread, inheritedState, 0);
-      t.ok(frame.pc > 0, 'initialization exits at the reached join block');
+      const coldResult = wasm.execute(frame, thread, inheritedState, 0);
+      t.notEqual(coldResult.returned, true, 'cold initialization exits before completing the method');
       t.equal(declaring.staticFields.has('number:I'), false,
         'the declaring class remains untouched before initialization');
-      t.ok(frame.stack.items.includes(choose ? 17 : 18),
-        'the selected operand survives the cold exit');
+      // A call-free structured body may check readiness at entry, before
+      // this pure selection. The dispatcher instead exits at the field.
+      t.ok(frame.pc === 0
+        ? frame.locals[0] === choose && frame.locals[1] === 17 && !frame.stack.items.length
+        : frame.stack.items.includes(choose ? 17 : 18),
+        'entry arguments or the selected operand survive the cold exit');
       t.notEqual(jvm.classInitializationState.get('ColdInheritedChild'), 'INITIALIZED',
         'compilation and the guard leave the referenced subclass cold');
       declaring.staticFields.set('number:I', 0);

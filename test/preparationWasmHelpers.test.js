@@ -18,10 +18,11 @@ public class PreparedHelpers {
 }`);
   const priorityMethods = ['PreparedHelpers.bits(I)I',
     'PreparedHelpers.next(I)B', 'PreparedHelpers.sum(I)I'];
-  for (const includeHelpers of [false, true]) {
+  for (const includeHelpers of [false, true, 'selected', 'selected-upgrades']) {
     const output = [];
     const policy = {priorityMethods, maxMethods: 3};
-    if (includeHelpers) policy.wasmLoopsOnly = false;
+    if (includeHelpers === true) policy.wasmLoopsOnly = false;
+    if (typeof includeHelpers === 'string') policy.wasmCalleeMethods = priorityMethods.slice(0,2);
     const j = new JVM({classpath, prepareBeforeMain: false, jit: {
       compileWorker: false, wasmStructured: true, preparationPolicy: policy,
     }});
@@ -29,8 +30,11 @@ public class PreparedHelpers {
     await j.preloadClasspathClasses();
     const result = await j.precompileInitializedClasses({
       initializedOnly: false, effectful: true, wasm: true,
+      wasmPreparedUpgradesOnly: includeHelpers === 'selected-upgrades',
     });
-    t.equal(result.wasmMethods, includeHelpers ? 3 : 1,
+    if (includeHelpers === 'selected-upgrades') {
+      t.ok(result.wasmMethods >= 2, 'selected helpers prepare while the upgrades-only filter remains enabled');
+    } else t.equal(result.wasmMethods, includeHelpers ? 3 : 1,
       includeHelpers ? 'explicit policy prepares all three selected methods'
         : 'default Wasm preparation remains limited to loops');
     if (includeHelpers) {

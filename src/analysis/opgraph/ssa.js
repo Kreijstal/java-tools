@@ -23,6 +23,7 @@ const {
   paramKindsFromMethodDescriptor,
   mergeKind,
 } = require('./ssaTypes');
+const { analyzeReferenceFacts } = require('./referenceFacts');
 
 const LETTER_KIND = { i: 'I', l: 'J', f: 'F', d: 'D', a: 'A' };
 const LOCAL_LOAD = /^[ilfda]load$/;
@@ -264,6 +265,13 @@ function buildSsaOrThrow(input, options) {
   fillPhiArgs(blocks, rpo, isJoin, makeValue, paramSlots);
   pruneTrivialPhis(fn);
   recordUses(fn);
+
+  // All SSA consumers share the same lazy proof object. It belongs to the
+  // temporary graph, not execution metadata or a process-wide compiler cache.
+  let referenceFacts;
+  Object.defineProperty(fn, 'referenceFacts', { get() {
+    return referenceFacts ||= analyzeReferenceFacts(fn, { className: input.className });
+  } });
 
   return fn;
 }

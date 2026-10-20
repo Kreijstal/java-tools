@@ -109,6 +109,193 @@ function expectedSum(per, n) {
   return sum;
 }
 
+const RECEIVER_BOUND_SOURCE = `
+public class ReceiverBound {
+  static void casted(int[] out, Object receiver, int n) {
+    int sum = 0;
+    for (int i = 0; i < n; i++) sum += ((BoundNarrow) receiver).value(i);
+    out[0] = sum;
+  }
+  static void checked(int[] out, Object receiver, int n) {
+    try { casted(out, receiver, n); }
+    catch (NullPointerException e) { out[0] = -1; }
+    catch (ClassCastException e) { out[0] = -2; }
+  }
+  static int wide(Object receiver, long a, double b) {
+    return ((BoundNarrow) receiver).wide(a, b);
+  }
+  static int joined(Object receiver, BoundRoot other, boolean first) {
+    return (first ? (BoundNarrow) receiver : other).value(1);
+  }
+  static int argument(BoundRoot receiver, Object argument) {
+    return receiver.echo((BoundNarrow) argument);
+  }
+  static void chain(int[] out, BoundWrapper wrapper, int n) {
+    int sum = 0;
+    for (int i = 0; i < n; i++) sum += wrapper.hop(i);
+    out[0] = sum;
+  }
+  static void inter(int[] out, Object receiver, int n) {
+    int sum = 0;
+    for (int i = 0; i < n; i++) sum += ((BoundCall)(BoundNarrow) receiver).value(i);
+    out[0] = sum;
+  }
+  static void typed(int[] out, BoundNarrow receiver, int n) {
+    int sum = 0;
+    for (int i = 0; i < n; i++) sum += receiver.value(i);
+    out[0] = sum;
+  }
+  static void aliased(int[] out, Object receiver, int n) {
+    BoundNarrow copy = (BoundNarrow) receiver;
+    int sum = 0;
+    for (int i = 0; i < n; i++) sum += copy.value(i);
+    out[0] = sum;
+  }
+  static void chosen(int[] out, Object a, Object b, boolean first, int n) {
+    BoundNarrow copy = first ? (BoundNarrow) a : (BoundNarrow) b;
+    int sum = 0;
+    for (int i = 0; i < n; i++) sum += copy.value(i);
+    out[0] = sum;
+  }
+}
+class BoundWrapper { Object target; int hop(int i) { return ((BoundNarrow) target).value(i); } }
+interface BoundCall { int value(int i); }
+class BoundRoot implements BoundCall {
+  public int value(int i) { return i; }
+  int wide(long a, double b) { return (int)a + (int)b; }
+  int echo(Object argument) { return 0; }
+}
+class BoundNarrow extends BoundRoot {
+  public int value(int i) { return i + 7; }
+  int wide(long a, double b) { return (int)a + (int)b + 7; }
+  int echo(Object argument) { return 7; }
+  void own(int[] out, int n) {
+    int sum = 0;
+    for (int i = 0; i < n; i++) sum += value(i);
+    out[0] = sum;
+  }
+}
+class BoundA extends BoundRoot {
+  public int value(int i) { return i + 10; }
+  int wide(long a, double b) { return 10; }
+  int echo(Object argument) { return 10; }
+}
+class BoundB extends BoundRoot {
+  public int value(int i) { return i + 20; }
+  int wide(long a, double b) { return 20; }
+  int echo(Object argument) { return 20; }
+}
+class BoundC extends BoundRoot {
+  public int value(int i) { return i + 30; }
+  int wide(long a, double b) { return 30; }
+  int echo(Object argument) { return 30; }
+}
+class BoundLateSibling extends BoundRoot { public int value(int i) { return i + 40; } }
+class BoundLateNarrow extends BoundNarrow { public int value(int i) { return i + 70; } }
+`;
+
+test('proven receiver bounds exclude sibling implementations without closing the world', async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'ReceiverBound', RECEIVER_BOUND_SOURCE,
+    ['BoundRoot', 'BoundNarrow', 'BoundA', 'BoundB', 'BoundC', 'BoundWrapper']);
+  const { inlineCalls, revalidateSpeculations } = require('../src/jit/wasmInline');
+  const hierarchy = jvm.jit.wasmJit.hierarchy;
+  const methods = new Map();
+  for (const [owner, name, descriptor] of [
+    ['BoundNarrow', 'own', '([II)V'],
+    ['ReceiverBound', 'casted', '([ILjava/lang/Object;I)V'],
+    ['ReceiverBound', 'wide', '(Ljava/lang/Object;JD)I'],
+    ['ReceiverBound', 'joined', '(Ljava/lang/Object;LBoundRoot;Z)I'],
+    ['ReceiverBound', 'argument', '(LBoundRoot;Ljava/lang/Object;)I'],
+    ['BoundWrapper', 'hop', '(I)I'],
+    ['ReceiverBound', 'chain', '([ILBoundWrapper;I)V'],
+    ['ReceiverBound', 'inter', '([ILjava/lang/Object;I)V'],
+    ['ReceiverBound', 'typed', '([ILBoundNarrow;I)V'],
+    ['ReceiverBound', 'aliased', '([ILjava/lang/Object;I)V'],
+    ['ReceiverBound', 'chosen', '([ILjava/lang/Object;Ljava/lang/Object;ZI)V'],
+  ]) {
+    const method = await jvm.findMethodInHierarchy(owner, name, descriptor);
+    const code = method.attributes.find(a => a.type === 'code');
+    // A legal superclass symbolic reference need not describe the receiver's
+    // actual upper bound. Obfuscated/handwritten bytecode uses this too.
+    for (const item of code.code.codeItems) {
+      if (item.instruction?.op === 'invokevirtual' && item.instruction.arg[2][0] !== 'hop') {
+        item.instruction.arg[1] = 'BoundRoot';
+      }
+    }
+    const expanded = inlineCalls(jvm, code, { hierarchy,
+      callerClassName: owner, callerIsStatic: method.flags.includes('static'), callerMethod: method });
+    methods.set(name, { method, code, expanded });
+  }
+  t.equal(hierarchy.resolveDispatch('BoundRoot', 'value', '(I)I').impls.size, 5,
+    'declared owner exceeds the ordinary three-implementation inline limit');
+  for (const name of ['own', 'casted', 'wide', 'inter', 'typed', 'aliased', 'chosen']) {
+    const expanded = methods.get(name).expanded;
+    t.equal(expanded?.inlined, 1, name + ' uses its proven receiver bound');
+    t.equal(expanded?.specSites[0]?.owner, 'BoundNarrow', name + ' records the narrower dependency');
+    t.equal(expanded?.elidedThisGuards, name === 'own' ? 1 : 0,
+      name + ' elides only a proven non-null this guard');
+  }
+  t.equal(methods.get('joined').expanded, null, 'a cast on just one incoming branch is insufficient');
+  t.equal(methods.get('argument').expanded, null, 'an argument cast is not a receiver bound');
+  t.ok(methods.get('inter').code.code.codeItems.some(item =>
+    item.instruction?.op === 'invokeinterface'), 'the interface fixture retains interface dispatch');
+  t.deepEqual(methods.get('chain').expanded?.specSites.map(site => site.owner),
+    ['BoundWrapper', 'BoundNarrow'], 'interior calls use the same bound proof');
+
+  const n = 2000, out = [0]; out.type = '[I';
+  const receiver = { type: 'BoundNarrow', fields: {} };
+  for (const [owner, name, descriptor, locals] of [
+    ['BoundNarrow', 'own', '([II)V', [receiver, out, n]],
+    ['ReceiverBound', 'casted', '([ILjava/lang/Object;I)V', [out, receiver, n]],
+    ['ReceiverBound', 'chain', '([ILBoundWrapper;I)V',
+      [out, { type: 'BoundWrapper', fields: { 'BoundWrapper.target': receiver } }, n]],
+    ['ReceiverBound', 'inter', '([ILjava/lang/Object;I)V', [out, receiver, n]],
+    ['ReceiverBound', 'typed', '([ILBoundNarrow;I)V', [out, receiver, n]],
+    ['ReceiverBound', 'aliased', '([ILjava/lang/Object;I)V', [out, receiver, n]],
+    ['ReceiverBound', 'chosen', '([ILjava/lang/Object;Ljava/lang/Object;ZI)V', [out, receiver, receiver, 1, n]],
+  ]) {
+    const method = methods.get(name).method;
+    const wasm = jvm.jit.wasmJit, state = wasm.methodState({ method });
+    wasm.compile({ method, className: owner }, state, { asCallee: true });
+    if (name === 'aliased' && !wasm.checkcastEnabled) {
+      // The SSA inliner proves the call, but the entry cast itself retains
+      // the existing admission policy. Type knowledge must not bypass it.
+      t.notEqual(state.status, 'ready', 'unadmitted entry cast retains the existing fallback');
+      t.equal(methods.get(name).expanded.inlined, 1, 'SSA still proves the aliased call independently');
+    } else {
+      t.equal(state.status, 'ready', name + ' compiles');
+      t.equal(state.meta?.inlinedCalls, 1, name + ' installs the specialized body');
+    }
+    await invoke(jvm, thread, owner, name, descriptor, locals);
+    t.equal(out[0], expectedSum(7, n), name + ' preserves execution results');
+  }
+  for (const [value, expected] of [[null, -1], [{ type: 'BoundA', fields: {} }, -2]]) {
+    await invoke(jvm, thread, 'ReceiverBound', 'checked', '([ILjava/lang/Object;I)V', [out, value, n]);
+    t.equal(out[0], expected, 'null/cast failure retains the original exception');
+  }
+
+  const before = metaOf(jvm, 'BoundNarrow.own([II)V');
+  await jvm.loadClassByName('BoundLateSibling');
+  jvm.classInitializationState.set('BoundLateSibling', 'INITIALIZED');
+  t.ok(revalidateSpeculations(jvm, hierarchy, methods.get('own').expanded?.specSites),
+    'loading a sibling outside the proven bound preserves the proof');
+  await invoke(jvm, thread, 'BoundNarrow', 'own', '([II)V', [receiver, out, n]);
+  t.equal(metaOf(jvm, 'BoundNarrow.own([II)V'), before, 'unrelated sibling keeps the same module');
+
+  await jvm.loadClassByName('BoundLateNarrow');
+  jvm.classInitializationState.set('BoundLateNarrow', 'INITIALIZED');
+  t.notOk(revalidateSpeculations(jvm, hierarchy, methods.get('own').expanded?.specSites),
+    'a late override inside the narrowed cone invalidates the proof');
+  const late = { type: 'BoundLateNarrow', fields: {} };
+  await invoke(jvm, thread, 'BoundNarrow', 'own', '([II)V', [late, out, n]);
+  t.equal(out[0], expectedSum(70, n), 'inherited caller dispatches a late override correctly');
+  await invoke(jvm, thread, 'ReceiverBound', 'casted', '([ILjava/lang/Object;I)V', [out, late, n]);
+  t.equal(out[0], expectedSum(70, n), 'cast bounds remain upper bounds, never exact-type assumptions');
+  await invoke(jvm, thread, 'ReceiverBound', 'inter', '([ILjava/lang/Object;I)V', [out, late, n]);
+  t.equal(out[0], expectedSum(70, n), 'narrowed interface dispatch also accepts a late override');
+  t.end();
+});
+
 test('bimorphic instance call inlines with CHA guards and matches semantics', async (t) => {
   const { jvm, thread } = await makeHarness(t, 'InstInline', BIMORPHIC_SOURCE, ['Base', 'Sub']);
   const n = 5000;

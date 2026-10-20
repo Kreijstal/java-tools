@@ -57,6 +57,7 @@ const {
 } = require('./wasmShared');
 const { collectRefdLabels } = require('../decompiler/structurer');
 const { getStackEffect } = require('../analysis/opgraph/stackEffects');
+const { buildSsa } = require('../analysis/opgraph/ssa');
 
 const SHORT_LOCAL = /^([ilfda])(load|store)_([0-3])$/;
 const LONG_LOCAL = /^([ilfda])(load|store)$/;
@@ -331,41 +332,71 @@ function planStaticInline(ctx, ins, base, maxItems) {
     coldOwner: hasClinit && ctx.inlineColdIntegerLeaves ? className : null };
 }
 
-// Splices one instance-call site. depth 0 = a site in the original caller
-// (up to 2 impls); deeper sites are interior to a spliced body (monomorphic
-// only, guard miss deopts to the outer call site). recvIsThis marks sites
-// whose receiver is provably the caller's own `this` (zero-arg call fed by
-// aload_0 in a method that never stores slot 0): guards and their deopt
-// stubs are elided when the dispatch pick is decidable from the caller
-// class, keeping the module fully compiled — the site still records a
-// specSite so entry revalidation catches later-loaded overriders.
 // Trace the receiver backwards through straight-line argument evaluation.
 // Slot counts include category-2 values. A join, call, or stack shuffle makes
-// the origin ambiguous, so keep the ordinary guard in those cases.
-function receiverIsThis(items, index, targeted) {
+// the origin ambiguous. An unchanged `this` has the caller's class as an
+// upper bound and is non-null; a successful checkcast proves only an upper
+// bound (null still passes). These are local proofs, not assumptions about
+// which classes preparation happened to allocate or load.
+function receiverFacts(items, index, targeted, callerClassName, thisSlotStable) {
   const call = items[index];
   const isTargeted = item => item.labelDef && targeted.has(item.labelDef.slice(0, -1));
-  if (isTargeted(call)) return false;
+  if (isTargeted(call)) return null;
   const {params} = parseMethodDescriptor(call.instruction.arg[2][1]);
   let above = paramSlotsOf(params, 0).end;
   for (let i = index - 1; i >= 0; i--) {
     const item = items[i], ins = item.instruction, op = getOp(ins);
-    if (above === 0 && (op === 'aload_0' ||
-        op === 'aload' && String(ins.arg) === '0')) return true;
+    if (above === 0) {
+      if (thisSlotStable && (op === 'aload_0' ||
+          op === 'aload' && String(ins.arg) === '0')) {
+        return { upperBound: callerClassName, isThis: true };
+      }
+      if (op === 'checkcast' && typeof ins.arg === 'string') {
+        return { upperBound: ins.arg, isThis: false };
+      }
+    }
     if (!op || isTargeted(item) || BRANCH_OP.test(op) ||
-        /^(invoke|.*switch$|.*return$|athrow$|jsr|ret$)/.test(op)) return false;
+        /^(invoke|.*switch$|.*return$|athrow$|jsr|ret$)/.test(op)) return null;
     const effect = getStackEffect(op, ins);
-    if (!effect || effect.special || effect.pushSlots > above) return false;
+    if (!effect || effect.special || effect.pushSlots > above) return null;
     above += effect.popSlots - effect.pushSlots;
   }
-  return false;
+  return null;
 }
 
-function planInstanceSite(ctx, ins, op, callerClassName, alloc, depth, recvIsThis) {
+// Local tracing is the cheap first proof. For references passed through
+// locals/joins, use the same SSA facts as the structured emitter. This graph
+// and cache live only for this inline pass; no analyses enter the installed
+// code or transport metadata. Large methods keep the existing local proof.
+function sharedReceiverFacts(ctx, codeAttr, method, className, index) {
+  if (!method || codeAttr.code.codeItems.length > 2048) return null;
+  if (!ctx.receiverAnalyses.has(codeAttr)) {
+    const fn = buildSsa({ ...codeAttr.code, method, className });
+    ctx.receiverAnalyses.set(codeAttr, fn.rejected ? null : fn.referenceFacts);
+  }
+  const facts = ctx.receiverAnalyses.get(codeAttr);
+  const call = facts?.nodesByItem.get(index);
+  const receiver = call?.args[0], owner = call?.imm?.[1];
+  if (!receiver || !owner) return null;
+  let bound = null;
+  for (const type of facts.get(receiver).upperBounds) {
+    if (ctx.jvm.isInstanceOf(type, owner) && (!bound || ctx.jvm.isInstanceOf(type, bound))) bound = type;
+  }
+  return bound ? { upperBound: bound, isThis:
+    !(method.flags || []).includes('static') && facts.identity(receiver).op === 'param' &&
+    facts.identity(receiver).imm.index === 0 } : null;
+}
+
+// Root sites allow a bounded polymorphic splice; interior sites must be
+// monomorphic. Receiver facts narrow the dispatch cone before applying that
+// bound. Guards and deopt stubs disappear only for proven non-null `this`,
+// with class-epoch revalidation still protecting later-loaded overrides.
+function planInstanceSite(ctx, ins, op, callerClassName, alloc, depth, receiver) {
   if (!Array.isArray(ins.arg)) return null;
   const [, owner, [name, descriptor]] = ins.arg;
   if (name === '<init>' || name === '<clinit>') return null;
   const { params } = parseMethodDescriptor(descriptor);
+  const recvIsThis = receiver?.isThis === true;
   let impls;
   let guards = null; // instanceof classes aligned with impls; null = ifnonnull only
   let elide = false;
@@ -376,7 +407,9 @@ function planInstanceSite(ctx, ins, op, callerClassName, alloc, depth, recvIsThi
     // statically bound and `this` is non-null by the JVM spec
     elide = !!recvIsThis;
   } else {
-    const r = ctx.hierarchy.resolveDispatch(owner, name, descriptor);
+    const bound = receiver?.upperBound;
+    const dispatchOwner = bound && ctx.jvm.isInstanceOf(bound, owner) ? bound : owner;
+    const r = ctx.hierarchy.resolveDispatch(dispatchOwner, name, descriptor);
     // An incomplete cone can hide receivers whose dispatch is unknown; an
     // instanceof guard would wrongly catch them. `noHiddenReceivers` says the
     // only members missing from the cone are classes that are not loaded at
@@ -409,7 +442,9 @@ function planInstanceSite(ctx, ins, op, callerClassName, alloc, depth, recvIsThi
     // enough to re-run this site's checks against a grown world later
     // (invokespecial needs no record: resolution walks the already-loaded
     // superclass chain, which later class loads cannot change)
-    ctx.specSites.push({ owner, name, descriptor, guards });
+    // Depend on this proven cone, not its declared superclass's siblings.
+    // A later subclass inside the cone still invalidates the same proof.
+    ctx.specSites.push({ owner: dispatchOwner, name, descriptor, guards });
     // `this` has runtime class R <= callerClassName; if the caller class
     // takes the most-derived guard, every R does too. If it only matches a
     // later guard, a more-derived receiver could differ — keep the guards.
@@ -621,10 +656,10 @@ function buildCalleeBody(ctx, impl, alloc, retLabel, depth) {
     const op = getOp(item.instruction);
     const lbl = item.labelDef ? prefix + item.labelDef : undefined;
     if (reachable.has(idx) && INSTANCE_INVOKE.test(op)) {
-      const interiorRecvIsThis = calleeThisStable &&
-        receiverIsThis(items, idx, targeted);
+      const receiver = receiverFacts(items, idx, targeted, className, calleeThisStable) ||
+        sharedReceiverFacts(ctx, codeAttr, method, className, idx);
       const site = planInstanceSite(ctx, item.instruction, op, className, alloc,
-        depth + 1, interiorRecvIsThis);
+        depth + 1, receiver);
       if (!site) return null;
       // a deopt at (or inside) this interior site replays the flattened body
       // from the outer call — unsound once a heap write has happened. An
@@ -672,6 +707,7 @@ function inlineCalls(jvm, codeAttr, options = {}) {
     speculations: 0,
     specSites: [],
     guardSites: [],
+    receiverAnalyses: new Map(),
     elidedThisGuards: 0,
     // Deep inlining (opt-in): splice static calls inside instance callees
     // and provably counted loops (planInteriorStatic, countedBackEdge).
@@ -754,10 +790,11 @@ function inlineCalls(jvm, codeAttr, options = {}) {
         continue;
       }
     } else if (ctx.hierarchy && INSTANCE_INVOKE.test(op) && budget > 0 && !inRange(i)) {
-      const recvIsThis = thisSlotStable &&
-        receiverIsThis(items, i, targetedLabels);
+      const receiver = receiverFacts(items, i, targetedLabels,
+        options.callerClassName, thisSlotStable) || sharedReceiverFacts(
+        ctx, codeAttr, options.callerMethod, options.callerClassName, i);
       const site = planInstanceSite(
-        ctx, item.instruction, op, options.callerClassName, alloc, 0, recvIsThis);
+        ctx, item.instruction, op, options.callerClassName, alloc, 0, receiver);
       const siteCost = site && site.items.length + 1 +
         (site.deadReceiverSlot !== undefined ? 2 : 0);
       if (site && siteCost <= budget) {

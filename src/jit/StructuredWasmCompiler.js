@@ -321,6 +321,7 @@ class StructuredWasmCompiler {
         budget: this.wasmJit?.inlineBudget,
         hierarchy: instanceInline && this.wasmJit ? this.wasmJit.hierarchy : null,
         callerClassName: this.className,
+        callerMethod: this.method,
         callerIsStatic: (this.method.flags || []).includes('static'),
         deepInline,
         inlineColdIntegerLeaves: this.wasmJit?.inlineColdIntegerLeavesEnabled,
@@ -370,7 +371,7 @@ class StructuredWasmCompiler {
     }
 
     const fn = buildSsa(
-      { codeItems: items, exceptionTable: table, method: this.method },
+      { codeItems: items, exceptionTable: table, method: this.method, className: this.className },
       { cfg },
     );
     if (fn.rejected) throw new Unsupported(`ssa: ${fn.rejected}`);
@@ -1414,8 +1415,16 @@ class StructuredWasmCompiler {
       out.push(...this.useOf(args[0]), OP.i32_const, ...sleb(0), BRANCH_ZERO[op]);
       return;
     }
-    if (op === 'ifnull') { out.push(...this.useOf(args[0]), OP.ref_is_null); return; }
-    if (op === 'ifnonnull') { out.push(...this.useOf(args[0]), OP.ref_is_null, OP.i32_eqz); return; }
+    if (op === 'ifnull' || op === 'ifnonnull') {
+      const known = this.fn.referenceFacts.at(args[0], blockId).nullness;
+      if (known !== 'maybe') {
+        out.push(OP.i32_const, known === (op === 'ifnull' ? 'null' : 'nonnull') ? 1 : 0);
+      } else {
+        out.push(...this.useOf(args[0]), OP.ref_is_null);
+        if (op === 'ifnonnull') out.push(OP.i32_eqz);
+      }
+      return;
+    }
     if (op === 'if_acmpeq' || op === 'if_acmpne') {
       out.push(...this.useOf(args[0]), ...this.useOf(args[1]),
         OP.call, ...uleb(this.importIndexByName.get('ref_eq')));
@@ -2077,9 +2086,11 @@ class StructuredWasmCompiler {
     // net-negative on the dispatcher tier (it unlocks tiny cast-bearing
     // callees whose import-dispatch overhead exceeds interpreting them).
     if (op === 'checkcast' || op === 'instanceof') {
-      // A literal null never resolves the target class or calls a type guard.
-      // Keep arbitrary references under the existing cast admission policy.
-      if (node.args[0]?.op === 'aconst_null') {
+      // Null proven through SSA copies, joins or dominating checks needs no
+      // target resolution. Keep all unknown references under the existing
+      // cast admission policy, including opaque exception-handler locals.
+      if (node.args[0]?.op === 'aconst_null' ||
+          this.fn.referenceFacts.at(node.args[0], node).nullness === 'null') {
         out.push(...(op === 'checkcast'
           ? [OP.ref_null, T.ref] : [OP.i32_const, 0]));
         return finish();
