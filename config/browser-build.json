@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "entryPoints": {
+    "jvm-debug": "src/platform/browser-entry.js",
+    "jvm-compile-worker": "src/jit/compileWorkerThread.js"
+  },
+  "aliases": {
+    "window": "src/isomorphic/window.browser.js",
+    "os": "src/isomorphic/os.browser.js"
+  },
+  "polyfills": {
+    "path": "path-browserify",
+    "util": "util/",
+    "stream": "stream-browserify",
+    "buffer": "buffer/",
+    "process": "process/browser",
+    "url": "url/"
+  },
+  "emptyModules": [
+    "fs", "v8", "crypto", "zlib", "dns", "net", "http", "https",
+    "node-fetch", "speaker", "worker_threads", "fetch-blob", "formdata-polyfill", "web-streams-polyfill"
+  ]
+}

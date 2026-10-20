@@ -6444,7 +6444,7 @@ function emitVirtualCall(lines, stack, arg, localState) {
   }
 
   const renderedArgs = formatCallArguments(ref, descriptor, args, localState && localState.exceptionModel);
-  const call = `${wrap(receiver, 100)}.${sourceMethodName(ref.name)}(${renderedArgs.join(', ')})`;
+  let call = `${wrap(receiver, 100)}.${sourceMethodName(ref.name)}(${renderedArgs.join(', ')})`;
   const returnType = simplifyType(descriptor.returnType);
   if (ref.owner === 'java/lang/invoke/MethodHandle'
     && (ref.name === 'invoke' || ref.name === 'invokeExact') && returnType !== 'void') {

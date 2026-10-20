@@ -40,7 +40,14 @@ A comprehensive toolkit for Java bytecode analysis, manipulation, and execution.
 - **Native Assembly/Disassembly**: JavaScript Jasmin parser, class-file writer, and class disassembler
 - **Class Manipulation**: Load, modify, and generate class files
 - **Native Methods**: JNI (Java Native Interface) support
-- **Build System**: Complete webpack-based build pipeline
+- **Build System**: Webpack builds for the standalone site; source builds for browser consumers
+
+Browser consumers can build `src/` directly using `config/browser-build.json` and
+the committed npm lockfile. That configuration is also consumed by Webpack so
+entry points and browser substitutions stay shared. Generate `src/jre/index.js`
+from the JRE modules before a filesystem build; the browser cloner generates its
+equivalent in memory. Runtime bundles are generated artifacts and belong in build
+output or browser caches, not source control.
 
 ## 📋 Use Cases
 

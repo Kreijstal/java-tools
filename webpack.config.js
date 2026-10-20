@@ -1,5 +1,11 @@
 const path = require('path');
 const browserBabel = require('./config/browser-babel');
+const browserBuild = require('./config/browser-build.json');
+const browserFallbacks = Object.fromEntries([
+  ...Object.entries(browserBuild.polyfills).map(([name, target]) => [name, require.resolve(target)]),
+  ...browserBuild.emptyModules.map(name => [name, false]),
+]);
+for (const [name, target] of Object.entries({...browserFallbacks})) browserFallbacks['node:' + name] = target;
 
 // Cache each compiler separately across invocations. Webpack invalidates
 // changed modules and their dependents; config/loader changes invalidate the
@@ -16,7 +22,7 @@ const buildCache = name => ({
 const jvmDebugConfig = {
   cache: buildCache('jvm-debug'),
   mode: 'production',
-  entry: './src/platform/browser-entry.js',
+  entry: './' + browserBuild.entryPoints['jvm-debug'],
   output: {
     filename: 'jvm-debug.js',
     path: path.resolve(__dirname, 'dist'),
@@ -41,47 +47,8 @@ const jvmDebugConfig = {
     ]
   },
   resolve: {
-    alias: {
-      // Isomorphic window module - use browser implementation for webpack builds
-      'window': path.resolve(__dirname, 'src/isomorphic/window.browser.js'),
-      'os': path.resolve(__dirname, 'src/isomorphic/os.browser.js')
-    },
-    fallback: {
-      // Provide browser-compatible alternatives for Node.js modules
-      "fs": false,
-      "path": require.resolve("path-browserify"),
-      "util": require.resolve("util/"),
-      "stream": require.resolve("stream-browserify"),
-      "buffer": require.resolve("buffer/"),
-      "process": require.resolve("process/browser"),
-      "v8": false, // Make v8 return false instead of trying to load it
-      "crypto": false,
-      "zlib": false,
-      "dns": false,
-      "net": false,
-      "url": require.resolve("url/"),
-      // Handle node-fetch v3 and Node.js native modules
-      "node-fetch": false, // Use browser fetch instead
-      "node:util": require.resolve("util/"),
-      "node:zlib": false,
-      "node:stream": require.resolve("stream-browserify"),
-      "node:http": false,
-      "node:https": false,
-      "node:url": require.resolve("url/"),
-      "node:fs": false,
-      "node:path": require.resolve("path-browserify"),
-      "node:buffer": require.resolve("buffer/"),
-      "node:process": require.resolve("process/browser"),
-      "speaker": false,
-      // The compile worker resolves this at runtime and checks the shape, so
-      // an empty module is the correct browser answer: the client then builds
-      // a Web Worker instead.
-      "worker_threads": false,
-      // Additional node-fetch dependencies
-      "fetch-blob": false,
-      "formdata-polyfill": false,
-      "web-streams-polyfill": false,
-    }
+    alias: Object.fromEntries(Object.entries(browserBuild.aliases).map(([name, target]) => [name, path.resolve(__dirname, target)])),
+    fallback: browserFallbacks,
   },
   plugins: [
     new (require('webpack')).ProvidePlugin({
@@ -120,7 +87,7 @@ const compileWorkerConfig = {
   cache: buildCache('jvm-compile-worker'),
   mode: 'production',
   target: 'webworker',
-  entry: './src/jit/compileWorkerThread.js',
+  entry: './' + browserBuild.entryPoints['jvm-compile-worker'],
   output: {
     filename: 'jvm-compile-worker.js',
     path: path.resolve(__dirname, 'dist')
