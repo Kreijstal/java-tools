@@ -7,6 +7,39 @@ on:
     branches: ["*"]
 
 jobs:
+  browser-source-consumer:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        browser: [chromium, firefox]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: java-tools
+      - name: Runtime artifacts are not source files
+        run: test -z "$(git ls-files browser-runtime)"
+        working-directory: java-tools
+      - uses: actions/checkout@v6
+        with:
+          repository: Kreijstal/blank-github-cloner
+          path: cloner
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: cloner/package-lock.json
+      - run: npm ci --ignore-scripts
+        working-directory: cloner
+      - run: npx playwright install --with-deps ${{ matrix.browser }}
+        working-directory: cloner
+      - run: npm run test:jvm-source
+        working-directory: cloner
+      - run: npm run test:jvm-source:browser
+        working-directory: cloner
+        env:
+          JAVA_TOOLS_ROOT: ${{ github.workspace }}/java-tools
+          BROWSER: ${{ matrix.browser }}
+
   test:
     runs-on: ubuntu-latest
     strategy:
