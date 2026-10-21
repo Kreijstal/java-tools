@@ -487,6 +487,10 @@ class JitCompiler {
     this.lazyStaticRelinkDependents = new Map();
     this.lazyStaticRelinkPending = new Set();
     this.lazyStaticRelinkCount = 0;
+    // Prepared variants bind storage cells, never their pre-initialization
+    // values. Their entry guards require all assumed owners to be initialized.
+    this.preparedStaticVariants = new WeakMap();
+    this.preparingInitializedStaticOwners = null;
     // OFF BY DEFAULT: this miscompiles by corrupting a reference
     // local in dj.b(IIIIII)V -- slot 10 holds the hr returned by an invoke, and
     // with eager linking on it instead reads back a raw int, which faults at
@@ -5763,6 +5767,44 @@ class JitCompiler {
     else Promise.resolve().then(upgrade);
   }
 
+  prepareInitializedStaticVariant(method) {
+    const cold = this.codegenCache.get(method);
+    const owners = cold?.jvmLazyStaticOwners;
+    if (!this.lazyStaticRelinkEnabled || !Array.isArray(owners) || !owners.length ||
+        this.preparedStaticVariants.has(method)) return false;
+    const previous = this.preparingInitializedStaticOwners;
+    this.preparingInitializedStaticOwners = new Set(owners);
+    try {
+      // Do not mark classes initialized or execute guest code. Only static
+      // storage resolution in the renderer uses this assumption; the emitted
+      // entry guard checks it before reading a cell or performing an effect.
+      const generated = this.compileMethod(method, {preparedWholeMethod: true});
+      if (!generated || !Array.isArray(generated.jvmLazyStaticOwners) ||
+          generated.jvmLazyStaticOwners.length ||
+          !this.preservesPositionalTiers(cold, generated)) return false;
+      if (!this.producesTransport) this.installedSourceRetention.apply(generated);
+      this.preparedStaticVariants.set(method, {cold, generated});
+      return true;
+    } finally {
+      this.preparingInitializedStaticOwners = previous;
+    }
+  }
+
+  preservesPositionalTiers(cached, replacement) {
+    return Boolean(replacement) && [
+      "jvmTrustedCheckedLeafDirectPositionalBody",
+      "jvmCheckedLeafDirectPositionalBody",
+      "jvmDirectPositionalBody",
+      "jvmRestoringDirectPositionalBody",
+      "jvmAdaptivePositionalBody",
+    ].every(key => typeof cached[key] !== "function" ||
+      typeof replacement[key] === "function" ||
+      // A pure direct entry needs no restoration frame and is a stronger
+      // version of the effectful direct entry it replaces.
+      key === "jvmRestoringDirectPositionalBody" &&
+        typeof replacement.jvmDirectPositionalBody === "function");
+  }
+
   lazyStaticOwnersInitialized(owners) {
     const tokens = this.jvm?.classInitializationTokens;
     return Boolean(tokens) &&
@@ -5813,6 +5855,14 @@ class JitCompiler {
     const relink = () => {
       if (this.codegenCache.get(method) !== cached ||
           this.codegenCompiling.has(method)) return;
+      const preparedVariant = this.preparedStaticVariants.get(method);
+      if (preparedVariant?.cold === cached) {
+        this.preparedStaticVariants.delete(method);
+        this.codegenCache.set(method, preparedVariant.generated);
+        this.publishGeneratedTargetUpgrade(method, preparedVariant.generated);
+        this.lazyStaticRelinkCount += 1;
+        return;
+      }
       if (!this.generatedTargetsByMethod.has(method)) {
         // Not called through a site yet; trackGeneratedTarget retries.
         this.lazyStaticRelinkPending.delete(method);
@@ -5830,16 +5880,7 @@ class JitCompiler {
       const replacement = this.getGeneratedFunction(method,
         prepared ? { allowEffectfulCalls: true, compileLocally: true }
           : { compileLocally: true });
-      const positionalTiers = [
-        "jvmTrustedCheckedLeafDirectPositionalBody",
-        "jvmCheckedLeafDirectPositionalBody",
-        "jvmDirectPositionalBody",
-        "jvmRestoringDirectPositionalBody",
-        "jvmAdaptivePositionalBody",
-      ];
-      if (!replacement || positionalTiers.some((key) =>
-        typeof cached[key] === "function" &&
-          typeof replacement[key] !== "function")) {
+      if (!this.preservesPositionalTiers(cached, replacement)) {
         this.codegenCache.set(method, cached);
         return;
       }
@@ -8951,6 +8992,18 @@ class JitCompiler {
           kind: "map", fields, key: targetKey,
           cell: typeof fields.cell === "function" ? fields.cell(targetKey) : null,
         });
+        // AOT may reserve a declared field's cell before its owner has
+        // populated the Map. Reserving storage neither creates the Java field
+        // value nor marks its class initialized; <clinit>'s ordinary writes
+        // populate this same cell before the guarded variant can execute.
+        if (this.preparingInitializedStaticOwners?.has(site.className) &&
+            typeof fields.cell === "function" &&
+            classData.ast?.classes?.[0]?.items?.some(item =>
+              item.type === "field" && item.field?.name === site.fieldName &&
+              item.field.descriptor === site.descriptor &&
+              item.field.flags?.includes("static"))) {
+          return mapTarget(key);
+        }
         if (fields.has(key)) {
           return mapTarget(key);
         }
@@ -9010,7 +9063,8 @@ class JitCompiler {
     // that does not exist yet and keeps it current once the key is set.
     if (!target.cell && target.kind === "map" &&
         typeof target.fields.cell === "function" &&
-        target.fields.has(target.key)) {
+        (target.fields.has(target.key) ||
+          this.preparingInitializedStaticOwners?.has(site.className))) {
       target.cell = target.fields.cell(target.key);
     }
     site.staticTarget = target;

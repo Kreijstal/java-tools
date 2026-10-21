@@ -53,3 +53,73 @@ public class PreparedHelpers {
   }
   t.end();
 });
+
+test('AOT follows cold static helper links without running their class initializer', async t => {
+  const classpath = compile(t, 'ColdHelperMain', `
+class ColdHelperTrace { static int initialized; }
+class ColdHelper {
+  static int factor = 3;
+  static { ColdHelperTrace.initialized++; }
+  static int leaf(int x) { return x * factor + 1; }
+}
+public class ColdHelperMain {
+  static int result;
+  static int loop(int n) { int sum=0; for(int i=0;i<n;i++) sum+=ColdHelper.leaf(i); return sum; }
+  public static void main(String[] args) { result=loop(100); }
+}`);
+  const j = new JVM({classpath, prepareBeforeMain: false, jit: {
+    compileWorker: false, wasmStructured: true, structuredSsa: true,
+    rendererPipeline: true, compiledCallChains: true,
+    preparedWasmMethods: ['ColdHelperMain.loop(I)I'],
+    wasm: {noOnDemandCalleeCompile: true, maxInlineCalleeItems: 1, inlineBudget: 1},
+  }});
+  await j.preloadClasspathClasses();
+  const w=j.jit.wasmJit; w.enabled=true;
+  const {report}=await j.precompileInitializedClasses({initializedOnly:false,
+    effectful:true,wasm:true,wasmPreparedUpgradesOnly:true});
+  const leaf=await j.findMethodInHierarchy('ColdHelper','leaf','(I)I');
+  t.equal(w.state.get(leaf)?.status,'ready','reachable non-loop helper compiled before first use');
+  t.ok(report.wasmLinkedCallees>0,'preparation reports dependency compilation');
+  t.notEqual(j.classInitializationState.get('ColdHelper'),'INITIALIZED','helper class remains cold');
+  w.freezeCompilation();
+  const late=[];
+  const start=j.jit.startSynchronousCompile.bind(j.jit);
+  j.jit.startSynchronousCompile=(method,entry)=>{
+    if(j.jit.mainStarted)late.push({method:j.jit.methodIdentity(method),entry,stack:new Error().stack});
+    return start(method,entry);
+  };
+  await j.run('ColdHelperMain',{prepare:false});
+  await new Promise(resolve=>setTimeout(resolve,10));
+  t.equal(j.classes.ColdHelperMain.staticFields.get('result:I'),14950,'correct result after initialization');
+  t.equal(j.classes.ColdHelperTrace.staticFields.get('initialized:I'),1,'initializer ran once at execution');
+  t.deepEqual(late,[],'no guest-time JavaScript or Wasm compilation');
+  t.end();
+});
+
+test('AOT includes dependencies of modules compiled outside the root candidate list', async t => {
+  const classpath=compile(t,'NestedPreparedChild',`
+class NestedPreparedLeaf {
+  static int factor=3;
+  static int leaf(int value) { return value*factor; }
+}
+public class NestedPreparedChild {
+  static int loop(int n) { int sum=0; for(int i=0;i<n;i++) sum+=NestedPreparedLeaf.leaf(i); return sum; }
+}`);
+  const j=new JVM({classpath,prepareBeforeMain:false,jit:{compileWorker:false,
+    wasmStructured:true,wasm:{noOnDemandCalleeCompile:true,maxInlineCalleeItems:1,inlineBudget:1}}});
+  await j.preloadClasspathClasses();
+  const loop=await j.findMethodInHierarchy('NestedPreparedChild','loop','(I)I');
+  const leaf=await j.findMethodInHierarchy('NestedPreparedLeaf','leaf','(I)I');
+  const w=j.jit.wasmJit;w.enabled=true;
+  const child={className:'NestedPreparedChild',method:loop};
+  w.compile(child,w.methodState(child),{asCallee:true,entryPath:'prepare-test-child'});
+  t.equal(w.state.get(loop)?.status,'ready','child module exists before the dependency pass');
+  t.notEqual(w.state.get(leaf)?.status,'ready','cold owner deferred the helper');
+  const roots=[];
+  const compiled=await j.prepareWasmLinkedCallees(roots,
+    [child,{className:'NestedPreparedLeaf',method:leaf}]);
+  t.ok(compiled>0,'dependency pass finds work with an empty original root list');
+  t.equal(w.state.get(leaf)?.status,'ready','helper of the previously compiled child is prepared');
+  t.notEqual(j.classInitializationState.get('NestedPreparedLeaf'),'INITIALIZED','helper owner remains uninitialized');
+  t.end();
+});

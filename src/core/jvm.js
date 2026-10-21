@@ -1576,6 +1576,18 @@ class JVM {
       report.unpreparedKeys = unprepared.slice(0, 400).map(({className, method}) =>
         `${className}.${method.name}${method.descriptor}`);
       report.upgradedStubClasses = this.upgradedStubClassCount || 0;
+      // Prepare the initialized-storage form while compilation is still
+      // outside guest execution. Class initialization later only publishes
+      // this guarded body; it must not need another compiler pass.
+      report.staticVariants = 0;
+      if (fixedPoint && compileEffectful && compileLocally) {
+        for (const {method} of methods) {
+          if (prepared(method) && this.jit.prepareInitializedStaticVariant(method)) {
+            report.staticVariants += 1;
+          }
+          await yieldToEventLoop(0, this.eventLoopYieldStrategy);
+        }
+      }
       // Link what was compiled. Every synchronous call site a prepared body
       // registered is given the target the first generic call would have
       // built -- a static or special call has one by bytecode; a virtual call
@@ -1647,6 +1659,8 @@ class JVM {
         report.deferredDeepWasm = deferredDeepWasm.length;
         if (deferredDeepWasm.length) this.jit.scheduleDeferredDeepWasm(deferredDeepWasm);
         if (fixedPoint) {
+          report.wasmLinkedCallees = await this.prepareWasmLinkedCallees(
+            wasmCandidates, methods, options.onProgress);
           report.wasmSettled = await this.settlePreparedWasmModules(
             wasmCandidates, options.onProgress);
           for (const {method} of wasmCandidates) {
@@ -1677,6 +1691,56 @@ class JVM {
     }
     return {preloadedClasses, methods: completed, wasmMethods: wasmCompleted,
       report};
+  }
+
+  // Cold owners may prevent the runtime linker from entering a helper, but
+  // not from compiling its bytecode. Prepare reachable late-bound helpers
+  // without invoking them or relaxing their runtime initialization checks.
+  async prepareWasmLinkedCallees(candidates, admittedMethods, onProgress) {
+    const wasm = this.jit.wasmJit;
+    const admitted = new Map(admittedMethods.map(entry =>
+      [`${entry.className}.${entry.method.name}${entry.method.descriptor}`, entry]));
+    const visited = new Set();
+    const queued = new Set(candidates.map(entry => entry.method));
+    // Root compilation can itself compile instance/static children. Their
+    // late-bound imports belong to the closure too, even though the root
+    // selection loop never added these child modules to its candidate list.
+    for (const entry of admittedMethods) {
+      if (wasm.state.get(entry.method)?.status === "ready" && !queued.has(entry.method)) {
+        candidates.push({...entry, asCallee: true});
+        queued.add(entry.method);
+      }
+    }
+    let compiled = 0;
+    for (let index = 0; index < candidates.length; index += 1) {
+      const {method} = candidates[index];
+      if (visited.has(method)) continue;
+      visited.add(method);
+      const state = wasm.state.get(method);
+      for (const binding of (state?.callee || state)?.meta?.linkBindings || []) {
+        if (!binding.kind?.startsWith("static")) continue;
+        const entry = admitted.get(binding.key ||
+          `${binding.className}.${binding.name}${binding.descriptor}`);
+        if (!entry || this.jit.jitDenied(entry.method) ||
+            this.jit.hasNativeMethodOverride(entry.method)) continue;
+        const flags = entry.method.flags || [];
+        if (flags.includes("native") || flags.includes("abstract")) continue;
+        const target = wasm.methodState(entry);
+        if (target.status === "cold") {
+          wasm.compile(entry, target, {asCallee: true, entryPath: "prepare-callee"});
+          compiled += 1;
+          if (typeof onProgress === "function") {
+            onProgress({completed: compiled, tier: "wasm-callee"});
+          }
+          await yieldToEventLoop(0, this.eventLoopYieldStrategy);
+        }
+        if (!queued.has(entry.method)) {
+          candidates.push({...entry, asCallee: true});
+          queued.add(entry.method);
+        }
+      }
+    }
+    return compiled;
   }
 
   // A prepared Wasm module built while one of its callees was still cold

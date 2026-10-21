@@ -834,7 +834,8 @@ class JvmSsaBlockRenderer {
       // and make safe class preloading useless. Owners whose initialized
       // storage or links were observed while compiling remain guarded.
       owners: [...new Set(owners)].filter((owner) =>
-        this.jit.jvm.classInitializationState.get(owner) === "INITIALIZED"),
+        this.jit.jvm.classInitializationState.get(owner) === "INITIALIZED" ||
+        this.jit.preparingInitializedStaticOwners?.has(owner)),
       classEpoch: -1,
       initializationEpoch: -1,
     };
@@ -1643,7 +1644,9 @@ class JvmSsaBlockRenderer {
           // particular, putstatic can resolve an empty cold store during
           // preparation. Only initialized owners are covered by the entry
           // guard; cold accesses must retain their bytecode-local handoff.
-          const direct = this.jit.fieldSites[fieldSite].initializationToken.initialized
+          const direct = (this.jit.fieldSites[fieldSite].initializationToken.initialized ||
+            this.jit.preparingInitializedStaticOwners?.has(
+              this.jit.fieldSites[fieldSite].className))
             ? this.jit.registerDirectStaticTarget(fieldSite, op === "putstatic")
             : null;
           if (direct) {
