@@ -1635,7 +1635,8 @@ class JVM {
             deferredDeepWasm.push({className, method});
           }
           if (admittedNow &&
-              method.name !== "<init>" && method.name !== "<clinit>" &&
+              (method.name !== "<init>" || this.jit.wasmJit.ctorCompileEnabled) &&
+              method.name !== "<clinit>" &&
               !flags.includes("native") && !flags.includes("abstract") &&
               (!flags.includes("synchronized") ||
                 (flags.includes("static")

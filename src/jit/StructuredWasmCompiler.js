@@ -41,7 +41,7 @@ const WasmLinker = require('./WasmLinker');
 const monoArray = require('./monoArray');
 const {
   addStringConstantImport, addStringCallImport, addRuntimeImports, pushImportFor, addArrayImports, addFieldImport, addMathImport,
-  addSystemImport, addArraysImport, addNewArrayImport, addANewArrayImport, addNewImport,
+  addStaticCallInitializationGuard, addSystemImport, addArraysImport, addNewArrayImport, addANewArrayImport, addNewImport,
 } = require('./wasmRuntimeImports');
 const { inlineCalls, GUARD_OWNER } = require('./wasmInline');
 const {DirectFrameContext,CanonicalDirectLinks} = require('./CanonicalDirectFrames');
@@ -281,7 +281,7 @@ class StructuredWasmCompiler {
         for (const key of [
           'fn', 'cfg', 'items', 'originalItems', 'localOf', 'arrayCaches', 'heapParamLocals',
           'fieldArrayOwners', 'sharedFieldArrayGroups', 'arrayReaderGenerations', 'primitiveCopyZeroEntry',
-          'fieldCaches', 'castCaches', 'objCaches', 'nativeStaticCells', 'staticFieldAccessors', 'nativeStaticSites', 'linkSlotByNode', 'canonicalSlotByNode',
+          'fieldCaches', 'castCaches', 'objCaches', 'nativeStaticCells', 'staticFieldAccessors', 'nativeStaticSites', 'linkSlotByNode', 'canonicalSlotByNode', 'canonicalInstanceSlots',
           'guardedNestedArrayLoopPlans','loweringGuardedLoopHeaders','activeGuardedLoopPlan',
           'deoptableSites', 'linkSlotSites', 'canonicalCompactSlots', 'emptyCopySites', 'fusedGuardOfLoad',
           'fusedGuardArms', 'fusedFieldReads', 'rematLoads', 'inlinedInitializationGuards', 'heapReadinessGuards',
@@ -440,13 +440,14 @@ class StructuredWasmCompiler {
     fn.params.forEach((p, i) => this.localOf.set(p, i));
     const directFlags=this.method.flags||[];
     const directEligible = this.wasmJit.canonicalDirectCallsEnabled &&
-      supportsWasmTryTable() && directFlags.includes('static') &&
+      supportsWasmTryTable() &&
       !directFlags.includes('synchronized') &&
-      !['<init>','<clinit>'].includes(this.method.name) &&
-      !'L['.includes(parseMethodDescriptor(this.method.descriptor).ret);
+      this.method.name !== '<clinit>' &&
+      (this.method.name !== '<init>' || this.wasmJit.ctorCompileEnabled);
     this.parameterArrayABI = directEligible && this.jvm.wasmHeap &&
       process.env.JVM_WASM_HEAP_ARRAYS !== '0'
-      ? primitiveArrayParameters(this.method.descriptor) : [];
+      ? primitiveArrayParameters(this.method.descriptor).map(index =>
+        index + (directFlags.includes('static') ? 0 : 1)) : [];
     // Do not capture fn in a callback here: retained runtime imports share
     // this lexical environment and must not keep the SSA graph alive.
     this.heapParamLocals = new Map();
@@ -810,7 +811,7 @@ class StructuredWasmCompiler {
       hostOwnedCanonicalFuel:this.importedGlobals.canonical_fuel||null,
       canonicalOwnerReadyAddress:this.directOwnerReadyAddress,
       parameterArrayABI: this.parameterArrayABI.slice(),
-      canonicalDirectSites: this.canonicalSlotByNode?.size || 0,
+      canonicalDirectSites: (this.canonicalSlotByNode?.size || 0) + (this.canonicalInstanceSlots?.size || 0),
       canonicalCompactSites:this.canonicalCompactSlots?.size || 0,
       canonicalEmptyCopySites:this.emptyCopySites?.size || 0,
       nativeStaticReadSites:this.nativeStaticSites?.get('read')?.size || 0,
@@ -1476,12 +1477,12 @@ class StructuredWasmCompiler {
       if (t !== T.ref) {
         // Direct scalar calls return the exported global in their native ABI.
         // Only ordinary JS entries need the legacy box.ret import callback.
-        if (this.canonicalNonThrowingNormalFlow || this.canonicalRecordedLeaf) {
+        if (this.directFrames) {
           out.push(OP.local_get, ...uleb(this.directIdLocal), OP.i32_eqz, OP.if, 0x40);
         }
         out.push(...definedGlobal(OP.global_get,0), OP.call,
           ...uleb(this.importIndexByName.get(`ret_${sig(t)}`)));
-        if (this.canonicalNonThrowingNormalFlow || this.canonicalRecordedLeaf) out.push(OP.end);
+        if (this.directFrames) out.push(OP.end);
       }
     }
     out.push(OP.i32_const, ...sleb(-1), STRUCTURED_RETURN);
@@ -1499,6 +1500,10 @@ class StructuredWasmCompiler {
       if (node.op === 'invokestatic') {
         const call = addArraysImport(this, this.jvm, {arg: node.imm});
         if (call?.initializationIdx != null) initializationGuards.add(call.initializationIdx);
+        if (!call && node.imm?.[1] !== GUARD_OWNER) {
+          const guard = addStaticCallInitializationGuard(this, this.jvm, node.imm?.[1]);
+          if (guard != null) initializationGuards.add(guard);
+        }
       }
       if (node.op !== 'getstatic' && node.op !== 'putstatic') continue;
       const field = addFieldImport(this, this.jvm, {arg: node.imm}, true,
@@ -1963,8 +1968,20 @@ class StructuredWasmCompiler {
           }
           out.push(OP.local_get,...uleb(cache.base),OP.local_get,...uleb(cache.len));
         }
-        out.push(OP.i32_const,...sleb(c.slot),OP.call_indirect,...uleb(c.type),
-          0x00);
+        if(c.guardIdx!==undefined){
+          // Arguments already reside on the operand stack. Inspect the saved
+          // SSA receiver without evaluating any Java expression a second time.
+          const cache=c.guardCache;
+          if(cache)out.push(OP.local_get,...uleb(cache.filled),OP.i32_eqz,OP.if,0x40,
+            ...use(0),OP.call,...uleb(c.guardIdx),OP.local_set,...uleb(cache.verdict),
+            OP.i32_const,1,OP.local_set,...uleb(cache.filled),OP.end,
+            OP.local_get,...uleb(cache.verdict));
+          else out.push(...use(0),OP.call,...uleb(c.guardIdx));
+          out.push(OP.if,T.i32,
+            OP.i32_const,...sleb(c.slot),OP.else,
+            OP.i32_const,...sleb(c.fallbackSlot),OP.end);
+        }else out.push(OP.i32_const,...sleb(c.slot));
+        out.push(OP.call_indirect,...uleb(c.type),0x00);
         if(node.kind!=='V')out.push(OP.local_set,...uleb(this.mustLocal(node)));
         const status=this.nextLocal++;this.declared.push(T.i32);
         let owner,id;
@@ -3030,10 +3047,12 @@ class StructuredWasmCompiler {
       if (!impl) throw new Unsupported(`invokespecial ${owner}.${name} unresolved`);
       direct = readyOrThrow(impl.className);
       if (name === '<init>') {
-        // all-or-nothing: a constructor target must be unable to hand the
-        // call back mid-body — it either completes or throws
+        // Raw constructor links must finish atomically. A canonical target
+        // instead owns a precise frame for any unfinished construction.
         const m = (direct.callee || direct).meta;
-        if (!m.fullyCompiled || m.deoptableCalls || m.usedEh) {
+        if ((!m.fullyCompiled || m.deoptableCalls || m.usedEh) &&
+            !(this.wasmJit.ctorCompileEnabled && this.wasmJit.canonicalEhLinksEnabled &&
+              CanonicalDirectLinks.eligible(direct))) {
           throw new Unsupported(`<init> ${owner} target not fully compiled`
             + (this.wasmJit && this.wasmJit.debug
               ? ` [full=${m.fullyCompiled} normalFlow=${m.normalFlowFullyCompiled}`
@@ -3164,6 +3183,51 @@ class StructuredWasmCompiler {
         pinnedNeverExits,
       );
     };
+    // Canonical calls transfer the precise callee frame only on an exit.
+    // Unlike raw runv links, their normal path remains native even when a
+    // helper can suspend. Constructors require their explicit compilation policy;
+    // canonical exits then preserve their unfinished object and continuation.
+    // Guard virtual targets by the closed set of receiver classes observed
+    // here; later subclasses must use ordinary dispatch.
+    const canonicalTargets = direct ? [direct] : [...new Set(dispatch.values())];
+    const canonicalTarget = canonicalTargets.length === 1 ? canonicalTargets[0] : null;
+    const canonicalMeta = canonicalTarget && (canonicalTarget.callee || canonicalTarget).meta;
+    if (this.wasmJit.canonicalDirectCallsEnabled && this.wasmJit.canonicalEhLinksEnabled &&
+        (name !== '<init>' || this.wasmJit.ctorCompileEnabled) && canonicalTarget &&
+        !canonicalTarget.synchronized &&
+        (!canonicalMeta || identityInstanceParams(canonicalMeta, params))) {
+      const classes = new Set();
+      if(dispatch)for(const [runtimeClass,target] of dispatch)
+        if(target===canonicalTarget)classes.add(runtimeClass);
+      const guardIdx=this.addImport(`canonical_guard_${op}_${key}`.replace(/[^\w]/g,'_'),
+        [T.ref],[T.i32],receiver=>receiver!==null && receiver!==undefined &&
+          (direct || classes.has(runtimeClassName(receiver))) ? 1 : 0);
+      const compact=!!this.compactExitLinks;
+      let slots=this.canonicalInstanceSlots?.get(node);
+      if(!slots){
+        const fallback=this.ehMethod && !this.jsTagEh
+          ? ehRecordingImport(fn,wParams.length,box) : fn;
+        const links=this.wasmJit.canonicalDirectLinks;
+        const targetSlot=links.allocate(canonicalTarget.key,wParams,results,fallback,[],compact);
+        // This slot deliberately has no method key and is never published.
+        // A miss cannot enter the old target merely because its ABI matches.
+        const fallbackSlot=links.allocate(Symbol('instance dispatch fallback'),wParams,results,fallback,[],compact);
+        slots={targetSlot,fallbackSlot};
+        (this.canonicalInstanceSlots ||= new Map()).set(node,slots);
+        this.canonicalSlots.push(targetSlot,fallbackSlot);
+        if(compact){(this.canonicalCompactSlots ||= new Set()).add(targetSlot);this.canonicalCompactSlots.add(fallbackSlot);}
+        this.canonicalLifetime.fallbacks.push(fallback);
+        links.publish(canonicalTarget);
+      }
+      this.usedCanonicalTable=true;
+      const type=this.internSig(wParams,[T.i32,...(compact?[]:[T.i32,T.ref]),...results]);
+      const consumeIdx=compact ? this.addImport('canonical_compact_exit',[T.i32],[T.i32],
+        status=>this.consumeCompactExit(status)) : this.addImport('canonical_exit',[T.i32,T.i32,T.ref],[T.i32],
+        (status,id,exitOwner)=>this.consumeDirectExit(status,id,exitOwner));
+      return {canonical:{slot:slots.targetSlot,fallbackSlot:slots.fallbackSlot,guardIdx,
+          guardCache:this.castCacheFor(node.args[0],`canonical:${op}:${key}`),type,consumeIdx,compact},
+        writes,deoptable:true};
+    }
     // Direct wasm->wasm fast path for the single-ready-target shape,
     // mirroring the dispatcher tier: matching receivers call the target's
     // runv export with no JS on the path (an in-wasm null check suffices for

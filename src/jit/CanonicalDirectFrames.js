@@ -1,6 +1,6 @@
 "use strict";
 const Frame = require('../core/frame');
-const {T, OP, uleb, sleb, assembleModule} = require('./wasmShared');
+const {T, OP, uleb, sleb, assembleModule, descToWasm} = require('./wasmShared');
 
 // A direct Wasm invocation allocates no JavaScript frame on a normal return.
 // The callee carries its own invocation id through every canonical spill.
@@ -78,7 +78,6 @@ class CanonicalDirectLinks {
       (meta.usedEh || meta.canonicalNonThrowingNormalFlow || meta.canonicalRecordedNormalFlow ||
         meta.nativeJsExceptionTags) &&
       !meta.boxedCount && !(meta.specSites?.length) && !meta.speculations &&
-      !'L['.includes(meta.retChar) &&
       (!meta.frameEntryOnly || meta.booleanStaticSpillProof);
   }
   allocate(key, params, results, fallback, parameterArrayABI = [], compact = false) {
@@ -106,7 +105,7 @@ class CanonicalDirectLinks {
     const slot = this.freeSlots.length?this.freeSlots.pop():this.table.length;
     if(slot===this.table.length)this.table.grow(1);
     this.table.set(slot,stub);
-    const binding = {slot,stub,key,params,compact,parameterArrayABI:parameterArrayABI.slice()};
+    const binding = {slot,stub,key,params,results:results.slice(),compact,parameterArrayABI:parameterArrayABI.slice()};
     this.bySlot.set(slot,binding);
     let list=this.bindings.get(key);
     if(!list)this.bindings.set(key,list=[]);
@@ -154,7 +153,13 @@ class CanonicalDirectLinks {
         : arrays.length ? st.meta.canonicalHeapRun : st.meta.canonicalRun : null;
       const javaCount=binding.params.length-2*arrays.length;
       let slot=0;
-      const identity=fn && st.meta.paramSlots.length===javaCount &&
+      // Publication must validate both halves of the Wasm signature. In
+      // particular an externref result cannot inhabit an older numeric slot.
+      const expectedResults=st.meta?.retChar==='V'?[]:[descToWasm(st.meta?.retChar)];
+      const resultIdentity=st.meta?.retChar===undefined ||
+        expectedResults.length===binding.results.length &&
+        expectedResults.every((type,i)=>type===binding.results[i]);
+      const identity=fn && resultIdentity && st.meta.paramSlots.length===javaCount &&
         (!arrays.length || arrays.length===st.meta.parameterArrayABI?.length &&
           arrays.every((index,i)=>index===st.meta.parameterArrayABI[i]) &&
           binding.params.slice(javaCount).every(type=>type===T.i32)) &&

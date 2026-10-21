@@ -68,7 +68,7 @@ const {
   denseSlotFor, readField, writeField,
 } = require('../core/objectModel');
 const {
-  addMathImport, addSystemImport, addArraysImport, addNewArrayImport, addANewArrayImport,
+  addStaticCallInitializationGuard, addMathImport, addSystemImport, addArraysImport, addNewArrayImport, addANewArrayImport,
   addNewImport, addTypedArrayStoreImports, arrayTracer,
   addI32ArrayLoadImports, addStringConstantImport, addStringCallImport,
 } = require('./wasmRuntimeImports');
@@ -373,7 +373,7 @@ class MethodTranslator {
       this.declared.push(t);
       const filledLocal = this.nextLocal++;
       this.declared.push(T.i32);
-      entry = { valLocal, filledLocal, t, killKey, slot, kind };
+      entry = { valLocal, filledLocal, t, killKey, slot, kind, cacheKey };
       this.fieldCaches.set(cacheKey, entry);
     }
     return entry;
@@ -386,7 +386,78 @@ class MethodTranslator {
         seq.push(OP.i32_const, ...sleb(0), OP.local_set, ...uleb(entry.filledLocal));
       }
     }
+    for (const cache of this.arrayCaches.values()) {
+      if (predicate(cache.origin)) seq.push(OP.i32_const, 0, OP.local_set, ...uleb(cache.filled));
+    }
     return seq;
+  }
+
+  // Native array metadata is invocation-local. Provenance ties it to a
+  // reference local or to the same field cache whose invalidation already
+  // accounts for aliases and transitive callee writes.
+  arrayCacheFor(origin, op) {
+    if (!this.jvm.wasmHeap || !origin) return null;
+    const kinds = {
+      iaload: ['i32_load', 2, T.i32, Int32Array], iastore: ['i32_store', 2, T.i32, Int32Array],
+      baload: ['i32_load8_s', 0, T.i32, Int8Array], bastore: ['i32_store8', 0, T.i32, Int8Array],
+      caload: ['i32_load16_u', 1, T.i32, Uint16Array], castore: ['i32_store16', 1, T.i32, Uint16Array],
+      saload: ['i32_load16_s', 1, T.i32, Int16Array], sastore: ['i32_store16', 1, T.i32, Int16Array],
+      faload: ['f32_load', 2, T.f32, Float32Array], fastore: ['f32_store', 2, T.f32, Float32Array],
+      daload: ['f64_load', 3, T.f64, Float64Array], dastore: ['f64_store', 3, T.f64, Float64Array],
+      laload: ['i64_load', 3, T.i64, BigInt64Array], lastore: ['i64_store', 3, T.i64, BigInt64Array],
+    };
+    const kind = kinds[op];
+    if (!kind) return null;
+    const originKey = origin.cacheKey || (origin.slot !== undefined ? `local|${origin.slot}` : null);
+    if (!originKey) return null;
+    const key = `${originKey}|${op}`;
+    if (this.arrayCaches.has(key)) return this.arrayCaches.get(key);
+    const base = this.nextLocal++, length = this.nextLocal++, filled = this.nextLocal++;
+    this.declared.push(T.i32, T.i32, T.i32);
+    const heap = this.jvm.wasmHeap, Ctor = kind[3];
+    const baseImport = this.addImport(`heap_base_${Ctor.name}`, [T.ref], [T.i32], array =>
+      array instanceof Ctor && array.buffer === heap.memory.buffer &&
+      array.wasmBase !== undefined && array.type !== '[Z' && array.elementType !== 'boolean'
+        ? array.wasmBase : -1);
+    const lengthImport = this.addImport('heap_length', [T.ref], [T.i32], array => array?.length || 0);
+    const boundsImport = this.addImport('heap_bounds', [T.i32, T.i32], [], (index, length) => {
+      throw AIOOBE(index, length);
+    });
+    const entry = {base, length, filled, baseImport, lengthImport, boundsImport, kind, origin, op};
+    this.arrayCaches.set(key, entry);
+    this.usedHeap = true;
+    return entry;
+  }
+
+  nativeArrayAccess(origin, op, type, store) {
+    const cache = this.arrayCacheFor(origin, op);
+    if (!cache) return null;
+    const [memoryOp, shift] = cache.kind;
+    // Operands were already evaluated by bytecode. Save them in distinct
+    // locals before any guard, preserving order and the surrounding stack.
+    const array = this.nextLocal++, index = this.nextLocal++;
+    this.declared.push(T.ref, T.i32);
+    let value;
+    const save = [];
+    if (store) { value = this.nextLocal++; this.declared.push(type); save.push(OP.local_set, ...uleb(value)); }
+    save.push(OP.local_set, ...uleb(index), OP.local_set, ...uleb(array));
+    const valueSeq = store ? [OP.local_get, ...uleb(value)] : [];
+    const fallback = this.importIndexByName.get(store
+      ? this.wasmJit.typedArrayStoresEnabled ? `aset_${op}` : `aset_${sig(type)}`
+      : arrayLoadImportName(this, op, type));
+    return [...save,
+      OP.local_get, ...uleb(cache.filled), OP.i32_eqz, OP.if, 0x40,
+      OP.local_get, ...uleb(array), OP.call, ...uleb(cache.baseImport), OP.local_set, ...uleb(cache.base),
+      OP.local_get, ...uleb(array), OP.call, ...uleb(cache.lengthImport), OP.local_set, ...uleb(cache.length),
+      OP.i32_const, 1, OP.local_set, ...uleb(cache.filled), OP.end,
+      OP.local_get, ...uleb(cache.base), OP.i32_const, 0, OP.i32_ge_s, OP.if, store ? 0x40 : type,
+      OP.local_get, ...uleb(index), OP.local_get, ...uleb(cache.length), OP.i32_ge_u, OP.if, 0x40,
+      OP.local_get, ...uleb(index), OP.local_get, ...uleb(cache.length), OP.call, ...uleb(cache.boundsImport), OP.end,
+      OP.local_get, ...uleb(cache.base), OP.local_get, ...uleb(index),
+      ...(shift ? [OP.i32_const, ...sleb(shift), OP.i32_shl] : []), OP.i32_add,
+      ...valueSeq, OP[memoryOp], ...uleb(shift), 0,
+      OP.else, OP.local_get, ...uleb(array), OP.local_get, ...uleb(index), ...valueSeq,
+      OP.call, ...uleb(fallback), OP.end];
   }
 
   // emit: read through the cache entry; on miss run `loadSeq` (which must
@@ -1303,7 +1374,7 @@ class MethodTranslator {
         // own resume/link tables; never clear those shared objects in place.
         for (const key of [
           'items', 'labelIndex', 'blockStarts', 'slotTypes', 'declared',
-          'localOfSlot', 'stackLocals', 'entryStacks', 'fieldCaches',
+          'localOfSlot', 'stackLocals', 'entryStacks', 'fieldCaches', 'arrayCaches',
           'importDecls', 'importFns', 'importIndexByName', 'staticFieldAccessors', 'stringConstantImports',
         ]) {
           // Clear roots without changing the runtime import receiver's shape.
@@ -1381,6 +1452,8 @@ class MethodTranslator {
     this.scratchPool = new Map(); // wasm type -> [localIdx]
     this.stackLocals = new Map(); // `${depth}|${type}` -> localIdx
     this.fieldCaches = new Map(); // cacheKey -> {valLocal, filledLocal, ...}
+    this.arrayCaches = new Map();
+    this.usedHeap = false;
     this.refScratch = undefined;
 
     // With EH the whole dispatcher loop runs under try_table/catch_all and a throw
@@ -1460,10 +1533,16 @@ class MethodTranslator {
       // cover fills that compile later in block order (pass 2 can only see a
       // subset of pass 1's sites — demotions remove, never add).
       const discovered = this.fieldCaches;
+      const discoveredArrays = this.arrayCaches;
+      this.arrayCaches = new Map();
       this.fieldCaches = new Map();
       this.refScratch = undefined;
       for (const [cacheKey, entry] of discovered) {
         this.fieldCacheFor(cacheKey, entry.t, entry.killKey, entry.slot, entry.kind);
+      }
+      for (const entry of discoveredArrays.values()) {
+        const origin = entry.origin.cacheKey ? this.fieldCaches.get(entry.origin.cacheKey) : entry.origin;
+        this.arrayCacheFor(origin, entry.op);
       }
     }
     this.dryRun = false;
@@ -1903,6 +1982,10 @@ class MethodTranslator {
       if (op === 'invokestatic') {
         const call = addArraysImport(this, this.jvm, ins);
         if (call?.initializationIdx != null) initializationGuards.add(call.initializationIdx);
+        if (!call) {
+          const guard = addStaticCallInitializationGuard(this, this.jvm, ins.arg?.[1]);
+          if (guard != null) initializationGuards.add(guard);
+        }
       }
       if (op !== 'getstatic' && op !== 'putstatic') continue;
       const {initializationIdx} = this.fieldImports(ins, true, op === 'getstatic');
@@ -2038,15 +2121,21 @@ class MethodTranslator {
       else if (op === 'dcmpg') fcmp(T.f64, 1);
       else if (op in ARRAY_LOAD) {
         const t = ARRAY_LOAD[op];
+        const origin = prov[prov.length - 2];
         pop(T.i32); pop(T.ref);
-        emit(OP.call, ...uleb(this.importIndexByName.get(arrayLoadImportName(this, op, t))));
+        const native = this.nativeArrayAccess(origin, op, t, false);
+        if (native) emit(...native);
+        else emit(OP.call, ...uleb(this.importIndexByName.get(arrayLoadImportName(this, op, t))));
         push(t);
       } else if (op in ARRAY_STORE) {
         const t = ARRAY_STORE[op];
+        const origin = prov[prov.length - 3];
         pop(); pop(T.i32); pop(T.ref);
+        const native = this.nativeArrayAccess(origin, op, t, true);
         const storeImport = this.wasmJit.typedArrayStoresEnabled
           ? `aset_${op}` : `aset_${sig(t)}`;
-        emit(OP.call, ...uleb(this.importIndexByName.get(storeImport)));
+        if (native) emit(...native);
+        else emit(OP.call, ...uleb(this.importIndexByName.get(storeImport)));
       } else if (op === 'arraylength') {
         pop(T.ref);
         emit(OP.call, ...uleb(this.importIndexByName.get('alen')));
@@ -2077,7 +2166,8 @@ class MethodTranslator {
           } else {
             emit(OP.call, ...uleb(idx));
           }
-          push(t);
+          const entry = caching ? this.fieldCaches.get(`s|${name}`) : null;
+          push(t, t === T.ref ? entry : null);
         } else {
           const receiver = prov[prov.length - 1];
           pop(T.ref);
@@ -2091,7 +2181,9 @@ class MethodTranslator {
           } else {
             emit(OP.call, ...uleb(idx));
           }
-          push(t);
+          const entry = caching && receiver?.slot !== undefined
+            ? this.fieldCaches.get(`f|${receiver.slot}|${name}`) : null;
+          push(t, t === T.ref ? entry : null);
         }
       } else if (op === 'putfield' || op === 'putstatic') {
         const st = op === 'putstatic';
@@ -2326,6 +2418,7 @@ class MethodTranslator {
       const nameBytes = [...d.name].map((c) => c.charCodeAt(0));
       importEntries.push([3, 0x65, 0x6e, 0x76, ...uleb(nameBytes.length), ...nameBytes, 0x00, ...uleb(ti)]);
     }
+    if (this.usedHeap) importEntries.push([3, 0x65, 0x6e, 0x76, 6, 0x6d, 0x65, 0x6d, 0x6f, 0x72, 0x79, 2, 0, 0]);
     const mainParams = [...this.paramSlots.map((s) => this.slotTypes.get(s)), T.i32, T.i32]; // + blk, fuel
     const mainType = internType(mainParams, [T.i32]);
     const mainIdx = this.importDecls.length;
@@ -2372,10 +2465,12 @@ class MethodTranslator {
     ]);
 
     const env = {};
+    if (this.usedHeap) env.memory = this.jvm.wasmHeap.memory;
     this.importDecls.forEach((d, i) => { env[d.name] = this.importFns[i]; });
     return {
       bytes,
       importObject: { env },
+      nativeArrayCacheCount: this.arrayCaches.size,
       box: this.box,
       paramSlots: this.paramSlots.map((s) => ({ slot: s, t: this.slotTypes.get(s) })),
       retChar: this.desc.ret,
@@ -3648,9 +3743,15 @@ class WasmJit {
       // class load can undo — a demoted block, or the structured tier itself
       // declining. The entry gate rebuilds such a module once the world that
       // produced the loss changes. See DEFERRABLE_DEMOTE.
+      // Entry and mid-method resumption are separately compiled modules.
+      // A complete primary can still have a companion that was built before
+      // its callees existed. Preparation must settle both dependency worlds,
+      // or every resumed invocation exits at the same already-ready helper.
+      const dependencyModules = [primary, ...(st.osr ? [st.osr.meta] : [])];
+      const dependencyReasons = dependencyModules.flatMap(module =>
+        [...(module.demoteReasons?.values() || [])]);
       st.partialDeps = structuredDeferred ||
-        [...primary.demoteReasons.values()]
-          .some((reason) => DEFERRABLE_DEMOTE.test(reason));
+        dependencyReasons.some((reason) => DEFERRABLE_DEMOTE.test(reason));
       // Which loss it was. A structured module that merely demoted a block is
       // left alone: on the dispatcher tier the same rebuild would discard
       // modules that late instance-target installation already serves without
@@ -3659,13 +3760,14 @@ class WasmJit {
       st.partialDepsStructured = structuredDeferred || !!(st.meta && st.meta.structured);
       // ...but a loss nothing can repair at runtime reopens the gate whatever
       // tier produced the module. See UNSERVICEABLE_DEMOTE.
-      st.partialDepsUnserviceable = [...primary.demoteReasons.values()]
+      st.partialDepsUnserviceable = dependencyReasons
         .some((reason) => UNSERVICEABLE_DEMOTE.test(reason));
       // Which classes have to change state before rebuilding could possibly
       // help. When this is known the rebuild waits for exactly them, which is
       // both more likely to succeed and far less likely to storm than waiting
       // for any world movement at all.
-      const blockers = new Set(primary.demoteBlockers || []);
+      const blockers = new Set(dependencyModules.flatMap(module =>
+        [...(module.demoteBlockers || [])]));
       for (const name of structuredBlockers) blockers.add(name);
       st.blockers = [...blockers].sort();
       this.compileEpoch += 1;

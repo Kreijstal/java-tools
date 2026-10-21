@@ -624,7 +624,8 @@ function canonicalRunWrapperBody(paramCount, mainIdx, retvType, globals, readyId
   if(!compact)out.push(OP.i32_const,0,OP.ref_null,T.ref);
   if(retvType)out.push(...(retvType===T.i64?[OP.i64_const,0]:
     retvType===T.f32?[OP.f32_const,0,0,0,0]:
-    retvType===T.f64?[OP.f64_const,0,0,0,0,0,0,0,0]:[OP.i32_const,0]));
+    retvType===T.f64?[OP.f64_const,0,0,0,0,0,0,0,0]:
+    retvType===T.ref?[OP.ref_null,T.ref]:[OP.i32_const,0]));
   out.push(OP.return,OP.end);
   out.push(OP.global_get,...uleb(globals+1),OP.i32_const,1,OP.i32_add,
     OP.local_tee,...uleb(id),OP.i32_eqz,OP.if,0x40,
@@ -642,6 +643,7 @@ function canonicalRunWrapperBody(paramCount, mainIdx, retvType, globals, readyId
   out.push(OP.local_get,...uleb(status));
   if(!compact)out.push(OP.local_get,...uleb(id),OP.global_get,...uleb(globals+2));
   if(retvType)out.push(OP.global_get,...uleb(retvIndex));
+  if(retvType===T.ref)out.push(OP.ref_null,T.ref,OP.global_set,...uleb(retvIndex));
   out.push(OP.end);
   return out;
 }
@@ -651,6 +653,7 @@ function structuredBodyBytes(body,frame,globals,returnValue=false,globalBase=0) 
   for(const byte of body){
     if(byte===STRUCTURED_RETURN){
       if(returnValue)out.push(OP.global_get,...uleb(globalBase));
+      if(returnValue===T.ref)out.push(OP.ref_null,T.ref,OP.global_set,...uleb(globalBase));
       out.push(OP.return);
     }else if(byte===CAPTURE_DIRECT_ID){
       if(!Number.isInteger(frame?.idLocal))throw TypeError('missing canonical invocation local');
@@ -670,7 +673,8 @@ function inlineCompactBody(paramCount,missingHeap,mainParams,declared,body,retvT
     [OP.i32_const,...sleb(frame.readyAddress),OP.i32_load,2,0]),OP.i32_eqz,OP.if,0x40,
     OP.i32_const,...sleb(-4));
   if(retvType)out.push(...(retvType===T.i64?[OP.i64_const,0]:
-    retvType===T.f32?[OP.f32_const,0,0,0,0]:retvType===T.f64?[OP.f64_const,0,0,0,0,0,0,0,0]:[OP.i32_const,0]));
+    retvType===T.f32?[OP.f32_const,0,0,0,0]:retvType===T.f64?[OP.f64_const,0,0,0,0,0,0,0,0]:
+    retvType===T.ref?[OP.ref_null,T.ref]:[OP.i32_const,0]));
   out.push(OP.return,OP.end,
     OP.global_get,...uleb(globals+1),OP.i32_const,1,OP.i32_add,OP.local_tee,...uleb(frame.idLocal),
     OP.i32_eqz,OP.if,0x40,OP.i32_const,1,OP.local_set,...uleb(frame.idLocal),OP.end,
@@ -679,10 +683,11 @@ function inlineCompactBody(paramCount,missingHeap,mainParams,declared,body,retvT
   for(let i=0;i<missingHeap;i++)out.push(OP.i32_const,...sleb(-2),OP.local_set,...uleb(paramCount+2*i));
   const emitCatch=frame.recordIdx==null ? emitTryTableCatchAll :
     (out,body,handler)=>emitTryTableJsTag(out,body,handler,frame.recordIdx);
-  emitCatch(out,native=>native.push(...structuredBodyBytes(body.slice(0,-1),{...frame,inline:true},globals,!!retvType,retvIndex)),
+  emitCatch(out,native=>native.push(...structuredBodyBytes(body.slice(0,-1),{...frame,inline:true},globals,retvType,retvIndex)),
     handler=>{
       handler.push(OP.i32_const,...sleb(-5));
       if(retvType)handler.push(OP.global_get,...uleb(retvIndex));
+      if(retvType===T.ref)handler.push(OP.ref_null,T.ref,OP.global_set,...uleb(retvIndex));
       handler.push(OP.return);
     });
   out.push(OP.unreachable,OP.end);

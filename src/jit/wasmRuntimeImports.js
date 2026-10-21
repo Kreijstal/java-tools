@@ -6,6 +6,19 @@ function addReadinessGuard(reg,name,token) {
     reg.addImport(name,[],[T.i32],token.wasmReadinessGuard?.() || (()=>token.initialized?1:0),true);
 }
 
+// A compiled static target still needs Java first-use initialization. The
+// caller's own owner is already initialized (or initializing on this thread),
+// while other owners are checked before the block performs any guest effect.
+function addStaticCallInitializationGuard(reg, jvm, owner) {
+  if (!owner || owner === reg.className ||
+      jvm.classInitializationState.get(owner) === 'INITIALIZED') return null;
+  const token = jvm.getClassInitializationToken(owner);
+  const index = addReadinessGuard(reg,
+    `static_ready_${owner}`.replace(/[^\w]/g, '_'), token);
+  (reg.staticInitializationGuards ||= new Set()).add(owner);
+  return index;
+}
+
 // Wasm↔JS boundary import builders shared by the wasm backends. A registry is
 // any object with addImport(name, params, results, fn) -> importIndex and an
 // importIndexByName Map (MethodTranslator satisfies this; so does the
@@ -690,6 +703,7 @@ function addStringConstantImport(reg, jvm, literal, op) {
 }
 
 module.exports = {
+  addStaticCallInitializationGuard,
   addStringConstantImport,
   addStringCallImport,
   addArraysImport,
