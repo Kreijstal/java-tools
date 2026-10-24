@@ -3518,6 +3518,80 @@ class JVM {
     return false;
   }
 
+  // Synchronous class initialization for callers that cannot yield (the
+  // closed Wasm module). Same protocol and state as initializeClassIfNeeded;
+  // the bytecode <clinit> runs through `runClinit(className, method)`, which
+  // must execute it to completion or throw. Returns false when it cannot
+  // proceed without blocking (another thread is initializing the class, or
+  // the class is not loaded) -- the caller must treat that as fatal.
+  initializeClassSync(className, thread, runClinit) {
+    const state = className && this.classInitializationState.get(className);
+    if (!className || state === "INITIALIZED") return true;
+    if (state === "ERRONEOUS") {
+      throw { type: "java/lang/NoClassDefFoundError", message: `Could not initialize class ${className}` };
+    }
+    if (state === "INITIALIZING") {
+      return this.classInitializationOwners.get(className) === thread.id;
+    }
+    const classData = this.classes[className];
+    if (!classData) {
+      if (this.jre[className] && !this.jre[className].applicationFallback) {
+        this._markClassInitialized(className);
+        return true;
+      }
+      return false;
+    }
+    this._setClassInitializationState(className, "INITIALIZING");
+    this.classInitializationOwners.set(className, thread.id);
+    const fail = () => {
+      this._setClassInitializationState(className, "ERRONEOUS");
+      this.classInitializationOwners.delete(className);
+      this._wakeClassInitializationWaiters(className);
+    };
+    try {
+      const superClassName = classData.ast?.classes?.[0]?.superClassName;
+      if (superClassName && !this.initializeClassSync(superClassName, thread, runClinit)) {
+        this.classInitializationState.delete(className);
+        this.classInitializationOwners.delete(className);
+        return false;
+      }
+      if (!classData.staticFields || !classData.staticFieldsInitialized) {
+        if (!classData.staticFields) {
+          classData.staticFields = new StaticFieldStore(undefined, !!this.wasmHeap, this.closedRuntime);
+        }
+        classData.staticFieldsInitialized = true;
+        for (const item of classData.ast?.classes?.[0]?.items || []) {
+          if (item.type !== "field" || !item.field.flags || !item.field.flags.includes("static")) continue;
+          classData.staticFields.set(`${item.field.name}:${item.field.descriptor}`, staticFieldInitialValue(this, item.field));
+        }
+        const jreClass = this.jre[className];
+        if (jreClass && jreClass.staticFields) {
+          for (const [fieldKey, fieldValue] of Object.entries(jreClass.staticFields)) {
+            if (fieldValue && fieldValue.type === "java/lang/Class" && fieldValue.isPrimitive && fieldValue.name) {
+              const mirror = this.getClassObjectSync?.(fieldValue.name);
+              if (!mirror) throw new Error(`initializeClassSync: no synchronous mirror for ${fieldValue.name}`);
+              classData.staticFields.set(fieldKey, mirror);
+            } else {
+              classData.staticFields.set(fieldKey, fieldValue);
+            }
+          }
+        }
+      }
+      const nativeClinit = this._jreFindMethod(className, "<clinit>", "()V");
+      if (nativeClinit) {
+        const result = nativeClinit(this, null, [], thread);
+        if (result && typeof result.then === "function") throw new Error(`initializeClassSync: asynchronous native <clinit> for ${className}`);
+      }
+      const staticInitializer = this.findStaticInitializer(classData);
+      if (staticInitializer) runClinit(className, staticInitializer);
+    } catch (error) {
+      fail();
+      throw error;
+    }
+    this._markClassInitialized(className);
+    return true;
+  }
+
   _markClassInitialized(className) {
     this._setClassInitializationState(className, "INITIALIZED");
     this.classInitializationOwners.delete(className);

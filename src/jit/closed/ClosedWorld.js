@@ -258,6 +258,7 @@ class ClosedWorld {
     this._hostImpls = {
       ref_eq: (a, b) => (toJs(a) === toJs(b) ? 1 : 0),
       err_npe: () => throwJava('java/lang/NullPointerException'),
+      init: (id) => world.initializeSync(id),
       menter: (value) => {
         const monitor = toJs(value), thread = world.thread;
         if (isNull(monitor)) throwJava('java/lang/NullPointerException');
@@ -459,7 +460,6 @@ class ClosedWorld {
   analyze(className, method, key) {
     const flags = flagsOf(method);
     if (flags.includes('native') || flags.includes('abstract')) return null;
-    if (method.name === '<clinit>') return this.reject(key, 'clinit');
     const code = method.attributes?.find((a) => a.type === 'code')?.code;
     if (!code) return this.reject(key, 'no-code');
     const table = code.exceptionTable || [];
@@ -557,7 +557,8 @@ class ClosedWorld {
         const valtype = cell.closedType === 'anyref' ? [VT.anyref] : [WT[valueKind]];
         const global = this.globalImport(`s:${declaring}.${name}:${descriptor}`, valtype, true, cell.closedGlobal);
         record.initClasses.add(declaring);
-        plan.set(node.id, { kind: op === 'getstatic' ? 'static-get' : 'static-put', global, valueKind });
+        plan.set(node.id, { kind: op === 'getstatic' ? 'static-get' : 'static-put', global, valueKind,
+          initClass: this.initCheckFor(record, declaring) });
         return;
       }
       case 'invokestatic': case 'invokespecial': case 'invokevirtual': case 'invokeinterface':
@@ -571,7 +572,7 @@ class ClosedWorld {
         const jit = this.jit;
         const fn = this.siteImport(`new:${className}`, [], [VT.anyref],
           () => this.runtime.toWasm(jit.allocateObject(className)));
-        plan.set(node.id, { kind: 'import', fn, argKinds: [] });
+        plan.set(node.id, { kind: 'import', fn, argKinds: [], initClass: this.initCheckFor(record, className) });
         return;
       }
       case 'newarray': {
@@ -646,15 +647,16 @@ class ClosedWorld {
       const target = this.resolveFrom(owner, name, descriptor, op === 'invokestatic');
       if (!target) throw new Unsupported(`invoke-unresolved: ${owner}.${name}${descriptor}`);
       if (op === 'invokestatic') record.initClasses.add(target.owner);
+      const initClass = op === 'invokestatic' ? this.initCheckFor(record, target.owner) : null;
       if (target.native) {
         const fn = this.nativeImport(`native:${target.owner}.${name}${descriptor}`, target.native, descriptor, op !== 'invokestatic');
-        record.plan.set(node.id, { kind: 'import', fn, argKinds });
+        record.plan.set(node.id, { kind: 'import', fn, argKinds, initClass });
         return;
       }
       if (!this.isGuestClass(target.owner)) throw new Unsupported(`invoke-nonguest: ${target.owner}.${name}`);
       const calleeKey = `${target.owner}.${name}${descriptor}`;
       record.calls.add(calleeKey);
-      record.plan.set(node.id, { kind: 'call', fn: `m:${calleeKey}`, argKinds,
+      record.plan.set(node.id, { kind: 'call', fn: `m:${calleeKey}`, argKinds, initClass,
         nullCheckReceiver: op === 'invokespecial' && name !== '<init>' });
       return;
     }
@@ -757,6 +759,46 @@ class ClosedWorld {
       return object !== null && object !== undefined && jvm.isInstanceOfSync(runtimeClassName(object), target) ? 1 : 0;
     });
     return { kind: isCast ? 'checkcast' : 'instanceof', hostFn, siteId };
+  }
+
+  // ---- lazy class initialization -----------------------------------------
+  // A class needs a check at a site unless it is the method's own class or a
+  // superclass of it: those are initialized (or initializing on this thread)
+  // whenever the method runs.
+  initCheckFor(record, className) {
+    for (let current = record.className; current; current = this.classAst(current)?.superClassName) {
+      if (current === className) return null;
+    }
+    return this.initTarget(className);
+  }
+
+  initTarget(className) {
+    this.initTargets ||= new Map();
+    let target = this.initTargets.get(className);
+    if (!target) {
+      const token = this.jvm.getClassInitializationToken(className);
+      const address = token.wasmReadinessAddress?.(this.runtime.heap);
+      target = { className, id: this.initTargets.size, address: Number.isInteger(address) ? address : null };
+      this.initTargets.set(className, target);
+    }
+    return target;
+  }
+
+  initImport() {
+    const world = this, jvm = this.jvm;
+    return this.hostImport('init', [VT.i32], []);
+  }
+
+  initializeSync(id) {
+    const target = [...this.initTargets.values()][id];
+    const ok = this.jvm.initializeClassSync(target.className, this.thread, (className) => this.runClinit(className));
+    if (!ok) throw new ClosedWorldError(`closed world: cannot initialize ${target.className} without blocking`);
+  }
+
+  runClinit(className) {
+    const record = this.entries.get(`${className}.<clinit>()V`);
+    if (!record || !record.fn) throw new ClosedWorldError(`closed world: <clinit> of ${className} is not in the module`);
+    record.fn();
   }
 
   // ---- module assembly ----------------------------------------------------
@@ -893,7 +935,13 @@ class ClosedWorld {
     return record.readinessClasses;
   }
 
+  // Classes initialize lazily at their sites inside the module, so every
+  // admitted method is always ready.
   isReady(record) {
+    return true;
+  }
+
+  isReadyByClosure(record) {
     if (record.ready) return true;
     const state = this.jvm.classInitializationState;
     for (const className of this.readinessClasses(record)) {
@@ -951,9 +999,11 @@ class ClosedWorld {
       // Every handler inside the module already ran. Replace the callee frame
       // with a handler-less tombstone so the scheduler dispatches in the
       // caller at its invoke, exactly as for an unwinding interpreter frame.
+      if (frame.initializingClassName) this.jvm.failClassInitialization(frame);
       thread.callStack.pop();
       this.throwThroughTombstone(record, thread, error);
     }
+    if (frame.initializingClassName) this.jvm.completeClassInitialization(frame);
     thread.callStack.pop();
     if (record.returnKind !== 'V' && !thread.callStack.isEmpty()) {
       thread.callStack.peek().stack.push(this.toJsValue(record.returnKind, result));

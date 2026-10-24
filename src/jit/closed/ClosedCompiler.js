@@ -592,6 +592,7 @@ class ClosedCompiler {
     if (op === 'arraylength') { out.push(...this.arrayLength(node)); return this.finish(node, out); }
     const plan = this.plan.get(node.id);
     if (!plan) throw new Unsupported(`no plan for ${op}`);
+    if (plan.initClass) out.push(...this.initCheck(plan.initClass));
     out.push(...this.planned(node, plan));
     return this.finish(node, out);
   }
@@ -716,6 +717,15 @@ class ClosedCompiler {
       case 'checkcast': return this.typeTest(node, plan, true);
       default: throw new Unsupported(`plan ${plan.kind}`);
     }
+  }
+
+  // Lazy class initialization: one load of the class's readiness word; only
+  // the first access calls out to run the initializer.
+  initCheck(target) {
+    const init = this.world.hostImport('init', [VT.i32], []);
+    const call = [OP.i32_const, ...sleb(target.id), OP.call, { fn: init }];
+    if (target.address === null) return call;
+    return [OP.i32_const, ...sleb(target.address), OP.i32_load, 2, 0, OP.i32_eqz, OP.if, 0x40, ...call, OP.end];
   }
 
   intrinsic(node, plan) {
