@@ -145,7 +145,7 @@ class ClosedRuntime {
     const cached = this.layouts.get(className);
     if (cached && cached.epoch === epoch && cached.classData === classData) return cached.layout;
     let layout = null;
-    if (!(jvm.jre && jvm.jre[className])) {
+    if (!(jvm.jre && jvm.jre[className] && !jvm.jre[className].applicationFallback)) {
       const chain = [];
       let current = className, complete = true;
       while (current) {

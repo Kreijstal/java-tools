@@ -77,11 +77,13 @@ class ClosedWorld {
     if (typeof process !== 'undefined' && process.env?.JVM_CLOSED_WORLD_STATS) {
       process.once('exit', () => {
         const rejected = [...this.rejected].map(([key, reason]) => `${key}\t${reason}`).join('\n');
-        process.stderr.write(`[closed-world] ${JSON.stringify(this.stats())}\n`);
-        if (process.env.JVM_CLOSED_WORLD_STATS === 'rejects') process.stderr.write(`${rejected}\n`);
+        // Synchronous: an asynchronous pipe write is truncated at exit.
+        const write = (text) => require('node:fs').writeSync(2, text);
+        write(`[closed-world] ${JSON.stringify(this.stats())}\n`);
+        if (process.env.JVM_CLOSED_WORLD_STATS === 'rejects') write(`${rejected}\n`);
         if (this.importCalls) {
           const top = [...this.importCalls].filter(([, n]) => n).sort((x, y) => y[1] - x[1]).slice(0, 40);
-          process.stderr.write(top.map(([key, n]) => `[closed-import] ${n}\t${key}`).join('\n') + '\n');
+          write(top.map(([key, n]) => `[closed-import] ${n}\t${key}`).join('\n') + '\n');
         }
       });
     }
@@ -101,9 +103,12 @@ class ClosedWorld {
 
   // ---- class model helpers ----------------------------------------------
   classAst(name) { return this.jvm.classes[name]?.ast?.classes?.[0] || null; }
+  // Guest bytecode. An application-fallback JRE entry only overrides some
+  // methods with natives; the class itself is still guest code.
   isGuestClass(name) {
     const data = this.jvm.classes[name];
-    return !!(data && data.ast && !data.isJreStub && !(this.jvm.jre && this.jvm.jre[name]));
+    const jre = this.jvm.jre && this.jvm.jre[name];
+    return !!(data && data.ast && !data.isJreStub && (!jre || jre.applicationFallback));
   }
   isInterface(name) {
     const ast = this.classAst(name);
@@ -351,9 +356,12 @@ class ClosedWorld {
   }
 
   // ---- admission ----------------------------------------------------------
-  async build() {
+  async build(thread = null) {
     if (this.built) return;
     this.built = true;
+    if (typeof this.jvm.preloadClasspathClasses === 'function') {
+      try { await this.jvm.preloadClasspathClasses(); } catch { /* referenced classes still load below */ }
+    }
     await this.loadReferencedClasses();
     const candidates = [];
     for (const className of Object.keys(this.jvm.classes)) {
@@ -382,6 +390,34 @@ class ClosedWorld {
     }
     if (!this.entries.size) return;
     this.assemble();
+    if (thread) await this.initializeTrivialClasses(thread);
+  }
+
+  // A class with no <clinit> anywhere up its guest superclass chain has no
+  // observable initialization, so initializing it early is invisible to Java.
+  // Doing so keeps it from holding an admitted closure back from readiness.
+  async initializeTrivialClasses(thread) {
+    const wanted = new Set();
+    for (const record of this.entries.values()) for (const c of this.readinessClasses(record)) wanted.add(c);
+    const trivial = (name, seen = new Set()) => {
+      if (seen.has(name)) return true;
+      seen.add(name);
+      if (this.jvm.classInitializationState.get(name) === 'INITIALIZED') return true;
+      if (!this.isGuestClass(name)) return false;
+      const ast = this.classAst(name);
+      if (ast.items.some((item) => item.type === 'method' && item.method.name === '<clinit>')) return false;
+      return !ast.superClassName || trivial(ast.superClassName, seen) || !!(this.jvm.jre && this.jvm.jre[ast.superClassName]);
+    };
+    for (const name of wanted) {
+      if (!trivial(name)) continue;
+      if (this.jvm.classInitializationState.get(name) === 'INITIALIZED') continue;
+      try {
+        const pushed = await this.jvm.initializeClassIfNeeded(name, thread);
+        if (pushed) throw new ClosedWorldError(`closed world: trivial class ${name} pushed an initializer`);
+      } catch (error) {
+        if (error instanceof ClosedWorldError) throw error;
+      }
+    }
   }
 
   // Load the classes admitted code may reference (without initializing them),
@@ -389,7 +425,7 @@ class ClosedWorld {
   async loadReferencedClasses() {
     const jvm = this.jvm;
     const done = new Set();
-    for (let round = 0; round < 8; round++) {
+    for (let round = 0; round < 64; round++) {
       const wanted = new Set();
       for (const className of Object.keys(jvm.classes)) {
         if (done.has(className) || !this.isGuestClass(className)) continue;

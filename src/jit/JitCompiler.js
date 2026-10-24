@@ -4631,6 +4631,9 @@ class JitCompiler {
   // owned by those classes, so a miscompile can be attributed to one class
   // without disabling the whole tier. Empty by default.
   jitDenied(method) {
+    // Methods the closed module owns run only there (or interpreted until
+    // their closure is initialized); no other tier compiles or links them.
+    if (this.closedWorld !== null && this.closedWorld.entryByMethod.has(method)) return true;
     if (!this.jitDenyClasses) {
       const raw = (typeof process !== "undefined" && process.env &&
         process.env.JVM_JIT_DENY) || "";

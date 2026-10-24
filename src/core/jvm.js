@@ -831,6 +831,9 @@ class JVM {
     //
     // Opt out with run(main, {prepare: false}) or new JVM({prepareBeforeMain:
     // false}), which is what an A/B against the old lifecycle needs.
+    // The closed module is built before preparation, so preparation and every
+    // other tier leave its methods alone (JitCompiler.jitDenied).
+    if (this.jit?.closedWorld) await this.jit.closedWorld.build(mainThread);
     if (options.prepare !== false && this.prepareBeforeMain !== false) {
       await this.precompileInitializedClasses({
         preloadClasspath: true,
@@ -871,7 +874,6 @@ class JVM {
     // <clinit> is guest code, so the boundary is here and not at the main()
     // invocation further down. Set it even when preparation was skipped --
     // opting out of preparation does not make later inline compilation free.
-    if (this.jit?.closedWorld) await this.jit.closedWorld.build();
     this.guestStarted = true;
     this.jit?.markMainStarted?.();
 
