@@ -336,6 +336,14 @@ class ClosedWorld {
   }
   toJsValue(kind, value) { return kind === 'A' ? this.runtime.toJs(value) : value; }
 
+  // An asynchronous native is a suspension point; module code cannot wait
+  // for it, so whoever can reach it stays on the suspending tiers.
+  rejectAsyncNative(native, where) {
+    if (native && native.constructor && native.constructor.name === 'AsyncFunction') {
+      throw new Unsupported(`async-native: ${where}`);
+    }
+  }
+
   // A synchronous native call as an import: (receiver?, args...) -> result.
   nativeImport(key, native, descriptor, hasReceiver) {
     const { params, ret } = parseMethodDescriptor(descriptor);
@@ -350,6 +358,9 @@ class ClosedWorld {
       const result = native(jvm, receiver, args, world.thread);
       if (result && typeof result.then === 'function') {
         throw new ClosedWorldError(`closed world: host method ${key} returned a Promise`);
+      }
+      if (world.thread && world.thread.status !== 'runnable') {
+        throw new ClosedWorldError(`closed world: host method ${key} asked thread ${world.thread.id} to ${world.thread.status}`);
       }
       return world.fromJs(retKind, result);
     };
@@ -649,6 +660,7 @@ class ClosedWorld {
       if (op === 'invokestatic') record.initClasses.add(target.owner);
       const initClass = op === 'invokestatic' ? this.initCheckFor(record, target.owner) : null;
       if (target.native) {
+        this.rejectAsyncNative(target.native, `${target.owner}.${name}${descriptor}`);
         const fn = this.nativeImport(`native:${target.owner}.${name}${descriptor}`, target.native, descriptor, op !== 'invokestatic');
         record.plan.set(node.id, { kind: 'import', fn, argKinds, initClass });
         return;
@@ -670,6 +682,7 @@ class ClosedWorld {
       if (!impl) throw new Unsupported(`virtual-unresolved: ${className}.${name}${descriptor}`);
       let fn;
       if (impl.native) {
+        this.rejectAsyncNative(impl.native, `${impl.owner}.${name}${descriptor}`);
         fn = this.nativeImport(`native:${impl.owner}.${name}${descriptor}`, impl.native, descriptor, true);
       } else {
         if (!this.isGuestClass(impl.owner)) throw new Unsupported(`virtual-nonguest: ${impl.owner}.${name}`);
@@ -682,6 +695,12 @@ class ClosedWorld {
     if (arms.size > 16) throw new Unsupported(`megamorphic: ${owner}.${name}`);
     let hostFn = null;
     if (hostCapable) {
+      // The static owner's own native (if any) is what most host receivers run.
+      for (let current = owner; current;) {
+        const native = this.jvm._jreFindMethod?.(current, name, descriptor);
+        if (native) { this.rejectAsyncNative(native, `${current}.${name}${descriptor}`); break; }
+        current = this.jvm.jre?.[current]?.super || this.classAst(current)?.superClassName || null;
+      }
       const world = this;
       const { resolveVirtualHost } = this;
       hostFn = this.siteImport(`vhost:${owner}.${name}${descriptor}`, argKinds.map((k) => WT[k]),
@@ -692,6 +711,7 @@ class ClosedWorld {
           const args = params.map((p, i) => world.toJsValue(kindOf(p), wasmArgs[i + 1]));
           const result = native(world.jvm, receiver, args, world.thread);
           if (result && typeof result.then === 'function') throw new ClosedWorldError(`closed world: host virtual ${owner}.${name} returned a Promise`);
+          if (world.thread && world.thread.status !== 'runnable') throw new ClosedWorldError(`closed world: host virtual ${owner}.${name} asked thread ${world.thread.id} to ${world.thread.status}`);
           return world.fromJs(returnKind, result);
         });
     }
