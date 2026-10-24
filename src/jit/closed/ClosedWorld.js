@@ -71,6 +71,13 @@ class ClosedWorld {
     this.built = false;
     this.counters = { entries: 0, entryFallbacks: 0, notReady: 0 };
     this.thread = null;
+    if (typeof process !== 'undefined' && process.env?.JVM_CLOSED_WORLD_STATS) {
+      process.once('exit', () => {
+        const rejected = [...this.rejected].map(([key, reason]) => `${key}\t${reason}`).join('\n');
+        process.stderr.write(`[closed-world] ${JSON.stringify(this.stats())}\n`);
+        if (process.env.JVM_CLOSED_WORLD_STATS === 'rejects') process.stderr.write(`${rejected}\n`);
+      });
+    }
   }
 
   stats() {
