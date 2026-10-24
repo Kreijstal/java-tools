@@ -607,7 +607,10 @@ function addNewImport(reg, jvm, className) {
   const layout=denseLayout?null:slabLayoutFor(jvm,className);
   const template=denseLayout || layout ? null:instanceFieldTemplate(jvm,className);
   const name=`new_${className.replace(/[^\w]/g,'_')}_${allocations.size}`;
-  const index=reg.addImport(name,[],[T.ref],()=>makeObjectRef(jvm,className,
+  // Closed-world storage has one allocation path; never bypass it.
+  const index=reg.addImport(name,[],[T.ref],jvm.closedRuntime
+    ? ()=>makeObjectRef(jvm,className,require('../core/objectModel').newFields(jvm,className))
+    : ()=>makeObjectRef(jvm,className,
     denseLayout ? makeDenseFields(denseLayout) : layout
       ? makeSlabFields(jvm,layout) || instanceFieldTemplate(jvm,className) : {...template}));
   allocations.set(className,{index,guard});return index;
