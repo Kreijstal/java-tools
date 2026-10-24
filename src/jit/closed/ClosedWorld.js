@@ -515,6 +515,10 @@ class ClosedWorld {
     const argKinds = [...(op === 'invokestatic' ? [] : ['A']), ...params.map(kindOf)];
     const returnKind = kindOf(ret);
     const where = this.where(record, node);
+    if (op === 'invokestatic' && (owner === 'java/lang/Math' || owner === 'java/lang/StrictMath')) {
+      const intrinsic = this.mathIntrinsic(name, descriptor);
+      if (intrinsic) { record.plan.set(node.id, { ...intrinsic, argKinds }); return; }
+    }
     if (op === 'invokestatic' || op === 'invokespecial') {
       if (op === 'invokespecial' && name === '<init>' && owner === 'java/lang/Object') {
         record.plan.set(node.id, { kind: 'noop' });
@@ -575,6 +579,29 @@ class ClosedWorld {
       kind: 'virtual', argKinds, returnKind, siteId, hostFn,
       targets: [...arms].map(([fn, classIds]) => ({ fn, classIds })),
     });
+  }
+
+  // java.lang.Math/StrictMath without the shim adapter. Native Wasm where
+  // the operation is bit-exact with Java (IEEE abs/min/max/sqrt/floor/ceil/
+  // rint, integer abs/min/max); otherwise the JS Math builtin imported
+  // directly, which is the function every other jvm.js tier already uses.
+  mathIntrinsic(name, descriptor) {
+    const native = {
+      'sqrt(D)D': 'f64.sqrt', 'abs(F)F': 'f32.abs', 'abs(D)D': 'f64.abs', 'floor(D)D': 'f64.floor',
+      'ceil(D)D': 'f64.ceil', 'rint(D)D': 'f64.nearest', 'min(FF)F': 'f32.min', 'max(FF)F': 'f32.max',
+      'min(DD)D': 'f64.min', 'max(DD)D': 'f64.max', 'abs(I)I': 'i32.abs', 'abs(J)J': 'i64.abs',
+      'min(II)I': 'i32.min', 'max(II)I': 'i32.max', 'min(JJ)J': 'i64.min', 'max(JJ)J': 'i64.max',
+    }[name + descriptor];
+    if (native) return { kind: 'intrinsic', op: native };
+    const unary = ['sin', 'cos', 'tan', 'asin', 'acos', 'atan', 'exp', 'log', 'log10', 'cbrt', 'sinh', 'cosh', 'tanh', 'expm1', 'log1p'];
+    const binary = ['atan2', 'pow', 'hypot'];
+    if (descriptor === '(D)D' && unary.includes(name)) {
+      return { kind: 'import', fn: this.siteImport(`math:${name}`, [VT.f64], [VT.f64], Math[name]) };
+    }
+    if (descriptor === '(DD)D' && binary.includes(name)) {
+      return { kind: 'import', fn: this.siteImport(`math:${name}`, [VT.f64, VT.f64], [VT.f64], Math[name]) };
+    }
+    return null;
   }
 
   resolveVirtualHost(receiver, owner, name, descriptor) {

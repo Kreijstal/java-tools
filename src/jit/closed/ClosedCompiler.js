@@ -573,9 +573,35 @@ class ClosedCompiler {
         code.push(OP.call, { fn: plan.fn });
         return code;
       }
+      case 'intrinsic': return this.intrinsic(node, plan);
       case 'instanceof': return this.typeTest(node, plan, false);
       case 'checkcast': return this.typeTest(node, plan, true);
       default: throw new Unsupported(`plan ${plan.kind}`);
+    }
+  }
+
+  intrinsic(node, plan) {
+    const k = plan.argKinds[0];
+    const a = this.use(node.args[0], k), b = node.args[1] ? this.use(node.args[1], k) : [];
+    switch (plan.op) {
+      case 'f64.sqrt': return [...a, OP.f64_sqrt];
+      case 'f32.abs': return [...a, OP.f32_abs];
+      case 'f64.abs': return [...a, OP.f64_abs];
+      case 'f64.floor': return [...a, OP.f64_floor];
+      case 'f64.ceil': return [...a, OP.f64_ceil];
+      case 'f64.nearest': return [...a, OP.f64_nearest];
+      case 'f32.min': return [...a, ...b, OP.f32_min];
+      case 'f32.max': return [...a, ...b, OP.f32_max];
+      case 'f64.min': return [...a, ...b, OP.f64_min];
+      case 'f64.max': return [...a, ...b, OP.f64_max];
+      // Integer abs wraps at MIN_VALUE exactly like Java: (x ^ s) - s, s = x >> 31.
+      case 'i32.abs': return [...a, ...a, OP.i32_const, 31, OP.i32_shr_s, OP.i32_xor, ...a, OP.i32_const, 31, OP.i32_shr_s, OP.i32_sub];
+      case 'i64.abs': return [...a, ...a, OP.i64_const, 63, OP.i64_shr_s, OP.i64_xor, ...a, OP.i64_const, 63, OP.i64_shr_s, OP.i64_sub];
+      case 'i32.min': return [...a, ...b, ...a, ...b, OP.i32_lt_s, OP.select];
+      case 'i32.max': return [...a, ...b, ...a, ...b, OP.i32_gt_s, OP.select];
+      case 'i64.min': return [...a, ...b, ...a, ...b, OP.i64_lt_s, OP.select];
+      case 'i64.max': return [...a, ...b, ...a, ...b, OP.i64_gt_s, OP.select];
+      default: throw new Unsupported(`intrinsic ${plan.op}`);
     }
   }
 

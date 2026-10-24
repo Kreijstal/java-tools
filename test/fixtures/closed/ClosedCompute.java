@@ -127,6 +127,20 @@ public class ClosedCompute {
   static int nullField(Node n) { return n.value; }
   static int outOfBounds(int[] a, int i) { return a[i]; }
 
+  static String mathEdges() {
+    StringBuilder sb = new StringBuilder();
+    double nan = Double.NaN, negZero = -0.0;
+    sb.append(Math.abs(Integer.MIN_VALUE)).append(' ').append(Math.abs(Long.MIN_VALUE)).append(' ')
+      .append(Math.abs(-3)).append(' ').append(Math.abs(-2.5f)).append(' ').append(Math.abs(negZero)).append(' ')
+      .append(Math.min(nan, 1.0)).append(' ').append(Math.max(1.0f, Float.NaN)).append(' ')
+      .append(1.0 / Math.min(0.0, negZero)).append(' ').append(1.0 / Math.max(negZero, 0.0)).append(' ')
+      .append(Math.min(-7, 3)).append(' ').append(Math.max(-7L, 3L)).append(' ')
+      .append(Math.rint(2.5)).append(' ').append(Math.rint(-3.5)).append(' ').append(Math.floor(-1.5)).append(' ')
+      .append(Math.ceil(-1.5)).append(' ').append(Math.sqrt(2.0)).append(' ').append(Math.sin(1.0)).append(' ')
+      .append(Math.pow(2.0, 0.5)).append(' ').append(Math.atan2(1.0, -1.0)).append(' ').append(Math.cos(3.0));
+    return sb.toString();
+  }
+
   static String describe(int n) {
     StringBuilder sb = new StringBuilder();
     sb.append("n=").append(n).append(',').append(n * 2L).append(':').append(fib(n % 15));
@@ -151,6 +165,7 @@ public class ClosedCompute {
     System.out.println(counter);
     System.out.println(fib(20));
     System.out.println(describe(12));
+    System.out.println(mathEdges());
     try { System.out.println(nullField(null)); } catch (NullPointerException e) { System.out.println("npe"); }
     try { System.out.println(outOfBounds(new int[3], 3)); } catch (ArrayIndexOutOfBoundsException e) { System.out.println("aioobe"); }
     try { System.out.println(divisions(1, 0)); } catch (ArithmeticException e) { System.out.println("arith"); }
