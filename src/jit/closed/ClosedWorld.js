@@ -76,6 +76,10 @@ class ClosedWorld {
         const rejected = [...this.rejected].map(([key, reason]) => `${key}\t${reason}`).join('\n');
         process.stderr.write(`[closed-world] ${JSON.stringify(this.stats())}\n`);
         if (process.env.JVM_CLOSED_WORLD_STATS === 'rejects') process.stderr.write(`${rejected}\n`);
+        if (this.importCalls) {
+          const top = [...this.importCalls].filter(([, n]) => n).sort((x, y) => y[1] - x[1]).slice(0, 40);
+          process.stderr.write(top.map(([key, n]) => `[closed-import] ${n}\t${key}`).join('\n') + '\n');
+        }
       });
     }
   }
@@ -652,10 +656,18 @@ class ClosedWorld {
       importObject.s[field] = g.mutable ? g.value : new WebAssembly.Global({ value: 'externref', mutable: false }, g.value);
     }
     let importIndex = 0;
+    const countImports = process.env?.JVM_CLOSED_WORLD_STATS === 'imports';
+    if (countImports) this.importCalls = new Map();
     for (const [key, imp] of this.imports) {
       const field = `f${importIndex++}`;
       builder.importFunction('f', field, imp.params.map((p) => [p]), imp.results.map((r) => [r]), key);
-      importObject.f[field] = imp.impl;
+      if (countImports) {
+        const calls = this.importCalls, impl = imp.impl;
+        calls.set(key, 0);
+        importObject.f[field] = (...args) => { calls.set(key, calls.get(key) + 1); return impl(...args); };
+      } else {
+        importObject.f[field] = imp.impl;
+      }
     }
     let exportIndex = 0;
     for (const [key, record] of this.entries) {
