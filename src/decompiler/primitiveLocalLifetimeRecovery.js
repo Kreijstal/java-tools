@@ -12,8 +12,10 @@ const primitiveTypes = new Set(['boolean', 'byte', 'short', 'char', 'int', 'long
 // Every read in each phase must be dominated by an assignment within that phase;
 // loops include their zero-iteration, break and continue paths. Captures remain
 // outside this reconstruction's contract.
-function splitLocalLifetimes(source, {retainDiagnostics = false, reservedNames = [], nestedBlocks = false, referenceLocals = false, initializedPrimitives = false, arrayDimensionLocals = false} = {}) {
-  const unchanged = () => ({source, localsSplit: 0, declarationsAdded: 0});
+function splitLocalLifetimes(source, {retainDiagnostics = false, reservedNames = [], nestedBlocks = false, referenceLocals = false, initializedPrimitives = false, arrayDimensionLocals = false, conditionalBranches = false} = {}) {
+  let branchIndex = null;
+  const unchanged = () => ({source, localsSplit: 0, declarationsAdded: 0,
+    ...(retainDiagnostics && branchIndex ? {diagnostics: {work: branchIndex.work}} : {})});
   if (typeof source !== 'string' || /\\u+[0-9a-fA-F]{4}/.test(source)) return unchanged();
   const wrapped = `{\n${source}\n}`;
   let tree, tokens;
@@ -31,8 +33,11 @@ function splitLocalLifetimes(source, {retainDiagnostics = false, reservedNames =
   const extended = referenceLocals || initializedPrimitives;
   if (extended && (/\/\/|\/\*/.test(wrapped.slice(tokens.at(-1)?.range.endOffset || 0))
       || typeof retainDiagnostics !== 'boolean' || !Array.isArray(reservedNames))) return unchanged();
-  const nodes = [];
-  walk(tree, n => nodes.push(n));
+  let nodes;
+  if (conditionalBranches) {
+    branchIndex = indexConditionalReferences(tree, tokens);
+    nodes = branchIndex.nodes;
+  } else { nodes = []; walk(tree, n => nodes.push(n)); }
   if (nodes.some(n => /^(?:Unsupported|ClassDeclaration|InterfaceDeclaration|EnumDeclaration|RecordDeclaration|LambdaExpression|SwitchStatement|EnhancedForStatement|MethodReferenceExpression)/.test(n.kind)
       || !extended && /^(?:TryStatement|SynchronizedStatement)/.test(n.kind)
       || n.kind === 'NewClassExpression' && n.body)) return unchanged();
@@ -53,6 +58,7 @@ function splitLocalLifetimes(source, {retainDiagnostics = false, reservedNames =
     }
   }
   const declarations = statements.filter(n => n.kind === 'LocalVariableDeclarationStatement');
+  const statementIndices = conditionalBranches ? new Map(statements.map((n,i) => [n,i])) : null;
   const usedNames = new Set([...reservedNames, ...tokens.filter(t => t.kind === 'identifier').map(t => t.text)]);
   const edits = [], added = [], diagnostics = [];
   for (const declaration of declarations) {
@@ -73,22 +79,44 @@ function splitLocalLifetimes(source, {retainDiagnostics = false, reservedNames =
       if (annotated) continue;
     }
     const name = variable.name;
-    const arrayUses = nodes.filter(n => n.kind === 'NewArrayExpression' && mentions(n, name));
+    const indexed = branchIndex?.references.get(name);
+    const arrayUses = conditionalBranches ? indexed?.arrayUse : nodes.filter(n => n.kind === 'NewArrayExpression' && mentions(n, name)).length;
     // Keep existing modes' refusal contract. The optional dimension pass only
     // revisits locals actually used by an array creation expression.
-    if (arrayDimensionLocals ? !arrayUses.length : arrayUses.length) continue;
+    if (arrayDimensionLocals ? !arrayUses : arrayUses) continue;
     // Refuse all shadows, field/method/type spellings and lexical ambiguities.
-    if (nodes.filter(n => n.kind === 'VariableDeclarator' && n.name === name).length !== 1) continue;
-    const identifiers = nodes.filter(n => n.kind === 'Identifier' && n.name === name).length;
-    const occurrences = tokens.filter(t => t.kind === 'identifier' && t.text === name);
+    if ((conditionalBranches ? branchIndex.declarators.get(name) : nodes.filter(n => n.kind === 'VariableDeclarator' && n.name === name).length) !== 1) continue;
+    const identifiers = conditionalBranches ? indexed?.items.length || 0 : nodes.filter(n => n.kind === 'Identifier' && n.name === name).length;
+    const occurrences = conditionalBranches ? branchIndex.tokens.get(name) || [] : tokens.filter(t => t.kind === 'identifier' && t.text === name);
     if (occurrences.length !== identifiers + 1) continue;
     const declarationStart = declaration.range?.startOffset;
-    const declarationIndex = statements.indexOf(declaration);
+    const declarationIndex = conditionalBranches ? statementIndices.get(declaration) : statements.indexOf(declaration);
     const nextStart = statements[declarationIndex + 1]?.range?.startOffset ?? wrapped.length - 1;
     const declarationToken = occurrences.find(t => t.range.startOffset >= declarationStart && t.range.startOffset < nextStart);
     if (!declarationToken) continue;
     const typeText = referenceLocals ? wrapped.slice(declarationStart, declarationToken.range.startOffset).trim() : type.name;
     if (referenceLocals && (typeText === 'var' || !typeText)) continue;
+    if (conditionalBranches) {
+      const groups = conditionalPrimitiveGroups(indexed, occurrences.filter(t => t !== declarationToken), name, branchIndex, blockEnds);
+      // A shared budget bounds all candidate proofs in this method. Discard
+      // every pending edit on exhaustion, retaining deterministic idempotence.
+      if (branchIndex.work.exhausted) return unchanged();
+      if (!groups || groups.length < 2) continue;
+      const ranges = [];
+      for (let index = 1; index < groups.length; index++) {
+        let suffix = index, fresh;
+        do { fresh = `${name}Lifetime${suffix++}`; } while (usedNames.has(fresh));
+        usedNames.add(fresh);
+        const selected = groups[index];
+        let first = Infinity, last = -Infinity;
+        for (const token of selected) edits.push({start: token.range.startOffset, end: token.range.endOffset, text: fresh});
+        for (const token of selected) { first = Math.min(first, token.range.startOffset); last = Math.max(last, token.range.endOffset); }
+        added.push(`${typeText} ${fresh};`);
+        ranges.push({name: fresh, start: first - 2, end: last - 2, references: selected.length});
+      }
+      diagnostics.push({name, type: typeText, groups: groups.length, conditional: true, initialized, ranges});
+      continue;
+    }
     // A nested block is eligible only when it contains every use of this
     // local. Loop headers and uses after the block therefore keep a reaching
     // value in its enclosing lifetime. Analyze each execution from unassigned,
@@ -158,11 +186,14 @@ function splitLocalLifetimes(source, {retainDiagnostics = false, reservedNames =
   const indent = /^\s*$/.test(prefix) ? prefix : '';
   edits.push({start: insertion, end: insertion, text: added.join('\n' + indent) + '\n' + indent});
   edits.sort((a,b) => b.start - a.start || b.end - a.end);
-  let result = wrapped;
-  for (const edit of edits) result = result.slice(0, edit.start) + edit.text + result.slice(edit.end);
+  const pieces = []; let end = wrapped.length;
+  for (const edit of edits) { pieces.push(wrapped.slice(edit.end, end), edit.text); end = edit.start; }
+  pieces.push(wrapped.slice(0, end));
+  const result = pieces.reverse().join('');
   return {source: result.slice(2, -2), localsSplit: diagnostics.length, declarationsAdded: added.length,
     ...(retainDiagnostics ? {diagnostics: {locals: diagnostics,
-      edits: edits.map(edit => ({...edit, start: edit.start - 2, end: edit.end - 2}))}} : {})};
+      edits: edits.map(edit => ({...edit, start: edit.start - 2, end: edit.end - 2})),
+      ...(branchIndex ? {work: branchIndex.work} : {})}} : {})};
 }
 
 function splitPrimitiveLocalLifetimes(source, options = {}) {
@@ -182,8 +213,141 @@ function splitNestedInitializedPrimitiveLocalLifetimes(source, options = {}) {
   return splitInitializedPrimitiveLocalLifetimes(source, {...options, nestedBlocks: true});
 }
 
+function splitConditionalPrimitiveLocalLifetimes(source, options = {}) {
+  return splitLocalLifetimes(source, {...options, referenceLocals: false, initializedPrimitives: true,
+    nestedBlocks: false, arrayDimensionLocals: false, conditionalBranches: true});
+}
+
 function splitArrayDimensionPrimitiveLocalLifetimes(source, options = {}) {
   return splitLocalLifetimes(source, {...options, referenceLocals: false, initializedPrimitives: true, arrayDimensionLocals: true});
+}
+
+// One iterative AST index provides exact descendant-identifier intervals, token
+// occurrences and enclosing conditional/abrupt-exit contexts. Binary lifting
+// finds common conditionals without enumerating paths or rescanning subtrees.
+function indexConditionalReferences(tree, tokens) {
+  const result = {nodes: [], spans: new WeakMap(), references: new Map(), declarators: new Map(),
+    tokens: new Map(), work: {nodesIndexed: 0, tokensIndexed: tokens.length, proofSteps: 0,
+      mentionQueries: 0, mentionComparisons: 0, limit: tokens.length * 32, exhausted: false}};
+  for (const token of tokens) if (token.kind === 'identifier') {
+    let group = result.tokens.get(token.text);
+    if (!group) result.tokens.set(token.text, group = []);
+    group.push(token);
+  }
+  let order = 0;
+  const pending = [{node: tree, conditional: null, context: null, array: false}];
+  while (pending.length) {
+    const frame = pending.pop(), node = frame.node;
+    if (!node || typeof node !== 'object') continue;
+    if (frame.exit) { result.spans.get(node).end = order; continue; }
+    let conditional = frame.conditional, context = frame.context, array = frame.array;
+    if (node.kind) {
+      result.nodes.push(node); result.work.nodesIndexed++;
+      result.spans.set(node, {start: order, end: order});
+      pending.push({node, exit: true});
+      if (node.kind === 'VariableDeclarator')
+        result.declarators.set(node.name, (result.declarators.get(node.name) || 0) + 1);
+      if (node.kind === 'Identifier') {
+        let refs = result.references.get(node.name);
+        if (!refs) result.references.set(node.name, refs = {items: [], arrayUse: false});
+        refs.items.push({order: order++, conditional});
+        refs.arrayUse ||= array;
+      }
+      if (node.kind === 'IfStatement') {
+        const up = [conditional];
+        for (let i = 1; up[i - 1]?.up[i - 1]; i++) up.push(up[i - 1].up[i - 1]);
+        conditional = {node, context, depth: (conditional?.depth || 0) + 1, up};
+      }
+      if (node.kind === 'LabeledStatement') context = {entry: {node, label: node.label}, parent: context};
+      else if (['ForStatement','WhileStatement','DoWhileStatement'].includes(node.kind))
+        context = {entry: {node, loop: true}, parent: context};
+      array ||= node.kind === 'NewArrayExpression';
+    }
+    const children = Array.isArray(node) ? node : Object.entries(node)
+      .filter(([key]) => !['range','tokens','meta','kind'].includes(key)).map(([,value]) => value);
+    for (let i = children.length - 1; i >= 0; i--)
+      if (children[i] && typeof children[i] === 'object') pending.push({node: children[i], conditional, context, array});
+  }
+  result.tick = () => {
+    if (result.work.proofSteps >= result.work.limit) { result.work.exhausted = true; return false; }
+    result.work.proofSteps++; return true;
+  };
+  return result;
+}
+
+function commonConditional(a, b, tick) {
+  if (!a || !b) return null;
+  if (a.depth < b.depth) [a,b] = [b,a];
+  let difference = a.depth - b.depth, bit = 0;
+  while (difference) {
+    if (!tick()) return null;
+    if (difference & 1) a = a.up[bit];
+    difference >>>= 1; bit++;
+  }
+  if (a === b) return a;
+  for (let i = Math.max(a.up.length, b.up.length) - 1; i >= 0; i--) {
+    if (!tick()) return null;
+    if (a.up[i] && b.up[i] && a.up[i] !== b.up[i]) { a = a.up[i]; b = b.up[i]; }
+  }
+  return a.up[0];
+}
+
+function conditionalPrimitiveGroups(indexed, tokens, name, index, blockEnds) {
+  if (!indexed?.items.length) return null;
+  const orders = indexed.items.map(r => r.order);
+  const proof = {name, tick: index.tick, contains(node) {
+    if (!node) return false;
+    index.work.mentionQueries++;
+    const span = index.spans.get(node);
+    if (!span) return true; // unknown expression forms must not hide a read
+    let low = 0, high = orders.length;
+    while (low < high) {
+      index.work.mentionComparisons++;
+      const mid = (low + high) >>> 1;
+      if (orders[mid] < span.start) low = mid + 1; else high = mid;
+    }
+    return low < orders.length && orders[low] < span.end;
+  }};
+  const groups = [], pending = [{refs: indexed.items, tokens}];
+  while (pending.length) {
+    const current = pending.pop(), {refs, tokens} = current;
+    const candidate = commonConditional(refs[0].conditional, refs.at(-1).conditional, index.tick);
+    const a = candidate?.node.consequent, b = candidate?.node.alternate;
+    const leftSpan = a && index.spans.get(a), rightSpan = b && index.spans.get(b);
+    // Expression nodes do not carry source ranges. Matched lexical braces
+    // identify the exact rewrite regions; descendant counts cross-check them
+    // against the AST proof. Unbraced arms conservatively remain unchanged.
+    const leftStart = a?.range?.startOffset, rightStart = b?.range?.startOffset;
+    const leftEnd = a?.kind === 'BlockStatement' ? blockEnds.get(leftStart) : null;
+    const rightEnd = b?.kind === 'BlockStatement' ? blockEnds.get(rightStart) : null;
+    if (!leftSpan || !rightSpan || leftEnd == null || rightEnd == null) { groups.push(tokens); continue; }
+    const left = [], right = [];
+    for (const ref of refs) {
+      if (!index.tick()) return null;
+      if (ref.order >= leftSpan.start && ref.order < leftSpan.end) left.push(ref);
+      else if (ref.order >= rightSpan.start && ref.order < rightSpan.end) right.push(ref);
+    }
+    // Neither the condition nor any outgoing/handler use may observe the
+    // shared slot. Both arms must define every read on each execution.
+    if (!left.length || !right.length || left.length + right.length !== refs.length) { groups.push(tokens); continue; }
+    const leftTokens = [], rightTokens = [];
+    for (const token of tokens) {
+      if (!index.tick()) return null;
+      if (token.range.startOffset > leftStart && token.range.endOffset <= leftEnd) leftTokens.push(token);
+      else if (token.range.startOffset > rightStart && token.range.endOffset <= rightEnd) rightTokens.push(token);
+    }
+    if (leftTokens.length !== left.length || rightTokens.length !== right.length
+        || leftTokens.length + rightTokens.length !== tokens.length) { groups.push(tokens); continue; }
+    const contexts = [];
+    for (let c = candidate.context; c; c = c.parent) {
+      if (!index.tick()) return null;
+      contexts.push(c.entry);
+    }
+    contexts.reverse();
+    if (!statement(a, false, proof, contexts) || !statement(b, false, proof, contexts)) { groups.push(tokens); continue; }
+    pending.push({refs: right, tokens: rightTokens}, {refs: left, tokens: leftTokens});
+  }
+  return groups;
 }
 
 function containingBlock(tree, name, count) {
@@ -217,10 +381,13 @@ function walk(node, visit) {
     if (!['range', 'tokens', 'meta', 'kind'].includes(key)) walk(value, visit);
 }
 function mentions(node, name) {
+  if (name && typeof name === 'object') return name.contains(node);
   let yes = false; walk(node, n => { if (n.kind === 'Identifier' && n.name === name) yes = true; }); return yes;
 }
 function expression(node, assigned, name) {
   if (!node || !mentions(node, name)) return assigned;
+  if (name && typeof name === 'object' && !name.tick()) return null;
+  const localName = name && typeof name === 'object' ? name.name : name;
   const expr = n => expression(n, assigned, name);
   switch (node.kind) {
     case 'Identifier': return assigned ? assigned : null;
@@ -228,7 +395,7 @@ function expression(node, assigned, name) {
     case 'CastExpression': return expr(node.expression);
     case 'UnaryExpression': return expr(node.operand);
     case 'AssignmentExpression': {
-      if (node.left.kind === 'Identifier' && node.left.name === name) {
+      if (node.left.kind === 'Identifier' && node.left.name === localName) {
         if (node.operator !== '=' && !assigned) return null;
         const right = expression(node.right, assigned, name);
         return right === null ? null : true;
@@ -279,16 +446,32 @@ function sequence(statements, assigned, name, contexts, postTestLoops = false) {
     if (state.normal === null) return null; // unreachable tails are not reconstructed
     const next = statement(node, state.normal, name, contexts, postTestLoops);
     if (!next) return null;
-    state = {normal: next.normal, exits: [...state.exits, ...next.exits]};
+    // Append once rather than repeatedly copy an increasing prefix of exits.
+    for (const exit of next.exits) {
+      if (name && typeof name === 'object' && !name.tick()) return null;
+      state.exits.push(exit);
+    }
+    state.normal = next.normal;
   }
   return state;
 }
-function merge(states) {
+function merge(states, name) {
   const normal = states.map(s => s.normal).filter(s => s !== null);
-  return {normal: normal.length ? normal.every(Boolean) : null, exits: states.flatMap(s => s.exits)};
+  const exits = [];
+  for (const state of states) for (const exit of state.exits) {
+    if (name && typeof name === 'object' && !name.tick()) return null;
+    exits.push(exit);
+  }
+  return {normal: normal.length ? normal.every(Boolean) : null, exits};
+}
+function chargeExits(exits, name) {
+  if (!name || typeof name !== 'object') return true;
+  for (const exit of exits) if (!name.tick()) return false;
+  return true;
 }
 function statement(node, assigned, name, contexts, postTestLoops = false) {
   if (!node) return null;
+  if (name && typeof name === 'object' && !name.tick()) return null;
   const simple = value => value === null ? null : {normal: value, exits: []};
   const evalExpr = n => expression(n, assigned, name);
   switch (node.kind) {
@@ -303,14 +486,16 @@ function statement(node, assigned, name, contexts, postTestLoops = false) {
     case 'IfStatement': {
       const condition = evalExpr(node.condition); if (condition === null) return null;
       const a = statement(node.consequent, condition, name, contexts, postTestLoops), b = node.alternate ? statement(node.alternate, condition, name, contexts, postTestLoops) : simple(condition);
-      return a && b ? merge([a,b]) : null;
+      return a && b ? merge([a,b], name) : null;
     }
     case 'LabeledStatement': {
       const body = statement(node.statement, assigned, name, [...contexts, {node, label: node.label}], postTestLoops);
       if (!body) return null;
+      if (!chargeExits(body.exits, name)) return null;
       const exits = body.exits.filter(e => e.target === node);
       if (exits.some(e => e.kind !== 'break')) return null;
-      const result = merge([body, ...exits.map(e => simple(e.assigned))]);
+      const result = merge([body, ...exits.map(e => simple(e.assigned))], name);
+      if (!result) return null;
       result.exits = body.exits.filter(e => e.target !== node); return result;
     }
     case 'ForStatement':
@@ -326,25 +511,29 @@ function statement(node, assigned, name, contexts, postTestLoops = false) {
         if (!postTestLoops) return null;
         const body = statement(node.body, entry, name, [...contexts, {node, loop: true}], postTestLoops);
         if (!body) return null;
+        if (!chargeExits(body.exits, name)) return null;
         const own = body.exits.filter(e => e.target === node);
         const tests = [body.normal, ...own.filter(e => e.kind === 'continue').map(e => e.assigned)]
           .filter(s => s !== null).map(s => expression(node.condition, s, name));
         if (tests.some(s => s === null)) return null;
         // No zero-iteration entry. Breaks skip the test; normal/continue paths
         // test after the body. Assignment is monotonic on later iterations.
-        const result = merge([...tests.map(simple), ...own.filter(e => e.kind === 'break').map(e => simple(e.assigned))]);
+        const result = merge([...tests.map(simple), ...own.filter(e => e.kind === 'break').map(e => simple(e.assigned))], name);
+        if (!result) return null;
         result.exits = body.exits.filter(e => e.target !== node);
         return result;
       }
       const tested = expression(node.condition, entry, name); if (tested === null) return null;
       const body = statement(node.body, tested, name, [...contexts, {node, loop: true}], postTestLoops); if (!body) return null;
+      if (!chargeExits(body.exits, name)) return null;
       const own = body.exits.filter(e => e.target === node);
       for (const s of [body.normal, ...own.filter(e => e.kind === 'continue').map(e => e.assigned)].filter(s => s !== null)) {
         const updated = expression(node.update, s, name);
         if (updated === null || expression(node.condition, updated, name) === null) return null;
       }
       const breaks = own.filter(e => e.kind === 'break').map(e => simple(e.assigned));
-      const result = merge([simple(tested), ...breaks]); // include zero iterations
+      const result = merge([simple(tested), ...breaks], name); // include zero iterations
+      if (!result) return null;
       result.exits = body.exits.filter(e => e.target !== node); return result;
     }
     case 'BreakStatement':
@@ -375,5 +564,5 @@ function independentlyAssignedLocalSequence(statements, name, contexts = [], {po
   if (arrayUse) return false; // existing control-frame recovery contract
   return sequence(statements, false, name, contexts, postTestLoops) !== null;
 }
-module.exports = {splitPrimitiveLocalLifetimes, splitNestedPrimitiveLocalLifetimes, splitReferenceLocalLifetimes, splitNestedReferenceLocalLifetimes, splitInitializedPrimitiveLocalLifetimes, splitNestedInitializedPrimitiveLocalLifetimes, splitArrayDimensionPrimitiveLocalLifetimes,
+module.exports = {splitPrimitiveLocalLifetimes, splitNestedPrimitiveLocalLifetimes, splitReferenceLocalLifetimes, splitNestedReferenceLocalLifetimes, splitInitializedPrimitiveLocalLifetimes, splitNestedInitializedPrimitiveLocalLifetimes, splitArrayDimensionPrimitiveLocalLifetimes, splitConditionalPrimitiveLocalLifetimes,
   independentlyAssignedLocalSequence};

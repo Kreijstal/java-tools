@@ -20,7 +20,7 @@ const { mergeDuplicateLoopIncrementTails } = require('./loopTailMerge');
 const {recoverPreloadedLoopEntries} = require('./preloadedLoopEntryRecovery');
 const {removeUnreachableControlTransfers} = require('./unreachableTransferCleanup');
 const { partitionStructuredVoidBody } = require('./structuredMethodPartition');
-const {splitPrimitiveLocalLifetimes, splitNestedPrimitiveLocalLifetimes, splitReferenceLocalLifetimes, splitNestedReferenceLocalLifetimes, splitInitializedPrimitiveLocalLifetimes, splitNestedInitializedPrimitiveLocalLifetimes, splitArrayDimensionPrimitiveLocalLifetimes} = require('./primitiveLocalLifetimeRecovery');
+const {splitPrimitiveLocalLifetimes, splitNestedPrimitiveLocalLifetimes, splitReferenceLocalLifetimes, splitNestedReferenceLocalLifetimes, splitInitializedPrimitiveLocalLifetimes, splitNestedInitializedPrimitiveLocalLifetimes, splitArrayDimensionPrimitiveLocalLifetimes, splitConditionalPrimitiveLocalLifetimes} = require('./primitiveLocalLifetimeRecovery');
 const {foldLoopFrameCompletion, shareDynamicGuardedTails, foldLeadingLoopExitWork, simplifyNaturalLoopExitCaptures, foldGuardedFrameCompletion, compactLocalBooleanGuards, foldKnownBooleanAlternatives, simplifyNegatedEqualityValues, reindentStructuredSource, foldExhaustiveSwitchFrameExits, foldExhaustiveIfFrameExits, foldSwitchExitTails, foldSharedFrameExitGuards, foldSharedSwitchFrameExits, foldSharedLoopFrameExits, splitMultilineBlockHeaders, wrapLogicalConditionLines} = require('./javaAstEmitter');
 const { listRegionSplitCandidates, applyRegionSplit } = require('../passes/regionSplit');
 const { jreClassInfo, jreMethodCandidates } = require('../java-frontend/jreMetadata');
@@ -2339,6 +2339,10 @@ function shareExistingExitTails(body, parameterNames = [], parameters = [], owne
       const nested = splitNestedReferenceLocalLifetimes(source, {reservedNames: parameterNames});
       if (nested.localsSplit) { source = nested.source; changed = true; }
     }
+  }
+  {
+    const conditional = splitConditionalPrimitiveLocalLifetimes(source, {reservedNames: parameterNames});
+    if (conditional.localsSplit) { source = conditional.source; changed = true; }
   }
   {
     const primitives = splitInitializedPrimitiveLocalLifetimes(source, {reservedNames: parameterNames});
