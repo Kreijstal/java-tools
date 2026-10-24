@@ -48,7 +48,9 @@ function disassembleBody(bytes, start, end, base = 0) {
     const op = r.u8();
     let text = NAMES.get(op) || `op_0x${op.toString(16)}`;
     switch (op) {
-      case OP.block: case OP.loop: case OP.if: text += ` ${blockType(r)}`; break;
+      case OP.block: case OP.loop: case OP.if: case OP.try: text += ` ${blockType(r)}`; break;
+      case OP.catch: case OP.throw: case OP.rethrow: text += ` ${r.uleb()}`; break;
+      case OP.br_on_null: case OP.br_on_non_null: text += ` ${r.uleb()}`; break;
       case OP.br: case OP.br_if: case OP.call: case OP.local_get: case OP.local_set: case OP.local_tee:
       case OP.global_get: case OP.global_set: text += ` ${r.uleb()}`; break;
       case OP.br_table: { const n = r.uleb(); const t = []; for (let i = 0; i <= n; i++) t.push(r.uleb()); text += ` [${t.join(',')}]`; break; }
@@ -68,9 +70,9 @@ function disassembleBody(bytes, start, end, base = 0) {
       default:
         if (op >= 0x28 && op <= 0x3e) text += ` align=${r.uleb()} offset=${r.uleb()}`;
     }
-    if (op === OP.end || op === OP.else) depth = Math.max(0, depth - 1);
+    if (op === OP.end || op === OP.else || op === OP.catch || op === OP.catch_all) depth = Math.max(0, depth - 1);
     lines.push(`${String(offset).padStart(6)}: ${'  '.repeat(depth)}${text}`);
-    if (op === OP.block || op === OP.loop || op === OP.if || op === OP.else) depth += 1;
+    if (op === OP.block || op === OP.loop || op === OP.if || op === OP.else || op === OP.try || op === OP.catch || op === OP.catch_all) depth += 1;
   }
   return lines;
 }

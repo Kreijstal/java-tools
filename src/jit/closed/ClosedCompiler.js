@@ -66,6 +66,13 @@ function zero(kind) {
 
 class Unsupported extends Error {}
 
+// Operations that can raise a Java exception inside the module.
+const THROWING = new Set(['idiv', 'irem', 'ldiv', 'lrem', 'getfield', 'putfield', 'arraylength', 'aaload', 'aastore',
+  'iaload', 'laload', 'faload', 'daload', 'baload', 'caload', 'saload', 'iastore', 'lastore', 'fastore', 'dastore',
+  'bastore', 'castore', 'sastore', 'invokestatic', 'invokespecial', 'invokevirtual', 'invokeinterface', 'new',
+  'newarray', 'anewarray', 'multianewarray', 'checkcast', 'monitorenter', 'monitorexit', 'frem', 'drem']);
+function mayThrow(node) { return THROWING.has(node.op) || !!(node.effects && node.effects.mayThrow); }
+
 function successorsOf(term) {
   switch (term.kind) {
     case 'cond': return [term.taken, term.fall];
@@ -92,6 +99,20 @@ class ClosedCompiler {
   compile() {
     const fn = this.fn;
     fn.params.forEach((param, index) => this.localOfValue.set(param.id, index));
+    // A handler local the handler never reads has no kind of its own, yet it
+    // still carries the slot's value into the join after the handler. It
+    // takes the kind of the phi it flows into.
+    for (let changed = true; changed;) {
+      changed = false;
+      for (const block of fn.blocks) {
+        for (const phi of block.phis) {
+          if (!this.live(phi)) continue;
+          for (const arg of phi.args) {
+            if (arg && arg.op === 'handler_local' && !this.live(arg)) { arg.kind = phi.kind; changed = true; }
+          }
+        }
+      }
+    }
     this.analyzeControl();
     const code = [];
     // Entry phis seeded from parameters (a loop back to the method entry).
@@ -99,10 +120,33 @@ class ClosedCompiler {
     if (entryBlock.phis.length && entryBlock.predIds[0] === 'entry') {
       code.push(...this.edgeCopies('entry', fn.entry));
     }
-    this.context = [];
+    // Uncovered null dereferences branch here (br_on_null) and throw NPE.
+    // Covered ones throw at the site so their own handler can catch it.
+    code.push(OP.block, 0x40);
+    this.context = [{ kind: 'npe' }];
+    this.tryDepth = 0;
     this.doTree(fn.entry, code);
-    code.push(OP.unreachable);
+    code.push(OP.unreachable, OP.end,
+      OP.call, { fn: this.world.hostImport('err_npe', [], []) }, OP.unreachable);
     return { locals: this.locals, code };
+  }
+
+  // Leaves the non-null reference on the stack or throws NullPointerException.
+  nonNull(refCode) {
+    if (this.tryDepth === 0) return [...refCode, OP.br_on_null, ...uleb(this.depthOf('npe'))];
+    const tmp = this.temp([VT.anyref]);
+    const out = [...refCode, OP.local_tee, ...uleb(tmp), OP.ref_is_null, OP.if, 0x40,
+      OP.call, { fn: this.world.hostImport('err_npe', [], []) }, OP.unreachable, OP.end,
+      OP.local_get, ...uleb(tmp), OP.ref_as_non_null];
+    this.release([VT.anyref], tmp);
+    return out;
+  }
+
+  // Handler entries (table order) protecting an item, with their handler blocks.
+  coveringEntries(itemIdx) {
+    if (itemIdx === null || itemIdx === undefined || !this.entry.handlerBlocks) return [];
+    return this.entry.handlerEntries.filter((h) => itemIdx >= h.startItemIdx && itemIdx < h.endItemIdx &&
+      this.entry.handlerBlocks.has(h));
   }
 
   // ---- values -----------------------------------------------------------
@@ -152,6 +196,11 @@ class ClosedCompiler {
     const succ = new Map(), succAll = new Map();
     for (const id of reachable) {
       const all = successorsOf(blocks[id].term).filter((t) => reachable.has(t));
+      // Exception edges: one per covered throwing site and handler, so a
+      // handler reached from several sites is a merge node.
+      for (const site of this.throwSites(id)) {
+        for (const h of site.entries) all.push(this.entry.handlerBlocks.get(h));
+      }
       succAll.set(id, all);
       succ.set(id, [...new Set(all)]);
     }
@@ -220,6 +269,27 @@ class ClosedCompiler {
     this.children = children;
   }
 
+  // Covered throwing sites of a block: {node|term, itemIdx, entries}.
+  throwSites(blockId) {
+    this.throwSiteCache ||= new Map();
+    if (this.throwSiteCache.has(blockId)) return this.throwSiteCache.get(blockId);
+    const block = this.fn.blocks[blockId];
+    const sites = [];
+    if (this.entry.handlerBlocks) {
+      for (const node of block.body) {
+        if (!mayThrow(node)) continue;
+        const entries = this.coveringEntries(node.itemIdx);
+        if (entries.length) sites.push({ node, itemIdx: node.itemIdx, entries });
+      }
+      if (block.term.insnOp === 'athrow') {
+        const entries = this.coveringEntries(block.term.itemIdx);
+        if (entries.length) sites.push({ term: block.term, itemIdx: block.term.itemIdx, entries });
+      }
+    }
+    this.throwSiteCache.set(blockId, sites);
+    return sites;
+  }
+
   depthOf(kind, target) {
     for (let i = this.context.length - 1, depth = 0; i >= 0; i--, depth++) {
       const frame = this.context[i];
@@ -257,8 +327,8 @@ class ClosedCompiler {
     this.doTree(y, out);
   }
 
-  doBranch(source, target, out) {
-    out.push(...this.edgeCopies(source, target));
+  doBranch(source, target, out, exceptional = false) {
+    if (!exceptional) out.push(...this.edgeCopies(source, target));
     if (this.rpoIndex.get(target) <= this.rpoIndex.get(source)) {
       out.push(OP.br, ...uleb(this.depthOf('loop', target)));
     } else if (this.mergeNodes.has(target)) {
@@ -284,6 +354,7 @@ class ClosedCompiler {
   // ---- terminators ---------------------------------------------------------
   emitTerminator(x, out) {
     const term = this.fn.blocks[x].term;
+    this.currentBlock = x;
     switch (term.kind) {
       case 'goto': case 'fall':
         this.doBranch(x, term.target, out);
@@ -383,7 +454,11 @@ class ClosedCompiler {
   emitReturn(term, out) {
     const op = term.insnOp;
     if (op === 'athrow') {
-      out.push(...this.use(term.args[0], 'A'), OP.call, { fn: this.world.hostImport('athrow', [VT.anyref], []) }, OP.unreachable);
+      const site = this.throwSites(this.currentBlock).find((s) => s.term === term);
+      const emit = (inner) => inner.push(...this.nonNull(this.use(term.args[0], 'A')), OP.throw, { tag: 'jx' });
+      if (site) this.emitCovered(this.currentBlock, site, emit, out);
+      else emit(out);
+      out.push(OP.unreachable);
       return;
     }
     if (op === 'return') { out.push(OP.return); return; }
@@ -393,7 +468,70 @@ class ClosedCompiler {
 
   // ---- straight-line nodes -----------------------------------------------
   emitBlockBody(x, out) {
-    for (const node of this.fn.blocks[x].body) this.emitNode(node, out);
+    const sites = new Map(this.throwSites(x).filter((s) => s.node).map((s) => [s.node, s]));
+    for (const node of this.fn.blocks[x].body) {
+      const site = sites.get(node);
+      if (site) this.emitCovered(x, site, (inner) => this.emitNode(node, inner), out);
+      else this.emitNode(node, out);
+    }
+  }
+
+  // try { op } catch $jx { first matching handler entry, else rethrow }.
+  // Locals the handlers read are captured just before the op, which is the
+  // frame state a Java handler observes.
+  emitCovered(x, site, emit, out) {
+    out.push(...this.handlerShadows(site));
+    out.push(OP.try, 0x40);
+    this.context.push({ kind: 'try' });
+    this.tryDepth += 1;
+    emit(out);
+    this.tryDepth -= 1;
+    const exc = this.temp([VT.anyref]);
+    out.push(OP.catch, { tag: 'jx' }, OP.local_set, ...uleb(exc));
+    for (const entry of site.entries) {
+      const handler = this.entry.handlerBlocks.get(entry);
+      const caught = this.fn.blocks[handler].body.find((n) => n.op === 'caught_exception');
+      const enter = [];
+      if (caught && caught.uses.length) enter.push(OP.local_get, ...uleb(exc), ...this.set(caught));
+      const type = entry.catchType && entry.catchType !== 'any' ? entry.catchType : null;
+      if (!type) {
+        out.push(...enter);
+        this.doBranch(x, handler, out, true);
+        break;
+      }
+      out.push(OP.local_get, ...uleb(exc), OP.call, { fn: this.world.exceptionTypeImport(type) }, OP.if, 0x40);
+      this.context.push({ kind: 'if' });
+      out.push(...enter);
+      this.doBranch(x, handler, out, true);
+      this.context.pop();
+      out.push(OP.end);
+    }
+    out.push(OP.local_get, ...uleb(exc), OP.throw, { tag: 'jx' });
+    this.release([VT.anyref], exc);
+    this.context.pop();
+    out.push(OP.end);
+  }
+
+  handlerShadows(site) {
+    const out = [];
+    const defs = this.fn.slotDefsBefore?.get(site.itemIdx);
+    for (const entry of site.entries) {
+      const handler = this.entry.handlerBlocks.get(entry);
+      for (const local of this.handlerLocals(handler)) {
+        const def = defs?.get(local.imm.slot);
+        out.push(...(def && def.kind === local.kind ? this.use(def, local.kind) : zero(local.kind)), ...this.set(local));
+      }
+    }
+    return out;
+  }
+
+  handlerLocals(handler) {
+    this.handlerLocalCache ||= new Map();
+    if (!this.handlerLocalCache.has(handler)) {
+      this.handlerLocalCache.set(handler, this.fn.values.filter((v) => v.op === 'handler_local' &&
+        v.block === handler && this.live(v) && v.uses.length));
+    }
+    return this.handlerLocalCache.get(handler);
   }
 
   finish(node, out) {
@@ -404,7 +542,7 @@ class ClosedCompiler {
   emitNode(node, out) {
     const op = node.op;
     const arg = (i, kind) => this.use(node.args[i], kind);
-    if (op === 'param' || op === 'phi') return;
+    if (op === 'param' || op === 'phi' || op === 'caught_exception' || op === 'handler_local') return;
     if (op in ICONST) { out.push(OP.i32_const, ...sleb(ICONST[op])); return this.finish(node, out); }
     if (op in LCONST) { out.push(OP.i64_const, ...sleb(LCONST[op])); return this.finish(node, out); }
     if (op in FCONST) { out.push(OP.f32_const, ...f32bytes(FCONST[op])); return this.finish(node, out); }
@@ -608,7 +746,7 @@ class ClosedCompiler {
   fieldAccess(node, plan, isPut) {
     const object = this.use(node.args[0], 'A');
     const value = isPut ? this.use(node.args[1], plan.valueKind) : [];
-    const cast = [...object, ...GC.ref_cast_null, { stype: T_OBJ }];
+    const cast = [...this.nonNull(object), ...GC.ref_cast, { stype: T_OBJ }];
     if (plan.reference) {
       return [...cast, ...GC.struct_get, { type: T_OBJ }, OBJ.refs, OP.i32_const, ...sleb(plan.index),
         ...value, ...(isPut ? GC.array_set : GC.array_get), { type: T_REFS }];
@@ -644,7 +782,7 @@ class ClosedCompiler {
 
   call(node, plan) {
     const code = [];
-    if (plan.nullCheckReceiver) code.push(...this.use(node.args[0], 'A'), OP.ref_as_non_null, OP.drop);
+    if (plan.nullCheckReceiver) code.push(...this.nonNull(this.use(node.args[0], 'A')), OP.drop);
     code.push(...this.callArgs(node, plan), OP.call, { fn: plan.fn });
     return code;
   }
@@ -657,7 +795,7 @@ class ClosedCompiler {
     const resultType = plan.returnKind === 'V' ? 0x40 : WT[plan.returnKind];
     const cls = this.temp([VT.i32]);
     const args = this.callArgs(node, plan);
-    const code = [...receiver, OP.ref_as_non_null, OP.drop];
+    const code = [...this.nonNull(receiver), OP.drop];
     code.push(...receiver, ...GC.ref_test, { stype: T_OBJ }, OP.if, resultType,
       ...receiver, ...GC.ref_cast, { stype: T_OBJ }, ...GC.struct_get, { type: T_OBJ }, OBJ.cls, OP.local_set, ...uleb(cls));
     const arms = plan.targets; // [{classIds:[...], fn}]

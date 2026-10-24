@@ -20,12 +20,12 @@
 // closure may initialize (static access, new, invokestatic owners) is already
 // INITIALIZED, so nothing inside the module ever triggers <clinit>.
 
-const { buildSsa } = require('../../analysis/opgraph/ssa');
+const { buildSsa, resolveHandlerRanges } = require('../../analysis/opgraph/ssa');
 const { VT, ModuleBuilder } = require('./wasmBuilder');
 const { closedTypes } = require('./representation');
 const { ClosedCompiler, Unsupported, WT } = require('./ClosedCompiler');
 
-const REJECT_OPS = new Set(['monitorenter', 'monitorexit', 'jsr', 'jsr_w', 'ret', 'invokedynamic']);
+const REJECT_OPS = new Set(['jsr', 'jsr_w', 'ret', 'invokedynamic']);
 const NEWARRAY = { 4: 'boolean', 5: 'char', 6: 'float', 7: 'double', 8: 'byte', 9: 'short', 10: 'int', 11: 'long' };
 
 class ClosedWorldError extends Error {}
@@ -71,6 +71,9 @@ class ClosedWorld {
     this.built = false;
     this.counters = { entries: 0, entryFallbacks: 0, notReady: 0 };
     this.thread = null;
+    // Java exceptions inside the module are this tag with the exception as
+    // payload; host imports convert whatever JS throws into it.
+    this.tag = new WebAssembly.Tag({ parameters: ['anyref'] });
     if (typeof process !== 'undefined' && process.env?.JVM_CLOSED_WORLD_STATS) {
       process.once('exit', () => {
         const rejected = [...this.rejected].map(([key, reason]) => `${key}\t${reason}`).join('\n');
@@ -220,6 +223,12 @@ class ClosedWorld {
     return key;
   }
 
+  // An import that never throws: bound directly, with no conversion wrapper.
+  pureImport(key, params, results, impl) {
+    if (!this.imports.has(key)) this.imports.set(key, { field: key, params, results, impl, pure: true });
+    return key;
+  }
+
   globalImport(key, valtype, mutable, value) {
     if (!this.globalImports.has(key)) this.globalImports.set(key, { valtype, mutable, value });
     return key;
@@ -228,7 +237,8 @@ class ClosedWorld {
   hostImpls() {
     if (this._hostImpls) return this._hostImpls;
     const jvm = this.jvm, runtime = this.runtime, toJs = runtime.toJs, toWasm = (v) => runtime.toWasm(v);
-    const throwJava = (type, message = null) => { throw { type, message }; };
+    const tag = this.tag, world = this;
+    const throwJava = (type, message = null) => { throw new WebAssembly.Exception(tag, [{ type, message }]); };
     const isNull = (v) => v === null || v === undefined;
     const hostArray = (array) => {
       const value = toJs(array);
@@ -242,6 +252,20 @@ class ClosedWorld {
     const storeElement = (array, index, element) => { const value = hostArray(array); checkIndex(value, index); value[index] = element; };
     this._hostImpls = {
       ref_eq: (a, b) => (toJs(a) === toJs(b) ? 1 : 0),
+      err_npe: () => throwJava('java/lang/NullPointerException'),
+      menter: (value) => {
+        const monitor = toJs(value), thread = world.thread;
+        if (isNull(monitor)) throwJava('java/lang/NullPointerException');
+        if (!monitor.isLocked) { monitor.isLocked = true; monitor.lockOwner = thread.id; monitor.lockCount = 1; }
+        else if (monitor.lockOwner === thread.id) monitor.lockCount++;
+        else throw new ClosedWorldError('closed world: contended monitor (module code cannot block)');
+      },
+      mexit: (value) => {
+        const monitor = toJs(value), thread = world.thread;
+        if (isNull(monitor)) throwJava('java/lang/NullPointerException');
+        if (!monitor.isLocked || monitor.lockOwner !== thread.id) throwJava('java/lang/IllegalMonitorStateException');
+        if (--monitor.lockCount === 0) { monitor.isLocked = false; monitor.lockOwner = null; }
+      },
       athrow: (exception) => { const value = toJs(exception); if (isNull(value)) throwJava('java/lang/NullPointerException'); throw value; },
       err_div0: () => throwJava('java/lang/ArithmeticException', '/ by zero'),
       err_aioob: (index, length) => throwJava('java/lang/ArrayIndexOutOfBoundsException', `Index ${index} out of bounds for length ${length}`),
@@ -265,6 +289,33 @@ class ClosedWorld {
       aastore: (a, i, v) => storeElement(a, i, toJs(v)),
     };
     return this._hostImpls;
+  }
+
+  // Catch-type test, matching jvm.js handler dispatch (isInstanceOf on .type).
+  exceptionTypeImport(type) {
+    const jvm = this.jvm, runtime = this.runtime;
+    return this.siteImport(`exc:${type}`, [VT.anyref], [VT.i32], (payload) => {
+      const exception = runtime.toJs(payload);
+      return exception && jvm.isInstanceOf(exception.type, type) ? 1 : 0;
+    });
+  }
+
+  // A host import's JS throw as a module exception. Internal JS errors stay
+  // JS errors: they must fail loudly, never reach a Java handler.
+  hostThrow(error) {
+    if (error instanceof WebAssembly.Exception || error instanceof Error) return error;
+    return new WebAssembly.Exception(this.tag, [this.runtime.toWasm(error)]);
+  }
+
+  wrapHost(impl, arity) {
+    const world = this;
+    switch (arity) {
+      case 0: return () => { try { return impl(); } catch (e) { throw world.hostThrow(e); } };
+      case 1: return (a) => { try { return impl(a); } catch (e) { throw world.hostThrow(e); } };
+      case 2: return (a, b) => { try { return impl(a, b); } catch (e) { throw world.hostThrow(e); } };
+      case 3: return (a, b, c) => { try { return impl(a, b, c); } catch (e) { throw world.hostThrow(e); } };
+      default: return (...args) => { try { return impl(...args); } catch (e) { throw world.hostThrow(e); } };
+    }
   }
 
   // JS value -> Wasm argument / result conversions by kind.
@@ -372,18 +423,27 @@ class ClosedWorld {
   analyze(className, method, key) {
     const flags = flagsOf(method);
     if (flags.includes('native') || flags.includes('abstract')) return null;
-    if (flags.includes('synchronized')) return this.reject(key, 'synchronized');
     if (method.name === '<clinit>') return this.reject(key, 'clinit');
     const code = method.attributes?.find((a) => a.type === 'code')?.code;
     if (!code) return this.reject(key, 'no-code');
-    if ((code.exceptionTable || []).length) return this.reject(key, 'exception-handlers');
+    const table = code.exceptionTable || [];
+    let ranges = [];
+    if (table.length) {
+      try { ranges = resolveHandlerRanges(code.codeItems, table); } catch { return this.reject(key, 'handler-ranges'); }
+      const end = (code.codeItems || []).length;
+      for (const range of ranges) {
+        if (range.startItemIdx === undefined || range.startItemIdx === null) return this.reject(key, 'handler-range-start');
+        if (range.endItemIdx === undefined || range.endItemIdx === null) range.endItemIdx = end;
+      }
+    }
     for (const item of code.codeItems || []) {
       const op = typeof item.instruction === 'string' ? item.instruction : item.instruction?.op;
       if (REJECT_OPS.has(op)) return this.reject(key, `op:${op}`);
     }
     let fn;
     try {
-      fn = buildSsa({ codeItems: code.codeItems, exceptionTable: [], method, className });
+      const covered = ranges.length ? (item) => ranges.some((r) => item >= r.startItemIdx && item < r.endItemIdx) : undefined;
+      fn = buildSsa({ codeItems: code.codeItems, exceptionTable: table, method, className }, { slotDefsAt: covered });
     } catch (error) {
       return this.reject(key, `ssa-error: ${error.message}`);
     }
@@ -398,7 +458,25 @@ class ClosedWorld {
       plan: new Map(),
       calls: new Set(),
       initClasses: new Set(),
+      synchronized: flags.includes('synchronized'),
+      handlerEntries: null,
+      handlerBlocks: null,
     };
+    if (table.length) {
+      const end = (code.codeItems || []).length;
+      record.handlerEntries = fn.handlerEntries.map((h) => (h.endItemIdx === undefined || h.endItemIdx === null ? Object.assign(h, { endItemIdx: end }) : h));
+      record.handlerBlocks = new Map();
+      for (const block of fn.blocks) {
+        if (!block.isHandlerEntry) continue;
+        for (const h of block.handlers) record.handlerBlocks.set(h, block.id);
+      }
+      if (record.handlerEntries.some((h) => !record.handlerBlocks.has(h))) return this.reject(key, 'handler-block');
+    }
+    if (record.synchronized && isStatic) {
+      const mirror = this.jvm.getClassObjectSync?.(className);
+      if (!mirror) return this.reject(key, 'synchronized-static-mirror');
+      record.lockGlobal = this.globalImport(`k:${this.globalImports.size}`, [VT.externref], false, mirror);
+    }
     try {
       for (const blockId of fn.reachable) {
         for (const node of fn.blocks[blockId].body) this.planNode(record, node);
@@ -482,6 +560,11 @@ class ClosedWorld {
         const fn = this.siteImport(`multianewarray:${className}:${dims}`, new Array(dims).fill(VT.i32), [VT.anyref],
           (...counts) => this.runtime.toWasm(allocMultiArray(this.jvm, className, counts)));
         plan.set(node.id, { kind: 'import', fn, argKinds: new Array(dims).fill('I') });
+        return;
+      }
+      case 'monitorenter': case 'monitorexit': {
+        const name = op === 'monitorenter' ? 'menter' : 'mexit';
+        plan.set(node.id, { kind: 'import', fn: this.hostImport(name, [VT.anyref], []), argKinds: ['A'] });
         return;
       }
       case 'checkcast': case 'instanceof':
@@ -596,10 +679,10 @@ class ClosedWorld {
     const unary = ['sin', 'cos', 'tan', 'asin', 'acos', 'atan', 'exp', 'log', 'log10', 'cbrt', 'sinh', 'cosh', 'tanh', 'expm1', 'log1p'];
     const binary = ['atan2', 'pow', 'hypot'];
     if (descriptor === '(D)D' && unary.includes(name)) {
-      return { kind: 'import', fn: this.siteImport(`math:${name}`, [VT.f64], [VT.f64], Math[name]) };
+      return { kind: 'import', fn: this.pureImport(`math:${name}`, [VT.f64], [VT.f64], Math[name]) };
     }
     if (descriptor === '(DD)D' && binary.includes(name)) {
-      return { kind: 'import', fn: this.siteImport(`math:${name}`, [VT.f64, VT.f64], [VT.f64], Math[name]) };
+      return { kind: 'import', fn: this.pureImport(`math:${name}`, [VT.f64, VT.f64], [VT.f64], Math[name]) };
     }
     return null;
   }
@@ -675,7 +758,16 @@ class ClosedWorld {
     const builder = new ModuleBuilder();
     builder.addRecGroup('closed', closedTypes());
     builder.importMemory('c', 'mem', this.runtime.heap.memory.buffer.byteLength >>> 16);
-    const importObject = { c: { mem: this.runtime.heap.memory }, s: {}, f: {} };
+    builder.importTag('t', 'jx', [[VT.anyref]], 'jx');
+    const importObject = { c: { mem: this.runtime.heap.memory }, t: { jx: this.tag }, s: {}, f: {} };
+    // Synchronized methods: their body is compiled separately and called by
+    // a wrapper that holds the monitor and releases it on every exit.
+    for (const record of this.entries.values()) {
+      if (record.synchronized) {
+        this.hostImport('menter', [VT.anyref], []);
+        this.hostImport('mexit', [VT.anyref], []);
+      }
+    }
     let globalIndex = 0;
     for (const [key, g] of this.globalImports) {
       const field = `g${globalIndex++}`;
@@ -688,22 +780,30 @@ class ClosedWorld {
     for (const [key, imp] of this.imports) {
       const field = `f${importIndex++}`;
       builder.importFunction('f', field, imp.params.map((p) => [p]), imp.results.map((r) => [r]), key);
+      const bound = imp.pure ? imp.impl : this.wrapHost(imp.impl, imp.params.length);
       if (countImports) {
-        const calls = this.importCalls, impl = imp.impl;
+        const calls = this.importCalls;
         calls.set(key, 0);
-        importObject.f[field] = (...args) => { calls.set(key, calls.get(key) + 1); return impl(...args); };
+        importObject.f[field] = (...args) => { calls.set(key, calls.get(key) + 1); return bound(...args); };
       } else {
-        importObject.f[field] = imp.impl;
+        importObject.f[field] = bound;
       }
     }
     let exportIndex = 0;
     for (const [key, record] of this.entries) {
       record.exportName = `m${exportIndex++}`;
-      builder.declareFunction(`m:${key}`, record.paramKinds.map((k) => [WT[k]]),
-        record.returnKind === 'V' ? [] : [[WT[record.returnKind]]]);
+      const params = record.paramKinds.map((k) => [WT[k]]);
+      const results = record.returnKind === 'V' ? [] : [[WT[record.returnKind]]];
+      builder.declareFunction(`m:${key}`, params, results);
+      if (record.synchronized) builder.declareFunction(`m:${key}$body`, params, results);
       builder.exportFunction(record.exportName, `m:${key}`);
     }
-    for (const [key, body] of bodies) builder.defineFunction(`m:${key}`, body.locals, body.code);
+    for (const [key, body] of bodies) {
+      const record = this.entries.get(key);
+      if (!record.synchronized) { builder.defineFunction(`m:${key}`, body.locals, body.code); continue; }
+      builder.defineFunction(`m:${key}$body`, body.locals, body.code);
+      builder.defineFunction(`m:${key}`, ...this.synchronizedWrapper(record, key));
+    }
     const bytes = builder.build();
     this.moduleBytes = bytes.length;
     if (process.env.JVM_CLOSED_WORLD_DUMP) require('node:fs').writeFileSync(process.env.JVM_CLOSED_WORLD_DUMP, bytes);
@@ -719,6 +819,24 @@ class ClosedWorld {
       record.plan = undefined;
     }
     for (const record of this.entries.values()) record.fnSsa = undefined;
+  }
+
+  synchronizedWrapper(record, key) {
+    const { OP, GC, uleb } = require('./wasmBuilder');
+    const n = record.paramKinds.length;
+    const lock = n, result = n + 1;
+    const hasResult = record.returnKind !== 'V';
+    const locals = [[VT.anyref], ...(hasResult ? [[WT[record.returnKind]]] : [])];
+    const lockCode = record.isStatic ? [OP.global_get, { global: record.lockGlobal }, ...GC.any_convert_extern] : [OP.local_get, 0];
+    const call = (name) => [OP.local_get, ...uleb(lock), OP.call, { fn: this.hostImport(name, [VT.anyref], []) }];
+    const code = [...lockCode, OP.local_set, ...uleb(lock), ...call('menter'),
+      OP.try, hasResult ? WT[record.returnKind] : 0x40];
+    for (let i = 0; i < n; i++) code.push(OP.local_get, ...uleb(i));
+    code.push(OP.call, { fn: `m:${key}$body` }, OP.catch_all, ...call('mexit'), OP.rethrow, 0, OP.end);
+    if (hasResult) code.push(OP.local_set, ...uleb(result));
+    code.push(...call('mexit'));
+    if (hasResult) code.push(OP.local_get, ...uleb(result));
+    return [locals, code];
   }
 
   // Classes the admitted closure of `record` may initialize.
@@ -770,6 +888,7 @@ class ClosedWorld {
     try {
       return record.fn(...wasmArgs);
     } catch (error) {
+      if (error instanceof WebAssembly.Exception && error.is(this.tag)) throw this.runtime.toJs(error.getArg(this.tag, 0));
       throw this.translateTrap(error);
     } finally {
       this.thread = previous;
@@ -789,7 +908,16 @@ class ClosedWorld {
       args[i] = this.fromJs(kind, frame.locals[slot]);
       slot += kind === 'J' || kind === 'D' ? 2 : 1;
     }
-    const result = this.invokeEntry(record, args, thread);
+    let result;
+    try {
+      result = this.invokeEntry(record, args, thread);
+    } catch (error) {
+      // Every handler inside the module already ran. Replace the callee frame
+      // with a handler-less tombstone so the scheduler dispatches in the
+      // caller at its invoke, exactly as for an unwinding interpreter frame.
+      thread.callStack.pop();
+      this.throwThroughTombstone(record, thread, error);
+    }
     thread.callStack.pop();
     if (record.returnKind !== 'V' && !thread.callStack.isEmpty()) {
       thread.callStack.peek().stack.push(this.toJsValue(record.returnKind, result));
@@ -808,8 +936,25 @@ class ClosedWorld {
     const args = new Array(count);
     for (let i = 0; i < count; i++) args[i] = this.fromJs(record.paramKinds[i], items[base + i]);
     items.length = base;
-    const result = this.invokeEntry(record, args, thread);
+    let result;
+    try {
+      result = this.invokeEntry(record, args, thread);
+    } catch (error) {
+      // The generated caller materialized its post-invoke pc; a tombstone
+      // callee frame makes propagation use that pc - 1, the invoke itself.
+      this.throwThroughTombstone(record, thread, error);
+    }
     return record.returnKind === 'V' ? undefined : this.toJsValue(record.returnKind, result);
+  }
+
+  throwThroughTombstone(record, thread, error) {
+    if (error instanceof Error) throw error;
+    const Frame = require('../../core/frame');
+    const tombstone = new Frame(record.method);
+    tombstone.className = record.className;
+    tombstone.exceptionTable = [];
+    thread.callStack.push(tombstone);
+    throw error;
   }
 }
 

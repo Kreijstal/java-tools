@@ -260,6 +260,7 @@ function buildSsaOrThrow(input, options) {
     simulateBlock({
       fn, cfg, items, block, stack, locals, makeValue, imposeKind,
       captureOperandStack: options.captureOperandStack,
+      slotDefsAt: options.slotDefsAt,
     });
   }
 
@@ -311,6 +312,11 @@ function simulateBlock(context) {
     const op = instruction && instruction.op;
     if (!op) continue;
     fn.depthBefore.set(itemIdx, stack.reduce((total, v) => total + (kindWidth(v.kind) || 1), 0));
+    // Exception-handler consumers need every local's reaching def at a
+    // throwing instruction inside a protected range (its handler reads them).
+    if (context.slotDefsAt && context.slotDefsAt(itemIdx)) {
+      (fn.slotDefsBefore ||= new Map()).set(itemIdx, new Map(locals));
+    }
     fn.stackKindsBefore.set(itemIdx, stack.map((value) => value.kind));
 
     const local = localOperation(instruction, instruction);
@@ -816,4 +822,15 @@ function trim(label) {
   return typeof label === 'string' ? label.replace(/:$/, '') : null;
 }
 
-module.exports = { buildSsa, IrValue, IrBlock };
+// Handler ranges in item indices, for consumers that must know which
+// instructions an exception entry protects before building the SSA.
+function resolveHandlerRanges(codeItems, exceptionTable) {
+  const labelToItem = new Map(), pcToItem = new Map();
+  (codeItems || []).forEach((item, index) => {
+    if (item && item.labelDef) labelToItem.set(trim(item.labelDef), index);
+    if (item && typeof item.pc === 'number') pcToItem.set(item.pc, index);
+  });
+  return resolveHandlers(exceptionTable, labelToItem, pcToItem);
+}
+
+module.exports = { buildSsa, IrValue, IrBlock, resolveHandlerRanges };
