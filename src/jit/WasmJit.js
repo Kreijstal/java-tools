@@ -68,7 +68,7 @@ const {
   denseSlotFor, readField, writeField,
 } = require('../core/objectModel');
 const {
-  addStaticCallInitializationGuard, addMathImport, addSystemImport, addArraysImport, addNewArrayImport, addANewArrayImport,
+  addStaticCallInitializationGuard, addMathImport, addSystemImport, addArraysImport, addNewArrayImport, addANewArrayImport, addMultiANewArrayImport,
   addNewImport, addTypedArrayStoreImports, arrayTracer,
   addI32ArrayLoadImports, addStringConstantImport, addStringCallImport,
 } = require('./wasmRuntimeImports');
@@ -2236,6 +2236,10 @@ class MethodTranslator {
         pop(T.i32);
         emit(OP.call, ...uleb(addANewArrayImport(this, this.jvm, ins.arg)));
         push(T.ref);
+      } else if (op === 'multianewarray') {
+        const index=addMultiANewArrayImport(this,this.jvm,ins.arg);
+        for(let i=0;i<Number(ins.arg[1]);i++)pop(T.i32);
+        emit(OP.call,...uleb(index));push(T.ref);
       } else if (op === 'new') {
         emit(OP.call, ...uleb(addNewImport(this, this.jvm, ins.arg)));
         push(T.ref);
@@ -3052,6 +3056,20 @@ class WasmJit {
     return true;
   }
 
+  // Preparation may have compiled a complete caller before a small wrapper
+  // earned its entry proof. Reconsider only those recorded boundaries, before
+  // guest execution; runtime entry never rebuilds a working body for this hint.
+  preparedPairedBoundaryReady(st) {
+    const keys=new Set([...(st.meta?.deferredPairedBoundaries||[]),
+      ...(st.osr?.meta?.deferredPairedBoundaries||[])]);
+    if(!keys.size)return false;
+    return this.compiled.some(target=>{
+      const meta=(target.callee||target).meta,proof=meta?.pairedNativeStorage;
+      return keys.has(target.key)&&CanonicalDirectLinks.eligible(target)&&proof?.version===1&&
+        proof.key===target.key&&!!proof.run&&proof.run===meta.canonicalPairedStorageRun;
+    });
+  }
+
   // Withdraw a method's published module(s). Every path that resets a state
   // back to cold goes through here so the runtime linker can stop callers
   // entering the withdrawn module directly on their next call.
@@ -3860,6 +3878,9 @@ class WasmJit {
       primary.canonicalCompactHeapRun=instance.exports.canonicalCompactHeapRun||null;
       primary.canonicalCompactStorageRun=instance.exports.canonicalCompactStorageRun||null;
       primary.canonicalClosedStorageRun=instance.exports.canonicalClosedStorageRun||null;
+      primary.canonicalPairedStorageRun=instance.exports.canonicalPairedStorageRun||null;
+      if(primary.pairedNativeStorage)primary.pairedNativeStorage=Object.freeze({...primary.pairedNativeStorage,
+        objectParameters:Object.freeze(primary.pairedNativeStorage.objectParameters.slice()),run:primary.canonicalPairedStorageRun});
       if(primary.closedNativeBody)primary.closedNativeBody=Object.freeze({...primary.closedNativeBody,
         objectParameters:Object.freeze(primary.closedNativeBody.objectParameters.slice()),run:primary.canonicalClosedStorageRun});
       primary.canonicalInlineCompactRun=!!instance.exports.canonicalInlineCompactRun;

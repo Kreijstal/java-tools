@@ -1,5 +1,5 @@
 'use strict';
-const {T,OP,uleb,sleb,getOp,descToWasm,entryModeCode}=require('./wasmShared');
+const {T,OP,uleb,sleb,getOp,descToWasm,entryModeCode,Unsupported}=require('./wasmShared');
 const {CanonicalDirectLinks}=require('./CanonicalDirectFrames');
 const {slabSlotFor,nativeReferenceSlotFor,denseLayoutFor}=require('../core/objectModel');
 const {validatedNativeObjectStorageOf}=require('../core/nativeObjectStorage');
@@ -11,6 +11,7 @@ const get=n=>[OP.local_get,...uleb(n)];
 // Other SSA users and callers keep their existing snapshot footprint. The
 // actual field/ownership proof below remains responsible for admission.
 function snapshotPredicate(c,items,structured){
+ if(c.origIdx)return c.hasNestedInlineScopes?op=>op==='getfield'||op==='putfield'||op==='aaload'||element.test(op)||op==='arraylength':undefined;
  if(!c.jvm.wasmFields||!c.jvm.wasmHeap||c.origIdx||items.length>8192||
     !items.some(item=>/^(getfield|putfield|invokestatic)$/.test(getOp(item.instruction))))return undefined;
  return op=>element.test(op)||op==='arraylength'||op==='getfield'||op==='putfield'||op==='getstatic'||op==='checkcast';
@@ -19,12 +20,12 @@ function snapshotPredicate(c,items,structured){
 // Resolve the same field layouts used by ordinary emission, without allocating
 // imports or locals. This lets the semantic proof reject unnecessary snapshots
 // BEFORE those snapshots extend register/local lifetimes.
-function discoverFields(c){
+function discoverFields(c,required=false){
  const operations=new Map();let work=0;
  for(const block of c.fn.blocks){
   if(!c.fn.reachable.has(block.id))continue;
   for(const node of block.body){
-  if(++work>4096)return new Map();
+  if(++work>4096){if(required)throw new Unsupported('nested inline field proof budget');return new Map();}
   if(node.op!=='getfield'&&node.op!=='putfield')continue;
   const [,owner,[name,descriptor]]=node.imm;if(denseLayoutFor(c.jvm,owner))continue;
   const slot=slabSlotFor(c.jvm,owner,name),type=slot&&(slot.kind==='i32'?T.i32:slot.kind==='f64'?T.f64:T.i64);
@@ -39,11 +40,24 @@ function discoverFields(c){
 }
 function discardUnusedSnapshots(c,structured){
  const plan=prepare(c,structured,true);
+ c.inlineNativeFields=c.hasNestedInlineScopes?discoverFields(c,true):new Map();
+ const referenceDerived=value=>{
+  const pending=[value],seen=new Set();let work=0;
+  while(pending.length){
+   const next=pending.pop();if(!next||seen.has(next))continue;
+   if(++work>128)return false;seen.add(next);
+   if(next.op==='aaload')return true;
+   if(next.op==='phi')pending.push(...next.args);
+  }
+  return false;
+ };
  for(const value of c.fn.values){
   const field=value.op==='getfield'||value.op==='putfield',special=value.op==='getstatic'||value.op==='checkcast';
-  const keep=field?plan?.lazy&&(!plan.partial||plan.fields.has(value.id)):
-   plan&&(!plan.partial||plan.arrays.has(value.id));
-  if((field||special||element.test(value.op)||value.op==='arraylength')&&!(special?plan?.partial&&(plan.staticReads.has(value.id)||plan.casts.has(value.id)):keep))delete value.stackUnder;
+  const checkedReference=c.hasNestedInlineScopes&&(value.op==='aaload'||
+   (element.test(value.op)||value.op==='arraylength')&&referenceDerived(value.args[0]));
+  const keep=field?c.inlineNativeFields.has(value.id)||plan?.lazy&&(!plan.partial||plan.fields.has(value.id)):
+   checkedReference||plan&&(!plan.partial||plan.arrays.has(value.id));
+  if((field||special||element.test(value.op)||value.op==='aaload'||value.op==='arraylength')&&!(special?plan?.partial&&(plan.staticReads.has(value.id)||plan.casts.has(value.id)):keep))delete value.stackUnder;
  }
  return plan;
 }
@@ -394,8 +408,15 @@ function field(c,node,out){
   OP.i32_const,1,OP.local_set,...uleb(source.captured));
  return true;
 }
+function inlineField(c,node,out){
+ const operation=c.inlineNativeFields?.get(node.id);if(!operation)return;
+ const cache=c.objCacheFor(operation.receiver);
+ if(cache.nativeRegionValid===undefined){cache.nativeRegionValid=c.nextLocal++;c.declared.push(T.i32);}
+ cache.inlineOwnership=true;
+ guardReceiver(c,node,cache,operation.receiver,out);
+}
 function kill(c,id,out){
- const plan=c.nativeObjectBody,cache=plan?.objects.get(id);
+ const plan=c.nativeObjectBody,ordinary=c.objCaches?.get(id),cache=plan?.objects.get(id)||(ordinary?.inlineOwnership?ordinary:null);
  if(cache?.nativeRegionValid!==undefined)out.push(OP.i32_const,0,OP.local_set,...uleb(cache.nativeRegionValid));
  for(const cast of plan?.castCaches?.values()||[])if(cast.source===id)out.push(OP.i32_const,0,OP.local_set,...uleb(cast.filled));
  const source=plan?.sourceCaches.get(id);
@@ -433,4 +454,4 @@ function needsSnapshotRetry(c,structured){
   (plan.partial?plan.arrays.has(value.id)||plan.fields.has(value.id)||plan.staticReads.has(value.id)||plan.casts.has(value.id):
    element.test(value.op)||value.op==='arraylength'||plan.lazy&&(value.op==='getfield'||value.op==='putfield')));
 }
-module.exports={snapshotPredicate,discardUnusedSnapshots,prepare,entry,access,field,kill,beforeCall,callSlot,phiInputs,phiOutputs,edge,needsSnapshotRetry};
+module.exports={snapshotPredicate,discardUnusedSnapshots,prepare,entry,access,field,inlineField,kill,beforeCall,callSlot,phiInputs,phiOutputs,edge,needsSnapshotRetry};

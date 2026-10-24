@@ -44,7 +44,7 @@ test('flattened non-counted loops recover real inner frames without replaying st
   t.equal(st.meta?.inlineActivationSiteCount,sites,name+' has the expected resumable inline activations');return st;};
  const root=build('root','([II)I'),wide=build('rootWide','(IJ)J'),capture=build('capture','(I)I');
  const tiny=build('tiny','(I)I','InlineActivationProbe',0),chain=build('chainRoot','(I)I'),
-  relay=build('relay','(LInlineWalker;I)I','InlineActivationProbe',0),caught=build('caught','([II)I'),
+  relay=build('relay','(LInlineWalker;I)I','InlineActivationProbe',1),caught=build('caught','([II)I'),
   follow=build('followRoot','([I)I');
  const guarded=build('guarded','(LInlineWalker;[II)I','InlineActivationProbe',1,false);
  const caughtGuarded=build('caughtGuarded','(LInlineWalker;[II)I','InlineActivationProbe',0);
@@ -154,7 +154,8 @@ test('flattened non-counted loops recover real inner frames without replaying st
  t.equal(await finish(relay,[orelay,7],({child})=>{
   t.equal(child.method.name,'tiny','native canonical caller preserves deepest frame');
  },{fuel:1000000,depth:5}),54,'direct native activation donates all flattened and real children');
- t.ok(chain.meta.directFrameContext.directExitCount>0,'inline recovery is exercised through a nonzero direct invocation id');
+ t.equal(relay.meta.inlineActivationDepth,2,'relay removes both nested instance boundaries');
+ t.ok(tiny.meta.directFrameContext.directExitCount>0,'inline recovery is exercised through a nonzero real helper invocation id');
  const faulty=array([0]),of=walker();
  t.equal(await finish(caught,[of,faulty,10]),1020,'exception after a fuel yield reaches the original outer handler');
  t.deepEqual([...faulty],[1],'preceding store is not replayed on exception');

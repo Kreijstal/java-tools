@@ -28,8 +28,22 @@ function prepare(c,structured) {
   group.readers.push(cache);
  }
  const active=new Map();
+ // A recovered wrapper return joins its owned row with an invoke-miss result.
+ // That phi is itself the array reader, with no intervening checkcast alias.
+ // Retain the private row header through the same positive-only transfer.
+ const rowSource=root=>{
+  const pending=[root],seen=new Set();
+  while(pending.length){
+   const value=pending.pop();if(seen.has(value))continue;
+   if(seen.size>=128)return false;seen.add(value);
+   if(c.referenceArrayElementHeaders?.has(value.id))return true;
+   if(value.op==='phi')pending.push(...value.args);
+  }
+  return false;
+ };
  for(const [id,group] of groups){
-  if(group.readers.some(cache=>cache.value!==group.root && repeated.has(cache.value.block)))active.set(id,group);
+  if(group.readers.some(cache=>cache.value!==group.root && repeated.has(cache.value.block))||
+     c.hasNestedInlineScopes&&group.root.op==='phi'&&group.readers.some(cache=>repeated.has(cache.value.block))&&rowSource(group.root))active.set(id,group);
  }
  // An unused intermediate phi still carries the reference to a later cast.
  // Propagate through that SSA slice, rather than dropping a proof merely

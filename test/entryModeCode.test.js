@@ -32,3 +32,36 @@ test('fixed canonical entries select their protocol while the shared core retain
  }
  t.end();
 });
+
+test('paired-storage entry is distinct from both untrusted and closed-body entry modes',t=>{
+ const {PAIRED_STORAGE_ENTRY}=require('../src/jit/wasmShared');
+ t.equal(PAIRED_STORAGE_ENTRY,-2,'paired storage has a separate private mode');
+ for(const padding of [0,18000]){
+  let ordinary=0,closed=0,paired=0,ready=true;
+  const protocol=[entryModeCode(2,[OP.call,1,OP.global_set,0],[OP.call,2,OP.global_set,0],0x40,PAIRED_STORAGE_ENTRY)];
+  const bytes=assembleModule({importDecls:[{name:'ready',params:[],results:[T.i32]},
+    {name:'ordinary',params:[],results:[T.i32]},{name:'paired',params:[],results:[T.i32]},{name:'closed',params:[],results:[T.i32]}],
+   mainParams:[T.ref,[0x63,1],T.i32,T.i32],mainResults:[T.i32],declared:[T.i32],gcTypes:nativeObjectStorageTypes(),
+   parameterObjectABI:[0],retvType:T.i32,runvWrapper:true,
+   canonicalFrameExport:{readyIdx:0,compact:true,inlineCompact:true,pairedStorage:true,closedStorage:true,idLocal:4},
+   body:[CAPTURE_DIRECT_ID,...Array(padding).fill(OP.nop??0x01),
+    entryModeCode(2,protocol,[OP.call,3,OP.global_set,0]),OP.i32_const,0x7f,STRUCTURED_RETURN,OP.end]});
+  t.ok(WebAssembly.validate(bytes),'both modes validate under '+(padding?'bounded wrapper':'inline code'));
+  const x=new WebAssembly.Instance(new WebAssembly.Module(bytes),{env:{ready:()=>+ready,
+   ordinary:()=>{ordinary++;return 10;},paired:()=>{paired++;return 30;},closed:()=>{closed++;return 20;}}}).exports;
+  t.deepEqual(x.canonicalCompactStorageRun(null,null),[-1,10],'ordinary typed entry does not assume pairing');
+  t.deepEqual(x.canonicalPairedStorageRun(null,null),[-1,30],'paired entry selects only its entry protocol');
+  t.deepEqual(x.canonicalClosedStorageRun(null,null),[-1,20],'closed-body entry keeps its separate protocol');
+  t.deepEqual([ordinary,closed,paired],[1,1,1],'fixed wrappers do not execute another mode callback');
+  t.equal(x.run(null,PAIRED_STORAGE_ENTRY,100),-1,'shared core supports the paired private mode');
+  t.equal(x.retv.value,30,'shared core paired return remains exact');
+  const legacy=x.canonicalRun(null);
+  t.equal(legacy[0],-1,'untrusted legacy export completes normally');
+  t.equal(legacy[1],4,'paired entry participates in canonical invocation accounting');
+  t.equal(legacy[2],x.canonicalOwner.value,'untrusted legacy entry retains its exact owner');
+  t.equal(legacy[3],10,'untrusted legacy export retains its ordinary result');
+  ready=false;t.deepEqual(x.canonicalPairedStorageRun(null,null),[-4,0],'cold paired owner refuses before protocol effects');
+  t.deepEqual([ordinary,closed,paired],[2,1,2],'cold refusal does not execute either entry body');
+ }
+ t.end();
+});

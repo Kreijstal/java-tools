@@ -30,7 +30,7 @@ function addStaticCallInitializationGuard(reg, jvm, owner) {
 // carries its own copies until its strangler step lands.
 
 const {
-  resolveInstanceFieldKey, allocPrimitiveArray, allocReferenceArray,
+  resolveInstanceFieldKey, allocPrimitiveArray, allocReferenceArray, allocMultiArray,
 } = require('../instructions/object');
 const {
   T, NPE, AIOOBE, MATH_INTRINSICS, Unsupported, I32_LOAD_OPS,
@@ -548,7 +548,7 @@ function addMathImport(reg, ins) {
   };
 }
 
-// Allocation imports (new / newarray / anewarray). None of these run guest
+// Allocation imports (new / newarray / anewarray / multianewarray). None run guest
 // code or a thread switch, so both backends' field-cache invariants hold:
 // array classes have no <clinit>, and `new` has a block-entry readiness
 // guard that exits before any guest effects when its class is still cold.
@@ -570,6 +570,18 @@ function addANewArrayImport(reg, jvm, elementType) {
   const name = `anewarr_${elementType}`.replace(/[^\w]/g, '_');
   return reg.addImport(name, [T.i32], [T.ref],
     (count) => allocReferenceArray(jvm, elementType, count));
+}
+
+function addMultiANewArrayImport(reg,jvm,arg){
+  const descriptor=Array.isArray(arg)&&arg[0],dimensions=Array.isArray(arg)?Number(arg[1]):NaN;
+  const rank=typeof descriptor==='string'?(descriptor.match(/^\[+/)?.[0].length||0):0;
+  if(!rank||rank>255||!Number.isInteger(dimensions)||dimensions<1||dimensions>rank||
+      !/^\[+(?:[ZBCSIJFD]|L[^;[\s]+;)$/.test(descriptor))throw new Unsupported('multianewarray arg');
+  // Preserve descriptor identity, including names whose punctuation would
+  // collide under the usual debug-name sanitization. The import name is ASCII.
+  const name='multianewarr_'+dimensions+'_'+Array.from(descriptor,c=>c.codePointAt(0).toString(16)).join('_');
+  return reg.addImport(name,new Array(dimensions).fill(T.i32),[T.ref],
+    (...counts)=>allocMultiArray(jvm,descriptor,counts));
 }
 
 function addNewImport(reg, jvm, className) {
@@ -731,5 +743,6 @@ module.exports = {
   addSystemImport,
   addNewArrayImport,
   addANewArrayImport,
+  addMultiANewArrayImport,
   addNewImport,
 };

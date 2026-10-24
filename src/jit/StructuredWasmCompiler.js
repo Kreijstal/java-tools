@@ -41,7 +41,7 @@ const WasmLinker = require('./WasmLinker');
 const monoArray = require('./monoArray');
 const {
   addStringConstantImport, addStringCallImport, addRuntimeImports, pushImportFor, addArrayImports, addFieldImport, addMathImport,
-  addStaticCallInitializationGuard, addSystemImport, addArraysImport, addNewArrayImport, addANewArrayImport, addNewImport,
+  addStaticCallInitializationGuard, addSystemImport, addArraysImport, addNewArrayImport, addANewArrayImport, addMultiANewArrayImport, addNewImport,
 } = require('./wasmRuntimeImports');
 const { inlineCalls, GUARD_OWNER } = require('./wasmInline');
 const {DirectFrameContext,CanonicalDirectLinks,consumeCanonicalExit} = require('./CanonicalDirectFrames');
@@ -285,9 +285,9 @@ class StructuredWasmCompiler {
         for (const key of [
           'fn', 'cfg', 'items', 'originalItems', 'localOf', 'arrayCaches', 'heapParamLocals',
           'objectParamLocals','objectInputImports','ownObjectInputs','arrayResultImports','ownArrayResult','nativeArrayResultOwnershipSites','arrayReturnIdentities', 'fieldArrayOwners', 'sharedFieldArrayGroups', 'arrayReaderGenerations', 'primitiveCopyZeroEntry',
-          'fieldCaches', 'castCaches', 'objCaches', 'nativeStaticCells', 'nativeStaticReferences', 'nativeStaticReferenceSites', 'staticFieldAccessors', 'nativeStaticSites', 'linkSlotByNode', 'canonicalSlotByNode', 'canonicalInstanceSlots',
+          'fieldCaches', 'castCaches', 'objCaches', 'nativeStaticCells', 'nativeStaticReferences', 'nativeStaticReferenceSites', 'staticFieldAccessors', 'nativeStaticSites', 'linkSlotByNode', 'canonicalSlotByNode', 'canonicalInstanceSlots', 'canonicalFallbackByNode', 'pairedStorageCalls',
           'guardedNestedArrayLoopPlans','loweringGuardedLoopHeaders','activeGuardedLoopPlan',
-          'loopResume','nativeStaticArrayBody','nativeStaticArrayReads','nativeStaticScalarAccesses','nativeReadinessProofSites','nativeObjectBody','nativeObjectSnapshotPlan','nativeObjectFieldOperations','nativeObjectCalls','instructionExitSites',
+          'loopResume','nativeStaticArrayBody','nativeStaticArrayReads','nativeStaticScalarAccesses','nativeReadinessProofSites','nativeObjectBody','nativeObjectSnapshotPlan','inlineNativeFields','nativeObjectFieldOperations','nativeObjectCalls','instructionExitSites',
           'stackifiedNumericValues','numericExpressionValue','blockArrayFills','omittedArrayFillSites',
           'blockSlabFills','omittedSlabFillSites','parameterHeapAccess','parameterHeapBoundsElisions',
           'deoptableSites', 'linkSlotSites', 'canonicalCompactSlots', 'emptyCopySites', 'fusedGuardOfLoad',
@@ -323,6 +323,7 @@ class StructuredWasmCompiler {
     const table = codeAttr.code.exceptionTable || [];
     this.origIdx = null;
     this.inlineActivations = null;
+    this.hasNestedInlineScopes=false;
     this.ehOrigIdx = null;
     this.deoptStubs = null;
     // Slots at or above this belong to spliced callees (wasmInline renumbers
@@ -331,6 +332,7 @@ class StructuredWasmCompiler {
     let coldStaticInlineOwners = [];
     let inlinedCalls = 0;
     let inlineAtomicStaticSites = 0;
+    let deferredPairedBoundaries=[];
     let speculations = 0;
     let specSites = null;
     let elidedThisGuards = 0;
@@ -348,6 +350,12 @@ class StructuredWasmCompiler {
         resumableLoops:!!(this.wasmJit?.canonicalEhLinksEnabled &&
           this.wasmJit.nativeJsExceptionTagsEnabled && supportsWasmJsTag()),
         inlineColdIntegerLeaves: this.wasmJit?.inlineColdIntegerLeavesEnabled,
+        pairedEntryFor:method=>{
+          const state=this.wasmJit?.state.get(method),meta=state&&(state.callee||state).meta;
+          return CanonicalDirectLinks.eligible(state)&&meta.pairedNativeStorage?.run===meta.canonicalPairedStorageRun&&
+            meta.pairedNativeStorage?.version===1&&meta.pairedNativeStorage.key===state.key&&
+            meta.inlineActivationSiteCount>0;
+        },
         // Sites in live handler ranges need Wasm-side exception dispatch.
         ehLiveRanges: deepInline && process.env.JVM_WASM_EH !== '0' &&
           supportsWasmTryTable(),
@@ -356,6 +364,7 @@ class StructuredWasmCompiler {
         items = expanded.items;
         this.inlineActivations=new Map(items.flatMap((item,i)=>
           item.inlineActivation?[[i,item.inlineActivation]]:[]));
+        this.hasNestedInlineScopes=[...this.inlineActivations.values()].some(a=>a.parent||a.nested);
         this.origIdx = expanded.origIdx;
         this.ehOrigIdx = expanded.ehOrigIdx || null;
         this.deoptStubs = expanded.deoptStubs;
@@ -364,13 +373,14 @@ class StructuredWasmCompiler {
         coldStaticInlineOwners = expanded.coldStaticInlineOwners || [];
         inlinedCalls = expanded.inlined;
         inlineAtomicStaticSites = expanded.atomicStaticSites||0;
+        deferredPairedBoundaries=expanded.deferredPairedBoundaries||[];
         speculations = expanded.speculations;
         specSites = expanded.specSites;
         elidedThisGuards = expanded.elidedThisGuards;
       }
     }
 
-    let cfg = buildCfgFromCode(items);
+    let cfg = buildCfgFromCode(items,items.filter(item=>item.inlineScopeEnd).map(item=>item.labelDef));
     if (!cfg) throw new Unsupported('no cfg');
     let structured;
     try {
@@ -708,10 +718,11 @@ class StructuredWasmCompiler {
     this.guardedNestedArrayLoopPlans=require('./guardedNestedArrayLoops').prepare(this,structured);
     this.guardedNestedArrayLoopCount=0;this.guardedNestedArrayLoopBytes=0;
     this.nativeStaticArrayBody=require('./nativeStaticArrayBody').prepare(this,structured);
+    this.pairedNativeStorage=require('./pairedNativeStorage').contract(this);
     this.nativeObjectBody=require('./nativeObjectBody').prepare(this,structured);
     if(!this.nativeObjectBody&&!this.nativeSnapshotRetried&&
         require('./nativeObjectBody').needsSnapshotRetry(this,structured))return RETRY_NATIVE_SNAPSHOTS;
-    this.loopResume=this.nativeStaticArrayBody&&!this.nativeStaticArrayBody.stateful||this.nativeObjectBody&&!this.nativeObjectBody.lazy
+    this.loopResume=this.nativeStaticArrayBody&&(this.nativeStaticArrayBody.regions||!this.nativeStaticArrayBody.stateful)||this.nativeObjectBody&&!this.nativeObjectBody.lazy
       ?null:require('./structuredLoopResume').prepare(this,structured);
 
     this.booleanStaticSpillProof = true;
@@ -802,6 +813,7 @@ class StructuredWasmCompiler {
         readyAddress:this.directOwnerReadyAddress,
         fuelImportIndex:0,compact:!!this.compactExitLinks,
         inlineCompact:true,idLocal:this.directIdLocal,closedStorage:!!this.nativeObjectBody&&!this.nativeObjectBody.partial||!!this.nativeStaticArrayBody?.closed&&!!this.compactExitLinks,
+        pairedStorage:!!this.pairedNativeStorage,
         recordIdx:this.jsTagEh ? this.jsTagRecordIdx : undefined} : null,
       importJsTag: this.jsTagEh,
       importCanonicalTable: !!this.usedCanonicalTable,
@@ -886,7 +898,8 @@ class StructuredWasmCompiler {
       importObject: { env:{...env,...this.importedGlobals} },
       box: this.box,
       directFrameContext: this.directFrames,
-      inlineActivationSiteCount:new Set([...(this.inlineActivations?.values()||[])].map(a=>a.call)).size,
+      inlineActivationSiteCount:new Set([...(this.inlineActivations?.values()||[])].map(a=>require('./inlineActivationResume').root(a).call)).size,
+      inlineActivationDepth:Math.max(0,...[...(this.inlineActivations?.values()||[])].map(a=>require('./inlineActivationResume').depth(a))),
       inlineAtomicStaticSiteCount:inlineAtomicStaticSites,
       hostOwnedCanonicalFuel:this.importedGlobals.canonical_fuel||null,
       canonicalOwnerReadyAddress:this.directOwnerReadyAddress,
@@ -927,6 +940,7 @@ class StructuredWasmCompiler {
       nativeStaticStateBodySites:this.nativeStaticArrayBody?.stateful?this.nativeStaticArrayBody.scalarSites.size:0,
       nativeStaticStateInstanceFieldSites:this.nativeStaticArrayBody?.instanceReads?.size||0,
       nativeStaticStateTailLoadCount:this.nativeStaticArrayBody?.tailLoads||0,
+      nativeStaticCheckedReferenceLoads:this.nativeStaticArrayBody?.checkedReferenceLoads?.size||0,
       nativeStaticArrayBodySites:this.nativeStaticArrayBody?.sites||0,
       nativeObjectBodyFieldSites:this.nativeObjectBody?.fields.size||0,
       nativeObjectBodyArraySites:this.nativeObjectBody?.arrayCaches.size||0,
@@ -944,6 +958,9 @@ class StructuredWasmCompiler {
       nativeArrayOwnershipLocalCount:[...this.arrayCaches.values()].filter(cache=>cache.owned!==undefined).length,
       closedNativeBody:((this.nativeObjectBody&&!this.nativeObjectBody.partial&&this.parameterObjectABI.length)||this.nativeStaticArrayBody?.closed&&this.directFrames&&this.compactExitLinks)&&!this.parameterArrayABI.length
         ?{version:1,key:this.className+'.'+this.method.name+this.method.descriptor,objectParameters:this.parameterObjectABI.slice()}:null,
+      pairedNativeStorage:this.pairedNativeStorage,
+      deferredPairedBoundaries,
+      pairedStorageCallSiteCount:this.pairedStorageCalls?.size||0,
       instructionExitSiteCount:this.instructionExitSites.size,
       nativeOperandSnapshotCount:this.nativeOperandSnapshotCount,
       nativeReadinessGuardsReusedCount:this.nativeReadinessProofSites.size,
@@ -1271,10 +1288,11 @@ class StructuredWasmCompiler {
     // a phi assignment rebinds its local (loop-carried receivers): caches
     // keyed on the phi describe the previous iteration's object
     const transferred=require('./arrayIdentityCaches').phiCopies(this,copies,out);
-    require('./nativeStaticArrayBody').phiCopies(this,copies,out,block.predIds[argIndex]);
+    const nativeArrayTransfers=require('./nativeStaticArrayBody').phiCopies(this,copies,out,block.predIds[argIndex])||[];
     const nativeCastTransfers=require('./nativeObjectBody').phiInputs(this,copies,out);
     for (const { phi } of copies) out.push(...this.cacheKillsFor(phi.id,transferred));
     require('./nativeObjectBody').phiOutputs(nativeCastTransfers,out);
+    for(const cache of nativeArrayTransfers.slice().reverse())out.push(OP.local_set,...uleb(cache.owned));
   }
 
   // A receiver loaded out of an array and consumed only by a dispatch guard
@@ -1780,9 +1798,11 @@ class StructuredWasmCompiler {
 
   emitNode(node, out) {
     if(require('./nativeStaticArrayBody').instruction(this,node,out))return;
+    require('./nativeStaticArrayBody').access(this,node,out);
     if(require('./nativeObjectBody').field(this,node,out))return;
     require('./nativeObjectBody').access(this,node,out);
     if((node.op==='getstatic'||node.op==='putstatic'||node.op==='getfield')&&require('./nativeStaticArrayBody').read(this,node,out))return;
+    require('./nativeObjectBody').inlineField(this,node,out);
     if(this.stackifiedNumericValues?.has(node)&&this.numericExpressionValue!==node)return;
     const op = node.op;
     const use = (i) => this.useOf(node.args[i]);
@@ -1912,7 +1932,7 @@ class StructuredWasmCompiler {
       }
       const storeImport = this.wasmJit.typedArrayStoresEnabled
         ? `aset_${op}` : `aset_${sig(t)}`;
-      out.push(...use(0), ...use(1), ...use(2), OP.call,
+      out.push(...(this.hasNestedInlineScopes?this.opaqueArrayCacheKills():[]),...use(0), ...use(1), ...use(2), OP.call,
         ...uleb(this.importIndexByName.get(storeImport)));
       if (op === 'aastore') out.push(...this.killSeqWhere((entry) => entry.kind === 'e'));
       return finish();
@@ -1937,10 +1957,10 @@ class StructuredWasmCompiler {
           OP.local_get, ...uleb(c.base), OP.i32_const, ...sleb(0), OP.i32_ge_s,
           OP.if, T.i32,
           OP.local_get, ...uleb(c.len),
-          OP.else, ...arr, OP.call, ...uleb(alenIdx), OP.end);
+          OP.else,...(this.hasNestedInlineScopes?this.opaqueArrayCacheKills():[]),...arr,OP.call,...uleb(alenIdx),OP.end);
         return finish();
       }
-      out.push(...use(0), OP.call, ...uleb(alenIdx));
+      out.push(...(this.hasNestedInlineScopes?this.opaqueArrayCacheKills():[]),...use(0),OP.call,...uleb(alenIdx));
       return finish();
     }
 
@@ -1964,7 +1984,7 @@ class StructuredWasmCompiler {
       const [, fieldOwner, [fieldName, descriptor]] = node.imm;
       const killKey = `${fieldName}:${descriptor}`;
       if(isStatic&&descriptor==='I'&&field.native)this.nativeStaticScalarAccesses.set(node.id,{...field,write:!isGet,killKey});
-      const caching = !this.wasmJit || this.wasmJit.fieldCacheEnabled !== false;
+      let caching = !this.wasmJit || this.wasmJit.fieldCacheEnabled !== false;
       // Slab path: the field has a static offset inside the wasm memory and
       // its slot kind matches the wasm type the import would have produced
       // (float fields keep an f64 slot for JS, so they stay on the import).
@@ -1996,6 +2016,7 @@ class StructuredWasmCompiler {
       const referenceSlot=!isStatic && this.objNativeOps && !receiver && !denseLayoutFor(this.jvm,fieldOwner)
         ? nativeReferenceSlotFor(this.jvm,fieldOwner,fieldName):null;
       if(referenceSlot)this.nativeObjectFieldOperations.set(node.id,{slot:referenceSlot,receiver:node.args[0],reference:true});
+      if(this.hasNestedInlineScopes&&!isStatic&&!referenceSlot)caching=false;
       if (isGet && caching) {
         const cacheKey = isStatic
           ? `s|${field.name}` : `f|${node.args[0].id}|${field.name}`;
@@ -2026,8 +2047,16 @@ class StructuredWasmCompiler {
             OP.local_set, ...uleb(entry.arrayGeneration));
         }
         for (const id of entry.readerIds) onMiss.push(...this.cacheKillsFor(id));
-        out.push(...(this.activeGuardedLoopPlan?.fieldNodes.has(node.id)
-          ? [OP.local_get,...uleb(entry.valLocal)] : this.cachedReadSeq(entry, loadSeq, onMiss)));
+        let readSeq=this.activeGuardedLoopPlan?.fieldNodes.has(node.id)
+          ? [OP.local_get,...uleb(entry.valLocal)] : this.cachedReadSeq(entry,loadSeq,onMiss);
+        if(this.hasNestedInlineScopes&&isStatic){
+          // Only certified data cells participate in CSE. A customized getter
+          // is an original Java read with possible effects at every occurrence.
+          const native=field.nativeReference||field.native;
+          readSeq=native?[OP.i32_const,...sleb(native.address),OP.i32_load,2,0,OP.i32_const,1,OP.i32_and,
+            OP.if,field.t,...readSeq,OP.else,...loadSeq,...onMiss,OP.end]:[...loadSeq,...onMiss];
+        }
+        out.push(...readSeq);
         if (node.kind !== 'V') out.push(OP.local_set, ...uleb(this.mustLocal(node)));
         if(entry.nativeReferenceHeader){
           const header=entry.nativeReferenceHeader,cache=this.arrayCacheFor(node);
@@ -2054,6 +2083,7 @@ class StructuredWasmCompiler {
       if(isStatic && !isGet && field.native){
         this.nativeStaticWrite(field,use(0),out);
       }else{
+        if(this.hasNestedInlineScopes&&!(isStatic&&isGet))out.push(...this.opaqueArrayCacheKills());
         if (receiver) {
           out.push(...receiver);
           for (let i = 1; i < node.args.length; i += 1) out.push(...use(i));
@@ -2073,7 +2103,7 @@ class StructuredWasmCompiler {
         // Non-ref fields only — a primitive reader value can never key
         // dependent array/field caches, so a hit that skips the refill
         // path's dependent kills stays sound.
-        if (caching && field.t !== T.ref) {
+        if (caching && field.t !== T.ref && !(this.hasNestedInlineScopes&&isStatic)) {
           const readField = addFieldImport(this, this.jvm, { arg: node.imm }, isStatic, true);
           const cacheKey = isStatic
             ? `s|${readField.name}` : `f|${node.args[0].id}|${readField.name}`;
@@ -2107,7 +2137,7 @@ class StructuredWasmCompiler {
         this.jvm.jit.monitorExit(monitor, thread);
         return 1;
       });
-      out.push(...use(0), OP.call, ...uleb(idx), OP.i32_eqz, OP.if, 0x40);
+      out.push(...(this.hasNestedInlineScopes?this.opaqueArrayCacheKills():[]),...use(0), OP.call, ...uleb(idx), OP.i32_eqz, OP.if, 0x40);
       this.emitCallExitStub(node, site, unders, true, out);
       out.push(OP.end);
       return;
@@ -2118,6 +2148,7 @@ class StructuredWasmCompiler {
     // dispatch map. Sites whose callee can hand the call back (deoptable)
     // get a flag check + exit stub right after the import call.
     if (op === 'invokestatic' && node.imm && node.imm[1] === GUARD_OWNER) {
+      if(this.hasNestedInlineScopes)out.push(...this.opaqueArrayCacheKills());
       const siteIndex = Number(node.imm[2][0]);
       if (this.fusedGuardArms.has(node)) {
         const remat = this.rematLoads.get(node.args[0]);
@@ -2190,8 +2221,12 @@ class StructuredWasmCompiler {
           }
           out.push(OP.local_get,...uleb(cache.base),OP.local_get,...uleb(cache.len));
         }
-        for(const input of c.objects||[])out.push(...this.objectStoreFill(input.cache,input.receiver));
-        if(c.objectParameters)for(const input of c.objects||[])out.push(OP.local_get,...uleb(input.cache.typedStore));
+        for(const input of c.objects||[])if(c.pair)require('./pairedNativeStorage').fill(this,input,out);
+          else out.push(...this.objectStoreFill(input.cache,input.receiver));
+        if(c.objectParameters)for(const [i,input]of (c.objects||[]).entries()){
+          out.push(OP.local_get,...uleb(input.cache.typedStore));
+          if(c.pair)out.push(OP.local_tee,...uleb(c.pair.captured[i]));
+        }
         const publish=c.objectParameters?[]:(c.objects||[]).flatMap(input=>[OP.local_get,...uleb(input.cache.store),OP.global_set,...uleb(input.global)]);
         if(c.guardIdx!==undefined){
           // Arguments already reside on the operand stack. Inspect the saved
@@ -2225,7 +2260,7 @@ class StructuredWasmCompiler {
           require('./nativeObjectBody').callSlot(this,node,c.slot,out);
         }
         if(c.arrayResult)out.push(...this.clearArrayResult(c.arrayResult.indices));
-        out.push(OP.call_indirect,...uleb(c.type),0x00);
+        this.emitCanonicalInvoke(node,c,out);
         if(c.arrayResult){const r=c.arrayResult;out.push(OP.global_get,...uleb(r.indices.base),OP.local_set,...uleb(r.base),
           OP.global_get,...uleb(r.indices.length),OP.local_set,...uleb(r.length),
           OP.global_get,...uleb(r.indices.owned),OP.local_set,...uleb(r.owned),...this.clearArrayResult(r.indices));}
@@ -2345,6 +2380,12 @@ class StructuredWasmCompiler {
       out.push(...use(0), OP.call, ...uleb(addANewArrayImport(this, this.jvm, node.imm)));
       return finish();
     }
+    if (op === 'multianewarray') {
+      const index=addMultiANewArrayImport(this,this.jvm,node.imm);
+      if(node.args.length!==Number(node.imm[1]))throw new Unsupported('multianewarray operands');
+      for(let i=0;i<node.args.length;i++)out.push(...use(i));
+      out.push(OP.call,...uleb(index));return finish();
+    }
     if (op === 'new') {
       out.push(OP.call, ...uleb(addNewImport(this, this.jvm, node.imm)));
       return finish();
@@ -2371,7 +2412,7 @@ class StructuredWasmCompiler {
       }
       const nativeCast=this.nativeCastSeq(node);
       if(nativeCast){out.push(...nativeCast);return finish();}
-      if (op === 'instanceof' && (!this.wasmJit || this.wasmJit.fieldCacheEnabled !== false)) {
+      if (op === 'instanceof' && !this.hasNestedInlineScopes && (!this.wasmJit || this.wasmJit.fieldCacheEnabled !== false)) {
         // guard-shaped instanceof runs per loop iteration on a loop-invariant
         // receiver: cache the verdict per SSA value instead of crossing into
         // JS every time
@@ -2384,7 +2425,7 @@ class StructuredWasmCompiler {
           OP.local_get, ...uleb(c.verdict));
         return finish();
       }
-      out.push(...use(0), OP.call, ...uleb(this.castImport(op, node.imm)));
+      out.push(...(this.hasNestedInlineScopes?this.opaqueArrayCacheKills():[]),...use(0), OP.call, ...uleb(this.castImport(op, node.imm)));
       return finish();
     }
 
@@ -2478,7 +2519,7 @@ class StructuredWasmCompiler {
     }
     // Retain ownership only for an actual return identity or a regional
     // consumer. Other header users need location/length, not this new fact.
-    const track=!!source||this.arrayReturnIdentities?.has(cache.value.id);
+    const track=!!source||this.arrayReturnIdentities?.has(cache.value.id)||this.nativeStaticArrayBody?.checkedReferenceLoads?.has(cache.value.id);
     if(track&&cache.owned===undefined){cache.owned=this.nextLocal++;this.declared.push(T.i32);}
     const out=[OP.local_get,...uleb(base),OP.local_set,...uleb(cache.base),
       OP.local_get,...uleb(len),OP.local_set,...uleb(cache.len),
@@ -2506,6 +2547,7 @@ class StructuredWasmCompiler {
     const arr = this.useOf(cache.value);
     const query = require('./arrayIdentityCaches').fill(this,cache,[
       ...(cache.owned===undefined?[]:[OP.i32_const,0,OP.local_set,...uleb(cache.owned)]),
+      ...(this.hasNestedInlineScopes?this.opaqueArrayCacheKills():[]),
       ...arr, OP.call, ...uleb(this.abaseIdx), OP.local_set, ...uleb(cache.base),
       ...arr, OP.call, ...uleb(this.alen0Idx), OP.local_set, ...uleb(cache.len),
     ]);
@@ -2629,6 +2671,7 @@ class StructuredWasmCompiler {
       : [...arr, ...idx, OP.call,
         ...uleb(this.importIndexByName.get(
           arrayLoadImportName(this, node.op, importT)))];
+    if(this.hasNestedInlineScopes)importCall.unshift(...this.opaqueArrayCacheKills());
     const heapOp = [OP[acc.op], ...uleb(acc.shift), ...uleb(0)];
     if(this.activeGuardedLoopPlan?.memoryNodes.has(node.id)) {
       return [...addr,...(storeSeq||[]),...heapOp];
@@ -2730,8 +2773,10 @@ class StructuredWasmCompiler {
     const header=headers.get(node.id);
     // A foreign array getter can change any field container or cell. Discard
     // cached facts before invoking it; the owned GC branch keeps its fast path.
-    const fallback=[...this.opaqueArrayCacheKills(),OP.i32_const,...sleb(-2),OP.local_set,...uleb(header.base),OP.i32_const,0,OP.local_set,...uleb(header.len),
-      ...receiver,...index,OP.call,...uleb(this.importIndexByName.get(arrayLoadImportName(this,'aaload',T.ref)))];
+    const fallback=[];
+    if(this.nativeStaticArrayBody?.checkedReferenceLoads?.has(node.id))this.emitInstructionExit(node,fallback);
+    else fallback.push(...this.opaqueArrayCacheKills(),OP.i32_const,...sleb(-2),OP.local_set,...uleb(header.base),OP.i32_const,0,OP.local_set,...uleb(header.len),
+      ...receiver,...index,OP.call,...uleb(this.importIndexByName.get(arrayLoadImportName(this,'aaload',T.ref))));
     const address=[OP.i32_const,...sleb(-2),OP.local_get,...uleb(cache.base),OP.i32_sub,
       ...index,OP.i32_const,3,OP.i32_shl,OP.i32_add];
     (this.nativeReferenceArraySites ||= new Set()).add(node.id);
@@ -2749,6 +2794,7 @@ class StructuredWasmCompiler {
   opaqueArrayCacheKills() {
     const out=this.killSeqWhere(()=>true);
     for(const cache of this.objCaches.values()){
+      if(cache.inlineOwnership)out.push(OP.i32_const,0,OP.local_set,...uleb(cache.nativeRegionValid));
       out.push(OP.i32_const,0,OP.local_set,...uleb(cache.filled));
       if(cache.storeFilled!==null)out.push(OP.i32_const,0,OP.local_set,...uleb(cache.storeFilled));
       if(cache.store!==null)out.push(OP.ref_null,T.ref,OP.local_set,...uleb(cache.store));
@@ -2905,15 +2951,16 @@ class StructuredWasmCompiler {
       }
       (this.nativeStaticReferenceSites ||= new Set()).add(field.idx);
       return [OP.i32_const,...sleb(native.address),OP.i32_load,2,0,OP.i32_const,1,OP.i32_and,OP.if,T.ref,
-        ...capture,OP.global_get,...uleb(native.index),OP.else,...fallback,OP.call,...uleb(field.idx),OP.end];
+        ...capture,OP.global_get,...uleb(native.index),OP.else,...fallback,
+        ...(this.hasNestedInlineScopes?this.opaqueArrayCacheKills():[]),OP.call,...uleb(field.idx),OP.end];
     }
-    if(!field.native)return [OP.call,...uleb(field.idx)];
+    if(!field.native)return [...(this.hasNestedInlineScopes?this.opaqueArrayCacheKills():[]),OP.call,...uleb(field.idx)];
     const sites=this.nativeStaticSites ||= new Map();
     if(!sites.has('read'))sites.set('read',new Set());sites.get('read').add(field.idx);
     const address=field.native.address;
     return [OP.i32_const,...sleb(address),OP.i32_load,2,0,OP.i32_const,1,OP.i32_and,OP.if,T.i32,
       OP.i32_const,...sleb(address+4),OP.i32_load,2,0,
-      OP.else,OP.call,...uleb(field.idx),OP.end];
+      OP.else,...(this.hasNestedInlineScopes?this.opaqueArrayCacheKills():[]),OP.call,...uleb(field.idx),OP.end];
   }
 
   nativeStaticWrite(field,value,out) {
@@ -2926,7 +2973,7 @@ class StructuredWasmCompiler {
       OP.i32_const,...sleb(address),OP.i32_load,2,0,OP.i32_const,2,OP.i32_and,OP.if,0x40,
       OP.i32_const,...sleb(address+4),OP.local_get,...uleb(scratch),OP.i32_store,2,0,
       OP.i32_const,...sleb(address+8),OP.i32_const,0,OP.i32_store,2,0,
-      OP.else,OP.local_get,...uleb(scratch),OP.call,...uleb(field.idx),OP.end);
+      OP.else,...(this.hasNestedInlineScopes?this.opaqueArrayCacheKills():[]),OP.local_get,...uleb(scratch),OP.call,...uleb(field.idx),OP.end);
   }
 
   fieldCacheFor(cacheKey, t, killKey, kind, recvId) {
@@ -2970,6 +3017,8 @@ class StructuredWasmCompiler {
     }
     const obj = this.objCaches.get(id);
     if (obj) {
+      if(obj.pairedStore!==undefined)seq.push(OP.ref_null,1,OP.local_set,...uleb(obj.pairedStore),
+        OP.ref_null,T.ref,OP.local_set,...uleb(obj.pairedRaw));
       this.blockSlabFills?.delete(obj);
       seq.push(OP.i32_const,0,OP.local_set,...uleb(obj.filled));
       if(obj.storeFilled!==null)seq.push(OP.i32_const,0,OP.local_set,...uleb(obj.storeFilled));
@@ -2978,16 +3027,19 @@ class StructuredWasmCompiler {
   }
 
   callFieldCacheKills(call) {
-    if (call.writes === null) return this.killSeqWhere(() => true);
+    const inline=[];
+    for(const cache of this.objCaches.values())if(cache.inlineOwnership)
+      inline.push(OP.i32_const,0,OP.local_set,...uleb(cache.nativeRegionValid));
+    if (call.writes === null) return [...inline,...this.killSeqWhere(() => true)];
     // Callee writes are summarized for fields only: any call may store into
     // a reference array, so cached elements never survive one.
     if (call.writes?.size) {
-      return this.killSeqWhere(entry => entry.kind === 'e' || call.writes.has(entry.killKey));
+      return [...inline,...this.killSeqWhere(entry => entry.kind === 'e' || call.writes.has(entry.killKey))];
     }
     const elementKills = this.killSeqWhere(entry => entry.kind === 'e');
-    if (elementKills.length) return elementKills;
-    return call.writes?.size
-      ? this.killSeqWhere(entry => call.writes.has(entry.killKey)) : [];
+    if (elementKills.length) return [...inline,...elementKills];
+    return [...inline,...(call.writes?.size
+      ? this.killSeqWhere(entry => call.writes.has(entry.killKey)) : [])];
   }
 
   killSeqWhere(predicate) {
@@ -3031,7 +3083,7 @@ class StructuredWasmCompiler {
       matches.push(OP.local_get,...uleb(local),OP.i32_const,...sleb(classIndexOf(this.jvm,name)),OP.i32_eq);
       if(i)matches.push(OP.i32_or);
     }
-    const fallback=[...receiver,OP.call,...uleb(this.castImport(node.op,node.imm))];
+    const fallback=[...(this.hasNestedInlineScopes?this.opaqueArrayCacheKills():[]),...receiver,OP.call,...uleb(this.castImport(node.op,node.imm))];
     const result=node.op==='checkcast'?receiver:[OP.i32_const,1];
     (this.nativeCastSites ||= new Set()).add(node.id);
     return [...this.objectStoreFill(cache,receiver),OP.local_get,...uleb(cache.store),OP.ref_is_null,
@@ -3171,6 +3223,11 @@ class StructuredWasmCompiler {
     ));
   }
 
+  emitCanonicalInvoke(node,call,out) {
+    require('./pairedNativeStorage').select(this,call,out);
+    out.push(OP.call_indirect,...uleb(call.type),0x00);
+  }
+
   // invokestatic bound directly to another compiled wasm method. A callee
   // that can never exit (fully compiled, no deoptable calls) is called with
   // a junk frame; any other ready callee takes the scratch-frame nested-call
@@ -3308,6 +3365,7 @@ class StructuredWasmCompiler {
           direct=this.wasmJit.canonicalDirectLinks.allocate(key,nativeParams,results,recordedFallback,arrayIndices,compact,
             objectParameters?[]:objects.map(input=>input.value),null,objectParameters?objects.map(input=>input.index):[]);
           (this.canonicalSlotByNode||=new Map()).set(node,direct);
+          (this.canonicalFallbackByNode||=new Map()).set(node,recordedFallback);
           this.canonicalSlots.push(direct);
           if(compact)(this.canonicalCompactSlots ||= new Set()).add(direct);
           this.canonicalLifetime.fallbacks.push(recordedFallback);
@@ -3340,7 +3398,9 @@ class StructuredWasmCompiler {
         const consumeIdx=compact ? this.addImport('canonical_compact_exit',[T.i32],[T.i32],
           status=>this.consumeCompactExit(status)) : this.addImport('canonical_exit',[T.i32,T.i32,T.ref],[T.i32],
           (status,id,owner)=>this.consumeDirectExit(status,id,owner));
-        return {canonical:{slot:direct,type,consumeIdx,arrays,objects,objectParameters,arrayOwnerReady,compact,emptyCopy},writes,deoptable:true};
+        const pair=objectParameters?require('./pairedNativeStorage').prepare(this,node,calleeSt,nativeParams,results,
+          arrayIndices,objects,this.canonicalFallbackByNode.get(node),null):null;
+        return {canonical:{slot:direct,type,consumeIdx,arrays,objects,objectParameters,arrayOwnerReady,compact,emptyCopy,pair},writes,deoptable:true};
       }
     }
     // UNKNOWN: the callee owns no module yet. Emit a late-bound call rather
@@ -3767,7 +3827,7 @@ class StructuredWasmCompiler {
         // This slot deliberately has no method key and is never published.
         // A miss cannot enter the old target merely because its ABI matches.
         const fallbackSlot=links.allocate(Symbol('instance dispatch fallback'),nativeParams,results,fallback,[],compact,[],resultRecord);
-        slots={targetSlot,fallbackSlot};
+        slots={targetSlot,fallbackSlot,fallback};
         (this.canonicalInstanceSlots ||= new Map()).set(node,slots);
         this.canonicalSlots.push(targetSlot,fallbackSlot);
         if(compact){(this.canonicalCompactSlots ||= new Set()).add(targetSlot);this.canonicalCompactSlots.add(fallbackSlot);}
@@ -3779,7 +3839,9 @@ class StructuredWasmCompiler {
       const consumeIdx=compact ? this.addImport('canonical_compact_exit',[T.i32],[T.i32],
         status=>this.consumeCompactExit(status)) : this.addImport('canonical_exit',[T.i32,T.i32,T.ref],[T.i32],
         (status,id,exitOwner)=>this.consumeDirectExit(status,id,exitOwner));
-      return {canonical:{slot:slots.targetSlot,fallbackSlot:slots.fallbackSlot,guardIdx,
+      const pair=objectParameters?require('./pairedNativeStorage').prepare(this,node,canonicalTarget,nativeParams,results,
+        [],objects,slots.fallback,resultRecord):null;
+      return {canonical:{slot:slots.targetSlot,fallbackSlot:slots.fallbackSlot,guardIdx,pair,
           guardCache:this.castCacheFor(node.args[0],`canonical:${op}:${key}`),type,consumeIdx,compact,objects,objectParameters,nativeGuard,arrayResult},
         writes,deoptable:true};
     }

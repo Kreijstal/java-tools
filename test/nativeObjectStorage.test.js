@@ -171,3 +171,74 @@ test('tracked wrapper bindings avoid descriptor scans and revoke independently f
  t.equal(nativeObjectBaseOf(copy,otherMemory),-1,'primitive base also retains the realm boundary');
  t.end();
 });
+
+test('native ownership shortcut certificate is synchronous, sticky and never borrowed from aliases',t=>{
+ const {JVM}=require('../src/core/jvm'),{newFields,makeObjectRef,writeField}=require('../src/core/objectModel');
+ const {pairedNativeObjectStorageOf,validatedNativeObjectStorageOf,nativeObjectStorageTypes}=require('../src/core/nativeObjectStorage');
+ const ops=getNativeObjectStorageOps();t.ok(ops,'native GC storage is supported without flags');if(!ops){t.end();return;}
+ const read=new WebAssembly.Instance(new WebAssembly.Module(assembleModule({importDecls:[],gcTypes:nativeObjectStorageTypes(),
+  mainParams:[[0x63,1]],mainResults:[T.i32],declared:[],body:[OP.local_get,0,0xfb,2,1,3,OP.end]}))).exports.run;
+ const raw=ops.create(128,7,1);t.equal(read(raw),0,'raw typed storage carries no tracked ownership certificate');
+ t.equal(ops.classId(raw),7,'certificate does not alter the actual class identity');
+ const j=new JVM({wasmHeap:true,wasmFields:true,jit:{compileWorker:false}});
+ j.classes.CertificateCell={ast:{classes:[{className:'CertificateCell',superClassName:'java/lang/Object',items:[
+  {type:'field',field:{name:'count',descriptor:'I',flags:[]}},
+  {type:'field',field:{name:'next',descriptor:'LCertificateCell;',flags:[]}}
+ ]}]}};
+ const fields=newFields(j,'CertificateCell'),a=makeObjectRef(j,'CertificateCell',fields),b=makeObjectRef(j,'CertificateCell',fields),memory=j.wasmHeap.memory;
+ const store=nativeObjectStorageOf(a,memory);
+ t.equal(read(store),1,'private tracked allocation publishes a native-readable certificate');
+ t.equal(pairedNativeObjectStorageOf(a,memory),store,'paired lookup authenticates the exact tracked Java wrapper');
+ t.equal(pairedNativeObjectStorageOf(b,memory),store,'a genuine shared-field alias can use its own paired lookup');
+ t.equal(pairedNativeObjectStorageOf(a,new WebAssembly.Memory({initial:1})),null,'pairing never crosses memory realms');
+ writeField(fields,'CertificateCell.count',31);writeField(fields,'CertificateCell.next',b);a.debugNote='host';
+ t.equal(read(store),1,'ordinary Java field writes and unrelated wrapper properties preserve the certificate');
+ t.equal(ops.reference(store,0),b,'reference updates retain original wrapper identity');
+ a.fields={};
+ t.equal(read(store),-1,'wrapper binding replacement synchronously revokes even a captured native store');
+ t.equal(pairedNativeObjectStorageOf(a,memory),null,'the replaced wrapper no longer supplies a paired store');
+ t.equal(validatedNativeObjectStorageOf(b,memory),store,'another alias retains the supported checked path');
+ t.equal(read(store),-1,'checking a valid alias cannot reactivate a revoked shared certificate');
+ a.fields=fields;t.equal(validatedNativeObjectStorageOf(a,memory),store,'restored binding still recovers by descriptor validation');
+ t.equal(read(store),-1,'binding restoration cannot reissue the shared native certificate');
+ ops.certify(store);t.equal(read(store),-1,'even the initialization primitive cannot recertify a revoked store');
+ const {createNativeFieldsStorage}=require('../src/core/nativeObjectStorage');
+ const reused=createNativeFieldsStorage(store,memory,ops.base(store),j.classes.CertificateCell._slabLayout.storageShape);
+ t.equal(validatedNativeObjectStorageOf(makeObjectRef(j,'CertificateCell',reused),memory),store,'a recreated tracked alias retains checked recovery');
+ t.equal(read(store),-1,'recreating a field container cannot revive an old alias certificate');
+ const legacy={fields};registerNativeObjectStorage(legacy,fields,store,memory);
+ t.equal(pairedNativeObjectStorageOf(legacy,memory),null,'manual registration is not synchronously tracked pairing');
+ let traps=0;const proxy=new Proxy({fields},{getOwnPropertyDescriptor(){traps++;throw Error('descriptor trap');}});
+ registerNativeObjectStorage(proxy,fields,store,memory);
+ t.equal(pairedNativeObjectStorageOf(proxy,memory),null,'legacy proxy registration cannot borrow a native shortcut');
+ t.equal(traps,0,'paired lookup never executes a proxy descriptor trap');
+ const freshFields=newFields(j,'CertificateCell'),fresh=makeObjectRef(j,'CertificateCell',freshFields),freshStore=nativeObjectStorageOf(fresh,memory);
+ t.equal(read(freshStore),1,'a separate fresh allocation has its own certificate');
+ let getters=0;Object.defineProperty(freshFields,'CertificateCell.count',{configurable:true,get(){getters++;t.equal(read(freshStore),-1,'getter sees revocation already published');return 9;}});
+ t.equal(read(freshStore),-1,'field descriptor mutation synchronously revokes the native bit');
+ t.equal(pairedNativeObjectStorageOf(fresh,memory),null,'customized field shape supplies no paired shortcut');
+ t.equal(getters,0,'revocation itself invokes no getter');
+ t.equal(freshFields['CertificateCell.count'],9,'the original host getter remains observable');
+ delete freshFields['CertificateCell.count'];t.equal(validatedNativeObjectStorageOf(fresh,memory),freshStore,'restored field shape retains ordinary checked recovery');
+ t.equal(read(freshStore),-1,'field-shape restoration does not reactivate a shared native bit');
+ t.equal(pairedNativeObjectStorageOf(fresh,memory),freshStore,'paired identity can recover independently of the expired shortcut bit');
+ t.end();
+});
+
+test('all tracked structural mutation paths revoke a captured native certificate',t=>{
+ const {JVM}=require('../src/core/jvm'),{newFields,makeObjectRef,BASE_KEY}=require('../src/core/objectModel');
+ const ops=getNativeObjectStorageOps();t.ok(ops,'requires supported native storage');if(!ops){t.end();return;}
+ const j=new JVM({wasmHeap:true,wasmFields:true,jit:{compileWorker:false}});
+ j.classes.RevocableCell={ast:{classes:[{className:'RevocableCell',superClassName:'java/lang/Object',items:[{type:'field',field:{name:'value',descriptor:'I',flags:[]}}]}]}};
+ const cases=[
+  ['base assignment',(wrapper,fields)=>{fields[BASE_KEY]+=8;}],
+  ['new symbol',(wrapper,fields)=>{fields[Symbol('host')]=1;}],
+  ['property deletion',(wrapper,fields)=>{delete fields['RevocableCell.value'];}],
+  ['prototype replacement',(wrapper,fields)=>Object.setPrototypeOf(fields,{})],
+  ['wrapper deletion',wrapper=>{delete wrapper.fields;}],
+  ['wrapper accessor',wrapper=>Object.defineProperty(wrapper,'fields',{get(){throw Error('early getter');}})],
+ ];
+ for(const [name,mutate]of cases){const fields=newFields(j,'RevocableCell'),wrapper=makeObjectRef(j,'RevocableCell',fields),store=nativeObjectStorageOf(wrapper,j.wasmHeap.memory);
+  t.equal(ops.certificate(store),1,name+' starts certified');mutate(wrapper,fields);t.equal(ops.certificate(store),-1,name+' revokes before later native use');}
+ t.end();
+});

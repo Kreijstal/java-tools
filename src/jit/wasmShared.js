@@ -14,13 +14,15 @@ const CAPTURE_DIRECT_ID=Object.freeze({kind:'capture direct invocation'});
 // Reserved structured fresh-entry mode. Only the closed canonical wrapper
 // supplies it after its caller has validated the private object arguments.
 const CLOSED_NATIVE_ENTRY=-1;
+// An entry-only paired-storage proof does not certify a callback-free body.
+const PAIRED_STORAGE_ENTRY=-2;
 const ENTRY_MODE_CODE=Symbol('entry-mode code');
 // Keep the shared core resumable, while fixed canonical exports select their
 // entry protocol during emission instead of relying on engine DCE. These
 // alternatives contain no branches to labels outside the alternative.
-function entryModeCode(blockLocal,ordinary,closed,resultType=0x40){
- return {kind:ENTRY_MODE_CODE,ordinary,closed,runtime:[OP.local_get,...uleb(blockLocal),
-  OP.i32_const,...sleb(CLOSED_NATIVE_ENTRY),OP.i32_eq,OP.if,resultType,
+function entryModeCode(blockLocal,ordinary,closed,resultType=0x40,mode=CLOSED_NATIVE_ENTRY){
+ return {kind:ENTRY_MODE_CODE,ordinary,closed,mode,runtime:[OP.local_get,...uleb(blockLocal),
+  OP.i32_const,...sleb(mode),OP.i32_eq,OP.if,resultType,
   ...closed,OP.else,...ordinary,OP.end]};
 }
 const DEFINED_GLOBAL=Symbol('defined Wasm global');
@@ -79,6 +81,12 @@ function uleb(n) {
   return out;
 }
 
+// Function-call spread has an engine-specific argument limit. Emitted bodies
+// can exceed it even when a compact wrapper later rejects their code size.
+function appendBytes(out, bytes) {
+  for (const byte of bytes) out.push(byte);
+}
+
 // Emit:
 //   block $done
 //     block $catch
@@ -102,11 +110,15 @@ function emitTryTableCatchAll(out, emitBody, emitCatch) {
     OP.block, 0x40,
     OP.try_table, 0x40,
     ...uleb(1), OP.catch_all_clause, ...uleb(0),
-    ...body,
+  );
+  appendBytes(out, body);
+  out.push(
     OP.end,
     OP.br, ...uleb(1),
     OP.end,
-    ...handler,
+  );
+  appendBytes(out, handler);
+  out.push(
     OP.end,
   );
 }
@@ -119,8 +131,11 @@ function emitTryTableJsTag(out, emitBody, emitCatch, recordIdx) {
   emitCatch(handler);
   out.push(OP.block, 0x40, OP.block, T.ref,
     OP.try_table, 0x40, ...uleb(1), 0x00, ...uleb(0), ...uleb(0),
-    ...body, OP.end, OP.br, ...uleb(1), OP.end,
-    OP.call, ...uleb(recordIdx), ...handler, OP.end);
+  );
+  appendBytes(out, body);
+  out.push(OP.end, OP.br, ...uleb(1), OP.end, OP.call, ...uleb(recordIdx));
+  appendBytes(out, handler);
+  out.push(OP.end);
 }
 
 let wasmJsTagSupport;
@@ -674,8 +689,9 @@ function structuredBodyBytes(body,frame,globals,returnValue=false,globalBase=0) 
       if(!frame.inline)out.push(OP.global_get,...uleb(globals),OP.local_set,...uleb(frame.idLocal),
         OP.i32_const,0,OP.global_set,...uleb(globals));
     }else if(byte?.kind===ENTRY_MODE_CODE){
-      const selected=frame?.entryMode==='closed'?byte.closed:frame?.entryMode==='ordinary'?byte.ordinary:byte.runtime;
-      out.push(...structuredBodyBytes(selected,frame,globals,returnValue,globalBase));
+      const mode=typeof frame?.entryMode==='number'?frame.entryMode:frame?.entryMode==='closed'?CLOSED_NATIVE_ENTRY:frame?.entryMode==='ordinary'?0:undefined;
+      const selected=mode===undefined?byte.runtime:mode===(byte.mode??CLOSED_NATIVE_ENTRY)?byte.closed:byte.ordinary;
+      appendBytes(out,structuredBodyBytes(selected,frame,globals,returnValue,globalBase));
     }else if(byte?.kind===DEFINED_GLOBAL){
       out.push(byte.op,...uleb(globalBase+byte.index));
     }else out.push(byte);
@@ -701,7 +717,7 @@ function inlineCompactBody(paramCount,missingHeap,mainParams,declared,body,retvT
   if(entryBlock)out.push(OP.i32_const,...sleb(entryBlock),OP.local_set,...uleb(mainParams.length-2));
   const emitCatch=frame.recordIdx==null ? emitTryTableCatchAll :
     (out,body,handler)=>emitTryTableJsTag(out,body,handler,frame.recordIdx);
-  emitCatch(out,native=>native.push(...structuredBodyBytes(body.slice(0,-1),{...frame,inline:true,entryMode:entryBlock===CLOSED_NATIVE_ENTRY?'closed':'ordinary'},globals,retvType,retvIndex)),
+  emitCatch(out,native=>appendBytes(native,structuredBodyBytes(body.slice(0,-1),{...frame,inline:true,entryMode:entryBlock},globals,retvType,retvIndex)),
     handler=>{
       handler.push(OP.i32_const,...sleb(-5));
       if(retvType)handler.push(OP.global_get,...uleb(retvIndex));
@@ -904,6 +920,8 @@ function assembleModule({ importDecls, mainParams, mainResults, declared, body, 
       // made first; adding the contract must not displace their inline bodies.
       if(canonicalFrameExport.closedStorage&&!heapParameterCount)
         compactEntry('canonicalClosedStorageRun',[...paramOnly,...parameterObjectABI.map(()=>[0x63,1])],0,0,CLOSED_NATIVE_ENTRY);
+      if(canonicalFrameExport.pairedStorage&&objectParameterCount)
+        compactEntry('canonicalPairedStorageRun',[...paramOnly,...parameterArrayABI.flatMap(()=>[T.i32,T.i32]),...parameterObjectABI.map(()=>[0x63,1])],0,0,PAIRED_STORAGE_ENTRY);
     }
     for(const [label,index] of [['canonicalOwner',globals+2],['canonicalFuel',fuelIndex],['canonicalEntries',globals+1]]){
       const bytes=[...label].map(c=>c.charCodeAt(0));exportEntries.push([bytes.length,...bytes,3,...uleb(index)]);
@@ -1051,7 +1069,7 @@ function capturesBooleanStatic(method) {
 }
 
 module.exports = {
-  T, CAT2, OP, TRUNC_SAT, STRUCTURED_RETURN, CAPTURE_DIRECT_ID, CLOSED_NATIVE_ENTRY, entryModeCode, definedGlobal,
+  T, CAT2, OP, TRUNC_SAT, STRUCTURED_RETURN, CAPTURE_DIRECT_ID, CLOSED_NATIVE_ENTRY, PAIRED_STORAGE_ENTRY, entryModeCode, definedGlobal,
   uleb, sleb, f32bytes, f64bytes,
   emitTryTableCatchAll, supportsWasmTryTable, emitTryTableJsTag, supportsWasmJsTag,
   wasmProfilerName, wasmFunctionNameSection,

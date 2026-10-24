@@ -1781,7 +1781,7 @@ class JVM {
         if (!state || state.status !== "ready") continue;
         if (!(state.partialDeps &&
             (state.partialDepsStructured || state.partialDepsUnserviceable) &&
-            wasm.depsMoved(state))) continue;
+            wasm.depsMoved(state)) && !wasm.preparedPairedBoundaryReady?.(state)) continue;
         if ((state.depRecompiles || 0) >= limit) continue;
         state.depWorld = wasm.depWorldVersion();
         state.blockerSig = wasm.blockerSignature(state.blockers);

@@ -67,21 +67,23 @@ function prepareWhole(c){
 // One body for bounded integer state over statics and readonly instance arrays.
 // Scalar stores remain visible at their exact Java instruction; only cell
 // representation/readiness decisions move to a side-effect-free entry guard.
-function prepareStateful(c,structured){
+function prepareStateful(c,structured,scope=null){
  if(!c.heap||c.liveRanges.length||c.demoted.size||c.deoptBlocks.size||
     c.irreducibleSplitBlocks||c.guardedNestedArrayLoopPlans?.size)return null;
  // Flattened leaf code is safe under the same whole-body effect proof. Keep
  // only loops with an original header or an existing recovered activation;
  // this proof never invents a new fuel/resumption policy for a spliced loop.
  if(c.origIdx&&(!structured||[...structured.loopHeaders].some(header=>{
+  if(scope&&!scope.blocks.has(header))return false;
   const item=c.cfg.blocks[header].insns[0];
   return c.origIdx[item]<0&&!require('./inlineActivationResume').at(c,item);
  })))return null;
  const reads=new Map(),fields=new Map(),scalars=new Map(),scalarSites=new Map(),roots=[];
- const instanceReads=new Map(),instanceArrays=new Map(),receivers=new Set(),guards=new Map(),fallbacks=new Set();let tailLoads=0;
+ const instanceReads=new Map(),instanceArrays=new Map(),receivers=new Set(),guards=new Map(),fallbacks=new Set(),checkedReferenceLoads=new Set();let tailLoads=0;
+ const input=value=>c.fn.params.includes(value)||scope?.inputs.has(value.id);
  let count=0,sites=0,writes=0;
  for(const block of c.fn.blocks){
-  if(!c.fn.reachable.has(block.id))continue;
+  if(!c.fn.reachable.has(block.id)||scope&&!scope.blocks.has(block.id))continue;
   if(!['return','goto','fall','cond','switch'].includes(block.term.kind))return null;
   for(const node of block.body){
    if(++count>256)return null;
@@ -90,7 +92,7 @@ function prepareStateful(c,structured){
    // A positive class match is proved with authenticated private storage. An
    // unknown class takes the original invoke handoff below, never a host cast.
    if(node.op==='instanceof'&&c.items[node.itemIdx]?.inlineReceiverGuard&&
-      c.fn.params.includes(node.args[0])&&c.objNativeOps){
+      input(node.args[0])&&c.objNativeOps){
     const matching=Object.keys(c.jvm.classes).filter(name=>c.jvm.isInstanceOfSync(name,node.imm)===true);
     if(!matching.length||matching.length>16)return null;
     receivers.add(node.args[0]);if(receivers.size>8)return null;
@@ -114,7 +116,7 @@ function prepareStateful(c,structured){
     reads.set(node.id,field);fields.set(field.native.address,field);continue;
    }
    if(node.op==='getfield'){
-    if(!c.objNativeOps||!c.fn.params.includes(node.args[0]))return null;
+    if(!c.objNativeOps||!input(node.args[0]))return null;
     const [,owner,[name,descriptor]]=node.imm,slot=nativeReferenceSlotFor(c.jvm,owner,name);
     const declaration=c.jvm.classes[owner]?.ast?.classes?.[0]?.items.find(item=>item.type==='field'&&
      item.field.name===name&&item.field.descriptor===descriptor)?.field;
@@ -129,8 +131,14 @@ function prepareStateful(c,structured){
    }
    // A final reference-array read may run a foreign getter, but cannot return
    // to the certified body. All original writes already happened before it.
-   if(node.op==='aaload'&&block.term.kind==='return'&&block.term.insnOp==='areturn'&&
-      block.term.args[0]===node&&block.body.at(-1)===node){tailLoads++;continue;}
+   if(node.op==='aaload'&&block.body.at(-1)===node&&(
+      block.term.kind==='return'&&block.term.insnOp==='areturn'&&block.term.args[0]===node||
+      scope&&block.term.kind==='goto'&&c.cfg.blocks[block.term.target]?.insns[0]===scope.end)){tailLoads++;continue;}
+   // Continue only through the owned reference-array branch. Foreign or
+   // customized arrays hand off before their original getter executes.
+   if(node.op==='aaload'&&c.objNativeOps&&node.slotState&&Array.isArray(node.stackUnder)){
+    checkedReferenceLoads.add(node.id);continue;
+   }
    if(element.test(node.op)||node.op==='arraylength'){roots.push(node.args[0]);sites++;continue;}
    return null;
   }
@@ -143,25 +151,47 @@ function prepareStateful(c,structured){
    const value=pending.pop();if(seen.has(value))continue;
    if(!value||++work>4096||references.size>=64)return null;
    seen.add(value);references.set(value.id,value);
+   // Generated miss invokes terminate this specialized invocation. Their
+   // apparent SSA result may meet a real array at a join, but that result
+   // never reaches the join in emitted native code.
+   if(fallbacks.has(value.id))continue;
    if(value.op==='getstatic'&&reads.has(value.id)||value.op==='getfield'&&instanceReads.get(value.id)?.array){source=true;continue;}
+   if(value.op==='aaload'&&checkedReferenceLoads.has(value.id)){source=true;continue;}
    if(value.op!=='phi'||value.kind!=='A')return null;pending.push(...value.args);
   }
   if(!source)return null;
  }
  const objects=new Map([...receivers].map(receiver=>[receiver.id,c.objCacheFor(receiver)]));
+ if(scope)for(const cache of objects.values()){
+  if(cache.nativeRegionValid===undefined){cache.nativeRegionValid=c.nextLocal++;c.declared.push(T.i32);}
+  cache.inlineOwnership=true;
+ }
  for(const guard of guards.values()){guard.local=c.nextLocal++;c.declared.push(T.i32);}
  for(const field of [...fields.values(),...instanceArrays.values()]){field.base=c.nextLocal++;field.len=c.nextLocal++;c.declared.push(T.i32,T.i32);}
  for(const field of scalars.values())if(field.mask&1){field.value=c.nextLocal++;c.declared.push(T.i32);}
+ const readinessGuards=[];
  for(const field of [...fields.values(),...scalars.values()]){
   const guard=c.addReadinessGuard('native_state_owner_'+field.owner.replace(/[^\w]/g,'_'),c.jvm.getClassInitializationToken(field.owner));
-  c.inlinedInitializationGuards.add(guard);(c.staticInitializationGuards ||= new Set()).add(field.owner);
+  readinessGuards.push(guard);
+  if(!scope)c.inlinedInitializationGuards.add(guard);
+  (c.staticInitializationGuards ||= new Set()).add(field.owner);
  }
- for(const value of references.values())c.arrayCacheFor(value);
- return {stateful:true,closed:!instanceReads.size&&!tailLoads&&!fallbacks.size&&(c.method.flags||[]).includes('static')&&
+ const dynamicReferences=new Set(checkedReferenceLoads);
+ for(let changed=true;changed;){changed=false;
+  for(const value of references.values())if(value.op==='phi'&&!dynamicReferences.has(value.id)&&value.args.some(arg=>dynamicReferences.has(arg.id))){
+   dynamicReferences.add(value.id);changed=true;
+  }
+ }
+ for(const value of references.values()){
+  const cache=c.arrayCacheFor(value);
+  if(checkedReferenceLoads.size&&cache.owned===undefined){cache.owned=c.nextLocal++;c.declared.push(T.i32);}
+ }
+ return {stateful:true,closed:!instanceReads.size&&!tailLoads&&!fallbacks.size&&!checkedReferenceLoads.size&&(c.method.flags||[]).includes('static')&&
   !c.fn.params.some(p=>p.kind==='A')&&!/\)[L[]/.test(c.method.descriptor),
-  fields,reads,scalars,scalarSites,references,sites,instanceReads,instanceArrays,objects,receivers,tailLoads,guards,fallbacks};
+  fields,reads,scalars,scalarSites,references,sites,instanceReads,instanceArrays,objects,receivers,tailLoads,guards,fallbacks,checkedReferenceLoads,dynamicReferences,readinessGuards,scope};
 }
-function refuseEntry(c,out){
+function refuseEntry(c,out,plan){
+ if(plan?.scope){c.emitSpillResume(plan.scope.entry,out);return;}
  if(c.loopResume){
   require('./structuredLoopResume').test(c,out);out.push(OP.if,0x40);
   c.emitSpillResume(c.loopResume.header,out);out.push(OP.else);
@@ -171,6 +201,12 @@ function refuseEntry(c,out){
 function entry(c,out){
  const plan=c.nativeStaticArrayBody;if(!plan)return;
  if(plan.regions){const first=plan.entries.get(c.cfg.entry);if(first)regionEntry(c,first,out);return;}
+ stateEntry(c,plan,out);
+}
+function stateEntry(c,plan,out){
+ for(const guard of plan.scope?plan.readinessGuards:[]){
+  out.push(...c.readinessSeq(guard),OP.i32_eqz,OP.if,0x40);refuseEntry(c,out,plan);out.push(OP.end);
+ }
  // A skipped prefix may be the only user of an instance receiver. Its Java
  // local need not survive a yield; authenticate restored array values instead
  // of demanding a now-dead receiver or substituting its current field.
@@ -184,10 +220,22 @@ function entry(c,out){
    object=>validatedNativeObjectStorageOf(object,memory),true);
   for(const receiver of plan.receivers){const cache=plan.objects.get(receiver.id),freshOnly=c.loopResume&&!resumeReads(receiver);
    if(freshOnly){require('./structuredLoopResume').test(c,out,false);out.push(OP.if,0x40);}
-   out.push(...c.useOf(receiver),OP.call,...uleb(index),OP.local_set,...uleb(cache.store),
-    ...c.captureTypedStore(cache.store,cache.typedStore),...get(cache.typedStore),OP.ref_is_null,OP.if,0x40);
-   refuseEntry(c,out);out.push(OP.end,...c.nativeStoreField(cache,0),OP.local_set,...uleb(cache.base),
+   if(plan.scope)out.push(...get(cache.nativeRegionValid),OP.i32_eqz,OP.if,0x40);
+   const checked=[...c.useOf(receiver),OP.call,...uleb(index),OP.local_set,...uleb(cache.store),
+    ...c.captureTypedStore(cache.store,cache.typedStore)];
+   if(c.pairedNativeStorage){
+    const {entryModeCode,PAIRED_STORAGE_ENTRY}=require('./wasmShared');
+    // Only a compiler-paired entry may authenticate the incoming typed store
+    // in Wasm. Ordinary exports always validate against the actual Java ref.
+    // Late argument callbacks can revoke a store already on the call stack.
+    const paired=[...require('./pairedNativeStorage').valid(cache.typedStore),OP.if,0x40,
+     ...get(cache.typedStore),0xfb,0x1b,OP.local_set,...uleb(cache.store),OP.else,...checked,OP.end];
+    out.push(entryModeCode(c.blkLocal,checked,paired,0x40,PAIRED_STORAGE_ENTRY));
+   }else out.push(...checked);
+   out.push(...get(cache.typedStore),OP.ref_is_null,OP.if,0x40);
+   refuseEntry(c,out,plan);out.push(OP.end,...c.nativeStoreField(cache,0),OP.local_set,...uleb(cache.base),
     OP.i32_const,1,OP.local_set,...uleb(cache.filled),OP.i32_const,1,OP.local_set,...uleb(cache.storeFilled));
+   if(plan.scope)out.push(OP.i32_const,1,OP.local_set,...uleb(cache.nativeRegionValid),OP.end);
    if(freshOnly)out.push(OP.end);
   }
  }
@@ -216,7 +264,7 @@ function entry(c,out){
  }
  out.push(OP.i32_eqz,OP.if,0x40);
  if(c.wasmJit.importStatsEnabled)out.push(OP.call,...uleb(c.addImport('native_static_arrays_refused',[],[],()=>{},true)));
- refuseEntry(c,out);out.push(OP.end);
+ refuseEntry(c,out,plan);out.push(OP.end);
  for(const field of plan.scalars?.values()||[])if(field.value!==undefined)out.push(...load(field.native.address+4),OP.local_set,...uleb(field.value));
  if(c.wasmJit.importStatsEnabled)out.push(OP.call,...uleb(c.addImport('native_static_arrays_entered',[],[],()=>{},true)));
  if(plan.stateful&&c.loopResume){
@@ -235,8 +283,9 @@ function entry(c,out){
  }
 }
 
+function planFor(c,node){const owner=c.nativeStaticArrayBody;return owner?.regions?owner.nodePlans?.get(node.id):owner;}
 function instruction(c,node,out){
- const plan=c.nativeStaticArrayBody;
+ const plan=planFor(c,node);
  if(plan?.fallbacks?.has(node.id)){c.emitInstructionExit(node,out);return true;}
  const guard=plan?.guards?.get(node.id);if(!guard)return false;
  const cache=plan.objects.get(guard.receiver.id);
@@ -246,6 +295,20 @@ function instruction(c,node,out){
   if(i)out.push(OP.i32_or);
  }
  out.push(OP.local_set,...uleb(c.mustLocal(node)),...c.cacheKillsFor(node.id));return true;
+}
+function access(c,node,out){
+ const plan=planFor(c,node);
+ if(!plan?.dynamicReferences?.has(node.args[0]?.id)||!(element.test(node.op)||node.op==='arraylength'))return;
+ const cache=c.arrayCacheFor(node.args[0]),memory=c.heap.memory;
+ const {allocationForArray}=require('../core/wasmHeap');
+ const index=c.addImport('native_state_array_header',[T.ref],[T.i32,T.i32],value=>{
+  const record=allocationForArray(value);
+  return record?.memory===memory&&record.descriptor!=='[Z'?[record.base,record.length]:[-1,0];
+ },true);
+ out.push(...get(cache.owned),OP.i32_eqz,OP.if,0x40,...c.useOf(node.args[0]),OP.call,...uleb(index),
+  OP.local_set,...uleb(cache.len),OP.local_tee,...uleb(cache.base),OP.i32_const,0,OP.i32_lt_s,OP.if,0x40);
+ c.emitInstructionExit(node,out);out.push(OP.end,OP.i32_const,1,OP.local_set,...uleb(cache.owned),
+  OP.i32_const,1,OP.local_set,...uleb(cache.filled),OP.end);
 }
 function read(c,node,out){
  const owner=c.nativeStaticArrayBody,plan=owner?.regions?owner.readPlans.get(node.id):owner;
@@ -266,15 +329,17 @@ function read(c,node,out){
    OP.local_set,...uleb(c.mustLocal(node)),...c.cacheKillsFor(node.id));
   const array=c.arrayCaches.get(node.id);
   if(instance.array&&array)out.push(...get(instance.array.base),OP.local_set,...uleb(array.base),
-   ...get(instance.array.len),OP.local_set,...uleb(array.len));
+   ...get(instance.array.len),OP.local_set,...uleb(array.len),
+   ...(!plan.checkedReferenceLoads?.size||array.owned===undefined?[]:[OP.i32_const,1,OP.local_set,...uleb(array.owned)]));
   return true;
  }
  const field=plan?.reads.get(node.id);if(!field)return false;
  const source=plan.fields.get(field.native.address);
  out.push(OP.global_get,...uleb(field.native.index),OP.local_set,...uleb(c.mustLocal(node)),...c.cacheKillsFor(node.id));
- const cache=owner.regions?null:c.arrayCaches.get(node.id);
+ const cache=owner.regions&&!plan.stateful?null:c.arrayCaches.get(node.id);
  if(cache)out.push(...get(source.base),OP.local_set,...uleb(cache.base),
   ...get(source.len),OP.local_set,...uleb(cache.len));
+ if(plan.checkedReferenceLoads?.size&&cache?.owned!==undefined)out.push(OP.i32_const,1,OP.local_set,...uleb(cache.owned));
  return true;
 }
 function phiCopies(c,copies,out,from){
@@ -283,17 +348,81 @@ function phiCopies(c,copies,out,from){
   for(const {phi,arg} of copies){
    const plan=owner.phiPlans.get(phi.id);if(!plan||!plan.blocks.has(from))continue;
    const source=plan.caches.get(arg.id),target=plan.caches.get(phi.id);
-   out.push(...get(source.base),...get(source.len));transfers.push(target);
+   out.push(...get(source.base),...get(source.len));transfers.push({source,target,owned:plan.checkedReferenceLoads?.size});
   }
-  for(const target of transfers.reverse())out.push(OP.local_set,...uleb(target.len),OP.local_set,...uleb(target.base));
-  return;
+  for(const {target}of transfers.slice().reverse())out.push(OP.local_set,...uleb(target.len),OP.local_set,...uleb(target.base));
+  const ownership=transfers.filter(x=>x.owned);
+  for(const {source}of ownership)out.push(...get(source.owned));
+  return ownership.map(x=>x.target);
  }
  const refs=owner?.references;if(!refs)return;
  const transfers=copies.filter(({phi})=>refs.has(phi.id));
+ const owned=owner.checkedReferenceLoads?.size;
  for(const {arg} of transfers){const cache=c.arrayCaches.get(arg.id);out.push(...get(cache.base),...get(cache.len));}
  for(const {phi} of transfers.slice().reverse()){
   const cache=c.arrayCaches.get(phi.id);out.push(OP.local_set,...uleb(cache.len),OP.local_set,...uleb(cache.base));
  }
+ // Ownership sources must be captured before any phi's ordinary cache kill,
+ // and installed after all those kills. This also preserves cyclic copies.
+ if(owned){
+  for(const {arg}of transfers)out.push(...get(c.arrayCaches.get(arg.id).owned));
+  return transfers.map(({phi})=>c.arrayCaches.get(phi.id));
+ }
+}
+
+// An inlined wrapper remains a proof boundary even when the outer method has
+// calls, allocations or stores. The entry is a real original PC-0 activation;
+// every outside edge authenticates fresh state before any wrapper effect.
+function prepareInlineScopes(c,structured){
+ if(!c.hasNestedInlineScopes||c.fn.blocks.length>512)return null;
+ const labels=new Map(c.items.flatMap((item,i)=>item.labelDef?[[item.labelDef.replace(/:$/,''),i]]:[]));
+ const candidates=c.items.flatMap((item,start)=>{
+  const end=labels.get(item.inlineScopeEnd);
+  return item.inlineScopeEnd&&end>start?[{start,end}]:[];
+ }).sort((a,b)=>(b.end-b.start)-(a.end-a.start));
+ const regions=[],occupied=new Set();let work=0;
+ for(const {start,end}of candidates){
+  if(regions.length>=4||work>50000)break;
+  const blocks=new Set(c.cfg.blocks.filter(block=>block.insns.every(i=>i>=start&&i<end)&&c.fn.reachable.has(block.id)).map(block=>block.id));
+  const entry=c.cfg.blocks.find(block=>block.insns[0]===start)?.id;
+  if(entry===undefined||!blocks.has(entry)||[...blocks].some(id=>occupied.has(id)))continue;
+  let valid=true;
+  for(const id of blocks){
+   work+=c.fn.blocks[id].predIds.length;
+   if(id!==entry&&c.fn.blocks[id].predIds.some(p=>!blocks.has(p))){valid=false;break;}
+  }
+  if(!valid||work>50000)continue;
+  const at=c.fn.blocks[entry],inputs=new Set([...at.slotDefsIn.values(),...at.entryStack].map(value=>value.id));
+  const scope={entry,end,blocks,inputs},plan=prepareStateful(c,structured,scope);if(!plan)continue;
+  Object.assign(plan,{entry,blocks,external:new Map(),caches:new Map([...plan.references].map(([id,value])=>[id,c.arrayCacheFor(value)]))});
+  regions.push(plan);for(const id of blocks)occupied.add(id);
+ }
+ if(!regions.length)return null;
+ // The dry run saw these splices before regions existed and collected eager
+ // root guards. When ALL uses of an owner are now behind scope entries, those
+ // guards belong at the original wrapper entry, after caller effects.
+ const owners=new Set(regions.flatMap(plan=>[...plan.fields.values(),...plan.scalars.values()].map(field=>field.owner)));
+ for(const owner of owners){
+  const outside=c.fn.blocks.some(block=>c.fn.reachable.has(block.id)&&!occupied.has(block.id)&&
+   (block.body.some(node=>['getstatic','putstatic','invokestatic'].includes(node.op)&&node.imm?.[1]===owner)||
+    c.cfg.blocks[block.id].insns.some(i=>c.items[i].inlineStaticOwner===owner)));
+  if(!outside)c.inlinedInitializationGuards.delete(c.addReadinessGuard('native_state_owner_'+owner.replace(/[^\w]/g,'_'),c.jvm.getClassInitializationToken(owner)));
+ }
+ const result={regions,entries:new Map(),sitePlans:new Map(),readPlans:new Map(),nodePlans:new Map(),phiPlans:new Map(),
+  stateful:true,sites:0,tailLoads:0,scalarSites:new Map(),instanceReads:new Map(),checkedReferenceLoads:new Set()};
+ for(const plan of regions){
+  result.entries.set(plan.entry,plan);result.sites+=plan.sites;result.tailLoads+=plan.tailLoads;
+  for(const [id,value]of plan.references)if(value.op==='phi'&&plan.blocks.has(value.block))result.phiPlans.set(id,plan);
+  for(const id of plan.checkedReferenceLoads)result.checkedReferenceLoads.add(id);
+  for(const [id,value]of plan.scalarSites)result.scalarSites.set(id,value);
+  for(const [id,value]of plan.instanceReads)result.instanceReads.set(id,value);
+  for(const block of plan.blocks)for(const node of c.fn.blocks[block].body){
+   result.nodePlans.set(node.id,plan);
+   if(plan.reads.has(node.id)||plan.scalarSites.has(node.id)||plan.instanceReads.has(node.id))result.readPlans.set(node.id,plan);
+   if(element.test(node.op)||node.op==='arraylength')result.sitePlans.set(node.id,plan);
+  }
+ }
+ return result;
 }
 
 // A region has one entry block, reached only through guarded outside edges.
@@ -397,6 +526,7 @@ function prepareRegions(c){
  return result;
 }
 function regionEntry(c,plan,out){
+ if(plan.scope){stateEntry(c,plan,out);return;}
  let first=true;const combine=()=>{if(!first)out.push(OP.i32_and);first=false;};
  for(const guard of plan.guards){out.push(...c.readinessSeq(guard));combine();}
  for(const field of plan.fields.values()){
@@ -432,8 +562,8 @@ function cacheFor(c,node){return c.nativeStaticArrayBody?.sitePlans?.get(node.id
 // positive entry guard; do not initialize a cold/untaken dependency early.
 function provesReadiness(c,block,guard){
  const owner=c.nativeStaticArrayBody;if(!owner)return false;
- return owner.regions?owner.regions.some(plan=>plan.blocks.has(block)&&plan.guards.includes(guard)):
+ return owner.regions?owner.regions.some(plan=>plan.blocks.has(block)&&(plan.readinessGuards||plan.guards).includes(guard)):
   c.inlinedInitializationGuards.has(guard);
 }
-function prepare(c,structured){return prepareStateful(c,structured)||prepareWhole(c)||prepareRegions(c);}
-module.exports={prepare,entry,instruction,read,phiCopies,edge,cacheFor,provesReadiness};
+function prepare(c,structured){return prepareStateful(c,structured)||prepareInlineScopes(c,structured)||prepareWhole(c)||prepareRegions(c);}
+module.exports={prepare,entry,instruction,access,read,phiCopies,edge,cacheFor,provesReadiness};

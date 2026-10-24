@@ -87,7 +87,9 @@ class CanonicalDirectLinks {
       !meta.boxedCount && !(meta.specSites?.length) && !meta.speculations &&
       (!meta.frameEntryOnly || meta.booleanStaticSpillProof);
   }
-  allocate(key, params, results, fallback, parameterArrayABI = [], compact = false, objectInputs = [], arrayResult = null, parameterObjectABI = [], closedNative = false) {
+  allocate(key, params, results, fallback, parameterArrayABI = [], compact = false, objectInputs = [], arrayResult = null, parameterObjectABI = [], closedNative = false, pairedStorage = false) {
+    if(pairedStorage&&(!compact||!parameterObjectABI.length||closedNative||objectInputs.length))
+      throw TypeError('paired native link requires compact typed object inputs');
     if(closedNative&&(!compact||parameterArrayABI.length||objectInputs.length||arrayResult))
       throw TypeError('closed native link requires compact typed object inputs');
     // The existing bridge is the fallback until a proved callee publishes.
@@ -135,7 +137,7 @@ class CanonicalDirectLinks {
     const slot = this.freeSlots.length?this.freeSlots.pop():this.table.length;
     if(slot===this.table.length)this.table.grow(1);
     this.table.set(slot,stub);
-    const binding = {slot,stub,key,params,results:results.slice(),compact,closedNative,parameterArrayABI:parameterArrayABI.slice(),parameterObjectABI:parameterObjectABI.slice()};
+    const binding = {slot,stub,key,params,results:results.slice(),compact,closedNative,pairedStorage,parameterArrayABI:parameterArrayABI.slice(),parameterObjectABI:parameterObjectABI.slice()};
     this.bySlot.set(slot,binding);
     let list=this.bindings.get(key);
     if(!list)this.bindings.set(key,list=[]);
@@ -186,7 +188,11 @@ class CanonicalDirectLinks {
       const closedCompatible=!binding.closedNative||contract?.version===1&&Array.isArray(contract.objectParameters)&&
         contract.key===binding.key&&contract.run===st.meta.canonicalClosedStorageRun&&
         contract.objectParameters.length===objects.length&&contract.objectParameters.every((index,i)=>index===objects[i]);
-      const fn=compatible&&closedCompatible ? binding.closedNative?st.meta.canonicalClosedStorageRun:binding.compact
+      const paired=st.meta?.pairedNativeStorage;
+      const pairedCompatible=binding.pairedStorage&&paired?.version===1&&paired.key===binding.key&&
+        paired.run===st.meta.canonicalPairedStorageRun&&Array.isArray(paired.objectParameters)&&
+        paired.objectParameters.length===objects.length&&paired.objectParameters.every((index,i)=>index===objects[i]);
+      const fn=compatible&&closedCompatible ? pairedCompatible?st.meta.canonicalPairedStorageRun:binding.closedNative?st.meta.canonicalClosedStorageRun:binding.compact
         ? objects.length ? st.meta.canonicalCompactStorageRun : arrays.length ? st.meta.canonicalCompactHeapRun : st.meta.canonicalCompactRun
         : arrays.length ? st.meta.canonicalHeapRun : st.meta.canonicalRun : null;
       const javaCount=binding.params.length-2*arrays.length-objects.length;
