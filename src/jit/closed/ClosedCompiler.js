@@ -125,6 +125,9 @@ class ClosedCompiler {
     code.push(OP.block, 0x40);
     this.context = [{ kind: 'npe' }];
     this.tryDepth = 0;
+    this.checked = new Set();
+    this.analyzeDerived();
+    for (const param of fn.params) code.push(...this.deriveCode(param));
     this.doTree(fn.entry, code);
     code.push(OP.unreachable, OP.end,
       OP.call, { fn: this.world.hostImport('err_npe', [], []) }, OP.unreachable);
@@ -299,6 +302,16 @@ class ClosedCompiler {
   }
 
   doTree(x, out) {
+    // Class initialization checks already done on every path to x stay done
+    // in x's dominator subtree. A handler block is entered from the middle of
+    // its throwing block, so it starts with nothing assumed.
+    const saved = this.checked;
+    this.checked = this.fn.blocks[x].isHandlerEntry ? new Set() : new Set(saved);
+    this.doTreeInner(x, out);
+    this.checked = saved;
+  }
+
+  doTreeInner(x, out) {
     const merges = this.children.get(x).filter((y) => this.mergeNodes.has(y))
       .sort((a, b) => this.rpoIndex.get(b) - this.rpoIndex.get(a));
     if (this.loopHeaders.has(x)) {
@@ -468,12 +481,87 @@ class ClosedCompiler {
 
   // ---- straight-line nodes -----------------------------------------------
   emitBlockBody(x, out) {
+    const block = this.fn.blocks[x];
+    for (const phi of block.phis) out.push(...this.deriveCode(phi));
+    if (block.isHandlerEntry) {
+      for (const value of this.fn.values) {
+        if (value.block === x && (value.op === 'handler_local' || value.op === 'caught_exception')) out.push(...this.deriveCode(value));
+      }
+    }
     const sites = new Map(this.throwSites(x).filter((s) => s.node).map((s) => [s.node, s]));
-    for (const node of this.fn.blocks[x].body) {
+    for (const node of block.body) {
       const site = sites.get(node);
       if (site) this.emitCovered(x, site, (inner) => this.emitNode(node, inner), out);
       else this.emitNode(node, out);
+      if (node.op !== 'caught_exception') out.push(...this.deriveCode(node));
     }
+  }
+
+  // ---- per-value caches -------------------------------------------------
+  // A value used as an object in field accesses, or as an array, gets its
+  // representation decoded once where it is defined: the object's slab base
+  // and $obj ref, the array's base/length (or a flag sending a foreign array
+  // to the host path). Each access then needs no cast or struct.get.
+  analyzeDerived() {
+    this.derived = new Map();
+    const want = (value, kind) => {
+      if (!value || !this.live(value) || value.op === 'aconst_null' || value.kind !== 'A') return;
+      let entry = this.derived.get(value.id);
+      if (!entry) { entry = {}; this.derived.set(value.id, entry); }
+      if (entry[kind]) return;
+      if (kind === 'obj') entry.obj = { base: this.local([VT.i32]), ref: this.local(refNull(T_OBJ)) };
+      if (kind === 'parr') entry.parr = { base: this.local([VT.i32]), len: this.local([VT.i32]), fast: this.local([VT.i32]) };
+      if (kind === 'rarr') entry.rarr = { elems: this.local(refNull(T_REFS)), len: this.local([VT.i32]), fast: this.local([VT.i32]) };
+    };
+    for (const id of this.fn.reachable) {
+      for (const node of this.fn.blocks[id].body) {
+        const plan = this.plan.get(node.id);
+        if (plan && (plan.kind === 'field-get' || plan.kind === 'field-put')) want(node.args[0], 'obj');
+        if (PRIM_ARRAY[node.op]) want(node.args[0], 'parr');
+        if (node.op === 'aaload' || node.op === 'aastore') want(node.args[0], 'rarr');
+      }
+    }
+  }
+
+  local(typeBytes) {
+    const index = this.paramCount + this.locals.length;
+    this.locals.push(typeBytes);
+    return index;
+  }
+
+  deriveCode(value) {
+    const entry = this.derived.get(value.id);
+    if (!entry) return [];
+    const v = this.use(value, 'A');
+    const out = [];
+    const L = (i) => uleb(i);
+    if (entry.obj) {
+      const { base, ref } = entry.obj;
+      out.push(...v, ...GC.ref_test, { stype: T_OBJ }, OP.if, 0x40,
+        ...v, ...GC.ref_cast, { stype: T_OBJ }, OP.local_tee, ...L(ref), ...GC.struct_get, { type: T_OBJ }, OBJ.base,
+        OP.local_set, ...L(base),
+        OP.else, OP.ref_null, ...refNull(T_OBJ).slice(1), OP.local_set, ...L(ref),
+        ...v, OP.ref_is_null, OP.if, VT.i32, OP.i32_const, 0, OP.else, OP.i32_const, ...sleb(-1), OP.end,
+        OP.local_set, ...L(base), OP.end);
+    }
+    if (entry.parr) {
+      const { base, len, fast } = entry.parr;
+      const tmp = this.temp(refNull(T_PARR));
+      out.push(...v, ...GC.ref_test, { stype: T_PARR }, OP.if, 0x40,
+        ...v, ...GC.ref_cast, { stype: T_PARR }, OP.local_tee, ...L(tmp), ...GC.struct_get, { type: T_PARR }, PARR.base,
+        OP.local_set, ...L(base), OP.local_get, ...L(tmp), ...GC.struct_get, { type: T_PARR }, PARR.len, OP.local_set, ...L(len),
+        OP.i32_const, 1, OP.local_set, ...L(fast),
+        OP.else, OP.i32_const, 0, OP.local_set, ...L(fast), OP.end);
+      this.release(refNull(T_PARR), tmp);
+    }
+    if (entry.rarr) {
+      const { elems, len, fast } = entry.rarr;
+      out.push(...v, ...GC.ref_test, { stype: T_RARR }, OP.if, 0x40,
+        ...v, ...GC.ref_cast, { stype: T_RARR }, ...GC.struct_get, { type: T_RARR }, RARR.elems, OP.local_tee, ...L(elems),
+        ...GC.array_len, OP.local_set, ...L(len), OP.i32_const, 1, OP.local_set, ...L(fast),
+        OP.else, OP.i32_const, 0, OP.local_set, ...L(fast), OP.end);
+    }
+    return out;
   }
 
   // try { op } catch $jx { first matching handler entry, else rethrow }.
@@ -649,6 +737,17 @@ class ClosedCompiler {
     const t = WT[kind];
     const array = this.use(node.args[0], 'A'), index = this.use(node.args[1], 'I');
     const value = store ? this.use(node.args[2], kind) : [];
+    const derived = this.derived.get(node.args[0].id)?.parr;
+    if (derived) {
+      const L = (i) => uleb(i);
+      const host = this.world.hostImport(`${store ? 'astore' : 'aload'}_${kind}`,
+        store ? [VT.anyref, VT.i32, t] : [VT.anyref, VT.i32], store ? [] : [t]);
+      return [OP.local_get, ...L(derived.fast), OP.if, store ? 0x40 : t,
+        ...this.boundsCheck(index, derived.len),
+        OP.local_get, ...L(derived.base), ...index, ...(shift ? [OP.i32_const, shift, OP.i32_shl] : []), OP.i32_add,
+        ...value, memOp, align, 0,
+        OP.else, ...array, ...index, ...value, OP.call, { fn: host }, OP.end];
+    }
     const pType = refNull(T_PARR);
     const p = this.temp(pType), len = this.temp([VT.i32]);
     const host = this.world.hostImport(`${store ? 'astore' : 'aload'}_${kind}`,
@@ -670,6 +769,16 @@ class ClosedCompiler {
     const store = node.op === 'aastore';
     const array = this.use(node.args[0], 'A'), index = this.use(node.args[1], 'I');
     const value = store ? this.use(node.args[2], 'A') : [];
+    const derived = this.derived.get(node.args[0].id)?.rarr;
+    if (derived) {
+      const L = (i) => uleb(i);
+      const host = this.world.hostImport(store ? 'aastore' : 'aaload',
+        store ? [VT.anyref, VT.i32, VT.anyref] : [VT.anyref, VT.i32], store ? [] : [VT.anyref]);
+      return [OP.local_get, ...L(derived.fast), OP.if, store ? 0x40 : VT.anyref,
+        ...this.boundsCheck(index, derived.len),
+        OP.local_get, ...L(derived.elems), ...index, ...value, ...(store ? GC.array_set : GC.array_get), { type: T_REFS },
+        OP.else, ...array, ...index, ...value, OP.call, { fn: host }, OP.end];
+    }
     const eType = refNull(T_REFS);
     const e = this.temp(eType), len = this.temp([VT.i32]);
     const host = this.world.hostImport(store ? 'aastore' : 'aaload',
@@ -687,6 +796,12 @@ class ClosedCompiler {
 
   arrayLength(node) {
     const array = this.use(node.args[0], 'A');
+    const derived = this.derived.get(node.args[0].id);
+    const cached = derived?.parr || derived?.rarr;
+    if (cached) {
+      return [OP.local_get, ...uleb(cached.fast), OP.if, VT.i32, OP.local_get, ...uleb(cached.len), OP.else,
+        ...array, OP.call, { fn: this.world.hostImport('alen', [VT.anyref], [VT.i32]) }, OP.end];
+    }
     return [...array, ...GC.ref_test, { stype: T_PARR }, OP.if, VT.i32,
       ...array, ...GC.ref_cast, { stype: T_PARR }, ...GC.struct_get, { type: T_PARR }, PARR.len,
       OP.else, ...array, ...GC.ref_test, { stype: T_RARR }, OP.if, VT.i32,
@@ -722,6 +837,8 @@ class ClosedCompiler {
   // Lazy class initialization: one load of the class's readiness word; only
   // the first access calls out to run the initializer.
   initCheck(target) {
+    if (this.checked.has(target.className)) return [];
+    this.checked.add(target.className);
     const init = this.world.hostImport('init', [VT.i32], []);
     const call = [OP.i32_const, ...sleb(target.id), OP.call, { fn: init }];
     if (target.address === null) return call;
@@ -756,12 +873,37 @@ class ClosedCompiler {
   fieldAccess(node, plan, isPut) {
     const object = this.use(node.args[0], 'A');
     const value = isPut ? this.use(node.args[1], plan.valueKind) : [];
+    const derived = this.derived.get(node.args[0].id)?.obj;
+    if (derived) return this.derivedFieldAccess(derived, plan, isPut, value);
     const cast = [...this.nonNull(object), ...GC.ref_cast, { stype: T_OBJ }];
     if (plan.reference) {
       return [...cast, ...GC.struct_get, { type: T_OBJ }, OBJ.refs, OP.i32_const, ...sleb(plan.index),
         ...value, ...(isPut ? GC.array_set : GC.array_get), { type: T_REFS }];
     }
     const base = [...cast, ...GC.struct_get, { type: T_OBJ }, OBJ.base];
+    const memarg = (align) => [align, ...uleb(plan.offset)];
+    switch (plan.slotKind) {
+      case 'i32': return isPut ? [...base, ...value, OP.i32_store, ...memarg(2)] : [...base, OP.i32_load, ...memarg(2)];
+      case 'i64': return isPut ? [...base, ...value, OP.i64_store, ...memarg(3)] : [...base, OP.i64_load, ...memarg(3)];
+      case 'f64':
+        if (plan.valueKind === 'F') {
+          return isPut ? [...base, ...value, OP.f64_promote_f32, OP.f64_store, ...memarg(3)]
+            : [...base, OP.f64_load, ...memarg(3), OP.f32_demote_f64];
+        }
+        return isPut ? [...base, ...value, OP.f64_store, ...memarg(3)] : [...base, OP.f64_load, ...memarg(3)];
+      default: throw new Unsupported(`field slot ${plan.slotKind}`);
+    }
+  }
+
+  derivedFieldAccess(derived, plan, isPut, value) {
+    const L = (i) => uleb(i);
+    if (plan.reference) {
+      return [...this.nonNull([OP.local_get, ...L(derived.ref)]), ...GC.struct_get, { type: T_OBJ }, OBJ.refs,
+        OP.i32_const, ...sleb(plan.index), ...value, ...(isPut ? GC.array_set : GC.array_get), { type: T_REFS }];
+    }
+    // base 0: null; base -1: not closed storage (a defect; NPE is raised).
+    const base = [OP.local_get, ...L(derived.base), OP.i32_const, 0, OP.i32_le_s, OP.if, 0x40,
+      OP.call, { fn: this.world.hostImport('err_npe', [], []) }, OP.unreachable, OP.end, OP.local_get, ...L(derived.base)];
     const memarg = (align) => [align, ...uleb(plan.offset)];
     switch (plan.slotKind) {
       case 'i32': return isPut ? [...base, ...value, OP.i32_store, ...memarg(2)] : [...base, OP.i32_load, ...memarg(2)];
