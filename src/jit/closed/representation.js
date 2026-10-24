@@ -24,6 +24,9 @@
 // the named accessors installed here, so compiled code may trust it.
 
 const { VT, OP, GC, ModuleBuilder, structType, arrayType, refNull, ref } = require('./wasmBuilder');
+// objectModel requires this module; resolve it lazily once, not per call.
+let objectModel = null;
+const classIndexOf = (jvm, name) => (objectModel ||= require('../../core/objectModel')).classIndexOf(jvm, name);
 
 const STORE = Symbol('closed.store');
 const BASE_KEY = '_wasmBase';
@@ -179,7 +182,7 @@ class ClosedRuntime {
         layout = { className, size: offset || 8, slots, references, keys: [...slots, ...references].map((f) => f.key) };
         layout.byKey = new Map([...slots, ...references].map((f) => [f.key, f]));
         layout.proto = this.buildProto(layout);
-        layout.classId = require('../../core/objectModel').classIndexOf(jvm, className);
+        layout.classId = classIndexOf(jvm, className);
       }
     }
     this.layouts.set(className, { epoch, classData, layout });
@@ -266,7 +269,7 @@ class ClosedRuntime {
   referenceArray(array) {
     const ops = this.ops, runtime = this;
     const length = array.length;
-    const cls = require('../../core/objectModel').classIndexOf(this.jvm, array.type);
+    const cls = classIndexOf(this.jvm, array.type);
     const store = ops.newRarr(length, cls);
     for (let i = 0; i < length; i++) {
       if (array[i] !== null && array[i] !== undefined) ops.rarrSet(store, i, this.toWasm(array[i]));

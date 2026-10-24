@@ -39,7 +39,7 @@ const {
 } = require('./wasmShared');
 const monoArray = require('./monoArray');
 const {
-  instanceFieldTemplate, makeObjectRef, slabLayoutFor, makeSlabFields,
+  instanceFieldTemplate, makeObjectRef, slabLayoutFor, makeSlabFields, newFields,
   denseLayoutFor, denseSlotFor, makeDenseFields, readField, writeField,
 } = require('../core/objectModel');
 const {
@@ -609,7 +609,7 @@ function addNewImport(reg, jvm, className) {
   const name=`new_${className.replace(/[^\w]/g,'_')}_${allocations.size}`;
   // Closed-world storage has one allocation path; never bypass it.
   const index=reg.addImport(name,[],[T.ref],jvm.closedRuntime
-    ? ()=>makeObjectRef(jvm,className,require('../core/objectModel').newFields(jvm,className))
+    ? ()=>makeObjectRef(jvm,className,newFields(jvm,className))
     : ()=>makeObjectRef(jvm,className,
     denseLayout ? makeDenseFields(denseLayout) : layout
       ? makeSlabFields(jvm,layout) || instanceFieldTemplate(jvm,className) : {...template}));

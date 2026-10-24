@@ -118,7 +118,7 @@ class ClosedWorld {
     const ast = this.classAst(name);
     return !!ast && ((ast.flags || []).includes('abstract') || (ast.flags || []).includes('interface'));
   }
-  classId(name) { return require('../../core/objectModel').classIndexOf(this.jvm, name); }
+  classId(name) { return (this.objectModel ||= require('../../core/objectModel')).classIndexOf(this.jvm, name); }
 
   findDeclaredMethod(className, name, descriptor) {
     const ast = this.classAst(className);
@@ -746,7 +746,7 @@ class ClosedWorld {
   }
 
   resolveVirtualHost(receiver, owner, name, descriptor) {
-    const { runtimeClassName } = require('../../instructions/object');
+    const { runtimeClassName } = (this.objectInstructions ||= require('../../instructions/object'));
     const className = runtimeClassName(receiver);
     let current = className || owner;
     while (current) {
@@ -1055,7 +1055,7 @@ class ClosedWorld {
 
   throwThroughTombstone(record, thread, error) {
     if (error instanceof Error) throw error;
-    const Frame = require('../../core/frame');
+    const Frame = (this.Frame ||= require('../../core/frame'));
     const tombstone = new Frame(record.method);
     tombstone.className = record.className;
     tombstone.exceptionTable = [];
