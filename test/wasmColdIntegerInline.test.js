@@ -49,6 +49,9 @@ for (const heap of [false, true]) test(`cold integer inlining preserves initiali
   t.equal(st.meta?.inlinedCalls,1,'mask is spliced before initialization');
   t.ok(st.meta?.initializationGuardTokens.some(token=>!token.initialized),'entry has a live readiness guard');
   if(st.status!=='ready'){t.end();return;}
+  // Exercise the published AOT body across initialization transitions instead
+  // of letting dependency refresh withdraw it before the forced-fuel call.
+  w.freezeCompilation();
   const thread={id:0,status:'runnable',callStack:new Stack(),pendingException:null};j.threads=[thread];j.currentThreadIndex=0;
   const field=(c,k)=>j.classes[c].staticFields.get(k+':I')||0;
   const run=async(x,fuel)=>{
@@ -70,7 +73,7 @@ for (const heap of [false, true]) test(`cold integer inlining preserves initiali
     t.deepEqual(await run(7,fuel),[7,0,1],`warm inline results remain exact with fuel=${fuel}`);
     t.equal(field('ColdMaskDrive','effects'),before+13,'caller writes are never replayed');
   }
-  w.compile({method:m,className:'ColdMaskDrive'},st,{asCallee:true});
+  w.thawCompilation();w.compile({method:m,className:'ColdMaskDrive'},st,{asCallee:true});w.freezeCompilation();
   t.equal(st.meta?.inlinedCalls,1,'warm recompilation retains the inline');
   t.ok(st.meta?.initializationGuardTokens.length,'warm recompilation retains the invalidation guard');
   j.classInitializationState.delete('ColdMask');

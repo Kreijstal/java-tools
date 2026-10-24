@@ -21,16 +21,17 @@ function nativePair(fields,key,heap){
 }
 test('native cells share one value with Map, cells and descriptors',t=>{
  const fields=makeFields([['x:I',1]]),heap=new WasmHeap(1),n=nativePair(fields,'x:I',heap);
- t.ok(n.native,'ordinary declared integer cell binds');t.equal(n.get(),1,'initial read');n.set(17);
+ t.ok(n.native,'ordinary declared integer cell binds');t.equal(heap.i32[n.native.address>>2]&4,4,'canonical integer representation is certified');t.equal(n.get(),1,'initial read');n.set(17);
  t.equal(fields.get('x:I'),17,'Map reads native writes');t.equal(n.cell.value,17,'cell reads native writes');
  t.equal(Object.getOwnPropertyDescriptor(n.cell,'value').value,17,'descriptor reads native writes');
  t.deepEqual([...fields],[['x:I',17]],'iteration observes native storage');t.equal(Map.prototype.get.call(fields,'x:I'),undefined,'no duplicate backing-map value');
  fields.set('x:I',23);t.equal(n.get(),23,'native reads Map writes');n.cell.value=29;t.equal(n.get(),29,'native reads generated JS writes');
  t.deepEqual(n.stats,{get:0,set:0},'ordinary reads and writes never enter fallback');
  for(const value of [true,false,null,undefined,1.25,NaN,Infinity,-Infinity,-0,4294967295,9007199254740991]){
-  fields.set('x:I',value);t.ok(Object.is(fields.get('x:I'),value),'Map keeps exact host value '+String(value));
+  fields.set('x:I',value);t.equal(heap.i32[n.native.address>>2]&4,typeof value==='number'&&Object.is(value,value|0)?4:0,'host write publishes its exact numeric representation');t.ok(Object.is(fields.get('x:I'),value),'Map keeps exact host value '+String(value));
   t.equal(n.get(),value|0,'native conversion matches i32 '+String(value));
   n.set(-41);t.equal(fields.get('x:I'),-41,'native write replaces host representation');
+  t.equal(heap.i32[n.native.address>>2]&4,0,'legacy conversion leaves the stronger certificate conservatively absent');
  }
  fields.delete('x:I');t.equal(n.get(),0,'deleted cell reads undefined as native zero');t.equal(fields.size,0,'delete preserves membership');
  n.set(43);t.equal(n.stats.set,1,'native write after deletion uses membership-restoring setter');t.ok(fields.has('x:I'),'write restores membership');t.equal(n.cell.value,43,'restored value is shared');

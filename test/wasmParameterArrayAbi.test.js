@@ -179,7 +179,9 @@ test('cold expanded callees preserve invocation order and recursive metadata sta
  h.j.classInitializationState.set('ColdArrayMetadata','INITIALIZED');
  t.equal(h.run(caller).value,9,'initialized callee runs with the original arguments');
  t.equal(leaf.meta.importStats.get('abase')||0,0,'nonparameter array cache forwards its captured metadata');
- t.equal(caller.meta.importStats.get('abase'),1,'caller captures a nonparameter array once');
+ t.equal(caller.meta.importStats.get('abase')||0,0,'native static array header supplies nonparameter metadata without a query');
+ h.j.classes.ArrayMetadataProof.staticFields.set('data:[I',h.array([3,11]));
+ t.equal(h.run(caller).value,14,'next invocation captures replacement static-array metadata');
  const recursive=h.prepare('ArrayMetadataProof','recursive','([I[II)I');
  t.equal(h.run(recursive,h.array([2]),h.array([7]),4).value,20,'recursive calls retain both arrays in their own parameter locals');
  t.equal(recursive.meta.importStats.get('abase'),2,'all recursion shares only the two captured bases');
@@ -236,12 +238,25 @@ test('a refused metadata fill cannot forward a default pointer after readiness c
  if(!supportsWasmTryTable()){t.pass('engine retains the bridge');t.end();return;}
  const h=await harness(t),leaf=h.prepare('ColdArrayMetadata','sum','([II)I');
  const token=h.j.getClassInitializationToken('ColdArrayMetadata');
+ let guardCalls=0;
  token.wasmReadinessGuard=()=>()=>{
+   // Let the earlier static-call guard pass, then refuse the metadata fill
+   // while publishing readiness for the callee's already compiled guard.
+   if(++guardCalls===1)return 1;
    h.j.classInitializationState.set('ColdArrayMetadata','INITIALIZED');return 0;
  };
  const root=h.prepare('ArrayMetadataProof','foreign','()I');
- h.j.classes.ArrayMetadataProof.staticFields.set('data:[I',h.array([2,7]));
+ // An ordinary native static header already captures the metadata before
+ // this call. Use a getter to exercise an uncaptured array and the refused
+ // lazy fill, without changing the guest value or evaluating it twice.
+ const data=h.array([2,7]);let reads=0;
+ h.j.classes.ArrayMetadataProof.staticFields.set('data:[I',data);
+ Object.defineProperty(h.j.classes.ArrayMetadataProof.staticFields.cell('data:[I'),'value',{
+   configurable:true,get(){reads++;return data;}
+ });
  t.equal(h.run(root).value,9,'callee queries the original array when its owner becomes ready');
+ t.equal(guardCalls,2,'test reaches the static guard and then the refused metadata guard');
+ t.equal(reads,1,'metadata refusal never re-evaluates the array getter');
  t.equal(root.meta.importStats.get('abase')||0,0,'refused caller fill performs no query');
  t.equal(leaf.meta.importStats.get('abase'),1,'uncaptured sentinel forces a valid callee query');
  t.end();

@@ -259,6 +259,7 @@ function buildSsaOrThrow(input, options) {
 
     simulateBlock({
       fn, cfg, items, block, stack, locals, makeValue, imposeKind,
+      captureOperandStack: options.captureOperandStack,
     });
   }
 
@@ -287,7 +288,7 @@ function imposeKind(value, kind, what) {
 }
 
 function simulateBlock(context) {
-  const { fn, cfg, items, block, stack, locals, makeValue } = context;
+  const { fn, cfg, items, block, stack, locals, makeValue, captureOperandStack } = context;
   const blockId = block.id;
 
   const popValues = (slots, what) => {
@@ -374,9 +375,11 @@ function simulateBlock(context) {
         // code need this exact state to spill (operand stack is discarded).
         if (effect.mayThrow) {
           node.slotState = new Map(locals);
-          // A call-site deopt resumes the interpreter AT or AFTER the invoke,
-          // which needs the operand stack beneath the call's arguments too.
-          if (op.startsWith('invoke') || op === 'monitorenter' || op === 'monitorexit') {
+          // Retrying an operation also needs the operand prefix, which an
+          // exception alone discards. Consumers request extra retry sites
+          // selectively; ordinary SSA users do not retain these snapshots.
+          if (op.startsWith('invoke') || op === 'monitorenter' || op === 'monitorexit' ||
+              captureOperandStack?.(op, itemIdx)) {
             node.stackUnder = stack.slice();
           }
         }
@@ -391,7 +394,7 @@ function simulateBlock(context) {
       value.effects = { mayThrow: effect.mayThrow };
       if (effect.mayThrow) {
         value.slotState = new Map(locals);
-        if (op.startsWith('invoke')) value.stackUnder = stack.slice();
+        if (op.startsWith('invoke') || captureOperandStack?.(op, itemIdx)) value.stackUnder = stack.slice();
       }
       block.body.push(value);
     } else {

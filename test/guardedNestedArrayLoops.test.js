@@ -176,7 +176,7 @@ test('conditional parameter guards preserve source failures, nulls, aliases and 
    return {result:normalize(h.run(a,[a,a,0,0,64,3,0,0])),bases,lengths};
  };
  const result=captures(fast);t.deepEqual(result,captures(base),'changing snapshots match original scalar execution');
- t.equal(result.bases,4,'base getters stay at their two original entry captures');
+ t.equal(result.bases,0,'allocator-owned bases do not consult a shadow wasmBase getter');
  t.equal(result.lengths,2,'length getters stay at entry');
  const physical=h=>{
    const dest=h.array(new Array(192).fill(19)),src=h.array(new Array(192).fill(3));
@@ -252,8 +252,8 @@ test('cached metadata getters and overlapping captures retain scalar ordering',a
    return {result,bases,lengths};
  };
  const result=run(fast);t.deepEqual(result,run(base),'changing captures and overlapping stores match original order');
- t.equal(result.bases,4,'both base snapshots happen only during the first row');
- t.equal(result.lengths,2,'metadata length getters are not repeated or moved');
+ t.equal(result.bases,0,'owned native field headers bypass a shadow base getter');
+ t.equal(result.lengths,0,'owned native field headers supply the allocation length');
  const physical=h=>{
    const a=h.array(values),heap=h.j.wasmHeap,start=(heap.limit>>2)-81;
    heap.i32.set(values.slice(0,81),start);a.wasmBase=start*4;

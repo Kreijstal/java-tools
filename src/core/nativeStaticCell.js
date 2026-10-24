@@ -3,7 +3,7 @@
 // One canonical integer value shared by JS cells and native field accesses.
 // Descriptor changes revoke native access synchronously, before a host getter
 // or setter can run. Wide/reference/legacy cells keep their ordinary storage.
-// The 16-byte extent holds capability bits (read=1, write=2), i32 value,
+// The 16-byte extent holds capability bits (read=1, write=2, canonical integer=4), i32 value,
 // JS representation tag, and padding. Native writes select numeric tag zero.
 // Other JS numbers keep their exact primitive property value until replaced.
 const records=new WeakMap();
@@ -38,7 +38,10 @@ function update(record,value) {
   words[1]=value|0;
   words[2]=type==='boolean'?1:value===null?2:value===undefined?3:
     Object.is(value,value|0)?0:4;
-  words[0]=1+(record.valueWritable && record.presentData && record.target.present===true?2:0);
+  // Descriptor/host writes publish the exact representation certificate.
+  // Legacy native writers preserve existing bits: after converting a host
+  // representation they may conservatively leave bit 4 unset, never stale true.
+  words[0]=1+(record.valueWritable && record.presentData && record.target.present===true?2:0)+(words[2]===0?4:0);
   record.active=true;
 }
 function refresh(record) {

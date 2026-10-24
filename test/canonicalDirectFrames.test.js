@@ -10,6 +10,40 @@ function raw(fn){
  return new WebAssembly.Instance(new WebAssembly.Module(bytes),{env:{value:fn}}).exports.run;
 }
 
+test('closed native links refuse before an incompatible target can execute',t=>{
+ const links=new CanonicalDirectLinks(),calls=[];
+ const compact=fn=>new WebAssembly.Instance(new WebAssembly.Module(assembleModule({
+  importDecls:[{name:'value',params:[T.i32],results:[T.i32]}],mainParams:[T.i32],mainResults:[T.i32,T.i32],declared:[],
+  body:[OP.i32_const,...sleb(-1),OP.local_get,0,OP.call,0,OP.end]})),{env:{value:fn}}).exports.run;
+ const slot=links.allocateClosed('C.closed(I)I',[T.i32],[T.i32],[]);
+ t.deepEqual(links.table.get(slot)(3),[-7,0],'unpublished closed slot requests retry without a bridge');
+ const normal=compact(x=>{calls.push('normal');return x+1;}),closed=compact(x=>{calls.push('closed');return x+10;});
+ const state={key:'C.closed(I)I',status:'ready',meta:{canonicalRun:raw(x=>x),canonicalCompactRun:normal,
+  canonicalClosedStorageRun:closed,canonicalCompactOwnerTag:links.identity,normalFlowFullyCompiled:true,nativeJsExceptionTags:true,
+  retChar:'I',paramSlots:[{slot:0,t:T.i32}],parameterObjectABI:[],parameterArrayABI:[]}};
+ links.publish(state);t.deepEqual(links.table.get(slot)(3),[-7,0],'ordinary canonical eligibility does not imply the closed contract');
+ t.deepEqual(calls,[],'an incompatible native export is never entered');
+ state.meta.closedNativeBody={version:1,key:state.key,run:closed,objectParameters:[]};links.publish(state);
+ t.deepEqual(links.table.get(slot)(3),[-1,13],'compatible publication chooses the closed export');
+ t.deepEqual(calls,['closed'],'normal export was not substituted for its stronger entry');
+ state.meta.canonicalClosedStorageRun=normal;links.publish(state);
+ t.deepEqual(links.table.get(slot)(4),[-7,0],'changing an export without its matching certificate withdraws it');
+ state.meta.canonicalClosedStorageRun=closed;
+ state.meta.closedNativeBody=null;links.publish(state);
+ t.deepEqual(links.table.get(slot)(4),[-7,0],'replacement without the contract restores a pure refusal');
+ t.deepEqual(calls,['closed'],'replacement ran no untrusted fallback');
+ state.meta.closedNativeBody={version:1};links.publish(state);
+ t.deepEqual(links.table.get(slot)(4),[-7,0],'incomplete contract metadata refuses safely');
+ state.meta.closedNativeBody={version:1,key:state.key,run:closed,objectParameters:[]};links.publish(state);links.withdraw(state.key);
+ t.deepEqual(links.table.get(slot)(5),[-7,0],'withdrawal never restores a JavaScript bridge on a closed slot');
+ const {consumeCanonicalExit}=require('../src/jit/CanonicalDirectFrames');
+ t.equal(consumeCanonicalExit(null,null,{deoptFlag:0},-7,0,null),1,'refusal uses the exact invoke-retry protocol without a callee frame');
+ links.release([slot]);t.equal(links.table.get(slot),null,'released closed slot retains no target');
+ const reused=links.allocate('C.legacy(I)I',[T.i32],[T.i32],x=>x+7);
+ t.equal(reused,slot,'released storage is reusable');
+ t.deepEqual(links.table.get(reused)(2),[-6,0,null,9],'reused ordinary slot keeps its established fallback policy');t.end();
+});
+
 test('canonical leaves release replaced metadata and mixed callers retain correct table indices',async t=>{
  const {supportsWasmTryTable}=require('../src/jit/wasmShared');
  if(!supportsWasmTryTable()){t.pass('engine retains its existing bridge');t.end();return;}
@@ -102,12 +136,15 @@ test('deferred direct frames preserve separate recursive exits and transfer owne
  const ctx=new DirectFrameContext({},method,'C',box);
  t.equal(ctx.frame(0),current,'ordinary JS entry still owns its original frame');
  t.equal(ctx.createdFrames,0,'ordinary entry allocates no deferred frame');
+ t.equal(ctx.exitCount,0,'native exit census starts empty');
  const outer=ctx.frame(7),inner=ctx.frame(8);
  outer.locals[0]=12;inner.locals[0]=19;
  ctx.exit(8,24);t.equal(ctx.take(8),inner,'inner invocation transfers its own frame');
  t.equal(inner.pc,24,'inner resume PC is preserved');
  const children=[inner];box.pendingFrames=children;
  ctx.exit(7,42);t.equal(ctx.take(7),outer,'outer invocation transfers its independent frame');
+ t.equal(ctx.exitCount,2,'recursive native exits are counted without host execute calls');
+ t.equal(ctx.directExitCount,2,'direct invocation transfers have their own count');
  t.equal(outer.locals[0],12,'recursive spills cannot overwrite the outer values');
  t.equal(outer.wasmDirectPendingFrames,children,'deeper handoff order is retained');
  t.equal(box.pendingFrames,null,'transferred children are released from shared scratch');
@@ -118,6 +155,10 @@ test('deferred direct frames preserve separate recursive exits and transfer owne
  t.equal(eh.wasmDirectThrowPc,91,'handler matching retains original bytecode PC');
  t.equal(box.pendingException,null,'shared exception scratch no longer owns the value');
  ctx.take(9);t.equal(ctx.frames.size,0,'taken frames are never kept for reuse while scheduler-owned');
+ ctx.exit(0,16);
+ t.equal(ctx.exitCount,4,'host-entry spills also contribute to the native status census');
+ t.equal(ctx.directExitCount,3,'host-entry spills are distinguished from direct invocation spills');
+ t.equal(ctx.lastExitStatus,16,'last native resume status remains available without retaining a frame');
  t.throws(()=>ctx.take(9),/without a canonical spill/,'a missing exit cannot publish a fabricated frame');
  t.end();
 });

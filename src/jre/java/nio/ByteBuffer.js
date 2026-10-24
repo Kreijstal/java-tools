@@ -37,6 +37,25 @@ function guestBytes(array) {
   return array;
 }
 
+// Bulk copies stay in the engine for ordinary byte views. Host arrays and
+// destructive forward overlaps retain the original element-by-element path.
+function copyBytes(destination,to,source,from,length) {
+  const byteView=value=>value instanceof Int8Array || value instanceof Uint8Array;
+  if(byteView(destination) && byteView(source) && Number.isInteger(to) && Number.isInteger(from) &&
+      Number.isInteger(length) && to>=0 && from>=0 && length>=0 &&
+      ![destination,source].some(value=>['buffer','byteOffset','byteLength','length'].some(key=>Object.hasOwn(value,key))) &&
+      to+length<=destination.length && from+length<=source.length &&
+      !(typeof SharedArrayBuffer!=='undefined' &&
+        (destination.buffer instanceof SharedArrayBuffer || source.buffer instanceof SharedArrayBuffer))){
+    const start=source.byteOffset+from,target=destination.byteOffset+to;
+    if(destination.buffer!==source.buffer || target<=start || target>=start+length){
+      Uint8Array.prototype.set.call(destination,new Uint8Array(source.buffer,start,length),to);
+      return;
+    }
+  }
+  for(let i=0;i<length;i++)destination[to+i]=source[from+i];
+}
+
 function allocate(capacity, direct) {
   if (capacity < 0) {
     throw {
@@ -286,9 +305,7 @@ module.exports = {
         throw { type: 'java/nio/BufferUnderflowException' };
       }
 
-      for (let i = 0; i < length; i++) {
-        destArray[i] = buffer[position + i];
-      }
+      copyBytes(destArray,0,buffer,position,length);
       obj['java/nio/Buffer/position'] = position + length;
       return obj;
     }, ['java/lang/IllegalArgumentException', 'java/nio/BufferUnderflowException']),
@@ -311,9 +328,7 @@ module.exports = {
         throw { type: 'java/nio/BufferOverflowException' };
       }
 
-      for (let i = 0; i < length; i++) {
-        buffer[position + i] = srcArray[i];
-      }
+      copyBytes(buffer,position,srcArray,0,length);
       obj['java/nio/Buffer/position'] = position + length;
       return obj;
     }, ['java/lang/IllegalArgumentException', 'java/nio/BufferOverflowException']),

@@ -378,11 +378,16 @@ function addFieldImport(reg, jvm, ins, isStaticOp, isGet, elementOf = null) {
     const native=t===T.i32 && declaration?.flags?.includes('static') &&
       !declaration.flags.includes('volatile') && reg.nativeStaticFieldAddress
       ? reg.nativeStaticFieldAddress(access.cell) : null;
+    const nativeReference=t===T.ref && /^\[[BCSIJFD]$/.test(descriptor) && declaration?.flags?.includes('static') &&
+      !declaration.flags.includes('volatile') && reg.nativeStaticReference
+      ? reg.nativeStaticReference(access.cell) : null;
     return {
       t,
       name,
       initializationIdx,
+      owner:currentClassName,
       native,
+      nativeReference,
       idx: isGet
         ? reg.addImport(name, [], [t], access.get)
         : reg.addImport(name, [t], [], access.set),
@@ -545,9 +550,9 @@ function addMathImport(reg, ins) {
 
 // Allocation imports (new / newarray / anewarray). None of these run guest
 // code or a thread switch, so both backends' field-cache invariants hold:
-// array classes have no <clinit>, and `new` compiles only against classes
-// whose <clinit> already ran (gated below; INITIALIZED is permanent, so the
-// compile-time check stays valid for the module's lifetime). Negative array
+// array classes have no <clinit>, and `new` has a block-entry readiness
+// guard that exits before any guest effects when its class is still cold.
+// Layout preparation never initializes a class. Negative array
 // sizes throw the guest NegativeArraySizeException, which unwinds through
 // wasm exactly like NPE/AIOOBE from the array imports.
 const PRIM_ATYPES = new Set([
@@ -569,24 +574,31 @@ function addANewArrayImport(reg, jvm, elementType) {
 
 function addNewImport(reg, jvm, className) {
   if (typeof className !== 'string') throw new Unsupported('new arg');
-  // Same gate as the JS tier's newObjectSync: allocation of a not-yet-
-  // initialized class must reach the interpreter so <clinit> can run.
-  if (jvm.classInitializationState.get(className) !== 'INITIALIZED' ||
-      !jvm.classes[className]) {
-    throw new Unsupported(`new ${className} not initialized`, className);
+  const allocations=reg.allocationImports ||= new Map();
+  if(allocations.has(className))return allocations.get(className).index;
+  // Layouts are immutable after their complete hierarchy is loaded. Class
+  // initialization remains guest work at the original new instruction.
+  let current=className;
+  while(current){
+    const data=jvm.classes[current];
+    if(!data){
+      if(current!==className && jvm.jre[current])break;
+      throw new Unsupported(`new ${className} unresolved hierarchy`,current);
+    }
+    current=data.ast?.classes?.[0]?.superClassName;
   }
-  // Default field map precomputed once at compile time (the hierarchy above
-  // an initialized class is loaded and immutable); each allocation clones it.
-  const denseLayout = denseLayoutFor(jvm, className);
-  const layout = denseLayout ? null : slabLayoutFor(jvm, className);
-  const template = denseLayout || layout ? null : instanceFieldTemplate(jvm, className);
-  const name = `new_${className}`.replace(/[^\w]/g, '_');
-  return reg.addImport(name, [], [T.ref], () => makeObjectRef(jvm, className,
-    denseLayout
-      ? makeDenseFields(denseLayout)
-      : layout
-        ? (makeSlabFields(jvm, layout) || instanceFieldTemplate(jvm, className))
-        : { ...template }));
+  const token=jvm.getClassInitializationToken(className);
+  const guard=addReadinessGuard(reg,`allocation_ready_${allocations.size}`,token);
+  (reg.staticInitializationGuards ||= new Set()).add(className);
+  const selected=jvm.wasmFieldClasses?.has(className);
+  const denseLayout=selected?null:denseLayoutFor(jvm,className);
+  const layout=denseLayout?null:slabLayoutFor(jvm,className);
+  const template=denseLayout || layout ? null:instanceFieldTemplate(jvm,className);
+  const name=`new_${className.replace(/[^\w]/g,'_')}_${allocations.size}`;
+  const index=reg.addImport(name,[],[T.ref],()=>makeObjectRef(jvm,className,
+    denseLayout ? makeDenseFields(denseLayout) : layout
+      ? makeSlabFields(jvm,layout) || instanceFieldTemplate(jvm,className) : {...template}));
+  allocations.set(className,{index,guard});return index;
 }
 
 // System time natives — like Math intrinsics they can never be compiled (JS

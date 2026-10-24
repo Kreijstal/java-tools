@@ -2,7 +2,7 @@
 
 // General call inlining over krakatau code items, applied before CFG
 // construction in the structured backend. No shape matching: any callee whose
-// NORMAL FLOW is small, loop-free, and fully emittable by the structured
+// NORMAL FLOW is small and fully emittable by the structured
 // backend is spliced into the caller — argument stores replace the invoke,
 // callee locals are renumbered above the caller's frame, reachable returns
 // become gotos to a per-site continuation label. The callee's exception table
@@ -44,7 +44,12 @@
 // deopt — a failed checkcast throws the guest CCE, which unwinds past the
 // frame exactly like the interpreter's.
 //
-// Resume-pc mapping: each spliced item carries an original caller item index
+// Recoverable root loop bodies instead keep their nested calls intact and
+// carry the original callee PC/slot mapping. A fuel or call exit donates a
+// real inner frame and the caller's continuation without replaying the body.
+// The backend supplies this capability only with canonical frame handoffs.
+//
+// Resume-pc mapping: each ordinary spliced item carries an original caller item index
 // where the interpreter could equivalently resume — the call itself for the
 // first argument store (arguments back on the operand stack, the call
 // re-executes with no side effects done), the post-call index for the
@@ -191,7 +196,7 @@ function analyzeCallee(code, maxItems, opts = {}) {
       if (target === undefined) return null;
       // backward edges would loop without a fuel check inside the caller,
       // unless the loop provably terminates (countedBackEdge)
-      if (target <= i && !(opts.countedLoops &&
+      if (target <= i && !opts.resumableLoops && !(opts.countedLoops &&
           countedBackEdge(items, labels, i, target))) return null;
       work.push(target);
       if (op !== 'goto') work.push(i + 1);
@@ -288,6 +293,13 @@ function planStaticInline(ctx, ins, base, maxItems) {
   const coldOwner = hasClinit &&
     ctx.jvm.classInitializationState.get(className) !== 'INITIALIZED';
   if (coldOwner && !ctx.inlineColdIntegerLeaves) return null;
+  const labels=new Map();
+  codeAttr.code.codeItems.forEach((item,index)=>{
+    if(item.labelDef)labels.set(item.labelDef.slice(0,-1),index);
+  });
+  // A splice has no callee exception table. Preserve every meaningful
+  // handler by keeping its original invocation instead of dropping it.
+  if(liveExceptionRanges(ctx.jvm,codeAttr.code,labels).length)return null;
   const reachable = analyzeCallee(codeAttr.code, maxItems);
   if (!reachable) return null;
   if (coldOwner) {
@@ -400,6 +412,7 @@ function planInstanceSite(ctx, ins, op, callerClassName, alloc, depth, receiver)
   let impls;
   let guards = null; // instanceof classes aligned with impls; null = ifnonnull only
   let elide = false;
+  let fixedDispatch=op==='invokespecial';
   if (op === 'invokespecial') {
     const impl = ctx.hierarchy.resolveSpecial(callerClassName, owner, name, descriptor);
     if (!impl) return null;
@@ -444,7 +457,11 @@ function planInstanceSite(ctx, ins, op, callerClassName, alloc, depth, receiver)
     // superclass chain, which later class loads cannot change)
     // Depend on this proven cone, not its declared superclass's siblings.
     // A later subclass inside the cone still invalidates the same proof.
-    ctx.specSites.push({ owner: dispatchOwner, name, descriptor, guards });
+    const fixed=impls.length===1&&(
+      impls[0].method.flags?.some(flag=>flag==='final'||flag==='private')||
+      ctx.jvm.classes[dispatchOwner]?.ast?.classes?.[0]?.flags?.includes('final'));
+    fixedDispatch=fixed;
+    if(!fixed)ctx.specSites.push({ owner: dispatchOwner, name, descriptor, guards });
     // `this` has runtime class R <= callerClassName; if the caller class
     // takes the most-derived guard, every R does too. If it only matches a
     // later guard, a more-derived receiver could differ — keep the guards.
@@ -467,10 +484,19 @@ function planInstanceSite(ctx, ins, op, callerClassName, alloc, depth, receiver)
     bodies.push(body);
     if (sub.next > end) end = sub.next;
   }
+  // Keep complete normal flow on a recovered loop's guard miss. Arguments
+  // are already captured: run the original invoke and join its continuation,
+  // without replaying the caller. Its original resume/exception PC is retained
+  // below. Polymorphic recovered bodies keep their conservative admission.
+  const recovered=bodies.some(body=>body.items.some(item=>item.inlineActivation));
+  if(!elide&&recovered&&bodies.length!==1)return null;
   alloc.next = end;
   // One scratch int above every body's slots, for the fused guard below.
   const armSlot = alloc.next;
-  if (guards && !elide) ctx.speculations += guards.length;
+  // A final implementation plus an original-invoke miss path has no baked
+  // class-world assumption. Its real null/type guard still executes, but it
+  // must not be mislabeled as an unchecked speculation that prevents linking.
+  if (guards && !elide && !(recovered&&fixedDispatch)) ctx.speculations += guards.length;
   if (elide) ctx.elidedThisGuards += 1;
 
   const items = [];
@@ -501,15 +527,25 @@ function planInstanceSite(ctx, ins, op, callerClassName, alloc, depth, receiver)
     } else if (guards) {
       guards.forEach((cls, gi) => {
         items.push({ instruction: { op: 'aload', arg: String(start) } });
-        items.push({ instruction: { op: 'instanceof', arg: cls } });
+        items.push({ instruction: { op: 'instanceof', arg: cls },inlineReceiverGuard:recovered });
         items.push({ instruction: { op: 'ifne', arg: `${prefix}E${gi}` } });
       });
     } else {
       items.push({ instruction: { op: 'aload', arg: String(start) } });
       items.push({ instruction: { op: 'ifnonnull', arg: `${prefix}E0` } });
     }
-    items.push({ instruction: 'aconst_null', deoptMark: true });
-    items.push({ instruction: 'athrow' });
+    if(recovered){
+      items.push({instruction:{op:'aload',arg:String(start)}});
+      for(let j=0;j<params.length;j++){
+        const load=(STORE_OP[params[j]]||'astore').replace('store','load');
+        items.push({instruction:{op:load,arg:String(argSlots[j])}});
+      }
+      items.push({instruction:ins,inlineFallbackCall:true});
+      items.push({instruction:{op:'goto',arg:`${prefix}RET`}});
+    }else{
+      items.push({ instruction: 'aconst_null', deoptMark: true });
+      items.push({ instruction: 'athrow' });
+    }
   }
   bodies.forEach((body, bi) => {
     items.push({ labelDef: `${prefix}E${bi}:`, instruction: 'nop' });
@@ -521,20 +557,19 @@ function planInstanceSite(ctx, ins, op, callerClassName, alloc, depth, receiver)
     valueSlots: [start, ...argSlots],
     hasHeapWrite: bodies.some((b) => b.hasHeapWrite),
     elided: elide,
-    // The receiver slot is dead once the site's continuation is reached. Say
-    // so explicitly: a slot written on every trip through a loop is otherwise
-    // live-in at the header, which puts the receiver into a phi there — and a
-    // phi is a use the backend cannot fuse away, costing the site the very
-    // boundary crossing this whole shape exists to avoid.
-    deadReceiverSlot: start,
+    // A completed recovered activation owns no live locals. Retire its entire
+    // private slot range at the continuation, preserving the returned operand.
+    // Otherwise unused numeric temporaries acquire loop-carried phis in the
+    // caller. Ordinary splices retain their established receiver-only cleanup.
+    deadLocalSlots: recovered?Array.from({length:end-start},(_,i)=>start+i):[start],
   };
 }
 
-// Deep inlining: a static call inside a spliced instance body (Geoblox's
-// sprite draw calling its blit). Statically bound, so no guard and no deopt
-// stub; its locals sit above every slot allocated so far. The callee itself
-// must be a leaf (no calls) whose loops are proven counted.
-function planInteriorStatic(ctx, ins, alloc) {
+// A statically bound leaf inside a spliced instance body. Deep inlining can
+// admit counted loops; an atomic leaf in a recoverable loop must be acyclic,
+// so it needs no separate fuel/continuation frame. Its original class readiness
+// dependency is carried to the caller even if the body reads no static fields.
+function planInteriorStatic(ctx, ins, alloc, atomic = false) {
   if (Array.isArray(ins.arg) &&
       ctx.jvm._jreFindMethod?.(ins.arg[1], ins.arg[2]?.[0], ins.arg[2]?.[1])) return null;
   if (!Array.isArray(ins.arg)) return null;
@@ -549,14 +584,14 @@ function planInteriorStatic(ctx, ins, alloc) {
       flags.includes('native')) return null;
   const hasClinit = clsAst.items.filter((x) => x.type === 'method')
     .some((x) => x.method.name === '<clinit>');
-  if (hasClinit && ctx.jvm.classInitializationState.get(className) !== 'INITIALIZED') return null;
+  if (!atomic && hasClinit && ctx.jvm.classInitializationState.get(className) !== 'INITIALIZED') return null;
   const codeAttr = methodAst.attributes && methodAst.attributes.find((a) => a.type === 'code');
   if (!codeAttr) return null;
   const code = codeAttr.code;
   const labelIndex = new Map();
   code.codeItems.forEach((it, idx) => { if (it.labelDef) labelIndex.set(it.labelDef.slice(0, -1), idx); });
   if (liveExceptionRanges(ctx.jvm, code, labelIndex).length) return null;
-  const reachable = analyzeCallee(code, ctx.maxCalleeItems, { countedLoops: true });
+  const reachable = analyzeCallee(code, ctx.maxCalleeItems, { countedLoops: !atomic });
   if (!reachable) return null;
   let heapWrite = false;
   for (const idx of reachable) {
@@ -579,7 +614,7 @@ function planInteriorStatic(ctx, ins, alloc) {
     instruction: renumberInstruction(item, base, prefix, reachable.has(idx), `${prefix}RET`),
   }));
   items.push({ labelDef: `${prefix}RET:`, instruction: 'nop' });
-  return { items, hasHeapWrite: heapWrite };
+  return { items, hasHeapWrite: heapWrite, atomicOwner:atomic?className:null };
 }
 
 function buildCalleeBody(ctx, impl, alloc, retLabel, depth) {
@@ -598,11 +633,19 @@ function buildCalleeBody(ctx, impl, alloc, retLabel, depth) {
   // dropping the callee's table below is only sound for no-op/reporter
   // handlers — a live handler could observe the splice
   if (liveExceptionRanges(ctx.jvm, code, labelIndex).length) return null;
-  const reachable = analyzeCallee(code, ctx.maxCalleeItems, {
+  let reachable = analyzeCallee(code, ctx.maxCalleeItems, {
     instanceCalls: depth + 1 < ctx.maxDepth,
     countedLoops: ctx.deepInline,
     staticCalls: ctx.deepInline && depth + 1 < ctx.maxDepth,
   });
+  let resumable = false;
+  const hasLoop=items.some((item,i)=>BRANCH_OP.test(getOp(item.instruction)||'')&&
+    labelIndex.has(item.instruction?.arg)&&labelIndex.get(item.instruction.arg)<=i);
+  if(!reachable && hasLoop && depth===0 && ctx.resumableLoops){
+    reachable=analyzeCallee(code,ctx.maxCalleeItems,{
+      instanceCalls:true,staticCalls:true,resumableLoops:true});
+    resumable=!!reachable;
+  }
   if (!reachable) return null;
 
   const { params } = parseMethodDescriptor(method.descriptor);
@@ -619,7 +662,7 @@ function buildCalleeBody(ctx, impl, alloc, retLabel, depth) {
       if (!known) return null; // backend could not build the verdict import
     }
   }
-  if (hasInterior) {
+  if (hasInterior && !resumable) {
     // interior deopts rebuild [recv, args...] from this body's param slots
     for (const idx of reachable) {
       const it = items[idx];
@@ -655,7 +698,9 @@ function buildCalleeBody(ctx, impl, alloc, retLabel, depth) {
     const item = items[idx];
     const op = getOp(item.instruction);
     const lbl = item.labelDef ? prefix + item.labelDef : undefined;
-    if (reachable.has(idx) && INSTANCE_INVOKE.test(op)) {
+    const activation=resumable?{method,className,base,
+      localsSize:Number(code.localsSize)||paramEnd,item:idx}:null;
+    if (!resumable && reachable.has(idx) && INSTANCE_INVOKE.test(op)) {
       const receiver = receiverFacts(items, idx, targeted, className, calleeThisStable) ||
         sharedReceiverFacts(ctx, codeAttr, method, className, idx);
       const site = planInstanceSite(ctx, item.instruction, op, className, alloc,
@@ -671,19 +716,24 @@ function buildCalleeBody(ctx, impl, alloc, retLabel, depth) {
       if (site.hasHeapWrite) heapWrite = true;
       continue;
     }
-    if (reachable.has(idx) && op === 'invokestatic' && ctx.deepInline &&
+    if (reachable.has(idx) && op === 'invokestatic' && (resumable||ctx.deepInline) &&
         !supportedCalleeOp(op, item.instruction)) {
-      const site = planInteriorStatic(ctx, item.instruction, alloc);
-      if (!site) return null;
-      out.push({ labelDef: lbl, instruction: 'nop' });
-      for (const s of site.items) out.push(s);
-      if (site.hasHeapWrite) heapWrite = true;
-      continue;
+      const site = planInteriorStatic(ctx, item.instruction, alloc,resumable);
+      if (!site && !resumable) return null;
+      if(site){
+        out.push({ labelDef: lbl, instruction: 'nop',
+          ...(activation?{inlineActivation:activation}:{}),
+          ...(site.atomicOwner?{inlineStaticOwner:site.atomicOwner}:{}) });
+        for (const s of site.items) out.push(s);
+        if (site.hasHeapWrite) heapWrite = true;
+        continue;
+      }
     }
     if (reachable.has(idx) && HEAP_WRITE.test(op)) heapWrite = true;
     out.push({
       labelDef: lbl,
       instruction: renumberInstruction(item, base, prefix, reachable.has(idx), retLabel),
+      ...(activation?{inlineActivation:activation}:{}),
     });
   }
   return { items: out, hasHeapWrite: heapWrite };
@@ -712,6 +762,7 @@ function inlineCalls(jvm, codeAttr, options = {}) {
     // Deep inlining (opt-in): splice static calls inside instance callees
     // and provably counted loops (planInteriorStatic, countedBackEdge).
     deepInline: options.deepInline === true,
+    resumableLoops:options.resumableLoops===true,
     inlineColdIntegerLeaves: options.inlineColdIntegerLeaves === true,
   };
   // Slot 0 holds `this` for the whole method only when nothing ever stores
@@ -789,19 +840,33 @@ function inlineCalls(jvm, codeAttr, options = {}) {
         if (inLoop(i)) loopSites += 1;
         continue;
       }
-    } else if (ctx.hierarchy && INSTANCE_INVOKE.test(op) && budget > 0 && !inRange(i)) {
+    } else if (ctx.hierarchy && INSTANCE_INVOKE.test(op) && budget > 0 && (!inRange(i)||ctx.resumableLoops)) {
       const receiver = receiverFacts(items, i, targetedLabels,
         options.callerClassName, thisSlotStable) || sharedReceiverFacts(
         ctx, codeAttr, options.callerMethod, options.callerClassName, i);
-      const site = planInstanceSite(
+      let site = planInstanceSite(
         ctx, item.instruction, op, options.callerClassName, alloc, 0, receiver);
-      const siteCost = site && site.items.length + 1 +
-        (site.deadReceiverSlot !== undefined ? 2 : 0);
+      if(inRange(i)&&!site?.items.some(s=>s.inlineActivation))site=null;
+      if(site?.items.some(s=>s.inlineActivation)){
+        // A flattened loop still carries the caller's operand stack underneath
+        // its own stack. Recover that exact prefix, including category-2 values.
+        if(items.length>2048 || !options.callerMethod)site=null;
+        else{
+          ctx.callerGraph ||= buildSsa({...codeAttr.code,method:options.callerMethod,
+            className:options.callerClassName});
+          const call=!ctx.callerGraph.rejected && ctx.callerGraph.referenceFacts.nodesByItem.get(i);
+          if(!call?.stackUnder)site=null;
+          else for(const s of site.items)if(s.inlineActivation)
+            s.inlineActivation={...s.inlineActivation,call:i,under:call.stackUnder.length};
+        }
+      }
+      const siteCost = site && site.items.length + 1 + 2*site.deadLocalSlots.length;
       if (site && siteCost <= budget) {
         site.items.forEach((s, si) => {
           out.push(si === 0 && item.labelDef ? { ...s, labelDef: item.labelDef } : s);
           origIdx.push(si === 0 ? i : -1);
           ehOrigIdx.push(i);
+          if(s.inlineFallbackCall)origIdx[origIdx.length-1]=i;
           if (s.deoptMark) {
             deoptStubs.set(out.length - 1, { resumeIdx: i, valueSlots: site.valueSlots });
           }
@@ -810,13 +875,14 @@ function inlineCalls(jvm, codeAttr, options = {}) {
         origIdx.push(i + 1 < items.length ? i + 1 : -1);
         ehOrigIdx.push(i + 1 < items.length ? i + 1 : i);
         budget -= site.items.length + 1;
-        if (site.deadReceiverSlot !== undefined) {
-          // See deadReceiverSlot: kill the slot on the continuation so the
-          // receiver does not survive a loop back edge in a phi.
+        for (const slot of site.deadLocalSlots) {
+          // These slots belong exclusively to the returned inline activation.
+          // Null cleanup gives the existing SSA builder an explicit lifetime
+          // end, without inventing a new opcode or touching caller locals.
           out.push({ instruction: 'aconst_null' });
           origIdx.push(-1);
           ehOrigIdx.push(i);
-          out.push({ instruction: { op: 'astore', arg: String(site.deadReceiverSlot) } });
+          out.push({ instruction: { op: 'astore', arg: String(slot) } });
           origIdx.push(-1);
           ehOrigIdx.push(i);
           budget -= 2;
@@ -831,12 +897,17 @@ function inlineCalls(jvm, codeAttr, options = {}) {
     ehOrigIdx.push(i);
   }
   if (!inlined) return null;
+  let atomicStaticSites=0;
+  for(const item of out)if(item.inlineStaticOwner){
+    coldStaticInlineOwners.add(item.inlineStaticOwner);atomicStaticSites++;
+  }
   return {
     items: out,
     origIdx,
     ehOrigIdx,
     inlined,
     loopSites,
+    atomicStaticSites,
     coldStaticInlineOwners: [...coldStaticInlineOwners],
     deoptStubs,
     speculations: ctx.speculations,

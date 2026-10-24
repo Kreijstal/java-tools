@@ -445,6 +445,16 @@ class JVM {
   }
 
   newByteArray(buffer) {
+    if(this.wasmHeap){
+      // Native I/O returns a fresh Java array, just like bytecode newarray.
+      // Do not leave freshly read buffers on a permanently imported-access
+      // path when the VM has an owned primitive-array heap.
+      const bytes=Array.isArray(buffer) || ArrayBuffer.isView(buffer) && !(buffer instanceof DataView)
+        ? buffer:new Int8Array(buffer);
+      const array=this.wasmHeap.alloc('[B',bytes.length);array.set(bytes);
+      array.type='[B';array.elementType='byte';array.hashCode=this.nextHashCode++;
+      return array;
+    }
     return {
       type: '[B',
       array: new Int8Array(buffer)
@@ -2473,10 +2483,16 @@ class JVM {
     const instructions = entryFrame.instructions;
     const inlineRegions = this.jit.inlineLoopRegionPcCache.get(
       entryFrame.method);
+    const nativeResumePc = this.jit.wasmJit.structuredResumeCandidate(entryFrame);
     let executedBytecodes = 0;
     for (let executed = 0; executed < this.interpreterBurst; executed += 1) {
       if (entryFrame.pc >= instructions.length ||
           thread.status !== "runnable") break;
+      // Batched interpretation can otherwise step across a proved native
+      // header without another JIT probe. Stop only after real bytecode
+      // progress, with the same fully materialized Frame and empty stack.
+      if(executedBytecodes>0 && entryFrame.pc===nativeResumePc &&
+          this.jit.requestStructuredResumeCheckpoint(entryFrame,thread))break;
       // The canonical slow path owns inline-loop OSR and its exception PC
       // reconstruction. Do not duplicate that state machine here.
       if (inlineRegions?.has(entryFrame.pc)) {

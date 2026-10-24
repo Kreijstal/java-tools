@@ -7,7 +7,7 @@
 // exhaustion exit spills the header's reaching slot defs + entry stack and
 // returns the header's item index, exactly matching the dispatcher tier's
 // resume protocol. The produced meta is byte-compatible with WasmJit's
-// linking contract (externalEntry={0}, run(slots.., blk(ignored), fuel)->i32,
+// linking contract (run(slots.., blk, fuel)->i32,
 // -1 = returned via takeWasmReturnValue(meta)).
 //
 // Coverage mirrors the dispatcher's per-block demotion: blocks whose body or
@@ -27,7 +27,7 @@ const { buildCfgFromCode, structure, IrreducibleError, succOfTerm, succAllOfTerm
 const { splitIrreducibleTerms } = require('../decompiler/exceptionStructurer');
 const { buildSsa } = require('../analysis/opgraph/ssa');
 const {
-  T, OP, TRUNC_SAT, STRUCTURED_RETURN, CAPTURE_DIRECT_ID, definedGlobal, uleb, sleb, f32bytes, f64bytes,
+  T, OP, TRUNC_SAT, STRUCTURED_RETURN, CAPTURE_DIRECT_ID, entryModeCode, definedGlobal, uleb, sleb, f32bytes, f64bytes,
   emitTryTableCatchAll, supportsWasmTryTable, emitTryTableJsTag, supportsWasmJsTag,
   wasmProfilerName, parseMethodDescriptor, descToWasm, getOp,
   BRANCH_COND, BRANCH_ZERO, ICONST, BIN_OPS, ARRAY_LOAD, ARRAY_STORE,
@@ -44,13 +44,16 @@ const {
   addStaticCallInitializationGuard, addSystemImport, addArraysImport, addNewArrayImport, addANewArrayImport, addNewImport,
 } = require('./wasmRuntimeImports');
 const { inlineCalls, GUARD_OWNER } = require('./wasmInline');
-const {DirectFrameContext,CanonicalDirectLinks} = require('./CanonicalDirectFrames');
+const {DirectFrameContext,CanonicalDirectLinks,consumeCanonicalExit} = require('./CanonicalDirectFrames');
 const { runtimeClassName } = require('../instructions/object');
 const {
-  slabSlotFor, denseLayoutFor, BASE_KEY: SLAB_BASE_KEY,
+  slabSlotFor, nativeReferenceSlotFor, denseLayoutFor, classIndexOf,
 } = require('../core/objectModel');
 const Frame = require('../core/frame');
+const {getNativeObjectStorageOps,nativeObjectStorageOf,nativeObjectBaseOf}=require('../core/nativeObjectStorage');
 
+const parameterArrayVersionCounter=()=>{};
+const RETRY_NATIVE_SNAPSHOTS=Symbol('retry newly available native operand snapshots');
 const KIND_T = { I: T.i32, J: T.i64, F: T.f32, D: T.f64, A: T.ref };
 function primitiveArrayParameters(descriptor) {
   const parameters = descriptor.slice(1, descriptor.indexOf(')'))
@@ -206,7 +209,7 @@ class StructuredWasmCompiler {
       this.sigTypes.push({ params: params.slice(), results: results.slice() });
       this.sigTypeIndex.set(key, idx);
     }
-    return idx;
+    return idx+(this.objNativeOps?2:0);
   }
 
   addImport(name, params, results, fn, nonThrowing = false) {
@@ -270,8 +273,9 @@ class StructuredWasmCompiler {
   }
 
   translateWith(inline) {
+    let result;
     try {
-      return this.translateBody(inline);
+      result=this.translateBody(inline);
     } finally {
       if (this.jvm.jit?.retainCompilerDiagnostics === false) {
         // Import callbacks can retain this compiler for runtime call/exception
@@ -280,29 +284,45 @@ class StructuredWasmCompiler {
         // intact; dropping these roots also covers refused translations.
         for (const key of [
           'fn', 'cfg', 'items', 'originalItems', 'localOf', 'arrayCaches', 'heapParamLocals',
-          'fieldArrayOwners', 'sharedFieldArrayGroups', 'arrayReaderGenerations', 'primitiveCopyZeroEntry',
-          'fieldCaches', 'castCaches', 'objCaches', 'nativeStaticCells', 'staticFieldAccessors', 'nativeStaticSites', 'linkSlotByNode', 'canonicalSlotByNode', 'canonicalInstanceSlots',
+          'objectParamLocals','objectInputImports','ownObjectInputs','arrayResultImports','ownArrayResult','nativeArrayResultOwnershipSites','arrayReturnIdentities', 'fieldArrayOwners', 'sharedFieldArrayGroups', 'arrayReaderGenerations', 'primitiveCopyZeroEntry',
+          'fieldCaches', 'castCaches', 'objCaches', 'nativeStaticCells', 'nativeStaticReferences', 'nativeStaticReferenceSites', 'staticFieldAccessors', 'nativeStaticSites', 'linkSlotByNode', 'canonicalSlotByNode', 'canonicalInstanceSlots',
           'guardedNestedArrayLoopPlans','loweringGuardedLoopHeaders','activeGuardedLoopPlan',
+          'loopResume','nativeStaticArrayBody','nativeStaticArrayReads','nativeStaticScalarAccesses','nativeReadinessProofSites','nativeObjectBody','nativeObjectSnapshotPlan','nativeObjectFieldOperations','nativeObjectCalls','instructionExitSites',
+          'stackifiedNumericValues','numericExpressionValue','blockArrayFills','omittedArrayFillSites',
+          'blockSlabFills','omittedSlabFillSites','parameterHeapAccess','parameterHeapBoundsElisions',
           'deoptableSites', 'linkSlotSites', 'canonicalCompactSlots', 'emptyCopySites', 'fusedGuardOfLoad',
-          'fusedGuardArms', 'fusedFieldReads', 'rematLoads', 'inlinedInitializationGuards', 'heapReadinessGuards',
-          'labelIndex', 'origIdx', 'deoptStubs', 'deoptBlocks', 'declared',
+          'fusedGuardArms', 'fusedFieldReads', 'rematLoads', 'inlinedInitializationGuards', 'heapReadinessGuards', 'arrayIdentityGroups',
+          'labelIndex', 'origIdx', 'inlineActivations', 'deoptStubs', 'deoptBlocks', 'declared',
           'frames', 'guardSites', 'liveRanges', 'demoteBlockersByBlock', 'frameLocalLiveness', 'omittedFrameSlots',
           'importDecls', 'importFns', 'importIndexByName', 'globalImportDecls', 'importedGlobals', 'emptyCopyGlobals', 'sigTypes', 'sigTypeIndex',
-          'stringConstantImports',
+          'stringConstantImports','nativeObjectReferenceSites','nativeCastSites','nativeReferenceArraySites','referenceArrayElementHeaders','allocationImports',
         ]) {
           // Clear roots without changing the runtime import receiver's shape.
           if (Object.hasOwn(this, key)) this[key] = undefined;
         }
       }
     }
+    if(result===RETRY_NATIVE_SNAPSHOTS){
+      // Discovery prepared a dependency after speculative snapshots had been
+      // pruned. Release the discarded graph/slots before one fresh translation.
+      this.releaseLinkSlots();
+      const next=new StructuredWasmCompiler(this.jvm,this.method,this.className,this.wasmJit,{asCallee:this.preferCompleteCallee});
+      next.nativeSnapshotRetried=true;
+      try{return next.translateWith(inline);}
+      catch(error){next.releaseLinkSlots();throw error;}
+    }
+    return result;
   }
 
   translateBody(inline) {
+    this.nativeStaticArrayBody=null;this.nativeStaticArrayReads=new Map();this.nativeStaticScalarAccesses=new Map();this.nativeReadinessProofSites=new Set();
+    this.nativeObjectBody=null;this.nativeObjectFieldOperations=new Map();this.nativeObjectCalls=new Map();
     const codeAttr = this.method.attributes.find((a) => a.type === 'code');
     if (!codeAttr) throw new Unsupported('no code');
     let items = codeAttr.code.codeItems;
     const table = codeAttr.code.exceptionTable || [];
     this.origIdx = null;
+    this.inlineActivations = null;
     this.ehOrigIdx = null;
     this.deoptStubs = null;
     // Slots at or above this belong to spliced callees (wasmInline renumbers
@@ -310,6 +330,7 @@ class StructuredWasmCompiler {
     this.callerLocals = Number(codeAttr.code.localsSize) || 0;
     let coldStaticInlineOwners = [];
     let inlinedCalls = 0;
+    let inlineAtomicStaticSites = 0;
     let speculations = 0;
     let specSites = null;
     let elidedThisGuards = 0;
@@ -324,6 +345,8 @@ class StructuredWasmCompiler {
         callerMethod: this.method,
         callerIsStatic: (this.method.flags || []).includes('static'),
         deepInline,
+        resumableLoops:!!(this.wasmJit?.canonicalEhLinksEnabled &&
+          this.wasmJit.nativeJsExceptionTagsEnabled && supportsWasmJsTag()),
         inlineColdIntegerLeaves: this.wasmJit?.inlineColdIntegerLeavesEnabled,
         // Sites in live handler ranges need Wasm-side exception dispatch.
         ehLiveRanges: deepInline && process.env.JVM_WASM_EH !== '0' &&
@@ -331,6 +354,8 @@ class StructuredWasmCompiler {
       });
       if (expanded) {
         items = expanded.items;
+        this.inlineActivations=new Map(items.flatMap((item,i)=>
+          item.inlineActivation?[[i,item.inlineActivation]]:[]));
         this.origIdx = expanded.origIdx;
         this.ehOrigIdx = expanded.ehOrigIdx || null;
         this.deoptStubs = expanded.deoptStubs;
@@ -338,6 +363,7 @@ class StructuredWasmCompiler {
         this.guardSites = expanded.guardSites || [];
         coldStaticInlineOwners = expanded.coldStaticInlineOwners || [];
         inlinedCalls = expanded.inlined;
+        inlineAtomicStaticSites = expanded.atomicStaticSites||0;
         speculations = expanded.speculations;
         specSites = expanded.specSites;
         elidedThisGuards = expanded.elidedThisGuards;
@@ -372,7 +398,7 @@ class StructuredWasmCompiler {
 
     const fn = buildSsa(
       { codeItems: items, exceptionTable: table, method: this.method, className: this.className },
-      { cfg },
+      { cfg, captureOperandStack: require('./nativeObjectBody').snapshotPredicate(this, items, structured) },
     );
     if (fn.rejected) throw new Unsupported(`ssa: ${fn.rejected}`);
     this.fn = fn;
@@ -413,6 +439,7 @@ class StructuredWasmCompiler {
     // or late-bound callees). Keyed by item index: the demotion dry-run
     // emits each block twice, so a plain counter would double-count.
     this.deoptableSites = new Set();
+    this.instructionExitSites = new Set();
     // The subset of deoptableSites that are late-bound calls through the
     // runtime linker's table. A module whose deoptable sites are ALL of this
     // kind can be sealed into a never-exits recursive group once every slot
@@ -455,7 +482,15 @@ class StructuredWasmCompiler {
       const index=this.parameterArrayABI[ordinal], base=fn.params.length+2*ordinal;
       this.heapParamLocals.set(fn.params[index],{base,len:base+1});
     }
-    this.blkLocal = fn.params.length + 2*this.parameterArrayABI.length;
+    // Private storage parameters follow expanded array headers. Existing
+    // Java/frame exports supply null; native links pass a structurally typed
+    // GC store, avoiding an externref conversion/cast at each callee entry.
+    const nativeObjectInputs=directEligible && this.jvm.wasmFields && this.jvm.wasmHeap &&
+      this.wasmJit.nativeJsExceptionTagsEnabled && supportsWasmJsTag() && getNativeObjectStorageOps()
+      ? this.wasmJit.objectStorageInputs(`${this.className}.${this.method.name}${this.method.descriptor}`,
+        this.method.descriptor,directFlags.includes('static')) : [];
+    this.parameterObjectABI=nativeObjectInputs.map(input=>input.index);
+    this.blkLocal = fn.params.length + 2*this.parameterArrayABI.length + this.parameterObjectABI.length;
     this.fuelLocal = this.blkLocal + 1;
     // Discovery marks actual canonical calls before final emission. A leaf
     // must not import the shared table merely because the option is enabled:
@@ -485,6 +520,7 @@ class StructuredWasmCompiler {
       const box = this.box;
       const owner=this.directFrames,links=this.compactExitLinks;
       this.jsTagRecordIdx = this.addImport('record_js_exception', [T.ref], [], e => {
+        if(owner)owner.throwCount++;
         box.lastThrown = e;
         box.pendingException = isGuestThrow(e) ? e : null;
         links?.deref()?.publishExit(owner,0,-5);
@@ -545,8 +581,25 @@ class StructuredWasmCompiler {
     // array base, an object's slab base is immutable for its whole lifetime,
     // so these are killed only when the SSA value is redefined.
     this.slabFields = (this.jvm.wasmFields && this.jvm.wasmHeap) || null;
+    this.objNativeOps=this.slabFields && getNativeObjectStorageOps();
+    this.arrayResultImports=new Map();
+    this.ownArrayResult=this.heap && this.wasmJit.arrayResultMetadata(
+      `${this.className}.${this.method.name}${this.method.descriptor}`,this.method.descriptor);
+    this.objectParamLocals=new Map();
+    this.ownObjectInputs=this.objNativeOps ? this.wasmJit.objectStorageInputs(
+      `${this.className}.${this.method.name}${this.method.descriptor}`,this.method.descriptor,directFlags.includes('static')):[];
+    for(const [ordinal,input] of this.ownObjectInputs.entries()){
+      const local=this.parameterObjectABI.length ? fn.params.length+2*this.parameterArrayABI.length+ordinal : this.nextLocal++;
+      if(!this.parameterObjectABI.length)this.declared.push(T.ref);
+      this.objectParamLocals.set(fn.params[input.index],local);
+      this.importObjectInput(input.value);
+    }
     this.objCaches = new Map();
     this.slabFieldSites = 0;
+    this.nativeObjectSnapshotPlan=require('./nativeObjectBody').discardUnusedSnapshots(this,structured);
+    this.nativeOperandSnapshotCount=fn.values.filter(value=>Array.isArray(value.stackUnder)&&
+      !/^(invoke|monitor)/.test(value.op)).length;
+    this.stackifiedNumericValues=require('./stackifyNumericValues').prepare(fn);
 
     const localFor = (value) => {
       let idx = this.localOf.get(value);
@@ -559,20 +612,8 @@ class StructuredWasmCompiler {
       }
       return idx;
     };
-    for (const block of fn.blocks) {
-      if (!fn.reachable.has(block.id)) continue;
-      for (const phi of block.phis) {
-        if (KIND_T[phi.kind] === undefined) {
-          // Dead frame-slot join (kind conflict / never loaded): no local, no
-          // copies — it must also never be spilled.
-          continue;
-        }
-        localFor(phi);
-      }
-      for (const node of block.body) {
-        if (node.kind !== 'V' && KIND_T[node.kind] !== undefined) localFor(node);
-      }
-    }
+    this.reusedNumericLocalCount=require('./stackifyNumericValues').assignLocals(
+      fn,this.stackifiedNumericValues,this.localOf,localFor);
 
     // Per-block demotion: live handler ranges first (only when EH is off),
     // then a dry-run of every tree block's body + terminator — any
@@ -663,8 +704,15 @@ class StructuredWasmCompiler {
     }
 
     this.prepareSharedFieldArrayCaches();
+    require('./arrayIdentityCaches').prepare(this,structured);
     this.guardedNestedArrayLoopPlans=require('./guardedNestedArrayLoops').prepare(this,structured);
     this.guardedNestedArrayLoopCount=0;this.guardedNestedArrayLoopBytes=0;
+    this.nativeStaticArrayBody=require('./nativeStaticArrayBody').prepare(this,structured);
+    this.nativeObjectBody=require('./nativeObjectBody').prepare(this,structured);
+    if(!this.nativeObjectBody&&!this.nativeSnapshotRetried&&
+        require('./nativeObjectBody').needsSnapshotRetry(this,structured))return RETRY_NATIVE_SNAPSHOTS;
+    this.loopResume=this.nativeStaticArrayBody&&!this.nativeStaticArrayBody.stateful||this.nativeObjectBody&&!this.nativeObjectBody.lazy
+      ?null:require('./structuredLoopResume').prepare(this,structured);
 
     this.booleanStaticSpillProof = true;
     this.booleanStaticSpillSites = 0;
@@ -681,10 +729,17 @@ class StructuredWasmCompiler {
     // This only tests readiness; it never runs a class initializer early.
     for (const idx of this.inlinedInitializationGuards) {
       body.push(...this.readinessSeq(idx), OP.i32_eqz, OP.if, 0x40);
+      if(this.loopResume){
+        require('./structuredLoopResume').test(this,body);body.push(OP.if,0x40);
+        this.emitSpillResume(this.loopResume.header,body);body.push(OP.else);
+      }
       this.emitSpillResume(cfg.entry, body);
+      if(this.loopResume)body.push(OP.end);
       body.push(OP.end);
     }
     this.frames = [];
+    require('./nativeStaticArrayBody').entry(this,body);
+    require('./nativeObjectBody').entry(this,body);
     const treeStart = body.length;
     this.lowerNode(structured.tree, body, { curBlock: cfg.entry });
     body.push(OP.unreachable);
@@ -702,7 +757,28 @@ class StructuredWasmCompiler {
     }
     const primitiveCopyEntry = require('./primitiveArrayCopyEntry').emitPrimitiveCopyEntry(this,structured);
     const intZeroClearEntry = require('./intZeroClearEntry').emitIntZeroClearEntry(this);
-    body.unshift(...(this.primitiveCopyZeroEntry || []), ...arrayEntry, ...primitiveCopyEntry, ...intZeroClearEntry);
+    const objectEntry=[];
+    if(this.ownArrayResult)objectEntry.push(...this.clearArrayResult(this.importArrayResult(this.ownArrayResult)));
+    for(const input of this.ownObjectInputs){
+      const local=this.objectParamLocals.get(fn.params[input.index]);
+      // Legacy entries may still publish through a global. A native storage
+      // argument needs neither a publication nor a clearing write on return.
+      if(this.parameterObjectABI.length)objectEntry.push(OP.local_get,...uleb(local),OP.ref_is_null,OP.if,0x40);
+      objectEntry.push(OP.global_get,...uleb(this.importObjectInput(input.value)),
+        ...(this.parameterObjectABI.length?[0xfb,0x1a,0xfb,0x17,1]:[]),
+        OP.local_set,...uleb(local),
+        OP.ref_null,T.ref,OP.global_set,...uleb(this.importObjectInput(input.value)));
+      if(this.parameterObjectABI.length)objectEntry.push(OP.end);
+    }
+    const entryPrelude=[...(this.nativeObjectBody&&!this.nativeObjectBody.partial?[entryModeCode(this.blkLocal,objectEntry,[])]:objectEntry),...(this.primitiveCopyZeroEntry || []), ...arrayEntry, ...primitiveCopyEntry, ...intZeroClearEntry];
+    if(this.loopResume){
+      const restore=[];require('./structuredLoopResume').emitRestore(this,restore);
+      // Resume only reconstructs metadata. Entry-only copy/clear operations
+      // and native argument ownership transfers must never be replayed.
+      require('./structuredLoopResume').test(this,restore);restore.push(OP.if,0x40,
+        ...arrayEntry,OP.else,...entryPrelude,OP.end);
+      body.unshift(...restore);
+    }else body.unshift(...entryPrelude);
     if(this.directFrames){
       body.unshift(CAPTURE_DIRECT_ID);
     }
@@ -710,7 +786,7 @@ class StructuredWasmCompiler {
     const bytes = assembleModule({
       importDecls: this.importDecls,
       mainParams: [...this.paramSlots.map((p) => p.t),
-        ...this.parameterArrayABI.flatMap(() => [T.i32,T.i32]), T.i32, T.i32],
+        ...this.parameterArrayABI.flatMap(() => [T.i32,T.i32]), ...this.parameterObjectABI.map(()=>[0x63,1]), T.i32, T.i32],
       mainResults: [T.i32],
       declared: this.declared,
       body,
@@ -725,12 +801,14 @@ class StructuredWasmCompiler {
       canonicalFrameExport: this.directFrames ? {readyIdx:this.directOwnerReadyIdx,
         readyAddress:this.directOwnerReadyAddress,
         fuelImportIndex:0,compact:!!this.compactExitLinks,
-        inlineCompact:true,idLocal:this.directIdLocal,
+        inlineCompact:true,idLocal:this.directIdLocal,closedStorage:!!this.nativeObjectBody&&!this.nativeObjectBody.partial||!!this.nativeStaticArrayBody?.closed&&!!this.compactExitLinks,
         recordIdx:this.jsTagEh ? this.jsTagRecordIdx : undefined} : null,
       importJsTag: this.jsTagEh,
       importCanonicalTable: !!this.usedCanonicalTable,
       parameterArrayABI: this.parameterArrayABI,
+      parameterObjectABI: this.parameterObjectABI,
       globalImportDecls:this.globalImportDecls,
+      gcTypes:this.objNativeOps?require('../core/nativeObjectStorage').nativeObjectStorageTypes():[],
     });
 
     const blockOfItem = new Map();
@@ -808,6 +886,8 @@ class StructuredWasmCompiler {
       importObject: { env:{...env,...this.importedGlobals} },
       box: this.box,
       directFrameContext: this.directFrames,
+      inlineActivationSiteCount:new Set([...(this.inlineActivations?.values()||[])].map(a=>a.call)).size,
+      inlineAtomicStaticSiteCount:inlineAtomicStaticSites,
       hostOwnedCanonicalFuel:this.importedGlobals.canonical_fuel||null,
       canonicalOwnerReadyAddress:this.directOwnerReadyAddress,
       parameterArrayABI: this.parameterArrayABI.slice(),
@@ -816,6 +896,7 @@ class StructuredWasmCompiler {
       canonicalEmptyCopySites:this.emptyCopySites?.size || 0,
       nativeStaticReadSites:this.nativeStaticSites?.get('read')?.size || 0,
       nativeStaticWriteSites:this.nativeStaticSites?.get('write')?.size || 0,
+      nativeStaticReferenceReadSites:this.nativeStaticReferenceSites?.size || 0,
       canonicalCompactOwnerTag:this.compactExitLinks ? this.wasmJit.canonicalDirectLinks.identity : null,
       canonicalSlots: this.canonicalSlots.slice(),
       canonicalLifetime:this.canonicalLifetime,
@@ -827,7 +908,8 @@ class StructuredWasmCompiler {
       // Diagnostic only (JVM_WASM_TRACE_RESUME): lets a resume trace say which
       // slots the OSR module then reads that this exit never wrote.
       spillSlots: this.spillSlots || new Map(),
-      externalEntry: new Set([0]),
+      externalEntry: new Set([0,...(this.loopResume?[this.loopResume.header]:[])]),
+      structuredResumeEntry:this.loopResume?{block:this.loopResume.header,item:this.loopResume.item}:null,
       demoteReasons: this.demoted,
       demoteBlockers: this.demoteBlockers,
       // Identity of the lowered artifact, independent of link state; see the
@@ -839,6 +921,35 @@ class StructuredWasmCompiler {
       frameSpillSlotsOmitted:this.omittedFrameSlots?.size || 0,
       frameLivenessProved:!!this.frameLocalLiveness,
       frameLivenessStorageBytes:this.frameLocalLiveness?.storageBytes || 0,
+      stackifiedNumericValueCount:this.stackifiedNumericValues.size,
+      reusedNumericLocalCount:this.reusedNumericLocalCount,
+      omittedArrayFillCount:this.omittedArrayFillSites?.size||0,
+      nativeStaticStateBodySites:this.nativeStaticArrayBody?.stateful?this.nativeStaticArrayBody.scalarSites.size:0,
+      nativeStaticStateInstanceFieldSites:this.nativeStaticArrayBody?.instanceReads?.size||0,
+      nativeStaticStateTailLoadCount:this.nativeStaticArrayBody?.tailLoads||0,
+      nativeStaticArrayBodySites:this.nativeStaticArrayBody?.sites||0,
+      nativeObjectBodyFieldSites:this.nativeObjectBody?.fields.size||0,
+      nativeObjectBodyArraySites:this.nativeObjectBody?.arrayCaches.size||0,
+      nativeObjectBodyReceiverCount:this.nativeObjectBody?.objects.size||0,
+      nativeObjectBodyLazyReceivers:!!this.nativeObjectBody?.lazy,
+      nativeClosedCallSiteCount:this.nativeObjectBody?.calls.size||0,
+      nativeClosedForwarder:!!this.nativeObjectBody?.forwarder,
+      nativeClosedCallRoot:!!this.nativeObjectBody?.calls.size&&!this.nativeObjectBody.forwarder,
+      nativeOperandSnapshotRetried:!!this.nativeSnapshotRetried,
+      nativeObjectRegionCastCacheCount:this.nativeObjectBody?.castCaches.size||0,
+      nativeObjectRegionCastCount:this.nativeObjectBody?.castSites.size||0,
+      nativeObjectRegionStaticReadCount:this.nativeObjectBody?.staticReads.size||0,
+      nativeObjectRegionBlockCount:this.nativeObjectBody?.partial?this.nativeObjectBody.blocks.size:0,
+      nativeArrayResultOwnershipSites:this.nativeArrayResultOwnershipSites?.size||0,
+      nativeArrayOwnershipLocalCount:[...this.arrayCaches.values()].filter(cache=>cache.owned!==undefined).length,
+      closedNativeBody:((this.nativeObjectBody&&!this.nativeObjectBody.partial&&this.parameterObjectABI.length)||this.nativeStaticArrayBody?.closed&&this.directFrames&&this.compactExitLinks)&&!this.parameterArrayABI.length
+        ?{version:1,key:this.className+'.'+this.method.name+this.method.descriptor,objectParameters:this.parameterObjectABI.slice()}:null,
+      instructionExitSiteCount:this.instructionExitSites.size,
+      nativeOperandSnapshotCount:this.nativeOperandSnapshotCount,
+      nativeReadinessGuardsReusedCount:this.nativeReadinessProofSites.size,
+      nativeStaticArrayRegions:this.nativeStaticArrayBody?.regions?.map(plan=>({
+        entry:plan.entry,blocks:plan.blocks.size,sites:plan.sites,externalReferences:plan.external.size,fields:plan.fields.size}))||[],
+      omittedSlabFillCount:this.omittedSlabFillSites?.size||0,
       fullyCompiled: normalFlowFullyCompiled && table.length === 0,
       normalFlowFullyCompiled,
       booleanStaticSpillProof: this.booleanStaticCaptures.length > 0 &&
@@ -860,7 +971,7 @@ class StructuredWasmCompiler {
       // Sites that may exit mid-method through the deopt-flag protocol:
       // callers must nest this module with a real scratch frame, never the
       // junk sink (same contract as the dispatcher tier's deoptable calls).
-      deoptableCalls: this.deoptableSites.size + (this.staticInitializationGuards?.size || 0),
+      deoptableCalls: this.deoptableSites.size + (this.staticInitializationGuards?.size || 0) + (this.nativeStaticArrayBody||this.nativeObjectBody?1:0),
       // A leaf cannot run guest/native callbacks that invalidate an initialized
       // class during its synchronous invocation. Its only exits can therefore
       // be excluded by checking the live tokens before a frame-free call.
@@ -891,6 +1002,11 @@ class StructuredWasmCompiler {
       // getfield/putfield sites compiled to a raw slab load/store instead of
       // a gf_/pf_ import (JVM_WASM_FIELDS); they need no value cache.
       slabFieldSites: this.slabFieldSites,
+      nativeObjectReferenceSites:this.nativeObjectReferenceSites?.size||0,
+      nativeCastSites:this.nativeCastSites?.size||0,
+      nativeReferenceArraySites:this.nativeReferenceArraySites?.size||0,
+      objectStorageInputCount:this.ownObjectInputs.length,
+      parameterObjectABI:this.parameterObjectABI.slice(),
       structured: true,
       inlinedCalls,
       elidedThisGuards,
@@ -911,6 +1027,8 @@ class StructuredWasmCompiler {
       parameterArrayCacheCount: [...this.arrayCaches.values()]
         .filter((cache) => cache.parameter).length,
       parameterHeapSpecializationBytes,
+      parameterHeapBoundsElisionCount:this.parameterHeapBoundsElisionCount||0,
+      parameterHeapRangeGuardCount:this.parameterHeapRangeGuardCount||0,
       guardedNestedArrayLoopCount:this.guardedNestedArrayLoopCount||0,
       guardedNestedArrayLoopBytes:this.guardedNestedArrayLoopBytes||0,
       irreducibleSplitBlocks:this.irreducibleSplitBlocks || 0,
@@ -922,33 +1040,46 @@ class StructuredWasmCompiler {
   // loops. Only immutable parameter caches qualify. The original body remains
   // the fallback for null/plain arrays, including unused null arguments.
   emitParameterHeapVersion(structured, body, treeStart) {
+    if(this.nativeStaticArrayBody?.regions||this.nativeObjectBody)return 0;
     const cfg = this.cfg;
     const versionBudget = this.wasmJit.parameterHeapSpecializationMaxBytes;
     let parameterHeapSpecializationBytes = 0;
-    const parameterCaches = [...this.arrayCaches.values()];
+    // Only parameter headers participate in the guard. Other arrays/fields
+    // keep their original lazy checks in both bodies; no values are hoisted.
+    this.parameterHeapBoundsElisionCount=0;this.parameterHeapRangeGuardCount=0;
+    if(versionBudget<=0||body.length-treeStart>versionBudget)return 0;
+    const plan=require('./nativeParameterArrays').prepare(this,HEAP_LOAD,HEAP_STORE);
+    const parameterCaches=plan.caches;
     if (versionBudget > 0 && body.length - treeStart + 16 * parameterCaches.length <= versionBudget &&
-        parameterCaches.length > 0 && parameterCaches.every(cache => cache.parameter) &&
+        parameterCaches.length > 0 &&
         structured.loopHeaders.size > 0 && this.demoted.size === 0 &&
         this.deoptBlocks.size === 0 && this.liveRanges.length === 0 &&
-        this.fieldCaches.size === 0 && this.objCaches.size === 0 && !this.usedLinkTable) {
+        !this.usedLinkTable) {
       const specialized = [];
-      this.parameterHeapAccess = true;
+      this.parameterHeapAccess = new Set(parameterCaches);
+      this.parameterHeapBoundsElisions=plan.sites;
       this.frames = [];
       try {
         this.lowerNode(structured.tree, specialized, { curBlock: cfg.entry });
         specialized.push(OP.unreachable);
       } finally {
-        this.parameterHeapAccess = false;
+        this.parameterHeapAccess = null;this.parameterHeapBoundsElisions=null;
       }
       const guard = [];
       for (const [index, cache] of parameterCaches.entries()) {
         guard.push(OP.local_get, ...uleb(cache.base), OP.i32_const, ...sleb(0), OP.i32_ge_s);
+        if(plan.limits.has(cache))guard.push(OP.local_get,...uleb(cache.len),
+          OP.i32_const,...sleb(plan.limits.get(cache)),OP.i32_ge_u,OP.i32_and);
         if (index > 0) guard.push(OP.i32_and);
       }
       const extraBytes = guard.length + specialized.length + 5;
       if (extraBytes <= versionBudget) {
         const generic = body.splice(treeStart);
-        body.push(...guard, OP.if, 0x40, ...specialized, OP.else, ...generic, OP.end, OP.unreachable);
+        const counter=name=>this.wasmJit.importStatsEnabled
+          ?[OP.call,...uleb(this.addImport(name,[],[],parameterArrayVersionCounter,true))]:[];
+        body.push(...guard, OP.if, 0x40, ...counter('parameter_heap_native'),...specialized,
+          OP.else,...counter('parameter_heap_checked'),...generic,OP.end,OP.unreachable);
+        this.parameterHeapBoundsElisionCount=plan.sites.size;this.parameterHeapRangeGuardCount=plan.limits.size;
         parameterHeapSpecializationBytes = extraBytes;
       }
     }
@@ -967,8 +1098,14 @@ class StructuredWasmCompiler {
 
   // ---- tree lowering ----
 
-  lowerNode(node, out, env) {
+  lowerNode(node, out, env, ungated = false) {
     if (!node) return;
+    if(!ungated&&this.loopResume?.prefix.has(node)){
+      require('./structuredLoopResume').test(this,out,false);out.push(OP.if,0x40);
+      this.frames.push({label:null});
+      this.lowerNode(node,out,env,true);
+      this.frames.pop();out.push(OP.end);return;
+    }
     switch (node.t) {
       case 'seq':
         for (const child of node.body) this.lowerNode(child, out, env);
@@ -1011,7 +1148,8 @@ class StructuredWasmCompiler {
         // A loop spliced from a callee has no caller pc to exit at; the
         // inliner admits only provably counted loops there (countedBackEdge).
         if (this.activeGuardedLoopPlan?.header!==header &&
-            !(this.origIdx && this.origIdx[this.cfg.blocks[header].insns[0]] === -1)) {
+            (!(this.origIdx && this.origIdx[this.cfg.blocks[header].insns[0]] === -1)||
+              require('./inlineActivationResume').at(this,this.cfg.blocks[header].insns[0]))) {
           this.emitFuelCheck(header, out);
         }
         this.lowerNode(node.body, out, env);
@@ -1090,10 +1228,14 @@ class StructuredWasmCompiler {
   emitEdge(from, target, out) {
     if (target == null) return;
     const block = this.blockOf(target);
-    if (!block || !block.phis.length) return;
-    const argIndex = block.predIds.indexOf(from);
-    if (argIndex < 0) throw new Unsupported(`edge ${from}->${target} not in preds`);
-    this.emitParallelPhiCopies(out, block, argIndex);
+    if (!block) return;
+    if(block.phis.length){
+      const argIndex = block.predIds.indexOf(from);
+      if (argIndex < 0) throw new Unsupported(`edge ${from}->${target} not in preds`);
+      this.emitParallelPhiCopies(out, block, argIndex);
+    }
+    require('./nativeStaticArrayBody').edge(this,from,target,out);
+    require('./nativeObjectBody').edge(this,from,target,out);
   }
 
   // Push all sources, then set targets in reverse: the wasm value stack is
@@ -1128,7 +1270,11 @@ class StructuredWasmCompiler {
     }
     // a phi assignment rebinds its local (loop-carried receivers): caches
     // keyed on the phi describe the previous iteration's object
-    for (const { phi } of copies) out.push(...this.cacheKillsFor(phi.id));
+    const transferred=require('./arrayIdentityCaches').phiCopies(this,copies,out);
+    require('./nativeStaticArrayBody').phiCopies(this,copies,out,block.predIds[argIndex]);
+    const nativeCastTransfers=require('./nativeObjectBody').phiInputs(this,copies,out);
+    for (const { phi } of copies) out.push(...this.cacheKillsFor(phi.id,transferred));
+    require('./nativeObjectBody').phiOutputs(nativeCastTransfers,out);
   }
 
   // A receiver loaded out of an array and consumed only by a dispatch guard
@@ -1237,6 +1383,11 @@ class StructuredWasmCompiler {
   }
 
   useOf(value) {
+    if(this.stackifiedNumericValues?.has(value)){
+      const previous=this.numericExpressionValue,out=[];this.numericExpressionValue=value;
+      try{this.emitNode(value,out);}finally{this.numericExpressionValue=previous;}
+      return out;
+    }
     const remat = this.rematLoads && this.rematLoads.get(value);
     if (remat) {
       return [...this.useOf(remat.array), ...this.useOf(remat.index),
@@ -1253,6 +1404,7 @@ class StructuredWasmCompiler {
       OP.i32_const, ...sleb(0), OP.i32_le_s,
       OP.if, 0x40,
     );
+    if(this.loopResume?.header===header)require('./structuredLoopResume').emitYieldMarker(this,out);
     this.emitSpillResume(header, out);
     out.push(OP.end);
   }
@@ -1305,32 +1457,22 @@ class StructuredWasmCompiler {
   }
 
   consumeDirectExit(status,id,owner) {
-    const box=this.box;
-    if(status===-6){const flag=box.deoptFlag;box.deoptFlag=0;return flag;}
-    if(status===-4)return 1; // clinit still belongs to the original invoke
-    if(status===-5)throw owner.box.lastThrown;
-    const frame=owner.take(id);
-    this.wasmJit.canonicalResumeFrames.add(frame);
-    if(status===-3){
-      const exn=frame.wasmDirectException;
-      frame.wasmDirectException=null;
-      if(!this.jvm.dispatchExceptionInFrame(frame,exn,frame.wasmDirectThrowPc))throw exn;
-    }
-    const deeper=frame.wasmDirectPendingFrames;
-    frame.wasmDirectPendingFrames=null;
-    box.pendingFrames=deeper?[...deeper,frame]:[frame];
-    box.canonicalFrameHandoff=true;
-    return 2;
+    return consumeCanonicalExit(this.jvm,this.wasmJit,this.box,status,id,owner);
   }
 
   consumeCompactExit(status) {
-    if(status===-4 || status===-6)return this.consumeDirectExit(status,0,null);
+    if(status===-4 || status===-6 || status===-7)return this.consumeDirectExit(status,0,null);
     const {owner,id}=this.wasmJit.canonicalDirectLinks.takeExit(status);
     return this.consumeDirectExit(status,id,owner);
   }
 
   emitSpillResume(blockId, out, stub = null) {
     const block = this.blockOf(blockId);
+    const inline=require('./inlineActivationResume'),activation=inline.at(this,this.cfg.blocks[blockId].insns[0]);
+    if(activation&&!stub){
+      inline.emit(this,activation,block.slotDefsIn,block.entryStack,activation.item,out,'block_'+blockId);
+      return;
+    }
     const resumeIndex=stub?stub.resumeIdx:this.resumeItemOf(blockId);
     const spills = [];
     const dropped = [];
@@ -1470,6 +1612,18 @@ class StructuredWasmCompiler {
       const value = term.args[0];
       const t = KIND_T[value.kind];
       if (t === undefined) throw new Unsupported('return kind');
+      if(t===T.ref && this.ownArrayResult){
+        const target=this.importArrayResult(this.ownArrayResult);
+        out.push(...this.clearArrayResult(target));
+        const source=this.arrayCaches.get(this.fn.referenceFacts.identity(value).id);
+        if(source){
+          if(!source.parameter)out.push(OP.local_get,...uleb(source.filled),OP.if,0x40);
+          out.push(OP.local_get,...uleb(source.base),OP.global_set,...uleb(target.base),
+            OP.local_get,...uleb(source.len),OP.global_set,...uleb(target.length),
+            ...(source.owned===undefined?[]:[OP.local_get,...uleb(source.owned),OP.global_set,...uleb(target.owned)]));
+          if(!source.parameter)out.push(OP.end);
+        }
+      }
       // Numeric values also use the cheaper ret_* import for JS entries.
       // References use only retv, consumed/cleared by both JS and runv callers;
       // copying them into box.ret would retain the last returned object.
@@ -1492,12 +1646,22 @@ class StructuredWasmCompiler {
     const block = this.blockOf(blockId);
     const initializationGuards = new Set();
     for (const node of block.body) {
+      if(node.op==='new'){
+        addNewImport(this,this.jvm,node.imm);
+        initializationGuards.add(this.allocationImports.get(node.imm).guard);
+      }
       if (node.op === 'invokestatic' && node.imm?.[1] === 'java/lang/System') {
         const call = addSystemImport(this, this.jvm, {arg:node.imm});
         if (call.initializationIdx != null) initializationGuards.add(call.initializationIdx);
         continue;
       }
       if (node.op === 'invokestatic') {
+        // A restricted target either refuses without guest effects or enters
+        // a canonical wrapper that checks its OWN owner readiness. Keep the
+        // Java initialization boundary at the invoke, after preceding writes.
+        if(this.nativeObjectBody?.calls.has(node.id)&&!this.nativeObjectBody.forwarder){
+          this.nativeReadinessProofSites.add('call:'+node.itemIdx);continue;
+        }
         const call = addArraysImport(this, this.jvm, {arg: node.imm});
         if (call?.initializationIdx != null) initializationGuards.add(call.initializationIdx);
         if (!call && node.imm?.[1] !== GUARD_OWNER) {
@@ -1506,27 +1670,40 @@ class StructuredWasmCompiler {
         }
       }
       if (node.op !== 'getstatic' && node.op !== 'putstatic') continue;
+      if(this.nativeObjectBody?.staticReads.has(node.id)){this.nativeReadinessProofSites.add('static:'+node.itemIdx);continue;}
       const field = addFieldImport(this, this.jvm, {arg: node.imm}, true,
         node.op === 'getstatic');
       if (field.initializationIdx != null) initializationGuards.add(field.initializationIdx);
     }
+    const closedForwarder=this.nativeObjectBody?.forwarder&&initializationGuards.size;
+    const initializationOut=closedForwarder?[]:out;
     for (const idx of initializationGuards) {
+      if(require('./nativeStaticArrayBody').provesReadiness(this,blockId,idx)){
+        this.nativeReadinessProofSites.add(blockId+':'+(typeof idx==='number'?idx:idx.address));continue;
+      }
       if (this.leafInitializationGuards ||
           this.origIdx && this.origIdx[this.cfg.blocks[blockId].insns[0]] === -1) {
         this.inlinedInitializationGuards.add(idx);
         continue;
       }
-      out.push(...this.readinessSeq(idx), OP.i32_eqz, OP.if, 0x40);
-      this.emitSpillResume(blockId, out);
-      out.push(OP.end);
+      initializationOut.push(...this.readinessSeq(idx), OP.i32_eqz, OP.if, 0x40);
+      this.emitSpillResume(blockId, initializationOut);
+      initializationOut.push(OP.end);
     }
-    for (const node of block.body) {
-      if (this.ehMethod && node.effects && node.effects.mayThrow) {
-        this.emitEhWrapped(node, out);
-      } else {
-        this.emitNode(node, out);
+    if(closedForwarder)out.push(entryModeCode(this.blkLocal,initializationOut,[]));
+    const previousFills=this.blockArrayFills;
+    const previousSlabFills=this.blockSlabFills;
+    this.blockArrayFills=new Set();
+    this.blockSlabFills=new Set();
+    try {
+      for (const node of block.body) {
+        if (this.ehMethod && node.effects && node.effects.mayThrow) {
+          this.emitEhWrapped(node, out);
+        } else {
+          this.emitNode(node, out);
+        }
       }
-    }
+    } finally {this.blockArrayFills=previousFills;this.blockSlabFills=previousSlabFills;}
   }
 
   // In a method with live handler ranges every throwing op — covered or not —
@@ -1557,7 +1734,8 @@ class StructuredWasmCompiler {
     const item = this.originalItems[orig];
     const label = item && item.labelDef;
     if (!label) throw new Unsupported('eh site without label');
-    return { resumeIdx: orig, pc: parseInt(label.slice(1, -1), 10) };
+    return { resumeIdx: orig, pc: parseInt(label.slice(1, -1), 10),
+      inlineActivation:require('./inlineActivationResume').at(this,itemIdx) };
   }
 
   emitEhCatch(slotState, site, out) {
@@ -1601,14 +1779,25 @@ class StructuredWasmCompiler {
   }
 
   emitNode(node, out) {
+    if(require('./nativeStaticArrayBody').instruction(this,node,out))return;
+    if(require('./nativeObjectBody').field(this,node,out))return;
+    require('./nativeObjectBody').access(this,node,out);
+    if((node.op==='getstatic'||node.op==='putstatic'||node.op==='getfield')&&require('./nativeStaticArrayBody').read(this,node,out))return;
+    if(this.stackifiedNumericValues?.has(node)&&this.numericExpressionValue!==node)return;
     const op = node.op;
     const use = (i) => this.useOf(node.args[i]);
     const finish = () => {
+      if(this.numericExpressionValue===node)return;
       if (node.kind !== 'V') {
         out.push(OP.local_set, ...uleb(this.mustLocal(node)));
         // this value's local now holds a fresh (re)computation — caches
         // keyed on it describe the previous one and must refill
         out.push(...this.cacheKillsFor(node.id));
+        const header=this.referenceArrayElementHeaders?.get(node.id);
+        if(header){
+          const cache=this.arrayCacheFor(node);
+          out.push(...this.seedArrayCacheHeader(cache,header.base,header.len));
+        }
       }
     };
 
@@ -1693,7 +1882,8 @@ class StructuredWasmCompiler {
         entry.readerIds.add(node.id);
         const onMiss = [];
         for (const id of entry.readerIds) onMiss.push(...this.cacheKillsFor(id));
-        out.push(...this.cachedReadSeq(entry, [...use(0), ...use(1), OP.call,
+        out.push(...this.cachedReadSeq(entry, this.objNativeOps && op==='aaload'
+          ? this.nativeReferenceArrayGetSeq(node) : [...use(0), ...use(1), OP.call,
           ...uleb(this.importIndexByName.get(arrayLoadImportName(this, op, t)))], onMiss));
         out.push(OP.local_set, ...uleb(this.mustLocal(node)));
         return;
@@ -1709,7 +1899,8 @@ class StructuredWasmCompiler {
         out.push(...this.heapAccessSeq(node, HEAP_LOAD[op], null, t));
         return finish();
       }
-      out.push(...use(0), ...use(1), OP.call,
+      if(this.objNativeOps && op==='aaload')out.push(...this.nativeReferenceArrayGetSeq(node));
+      else out.push(...use(0), ...use(1), OP.call,
         ...uleb(this.importIndexByName.get(arrayLoadImportName(this, op, t))));
       return finish();
     }
@@ -1727,6 +1918,11 @@ class StructuredWasmCompiler {
       return finish();
     }
     if (op === 'arraylength') {
+      const regionCache=require('./nativeStaticArrayBody').cacheFor(this,node)||this.nativeObjectBody?.arrayCaches.get(node.id);
+      if(regionCache){out.push(OP.local_get,...uleb(regionCache.len));return finish();}
+      if(this.nativeStaticArrayBody?.references?.has(node.args[0].id)){
+        out.push(OP.local_get,...uleb(this.arrayCacheFor(node.args[0]).len));return finish();
+      }
       const alenIdx = this.importIndexByName.get('alen');
       if (this.heap) {
         // serve the length from the array's base/len cache (filled once per
@@ -1737,7 +1933,7 @@ class StructuredWasmCompiler {
         const c = this.arrayCacheFor(node.args[0]);
         const arr = this.useOf(node.args[0]);
         out.push(
-          ...this.lazyArrayCacheFill(c),
+          ...this.arrayAccessFill(c,node),
           OP.local_get, ...uleb(c.base), OP.i32_const, ...sleb(0), OP.i32_ge_s,
           OP.if, T.i32,
           OP.local_get, ...uleb(c.len),
@@ -1759,11 +1955,15 @@ class StructuredWasmCompiler {
       const where = `${this.className}.${this.method.name}`;
       const field = addFieldImport(this, this.jvm, { arg: node.imm }, isStatic, isGet,
         fusedRemat ? ((array, i) => arrayElement(array, i, where)) : null);
+      if(isStatic&&isGet&&field.nativeReference){
+        (this.nativeStaticArrayReads ||= new Map()).set(node.id,{native:field.nativeReference,owner:field.owner||node.imm[1]});
+      }
       const receiver = fusedRemat
         ? [...this.useOf(fusedRemat.array), ...this.useOf(fusedRemat.index)]
         : null;
       const [, fieldOwner, [fieldName, descriptor]] = node.imm;
       const killKey = `${fieldName}:${descriptor}`;
+      if(isStatic&&descriptor==='I'&&field.native)this.nativeStaticScalarAccesses.set(node.id,{...field,write:!isGet,killKey});
       const caching = !this.wasmJit || this.wasmJit.fieldCacheEnabled !== false;
       // Slab path: the field has a static offset inside the wasm memory and
       // its slot kind matches the wasm type the import would have produced
@@ -1779,6 +1979,7 @@ class StructuredWasmCompiler {
       const slotT = slot && (slot.kind === 'i32' ? T.i32
         : slot.kind === 'f64' ? T.f64 : T.i64);
       if (slot && slotT === field.t) {
+        this.nativeObjectFieldOperations.set(node.id,{slot,receiver:node.args[0],reference:false});
         this.slabFieldSites += 1;
         out.push(...this.slabAccessSeq(node, slot, field.idx, isGet, use));
         if (isGet) {
@@ -1792,6 +1993,9 @@ class StructuredWasmCompiler {
         }
         return;
       }
+      const referenceSlot=!isStatic && this.objNativeOps && !receiver && !denseLayoutFor(this.jvm,fieldOwner)
+        ? nativeReferenceSlotFor(this.jvm,fieldOwner,fieldName):null;
+      if(referenceSlot)this.nativeObjectFieldOperations.set(node.id,{slot:referenceSlot,receiver:node.args[0],reference:true});
       if (isGet && caching) {
         const cacheKey = isStatic
           ? `s|${field.name}` : `f|${node.args[0].id}|${field.name}`;
@@ -1804,7 +2008,8 @@ class StructuredWasmCompiler {
         // cached instance path skips the null check: a filled flag proves
         // this exact SSA value already loaded this field successfully
         const loadSeq = isStatic
-          ? this.nativeStaticRead(field)
+          ? this.nativeStaticRead(field, /^\[[BCSIJFD]$/.test(descriptor)?entry:null)
+          : referenceSlot ? this.nativeReferenceRead(node,referenceSlot,field.idx,entry)
           : [...(receiver || use(0)), OP.call, ...uleb(field.idx)];
         // Dependent caches (arrays/fields keyed on a reader's value) are
         // killed on the refill path only — a hit reproduces the entry's
@@ -1824,6 +2029,21 @@ class StructuredWasmCompiler {
         out.push(...(this.activeGuardedLoopPlan?.fieldNodes.has(node.id)
           ? [OP.local_get,...uleb(entry.valLocal)] : this.cachedReadSeq(entry, loadSeq, onMiss)));
         if (node.kind !== 'V') out.push(OP.local_set, ...uleb(this.mustLocal(node)));
+        if(entry.nativeReferenceHeader){
+          const header=entry.nativeReferenceHeader,cache=this.arrayCacheFor(node);
+          out.push(...this.seedArrayCacheHeader(cache,header.base,header.len));
+        }
+        if(entry.referenceArrayStorage){
+          const captured=entry.referenceArrayStorage,cache=this.objCacheFor(node);
+          // A checked field import cannot supply private storage. On a later
+          // field-cache hit, keep metadata discovered by the array's own read:
+          // replacing its store with null would leave a valid base paired with
+          // a null typed store. A refill already kills dependent array caches.
+          out.push(OP.local_get,...uleb(captured.raw),OP.ref_is_null,OP.i32_eqz,OP.if,0x40,
+            OP.local_get,...uleb(captured.raw),OP.local_set,...uleb(cache.store),
+            OP.local_get,...uleb(captured.typed),OP.local_set,...uleb(cache.typedStore),
+            OP.i32_const,1,OP.local_set,...uleb(cache.storeFilled),OP.end);
+        }
         const generation = this.arrayReaderGenerations?.get(node.id);
         if (generation !== undefined) {
           out.push(OP.local_get, ...uleb(entry.arrayGeneration),
@@ -1931,6 +2151,8 @@ class StructuredWasmCompiler {
       const call = op === 'invokestatic'
         ? this.staticCallImport(node)
         : this.instanceCallImport(node, op);
+      if(op==='invokestatic'&&call.canonical)this.nativeObjectCalls.set(node.id,call.canonical);
+      require('./nativeObjectBody').beforeCall(this,node,out);
       if (this.heap && this.wasmJit.heapBulkCopy && call.builtinArrayCopy) {
         require('./WasmArrayCopy').emitHeapCopy(this, node, call, out);
         out.push(...this.callFieldCacheKills(call));
@@ -1968,20 +2190,48 @@ class StructuredWasmCompiler {
           }
           out.push(OP.local_get,...uleb(cache.base),OP.local_get,...uleb(cache.len));
         }
+        for(const input of c.objects||[])out.push(...this.objectStoreFill(input.cache,input.receiver));
+        if(c.objectParameters)for(const input of c.objects||[])out.push(OP.local_get,...uleb(input.cache.typedStore));
+        const publish=c.objectParameters?[]:(c.objects||[]).flatMap(input=>[OP.local_get,...uleb(input.cache.store),OP.global_set,...uleb(input.global)]);
         if(c.guardIdx!==undefined){
           // Arguments already reside on the operand stack. Inspect the saved
           // SSA receiver without evaluating any Java expression a second time.
           const cache=c.guardCache;
+          let guard=[...use(0),OP.call,...uleb(c.guardIdx)];
+          if(c.nativeGuard){
+            const ng=c.nativeGuard,native=[];
+            if(ng.direct)native.push(OP.i32_const,1);
+            else{
+              const classLocal=this.nextLocal++;this.declared.push(T.i32);
+              native.push(...this.nativeStoreField(ng.cache,1),OP.local_set,...uleb(classLocal));
+              for(const [i,index] of ng.classes.entries()){
+                native.push(OP.local_get,...uleb(classLocal),OP.i32_const,...sleb(index),OP.i32_eq);
+                if(i)native.push(OP.i32_or);
+              }
+              if(!ng.classes.length)native.push(OP.i32_const,0);
+            }
+            guard=[OP.local_get,...uleb(ng.cache.store),OP.ref_is_null,OP.if,T.i32,...guard,OP.else,...native,OP.end];
+          }
           if(cache)out.push(OP.local_get,...uleb(cache.filled),OP.i32_eqz,OP.if,0x40,
-            ...use(0),OP.call,...uleb(c.guardIdx),OP.local_set,...uleb(cache.verdict),
+            ...guard,OP.local_set,...uleb(cache.verdict),
             OP.i32_const,1,OP.local_set,...uleb(cache.filled),OP.end,
             OP.local_get,...uleb(cache.verdict));
-          else out.push(...use(0),OP.call,...uleb(c.guardIdx));
-          out.push(OP.if,T.i32,
+          else out.push(...guard);
+          out.push(OP.if,T.i32,...publish,
             OP.i32_const,...sleb(c.slot),OP.else,
             OP.i32_const,...sleb(c.fallbackSlot),OP.end);
-        }else out.push(OP.i32_const,...sleb(c.slot));
+        }else{
+          out.push(...publish);
+          require('./nativeObjectBody').callSlot(this,node,c.slot,out);
+        }
+        if(c.arrayResult)out.push(...this.clearArrayResult(c.arrayResult.indices));
         out.push(OP.call_indirect,...uleb(c.type),0x00);
+        if(c.arrayResult){const r=c.arrayResult;out.push(OP.global_get,...uleb(r.indices.base),OP.local_set,...uleb(r.base),
+          OP.global_get,...uleb(r.indices.length),OP.local_set,...uleb(r.length),
+          OP.global_get,...uleb(r.indices.owned),OP.local_set,...uleb(r.owned),...this.clearArrayResult(r.indices));}
+        // Cold wrappers return before their body's consuming prologue. Clear
+        // those inputs too, while native return values remain on the stack.
+        if(!c.objectParameters)for(const input of c.objects||[])out.push(OP.ref_null,T.ref,OP.global_set,...uleb(input.global));
         if(node.kind!=='V')out.push(OP.local_set,...uleb(this.mustLocal(node)));
         const status=this.nextLocal++;this.declared.push(T.i32);
         let owner,id;
@@ -2001,6 +2251,9 @@ class StructuredWasmCompiler {
         if(empty)out.push(OP.end);
         out.push(...this.callFieldCacheKills(call));
         if(node.kind!=='V')out.push(...this.cacheKillsFor(node.id));
+        if(c.arrayResult){const r=c.arrayResult,cache=this.arrayCacheFor(node);
+          cache.returnedOwnership=true;
+          out.push(...this.seedArrayCacheHeader(cache,r.base,r.length,[OP.local_get,...uleb(r.owned)]));}
         return;
       }
       if (call.directLink) {
@@ -2113,9 +2366,11 @@ class StructuredWasmCompiler {
         return finish();
       }
       if ((!this.origIdx || this.origIdx[node.itemIdx] !== -1) &&
-          !this.wasmJit?.checkcastEnabled) {
+          !this.wasmJit?.checkcastEnabled&&!this.nativeObjectSnapshotPlan?.casts?.has(node.id)) {
         throw new Unsupported(`op ${op}`);
       }
+      const nativeCast=this.nativeCastSeq(node);
+      if(nativeCast){out.push(...nativeCast);return finish();}
       if (op === 'instanceof' && (!this.wasmJit || this.wasmJit.fieldCacheEnabled !== false)) {
         // guard-shaped instanceof runs per loop iteration on a loop-invariant
         // receiver: cache the verdict per SSA value instead of crossing into
@@ -2211,12 +2466,49 @@ class StructuredWasmCompiler {
     return entry;
   }
 
+  seedArrayCacheHeader(cache, base, len, ownership) {
+    // These seeds come from private field/element headers, or from a returned
+    // payload carrying its own ownership bit. Numeric pointers from generic
+    // metadata queries and parameter transport never establish this fact.
+    const source=this.nativeObjectBody?.sourceCaches.get(cache.value.id);
+    if(this.ownArrayResult&&!this.arrayReturnIdentities){
+      this.arrayReturnIdentities=new Set(this.fn.blocks.filter(block=>this.fn.reachable.has(block.id)&&
+        block.term.kind==='return'&&block.term.args[0]?.kind==='A')
+        .map(block=>this.fn.referenceFacts.identity(block.term.args[0]).id));
+    }
+    // Retain ownership only for an actual return identity or a regional
+    // consumer. Other header users need location/length, not this new fact.
+    const track=!!source||this.arrayReturnIdentities?.has(cache.value.id);
+    if(track&&cache.owned===undefined){cache.owned=this.nextLocal++;this.declared.push(T.i32);}
+    const out=[OP.local_get,...uleb(base),OP.local_set,...uleb(cache.base),
+      OP.local_get,...uleb(len),OP.local_set,...uleb(cache.len),
+      ...(track?[...(ownership||[OP.i32_const,1]),OP.local_get,...uleb(base),OP.i32_const,0,OP.i32_ge_s,
+        OP.i32_and,OP.local_set,...uleb(cache.owned)]:[]),
+      // Bulk copies still perform their separate element-representation check.
+      ...(cache.copyKind===undefined
+        ?[OP.local_get,...uleb(base),OP.i32_const,...sleb(-2),OP.i32_ne]
+        :[OP.i32_const,0]),OP.local_set,...uleb(cache.filled)];
+    if(source){
+      (this.nativeArrayResultOwnershipSites ||= new Set()).add(cache.value.id);
+      out.push(OP.local_get,...uleb(cache.owned),OP.if,0x40,
+        OP.local_get,...uleb(base),OP.local_set,...uleb(source.base),
+        OP.local_get,...uleb(len),OP.local_set,...uleb(source.len),
+        OP.i32_const,1,OP.local_set,...uleb(source.captured),OP.else,
+        OP.i32_const,0,OP.local_set,...uleb(source.captured),OP.end,
+        // The producer already authenticated this positive header. Its proof
+        // must survive an outside edge even before the first element use.
+        OP.local_get,...uleb(cache.owned),OP.local_set,...uleb(source.filled));
+    }
+    return out;
+  }
+
   arrayCacheFill(cache) {
     const arr = this.useOf(cache.value);
-    const query = [
+    const query = require('./arrayIdentityCaches').fill(this,cache,[
+      ...(cache.owned===undefined?[]:[OP.i32_const,0,OP.local_set,...uleb(cache.owned)]),
       ...arr, OP.call, ...uleb(this.abaseIdx), OP.local_set, ...uleb(cache.base),
       ...arr, OP.call, ...uleb(this.alen0Idx), OP.local_set, ...uleb(cache.len),
-    ];
+    ]);
     return [
       ...(cache.incoming ? [OP.local_get,...uleb(cache.base),OP.i32_const,...sleb(-2),
         OP.i32_eq,OP.if,0x40,...query,OP.end] : query),
@@ -2267,10 +2559,26 @@ class StructuredWasmCompiler {
     ];
   }
 
+  // An ordinary array access fills its immutable reference's metadata on
+  // every continuing path. Later accesses in this basic block need no flag
+  // test. Conditional call-argument fills do not establish this fact, and
+  // generation-checked field readers retain every validation.
+  arrayAccessFill(cache,node) {
+    if(cache.parameter || cache.sharedField || !this.blockArrayFills)
+      return this.lazyArrayCacheFill(cache);
+    if(this.blockArrayFills.has(cache)){
+      (this.omittedArrayFillSites ||= new Set()).add(node.id);
+      return [];
+    }
+    const sequence=this.lazyArrayCacheFill(cache);
+    this.blockArrayFills.add(cache);
+    return sequence;
+  }
+
   heapImports() {
     if (this.abaseIdx === undefined) {
-      this.abaseIdx = this.addImport('abase', [T.ref], [T.i32], (a) => (
-        a && a.wasmBase !== undefined ? a.wasmBase : -1));
+      const memory=this.heap.memory,{nativeArrayBase}=require('../core/nativeArrayMetadata');
+      this.abaseIdx = this.addImport('abase', [T.ref], [T.i32], array=>nativeArrayBase(memory,array));
       this.alen0Idx = this.addImport('alen0', [T.ref], [T.i32], (a) => (
         a === null || a === undefined ? 0 : a.length));
       this.aioobIdx = this.addImport('err_aioob', [T.i32, T.i32], [], (i, len) => {
@@ -2296,7 +2604,8 @@ class StructuredWasmCompiler {
   heapAccessSeq(node, acc, storeSeq, importT) {
     this.heapImports();
     this.usedHeap = true;
-    const c = this.arrayCacheFor(node.args[0]);
+    const regionCache=require('./nativeStaticArrayBody').cacheFor(this,node)||this.nativeObjectBody?.arrayCaches.get(node.id);
+    const c = regionCache||this.arrayCacheFor(node.args[0]);
     const arr = this.useOf(node.args[0]);
     const idx = this.useOf(node.args[1]);
     const addr = [
@@ -2304,9 +2613,13 @@ class StructuredWasmCompiler {
       ...idx, ...(acc.shift ? [OP.i32_const, ...sleb(acc.shift), OP.i32_shl] : []),
       OP.i32_add,
     ];
-    const bounds = [
+    const nativeParameter=this.parameterHeapAccess?.has(c);
+    const bounds = nativeParameter&&this.parameterHeapBoundsElisions?.has(node.id)?[]:[
       ...idx, OP.local_get, ...uleb(c.len), OP.i32_ge_u, OP.if, 0x40,
-      ...idx, OP.local_get, ...uleb(c.len), OP.call, ...uleb(this.aioobIdx), OP.end,
+      ...idx, OP.local_get, ...uleb(c.len), OP.call, ...uleb(this.aioobIdx),
+      // This import always throws. In the selected native body expose that
+      // fact to the engine; a failing check never rejoins subsequent accesses.
+      ...(nativeParameter ? [OP.unreachable] : []), OP.end,
     ];
     const storeImport = this.wasmJit.typedArrayStoresEnabled
       ? `aset_${node.op}` : `aset_${sig(importT)}`;
@@ -2320,12 +2633,12 @@ class StructuredWasmCompiler {
     if(this.activeGuardedLoopPlan?.memoryNodes.has(node.id)) {
       return [...addr,...(storeSeq||[]),...heapOp];
     }
-    if (this.parameterHeapAccess && c.parameter) {
+    if (nativeParameter||regionCache||this.nativeStaticArrayBody?.references?.has(node.args[0].id)) {
       return [...bounds, ...addr, ...(storeSeq || []), ...heapOp];
     }
     return [
       // fill once per run: base (-1 for null/non-heap) and length
-      ...this.lazyArrayCacheFill(c),
+      ...this.arrayAccessFill(c,node),
       OP.local_get, ...uleb(c.base), OP.i32_const, ...sleb(0), OP.i32_ge_s,
       OP.if, storeSeq ? 0x40 : acc.t,
       ...bounds, ...addr, ...(storeSeq || []), ...heapOp,
@@ -2341,7 +2654,15 @@ class StructuredWasmCompiler {
       this.declared.push(T.i32);
       const filled = this.nextLocal++;
       this.declared.push(T.i32);
-      entry = { base, filled };
+      const incoming=this.objectParamLocals?.get(objValue);
+      const typedIncoming=incoming!==undefined && this.parameterObjectABI.length>0;
+      const store=!typedIncoming && incoming!==undefined ? incoming : this.objNativeOps?this.nextLocal++:null;
+      if(store!==null && (incoming===undefined||typedIncoming))this.declared.push(T.ref);
+      const storeFilled=this.objNativeOps?this.nextLocal++:null;
+      if(storeFilled!==null)this.declared.push(T.i32);
+      const typedStore=typedIncoming?incoming:this.objNativeOps?this.nextLocal++:null;
+      if(typedStore!==null && !typedIncoming)this.declared.push([0x63,1]);
+      entry = { base, filled,store,storeFilled,typedStore,typedIncoming,incoming:incoming!==undefined };
       this.objCaches.set(objValue.id, entry);
     }
     return entry;
@@ -2349,12 +2670,151 @@ class StructuredWasmCompiler {
 
   objImports() {
     if (this.obaseIdx === undefined) {
-      this.obaseIdx = this.addImport('obase', [T.ref], [T.i32], (o) => {
-        if (!o || !o.fields) return -1;
-        const base = o.fields[SLAB_BASE_KEY];
-        return base === undefined ? -1 : base;
-      });
+      const memory=this.heap.memory;
+      this.obaseIdx = this.addImport('obase', [T.ref], [T.i32], object=>nativeObjectBaseOf(object,memory));
     }
+  }
+
+  importArrayResult(record) {
+    let indices=this.arrayResultImports.get(record);
+    if(!indices){
+      const add=(value,suffix)=>{const index=this.globalImportDecls.length,name='array_result_'+index+'_'+suffix;
+        this.globalImportDecls.push({name,type:T.i32,mutable:true});this.importedGlobals[name]=value;return index;};
+      indices={base:add(record.base,'base'),length:add(record.length,'length'),owned:add(record.owned,'owned')};
+      this.arrayResultImports.set(record,indices);
+    }
+    return indices;
+  }
+
+  clearArrayResult(indices) {
+    return [OP.i32_const,...sleb(-2),OP.global_set,...uleb(indices.base),
+      OP.i32_const,0,OP.global_set,...uleb(indices.length),
+      OP.i32_const,0,OP.global_set,...uleb(indices.owned)];
+  }
+
+  importObjectInput(value) {
+    const imports=this.objectInputImports ||= new Map();
+    if(!imports.has(value)){
+      const index=this.globalImportDecls.length,name='object_input_'+index;
+      this.globalImportDecls.push({name,type:T.ref,mutable:true});this.importedGlobals[name]=value;
+      imports.set(value,index);
+    }
+    return imports.get(value);
+  }
+
+  objectCallInputs(key,descriptor,isStatic,node) {
+    if(!this.objNativeOps)return [];
+    return this.wasmJit.objectStorageInputs(key,descriptor,isStatic).map(input=>({
+      index:input.index,cache:this.objCacheFor(node.args[input.index]),receiver:this.useOf(node.args[input.index]),
+      global:this.importObjectInput(input.value),value:input.value}));
+  }
+
+  // Both declarations match the structurally canonical GC storage type.
+  // Inline its loads so each field access stays in the caller's module.
+  nativeStoreField(cache,index) {
+    return [OP.local_get,...uleb(cache.typedStore),0xfb,2,1,index];
+  }
+
+  captureTypedStore(raw,typed) {
+    return [OP.local_get,...uleb(raw),OP.ref_is_null,OP.if,0x40,
+      OP.ref_null,1,OP.local_set,...uleb(typed),OP.else,
+      OP.local_get,...uleb(raw),0xfb,0x1a,0xfb,0x16,1,OP.local_set,...uleb(typed),OP.end];
+  }
+
+  nativeReferenceArrayGetSeq(node) {
+    this.heapImports();this.usedHeap=true;
+    const cache=this.objCacheFor(node.args[0]),receiver=this.useOf(node.args[0]),index=this.useOf(node.args[1]);
+    const length=this.nextLocal++;this.declared.push(T.i32);
+    const headers=this.referenceArrayElementHeaders ||= new Map();
+    if(!headers.has(node.id)){headers.set(node.id,{base:this.nextLocal++,len:this.nextLocal++});this.declared.push(T.i32,T.i32);}
+    const header=headers.get(node.id);
+    // A foreign array getter can change any field container or cell. Discard
+    // cached facts before invoking it; the owned GC branch keeps its fast path.
+    const fallback=[...this.opaqueArrayCacheKills(),OP.i32_const,...sleb(-2),OP.local_set,...uleb(header.base),OP.i32_const,0,OP.local_set,...uleb(header.len),
+      ...receiver,...index,OP.call,...uleb(this.importIndexByName.get(arrayLoadImportName(this,'aaload',T.ref)))];
+    const address=[OP.i32_const,...sleb(-2),OP.local_get,...uleb(cache.base),OP.i32_sub,
+      ...index,OP.i32_const,3,OP.i32_shl,OP.i32_add];
+    (this.nativeReferenceArraySites ||= new Set()).add(node.id);
+    return [...this.objectCacheFill(cache,receiver),OP.local_get,...uleb(cache.base),OP.i32_const,...sleb(-1),OP.i32_lt_s,
+      OP.if,T.ref,OP.i32_const,...sleb(-2),OP.local_get,...uleb(cache.base),OP.i32_sub,OP.i32_load,2,0,
+      OP.if,T.ref,...this.nativeStoreField(cache,2),0xfb,15,OP.local_set,...uleb(length),
+      ...index,OP.local_get,...uleb(length),OP.i32_ge_u,OP.if,0x40,
+      ...index,OP.local_get,...uleb(length),OP.call,...uleb(this.aioobIdx),OP.end,
+      ...address,OP.i32_load,2,8,OP.local_set,...uleb(header.base),
+      ...address,OP.i32_load,2,12,OP.local_set,...uleb(header.len),
+      ...this.nativeStoreField(cache,2),...index,0xfb,11,0,
+      OP.else,...fallback,OP.end,OP.else,...fallback,OP.end];
+  }
+
+  opaqueArrayCacheKills() {
+    const out=this.killSeqWhere(()=>true);
+    for(const cache of this.objCaches.values()){
+      out.push(OP.i32_const,0,OP.local_set,...uleb(cache.filled));
+      if(cache.storeFilled!==null)out.push(OP.i32_const,0,OP.local_set,...uleb(cache.storeFilled));
+      if(cache.store!==null)out.push(OP.ref_null,T.ref,OP.local_set,...uleb(cache.store));
+      if(cache.typedStore!==null)out.push(OP.ref_null,1,OP.local_set,...uleb(cache.typedStore));
+    }
+    return out;
+  }
+
+  objectStoreFill(cache,receiver) {
+    if(!this.objNativeOps)return this.objectCacheFill(cache,receiver);
+    if(this.objectStoreIdx===undefined){
+      const memory=this.heap.memory;
+      this.objectStoreIdx=this.addImport('object_storage',[T.ref],[T.ref],object=>nativeObjectStorageOf(object,memory));
+    }
+    const query=[...receiver,OP.call,...uleb(this.objectStoreIdx),OP.local_set,...uleb(cache.store)];
+    // A private typed parameter already carries the structural type proof.
+    // Missing metadata still queries the Java receiver at its original use.
+    const capture=[...query,...this.captureTypedStore(cache.store,cache.typedStore)];
+    return [OP.local_get,...uleb(cache.storeFilled),OP.i32_eqz,OP.if,0x40,
+      ...(cache.typedIncoming ? [
+        OP.local_get,...uleb(cache.typedStore),OP.ref_is_null,OP.if,0x40,...capture,OP.else,
+        OP.local_get,...uleb(cache.typedStore),0xfb,0x1b,OP.local_set,...uleb(cache.store),OP.end,
+      ] : [
+        ...(cache.incoming ? [OP.local_get,...uleb(cache.store),OP.ref_is_null,OP.if,0x40,...query,OP.end]:query),
+        ...this.captureTypedStore(cache.store,cache.typedStore),
+      ]),
+      OP.i32_const,1,OP.local_set,...uleb(cache.storeFilled),OP.end];
+  }
+
+  objectCacheFill(cache,receiver) {
+    this.objImports();
+    const loadBase=[...receiver,OP.call,...uleb(this.obaseIdx),OP.local_set,...uleb(cache.base)];
+    const fill=this.objNativeOps ? [...this.objectStoreFill(cache,receiver),
+      OP.local_get,...uleb(cache.store),OP.ref_is_null,OP.if,0x40,...loadBase,OP.else,
+      ...this.nativeStoreField(cache,0),OP.local_set,...uleb(cache.base),OP.end] : loadBase;
+    return [OP.local_get,...uleb(cache.filled),OP.i32_eqz,OP.if,0x40,...fill,
+      OP.i32_const,1,OP.local_set,...uleb(cache.filled),OP.end];
+  }
+
+  nativeReferenceRead(node,slot,fieldIndex,entry) {
+    const cache=this.objCacheFor(node.args[0]),receiver=this.useOf(node.args[0]);
+    const fill=entry && slot.header!==undefined ? this.objectCacheFill(cache,receiver):this.objectStoreFill(cache,receiver);
+    this.usedHeap=true;
+    let capture=[],fallback=[];
+    if(entry && slot.header!==undefined){
+      if(!entry.nativeReferenceHeader){
+        entry.nativeReferenceHeader={base:this.nextLocal++,len:this.nextLocal++};this.declared.push(T.i32,T.i32);
+      }
+      const header=entry.nativeReferenceHeader;
+      capture=[OP.local_get,...uleb(cache.base),OP.i32_load,2,...uleb(slot.header),OP.local_set,...uleb(header.base),
+        OP.local_get,...uleb(cache.base),OP.i32_load,2,...uleb(slot.header+4),OP.local_set,...uleb(header.len)];
+      fallback=[OP.i32_const,...sleb(-2),OP.local_set,...uleb(header.base),OP.i32_const,0,OP.local_set,...uleb(header.len)];
+    }
+    if(entry && slot.referenceArrayIndex!==undefined){
+      if(!entry.referenceArrayStorage){
+        entry.referenceArrayStorage={raw:this.nextLocal++,typed:this.nextLocal++};this.declared.push(T.ref,[0x63,1]);
+      }
+      const captured=entry.referenceArrayStorage;
+      capture.push(...this.nativeStoreField(cache,2),OP.i32_const,...sleb(slot.referenceArrayIndex),0xfb,11,0,
+        OP.local_set,...uleb(captured.raw),...this.captureTypedStore(captured.raw,captured.typed));
+      fallback.push(OP.ref_null,T.ref,OP.local_set,...uleb(captured.raw),OP.ref_null,1,OP.local_set,...uleb(captured.typed));
+    }
+    (this.nativeObjectReferenceSites ||= new Set()).add(fieldIndex);
+    return [...fill,OP.local_get,...uleb(cache.store),OP.ref_is_null,OP.i32_eqz,OP.if,T.ref,
+      ...capture,...this.nativeStoreField(cache,2),OP.i32_const,...sleb(slot.index),0xfb,11,0,
+      OP.else,...fallback,...receiver,OP.call,...uleb(fieldIndex),OP.end];
   }
 
   // getfield/putfield straight into the linear heap: fill the receiver's slab
@@ -2367,6 +2827,13 @@ class StructuredWasmCompiler {
     this.usedHeap = true;
     const cache = this.objCacheFor(node.args[0]);
     const recv = use(0);
+    // A completed primitive field operation unconditionally leaves this
+    // receiver's base cache filled, including the checked import arm. Keep
+    // this fact within the current basic block; SSA redefinitions kill it.
+    const known=this.blockSlabFills?.has(cache);
+    const fill=known?[]:this.objectCacheFill(cache,recv);
+    if(known)(this.omittedSlabFillSites ||= new Set()).add(node.id);
+    this.blockSlabFills?.add(cache);
     const align = slot.kind === 'i32' ? 2 : 3;
     const memOp = slot.kind === 'i32'
       ? (isGet ? OP.i32_load : OP.i32_store)
@@ -2385,9 +2852,7 @@ class StructuredWasmCompiler {
       ? (slot.kind === 'i32' ? T.i32 : slot.kind === 'f64' ? T.f64 : T.i64)
       : 0x40;
     return [
-      OP.local_get, ...uleb(cache.filled), OP.i32_eqz, OP.if, 0x40,
-      ...recv, OP.call, ...uleb(this.obaseIdx), OP.local_set, ...uleb(cache.base),
-      OP.i32_const, ...sleb(1), OP.local_set, ...uleb(cache.filled), OP.end,
+      ...fill,
       OP.local_get, ...uleb(cache.base), OP.i32_const, ...sleb(0), OP.i32_ge_s,
       OP.if, blockT,
       ...raw,
@@ -2404,7 +2869,44 @@ class StructuredWasmCompiler {
     return native;
   }
 
-  nativeStaticRead(field) {
+  nativeStaticReference(cell) {
+    if(!this.heap || !cell)return null;
+    const cells=this.nativeStaticReferences ||= new Map();
+    if(!cells.has(cell)){
+      const binding=require('../core/nativeStaticReferenceCell').bindNativeStaticReferenceCell(cell,this.heap);
+      if(!binding)cells.set(cell,null);
+      else{
+        const index=this.globalImportDecls.length,name='static_reference_'+index;
+        this.globalImportDecls.push({name,type:T.ref,mutable:true});
+        this.importedGlobals[name]=binding.value;
+        cells.set(cell,{...binding,index});
+      }
+    }
+    const native=cells.get(cell);
+    if(native){this.heapImports();this.usedHeap=true;}
+    return native;
+  }
+
+  nativeStaticRead(field,entry) {
+    if(field.nativeReference){
+      const native=field.nativeReference;
+      // Capture metadata with the field value, before any later call can
+      // replace that field. A cache hit reproduces this same old reference.
+      let capture=[],fallback=[];
+      if(entry){
+        if(!entry.nativeReferenceHeader){
+          entry.nativeReferenceHeader={base:this.nextLocal++,len:this.nextLocal++};
+          this.declared.push(T.i32,T.i32);
+        }
+        const c=entry.nativeReferenceHeader;
+        capture=[OP.i32_const,...sleb(native.address+4),OP.i32_load,2,0,OP.local_set,...uleb(c.base),
+          OP.i32_const,...sleb(native.address+8),OP.i32_load,2,0,OP.local_set,...uleb(c.len)];
+        fallback=[OP.i32_const,...sleb(-2),OP.local_set,...uleb(c.base),OP.i32_const,0,OP.local_set,...uleb(c.len)];
+      }
+      (this.nativeStaticReferenceSites ||= new Set()).add(field.idx);
+      return [OP.i32_const,...sleb(native.address),OP.i32_load,2,0,OP.i32_const,1,OP.i32_and,OP.if,T.ref,
+        ...capture,OP.global_get,...uleb(native.index),OP.else,...fallback,OP.call,...uleb(field.idx),OP.end];
+    }
     if(!field.native)return [OP.call,...uleb(field.idx)];
     const sites=this.nativeStaticSites ||= new Map();
     if(!sites.has('read'))sites.set('read',new Set());sites.get('read').add(field.idx);
@@ -2443,9 +2945,14 @@ class StructuredWasmCompiler {
   // Clears every cache keyed on this SSA value: emitted right after the
   // value's wasm local is (re)written, so a cache filled from a previous
   // execution of the defining node (loop-carried receiver) never survives it.
-  cacheKillsFor(id) {
+  cacheKillsFor(id, preserveArrayIdentity = false) {
     const seq = [];
+    require('./nativeObjectBody').kill(this,id,seq);
+    const identity=this.arrayIdentityGroups?.get(id);
+    if(identity && !preserveArrayIdentity)seq.push(OP.i32_const,0,OP.local_set,...uleb(identity.filled));
     const arr = this.arrayCaches.get(id);
+    if(arr)this.blockArrayFills?.delete(arr);
+    if(arr?.owned!==undefined)seq.push(OP.i32_const,0,OP.local_set,...uleb(arr.owned));
     // Shared readers validate their captured generation on every access. A
     // sibling refill must not discard an older, still-live captured array.
     if (arr && !arr.parameter && !arr.sharedField) {
@@ -2462,7 +2969,11 @@ class StructuredWasmCompiler {
       }
     }
     const obj = this.objCaches.get(id);
-    if (obj) seq.push(OP.i32_const, ...sleb(0), OP.local_set, ...uleb(obj.filled));
+    if (obj) {
+      this.blockSlabFills?.delete(obj);
+      seq.push(OP.i32_const,0,OP.local_set,...uleb(obj.filled));
+      if(obj.storeFilled!==null)seq.push(OP.i32_const,0,OP.local_set,...uleb(obj.storeFilled));
+    }
     return seq;
   }
 
@@ -2503,6 +3014,30 @@ class StructuredWasmCompiler {
       ...onMiss,
       OP.local_get, ...uleb(entry.valLocal), OP.end,
     ];
+  }
+
+  // A loaded class's proven supertypes never change when another class is
+  // loaded. Recognize a bounded positive set in native storage; unknown,
+  // foreign and later classes retain the existing checked import.
+  nativeCastSeq(node) {
+    if(!this.objNativeOps)return null;
+    const matching=Object.keys(this.jvm.classes).filter(name=>
+      this.jvm.isInstanceOfSync(name,node.imm)===true);
+    if(!matching.length || matching.length>16)return null;
+    const receiver=this.useOf(node.args[0]),cache=this.objCacheFor(node.args[0]);
+    const local=this.nextLocal++;this.declared.push(T.i32);
+    const matches=[];
+    for(const [i,name] of matching.entries()){
+      matches.push(OP.local_get,...uleb(local),OP.i32_const,...sleb(classIndexOf(this.jvm,name)),OP.i32_eq);
+      if(i)matches.push(OP.i32_or);
+    }
+    const fallback=[...receiver,OP.call,...uleb(this.castImport(node.op,node.imm))];
+    const result=node.op==='checkcast'?receiver:[OP.i32_const,1];
+    (this.nativeCastSites ||= new Set()).add(node.id);
+    return [...this.objectStoreFill(cache,receiver),OP.local_get,...uleb(cache.store),OP.ref_is_null,
+      OP.if,node.op==='checkcast'?T.ref:T.i32,...fallback,OP.else,
+      ...this.nativeStoreField(cache,1),OP.local_set,...uleb(local),...matches,
+      OP.if,node.op==='checkcast'?T.ref:T.i32,...result,OP.else,...fallback,OP.end,OP.end];
   }
 
   // Memoized subtype-verdict imports. Never deopts: a hierarchy verdict for a
@@ -2750,6 +3285,7 @@ class StructuredWasmCompiler {
         }
         const scratch=new Map(),dummy=dummyRet(ret);
         let bound=calleeSt,boundEpoch=-1;
+        let objectParameters=false;
         const fallback=(...args)=>{
           if(!bound || boundEpoch!==this.wasmJit.compileEpoch || !(bound.callee||bound).meta){
             bound=this.wasmJit.findReadyStatic(className,name,descriptor,true,true,true,true);
@@ -2758,15 +3294,19 @@ class StructuredWasmCompiler {
           }
           if(!bound || !(bound.callee||bound).meta){this.box.deoptFlag=1;return dummy;}
           return this.runNested(bound,className,
-            arrayCount?args.slice(0,params.length):args,argPosBySlot,scratch,dummy);
+            arrayCount||objectParameters?args.slice(0,params.length):args,argPosBySlot,scratch,dummy);
         };
+        const objects=this.objectCallInputs(key,descriptor,true,node);
+        objectParameters=compact&&objects.length>0;
+        const nativeParams=objectParameters?[...expandedParams,...objects.map(()=>[0x63,1])]:expandedParams;
         let direct=this.canonicalSlotByNode?.get(node);
         if(direct===undefined){
           // The stub's JS call crosses an indirect table, so the caller's
           // ordinary import wrapper cannot record its exception for catch_all.
           const recordedFallback = this.ehMethod && !this.jsTagEh
-            ? ehRecordingImport(fallback, expandedParams.length, this.box) : fallback;
-          direct=this.wasmJit.canonicalDirectLinks.allocate(key,expandedParams,results,recordedFallback,arrayIndices,compact);
+            ? ehRecordingImport(fallback, nativeParams.length, this.box) : fallback;
+          direct=this.wasmJit.canonicalDirectLinks.allocate(key,nativeParams,results,recordedFallback,arrayIndices,compact,
+            objectParameters?[]:objects.map(input=>input.value),null,objectParameters?objects.map(input=>input.index):[]);
           (this.canonicalSlotByNode||=new Map()).set(node,direct);
           this.canonicalSlots.push(direct);
           if(compact)(this.canonicalCompactSlots ||= new Set()).add(direct);
@@ -2796,11 +3336,11 @@ class StructuredWasmCompiler {
         }
         this.usedCanonicalTable=true;
         this.canonicalDirectSites=(this.canonicalDirectSites||0)+1;
-        const type=this.internSig(expandedParams,[T.i32,...(compact?[]:[T.i32,T.ref]),...results]);
+        const type=this.internSig(nativeParams,[T.i32,...(compact?[]:[T.i32,T.ref]),...results]);
         const consumeIdx=compact ? this.addImport('canonical_compact_exit',[T.i32],[T.i32],
           status=>this.consumeCompactExit(status)) : this.addImport('canonical_exit',[T.i32,T.i32,T.ref],[T.i32],
           (status,id,owner)=>this.consumeDirectExit(status,id,owner));
-        return {canonical:{slot:direct,type,consumeIdx,arrays,arrayOwnerReady,compact,emptyCopy},writes,deoptable:true};
+        return {canonical:{slot:direct,type,consumeIdx,arrays,objects,objectParameters,arrayOwnerReady,compact,emptyCopy},writes,deoptable:true};
       }
     }
     // UNKNOWN: the callee owns no module yet. Emit a late-bound call rather
@@ -3003,7 +3543,7 @@ class StructuredWasmCompiler {
     // the interpreter's responsibility, including later guest overrides.
     const nativeExit = () => {
       if (!this.wasmJit.nativeInstanceExitsEnabled ||
-          op === 'invokespecial' ||
+          op === 'invokespecial' && !(this.directFrames && this.wasmJit.canonicalEhLinksEnabled) ||
           !this.jvm._jreFindMethod?.(owner, name, descriptor)) return null;
       const dummy = dummyRet(ret);
       return {
@@ -3016,6 +3556,9 @@ class StructuredWasmCompiler {
         deoptable: true,
       };
     };
+    if(op==='invokespecial'){
+      const exit=nativeExit();if(exit)return exit;
+    }
     const hierarchy = this.wasmJit.hierarchy;
     // See the matching site in WasmJit: these wait on the impl METHOD.
     const implKey = (implClassName) => `${implClassName}.${name}${descriptor}`;
@@ -3203,15 +3746,27 @@ class StructuredWasmCompiler {
         [T.ref],[T.i32],receiver=>receiver!==null && receiver!==undefined &&
           (direct || classes.has(runtimeClassName(receiver))) ? 1 : 0);
       const compact=!!this.compactExitLinks;
+      const objects=this.objectCallInputs(canonicalTarget.key,descriptor,false,node);
+      // Instance array headers retain their existing lazy ABI until this
+      // call site can supply all headers required by the combined entry.
+      const objectParameters=compact&&objects.length>0&&!primitiveArrayParameters(descriptor).length;
+      const nativeParams=objectParameters?[...wParams,...objects.map(()=>[0x63,1])]:wParams;
+      const nativeGuard=objects.length ? {cache:objects[0].cache,direct:!!direct,
+        classes:[...classes].map(name=>classIndexOf(this.jvm,name))}:null;
+      const resultRecord=this.heap && this.wasmJit.arrayResultMetadata(canonicalTarget.key,descriptor);
+      let arrayResult=null;
+      if(resultRecord){arrayResult={indices:this.importArrayResult(resultRecord),base:this.nextLocal++,length:this.nextLocal++,owned:this.nextLocal++};this.declared.push(T.i32,T.i32,T.i32);}
       let slots=this.canonicalInstanceSlots?.get(node);
       if(!slots){
+        const invoke=objectParameters?(...args)=>fn(...args.slice(0,wParams.length)):fn;
         const fallback=this.ehMethod && !this.jsTagEh
-          ? ehRecordingImport(fn,wParams.length,box) : fn;
+          ? ehRecordingImport(invoke,nativeParams.length,box) : invoke;
         const links=this.wasmJit.canonicalDirectLinks;
-        const targetSlot=links.allocate(canonicalTarget.key,wParams,results,fallback,[],compact);
+        const targetSlot=links.allocate(canonicalTarget.key,nativeParams,results,fallback,[],compact,
+          objectParameters?[]:objects.map(input=>input.value),resultRecord,objectParameters?objects.map(input=>input.index):[]);
         // This slot deliberately has no method key and is never published.
         // A miss cannot enter the old target merely because its ABI matches.
-        const fallbackSlot=links.allocate(Symbol('instance dispatch fallback'),wParams,results,fallback,[],compact);
+        const fallbackSlot=links.allocate(Symbol('instance dispatch fallback'),nativeParams,results,fallback,[],compact,[],resultRecord);
         slots={targetSlot,fallbackSlot};
         (this.canonicalInstanceSlots ||= new Map()).set(node,slots);
         this.canonicalSlots.push(targetSlot,fallbackSlot);
@@ -3220,12 +3775,12 @@ class StructuredWasmCompiler {
         links.publish(canonicalTarget);
       }
       this.usedCanonicalTable=true;
-      const type=this.internSig(wParams,[T.i32,...(compact?[]:[T.i32,T.ref]),...results]);
+      const type=this.internSig(nativeParams,[T.i32,...(compact?[]:[T.i32,T.ref]),...results]);
       const consumeIdx=compact ? this.addImport('canonical_compact_exit',[T.i32],[T.i32],
         status=>this.consumeCompactExit(status)) : this.addImport('canonical_exit',[T.i32,T.i32,T.ref],[T.i32],
         (status,id,exitOwner)=>this.consumeDirectExit(status,id,exitOwner));
       return {canonical:{slot:slots.targetSlot,fallbackSlot:slots.fallbackSlot,guardIdx,
-          guardCache:this.castCacheFor(node.args[0],`canonical:${op}:${key}`),type,consumeIdx,compact},
+          guardCache:this.castCacheFor(node.args[0],`canonical:${op}:${key}`),type,consumeIdx,compact,objects,objectParameters,nativeGuard,arrayResult},
         writes,deoptable:true};
     }
     // Direct wasm->wasm fast path for the single-ready-target shape,
@@ -3482,7 +4037,32 @@ class StructuredWasmCompiler {
     out.push(OP.end);
   }
 
+  // Refuse BEFORE this operation, without replaying effects earlier in its
+  // block. The SSA snapshot owns both the locals and the operand prefix;
+  // operands themselves are re-pushed by the established retry protocol.
+  emitInstructionExit(node, out) {
+    if (!node.slotState || !Array.isArray(node.stackUnder) ||
+        [...node.stackUnder, ...node.args].some(value => KIND_T[value.kind] === undefined)) {
+      throw new Unsupported('instruction exit state unavailable');
+    }
+    const activation = require('./inlineActivationResume').at(this, node.itemIdx);
+    const resumeIdx = this.origIdx ? this.origIdx[node.itemIdx] : node.itemIdx;
+    if (!activation && (!Number.isInteger(resumeIdx) || resumeIdx < 0)) {
+      throw new Unsupported('instruction exit inside unrecoverable inline');
+    }
+    this.deoptableSites.add(node.itemIdx);
+    this.instructionExitSites.add(node.itemIdx);
+    this.emitCallExitStub(node, {resumeIdx, inlineActivation:activation}, node.stackUnder, true, out);
+  }
+
   emitCallExitStub(node, site, unders, reexecute, out) {
+    if(site.inlineActivation){
+      const activation=site.inlineActivation;
+      require('./inlineActivationResume').emit(this,activation,node.slotState,
+        reexecute?[...unders,...node.args]:unders,activation.item+(reexecute?0:1),out,
+        'call_'+node.itemIdx+'_'+(reexecute?'retry':'after'));
+      return;
+    }
     // locals as of the call, from the SSA snapshot (same filter as EH spill)
     const spills = [];
     const droppedSlots = [];

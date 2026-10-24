@@ -1,4 +1,6 @@
 'use strict';
+const {getNativeObjectStorageOps,NATIVE_STORE,registerNativeFieldsStorage,createNativeFieldsStorage,
+  createNativeObjectWrapper}=require('./nativeObjectStorage');
 
 // The single definition of what a guest object *is*.
 //
@@ -179,7 +181,13 @@ async function loadHierarchy(jvm, className) {
 // single hidden class that makes every read of it monomorphic.
 function classIndexOf(jvm, className) {
   let indices = jvm._classIndices;
-  if (!indices) { indices = jvm._classIndices = new Map(); }
+  if (!indices) {
+    // Primitive array classes have the same identity in every VM. Reserve
+    // their small indices before ordinary classes, so an array supplied by a
+    // different VM cannot collide with one of this VM's object classes.
+    indices = jvm._classIndices = new Map(
+      ['[Z','[B','[C','[S','[I','[J','[F','[D'].map((name,index)=>[name,index]));
+  }
   let index = indices.get(className);
   if (index === undefined) {
     index = indices.size;
@@ -189,7 +197,7 @@ function classIndexOf(jvm, className) {
 }
 
 function makeObjectRef(jvm, className, fields) {
-  return {
+  const object = {
     type: className,
     _className: className,
     cidx: classIndexOf(jvm, className),
@@ -200,6 +208,7 @@ function makeObjectRef(jvm, className, fields) {
     lockCount: 0,
     waitSet: [],
   };
+  return createNativeObjectWrapper(object);
 }
 
 // ---------------------------------------------------------------------------
@@ -213,8 +222,8 @@ function makeObjectRef(jvm, className, fields) {
 // Representation: the object's `fields` still looks like a map keyed
 // `Owner.name`, but for a slab-backed class it is `Object.create(proto)` where
 // `proto` carries one accessor per primitive field reading/writing the slab at
-// a static offset. Reference fields stay own data properties (Stage C would
-// move them behind handles). Consequences callers must know about:
+// a static offset. Supported engines keep reference fields in a GC store
+// exposed through the same named accessors. Consequences callers must know about:
 //   - `Object.keys(fields)` no longer lists primitive fields — use
 //     enumerateFieldKeys(fields).
 //   - `hasOwnProperty(fields, key)` is false for primitive fields — use
@@ -253,22 +262,27 @@ function isStaticField(item) {
 // occupy dead entries in the plain field map today.
 function computeLayout(jvm, className) {
   const chain = [];
-  const refKeys = [];
+  const refKeys = [],referenceChain=[];
+  const nativeOps=getNativeObjectStorageOps();
   let current = className;
   while (current) {
     const classData = jvm.classes[current];
     if (!classData || !classData.ast || !classData.ast.classes[0]) return null;
     const wide = [];
-    const narrow = [];
+    const narrow = [],references=[],headers=[];
     for (const item of classData.ast.classes[0].items) {
       if (item.type !== 'field' || isStaticField(item)) continue;
       const key = `${current}.${item.field.name}`;
       const kind = slotKind(item.field.descriptor);
-      if (!kind) refKeys.push(key);
+      if (!kind){
+        refKeys.push(key);references.push({key,descriptor:item.field.descriptor});
+        if(nativeOps && /^\[[ZBCSIJFD]$/.test(item.field.descriptor))headers.push({key,kind:'arrayHeader'});
+      }
       else if (kind === 'i32') narrow.push({ key, kind });
       else wide.push({ key, kind });
     }
-    chain.unshift([...wide, ...narrow]);
+    chain.unshift([...wide, ...narrow,...headers]);
+    referenceChain.unshift(references);
     const superName = classData.ast.classes[0].superClassName;
     if (superName && !jvm.classes[superName]) {
       // A JRE superclass ends the guest prefix — its state lives in expandos
@@ -280,16 +294,21 @@ function computeLayout(jvm, className) {
     }
     current = superName;
   }
-  const slots = [];
+  const slots = [],headers=new Map();
   let offset = 0;
   for (const block of chain) {
     for (const slot of block) {
-      slots.push({ ...slot, offset });
+      if(slot.kind==='arrayHeader')headers.set(slot.key,offset);
+      else slots.push({ ...slot, offset });
       offset += slot.kind === 'i32' ? 4 : 8;
     }
     offset = (offset + 7) & ~7; // each class's block starts 8-aligned
   }
-  return { size: offset || 8, slots, refKeys, keys: slots.map((s) => s.key) };
+  let referenceStorageCount=0;
+  const references=referenceChain.flat().map(field=>({...field,index:referenceStorageCount++,
+    referenceArrayIndex:/^\[(\[|L)/.test(field.descriptor)?referenceStorageCount++:undefined,header:headers.get(field.key)}));
+  return {className,nativeOps,size:offset||8,slots,refKeys,references,referenceStorageCount,
+    keys:[...slots.map(s=>s.key),...(nativeOps?references.map(f=>f.key):[])]};
 }
 
 // Compile-time slot for the fieldref (`owner`.`fieldName`): resolves the
@@ -316,6 +335,20 @@ function slabSlotFor(jvm, owner, fieldName) {
   return null;
 }
 
+function nativeReferenceSlotFor(jvm,owner,fieldName) {
+  let current=owner;
+  while(current){
+    const ast=jvm.classes[current]?.ast?.classes?.[0];
+    if(!ast)return null;
+    if(ast.items.some(item=>item.type==='field' && !isStaticField(item) && item.field.name===fieldName)){
+      const layout=slabLayoutFor(jvm,current);
+      return layout?.nativeOps ? layout.references.find(field=>field.key===`${current}.${fieldName}`)||null:null;
+    }
+    current=ast.superClassName;
+  }
+  return null;
+}
+
 // Prototype carrying the accessors, built once per class.
 function buildProto(jvm, layout) {
   const proto = {};
@@ -338,6 +371,19 @@ function buildProto(jvm, layout) {
       set = function (v) { heap.i64[(this[BASE_KEY] >> 3) + index] = BigInt(v); };
     }
     Object.defineProperty(proto, slot.key, { get, set, enumerable: false, configurable: false });
+  }
+  if(layout.nativeOps)for(const field of layout.references){
+    Object.defineProperty(proto,field.key,{enumerable:false,configurable:false,
+      get(){return layout.nativeOps.reference(this[NATIVE_STORE],field.index);},
+      set(value){
+        layout.nativeOps.setReference(this[NATIVE_STORE],field.index,value);
+        if(field.referenceArrayIndex!==undefined)layout.nativeOps.setReference(this[NATIVE_STORE],field.referenceArrayIndex,
+          require('./nativeObjectStorage').nativeReferenceArrayStorageOf(value,heap.memory));
+        if(field.header!==undefined){
+          const at=(this[BASE_KEY]+field.header)>>2;
+          require('./nativeArrayMetadata').writeNativeArrayHeader(heap.memory,value,heap.i32,at);
+        }
+      }});
   }
   Object.defineProperty(proto, BASE_KEY, {
     value: -1, writable: true, enumerable: false, configurable: false,
@@ -368,6 +414,8 @@ function slabLayoutFor(jvm, className) {
   classData._slabEpoch = epoch;
   classData._slabLayout = layout
     ? { ...layout, proto: buildProto(jvm, layout) } : null;
+  if(classData._slabLayout)classData._slabLayout.storageShape=Object.freeze({
+    prototype:classData._slabLayout.proto,baseKey:BASE_KEY});
   return classData._slabLayout;
 }
 
@@ -376,9 +424,18 @@ function slabLayoutFor(jvm, className) {
 function makeSlabFields(jvm, layout) {
   const base = jvm.wasmHeap.allocObject(layout.size);
   if (base < 0) return null;
-  const fields = Object.create(layout.proto);
-  fields[BASE_KEY] = base;
+  if(layout.nativeOps){
+    const store=layout.nativeOps.create(base,classIndexOf(jvm,layout.className),layout.referenceStorageCount);
+    const fields=createNativeFieldsStorage(store,jvm.wasmHeap.memory,base,layout.storageShape);
+    for(const field of layout.references)if(field.header!==undefined){
+      jvm.wasmHeap.i32[(base+field.header)>>2]=-1;
+    }
+    jvm.wasmHeap.trackObject?.(store,base,layout.size);
+    return fields;
+  }
+  const fields=Object.create(layout.proto);fields[BASE_KEY]=base;
   for (const key of layout.refKeys) fields[key] = null;
+  registerNativeFieldsStorage(fields,null,jvm.wasmHeap.memory,base);
   // Track the storage container: it can outlive its Java wrapper through
   // reflection/host references. Registry callbacks run between host turns;
   // compiled raw bases are invocation-local and are not cached across yields.
@@ -439,6 +496,7 @@ module.exports = {
   slotKind,
   slabLayoutFor,
   slabSlotFor,
+  nativeReferenceSlotFor,
   makeSlabFields,
   hasField,
   enumerateFieldKeys,

@@ -1,7 +1,7 @@
 const {
   classInitializationTokenFor,
 } = require('./utils');
-const { enumerateFieldKeys, hasField, loadHierarchy, makeObjectRef, newFields, readField, writeField } = require('../core/objectModel');
+const { enumerateFieldKeys, hasField, loadHierarchy, makeObjectRef, newFields, readField, writeField, classIndexOf } = require('../core/objectModel');
 
 // Guest-object fast path first. `objRef instanceof String` is only ever true
 // for a boxed String, but it costs a prototype walk on every other object, and
@@ -193,6 +193,7 @@ function allocPrimitiveArray(jvm, atype, count) {
     array = new Array(count).fill(atype === 'long' ? BigInt(0) : 0);
   }
   array.type = desc;
+  array.cidx = classIndexOf(jvm,desc);
   array.elementType = atype;
   array.hashCode = jvm.nextHashCode++;
   return array;
@@ -208,7 +209,7 @@ function allocReferenceArray(jvm, elementType, count) {
   array.type = elementType.startsWith('[') ? `[${elementType}` : `[L${elementType};`;
   array.elementType = elementType;
   array.hashCode = jvm.nextHashCode++;
-  return array;
+  return require('../core/nativeReferenceArray').makeNativeReferenceArray(jvm,array);
 }
 
 // One allocator for multianewarray in every tier (interpreter, generated
@@ -266,9 +267,11 @@ function allocMultiArray(jvm, className, counts) {
     // runtimeClassName returned undefined for rows produced by
     // multianewarray even though newarray/anewarray were already tagged.
     arr.type = className.slice(depth);
+    if (/^\[[ZBCSIJFD]$/.test(arr.type)) arr.cidx = classIndexOf(jvm,arr.type);
     arr.elementType = arr.type.slice(1);
     arr.hashCode = jvm.nextHashCode++;
-    return arr;
+    return Array.isArray(arr) && (remaining.length || depth < totalDimensions-1 || baseType.startsWith('L'))
+      ? require('../core/nativeReferenceArray').makeNativeReferenceArray(jvm,arr):arr;
   };
   return createMultiArray(counts);
 }

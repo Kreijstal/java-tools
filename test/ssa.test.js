@@ -13,6 +13,54 @@ function build(codeItems, method = STATIC_II_I, exceptionTable = []) {
   return buildSsa({ codeItems, exceptionTable, method });
 }
 
+test('ssa selectively captures exact field retry operands and reaching locals', t => {
+  const codeItems = [
+    'iload_1', {op:'iinc',arg:[1,1]}, 'aload_0',
+    {op:'getfield',arg:['Field','Point',['x','I']]}, 'iadd', 'ireturn',
+  ].map(instruction => ({instruction}));
+  const method = {name:'field',descriptor:'(Ljava/lang/Object;I)I',flags:['static']};
+  const ordinary = buildSsa({codeItems,method});
+  t.notOk(ordinary.rejected, 'ordinary graph is accepted');
+  t.equal(ordinary.values.find(v=>v.op==='getfield').stackUnder, undefined,
+    'ordinary field analysis retains no additional operand snapshot');
+  const fn = buildSsa({codeItems,method}, {captureOperandStack:op=>op==='getfield'});
+  t.notOk(fn.rejected, 'selected field snapshot is accepted');
+  const field = fn.values.find(v=>v.op==='getfield');
+  t.deepEqual(field.stackUnder, [fn.params[1]], 'prefix retains the old value before the increment');
+  t.deepEqual(field.args, [fn.params[0]], 'receiver remains a separate operation operand');
+  t.equal(field.slotState.get(1).op, 'iinc', 'locals retain the completed increment');
+  t.end();
+});
+
+test('ssa retry snapshots preserve wide values and resolve pruned phis', t => {
+  const method={name:'array',descriptor:'(I[IJ)J',flags:['static']};
+  const codeItems=[
+    {instruction:'iload_0'}, {instruction:{op:'ifeq',arg:'Lelse'}},
+    {instruction:'aload_1'}, {instruction:{op:'astore',arg:4}},
+    {instruction:{op:'goto',arg:'Ljoin'}},
+    {labelDef:'Lelse:',instruction:'aload_1'}, {instruction:{op:'astore',arg:4}},
+    {labelDef:'Ljoin:',instruction:'lload_2'}, {instruction:{op:'aload',arg:4}},
+    {instruction:'iconst_0'}, {instruction:'iaload'}, {instruction:'i2l'},
+    {instruction:'ladd'}, {instruction:'lreturn'},
+  ];
+  const fn=buildSsa({codeItems,method},{captureOperandStack:op=>op==='iaload'});
+  t.notOk(fn.rejected, 'diamond graph is accepted');
+  const load=fn.values.find(v=>v.op==='iaload');
+  t.deepEqual(load.stackUnder, [fn.params[2]], 'wide prefix is one logical value after phi pruning');
+  t.equal(load.args[0], fn.params[1], 'array operand resolves to its original parameter');
+  t.equal(load.slotState.get(4), fn.params[1], 'local snapshot resolves the same trivial phi');
+  const storeItems=['lload_1','aload_0','lload_1',
+    {op:'putfield',arg:['Field','Point',['wide','J']]},'pop2','return']
+    .map(instruction=>({instruction}));
+  const storeFn=buildSsa({codeItems:storeItems,method:{name:'store',descriptor:'(Ljava/lang/Object;J)V',flags:['static']}},
+    {captureOperandStack:op=>op==='putfield'});
+  t.notOk(storeFn.rejected, 'wide store graph is accepted');
+  const store=storeFn.values.find(v=>v.op==='putfield');
+  t.deepEqual(store.stackUnder, [storeFn.params[1]], 'wide store prefix survives independently of its arguments');
+  t.deepEqual(store.args, storeFn.params, 'store operands retain logical widths and order');
+  t.end();
+});
+
 test('ssa builds a straight-line body with params as defs', (t) => {
   const fn = build([
     { pc: 0, instruction: 'iload_0' },

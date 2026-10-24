@@ -37,6 +37,12 @@ test('only built-in arraycopy preserves cached guest field values', async t => {
       };
       try {
         fields.set('value:I',mode==='builtin'?7:0);target[0]=0;
+        // Observe actual field reloads through the checked accessor path.
+        // Native integer cells bypass the gs_ import, so counting that import
+        // on a native cell cannot distinguish a hit from a direct refill.
+        let currentValue=fields.get('value:I');
+        Object.defineProperty(fields.cell('value:I'),'value',{configurable:true,
+          get(){return currentValue;},set(value){currentValue=value;}});
         if(mode==='native-override')natives[key]=(j,receiver,args)=>replacement(...args);
         if(mode==='positional-override')native.jvmPositionalBody=replacement;
         const meta=new Compiler(jvm,method,'CopyFieldCache',jvm.jit.wasmJit).translate();

@@ -14,6 +14,10 @@ class DirectFrameContext {
     this.box = box;
     this.frames = new Map();
     this.createdFrames = 0;
+    this.exitCount = 0;
+    this.directExitCount = 0;
+    this.throwCount = 0;
+    this.lastExitStatus = null;
   }
   frame(id) {
     if (!id) return this.box.frame;
@@ -27,7 +31,10 @@ class DirectFrameContext {
     return frame;
   }
   exit(id, status) {
+    this.exitCount++;
+    this.lastExitStatus = status;
     if (!id) return;
+    this.directExitCount++;
     const frame = this.frame(id);
     if (status !== -3) frame.pc = status;
     frame.wasmDirectPendingFrames = this.box.pendingFrames;
@@ -80,37 +87,63 @@ class CanonicalDirectLinks {
       !meta.boxedCount && !(meta.specSites?.length) && !meta.speculations &&
       (!meta.frameEntryOnly || meta.booleanStaticSpillProof);
   }
-  allocate(key, params, results, fallback, parameterArrayABI = [], compact = false) {
+  allocate(key, params, results, fallback, parameterArrayABI = [], compact = false, objectInputs = [], arrayResult = null, parameterObjectABI = [], closedNative = false) {
+    if(closedNative&&(!compact||parameterArrayABI.length||objectInputs.length||arrayResult))
+      throw TypeError('closed native link requires compact typed object inputs');
     // The existing bridge is the fallback until a proved callee publishes.
     // -6 requests the old deopt-flag check; normal raw exports return -1.
-    const imports = [{name:'fallback',params,results}];
+    const imports = closedNative?[]:[{name:'fallback',params,results}];
     const body = [];
+    if(closedNative){
+      // No JavaScript bridge or guest code can run on a refused contract.
+      // The caller retries its original invoke with its exact operand stack.
+      body.push(OP.i32_const,...sleb(-7));
+      for(const type of results)body.push(...(type===T.i64?[OP.i64_const,0]:
+        type===T.f32?[OP.f32_const,0,0,0,0]:type===T.f64?[OP.f64_const,0,0,0,0,0,0,0,0]:
+        type===T.ref?[OP.ref_null,T.ref]:[OP.i32_const,0]));
+    }else{
+    // A withdrawn/unready target enters its established JavaScript bridge.
+    // It must release unpublished native metadata before any callback runs.
+    for(let i=0;i<objectInputs.length;i++)body.push(OP.ref_null,T.ref,OP.global_set,...uleb(i));
     for(let i=0;i<params.length;i++)body.push(OP.local_get,...uleb(i));
     body.push(OP.call,0);
+    // Nested calls inside a JavaScript bridge cannot publish a payload for
+    // the bridge's final result. The returned Java reference stays on stack.
+    if(arrayResult)body.push(OP.i32_const,...sleb(-2),OP.global_set,...uleb(objectInputs.length),
+      OP.i32_const,0,OP.global_set,...uleb(objectInputs.length+1),
+      ...(arrayResult.owned?[OP.i32_const,0,OP.global_set,...uleb(objectInputs.length+2)]:[]));
     if(results.length)body.push(OP.local_set,...uleb(params.length));
     body.push(OP.i32_const,...sleb(-6));
     if(!compact)body.push(OP.i32_const,0,OP.ref_null,T.ref);
     if(results.length)body.push(OP.local_get,...uleb(params.length));
+    }
     body.push(OP.end);
     const bytes = assembleModule({importDecls:imports,mainParams:params,
-      mainResults:[T.i32,...(compact?[]:[T.i32,T.ref]),...results],declared:results,body});
-    const weakFallback=new WeakRef(fallback);
-    const invokeFallback=(...args)=>{
+      mainResults:[T.i32,...(compact?[]:[T.i32,T.ref]),...results],declared:results,body,
+      gcTypes:params.some(Array.isArray)?require('../core/nativeObjectStorage').nativeObjectStorageTypes():[],
+      globalImportDecls:[...objectInputs.map((_,index)=>({name:'object_input_'+index,type:T.ref,mutable:true})),
+        ...(arrayResult?[{name:'array_result_base',type:T.i32,mutable:true},{name:'array_result_length',type:T.i32,mutable:true},...(arrayResult.owned?[{name:'array_result_owned',type:T.i32,mutable:true}]:[])]:[])]});
+    const weakFallback=closedNative?null:new WeakRef(fallback);
+    const invokeFallback=closedNative?null:(...args)=>{
       const fn=weakFallback.deref();
       if(!fn)throw Error('retired canonical call stub');
       return fn(...args);
     };
     const stub = new WebAssembly.Instance(new WebAssembly.Module(bytes),
-      {env:{fallback:invokeFallback}}).exports.run;
+      {env:{...(closedNative?{}:{fallback:invokeFallback}),...Object.fromEntries(objectInputs.map((value,index)=>['object_input_'+index,value])),
+        ...(arrayResult?{array_result_base:arrayResult.base,array_result_length:arrayResult.length,...(arrayResult.owned?{array_result_owned:arrayResult.owned}:{})}:{})}}).exports.run;
     const slot = this.freeSlots.length?this.freeSlots.pop():this.table.length;
     if(slot===this.table.length)this.table.grow(1);
     this.table.set(slot,stub);
-    const binding = {slot,stub,key,params,results:results.slice(),compact,parameterArrayABI:parameterArrayABI.slice()};
+    const binding = {slot,stub,key,params,results:results.slice(),compact,closedNative,parameterArrayABI:parameterArrayABI.slice(),parameterObjectABI:parameterObjectABI.slice()};
     this.bySlot.set(slot,binding);
     let list=this.bindings.get(key);
     if(!list)this.bindings.set(key,list=[]);
     list.push(binding);
     return slot;
+  }
+  allocateClosed(key,params,results,parameterObjectABI){
+    return this.allocate(key,params,results,null,[],true,[],null,parameterObjectABI,true);
   }
   enableEmptyCopy(slot,heap,st) {
     const binding=this.bySlot.get(slot),meta=st?.meta;
@@ -147,11 +180,16 @@ class CanonicalDirectLinks {
     const eligible=CanonicalDirectLinks.eligible(st);
     for(const binding of this.bindings.get(st.key)||[]){
       const arrays=binding.parameterArrayABI;
+      const objects=binding.parameterObjectABI;
       const compatible=eligible && (!binding.compact || st.meta.canonicalCompactOwnerTag===this.identity);
-      const fn=compatible ? binding.compact
-        ? arrays.length ? st.meta.canonicalCompactHeapRun : st.meta.canonicalCompactRun
+      const contract=st.meta?.closedNativeBody;
+      const closedCompatible=!binding.closedNative||contract?.version===1&&Array.isArray(contract.objectParameters)&&
+        contract.key===binding.key&&contract.run===st.meta.canonicalClosedStorageRun&&
+        contract.objectParameters.length===objects.length&&contract.objectParameters.every((index,i)=>index===objects[i]);
+      const fn=compatible&&closedCompatible ? binding.closedNative?st.meta.canonicalClosedStorageRun:binding.compact
+        ? objects.length ? st.meta.canonicalCompactStorageRun : arrays.length ? st.meta.canonicalCompactHeapRun : st.meta.canonicalCompactRun
         : arrays.length ? st.meta.canonicalHeapRun : st.meta.canonicalRun : null;
-      const javaCount=binding.params.length-2*arrays.length;
+      const javaCount=binding.params.length-2*arrays.length-objects.length;
       let slot=0;
       // Publication must validate both halves of the Wasm signature. In
       // particular an externref result cannot inhabit an older numeric slot.
@@ -162,7 +200,11 @@ class CanonicalDirectLinks {
       const identity=fn && resultIdentity && st.meta.paramSlots.length===javaCount &&
         (!arrays.length || arrays.length===st.meta.parameterArrayABI?.length &&
           arrays.every((index,i)=>index===st.meta.parameterArrayABI[i]) &&
-          binding.params.slice(javaCount).every(type=>type===T.i32)) &&
+          binding.params.slice(javaCount,javaCount+2*arrays.length).every(type=>type===T.i32)) &&
+        (!objects.length || objects.length===st.meta.parameterObjectABI?.length &&
+          objects.every((index,i)=>index===st.meta.parameterObjectABI[i]) &&
+          arrays.length===(st.meta.parameterArrayABI?.length||0) &&
+          binding.params.slice(javaCount+2*arrays.length).every(type=>Array.isArray(type)&&type.length===2&&type[0]===0x63&&type[1]===1)) &&
         st.meta.paramSlots.every((p,i)=>{
           const at=slot;slot+=(binding.params[i]===T.i64||binding.params[i]===T.f64)?2:1;
           return p.slot===at&&p.t===binding.params[i];
@@ -181,4 +223,24 @@ class CanonicalDirectLinks {
     }
   }
 }
-module.exports={DirectFrameContext,CanonicalDirectLinks};
+// Shared by structured callers and dispatcher resumptions. A non-normal
+// canonical return owns its precise callee frame, including nested pending
+// frames and the original exception PC; never replay the call to recover it.
+function consumeCanonicalExit(jvm,wasmJit,box,status,id,owner) {
+  if(status===-6){const flag=box.deoptFlag;box.deoptFlag=0;return flag;}
+  if(status===-4||status===-7)return 1;
+  if(status===-5)throw owner.box.lastThrown;
+  const frame=owner.take(id);
+  wasmJit.canonicalResumeFrames.add(frame);
+  if(status===-3){
+    const exn=frame.wasmDirectException;
+    frame.wasmDirectException=null;
+    if(!jvm.dispatchExceptionInFrame(frame,exn,frame.wasmDirectThrowPc))throw exn;
+  }
+  const deeper=frame.wasmDirectPendingFrames;
+  frame.wasmDirectPendingFrames=null;
+  box.pendingFrames=deeper?[...deeper,frame]:[frame];
+  box.canonicalFrameHandoff=true;
+  return 2;
+}
+module.exports={DirectFrameContext,CanonicalDirectLinks,consumeCanonicalExit};

@@ -35,28 +35,12 @@ async function invoke(jvm, thread, className, methodName, descriptor, locals) {
   return ticks;
 }
 
-function withEnv(t, vars) {
-  const saved = {};
-  for (const [key, value] of Object.entries(vars)) {
-    saved[key] = process.env[key];
-    process.env[key] = value;
-  }
-  t.teardown(() => {
-    for (const [key, value] of Object.entries(saved)) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
-  });
-}
-
-async function makeHarness(t, className, source) {
-  withEnv(t, {
-    JVM_WASM_JIT: '1', JVM_WASM_STRUCTURED: '1', JVM_WASM_HEAP: '1',
-    JVM_WASM_HEAP_MB: '16',
-  });
+async function makeHarness(t, className, source, wasmOptions = {}) {
   const classpath = compileJavaFixture(t, className, source);
-  const jvm = new JVM({ classpath, jit: { warmupThreshold: 100,
-    wasm: {parameterHeapSpecializationMaxBytes: 32768} } });
+  const jvm = new JVM({ classpath, wasmHeap:true, wasmHeapMb:16,
+    jit: { warmupThreshold: 100, wasmStructured:true,
+    wasm: {parameterHeapSpecializationMaxBytes: 32768, ...wasmOptions} } });
+  jvm.jit.wasmJit.enabled=true;
   await jvm.loadClassByName(className);
   jvm.classInitializationState.set(className, 'INITIALIZED');
   const thread = {
@@ -141,6 +125,15 @@ public class HeapArr {
     for (int i = 0; i < n; i++) { s += h.v; h = h.next; }
     out[0] = s;
   }
+  static void boundsLeaf(int[] a, int index) { a[index] += 7; }
+  public static void boundsRegions(int[] out, int[] a, int index) {
+    out[0] = 11;
+    try { out[1] = 13; a[index] += 3; out[2] = 17; }
+    catch (ArrayIndexOutOfBoundsException e) { out[2] = 19; }
+    try { boundsLeaf(a, index); out[3] = 23; }
+    catch (ArrayIndexOutOfBoundsException e) { out[3] = 29; }
+    out[4] = a[0];
+  }
 }
 class Node { int v; Node next; }
 `;
@@ -213,6 +206,33 @@ test('out-of-bounds and null throw the guest exceptions', async (t) => {
   await invoke(jvm, thread, 'HeapArr', 'nullCatch', '([II)V', [out, N]);
   t.equal(out[0], -3, 'null array surfaces NPE through the import fallback');
   t.ok(state.runs > runs, 'null access entered compiled code');
+  t.end();
+});
+
+test('native bounds tags preserve partial effects and the nearest local or caller handler', async t => {
+  const {supportsWasmJsTag}=require('../src/jit/wasmShared');
+  if(!supportsWasmJsTag()){t.pass('engine retains the original exception path');t.end();return;}
+  for(const nativeJsExceptionTags of [false,true]){
+    const {jvm,thread}=await makeHarness(t,'HeapArr',SOURCE,{deepInline:false,maxInlineCalleeItems:1,
+      canonicalDirectCalls:true,canonicalEhLinks:true,canonicalLeafCalls:true,nativeJsExceptionTags});
+    const w=jvm.jit.wasmJit;
+    for(const [name,desc]of [['boundsLeaf','([II)V'],['boundsRegions','([I[II)V']]){
+      const method=jvm.findMethod(jvm.classes.HeapArr,name,desc),state=w.methodState({method});
+      w.compile({method,className:'HeapArr'},state,{asCallee:true});
+      t.equal(state.status,'ready',state.lastCompileError||name+' compiles');
+      t.equal(state.meta.nativeJsExceptionTags,nativeJsExceptionTags,'test selects the actual tag protocol');
+    }
+    w.freezeCompilation();jvm.jit._syncCompileEnvironment={trace:false,assert:true};jvm.jit.markMainStarted();
+    for(const native of [false,true])for(const index of [-1,2,1]){
+      const a=native?jvm.wasmHeap.alloc('[I',2):[2,5];a.type='[I';a[0]=2;a[1]=5;
+      const out=jvm.wasmHeap.alloc('[I',5);out.type='[I';
+      await invoke(jvm,thread,'HeapArr','boundsRegions','([I[II)V',[out,a,index]);
+      t.deepEqual(Array.from(out),index===1?[11,13,17,23,2]:[11,13,19,29,2],
+        'exact effects and handler selection for '+JSON.stringify({nativeJsExceptionTags,native,index}));
+      t.deepEqual(Array.from(a),index===1?[2,15]:[2,5],'failed accesses do not modify the target');
+    }
+    t.equal(jvm.jit.syncCompileCensus().postMainSyncCompileCount,0,'exception recovery requires no execution-time compilation');
+  }
   t.end();
 });
 

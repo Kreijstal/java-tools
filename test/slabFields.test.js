@@ -182,3 +182,20 @@ test('slab allocation falls back to a plain map when the heap is spent', (t) => 
     'exhaustion degrades to the plain map, never to a broken object');
   t.end();
 });
+
+test('primitive slab fallback still initializes reference fields without native GC storage',t=>{
+ const fs=require('fs'),Module=require('module'),filename=require.resolve('../src/core/objectModel');
+ const load=Module.createRequire(filename),legacy=new Module(filename,module);legacy.filename=filename;
+ legacy.require=request=>request==='./nativeObjectStorage'
+  ?{...load(request),getNativeObjectStorageOps:()=>null}:load(request);
+ legacy._compile(fs.readFileSync(filename,'utf8'),filename);
+ const model=legacy.exports,jvm=fakeJvm(),fields=model.newFields(jvm,'Sub');
+ t.equal(model.readField(fields,'Base.count'),0,'legacy primitive base initializes');
+ t.equal(model.readField(fields,'Sub.total'),0n,'legacy wide primitive initializes');
+ t.equal(model.readField(fields,'Sub.name'),null,'legacy reference initializes');
+ t.ok(Object.hasOwn(fields,'Sub.name'),'legacy reference has its ordinary own slot');
+ model.writeField(fields,'Base.count',31);model.writeField(fields,'Sub.name','kept');
+ t.equal(model.readField(fields,'Base.count'),31,'legacy primitive remains writable');
+ t.equal(model.readField(fields,'Sub.name'),'kept','legacy reference remains writable');
+ t.end();
+});

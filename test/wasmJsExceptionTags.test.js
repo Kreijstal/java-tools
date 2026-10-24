@@ -52,3 +52,29 @@ test('native JavaScript tag capture preserves original thrown values', t => {
   t.equal(hits,before,'foreign tag does not call the JavaScript recorder');
   t.end();
 });
+
+test('Wasm-origin JavaScript tag throws preserve payloads across both boundaries', t => {
+  if (!supportsWasmJsTag()) {t.pass('unsupported engine keeps the old exception path');t.end();return;}
+  for (const caught of [false,true]) {
+    const body=[];
+    // Native throw opcode is used only by this assembler boundary test.
+    const emit=out=>out.push(OP.call,0,0x08,0);
+    if(caught)emitTryTableJsTag(body,emit,()=>{},1);else emit(body);
+    body.push(OP.end);
+    const bytes=assembleModule({importJsTag:true,
+      importDecls:[{name:'payload',params:[],results:[T.ref]},{name:'record',params:[T.ref],results:[]}],
+      mainParams:[],mainResults:[],declared:[],body});
+    let value,observed,hits=0;
+    const instance=new WebAssembly.Instance(new WebAssembly.Module(bytes),{env:{js_tag:WebAssembly.JSTag,
+      payload:()=>value,record:e=>{observed=e;hits++;}}});
+    for(const marker of [Error('native tag'),{type:'java/lang/ArrayIndexOutOfBoundsException'},null,undefined,0,false,'marker']){
+      value=marker;observed=Symbol();const before=hits;
+      if(caught)instance.exports.run();else {
+        try{instance.exports.run();t.fail('native throw returned');}catch(error){observed=error;}
+      }
+      t.ok(Object.is(observed,marker),'exact payload survives '+(caught?'Wasm capture':'JS boundary'));
+      t.equal(hits-before,caught?1:0,'recorder runs exactly at the selected boundary');
+    }
+  }
+  t.end();
+});

@@ -8,11 +8,12 @@ const compile = require('./javaFixture').makeJavaFixtureCompiler('structured-ret
 const analysisKeys = ['labelIndex', 'origIdx', 'deoptStubs', 'deoptBlocks',
   'declared', 'frames', 'guardSites', 'liveRanges', 'demoteBlockersByBlock',
   'importDecls', 'importFns', 'importIndexByName', 'sigTypes', 'sigTypeIndex',
-  'frameLocalLiveness', 'omittedFrameSlots'];
+  'nativeStaticScalarAccesses', 'frameLocalLiveness', 'omittedFrameSlots', 'loopResume', 'blockSlabFills', 'omittedSlabFillSites'];
 
 test('structured compiler releases emission plans while imports remain executable', async t => {
   const classpath = compile(t, 'RetainedWasm', `
 public class RetainedWasm {
+  static int loop(int n) { int sum=7; for(int i=0;i<n;i++)sum+=i; return sum; }
   int value(int n) { return n * 3; }
   static int sum(RetainedWasm receiver, int[] values) {
     int result = 0;
@@ -53,6 +54,21 @@ public class RetainedWasm {
       t.throws(() => failed.translateWith(true), error => error === failure, 'emission failure propagates');
       for (const key of analysisKeys) t.equal(failed[key], undefined, `${key} released after failure`);
     }
+    const loopMethod=j.findMethod(j.classes.RetainedWasm,'loop','(I)I');
+    const loopCompiler=new Compiler(j,loopMethod,'RetainedWasm',j.jit.wasmJit);
+    const loopMeta=loopCompiler.translateWith(false);
+    t.ok(loopMeta.structuredResumeEntry,'fixture includes a positive resume proof');
+    if(!retainCompilerDiagnostics)t.equal(loopCompiler.loopResume,undefined,'positive resume graph is released');
+    const loop=new WebAssembly.Instance(new WebAssembly.Module(loopMeta.bytes),loopMeta.importObject).exports.run;
+    const loopFrame=new Frame(loopMethod);loopFrame.locals[0]=5;loopMeta.box.frame=loopFrame;
+    let status=loop(5,0,2),entries=0;
+    while(status>=0){
+      loopFrame.pc=status;
+      status=loop(...loopMeta.paramSlots.map(p=>loopFrame.locals[p.slot]),loopMeta.structuredResumeEntry.block,2);
+      if(++entries>20)throw Error('retained resume did not progress');
+    }
+    t.ok(entries>1,'callbacks resume after several fuel spills');
+    t.equal(loopMeta.box.ret,17,'resume callbacks remain executable after graph cleanup');
   }
   t.end();
 });

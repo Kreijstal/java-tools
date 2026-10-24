@@ -11,6 +11,18 @@ const CAT2 = new Set([T.i64, T.f64]);
 // Immediates can contain any opcode byte, including the byte for return.
 const STRUCTURED_RETURN=Object.freeze({kind:'structured return'});
 const CAPTURE_DIRECT_ID=Object.freeze({kind:'capture direct invocation'});
+// Reserved structured fresh-entry mode. Only the closed canonical wrapper
+// supplies it after its caller has validated the private object arguments.
+const CLOSED_NATIVE_ENTRY=-1;
+const ENTRY_MODE_CODE=Symbol('entry-mode code');
+// Keep the shared core resumable, while fixed canonical exports select their
+// entry protocol during emission instead of relying on engine DCE. These
+// alternatives contain no branches to labels outside the alternative.
+function entryModeCode(blockLocal,ordinary,closed,resultType=0x40){
+ return {kind:ENTRY_MODE_CODE,ordinary,closed,runtime:[OP.local_get,...uleb(blockLocal),
+  OP.i32_const,...sleb(CLOSED_NATIVE_ENTRY),OP.i32_eq,OP.if,resultType,
+  ...closed,OP.else,...ordinary,OP.end]};
+}
 const DEFINED_GLOBAL=Symbol('defined Wasm global');
 const definedGlobal=(op,index)=>[{kind:DEFINED_GLOBAL,op,index}];
 
@@ -597,10 +609,11 @@ function takeWasmReturnValue(meta) {
 // block 0 and the nested-call fuel budget, run the main function, then push
 // the retv global so a wasm->wasm caller receives [status, value] without
 // any JS boundary. Mirrors the JS bridges' full[] tail exactly.
-function runvWrapperBody(paramCount, mainIdx, retvType, heapParameterCount = 0, retvIndex = 0) {
+function runvWrapperBody(paramCount, mainIdx, retvType, heapParameterCount = 0, retvIndex = 0, objectParameterCount=0) {
   const out = [0]; // no locals
   for (let i = 0; i < paramCount; i++) out.push(OP.local_get, ...uleb(i));
   for (let i = 0; i < heapParameterCount; i++) out.push(OP.i32_const, ...sleb(-2), OP.i32_const, 0);
+  for(let i=0;i<objectParameterCount;i++)out.push(OP.ref_null,1);
   out.push(OP.i32_const, ...sleb(0));
   out.push(OP.i32_const, ...sleb(100_000_000));
   out.push(OP.call, ...uleb(mainIdx));
@@ -615,7 +628,7 @@ function runvWrapperBody(paramCount, mainIdx, retvType, heapParameterCount = 0, 
 // Direct canonical wrapper returns status, invocation id, owner, and value.
 // The main body captures/clears the active id before any guest work. Its
 // spill imports use that local id, so recursive calls cannot overwrite it.
-function canonicalRunWrapperBody(paramCount, mainIdx, retvType, globals, readyIdx, recordIdx, heapParameterCount = 0, readyAddress, compact = false, retvIndex = 0, fuelIndex = globals + 3) {
+function canonicalRunWrapperBody(paramCount, mainIdx, retvType, globals, readyIdx, recordIdx, heapParameterCount = 0, readyAddress, compact = false, retvIndex = 0, fuelIndex = globals + 3, objectParameterCount=0,entryBlock=0) {
   const id=paramCount, status=paramCount+1;
   const out=[1,2,T.i32]; // two i32 locals
   out.push(...(readyAddress===undefined ? [OP.call,...uleb(readyIdx)] :
@@ -637,7 +650,8 @@ function canonicalRunWrapperBody(paramCount, mainIdx, retvType, globals, readyId
   emitCatch(out,body=>{
     for(let i=0;i<paramCount;i++)body.push(OP.local_get,...uleb(i));
     for(let i=0;i<heapParameterCount;i++)body.push(OP.i32_const,...sleb(-2),OP.i32_const,0);
-    body.push(OP.i32_const,0,OP.global_get,...uleb(fuelIndex),
+    for(let i=0;i<objectParameterCount;i++)body.push(OP.ref_null,1);
+    body.push(OP.i32_const,...sleb(entryBlock),OP.global_get,...uleb(fuelIndex),
       OP.call,...uleb(mainIdx),OP.local_set,...uleb(status));
   },body=>body.push(OP.i32_const,...sleb(-5),OP.local_set,...uleb(status)));
   out.push(OP.local_get,...uleb(status));
@@ -659,6 +673,9 @@ function structuredBodyBytes(body,frame,globals,returnValue=false,globalBase=0) 
       if(!Number.isInteger(frame?.idLocal))throw TypeError('missing canonical invocation local');
       if(!frame.inline)out.push(OP.global_get,...uleb(globals),OP.local_set,...uleb(frame.idLocal),
         OP.i32_const,0,OP.global_set,...uleb(globals));
+    }else if(byte?.kind===ENTRY_MODE_CODE){
+      const selected=frame?.entryMode==='closed'?byte.closed:frame?.entryMode==='ordinary'?byte.ordinary:byte.runtime;
+      out.push(...structuredBodyBytes(selected,frame,globals,returnValue,globalBase));
     }else if(byte?.kind===DEFINED_GLOBAL){
       out.push(byte.op,...uleb(globalBase+byte.index));
     }else out.push(byte);
@@ -666,9 +683,9 @@ function structuredBodyBytes(body,frame,globals,returnValue=false,globalBase=0) 
   return out;
 }
 
-function inlineCompactBody(paramCount,missingHeap,mainParams,declared,body,retvType,globals,frame,retvIndex=0,fuelIndex=globals+3) {
-  const locals=[...Array(missingHeap*2+2).fill(T.i32),...declared];
-  const out=[...uleb(locals.length),...locals.flatMap(t=>[1,t])];
+function inlineCompactBody(paramCount,missingHeap,mainParams,declared,body,retvType,globals,frame,retvIndex=0,fuelIndex=globals+3,missingObjects=0,entryBlock=0) {
+  const locals=[...Array(missingHeap*2).fill(T.i32),...Array.from({length:missingObjects},()=>[0x63,1]),T.i32,T.i32,...declared];
+  const out=[...uleb(locals.length),...locals.flatMap(t=>[1,...(Array.isArray(t)?t:[t])])];
   out.push(...(frame.readyAddress===undefined ? [OP.call,...uleb(frame.readyIdx)] :
     [OP.i32_const,...sleb(frame.readyAddress),OP.i32_load,2,0]),OP.i32_eqz,OP.if,0x40,
     OP.i32_const,...sleb(-4));
@@ -681,9 +698,10 @@ function inlineCompactBody(paramCount,missingHeap,mainParams,declared,body,retvT
     OP.local_get,...uleb(frame.idLocal),OP.global_set,...uleb(globals+1),
     OP.global_get,...uleb(fuelIndex),OP.local_set,...uleb(mainParams.length-1));
   for(let i=0;i<missingHeap;i++)out.push(OP.i32_const,...sleb(-2),OP.local_set,...uleb(paramCount+2*i));
+  if(entryBlock)out.push(OP.i32_const,...sleb(entryBlock),OP.local_set,...uleb(mainParams.length-2));
   const emitCatch=frame.recordIdx==null ? emitTryTableCatchAll :
     (out,body,handler)=>emitTryTableJsTag(out,body,handler,frame.recordIdx);
-  emitCatch(out,native=>native.push(...structuredBodyBytes(body.slice(0,-1),{...frame,inline:true},globals,retvType,retvIndex)),
+  emitCatch(out,native=>native.push(...structuredBodyBytes(body.slice(0,-1),{...frame,inline:true,entryMode:entryBlock===CLOSED_NATIVE_ENTRY?'closed':'ordinary'},globals,retvType,retvIndex)),
     handler=>{
       handler.push(OP.i32_const,...sleb(-5));
       if(retvType)handler.push(OP.global_get,...uleb(retvIndex));
@@ -705,7 +723,7 @@ function specokGlobalEntry() {
 
 function assembleModule({ importDecls, mainParams, mainResults, declared, body, profilerName,
   importMemory, retvType, runvWrapper, specokGlobal, importTable, sigTypes,
-  canonicalFrameExport, importCanonicalTable, importJsTag, parameterArrayABI = [], globalImportDecls = [], memoryImportDecls = [] }) {
+  canonicalFrameExport, importCanonicalTable, importJsTag, parameterArrayABI = [], parameterObjectABI = [], globalImportDecls = [], gcTypes = [], memoryImportDecls = [] }) {
   if (canonicalFrameExport?.readyAddress !== undefined &&
       (!importMemory || !Number.isInteger(canonicalFrameExport.readyAddress) ||
        canonicalFrameExport.readyAddress < 0 || canonicalFrameExport.readyAddress > 0x7ffffff8 ||
@@ -718,19 +736,19 @@ function assembleModule({ importDecls, mainParams, mainResults, declared, body, 
       globalImportDecls[importedFuel]?.type!==T.i32 || !globalImportDecls[importedFuel]?.mutable))
     throw TypeError('canonical fuel requires an imported mutable i32 global');
   const typeKey = (p, r) => `${p.join(',')}|${r.join(',')}`;
-  const types = [];
+  const types = [...gcTypes];
   const typeIndex = new Map();
   const internType = (p, r) => {
     const key = typeKey(p, r);
     if (!typeIndex.has(key)) {
       typeIndex.set(key, types.length);
-      types.push([0x60, ...uleb(p.length), ...p, ...uleb(r.length), ...r]);
+      types.push([0x60, ...uleb(p.length), ...p.flat(), ...uleb(r.length), ...r.flat()]);
     }
     return typeIndex.get(key);
   };
   // Signatures the body already encoded by index (call_indirect through the
   // linker table). They are interned FIRST so their indices are exactly
-  // their positions in `sigTypes`, which is what the emitter assumed when it
+  // their positions in `sigTypes` plus the GC-type prefix, as the emitter assumed when it
   // wrote the body; a later import with the same shape simply reuses them.
   for (const sig of sigTypes || []) internType(sig.params, sig.results);
 
@@ -777,7 +795,7 @@ function assembleModule({ importDecls, mainParams, mainResults, declared, body, 
 
   const section = (id, content) => [id, ...uleb(content.length), ...content];
   const vec = (entries) => [...uleb(entries.length), ...entries.flat()];
-  const localDecls = [...uleb(declared.length), ...declared.flatMap((t) => [1, t])];
+  const localDecls = [...uleb(declared.length), ...declared.flatMap((t) => [1,...(Array.isArray(t)?t:[t])])];
   const canonicalGlobals=globalBase+(retvType?1:0)+(specokGlobal?1:0);
   const funcBody = [...localDecls, ...structuredBodyBytes(body,canonicalFrameExport,canonicalGlobals,false,globalBase)];
   const exportName = [...'run'].map((c) => c.charCodeAt(0));
@@ -799,13 +817,19 @@ function assembleModule({ importDecls, mainParams, mainResults, declared, body, 
   // callers. Only real method modules ask for it: their main signature is
   // (params..., blk, fuel) -> [status].
   const heapParameterCount = parameterArrayABI.length;
-  const paramOnly = runvWrapper ? mainParams.slice(0, mainParams.length - 2 - heapParameterCount * 2) : [];
+  const objectParameterCount=parameterObjectABI.length;
+  const paramOnly = runvWrapper ? mainParams.slice(0, mainParams.length - 2 - heapParameterCount * 2-objectParameterCount) : [];
   if (heapParameterCount && (!runvWrapper || !canonicalFrameExport ||
       new Set(parameterArrayABI).size !== heapParameterCount ||
       parameterArrayABI.some(i => !Number.isInteger(i) || i < 0 || paramOnly[i] !== T.ref) ||
-      mainParams.slice(paramOnly.length, -2).some(t => t !== T.i32))) {
+      mainParams.slice(paramOnly.length,paramOnly.length+2*heapParameterCount).some(t => t !== T.i32))) {
     throw new TypeError('invalid parameter array ABI');
   }
+  if(objectParameterCount && (!runvWrapper || !canonicalFrameExport ||
+      new Set(parameterObjectABI).size!==objectParameterCount ||
+      parameterObjectABI.some(i=>!Number.isInteger(i)||i<0||paramOnly[i]!==T.ref) ||
+      mainParams.slice(paramOnly.length+2*heapParameterCount,-2).some(t=>!Array.isArray(t)||t.length!==2||t[0]!==0x63||t[1]!==1)))
+    throw new TypeError('invalid parameter object ABI');
   const functionTypes = [mainType], functionBodies = [funcBody];
   const addFunction = (params, results, bytes) => {
     const index = mainIdx + functionTypes.length;
@@ -813,13 +837,14 @@ function assembleModule({ importDecls, mainParams, mainResults, declared, body, 
     return index;
   };
   let runIdx = mainIdx;
-  if (heapParameterCount) {
+  if (heapParameterCount||objectParameterCount) {
     // Existing JS/frame entry remains (Java arguments, block, fuel). A -2
     // base asks the body to query its original reference at the original
     // entry point; -1 continues to mean a captured non-heap array.
     const wrapper = [0];
     for (let i = 0; i < paramOnly.length; i++) wrapper.push(OP.local_get, ...uleb(i));
     for (let i = 0; i < heapParameterCount; i++) wrapper.push(OP.i32_const, ...sleb(-2), OP.i32_const, 0);
+    for(let i=0;i<objectParameterCount;i++)wrapper.push(OP.ref_null,1);
     wrapper.push(OP.local_get, ...uleb(paramOnly.length),
       OP.local_get, ...uleb(paramOnly.length + 1), OP.call, ...uleb(mainIdx), OP.end);
     runIdx = addFunction([...paramOnly, T.i32, T.i32], mainResults, wrapper);
@@ -835,7 +860,7 @@ function assembleModule({ importDecls, mainParams, mainResults, declared, body, 
   };
   if (runvWrapper) exportFunction('runv', addFunction(paramOnly,
     retvType ? [T.i32, retvType] : [T.i32],
-    runvWrapperBody(paramOnly.length, mainIdx, retvType, heapParameterCount,globalBase)));
+    runvWrapperBody(paramOnly.length, mainIdx, retvType, heapParameterCount,globalBase,objectParameterCount)));
   if(canonicalFrameExport){
     const globals=canonicalGlobals;
     const fuelIndex=importedFuel ?? globals+3;
@@ -843,36 +868,42 @@ function assembleModule({ importDecls, mainParams, mainResults, declared, body, 
     exportFunction('canonicalRun',addFunction(paramOnly,results,
       canonicalRunWrapperBody(paramOnly.length,mainIdx,retvType,globals,
         canonicalFrameExport.readyIdx,canonicalFrameExport.recordIdx,heapParameterCount,
-        canonicalFrameExport.readyAddress,false,globalBase,fuelIndex)));
+        canonicalFrameExport.readyAddress,false,globalBase,fuelIndex,objectParameterCount)));
     if (heapParameterCount) {
       const expanded = [...paramOnly, ...parameterArrayABI.flatMap(() => [T.i32, T.i32])];
       exportFunction('canonicalHeapRun',addFunction(expanded,results,
         canonicalRunWrapperBody(expanded.length,mainIdx,retvType,globals,
           canonicalFrameExport.readyIdx,canonicalFrameExport.recordIdx,0,
-          canonicalFrameExport.readyAddress,false,globalBase,fuelIndex)));
+          canonicalFrameExport.readyAddress,false,globalBase,fuelIndex,objectParameterCount)));
     }
     if(canonicalFrameExport.compact){
       const compactResults=[T.i32,...(retvType?[retvType]:[])];
       // Bound duplicate code across both native entries. The original body
       // and legacy wrappers remain the supported fallback for larger methods.
       let remaining=16384;
-      const compactEntry=(name,params,missingHeap)=>{
+      const compactEntry=(name,params,missingHeap,missingObjects=objectParameterCount,entryBlock=0)=>{
         let bytes,inline=false;
         if(canonicalFrameExport.inlineCompact && body[0]===CAPTURE_DIRECT_ID && body.at(-1)===OP.end){
-          const candidate=inlineCompactBody(params.length,missingHeap,mainParams,declared,body,retvType,globals,canonicalFrameExport,globalBase,fuelIndex);
+          const candidate=inlineCompactBody(params.length,missingHeap,mainParams,declared,body,retvType,globals,canonicalFrameExport,globalBase,fuelIndex,missingObjects,entryBlock);
           if(candidate.length<=remaining){bytes=candidate;inline=true;remaining-=candidate.length;}
         }
         bytes ||= canonicalRunWrapperBody(params.length,mainIdx,retvType,globals,
           canonicalFrameExport.readyIdx,canonicalFrameExport.recordIdx,missingHeap,
-          canonicalFrameExport.readyAddress,true,globalBase,fuelIndex);
+          canonicalFrameExport.readyAddress,true,globalBase,fuelIndex,missingObjects,entryBlock);
         const index=addFunction(params,compactResults,bytes);exportFunction(name,index);
-        if(inline)exportFunction(name.replace('Compact','InlineCompact'),index);
+        if(inline&&name.includes('Compact'))exportFunction(name.replace('Compact','InlineCompact'),index);
       };
+      if(objectParameterCount)compactEntry('canonicalCompactStorageRun',
+        [...paramOnly,...parameterArrayABI.flatMap(()=>[T.i32,T.i32]),...parameterObjectABI.map(()=>[0x63,1])],0,0);
       if(heapParameterCount){
         const expanded=[...paramOnly,...parameterArrayABI.flatMap(()=>[T.i32,T.i32])];
         compactEntry('canonicalCompactHeapRun',expanded,0);
       }
       compactEntry('canonicalCompactRun',paramOnly,heapParameterCount);
+      // Share the existing duplicate-code budget. Existing entry choices are
+      // made first; adding the contract must not displace their inline bodies.
+      if(canonicalFrameExport.closedStorage&&!heapParameterCount)
+        compactEntry('canonicalClosedStorageRun',[...paramOnly,...parameterObjectABI.map(()=>[0x63,1])],0,0,CLOSED_NATIVE_ENTRY);
     }
     for(const [label,index] of [['canonicalOwner',globals+2],['canonicalFuel',fuelIndex],['canonicalEntries',globals+1]]){
       const bytes=[...label].map(c=>c.charCodeAt(0));exportEntries.push([bytes.length,...bytes,3,...uleb(index)]);
@@ -1020,7 +1051,7 @@ function capturesBooleanStatic(method) {
 }
 
 module.exports = {
-  T, CAT2, OP, TRUNC_SAT, STRUCTURED_RETURN, CAPTURE_DIRECT_ID, definedGlobal,
+  T, CAT2, OP, TRUNC_SAT, STRUCTURED_RETURN, CAPTURE_DIRECT_ID, CLOSED_NATIVE_ENTRY, entryModeCode, definedGlobal,
   uleb, sleb, f32bytes, f64bytes,
   emitTryTableCatchAll, supportsWasmTryTable, emitTryTableJsTag, supportsWasmJsTag,
   wasmProfilerName, wasmFunctionNameSection,

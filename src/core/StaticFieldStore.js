@@ -1,5 +1,6 @@
 "use strict";
 const {makeNativeStaticCell}=require('./nativeStaticCell');
+const {makeNativeStaticReferenceCell}=require('./nativeStaticReferenceCell');
 
 // Static field storage for one class.  It is a Map keyed by
 // "name:descriptor" (the historical representation every loader, interpreter
@@ -30,7 +31,9 @@ class StaticFieldStore extends Map {
     if (!cell) {
       cell = this.nativeIntegers && typeof key==='string' && /:[ZBCSI]$/.test(key)
         ? makeNativeStaticCell(super.get(key),super.has(key))
-        : { value: super.get(key), present: super.has(key) };
+        : this.nativeIntegers && typeof key==='string' && /:\[[BCSIJFD]$/.test(key)
+          ? makeNativeStaticReferenceCell(super.get(key),super.has(key))
+          : { value: super.get(key), present: super.has(key) };
       this.cells.set(key, cell);
       // Once the cell owns the value, the Map only tracks membership. Keeping
       // its original value would retain replaced arrays/objects indefinitely.

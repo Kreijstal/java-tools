@@ -49,6 +49,11 @@ public class CanonicalConstruction {
  const ctor=prepare('NativeConstruction','<init>','([I)V');
  const build=prepare('CanonicalConstruction','build','([I)I');
  t.ok(ctor.meta.canonicalRun,'ordinary constructor exports precise canonical frames');
+ w.enabled=true;
+ t.ok(j.jit.hasReadyWasmModuleForSynchronousCall(ctor.method),'canonical constructor may own prepared entry');
+ w.ctorCompileEnabled=false;
+ t.notOk(j.jit.hasReadyWasmModuleForSynchronousCall(ctor.method),'disabled constructor policy retains legacy entry');
+ w.ctorCompileEnabled=true;
  t.ok(build.meta.normalFlowFullyCompiled,'allocating caller links a suspending constructor');
  const fields=j.classes.CanonicalConstruction.staticFields;
  const execute=async n=>{
@@ -72,5 +77,90 @@ public class CanonicalConstruction {
  t.equal(thrown.value,-23,'constructor throwable reaches allocating caller handler');
  t.deepEqual([...thrown.progress],[1,1],'failed constructor keeps only preceding effects');
  t.equal(readField(thrown.saved.fields,'NativeConstruction.value'),1,'failed constructor retains unfinished object state');
+ t.end();
+});
+
+test('prepared cold allocations preserve initialization order and native constructor exits',async t=>{
+ const classpath=compile(t,'ColdAllocation',`
+class ColdAllocated {
+ static int initialized=initialize(); int value;
+ static int initialize(){ColdAllocation.initializations++;ColdAllocation.observed=ColdAllocation.effects;return 7;}
+ ColdAllocated(){ColdAllocation.constructions++;value=initialized;}
+}
+public class ColdAllocation {
+ static int effects,initializations,observed,constructions,result;
+ static int build(boolean take,boolean fail){
+  effects++;if(!take)return 5;effects+=10;
+  ColdAllocated value=new ColdAllocated();effects+=100;
+  if(fail)throw new RuntimeException();return value.value;
+ }
+ static int caught(boolean take,boolean fail){try{return build(take,fail);}catch(RuntimeException e){return -17;}}
+ static void entry(boolean take,boolean fail){result=caught(take,fail);}
+}`);
+ for(const structured of [false,true]){
+  const j=new JVM({classpath,wasmHeap:true,wasmFields:true,jit:{enabled:false,compileWorker:false,
+   retainCompilerDiagnostics:false,wasmStructured:structured,wasm:{compileConstructors:true,deepInline:false,
+    canonicalDirectCalls:true,canonicalEhLinks:true,nativeJsExceptionTags:true,nativeInstanceExits:true}}});
+  await j.preloadClasspathClasses();j._markClassInitialized('ColdAllocation');
+  for(const field of ['effects','initializations','observed','constructions','result'])j.classes.ColdAllocation.staticFields.set(field+':I',0);
+  const w=j.jit.wasmJit;w.enabled=true;
+  for(const [owner,name,desc] of [['ColdAllocated','<init>','()V'],['ColdAllocation','build','(ZZ)I']]){
+   const method=j.findMethod(j.classes[owner],name,desc),state=w.methodState({method});
+   w.compile({method,className:owner},state,{asCallee:true});
+   t.equal(state.status,'ready',state.lastCompileError||name+' prepares');
+  }
+  const build=j.findMethod(j.classes.ColdAllocation,'build','(ZZ)I'),state=w.state.get(build);
+  t.ok(state.meta.deoptableCalls>0,'prepared allocation retains a cold initialization guard');
+  if(structured && require('../src/jit/wasmShared').supportsWasmTryTable())t.ok(state.meta.structured && state.meta.normalFlowFullyCompiled,'structured body covers the cold native constructor site');
+  t.notEqual(j.classInitializationState.get('ColdAllocated'),'INITIALIZED','preparation does not run initializer');
+  const fields=j.classes.ColdAllocation.staticFields;
+  const run=async(take,fail)=>{
+   const Frame=require('../src/core/frame'),Stack=require('../src/core/stack');
+   const method=j.findMethod(j.classes.ColdAllocation,'entry','(ZZ)V');
+   const frame=new Frame(method);frame.className='ColdAllocation';frame.locals[0]=take;frame.locals[1]=fail;
+   const thread={id:0,status:'runnable',callStack:new Stack(),pendingException:null};
+   thread.callStack.push(frame);j.threads=[thread];j.currentThreadIndex=0;
+   let ticks=0;
+   while(thread.callStack.size()){
+    const current=thread.callStack.peek();
+    if(current.method===build && current.pc===0){const prepared=w.prepare(current);if(prepared)w.execute(current,thread,prepared.st,prepared.blk);}
+    if(!thread.callStack.size())break;
+    await j.executeTick();if(++ticks>10000)throw Error('tick limit');
+   }
+   return fields.get('result:I');
+  };
+  w.freezeCompilation();j.jit._syncCompileEnvironment={trace:false,assert:true};j.jit.markMainStarted();
+  t.equal(await run(0,0),5,'untaken allocation returns normally');
+  t.equal(fields.get('initializations:I'),0,'untaken branch leaves class cold');
+  t.equal(await run(1,0),7,'first allocation returns initialized state');
+  t.equal(fields.get('observed:I'),12,'initializer observes preceding effects exactly once');
+  t.equal(fields.get('effects:I'),112,'cold continuation does not replay effects');
+  t.equal(await run(1,0),7,'prepared warm allocation keeps exact result');
+  t.equal(fields.get('initializations:I'),1,'initializer executes once');
+  t.equal(fields.get('constructions:I'),2,'each object is constructed once');
+  t.equal(await run(1,1),-17,'rare native exception constructor reaches original handler');
+  t.equal(fields.get('effects:I'),334,'exception continuation preserves exactly-once effects');
+  t.equal(fields.get('constructions:I'),3,'throwing invocation does not repeat allocation');
+  t.equal(j.jit.syncCompileCensus().postMainSyncCompileCount,0,'cold and warm execution never compiles');
+ }
+ t.end();
+});
+
+
+test('guard-only prepared selection follows emitted coverage rather than inline policy',t=>{
+ const j=new JVM({jit:{compileWorker:false,wasm:{deepInline:false,canonicalDirectCalls:true,canonicalEhLinks:true,compileConstructors:true}}});
+ const h=j.jit,w=h.wasmJit;w.enabled=true;
+ const method={name:'<init>',descriptor:'()V',flags:[]};
+ const state=w.methodState({method});state.status='ready';
+ state.meta={structured:true,canonicalRun(){},guardOnlyNormalFlowGaps:true,
+  externalEntry:new Set([0]),blockOfItem:new Map([[0,0]]),boxedCount:0};
+ h.hasBackwardBranch=()=>true;
+ t.notOk(h.hasPreparedDeepInlineWasmUpgrade(method),'unprepared method remains excluded');
+ h.preparedCodegenMethods.add(method);
+ t.ok(h.hasPreparedDeepInlineWasmUpgrade(method),'emitted guarded body can own entry with deep inlining disabled');
+ state.meta.boxedCount=1;t.notOk(h.hasPreparedDeepInlineWasmUpgrade(method),'boxed state retains fallback');state.meta.boxedCount=0;
+ state.meta.guardOnlyNormalFlowGaps=false;t.notOk(h.hasPreparedDeepInlineWasmUpgrade(method),'unsupported islands cannot claim guarded coverage');state.meta.guardOnlyNormalFlowGaps=true;
+ state.meta.canonicalRun=null;t.notOk(h.hasPreparedDeepInlineWasmUpgrade(method),'legacy constructor retains atomic entry');state.meta.canonicalRun=()=>{};
+ state.runs=64;state.exits=32;t.notOk(h.hasPreparedDeepInlineWasmUpgrade(method),'unproductive guarded body retains exit-storm fallback');
  t.end();
 });

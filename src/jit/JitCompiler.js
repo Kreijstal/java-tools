@@ -1193,7 +1193,8 @@ class JitCompiler {
 
   tryRunFrame(frame, thread) {
     if ((this.wasmJit.opaqueNormalFlowEnabled || this.wasmJit.canonicalEhLinksEnabled) &&
-        this.wasmJit.requiresCanonicalResume(frame)) return UNHANDLED_RESULT;
+        this.wasmJit.requiresCanonicalResume(frame) &&
+        !this.requestStructuredResumeCheckpoint(frame,thread))return UNHANDLED_RESULT;
     // A transient generated-code deopt requests one canonical bytecode before
     // any compiled tier may try the frame again.  Consume that request at the
     // dispatcher boundary: letting canRun() consume it later still leaves the
@@ -1208,7 +1209,23 @@ class JitCompiler {
         retainedGenerated?.jvmHasOwnedStructuredContinuation?.(frame) ||
         retainedGenerated?.jvmHotCallGraphHasOwnedContinuation?.(frame));
       frame.jitSkipOnce = undefined;
-      if (!ownsStructuredContinuation) return UNHANDLED_RESULT;
+      if (!ownsStructuredContinuation && !this.wasmJit.hasStructuredResumePoint(frame)) return UNHANDLED_RESULT;
+    }
+    if(!this.runningFrames.has(frame)&&this.wasmJit.hasStructuredResumePoint(frame)){
+      const retained=frame.jitStableGeneratedEntry||this.stableGeneratedEntries.get(frame.method);
+      const generated=retained?.jit===this?retained.generated:this.codegenCache.get(frame.method);
+      // An existing iterator owns its lexical locals until it spills them.
+      // A coincidentally matching frame PC cannot transfer that ownership.
+      if(!generated?.jvmHasOwnedStructuredContinuation?.(frame)&&
+          !generated?.jvmHotCallGraphHasOwnedContinuation?.(frame)){
+        const resumed=this.wasmJit.tryRunFrame(frame,thread);
+        if(resumed.handled){
+          if(resumed.returned||!thread.callStack.isEmpty()&&
+            thread.callStack.peek()===frame&&this.wasmJit.hasStructuredResumePoint(frame))
+            return HANDLED_RESULT;
+          return WASM_EXITED_RESULT;
+        }
+      }
     }
     // Ask the wasm gate before any JS tier can win, so the census can account
     // for methods the JS tier claims first. Diagnostic mode only; a no-op
@@ -1289,6 +1306,11 @@ class JitCompiler {
       const wasmResult = this.wasmJit.tryRunFrame(frame, thread);
       if (wasmResult.handled) {
         if (wasmResult.returned) return HANDLED_RESULT;
+        // A proved header already owns its complete saved state. Yield at
+        // that boundary; interpreting one bytecode would consume its empty
+        // stack shape and strand the activation on a slower resume tier.
+        if(!thread.callStack.isEmpty()&&thread.callStack.peek()===frame&&this.wasmJit.hasStructuredResumePoint(frame))
+          return HANDLED_RESULT;
         // A partial-Wasm exit has already materialized locals, operand stack,
         // and the exact resume pc. Let executeTick interpret the unsupported
         // island immediately instead of consuming an otherwise empty thread
@@ -1362,6 +1384,19 @@ class JitCompiler {
     return this.hasReadyFullWasmModule(method);
   }
 
+  requestStructuredResumeCheckpoint(frame,thread) {
+    if(thread?.status!=='runnable' || thread.callStack.isEmpty() || thread.callStack.peek()!==frame)return false;
+    const retained=frame.jitStableGeneratedEntry||this.stableGeneratedEntries.get(frame.method);
+    const generated=retained?.jit===this?retained.generated:this.codegenCache.get(frame.method);
+    if(generated?.jvmHasOwnedStructuredContinuation?.(frame) ||
+       generated?.jvmHotCallGraphHasOwnedContinuation?.(frame))return false;
+    if(this.wasmJit.canonicalResumeFrames.has(frame))
+      return this.wasmJit.requestCanonicalStructuredResume(frame,thread);
+    if(this.wasmJit.structuredResumeCheckpoint(frame)!==frame.pc || !frame.stack.isEmpty())return false;
+    this.wasmJit.structuredResumeFrames.add(frame);
+    return true;
+  }
+
   hasReadyFullWasmModule(method) {
     const state = this.wasmJit.enabled && method
       ? this.wasmJit.state.get(method) : null;
@@ -1384,15 +1419,17 @@ class JitCompiler {
   // would have paid anyway, and the exit-storm veto retires it if that
   // becomes the rule rather than the exception.
   hasReadyWasmModuleForSynchronousCall(method) {
-    if (!method || method.name === "<init>" || method.name === "<clinit>") {
-      return false;
-    }
+    if (!method || method.name === "<clinit>") return false;
     const state = this.wasmJit.enabled ? this.wasmJit.state.get(method) : null;
     if (!state || state.status !== "ready" || !state.meta) return false;
     // A partial module may not contain the method's entry block at all; the
     // nested runner would refuse it on every call ("no-external-entry-at-pc"
     // in the census), each refusal costing a materialized child and a deopt.
     const meta = state.meta;
+    // Canonical constructor exits own the unfinished receiver and original
+    // invocation stack. Legacy scratch-frame constructors remain atomic.
+    if(method.name==='<init>' && !(this.wasmJit.ctorCompileEnabled &&
+        this.wasmJit.canonicalEhLinksEnabled && meta.structured && meta.canonicalRun))return false;
     const entryBlock = meta.blockOfItem ? meta.blockOfItem.get(0) : undefined;
     if (entryBlock === undefined || !meta.externalEntry ||
         !meta.externalEntry.has(entryBlock)) return false;
@@ -1473,11 +1510,11 @@ class JitCompiler {
     schedule();
   }
 
-  // Deep inlining, selection side: a ready module that compiles every
+  // Prepared inlining, selection side: a ready module that compiles every
   // normal-flow block and exits only at inlined guard-miss stubs owns the
   // method's entry, while it does not storm exits.
   hasPreparedDeepInlineWasmUpgrade(method) {
-    if (!this.wasmJit?.enabled || !this.wasmJit.deepInline ||
+    if (!this.wasmJit?.enabled ||
         !this.preparedCodegenMethods.has(method) || !this.hasBackwardBranch(method)) {
       return false;
     }
@@ -6574,6 +6611,7 @@ class JitCompiler {
 
     const terminal = new Set(["athrow", "ireturn", "return"]);
     const leaders = new Set([0]);
+    const nativeResumeHeaders = new Set();
     for (let index = 0; index < codeItems.length; index += 1) {
       if (!reachable.has(index)) continue;
       const instruction = codeItems[index] && codeItems[index].instruction;
@@ -6582,6 +6620,7 @@ class JitCompiler {
         const target = branchTargetIndex(instruction, labels);
         if (target === undefined) return null;
         leaders.add(target);
+        if(target<=index)nativeResumeHeaders.add(target);
         if (index + 1 < codeItems.length) leaders.add(index + 1);
       } else if (callSites.has(index)) {
         leaders.add(index);
@@ -6623,6 +6662,8 @@ class JitCompiler {
       "const stack = frame.stack.items;",
       "let pc = frame.pc;",
       "let backedgesUntilSafePoint = 10000;",
+      "const nativeResumePc = helpers.wasmJit.structuredResumeCheckpoint(frame);",
+      "const nativeResumeEntry = pc; let nativeResumeFirst = true;",
       ...[...usedLocals].sort((a, b) => a - b)
         .map((index) => `let local${index} = locals[${index}];`),
       ...(ssaOptimizations ? [...referenceLocals].sort((a, b) => a - b)
@@ -6674,6 +6715,14 @@ class JitCompiler {
       const entryDepth = depths[leader];
       if (entryDepth === undefined) continue;
       body.push(`case ${leader}: {`);
+      if(entryDepth===0 && nativeResumeHeaders.has(leader)){
+        body.push(`if (nativeResumePc === ${leader}) {`,
+          `if (!nativeResumeFirst || nativeResumeEntry !== ${leader}) {`,
+          ...materialize([],leader),
+          "helpers.wasmJit.structuredResumeFrames.add(frame);",
+          "return { deopt: true, transient: true, reason: 'native structured resume handoff' };",
+          "} nativeResumeFirst = false; }");
+      }
       const expressions = [];
       const arrayViews = new Map();
       const valueIdentities = new Map();
@@ -7197,6 +7246,8 @@ class JitCompiler {
       "let pc = frame.pc;",
       "const handoffPcs = frame.method.jvmStructuredResumePcs || null;",
       "const handoffEntry = pc;",
+      ...(synchronous ? ["const nativeResumePc = helpers.wasmJit.structuredResumeCheckpoint(frame);",
+        "let nativeResumeFirst = true;"] : []),
       "let bytecodesUntilYield = 10000;",
       "let bytecodeChecks = initialBytecodeChecks === undefined ? helpers.needsBytecodeChecks() : initialBytecodeChecks;",
       // Prime stride, as in the runner, so successive probes land on different
@@ -7231,6 +7282,13 @@ class JitCompiler {
           return;
         }
         if (synchronous && backEdgeTargets.has(index)) {
+          body.push(
+            `if (nativeResumePc === ${index} && sp === 0) { ` +
+              `if (!nativeResumeFirst || handoffEntry !== ${index}) { ` +
+              `helpers.materializeCached(frame, locals, stack, sp, ${index}); ` +
+              "helpers.wasmJit.structuredResumeFrames.add(frame); " +
+              "return { deopt: true, transient: true, reason: 'native structured resume handoff' }; " +
+              "} nativeResumeFirst = false; }");
           body.push(
             // The per-frame cap bounds a fast body that keeps declining the
             // frame at this header (each decline interprets one bytecode and

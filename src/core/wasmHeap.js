@@ -54,8 +54,9 @@ const MAX_BINNED_BYTES = 4096;
 const EXTENT_SCAN_LIMIT = 8;
 // Presenters can read a genuine heap view through its owning Memory without
 // staging a second copy. Weak keys do not keep a closed VM's memory alive.
-const memoryByBuffer = new WeakMap();
+const memoryByBuffer = new WeakMap(),allocationByArray=new WeakMap();
 function memoryForBuffer(buffer) { return memoryByBuffer.get(buffer); }
+function allocationForArray(array) { return allocationByArray.get(array); }
 
 // Design A reclamation (docs/phase2-representation.md 7-8). A guest array's
 // identity is the JS TypedArray view, so the host GC already knows when the
@@ -322,7 +323,7 @@ class WasmHeap {
       view.wasmBase = reused;
       this.stats.arrayReused += 1;
       this.stats.arrayFreeBytes -= bytes;
-      this.watch(view, reused, bytes);
+      this.watch(view, reused, bytes,desc);
       return view;
     }
     const base = (this.top + align - 1) & ~(align - 1);
@@ -337,14 +338,16 @@ class WasmHeap {
     this.stats.arrayBumped += 1;
     const view = new Ctor(this.memory.buffer, base, count);
     view.wasmBase = base;
-    this.watch(view, base, bytes);
+    this.watch(view, base, bytes,desc);
     return view;
   }
 
   // Register a view so its extent returns to the free list when the view dies.
   // The view is also the unregister token, so an explicit freeArray can cancel
   // the registration and avoid binning the same extent twice.
-  watch(view, base, bytes) {
+  watch(view, base, bytes,descriptor) {
+    const record={base,bytes,memory:this.memory,length:view.length,descriptor};
+    allocationByArray.set(view,record);
     // Only counted when something can report the view dead again. Without the
     // registry this would climb to millions over a session and read like a
     // leak in the sampler; growBlocker refuses on the untracked case anyway,
@@ -354,7 +357,7 @@ class WasmHeap {
     // Every heap-backed view is registered, including extents too large to
     // bin. Binning is decided in reclaimExtent; registration here is also what
     // lets arrayViewsLive fall back to zero, which is growTo's precondition.
-    this.registry.register(view, { base, bytes }, view);
+    this.registry.register(view, record, view);
   }
 
   // Called by the host GC after a view becomes unreachable. Carries no view --
@@ -410,6 +413,7 @@ class WasmHeap {
     if (bytes <= 0) return false;
     if (bytes > MAX_BINNED_BYTES) return false;
     if (this.registry) this.registry.unregister(view);
+    allocationByArray.delete(view);
     if (this.arrayViewsLive > 0) this.arrayViewsLive -= 1;
     let bin = this.arrayBins.get(bytes);
     if (!bin) { bin = []; this.arrayBins.set(bytes, bin); }
@@ -426,4 +430,4 @@ function isJavaArray(v) {
   return Array.isArray(v) || (ArrayBuffer.isView(v) && !(v instanceof DataView));
 }
 
-module.exports = { WasmHeap, isJavaArray, memoryForBuffer };
+module.exports = { WasmHeap, isJavaArray, memoryForBuffer,allocationForArray };
