@@ -240,7 +240,11 @@ class ModuleBuilder {
     const resolve = (code, where) => {
       const out = [];
       for (const item of code) {
-        if (typeof item === 'number') { out.push(item); continue; }
+        if (typeof item === 'number') {
+          if (!(item >= 0 && item <= 255 && Number.isInteger(item))) throw new Error(`code byte ${item} out of range in ${where}`);
+          out.push(item);
+          continue;
+        }
         if (item === undefined || item === null) throw new Error(`undefined code byte in ${where}`);
         if (item.fn !== undefined) {
           const index = funcIndex.get(item.fn);
@@ -317,10 +321,21 @@ class ModuleBuilder {
       ...section(7, vec(exportEntries)),
       ...section(9, vec(elementEntries)),
       ...section(10, vec(codeEntries)),
+      ...this.nameSection(funcIndex),
     ];
     return Uint8Array.from(bytes);
   }
 }
+
+ModuleBuilder.prototype.nameSection = function nameSection(funcIndex) {
+  // Function names make Wasm stack traces and CPU profiles name the Java
+  // method instead of wasm-function[n].
+  const entries = [...funcIndex].sort((a, b) => a[1] - b[1])
+    .map(([key, index]) => [...uleb(index), ...name(String(key).replace(/^m:/, '').slice(0, 200))]);
+  const functions = [1, ...uleb(vec(entries).length), ...vec(entries)];
+  const payload = [...name('name'), ...functions];
+  return [0, ...uleb(payload.length), ...payload];
+};
 
 module.exports = {
   VT, HT, OP, GC, SAT, uleb, sleb, f32bytes, f64bytes, refNull, ref, heapType,

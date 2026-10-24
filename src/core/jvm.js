@@ -871,6 +871,7 @@ class JVM {
     // <clinit> is guest code, so the boundary is here and not at the main()
     // invocation further down. Set it even when preparation was skipped --
     // opting out of preparation does not make later inline compilation free.
+    if (this.jit?.closedWorld) await this.jit.closedWorld.build();
     this.guestStarted = true;
     this.jit?.markMainStarted?.();
 

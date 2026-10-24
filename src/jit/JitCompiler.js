@@ -46,6 +46,7 @@ const { capturesBooleanStatic, isNoOpExceptionHandler, supportsWasmTryTable } =
 const { inlineCalls: wasmInlineCalls } = require("./wasmInline");
 
 const RETURN_VOID = Symbol("jit.return.void");
+const { NOT_CLOSED: CLOSED_NOT_HANDLED } = require("./closed/ClosedWorld");
 
 // Built during JVM construction, before guest execution. Fixed arity avoids
 // an argument-array allocation on successful calls; only throws allocate.
@@ -912,6 +913,10 @@ class JitCompiler {
     this._envInstrumented = Boolean(typeof process !== "undefined" && process.env &&
       (process.env.JVM_TRACE || process.env.JVM_PROFILE_HOT_METHODS === "1"));
     this.wasmJit = new WasmJit(jvm, this);
+    // One closed Wasm module over the closed storage (jit/closed). Built by
+    // jvm.run() before main; consulted first at frame and call entry.
+    this.closedWorld = jvm.closedRuntime && this.enabled !== false && options.closedWorld !== false
+      ? new (require('./closed/ClosedWorld').ClosedWorld)(this) : null;
     if (options.wasmStructured === true) {
       this.wasmJit.structuredEnabled = true;
     }
@@ -1192,6 +1197,10 @@ class JitCompiler {
   }
 
   tryRunFrame(frame, thread) {
+    if (this.closedWorld !== null && frame.pc === 0) {
+      const closed = this.closedWorld.tryRunFrame(frame, thread);
+      if (closed) return closed;
+    }
     if ((this.wasmJit.opaqueNormalFlowEnabled || this.wasmJit.canonicalEhLinksEnabled) &&
         this.wasmJit.requiresCanonicalResume(frame) &&
         !this.requestStructuredResumeCheckpoint(frame,thread))return UNHANDLED_RESULT;
@@ -11156,6 +11165,10 @@ class JitCompiler {
     const {
       method, lookupClass, inlineIntegerRegion, memoizedIntegralLeaf, generated,
     } = target;
+    if (this.closedWorld !== null) {
+      const closed = this.closedWorld.tryInvoke(method, frame, thread);
+      if (closed !== CLOSED_NOT_HANDLED) return closed === undefined ? RETURN_VOID : closed;
+    }
     const intrinsic = target.intrinsic;
     const receiver = receiverSlots
       ? frame.stack.items[availableOperands - params.length - 1]
