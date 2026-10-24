@@ -543,7 +543,12 @@ class ClosedWorld {
       case 'getfield': case 'putfield': {
         const [, owner, [name, descriptor]] = imm;
         const layout = this.runtime.layout(owner);
-        if (!layout) throw new Unsupported(`field-without-layout: ${owner}`);
+        if (!layout) {
+          // JRE objects and other host-shaped storage: the interpreter's own
+          // field handler, one import per site.
+          plan.set(node.id, this.hostFieldPlan(op, imm, kindOf(descriptor)));
+          return;
+        }
         let declaring = owner, field = null;
         for (let current = owner; current && !field; current = this.classAst(current)?.superClassName) {
           field = layout.byKey.get(`${current}.${name}`) || null;
@@ -577,7 +582,12 @@ class ClosedWorld {
         return;
       case 'new': {
         const className = imm;
-        if (!this.jvm.classes[className] && !(this.jvm.jre && this.jvm.jre[className])) throw new Unsupported(`new-unloaded: ${className}`);
+        if (!this.jvm.classes[className] && !(this.jvm.jre && this.jvm.jre[className])) {
+          // The interpreter throws NoClassDefFoundError when this executes.
+          plan.set(node.id, { kind: 'import', argKinds: [], fn: this.throwingImport(`nocls:${className}`, [], [VT.anyref],
+            'java/lang/NoClassDefFoundError', className) });
+          return;
+        }
         if (this.isGuestClass(className) && !this.runtime.layout(className)) throw new Unsupported(`new-without-layout: ${className}`);
         record.initClasses.add(className);
         const jit = this.jit;
@@ -656,7 +666,14 @@ class ClosedWorld {
         return;
       }
       const target = this.resolveFrom(owner, name, descriptor, op === 'invokestatic');
-      if (!target) throw new Unsupported(`invoke-unresolved: ${owner}.${name}${descriptor}`);
+      if (!target) {
+        const missingClass = !this.jvm.classes[owner] && !(this.jvm.jre && this.jvm.jre[owner]);
+        record.plan.set(node.id, { kind: 'import', argKinds, fn: this.throwingImport(`nomethod:${owner}.${name}${descriptor}`,
+          argKinds.map((k) => WT[k]), returnKind === 'V' ? [] : [WT[returnKind]],
+          missingClass ? 'java/lang/NoClassDefFoundError' : 'java/lang/NoSuchMethodError',
+          missingClass ? owner : `${owner}.${name}${descriptor}`) });
+        return;
+      }
       if (op === 'invokestatic') record.initClasses.add(target.owner);
       const initClass = op === 'invokestatic' ? this.initCheckFor(record, target.owner) : null;
       if (target.native) {
@@ -779,6 +796,33 @@ class ClosedWorld {
       return object !== null && object !== undefined && jvm.isInstanceOfSync(runtimeClassName(object), target) ? 1 : 0;
     });
     return { kind: isCast ? 'checkcast' : 'instanceof', hostFn, siteId };
+  }
+
+  // An operation whose execution throws a linkage error, like the interpreter.
+  throwingImport(key, params, results, type, message) {
+    const tag = this.tag;
+    return this.siteImport(key, params, results, () => { throw new WebAssembly.Exception(tag, [{ type, message }]); });
+  }
+
+  hostFieldPlan(op, imm, valueKind) {
+    const handlers = (this.objectInstructions ||= require('../../instructions/object'));
+    const handler = handlers[op], instruction = { op, arg: imm }, jvm = this.jvm, world = this;
+    const items = [];
+    const frame = { stack: { items, pop: () => items.pop(), push: (v) => { items.push(v); }, isEmpty: () => !items.length } };
+    const key = `hostfield:${op}:${imm[1]}.${imm[2][0]}`;
+    if (op === 'getfield') {
+      return { kind: 'import', argKinds: ['A'], fn: this.siteImport(key, [VT.anyref], [WT[valueKind]], (object) => {
+        items.length = 0;
+        items.push(world.runtime.toJs(object));
+        handler(frame, instruction, jvm);
+        return world.fromJs(valueKind, items.pop());
+      }) };
+    }
+    return { kind: 'import', argKinds: ['A', valueKind], fn: this.siteImport(key, [VT.anyref, WT[valueKind]], [], (object, value) => {
+      items.length = 0;
+      items.push(world.runtime.toJs(object), world.toJsValue(valueKind, value));
+      handler(frame, instruction, jvm);
+    }) };
   }
 
   // ---- lazy class initialization -----------------------------------------
