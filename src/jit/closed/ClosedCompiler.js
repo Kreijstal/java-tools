@@ -135,14 +135,13 @@ class ClosedCompiler {
   }
 
   // Leaves the non-null reference on the stack or throws NullPointerException.
+  // `refCode` is always a side-effect-free local.get (or ref.null), so the
+  // covered form reads it twice and keeps its static type.
   nonNull(refCode) {
     if (this.tryDepth === 0) return [...refCode, OP.br_on_null, ...uleb(this.depthOf('npe'))];
-    const tmp = this.temp([VT.anyref]);
-    const out = [...refCode, OP.local_tee, ...uleb(tmp), OP.ref_is_null, OP.if, 0x40,
+    return [...refCode, OP.ref_is_null, OP.if, 0x40,
       OP.call, { fn: this.world.hostImport('err_npe', [], []) }, OP.unreachable, OP.end,
-      OP.local_get, ...uleb(tmp), OP.ref_as_non_null];
-    this.release([VT.anyref], tmp);
-    return out;
+      ...refCode, OP.ref_as_non_null];
   }
 
   // Handler entries (table order) protecting an item, with their handler blocks.
