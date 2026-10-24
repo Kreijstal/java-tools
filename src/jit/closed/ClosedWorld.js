@@ -74,6 +74,8 @@ class ClosedWorld {
     // Java exceptions inside the module are this tag with the exception as
     // payload; host imports convert whatever JS throws into it.
     this.tag = new WebAssembly.Tag({ parameters: ['anyref'] });
+    this.optimisticAsync = jit.closedWorldOptimisticAsync ??
+      (typeof process !== 'undefined' && process.env?.JVM_CLOSED_WORLD_OPTIMISTIC_ASYNC === '1');
     if (typeof process !== 'undefined' && process.env?.JVM_CLOSED_WORLD_STATS) {
       process.once('exit', () => {
         const rejected = [...this.rejected].map(([key, reason]) => `${key}\t${reason}`).join('\n');
@@ -97,6 +99,7 @@ class ClosedWorld {
       rejectReasons: [...this.rejected.values()].reduce((m, r) => { const k = r.split(':')[0]; m[k] = (m[k] || 0) + 1; return m; }, {}),
       imports: this.imports.size,
       moduleBytes: this.moduleBytes || 0,
+      optimisticAsyncSites: this.optimisticAsyncSites || 0,
       ...this.counters,
     };
   }
@@ -338,8 +341,16 @@ class ClosedWorld {
 
   // An asynchronous native is a suspension point; module code cannot wait
   // for it, so whoever can reach it stays on the suspending tiers.
+  //
+  // Obfuscated code defeats this static rule: opaque dummy-parameter branches
+  // connect nearly every method to sockets, files and reflection, so one
+  // async native excludes almost everything. With `optimisticAsync`
+  // (JVM_CLOSED_WORLD_OPTIMISTIC_ASYNC=1) such calls are admitted and an
+  // async native that actually runs inside the module fails loudly at run
+  // time instead. Real suspension inside the module is not implemented.
   rejectAsyncNative(native, where) {
     if (native && native.constructor && native.constructor.name === 'AsyncFunction') {
+      if (this.optimisticAsync) { this.optimisticAsyncSites = (this.optimisticAsyncSites || 0) + 1; return; }
       throw new Unsupported(`async-native: ${where}`);
     }
   }
