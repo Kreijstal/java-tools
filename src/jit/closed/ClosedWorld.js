@@ -716,6 +716,11 @@ class ClosedWorld {
     if (error instanceof WebAssembly.RuntimeError && /null/i.test(error.message)) {
       return { type: 'java/lang/NullPointerException', message: null };
     }
+    if (error instanceof WebAssembly.RuntimeError && !this.reportedTrap) {
+      // Any other trap is a closed-world defect, never Java semantics.
+      this.reportedTrap = true;
+      process.stderr.write(`[closed-world] trap: ${error.stack}\n`);
+    }
     return error;
   }
 
