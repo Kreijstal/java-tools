@@ -244,6 +244,15 @@ class JVM {
     // are superclass-first so compiled fieldrefs can embed one numeric slot.
     this.denseInstanceFields = options.denseInstanceFields === true ||
       env.JVM_DENSE_INSTANCE_FIELDS === '1';
+    // Closed-world storage (jit/closed): one VM-owned representation of guest
+    // objects, arrays and statics that a single Wasm module addresses
+    // directly. It replaces the opt-in slab/dense layouts entirely.
+    this.closedRuntime = null;
+    if (this.wasmHeap && (options.closedWorld ?? env.JVM_CLOSED_WORLD === '1')) {
+      this.wasmFields = false;
+      this.denseInstanceFields = false;
+      this.closedRuntime = new (require('../jit/closed/representation').ClosedRuntime)(this);
+    }
     if (options.wasmFieldClasses !== undefined &&
         (!Array.isArray(options.wasmFieldClasses) ||
           options.wasmFieldClasses.some(name => typeof name !== 'string' || !name))) {
@@ -511,7 +520,7 @@ class JVM {
       // Handle static field overrides
       if (classOverrides.staticFields) {
         if (!this.jre[className].staticFields) {
-          this.jre[className].staticFields = new StaticFieldStore(undefined,!!this.wasmHeap);
+          this.jre[className].staticFields = new StaticFieldStore(undefined,!!this.wasmHeap,this.closedRuntime);
         }
         for (const [fieldName, fieldValue] of Object.entries(
           classOverrides.staticFields,
@@ -2967,7 +2976,7 @@ class JVM {
     try {
       const classData = await loadClassByPath(classFilePath, options);
       if (classData) {
-        classData.staticFields = new StaticFieldStore(undefined,!!this.wasmHeap);
+        classData.staticFields = new StaticFieldStore(undefined,!!this.wasmHeap,this.closedRuntime);
         this.classes[classData.ast.classes[0].className] = classData;
       }
       return classData;
@@ -2976,7 +2985,7 @@ class JVM {
       try {
         const classData = loadConvertedClass(classFilePath, options);
         if (classData) {
-          classData.staticFields = new StaticFieldStore(undefined,!!this.wasmHeap);
+          classData.staticFields = new StaticFieldStore(undefined,!!this.wasmHeap,this.closedRuntime);
           this.classes[classData.ast.classes[0].className] = classData;
         }
         return classData;
@@ -3008,7 +3017,7 @@ class JVM {
     const classData = {
       ast: convertedAst,
       constantPool: rawAst.constantPool,
-      staticFields: new StaticFieldStore(undefined,!!this.wasmHeap),
+      staticFields: new StaticFieldStore(undefined,!!this.wasmHeap,this.closedRuntime),
     };
 
     this.classes[classData.ast.classes[0].className] = classData;
@@ -3395,7 +3404,7 @@ class JVM {
       // Initialize static fields with default values first
       if (!classData.staticFields || !classData.staticFieldsInitialized) {
         if (!classData.staticFields) {
-          classData.staticFields = new StaticFieldStore(undefined,!!this.wasmHeap);
+          classData.staticFields = new StaticFieldStore(undefined,!!this.wasmHeap,this.closedRuntime);
         }
         classData.staticFieldsInitialized = true;
 

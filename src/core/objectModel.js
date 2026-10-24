@@ -1,6 +1,7 @@
 'use strict';
 const {getNativeObjectStorageOps,NATIVE_STORE,registerNativeFieldsStorage,createNativeFieldsStorage,
   createNativeObjectWrapper}=require('./nativeObjectStorage');
+const {STORE: CLOSED_STORE}=require('../jit/closed/representation');
 
 // The single definition of what a guest object *is*.
 //
@@ -197,6 +198,20 @@ function classIndexOf(jvm, className) {
 }
 
 function makeObjectRef(jvm, className, fields) {
+  if (jvm.closedRuntime) {
+    return jvm.closedRuntime.adoptWrapper({
+      type: className,
+      _className: className,
+      cidx: classIndexOf(jvm, className),
+      fields,
+      hashCode: jvm.nextHashCode++,
+      isLocked: false,
+      lockOwner: null,
+      lockCount: 0,
+      waitSet: [],
+      [CLOSED_STORE]: undefined,
+    });
+  }
   const object = {
     type: className,
     _className: className,
@@ -469,6 +484,9 @@ function enumerateFieldKeys(fields) {
 // The field map for a fresh instance: slab-backed when the class is eligible,
 // otherwise the plain defaulted map. Every allocation site calls this.
 function newFields(jvm, className) {
+  if (jvm.closedRuntime) {
+    return jvm.closedRuntime.newFields(className) || instanceFieldTemplate(jvm, className);
+  }
   if (jvm.wasmFieldClasses?.has(className)) {
     const selectedLayout = slabLayoutFor(jvm, className);
     if (selectedLayout) {

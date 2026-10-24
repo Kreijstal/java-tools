@@ -100,7 +100,7 @@ class JreBootstrap {
           ],
         },
         constantPool: [],
-        staticFields: new StaticFieldStore(undefined,!!jvm.wasmHeap),
+        staticFields: new StaticFieldStore(undefined,!!jvm.wasmHeap,jvm.closedRuntime),
         isJreStub: true,
       methods: jreClassDef.methods || {},
       staticMethods: jreClassDef.staticMethods || {},
@@ -168,7 +168,7 @@ class JreBootstrap {
                   ],
                 },
                 constantPool: [],
-                staticFields: new StaticFieldStore(undefined,!!jvm.wasmHeap),
+                staticFields: new StaticFieldStore(undefined,!!jvm.wasmHeap,jvm.closedRuntime),
                 isJreStub: true,
               };
 
@@ -729,7 +729,7 @@ class JreBootstrap {
         ],
       },
       constantPool: [],
-      staticFields: new StaticFieldStore(undefined,!!jvm.wasmHeap),
+      staticFields: new StaticFieldStore(undefined,!!jvm.wasmHeap,jvm.closedRuntime),
       isJreStub: true,
       methods: jreClassDef.methods || {},
       staticMethods: jreClassDef.staticMethods || {},

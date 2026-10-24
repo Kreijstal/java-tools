@@ -17,10 +17,13 @@ const {makeNativeStaticReferenceCell}=require('./nativeStaticReferenceCell');
 // `present` mirrors that membership so resolved writers can avoid a keyed
 // lookup while still restoring a key after deletion or a cold first write.
 class StaticFieldStore extends Map {
-  constructor(entries,nativeIntegers=false) {
+  constructor(entries,nativeIntegers=false,closedRuntime=null) {
     super();
     this.cells = new Map();
     this.nativeIntegers=!!nativeIntegers;
+    // Closed-world cells keep their value in a WebAssembly.Global that the
+    // closed module imports, so JS tiers and Wasm share one value of record.
+    this.closedRuntime=closedRuntime;
     if (entries) {
       for (const [key, value] of entries) this.set(key, value);
     }
@@ -29,7 +32,8 @@ class StaticFieldStore extends Map {
   cell(key) {
     let cell = this.cells.get(key);
     if (!cell) {
-      cell = this.nativeIntegers && typeof key==='string' && /:[ZBCSI]$/.test(key)
+      cell = this.closedRuntime ? this.closedRuntime.staticCell(key,super.get(key),super.has(key))
+        : this.nativeIntegers && typeof key==='string' && /:[ZBCSI]$/.test(key)
         ? makeNativeStaticCell(super.get(key),super.has(key))
         : this.nativeIntegers && typeof key==='string' && /:\[[BCSIJFD]$/.test(key)
           ? makeNativeStaticReferenceCell(super.get(key),super.has(key))

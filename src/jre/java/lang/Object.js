@@ -54,9 +54,14 @@ module.exports = {
         cloned.type = obj.type;
         cloned.elementType = obj.elementType;
         cloned.hashCode = jvm.nextHashCode++;
+        if (jvm.closedRuntime && Array.isArray(cloned)) return jvm.closedRuntime.referenceArray(cloned);
         return cloned;
       }
       
+      if (jvm.closedRuntime) {
+        const closedClone = jvm.closedRuntime.cloneObject(obj);
+        if (closedClone) return closedClone;
+      }
       // Basic clone implementation - shallow copy
       const cloned = Object.assign({}, obj);
       cloned.hashCode = jvm.nextHashCode++;

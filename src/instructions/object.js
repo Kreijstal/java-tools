@@ -209,6 +209,7 @@ function allocReferenceArray(jvm, elementType, count) {
   array.type = elementType.startsWith('[') ? `[${elementType}` : `[L${elementType};`;
   array.elementType = elementType;
   array.hashCode = jvm.nextHashCode++;
+  if (jvm.closedRuntime) return jvm.closedRuntime.referenceArray(array);
   return require('../core/nativeReferenceArray').makeNativeReferenceArray(jvm,array);
 }
 
@@ -270,7 +271,9 @@ function allocMultiArray(jvm, className, counts) {
     if (/^\[[ZBCSIJFD]$/.test(arr.type)) arr.cidx = classIndexOf(jvm,arr.type);
     arr.elementType = arr.type.slice(1);
     arr.hashCode = jvm.nextHashCode++;
-    return Array.isArray(arr) && (remaining.length || depth < totalDimensions-1 || baseType.startsWith('L'))
+    const referenceLevel = Array.isArray(arr) && (remaining.length || depth < totalDimensions-1 || baseType.startsWith('L'));
+    if (referenceLevel && jvm.closedRuntime) return jvm.closedRuntime.referenceArray(arr);
+    return referenceLevel
       ? require('../core/nativeReferenceArray').makeNativeReferenceArray(jvm,arr):arr;
   };
   return createMultiArray(counts);
