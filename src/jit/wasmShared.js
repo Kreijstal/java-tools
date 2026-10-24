@@ -43,7 +43,7 @@ const OP = {
   f32_convert_i32_s: 0xb2, f32_convert_i64_s: 0xb4, f32_demote_f64: 0xb6,
   f64_convert_i32_s: 0xb7, f64_convert_i64_s: 0xb9, f64_promote_f32: 0xbb,
   i32_extend8_s: 0xc0, i32_extend16_s: 0xc1,
-  i32_lt_u: 0x49, i32_ge_u: 0x4f,
+  i32_lt_u: 0x49, i32_gt_u: 0x4b, i32_ge_u: 0x4f,
   i32_load: 0x28, i64_load: 0x29, f32_load: 0x2a, f64_load: 0x2b,
   i32_load8_s: 0x2c, i32_load8_u: 0x2d, i32_load16_s: 0x2e, i32_load16_u: 0x2f,
   i32_store: 0x36, i64_store: 0x37, f32_store: 0x38, f64_store: 0x39,
@@ -705,7 +705,7 @@ function specokGlobalEntry() {
 
 function assembleModule({ importDecls, mainParams, mainResults, declared, body, profilerName,
   importMemory, retvType, runvWrapper, specokGlobal, importTable, sigTypes,
-  canonicalFrameExport, importCanonicalTable, importJsTag, parameterArrayABI = [], globalImportDecls = [] }) {
+  canonicalFrameExport, importCanonicalTable, importJsTag, parameterArrayABI = [], globalImportDecls = [], memoryImportDecls = [] }) {
   if (canonicalFrameExport?.readyAddress !== undefined &&
       (!importMemory || !Number.isInteger(canonicalFrameExport.readyAddress) ||
        canonicalFrameExport.readyAddress < 0 || canonicalFrameExport.readyAddress > 0x7ffffff8 ||
@@ -739,6 +739,13 @@ function assembleModule({ importDecls, mainParams, mainResults, declared, body, 
     // (import "env" "mem" (memory 1)) — memories index separately from
     // functions, so this does not shift any call target
     importEntries.push([3, 0x65, 0x6e, 0x76, 3, 0x6d, 0x65, 0x6d, 0x02, 0x00, ...uleb(1)]);
+  }
+  for(const d of memoryImportDecls){
+    if(typeof d.name!=='string'||!d.name.length||!Number.isInteger(d.minimum)||d.minimum<0||
+       !Number.isInteger(d.maximum)||d.maximum<d.minimum||d.maximum>65536)
+      throw TypeError('invalid additional memory import');
+    const name=Array.from(d.name,c=>c.charCodeAt(0));
+    importEntries.push([3,0x65,0x6e,0x76,...uleb(name.length),...name,2,1,...uleb(d.minimum),...uleb(d.maximum)]);
   }
   if (importCanonicalTable) {
     importEntries.push([3,0x65,0x6e,0x76,4,0x63,0x74,0x61,0x62,0x01,0x70,0x00,0x00]);
