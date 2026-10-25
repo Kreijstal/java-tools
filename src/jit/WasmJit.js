@@ -931,6 +931,10 @@ class MethodTranslator {
         ? hierarchy.resolveInit(owner, descriptor)
         : hierarchy.resolveSpecial(this.className, owner, name, descriptor);
       if (!impl) throw new Unsupported(`invokespecial ${owner}.${name} unresolved`, owner);
+      if (name === '<init>' &&
+          this.wasmJit.constructorAwaitsInitialization(impl.className, descriptor)) {
+        throw new Unsupported(`<init> ${impl.className} not initialized`, impl.className);
+      }
       direct = readyOrThrow(impl.className);
       if (name === '<init>') {
         // all-or-nothing: a constructor target must be unable to hand the
@@ -4700,6 +4704,11 @@ class WasmJit {
   // coupling this whole phase removes -- but so is treating 'incompatible' as
   // 'unknown', which installs a caller that exits Wasm on every invocation.
   staticLinkClassification(className, name, descriptor, allowSynchronized = false, allowCanonicalEh = false) {
+    // A method the JRE implements natively is never compiled here, however
+    // much bytecode its class carries: findReadyStatic refuses it first.
+    // Calling it 'unknown' would lower a late-bound trampoline that can never
+    // resolve, and the caller would exit Wasm at that call on every run.
+    if (this.jvm._jreFindMethod?.(className, name, descriptor)) return 'incompatible';
     const cd = this.jvm.classes[className];
     const clsAst = cd && cd.ast && cd.ast.classes[0];
     // A JRE-native or unloaded class owns no bytecode this backend compiles,
@@ -4869,6 +4878,26 @@ class WasmJit {
     // partial callees deopt on demoted blocks; the entry block at least must
     // run in wasm or every call would deopt immediately
     return allowPartial && cm.externalEntry.has(0) ? st : null;
+  }
+
+  // A constructor link on a class that is not initialized yet, whose target
+  // owns no module. Compiling that target on demand now bakes a readiness
+  // guard into every static access it makes to its own (or another cold)
+  // class. Those guards are deoptable exits, so the raw <init> link refuses
+  // the result, and they are stale by the time the constructor can first
+  // run: `new` initializes the class before any constructor body executes.
+  // While compilation is frozen the stale module is never replaced, so a
+  // caller waiting on the constructor METHOD would wait for good. The real
+  // dependency is the class's initialization: name the class, and the
+  // constructor compiles on demand when the requeued caller retries.
+  constructorAwaitsInitialization(implClassName, descriptor) {
+    if (this.jvm.classInitializationState.get(implClassName) === 'INITIALIZED') return false;
+    const clsAst = this.jvm.classes[implClassName]?.ast?.classes?.[0];
+    const method = clsAst?.items?.find((item) => item.type === 'method' &&
+      item.method.name === '<init>' && item.method.descriptor === descriptor)?.method;
+    if (!method) return false;
+    const st = this.state.get(method);
+    return !(st && st.status === 'ready');
   }
 
   // A method that calls itself can never find a ready module for that

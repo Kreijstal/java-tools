@@ -12437,6 +12437,10 @@ public class WasmCheckedHandlerHarness {
 });
 
 test('generated JS callers use proven rethrow-only children without deoptimizing', async (t) => {
+  // The handler rethrows the caught throwable unchanged (astore; aload;
+  // athrow). A wrap-and-rethrow reporter (`throw new X(msg, failure)`) is no
+  // longer a no-op handler: its allocation, constructor and replacement
+  // exception are guest behavior (wasmShared.isNoOpExceptionHandler).
   const classpath = compileJavaFixture(t, 'WasmBeforeDeoptHarness', `
 public class WasmBeforeDeoptHarness {
   private static int increment(int value) {
@@ -12447,7 +12451,7 @@ public class WasmBeforeDeoptHarness {
     try {
       for (int i = 0; i < out.length; i++) out[i] = increment(out[i]);
     } catch (RuntimeException failure) {
-      throw new IllegalStateException("wrappedLoop", failure);
+      throw failure;
     }
   }
 
@@ -13879,9 +13883,16 @@ public final class WasmOsrModuleSelectionHarness {
 
   const executions = [];
   jvm.jit.wasmJit.enabled = true;
+  // execute() owns reading the return box: it derives the module from the
+  // osr flag it is handed and reports that module's result as `value` (after
+  // releasing reference-valued return scratch). The stub follows the same
+  // contract, so the probe must forward execute()'s value and must hand it
+  // the flag prepare() reported; dropping the flag, or reading the primary's
+  // box on an OSR entry, yields the other module's value.
   jvm.jit.wasmJit.execute = (_frame, _thread, module, block, nested, osr) => {
     executions.push({ module, block, nested, osr });
-    return { returned: true };
+    const ran = osr && module.osr ? module.osr : module;
+    return { returned: true, value: ran.meta.box.ret };
   };
   const probe = (prep) => {
     jvm.jit.wasmJit.prepare = () => prep;
