@@ -17,7 +17,13 @@ test('late dispatch finishes its newly exposed terminal switch in the real emitt
 test('late switch completion retains work, intervening protection and declaration scopes',()=>{
   const suffix=source.replace('}}event(10);','}event(13);}event(10);');assert.match(fold(suffix),/break Phase/);
   const protectedSuffix=source.replace('Phase:{event(0);','Phase:{try{event(0);').replace('}}event(10);','}}finally{event(13);}event(14);}event(10);');assert.match(fold(protectedSuffix),/break Phase/);
-  const scoped=source.replace('int selected=key;Phase:{','Phase:{int selected=key;');const next=fold(scoped);assert.doesNotMatch(next,/Phase:|break Phase/);assert.match(next,/\{int selected=key;/);
+  const scoped=source.replace('int selected=key;Phase:{','Phase:{int selected=key;');const next=fold(scoped);assert.doesNotMatch(next,/Phase:|break Phase/);
+  // flattenStandaloneBlocks may widen the block scope only because `selected`
+  // is the method's sole declaration of that name; a reused name keeps it.
+  const depth=s=>{const head=s.slice(0,s.indexOf('int selected=key;'));return (head.match(/\{/g)||[]).length-(head.match(/\}/g)||[]).length;};
+  assert.equal((next.match(/int selected=key;/g)||[]).length,1);assert.ok(next.indexOf('int selected=key;')<next.indexOf('switch (selected)'));
+  const reused=fold(scoped.replace('event(10);return state;','event(10);{int selected=mode;event(selected);}return state;'));
+  assert.doesNotMatch(reused,/Phase:|break Phase/);assert.ok(depth(reused)>0,'a declaration whose name is reused later keeps its block scope');
 });
 
 test('late emitter completion matches an independent native action dispatcher',()=>{

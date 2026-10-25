@@ -957,7 +957,8 @@ test('CFR-JS reconstructs additional expression and declaration features', (t) =
     t.match(source, /public void printChoice\(boolean flag, PrintStream out, String yes, String no\) \{\s*out\.print\(flag \? yes : no\);\s*}/, 'stack ternary values survive into following calls');
     t.match(source, /public void printAsObject\(PrintStream out, String value\) \{\s*out\.print\(\(Object\) \(value\)\);\s*}/,
       'JRE overload metadata pins a deliberately broad bytecode descriptor');
-    t.match(source, /public void bounds\(int value\) \{\s*if \(\(?value < 0\)? \|\| value >= 100\) \{\s*throw new RuntimeException\("bounds"\);\s*}\s*}/, 'nested materialized boolean guards simplify to boolean expressions');
+    // Logical control headers wrap after `||` (wrapLogicalConditionLines).
+    t.match(source, /public void bounds\(int value\) \{\s*if \(\(?value < 0\)? \|\|\s+value >= 100\) \{\s*throw new RuntimeException\("bounds"\);\s*}\s*}/, 'nested materialized boolean guards simplify to boolean expressions');
     t.match(source, /public int countDownOnce\(int n\) \{\s*int count = 0;\s*do \{\s*count = count \+ 1;\s*n--;\s*} while \(n > 0\);\s*return count;\s*}/, 'back-edge conditional loops are reconstructed as do/while');
     t.match(source, /public int sumFor\(int n\) \{\s*int sum = 0;\s*for \(int i = 0; i < n; i\+\+\) \{\s*sum = sum \+ i;\s*}\s*return sum;\s*}/, 'counting loops are reconstructed as for loops');
     t.match(source, /public String\[\] words\(\) \{\s*String\[\] words = new String\[\]\{"alpha", "beta"\};\s*return words;\s*}/, 'object array initialisation is condensed');
@@ -973,7 +974,9 @@ test('CFR-JS reconstructs additional expression and declaration features', (t) =
     t.notOk(/new StringBuilder\(\)\.append/.test(source), 'string builder implementation detail is hidden');
     t.match(source, /int\[\] (\w+) = null;[\s\S]*?\1 = \(int\[\]\) \(\w+\);[\s\S]*?\1\[0\]/,
       'primitive array opcodes refine an Object[] carrier to the verifier array type');
-    t.match(source, /Object\[\] (\w+) = [^;]*;[\s\S]*?\1 = \(Object\[\]\) \(Object\) \(\w+\);/,
+    // An intermediate `(Object)` cast of a local declared Object is an identity
+    // cast; simplifyIdentityReferenceCasts may drop it. The Object[] cast stays.
+    t.match(source, /Object\[\] (\w+) = [^;]*;[\s\S]*?\1 = \(Object\[\]\) (?:\(Object\) )?\(?\w+\)?;/,
       'post-emission Object[] refinement casts earlier Object assignments');
     t.match(source,
       /mixedPrimitiveArrayLength\(boolean param0\)[\s\S]*?java\.lang\.reflect\.Array\.getLength\([A-Za-z_$][A-Za-z0-9_$]*\)/,
@@ -1146,7 +1149,9 @@ test('CFR-JS preserves synchronized multi-exit ring-buffer selection', (t) => {
     const branchGap = contiguous && wrapped
       ? source.slice(contiguous.index + contiguous[0].length, wrapped.index)
       : '';
-    t.match(branchGap, /if \([^)]*== 0\) \{[\s\S]*?break [^;]+;/,
+    // Either a labeled exit taken when the flag is clear, or the overwrite as
+    // the first statement of a guard that requires the flag to be set.
+    t.match(branchGap, /if \([^)]*== 0\) \{[\s\S]*?break [^;]+;|if \([^)]*!= 0\) \{\s*$/,
       'normal branch skips the wrapped-length overwrite');
     t.notOk(lengthLocal && new RegExp(
       `\\.write - [^;\\n]*\\.read;\\s*${lengthLocal} = [^;\\n]*\\.capacity`).test(source),

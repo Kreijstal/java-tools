@@ -42,7 +42,8 @@ test('minimal compiler accepts decompiled PyramidApplet array and support-field 
     });
     t.match(
       decompiled,
-      /var\d+\s*=\s*var\d+\.indices\[var\d+\]/,
+      // Split local lifetimes carry a suffix such as `var25Lifetime1`.
+      /var\d+\w*\s*=\s*var\d+\w*\.indices\[var\d+\w*\]/,
       'decompiler emits the previously unsupported support-field array load',
     );
     t.notOk(
@@ -93,14 +94,16 @@ test('frontend-produced PyramidApplet bytecode decompiles back to readable sourc
   });
   t.match(decompiled, /double\[\]\[\] vertices = /, 'reused reference slots recover their ranged debug names');
   t.match(decompiled, /for \(double x = -GRID_SIZE; x <= GRID_SIZE;/, 'floating-point counting loops reconstruct as for loops');
+  // wrapLogicalConditionLines puts each `&&`/`||` operand of a control header
+  // on its own line; only the whitespace after the operator changes.
   t.match(
     decompiled,
-    /if \(v1\[2\] < near && v2\[2\] < near\)/,
+    /if \(v1\[2\] < near &&\s+v2\[2\] < near\)/,
     'short-circuit AND guards remain structured',
   );
   t.match(
     decompiled,
-    /backBuffer == null \|\| this\.backBuffer\.getWidth/,
+    /backBuffer == null \|\|\s+this\.backBuffer\.getWidth/,
     'nested short-circuit OR guards remain structured',
   );
   t.notOk(/\bstackIn_|\bvar\d+\b|^\s+L\d+:/m.test(decompiled), 'compiler artifacts do not leak into reconstructed source');
