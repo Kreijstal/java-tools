@@ -144,6 +144,7 @@ class WasmHeap {
     this.i32 = new Int32Array(buffer);
     this.f64 = new Float64Array(buffer);
     this.i64 = new BigInt64Array(buffer);
+    this.u8 = new Uint8Array(buffer);
     this.viewEpoch += 1;
     return this.viewEpoch;
   }
@@ -342,6 +343,49 @@ class WasmHeap {
     return view;
   }
 
+  // An array extent with no view (closed-world module arrays). Returns its
+  // base, or -1 when the heap is spent. The caller registers the extent's
+  // owner with registerExtent and may make a view for it later (watchView).
+  allocExtent(desc, count) {
+    const Ctor = CTOR[desc];
+    if (!Ctor) return -1;
+    const align = Ctor.BYTES_PER_ELEMENT, bytes = count * align;
+    const reused = this._takeExtent(bytes, align);
+    if (reused >= 0) {
+      this.u8.fill(0, reused, reused + bytes);
+      this.stats.arrayReused += 1;
+      this.stats.arrayFreeBytes -= bytes;
+      return reused;
+    }
+    const base = (this.top + align - 1) & ~(align - 1);
+    if (base + bytes > this.limit && !this.growTo(base + bytes)) {
+      if (!this.exhausted) {
+        this.exhausted = true;
+        warnExhausted(this.limit);
+      }
+      return -1;
+    }
+    this.top = base + bytes;
+    this.stats.arrayBumped += 1;
+    return base;
+  }
+
+  // Reclaim an allocExtent extent when `owner` dies. Without a view it cannot
+  // detach, so it does not count against growth.
+  registerExtent(owner, base, bytes) {
+    if (this.registry) this.registry.register(owner, { base, bytes, viewless: true });
+  }
+
+  // A view over an extent whose owner registerExtent already tracks. It
+  // counts against growth until it dies; the owner's registration reclaims
+  // the extent (owner and view keep each other alive).
+  watchView(view, base, bytes, descriptor) {
+    allocationByArray.set(view, { base, bytes, memory: this.memory, length: view.length, descriptor });
+    if (!this.registry) return;
+    this.arrayViewsLive += 1;
+    this.registry.register(view, { viewOnly: true }, view);
+  }
+
   // Register a view so its extent returns to the free list when the view dies.
   // The view is also the unregister token, so an explicit freeArray can cancel
   // the registration and avoid binning the same extent twice.
@@ -364,7 +408,8 @@ class WasmHeap {
   // by definition there is none left -- so it bins by the recorded extent.
   reclaimExtent(held) {
     if (!held) return;
-    if (this.arrayViewsLive > 0) this.arrayViewsLive -= 1;
+    if (!held.viewless && this.arrayViewsLive > 0) this.arrayViewsLive -= 1;
+    if (held.viewOnly) return;
     const { base, bytes } = held;
     if (!(base > 0) || !(bytes > 0) || bytes > MAX_BINNED_BYTES) return;
     let bin = this.arrayBins.get(bytes);

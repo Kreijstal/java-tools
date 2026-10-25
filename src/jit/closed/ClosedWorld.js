@@ -722,9 +722,9 @@ class ClosedWorld {
       }
       case 'newarray': {
         const atype = typeof imm === 'number' ? NEWARRAY[imm] : imm;
-        const { allocPrimitiveArray } = require('../../instructions/object');
-        const fn = this.siteImport(`newarray:${atype}`, [VT.i32], [VT.anyref],
-          (count) => this.runtime.toWasm(allocPrimitiveArray(this.jvm, atype, count)));
+        const desc = { boolean: '[Z', byte: '[B', char: '[C', short: '[S', int: '[I', long: '[J', float: '[F', double: '[D' }[atype];
+        const runtime = this.runtime;
+        const fn = this.siteImport(`newarray:${atype}`, [VT.i32], [VT.anyref], (count) => runtime.newPrimitiveArray(desc, count));
         plan.set(node.id, { kind: 'import', fn, argKinds: ['I'] });
         return;
       }
@@ -844,11 +844,19 @@ class ClosedWorld {
       }
       const world = this;
       const { resolveVirtualHost } = this;
+      const { runtimeClassName } = (this.objectInstructions ||= require('../../instructions/object'));
+      // Resolution depends only on the receiver's class.
+      const byClass = new Map();
       hostFn = this.siteImport(`vhost:${owner}.${name}${descriptor}`, argKinds.map((k) => WT[k]),
         returnKind === 'V' ? [] : [WT[returnKind]], (...wasmArgs) => {
           const receiver = world.runtime.toJs(wasmArgs[0]);
           if (receiver === null || receiver === undefined) throw { type: 'java/lang/NullPointerException', message: null };
-          const native = resolveVirtualHost.call(world, receiver, owner, name, descriptor);
+          const className = runtimeClassName(receiver);
+          let native = byClass.get(className);
+          if (native === undefined) {
+            native = resolveVirtualHost.call(world, receiver, owner, name, descriptor);
+            if (className !== undefined) byClass.set(className, native);
+          }
           const args = params.map((p, i) => world.toJsValue(kindOf(p), wasmArgs[i + 1]));
           const result = native(world.jvm, receiver, args, world.thread);
           if (result && typeof result.then === 'function') throw new ClosedWorldError(`closed world: host virtual ${owner}.${name} returned a Promise`);

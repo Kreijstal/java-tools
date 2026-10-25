@@ -32,6 +32,9 @@ const STORE = Symbol('closed.store');
 const BASE_KEY = '_wasmBase';
 const KIND = { '[Z': 0, '[B': 1, '[C': 2, '[S': 3, '[I': 4, '[J': 5, '[F': 6, '[D': 7 };
 const KIND_SHIFT = [0, 0, 1, 1, 2, 3, 2, 3];
+const CTOR = { '[Z': Int8Array, '[B': Int8Array, '[C': Uint16Array, '[S': Int16Array, '[I': Int32Array,
+  '[J': BigInt64Array, '[F': Float32Array, '[D': Float64Array };
+const DESC_OF_KIND = ['[Z', '[B', '[C', '[S', '[I', '[J', '[F', '[D'];
 const ELEMENT_TYPE = { '[Z': 'boolean', '[B': 'byte', '[C': 'char', '[S': 'short', '[I': 'int', '[J': 'long', '[F': 'float', '[D': 'double' };
 
 // The shared rec group. Every closed module declares it first, so these type
@@ -44,7 +47,8 @@ function closedTypes() {
   return [
     arrayType(VT.anyref, true),
     subType([], structType(OBJ_FIELDS)),
-    structType([{ type: VT.i32 }, { type: VT.i32 }, { type: VT.i32 }, { type: VT.externref }]),
+    // view is set when the array first crosses into JS (materialize).
+    structType([{ type: VT.i32 }, { type: VT.i32 }, { type: VT.i32 }, { type: VT.externref, mutable: true }]),
     structType([{ type: ref(T_REFS) }, { type: VT.i32 }, { type: VT.externref, mutable: true }]),
   ];
 }
@@ -74,6 +78,10 @@ function helperModule() {
   def('newParr', [I, I, I, E], [A], [...get(0), ...get(1), ...get(2), ...get(3), ...GC.struct_new, { type: T_PARR }]);
   def('newRarr', [I, I], [A], [...get(0), ...GC.array_new_default, { type: T_REFS }, ...get(1),
     OP.ref_null, VT.externref, ...GC.struct_new, { type: T_RARR }]);
+  def('parrBase', [A], [I], [...get(0), ...GC.ref_cast, { stype: T_PARR }, ...GC.struct_get, { type: T_PARR }, PARR.base]);
+  def('parrLen', [A], [I], [...get(0), ...GC.ref_cast, { stype: T_PARR }, ...GC.struct_get, { type: T_PARR }, PARR.len]);
+  def('parrKind', [A], [I], [...get(0), ...GC.ref_cast, { stype: T_PARR }, ...GC.struct_get, { type: T_PARR }, PARR.kind]);
+  def('setParrView', [A, E], [], [...get(0), ...GC.ref_cast, { stype: T_PARR }, ...get(1), ...GC.struct_set, { type: T_PARR }, PARR.view]);
   def('setRarrWrapper', [A, E], [], [...castRarr(0), ...get(1), ...GC.struct_set, { type: T_RARR }, RARR.wrapper]);
   def('rarrGet', [A, I], [A], [...castRarr(0), ...GC.struct_get, { type: T_RARR }, RARR.elems, ...get(1), ...GC.array_get, { type: T_REFS }]);
   def('rarrSet', [A, I, A], [], [...castRarr(0), ...GC.struct_get, { type: T_RARR }, RARR.elems, ...get(1), ...get(2),
@@ -122,8 +130,13 @@ class ClosedRuntime {
     // accessors. Before that, objects are plain $obj with a refs array.
     this.classTypes = null;
     this.untypedObjects = 0;
-    const ops = this.ops;
-    this.toJs = (value) => (value === null ? null : ops.toJs(value));
+    const ops = this.ops, runtime = this;
+    // A module-made primitive array has no view until it first crosses here.
+    this.toJs = (value) => {
+      if (value === null) return null;
+      const js = ops.toJs(value);
+      return js === null ? runtime.materialize(value) : js;
+    };
   }
 
   toWasm(value) {
@@ -173,6 +186,38 @@ class ClosedRuntime {
     Object.defineProperty(value, STORE, { value: store, configurable: true });
     this.adoptedArrays += 1;
     return store;
+  }
+
+  // A fresh primitive array made by module code: closed storage with no JS
+  // view, so allocation creates no TypedArray, expandos or view registration.
+  newPrimitiveArray(desc, count) {
+    if (count < 0) throw { type: 'java/lang/NegativeArraySizeException', message: String(count) };
+    const kind = KIND[desc];
+    const base = this.heap.allocExtent(desc, count);
+    if (base < 0) {
+      const { allocPrimitiveArray } = require('../../instructions/object');
+      return this.toWasm(allocPrimitiveArray(this.jvm, ELEMENT_TYPE[desc], count));
+    }
+    const store = this.ops.newParr(base, count, kind, null);
+    this.heap.registerExtent(store, base, count << KIND_SHIFT[kind]);
+    return store;
+  }
+
+  // The JS view of a module-made primitive array, created once.
+  materialize(store) {
+    const ops = this.ops;
+    const base = ops.parrBase(store), length = ops.parrLen(store), kind = ops.parrKind(store);
+    const desc = DESC_OF_KIND[kind];
+    const view = new CTOR[desc](this.heap.memory.buffer, base, length);
+    view.wasmBase = base;
+    view.type = desc;
+    view.cidx = classIndexOf(this.jvm, desc);
+    view.elementType = ELEMENT_TYPE[desc];
+    view.hashCode = this.jvm.nextHashCode++;
+    Object.defineProperty(view, STORE, { value: store });
+    ops.setParrView(store, view);
+    this.heap.watchView(view, base, length << KIND_SHIFT[kind], desc);
+    return view;
   }
 
   parrOf(view) {
