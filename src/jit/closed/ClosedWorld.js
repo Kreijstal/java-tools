@@ -1128,6 +1128,9 @@ class ClosedWorld {
     try {
       result = this.invokeEntry(record, args, thread);
     } catch (error) {
+      // An internal (non-Java) failure leaves the frame in place, so the
+      // scheduler reports it against the method that was running.
+      if (error instanceof Error) throw error;
       // Every handler inside the module already ran. Replace the callee frame
       // with a handler-less tombstone so the scheduler dispatches in the
       // caller at its invoke, exactly as for an unwinding interpreter frame.
