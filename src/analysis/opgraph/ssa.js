@@ -603,6 +603,11 @@ function pruneTrivialPhis(fn) {
     }
     block.body = block.body.filter((node) => !replacements.has(node));
   }
+  // Frame states recorded before covered instructions name the surviving
+  // value too, or a handler would read a removed phi.
+  for (const defs of fn.slotDefsBefore?.values() || []) {
+    for (const [slot, value] of defs) defs.set(slot, map(value));
+  }
   fn.values = fn.values.filter((value) => !replacements.has(value));
   fn.params = fn.params.map(map);
 }
