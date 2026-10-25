@@ -26,6 +26,9 @@ const { closedTypes, OBJ_FIELDS, T_OBJ, T_PARR, T_RARR, T_REFS } = require('./re
 const { ClosedCompiler, Unsupported, WT } = require('./ClosedCompiler');
 const { ASYNC_METHOD_SENTINEL } = require('../../core/constants');
 
+// Longest a thread runs in the module before it is parked at a host call.
+const SLICE_MS = 10;
+const now = typeof performance !== 'undefined' ? () => performance.now() : () => Date.now();
 const REJECT_OPS = new Set(['jsr', 'jsr_w', 'ret', 'invokedynamic']);
 const NEWARRAY = { 4: 'boolean', 5: 'char', 6: 'float', 7: 'double', 8: 'byte', 9: 'short', 10: 'int', 11: 'long' };
 
@@ -70,7 +73,8 @@ class ClosedWorld {
     this.globalImports = new Map(); // global key -> {valtype, mutable, value}
     this.sites = [];               // diagnostics for vmiss / cce
     this.built = false;
-    this.counters = { entries: 0, entryFallbacks: 0, notReady: 0 };
+    this.counters = { entries: 0, entryFallbacks: 0, notReady: 0, preempted: 0 };
+    this.sliceStart = 0;
     this.thread = null;
     // Java exceptions inside the module are this tag with the exception as
     // payload; host imports convert whatever JS throws into it.
@@ -379,20 +383,26 @@ class ClosedWorld {
       menter: (value) => {
         const monitor = toJs(value), thread = world.thread;
         if (isNull(monitor)) throwJava('java/lang/NullPointerException');
+        // Park as BLOCKED; the scheduler makes the thread runnable once the
+        // owner releases, and the retry takes the monitor.
+        const acquire = () => {
+          if (!monitor.isLocked) {
+            monitor.isLocked = true; monitor.lockOwner = thread.id; monitor.lockCount = 1;
+            thread.blockingOn = undefined;
+            return true;
+          }
+          thread.status = 'BLOCKED'; thread.blockingOn = monitor;
+          return false;
+        };
+        // A thread out of time gives way before it takes a free monitor, so
+        // waiters (a notified thread reacquiring it) can run first.
+        if (!monitor.isLocked && world.sliceExpired() && world.requestPark({ value: undefined, retry: acquire })) {
+          world.counters.preempted += 1;
+          return;
+        }
         if (!monitor.isLocked) { monitor.isLocked = true; monitor.lockOwner = thread.id; monitor.lockCount = 1; }
         else if (monitor.lockOwner === thread.id) monitor.lockCount++;
         else {
-          // Park as BLOCKED; the scheduler makes the thread runnable once the
-          // owner releases, and the retry takes the monitor.
-          const acquire = () => {
-            if (!monitor.isLocked) {
-              monitor.isLocked = true; monitor.lockOwner = thread.id; monitor.lockCount = 1;
-              thread.blockingOn = undefined;
-              return true;
-            }
-            thread.status = 'BLOCKED'; thread.blockingOn = monitor;
-            return false;
-          };
           if (!world.requestPark({ value: undefined, retry: acquire })) {
             throw new ClosedWorldError('closed world: contended monitor (module code cannot block)');
           }
@@ -516,7 +526,19 @@ class ClosedWorld {
       if (this.requestPark({ value: this.fromHost(kind, result, returnDesc) })) return parkDummy(kind);
       throw new ClosedWorldError(`closed world: host method ${where} asked thread ${thread.id} to ${thread.status}`);
     }
+    if (this.sliceExpired() && this.requestPark({ value: this.fromHost(kind, result, returnDesc) })) {
+      this.counters.preempted += 1;
+      return parkDummy(kind);
+    }
     return this.fromHost(kind, result, returnDesc);
+  }
+
+  // Module code runs a thread until it parks. A guest loop that never blocks
+  // (a game loop running behind schedule never sleeps) would hold the event
+  // loop and starve every other thread, so a thread that has run for a time
+  // slice is parked at its next host call and goes back to the scheduler.
+  sliceExpired() {
+    return this.jspi && now() - this.sliceStart > SLICE_MS;
   }
 
   // JRE natives may return a bare JS array for a Java array result. The
@@ -1711,6 +1733,7 @@ class ClosedWorld {
     frame.closedOuterEntry = thread.closedEntryFrame;
     thread.closedEntryFrame = frame;
     this.thread = thread;
+    this.sliceStart = now();
     this.counters.entries += 1;
     this.setDepth(thread.callStack.size());
     fn(...args).then(
@@ -1725,6 +1748,7 @@ class ClosedWorld {
     frame.closedResumeWith = undefined;
     const tick = beginSegment(frame);
     this.thread = thread;
+    this.sliceStart = now();
     resume(outcome);
     return tick;
   }

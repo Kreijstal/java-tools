@@ -53,7 +53,8 @@ function runDetailed(directory, mainClass, options = {}) {
   const jvmOptions = { ...options };
   delete jvmOptions.jspiNode;
   env.CLOSED_OPTIONS = JSON.stringify({ classpath: directory, wasmHeap: true, ...jvmOptions });
-  const result = spawnSync(node, ['-e', RUNNER], { env, encoding: 'utf8', maxBuffer: 64 << 20 });
+  // A module thread that never yields hangs; fail instead.
+  const result = spawnSync(node, ['-e', RUNNER], { env, encoding: 'utf8', maxBuffer: 64 << 20, timeout: 120000 });
   if (result.error) throw result.error;
   const parsed = parseStats(result.stderr || '');
   return { output: result.stdout, stderr: result.stderr, ...parsed };

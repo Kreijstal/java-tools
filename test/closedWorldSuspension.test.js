@@ -50,3 +50,9 @@ test('handlers inside handlers keep the frame state (try-with-resources)', { ski
     assert.ok(stats.admitted >= 5, `admitted ${JSON.stringify(stats)}`);
   });
 });
+
+test('a thread that never blocks is preempted so others run', { skip }, () => {
+  check('ClosedPreemption', (stats) => {
+    assert.ok(stats.preempted > 0, `preempted ${JSON.stringify(stats)}`);
+  });
+});
