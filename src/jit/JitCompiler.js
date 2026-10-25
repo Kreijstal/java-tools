@@ -573,6 +573,11 @@ class JitCompiler {
     this.directSynchronousIntrinsics = [];
     this.directCheckedLeafBodies = [];
     this.directCheckedLeafBodyIds = new WeakMap();
+    // Parallel to directCheckedLeafBodies: which method and which of its
+    // published checked-leaf entries each id holds, so a transported caller's
+    // `helpers.directCheckedLeafBodies[id]` can be rebound on the receiver.
+    this.directCheckedLeafDescriptors = [];
+    this.directCheckedLeafReuseFloor = 0;
     this.codegenCompiling = new WeakSet();
     this.positionalGeneratedCallsEnabled =
       options.positionalGeneratedCalls !== false &&
@@ -4181,7 +4186,45 @@ class JitCompiler {
   static get transportableSiteTables() {
     return ["fieldSites", "syncCallSites", "directStaticTargets",
       "classInitializationGuards", "restoringFrameLayouts",
-      "directJreIntrinsics", "directJreInitializationTokens"];
+      "directJreIntrinsics", "directJreInitializationTokens",
+      "directCheckedLeafBodies"];
+  }
+
+  // What a direct checked-leaf entry is, as plain data: the callee and which
+  // of its published bodies getCompileTimeCheckedLeaf selected, plus the
+  // plans a caller compiled against it baked in. Equal descriptors mean the
+  // two bodies have the same calling contract.
+  static checkedLeafEntryDescriptor(className, methodName, descriptor, generated) {
+    const captured =
+      typeof generated?.jvmCapturedCheckedLeafDirectPositionalBody === "function";
+    return { className, methodName, descriptor,
+      variant: captured ? "captured" : "checked",
+      captures: JSON.stringify(captured
+        ? generated.jvmCapturedCheckedLeafDirectPositionalPlan?.captures ?? null : null),
+      admissionPlan: JSON.stringify(
+        generated?.jvmStructuredCheckedLeafAdmissionPlan ?? null) };
+  }
+
+  // The receiver's own body for a transported checked-leaf entry, or a
+  // reason string. Only an already published callee body is used: binding
+  // must never compile, and a differing contract refuses the result.
+  resolveTransportedCheckedLeaf(entry) {
+    const { className, methodName, descriptor } = entry;
+    const classData = this.jvm.classes[className];
+    const method = classData && this.jvm.findMethod(classData, methodName, descriptor);
+    const generated = method && this.codegenCache.get(method);
+    const label = `checked leaf ${className}.${methodName}${descriptor}`;
+    if (!generated) return `${label} has no published body here`;
+    const local = JitCompiler.checkedLeafEntryDescriptor(
+      className, methodName, descriptor, generated);
+    if (local.variant !== entry.variant || local.captures !== entry.captures ||
+        local.admissionPlan !== entry.admissionPlan) {
+      return `${label} has a different entry contract here`;
+    }
+    const body = entry.variant === "captured"
+      ? generated.jvmCapturedCheckedLeafDirectPositionalBody
+      : generated.jvmCheckedLeafDirectPositionalBody;
+    return typeof body === "function" ? body : `${label} has no checked-leaf entry here`;
   }
 
   // Names the tables a compile allocated into that cannot cross, or [] when
@@ -4211,9 +4254,12 @@ class JitCompiler {
       watermark.restoringFrameLayouts);
     grow(this.directJreIntrinsics, watermark.directJreIntrinsics);
     grow(this.directJreInitializationTokens, watermark.directJreInitializationTokens);
-    // A worker cannot carry these executable entries. Reserve the sender's
-    // prefix so a new allocation is detected as unsupported table growth.
+    // Checked-leaf entries cross symbolically and are rebound to the
+    // receiver's own published callee body (placeSiteTables). Reserve the
+    // sender's prefix so new entries land above it.
     grow(this.directCheckedLeafBodies, watermark.directCheckedLeafBodies ?? 0);
+    this.directCheckedLeafReuseFloor = Math.max(this.directCheckedLeafReuseFloor,
+      watermark.directCheckedLeafBodies ?? 0);
     return this.siteIdWatermark();
   }
 
@@ -4221,7 +4267,16 @@ class JitCompiler {
   describeSiteTablesSince(from) {
     const tables = { fieldSites: [], syncCallSites: [], directStaticTargets: [],
       classInitializationGuards: [], restoringFrameLayouts: [],
-      directJreIntrinsics: [] };
+      directJreIntrinsics: [], directCheckedLeafBodies: [] };
+    for (let id = from.directCheckedLeafBodies ?? 0;
+      id < this.directCheckedLeafBodies.length; id += 1) {
+      if (!this.directCheckedLeafBodies[id]) continue;
+      const descriptor = this.directCheckedLeafDescriptors[id];
+      if (!descriptor) {
+        throw new Error('direct checked leaf has no transport descriptor');
+      }
+      tables.directCheckedLeafBodies.push({ index: id, ...descriptor });
+    }
     for (let id = from.directJreIntrinsics ?? 0; id < this.directJreIntrinsics.length; id++) {
       if (!this.directJreIntrinsics[id]) continue;
       const descriptor = this.directJreDescriptors.get(id);
@@ -4274,6 +4329,29 @@ class JitCompiler {
     if (!tables) return null;
     const conflict = preflightTransportSites(this, tables, callerMethod);
     if (conflict) return conflict;
+    // Resolve every checked-leaf entry before placing anything, so a refusal
+    // leaves no partial binding behind.
+    const checkedLeaves = [];
+    for (const entry of tables.directCheckedLeafBodies || []) {
+      const body = this.resolveTransportedCheckedLeaf(entry);
+      if (typeof body === 'string') return body;
+      const existing = this.directCheckedLeafBodies[entry.index];
+      if (existing && existing !== body) {
+        return `direct checked leaf ${entry.index} is already occupied`;
+      }
+      checkedLeaves.push({ entry, body });
+    }
+    for (const { entry, body } of checkedLeaves) {
+      while (this.directCheckedLeafBodies.length <= entry.index) {
+        this.directCheckedLeafBodies.push(undefined);
+      }
+      this.directCheckedLeafBodies[entry.index] = body;
+      const { index, ...descriptor } = entry;
+      this.directCheckedLeafDescriptors[index] = descriptor;
+      if (!Number.isInteger(this.directCheckedLeafBodyIds.get(body))) {
+        this.directCheckedLeafBodyIds.set(body, index);
+      }
+    }
     for (const entry of tables.directJreIntrinsics || []) {
       const {className, methodName, descriptor, index} = entry;
       const native = this.resolveSynchronousJreMethod(className, className, methodName, descriptor);
@@ -12247,10 +12325,16 @@ class JitCompiler {
       ? capturedBody : generated?.jvmCheckedLeafDirectPositionalBody;
     if (typeof body !== "function") return null;
     let id = this.directCheckedLeafBodyIds.get(body);
-    if (!Number.isInteger(id)) {
+    // A transport producer describes only the ids above its current grant.
+    // An id an earlier grant allocated may never have been placed on the
+    // receiver (that result could have been refused), so allocate afresh.
+    if (!Number.isInteger(id) || this.producesTransport &&
+        id < this.directCheckedLeafReuseFloor) {
       id = this.directCheckedLeafBodies.length;
       this.directCheckedLeafBodies.push(body);
       this.directCheckedLeafBodyIds.set(body, id);
+      this.directCheckedLeafDescriptors[id] =
+        JitCompiler.checkedLeafEntryDescriptor(className, methodName, descriptor, generated);
     }
     return {
       id,

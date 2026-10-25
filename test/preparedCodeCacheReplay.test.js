@@ -212,7 +212,28 @@ test('a worker reservation cannot hide direct checked-leaf allocations', async t
   worker.jit.getGeneratedFunction(caller, {allowEffectfulCalls: true, compileLocally: true});
   t.ok(worker.jit.directCheckedLeafBodies.length > prefix.directCheckedLeafBodies,
     'new callable entries allocate beyond the reserved prefix');
-  t.ok(worker.jit.untransportableTableGrowth(prefix).includes('directCheckedLeafBodies'),
-    'the result is refused rather than addressing unrelated receiver entries');
+  // New entries cross as descriptors and are rebound to the receiver's own
+  // published callee bodies, never to whatever the receiver holds at an id.
+  t.notOk(worker.jit.untransportableTableGrowth(prefix).includes('directCheckedLeafBodies'),
+    'the checked-leaf table is carried by the transport');
+  const described = worker.jit.describeSiteTablesSince(prefix).directCheckedLeafBodies;
+  const allocated = worker.jit.directCheckedLeafBodies
+    .map((body, index) => body && index >= prefix.directCheckedLeafBodies ? index : -1)
+    .filter((index) => index >= 0);
+  t.deepEqual(described.map((entry) => entry.index), allocated,
+    'every new callable entry is described');
+  t.equal(sender.jit.placeSiteTables({directCheckedLeafBodies: described}), null,
+    'the receiver binds every described entry');
+  for (const entry of described) {
+    t.equal(sender.jit.directCheckedLeafBodies[entry.index],
+      sender.jit.resolveTransportedCheckedLeaf(entry),
+      `entry ${entry.index} is the receiver's own ${entry.className}.${entry.methodName} body`);
+    t.equal(typeof sender.jit.directCheckedLeafBodies[entry.index], 'function',
+      `entry ${entry.index} is callable on the receiver`);
+  }
+  const occupied = {...described[0], index: sender.jit.directCheckedLeafBodies.length};
+  sender.jit.directCheckedLeafBodies[occupied.index] = function unrelated() {};
+  t.match(String(sender.jit.placeSiteTables({directCheckedLeafBodies: [occupied]})),
+    /already occupied/, 'the result is refused rather than addressing unrelated receiver entries');
   t.end();
 });

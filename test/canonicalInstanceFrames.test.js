@@ -17,6 +17,7 @@ public class InstanceFrameProof {
  static int effects;
  static int step(int x){effects++;return x+1;}
  static int call(InstanceReader reader,int[] a,int n){effects++;return reader.read(a,n)+5;}
+ static int callPlain(InstanceReader reader,int[] a,int n){effects++;return reader.read(a,n)+5;}
 }`);
  const j=new JVM({classpath,wasmHeap:true,jit:{enabled:false,compileWorker:false,
   retainCompilerDiagnostics:false,wasmStructured:true,wasm:{deepInline:false,
@@ -34,6 +35,16 @@ public class InstanceFrameProof {
  const recursive=prepare('InstanceReader','recurse','(I)I');
  const leaf=prepare('InstanceReader','read','([II)I');
  const caller=prepare('InstanceFrameProof','call','(LInstanceReader;[II)I');
+ // The default caller splices read's loop as a recovered activation behind
+ // an instanceof speculation. Compile one caller without inlining so the
+ // canonical instance boundary and its closed receiver-class guard remain
+ // directly exercised as well.
+ const inlineSetting=process.env.JVM_WASM_INLINE;
+ let plain;
+ try{process.env.JVM_WASM_INLINE='0';plain=prepare('InstanceFrameProof','callPlain','(LInstanceReader;[II)I');}
+ finally{if(inlineSetting===undefined)delete process.env.JVM_WASM_INLINE;else process.env.JVM_WASM_INLINE=inlineSetting;}
+ t.ok(plain.meta.canonicalDirectSites>0,'uninlined caller uses a canonical native instance slot');
+ t.notOk(plain.meta.specSites?.length,'uninlined caller bakes no dispatch speculation');
  t.ok(leaf.meta.canonicalRun,'instance method has a native canonical entry');
  t.deepEqual(leaf.meta.parameterArrayABI,[1],'forwarded array ABI accounts for receiver');
  t.ok(caller.meta.canonicalDirectSites>0,'caller uses canonical native instance slots');
@@ -62,11 +73,11 @@ public class InstanceFrameProof {
  t.equal(bounds[0],-5,'callee exception unwinds normally');
  t.equal(bounds[2].box.lastThrown.type,'java/lang/ArrayIndexOutOfBoundsException','callee exception identity is retained');
  t.equal(fields.get('effects:I'),4,'successful effects preceding a failure are not replayed');
- const execute=async(target=receiver)=>{
-  const frame=new Frame(caller.method);frame.className='InstanceFrameProof';
+ const execute=async(target=receiver,state=caller)=>{
+  const frame=new Frame(state.method);frame.className='InstanceFrameProof';
   [target,array,3].forEach((v,i)=>frame.locals[i]=v);
   const thread={id:0,status:'runnable',callStack:new Stack()};thread.callStack.push(frame);j.threads=[thread];j.currentThreadIndex=0;
-  let value=w.execute(frame,thread,caller,0).value,steps=0;
+  let value=w.execute(frame,thread,state,0).value,steps=0;
   while(!thread.callStack.isEmpty()&&++steps<10000){
    const current=thread.callStack.peek(),ins=current.instructions[current.pc++].instruction;
    if((typeof ins==='string'?ins:ins?.op)==='ireturn')value=current.stack.peek();
@@ -80,9 +91,21 @@ public class InstanceFrameProof {
  leaf.meta.canonicalFuel.value=100000000;
  await j.loadClassByName('LaterReader');j._markClassInitialized('LaterReader');
  prepare('LaterReader','read','([II)I');
- reset();t.equal(await execute({type:'LaterReader',fields:{}}),118,
+ reset();t.equal(await execute({type:'LaterReader',fields:{}},plain),118,
   'guard miss dispatches to new override including invokespecial super call');
  t.equal(fields.get('effects:I'),4,'late dispatch effects occur once');
+ // The inlined caller's instanceof guard admits the subclass, so the class
+ // world gate must retire that body before any entry (prepare and nested
+ // targets both run this check); the rebuilt caller then dispatches exactly.
+ t.deepEqual(caller.meta.specSites.map(site=>site.owner+'.'+site.name+site.descriptor),
+  ['InstanceReader.read([II)I'],'inlined loop records its dispatch speculation');
+ t.notOk(w.revalidateNestedCallee(caller),'late override invalidates the inlined speculation');
+ t.equal(caller.status,'cold','invalidated caller is withdrawn before it can run');
+ prepare('InstanceFrameProof','call','(LInstanceReader;[II)I');
+ reset();t.equal(await execute({type:'LaterReader',fields:{}}),118,
+  'recompiled caller dispatches to new override including invokespecial super call');
+ t.equal(fields.get('effects:I'),4,'recompiled late dispatch effects occur once');
+ reset();t.equal(await execute(),18,'recompiled caller keeps the original target');
  t.end();
 });
 

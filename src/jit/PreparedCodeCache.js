@@ -239,6 +239,12 @@ class PreparedCodeCache {
     const jit = this.jit;
     const after = jit.siteIdWatermark();
     const growth = jit.untransportableTableGrowth(before);
+    // A checked-leaf entry is rebound to the receiver's published callee
+    // body. Replay materializes the companions that would publish it only
+    // after placement, so such a step is still not stored.
+    if (after.directCheckedLeafBodies > (before.directCheckedLeafBodies ?? 0)) {
+      growth.push('directCheckedLeafBodies');
+    }
     if (growth.length) return `untransportable tables: ${growth.join(', ')}`;
     const published = jit.codegenCache.has(method);
     const current = published ? jit.codegenCache.get(method) : undefined;

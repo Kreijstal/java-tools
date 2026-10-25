@@ -230,6 +230,22 @@ test('the real dm.b(II)V, prepared cold through a compile worker, inserts ' +
   t.ok(stats.installed >= 2 && stats.failed === 0 && stats.refused === 0,
     'both bodies were installed from the worker: ' + JSON.stringify(stats));
   const generated = jvm.jit.getGeneratedFunction(caller);
+  // The caller's framed and fast bodies still call the leaf through the
+  // direct checked-leaf table. The worker's entry ids must be rebound here
+  // to the blit body this thread installed, or those bodies would call an
+  // empty slot.
+  const leafBody = jvm.jit.codegenCache.get(callee)?.jvmCheckedLeafDirectPositionalBody;
+  const referenced = new Set();
+  for (const value of Object.values(generated || {})) {
+    if (typeof value !== 'function') continue;
+    for (const match of String(value).matchAll(/directCheckedLeafBodies\[(\d+)\]/g)) {
+      referenced.add(Number(match[1]));
+    }
+  }
+  t.ok(typeof leafBody === 'function' && referenced.size > 0 &&
+    [...referenced].every((id) => jvm.jit.directCheckedLeafBodies[id] === leafBody),
+    'every direct leaf entry the transported caller names is the installed blit: ' +
+    JSON.stringify([...referenced]));
   t.equal(generated?.jvmStructuredLexicalCheckedLeafCallCount, 1,
     'the blit call site is a lexical checked-leaf insertion');
   t.equal(generated?.jvmStructuredLexicalVoidFastPathCallCount, 1,
@@ -247,5 +263,16 @@ test('the real dm.b(II)V, prepared cold through a compile worker, inserts ' +
     'a rejected admission leaves the restoring body for the canonical call');
   t.notOk(/safePointBudget/.test(body.slice(body.indexOf('ssaInlineCheckedLeaf'))),
     'the inserted leaf polls no scheduler budget');
+  // A transported entry binds only to an equal contract on a published body.
+  const entry = {index: jvm.jit.directCheckedLeafBodies.length + 8,
+    ...jvm.jit.directCheckedLeafDescriptors[[...referenced][0]]};
+  t.match(String(jvm.jit.placeSiteTables({directCheckedLeafBodies: [
+    {...entry, variant: 'captured'}]})), /different entry contract/,
+    'a different checked-leaf contract refuses the result');
+  t.match(String(jvm.jit.placeSiteTables({directCheckedLeafBodies: [
+    {...entry, methodName: 'a'}]})), /no published body/,
+    'an unpublished callee refuses the result');
+  t.equal(jvm.jit.directCheckedLeafBodies[entry.index], undefined,
+    'a refused entry is not placed');
   t.end();
 });
