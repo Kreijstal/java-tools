@@ -585,6 +585,10 @@ class ClosedCompiler {
     this.derived = new Map();
     const want = (value, kind) => {
       if (!value || !this.live(value) || value.op === 'aconst_null' || value.kind !== 'A') return;
+      // A typed value is read directly: V8 shares its immutable struct
+      // fields and null checks; decoded locals would only lengthen live
+      // ranges across calls.
+      if (typed(this.reprOf(value))) return;
       let entry = this.derived.get(value.id);
       if (!entry) { entry = {}; this.derived.set(value.id, entry); }
       if (entry[kind]) return;
@@ -849,6 +853,13 @@ class ClosedCompiler {
   }
 
   // ---- arrays -----------------------------------------------------------
+  // Index check of a typed array: null raises NullPointerException, an
+  // index outside [0, length) the bounds exception.
+  typedIndexCheck(arrayCode, indexCode, lengthOps) {
+    return [...indexCode, ...this.nonNull(arrayCode), ...lengthOps, OP.i32_ge_u, OP.if, 0x40,
+      ...arrayCode, ...indexCode, OP.call, { fn: this.world.hostImport('err_index', [VT.anyref, VT.i32], []) }, OP.unreachable, OP.end];
+  }
+
   // Index check against a decoded length; the failure path raises
   // NullPointerException for a null array, else the bounds exception.
   indexCheck(arrayCode, indexCode, lengthLocal) {
@@ -877,6 +888,11 @@ class ClosedCompiler {
         OP.local_get, ...L(derived.base), ...index, ...(shift ? [OP.i32_const, shift, OP.i32_shl] : []), OP.i32_add,
         ...value, memOp, align, 0];
     }
+    if (this.reprOf(node.args[0]) === 'parr') {
+      return [...this.typedIndexCheck(array, index, [...GC.struct_get, { type: T_PARR }, PARR.len]),
+        ...array, ...GC.struct_get, { type: T_PARR }, PARR.base, ...index, ...(shift ? [OP.i32_const, shift, OP.i32_shl] : []), OP.i32_add,
+        ...value, memOp, align, 0];
+    }
     const pType = refNull(T_PARR);
     const p = this.temp(pType), len = this.temp([VT.i32]);
     const host = this.world.hostImport(`${store ? 'astore' : 'aload'}_${kind}`,
@@ -903,6 +919,11 @@ class ClosedCompiler {
       return [...this.indexCheck(array, index, derived.len),
         OP.local_get, ...uleb(derived.elems), ...index, ...value, ...(store ? GC.array_set : GC.array_get), { type: T_REFS }];
     }
+    if (this.reprOf(node.args[0]) === 'rarr') {
+      const elems = [...GC.struct_get, { type: T_RARR }, RARR.elems];
+      return [...this.typedIndexCheck(array, index, [...elems, ...GC.array_len]),
+        ...array, ...elems, ...index, ...value, ...(store ? GC.array_set : GC.array_get), { type: T_REFS }];
+    }
     const eType = refNull(T_REFS);
     const e = this.temp(eType), len = this.temp([VT.i32]);
     const host = this.world.hostImport(store ? 'aastore' : 'aaload',
@@ -923,6 +944,9 @@ class ClosedCompiler {
     const derived = this.derived.get(node.args[0].id);
     const cached = derived?.parr || derived?.rarr;
     if (cached) return [...this.nonNull(array), OP.drop, OP.local_get, ...uleb(cached.len)];
+    const repr = this.reprOf(node.args[0]);
+    if (repr === 'parr') return [...this.nonNull(array), ...GC.struct_get, { type: T_PARR }, PARR.len];
+    if (repr === 'rarr') return [...this.nonNull(array), ...GC.struct_get, { type: T_RARR }, RARR.elems, ...GC.array_len];
     return [...array, ...GC.ref_test, { stype: T_PARR }, OP.if, VT.i32,
       ...array, ...GC.ref_cast, { stype: T_PARR }, ...GC.struct_get, { type: T_PARR }, PARR.len,
       OP.else, ...array, ...GC.ref_test, { stype: T_RARR }, OP.if, VT.i32,
@@ -996,7 +1020,7 @@ class ClosedCompiler {
     const value = isPut ? this.use(node.args[1], plan.valueKind) : [];
     const derived = this.derived.get(node.args[0].id)?.obj;
     if (derived) return this.derivedFieldAccess(derived, plan, isPut, value);
-    const cast = [...this.nonNull(object), ...GC.ref_cast, { stype: T_OBJ }];
+    const cast = this.reprOf(node.args[0]) === 'obj' ? this.nonNull(object) : [...this.nonNull(object), ...GC.ref_cast, { stype: T_OBJ }];
     if (plan.reference) {
       return [...cast, ...GC.struct_get, { type: T_OBJ }, OBJ.refs, OP.i32_const, ...sleb(plan.index),
         ...value, ...(isPut ? GC.array_set : GC.array_get), { type: T_REFS }];
