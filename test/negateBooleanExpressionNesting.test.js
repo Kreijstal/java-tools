@@ -20,8 +20,15 @@ const { _internals } = require('../src/decompiler/cfr');
 
 const { negateBooleanExpression, isBracketBalanced } = _internals;
 
-function boolExpr(code) {
-  return { code, type: 'boolean', precedence: 60 };
+function boolExpr(code, extra = {}) {
+  return { code, type: 'boolean', precedence: 60, ...extra };
+}
+
+// Relational inversion is exact only for integral operands: !(NaN < x) is true
+// but NaN >= x is false. conditionForBranch tags integral comparisons; a bare
+// string carries no operand types.
+function integralExpr(code) {
+  return boolExpr(code, { integralComparison: true });
 }
 
 test('negation does not rewrite a comparison nested in a call argument list', (t) => {
@@ -35,10 +42,17 @@ test('negation does not rewrite a comparison nested in a call argument list', (t
 
 test('negation still inverts a genuine top-level comparison', (t) => {
   t.equal(negateBooleanExpression(boolExpr('a != 0')).code, 'a == 0');
-  t.equal(negateBooleanExpression(boolExpr('x >= y')).code, 'x < y');
+  t.equal(negateBooleanExpression(integralExpr('x >= y')).code, 'x < y');
   t.equal(negateBooleanExpression(boolExpr('f(p) == g(q)')).code, 'f(p) != g(q)',
     'operands may contain calls as long as the operator is top level');
-  t.equal(negateBooleanExpression(boolExpr('(a + b) <= (c + d)')).code, '(a + b) > (c + d)');
+  t.equal(negateBooleanExpression(integralExpr('(a + b) <= (c + d)')).code, '(a + b) > (c + d)');
+  t.end();
+});
+
+test('negation keeps an untyped relational comparison NaN-safe', (t) => {
+  t.equal(negateBooleanExpression(boolExpr('x >= y')).code, '!(x >= y)',
+    'without integral evidence the relation is wrapped, not complemented');
+  t.equal(negateBooleanExpression(boolExpr('(a + b) <= (c + d)')).code, '!((a + b) <= (c + d))');
   t.end();
 });
 

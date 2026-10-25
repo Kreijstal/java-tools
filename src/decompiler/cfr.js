@@ -12,6 +12,7 @@ const JSZip = require('jszip');
 const { getAST } = require('jvm_parser');
 const { convertJson } = require('../parsing/convert_tree');
 const { parseDescriptor } = require('../parsing/typeParser');
+const { getStackEffect } = require('../utils/instructionUtils');
 const {
   buildCfgFromCode, printTree, structuredStatements, emitStatements, hasUnreachableStatement,
 } = require('./structurer');
@@ -2839,7 +2840,7 @@ function decompileCode(code, method, cls, localState, options = {}) {
     }
   }
   const preferOwnedStructurer = options.forceOwnedStructurer === true
-    || hasStackPermutationBackedge(codeItemsForSelection)
+    || hasStackPermutationBackedge(codeItemsForSelection, code.exceptionTable || [])
     || tableHasTrivialCheckedHandler(code)
     // A ladder of conditional branches sharing one exit makes the legacy
     // range recognizer explore overlapping suffixes repeatedly. Obfuscated
@@ -2935,7 +2936,11 @@ function hasHighConditionalTargetFanIn(codeItems, minimumFanIn = 6) {
 
 // A range recognizer does not carry the operand stack around a loop. Stack
 // permutations on a retreating edge need the owned CFG's explicit join values.
-function hasStackPermutationBackedge(codeItems) {
+// Only an edge that carries operand values needs them: a swap or inserting dup
+// that completes inside the loop body (javac.js emits `getstatic out; swap`
+// for a println argument) leaves an empty stack at the backedge, and the range
+// recognizer renders that loop exactly. Unknown depths stay conservative.
+function hasStackPermutationBackedge(codeItems, exceptionTable = []) {
   const labels = buildLabelIndex(codeItems);
   const permutations = new Set(['swap', 'dup_x1', 'dup_x2', 'dup2_x1', 'dup2_x2']);
   const prefix = [0];
@@ -2943,13 +2948,62 @@ function hasStackPermutationBackedge(codeItems) {
     const instruction = getInstructionFromItem(item);
     prefix.push(prefix[prefix.length - 1] + (permutations.has(instruction?.op) ? 1 : 0));
   }
+  let depths;
   return codeItems.some((item, index) => {
     const instruction = getInstructionFromItem(item);
     return branchTargetLabels(instruction).some(label => {
       const target = labels.get(String(label).replace(/:$/, ''));
-      return target != null && target <= index && prefix[index + 1] > prefix[target];
+      if (target == null || target > index || prefix[index + 1] <= prefix[target]) return false;
+      if (depths === undefined) depths = operandDepthsBeforeItems(codeItems, exceptionTable, labels);
+      const carried = depths && depths[target];
+      return carried == null || carried > 0;
     });
   });
+}
+
+// Operand-stack depth in slots before each code item, from the method entry
+// (empty stack) and every exception handler (one thrown reference). Returns
+// null when an opcode's effect is unknown, a subroutine is present or two
+// edges disagree; unreachable items stay undefined.
+function operandDepthsBeforeItems(codeItems, exceptionTable = [], labels = buildLabelIndex(codeItems)) {
+  const depths = new Array(codeItems.length);
+  const work = [];
+  const reach = (index, depth) => {
+    if (index == null || index >= codeItems.length) return true;
+    if (depths[index] === undefined) {
+      depths[index] = depth;
+      work.push(index);
+      return true;
+    }
+    return depths[index] === depth;
+  };
+  reach(0, 0);
+  for (const entry of exceptionTable || []) {
+    const handler = labels.get(String(entry && entry.handlerLbl || '').replace(/:$/, ''));
+    if (handler == null || !reach(handler, 1)) return null;
+  }
+  while (work.length) {
+    const index = work.pop();
+    const depth = depths[index];
+    const instruction = getInstructionFromItem(codeItems[index]);
+    if (!instruction || !instruction.op) {
+      if (!reach(index + 1, depth)) return null;
+      continue;
+    }
+    const op = instruction.op;
+    if (op === 'jsr' || op === 'jsr_w' || op === 'ret' || op === 'wide') return null;
+    const effect = op === 'goto_w' ? {popSlots: 0, pushSlots: 0} : getStackEffect(op, instruction);
+    if (!effect) return null;
+    const after = depth - effect.popSlots + effect.pushSlots;
+    if (after < 0) return null;
+    for (const label of branchTargetLabels(instruction)) {
+      const target = labels.get(String(label).replace(/:$/, ''));
+      if (target == null || !reach(target, after)) return null;
+    }
+    const ends = effect.terminator || ['goto', 'goto_w', 'tableswitch', 'lookupswitch'].includes(op);
+    if (!ends && !reach(index + 1, after)) return null;
+  }
+  return depths;
 }
 
 function nopNormallyUnreachableBlocks(code) {
