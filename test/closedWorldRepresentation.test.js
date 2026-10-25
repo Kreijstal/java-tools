@@ -13,10 +13,9 @@ test('closed storage preserves objects, arrays, statics and clone semantics', as
   assert.equal(actual, expected);
 });
 
-// Known pre-existing defect, not introduced by closed storage: without it,
-// Object.clone copies the wrapper with Object.assign, so the clone shares the
-// original's field map and `copy.a = 1000` also changes `d.a`.
-test('the same program without closed storage (pre-existing Object.clone field sharing)', { todo: 'Object.clone shares fields outside closed storage' }, async () => {
+// Object.clone used to copy only the wrapper, so the clone shared the
+// original's field map and `copy.a = 1000` also changed `d.a`.
+test('the same program without closed storage', async () => {
   const directory = compileFixture('ClosedRepr');
   const actual = await runJvmJs(directory, 'ClosedRepr', { jit: { enabled: false, compileWorker: false } });
   assert.equal(actual, hotspot(directory, 'ClosedRepr'));

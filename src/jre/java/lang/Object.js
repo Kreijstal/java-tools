@@ -1,4 +1,5 @@
 const { withThrows } = require('../../helpers');
+const { newFields, makeObjectRef, enumerateFieldKeys, readField, writeField } = require('../../../core/objectModel');
 
 module.exports = {
   super: null,
@@ -62,7 +63,22 @@ module.exports = {
         const closedClone = jvm.closedRuntime.cloneObject(obj);
         if (closedClone) return closedClone;
       }
-      // Basic clone implementation - shallow copy
+      // A shallow copy: field values are shared, the field container is not.
+      // Copying the wrapper alone would alias `fields`, so a write to the
+      // clone would also change the original. The clone gets its own
+      // container in the class's current layout and fresh monitor state.
+      const className = obj._className || obj.type;
+      if (obj.fields && className) {
+        const fields = newFields(jvm, className);
+        for (const key of enumerateFieldKeys(obj.fields)) {
+          const value = readField(obj.fields, key);
+          if (value !== undefined) writeField(fields, key, value);
+        }
+        const cloned = makeObjectRef(jvm, className, fields);
+        // Host state a JRE superclass keeps on the wrapper stays shallow.
+        for (const key of Object.keys(obj)) if (!(key in cloned)) cloned[key] = obj[key];
+        return cloned;
+      }
       const cloned = Object.assign({}, obj);
       cloned.hashCode = jvm.nextHashCode++;
       return cloned;
