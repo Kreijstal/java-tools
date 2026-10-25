@@ -116,6 +116,8 @@ class ClosedWorld {
       adoptedArrays: this.runtime.adoptedArrays,
       spilledArrays: this.runtime.spilledArrays || 0,
       spilledArrayBytes: this.runtime.spilledArrayBytes || 0,
+      spilledObjects: this.runtime.spilledObjects || 0,
+      spilledObjectBytes: this.runtime.spilledObjectBytes || 0,
       ...this.counters,
     };
   }
@@ -904,6 +906,7 @@ class ClosedWorld {
           structType: reference ? this.classTypes.get(declaring).key : null,
           structIndex: reference ? OBJ_FIELDS.length + field.index : null,
           fieldRepr: reference ? this.reprOfDescriptor(descriptor) : null,
+          spillFn: reference ? null : this.hostFieldPlan(op, imm, kindOf(descriptor)).fn,
         });
         return;
       }
@@ -1668,6 +1671,8 @@ class ClosedWorld {
           methodName: text(frame.method?.name), descriptor: text(frame.method?.descriptor)} : null,
         heap, spilledArrays: this.runtime?.spilledArrays || 0,
         spilledArrayBytes: this.runtime?.spilledArrayBytes || 0,
+        spilledObjects: this.runtime?.spilledObjects || 0,
+        spilledObjectBytes: this.runtime?.spilledObjectBytes || 0,
         moduleBytes: this.moduleBytes || 0,
       };
       try { Object.defineProperty(error, 'jvmClosedWorld', {value: detail, configurable: true}); } catch (_) {}

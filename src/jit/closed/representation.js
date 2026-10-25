@@ -357,7 +357,8 @@ class ClosedRuntime {
   }
 
   // Field container for a fresh instance, or null when the class has no
-  // closed layout (JRE classes, unresolved hierarchies) or the heap is spent.
+  // closed layout (JRE classes, unresolved hierarchies). If linear storage is
+  // spent, keep the class's typed handle and put primitive fields in JS.
   newFields(className) {
     const layout = this.layout(className);
     if (!layout) return null;
@@ -369,14 +370,19 @@ class ClosedRuntime {
       if (!allocate) { this.lateObjects = (this.lateObjects || 0) + 1; return null; }
     }
     const base = this.heap.allocObject(layout.size);
-    if (base < 0) return null;
     let store;
     if (allocate) store = allocate(base);
     else { store = this.ops.newObj(base, layout.classId, layout.references.length); this.untypedObjects += 1; }
     const fields = Object.create(layout.proto);
     Object.defineProperty(fields, BASE_KEY, { value: base, writable: false, enumerable: false });
     Object.defineProperty(fields, STORE, { value: store, enumerable: false });
-    this.heap.trackObject?.(store, base, layout.size);
+    if (base < 0) {
+      for (const slot of layout.slots) Object.defineProperty(fields, slot.key, {
+        value: slot.kind === 'i64' ? 0n : 0, writable: true,
+      });
+      this.spilledObjects = (this.spilledObjects || 0) + 1;
+      this.spilledObjectBytes = (this.spilledObjectBytes || 0) + layout.size;
+    } else this.heap.trackObject?.(store, base, layout.size);
     return fields;
   }
 
@@ -398,7 +404,8 @@ class ClosedRuntime {
     const fields = layout && this.newFields(obj.type);
     if (!fields) return null;
     const from = obj.fields[BASE_KEY], to = fields[BASE_KEY];
-    new Uint8Array(this.heap.memory.buffer).copyWithin(to, from, from + layout.size);
+    if (from >= 0 && to >= 0) new Uint8Array(this.heap.memory.buffer).copyWithin(to, from, from + layout.size);
+    else for (const slot of layout.slots) fields[slot.key] = obj.fields[slot.key];
     for (const field of layout.references) this.refSet(field, fields[STORE], this.refGet(field, store));
     const cloned = Object.assign({}, obj, {
       fields, hashCode: this.jvm.nextHashCode++, isLocked: false, lockOwner: null, lockCount: 0, waitSet: [],

@@ -1171,18 +1171,21 @@ class ClosedCompiler {
       return [...target, ...GC.struct_get, { type: plan.structType }, ...uleb(plan.structIndex)];
     }
     const value = isPut ? this.use(node.args[1], plan.valueKind) : [];
-    const base = [...this.nonNull(object), ...(repr.startsWith('obj') ? [] : [...GC.ref_cast, { stype: T_OBJ }]),
+    const base = [...object, ...(repr.startsWith('obj') ? [] : [...GC.ref_cast, { stype: T_OBJ }]),
       ...GC.struct_get, { type: T_OBJ }, OBJ.base];
     const memarg = (align) => [align, ...uleb(plan.offset)];
+    const storage = native => [...this.nonNull(object), OP.drop, ...base, OP.i32_const, 0, OP.i32_ge_s,
+      OP.if, isPut ? 0x40 : WT[plan.valueKind], ...native,
+      OP.else, ...object, ...value, OP.call, {fn: plan.spillFn}, OP.end];
     switch (plan.slotKind) {
-      case 'i32': return isPut ? [...base, ...value, OP.i32_store, ...memarg(2)] : [...base, OP.i32_load, ...memarg(2)];
-      case 'i64': return isPut ? [...base, ...value, OP.i64_store, ...memarg(3)] : [...base, OP.i64_load, ...memarg(3)];
+      case 'i32': return storage(isPut ? [...base, ...value, OP.i32_store, ...memarg(2)] : [...base, OP.i32_load, ...memarg(2)]);
+      case 'i64': return storage(isPut ? [...base, ...value, OP.i64_store, ...memarg(3)] : [...base, OP.i64_load, ...memarg(3)]);
       case 'f64':
         if (plan.valueKind === 'F') {
-          return isPut ? [...base, ...value, OP.f64_promote_f32, OP.f64_store, ...memarg(3)]
-            : [...base, OP.f64_load, ...memarg(3), OP.f32_demote_f64];
+          return storage(isPut ? [...base, ...value, OP.f64_promote_f32, OP.f64_store, ...memarg(3)]
+            : [...base, OP.f64_load, ...memarg(3), OP.f32_demote_f64]);
         }
-        return isPut ? [...base, ...value, OP.f64_store, ...memarg(3)] : [...base, OP.f64_load, ...memarg(3)];
+        return storage(isPut ? [...base, ...value, OP.f64_store, ...memarg(3)] : [...base, OP.f64_load, ...memarg(3)]);
       default: throw new Unsupported(`field slot ${plan.slotKind}`);
     }
   }

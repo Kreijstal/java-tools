@@ -85,7 +85,8 @@ test('traps expose bounded scalar context without retaining the Java frame or he
   world.thread = {id: 7, name: 'worker', closedEntryFrame: {className: 'Example',
     method: {name: 'render', descriptor: '()V'}, locals: ['private guest value']}};
   world.runtime = {heap: {usage: () => ({allocated: 1048576, free: 0, live: 1048576,
-    limit: 1048576, reserved: 1048576, privateObject: {}})}, spilledArrays: 3, spilledArrayBytes: 8192};
+    limit: 1048576, reserved: 1048576, privateObject: {}})}, spilledArrays: 3, spilledArrayBytes: 8192,
+    spilledObjects: 2, spilledObjectBytes: 128};
   const error = new WebAssembly.RuntimeError('bad cast');
   error.stack = 'x'.repeat(12000);
   withoutStderr({env: {}}, () => {}, () => {
@@ -100,6 +101,8 @@ test('traps expose bounded scalar context without retaining the Java frame or he
   assert.equal(detail.heap.limit, 1048576);
   assert.equal(detail.spilledArrays, 3);
   assert.equal(detail.spilledArrayBytes, 8192);
+  assert.equal(detail.spilledObjects, 2);
+  assert.equal(detail.spilledObjectBytes, 128);
   assert.doesNotMatch(JSON.stringify(detail), /private guest value|privateObject|locals/);
   world.thread.closedEntryFrame.className = 'Changed';
   assert.equal(detail.javaEntry.className, 'Example');

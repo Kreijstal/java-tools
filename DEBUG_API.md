@@ -322,8 +322,8 @@ npm test -- debug
 Closed-world Wasm functions retain Java method names in their Wasm stack traces.
 Unexpected traps also carry `error.jvmClosedWorld`: the original message/stack,
 Java entry point, thread identity, native heap usage and cumulative primitive
-array spill counts/bytes. Heap `live` is an allocator upper bound, not a GC or
-total-JavaScript-heap measurement. Frames, guest values and compiler graphs are
+array and object spill counts/bytes. Heap `live` is an allocator upper bound,
+not a GC or total-JavaScript-heap measurement. Frames, guest values and compiler graphs are
 not retained by these snapshots.
 
 Set `jvm.onRuntimeDiagnostic = detail => { ... }` before execution to collect
