@@ -100,6 +100,7 @@ class ClosedWorld {
       imports: this.imports.size,
       moduleBytes: this.moduleBytes || 0,
       optimisticAsyncSites: this.optimisticAsyncSites || 0,
+      adoptedArrays: this.runtime.adoptedArrays,
       ...this.counters,
     };
   }
@@ -278,6 +279,11 @@ class ClosedWorld {
       athrow: (exception) => { const value = toJs(exception); if (isNull(value)) throwJava('java/lang/NullPointerException'); throw value; },
       err_div0: () => throwJava('java/lang/ArithmeticException', '/ by zero'),
       err_aioob: (index, length) => throwJava('java/lang/ArrayIndexOutOfBoundsException', `Index ${index} out of bounds for length ${length}`),
+      err_index: (array, index) => { const value = hostArray(array); checkIndex(value, index); },
+      err_foreign: (array) => {
+        const value = toJs(array);
+        throw new ClosedWorldError(`closed world: ${value?.type || typeof value} array outside closed storage reached module code`);
+      },
       err_cce: (value, siteId) => {
         const object = toJs(value);
         const site = this.sites[siteId];

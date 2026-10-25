@@ -27,4 +27,6 @@ test('closed module handles exception handlers, finally, rethrow and monitors li
   assert.equal(result.output, expected);
   assert.ok(result.stats.admitted >= 15, `admitted ${JSON.stringify(result.stats)}`);
   assert.ok(!result.stats.rejectReasons['exception-handlers'], 'handler methods are admitted');
+  // toCharArray / split / getBytes results entered the module as closed storage.
+  assert.ok(result.stats.adoptedArrays >= 3, `adopted ${JSON.stringify(result.stats)}`);
 });

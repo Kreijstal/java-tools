@@ -509,8 +509,8 @@ class ClosedCompiler {
       if (!entry) { entry = {}; this.derived.set(value.id, entry); }
       if (entry[kind]) return;
       if (kind === 'obj') entry.obj = { base: this.local([VT.i32]), ref: this.local(refNull(T_OBJ)) };
-      if (kind === 'parr') entry.parr = { base: this.local([VT.i32]), len: this.local([VT.i32]), fast: this.local([VT.i32]) };
-      if (kind === 'rarr') entry.rarr = { elems: this.local(refNull(T_REFS)), len: this.local([VT.i32]), fast: this.local([VT.i32]) };
+      if (kind === 'parr') entry.parr = { base: this.local([VT.i32]), len: this.local([VT.i32]) };
+      if (kind === 'rarr') entry.rarr = { elems: this.local(refNull(T_REFS)), len: this.local([VT.i32]) };
     };
     for (const id of this.fn.reachable) {
       for (const node of this.fn.blocks[id].body) {
@@ -543,22 +543,30 @@ class ClosedCompiler {
         ...v, OP.ref_is_null, OP.if, VT.i32, OP.i32_const, 0, OP.else, OP.i32_const, ...sleb(-1), OP.end,
         OP.local_set, ...L(base), OP.end);
     }
+    // Arrays decode to base/elems and length. Null decodes with length 0, so
+    // the access's one unsigned bounds check also raises its
+    // NullPointerException. A primitive array outside closed storage is a
+    // closed-world defect and fails here; that keeps every slow path a throw,
+    // with no call returning into the access.
     if (entry.parr) {
-      const { base, len, fast } = entry.parr;
+      const { base, len } = entry.parr;
       const tmp = this.temp(refNull(T_PARR));
       out.push(...v, ...GC.ref_test, { stype: T_PARR }, OP.if, 0x40,
         ...v, ...GC.ref_cast, { stype: T_PARR }, OP.local_tee, ...L(tmp), ...GC.struct_get, { type: T_PARR }, PARR.base,
         OP.local_set, ...L(base), OP.local_get, ...L(tmp), ...GC.struct_get, { type: T_PARR }, PARR.len, OP.local_set, ...L(len),
-        OP.i32_const, 1, OP.local_set, ...L(fast),
-        OP.else, OP.i32_const, 0, OP.local_set, ...L(fast), OP.end);
+        OP.else, ...v, OP.ref_is_null, OP.i32_eqz, OP.if, 0x40,
+        ...v, OP.call, { fn: this.world.hostImport('err_foreign', [VT.anyref], []) }, OP.unreachable, OP.end,
+        OP.i32_const, 0, OP.local_set, ...L(len), OP.end);
       this.release(refNull(T_PARR), tmp);
     }
     if (entry.rarr) {
-      const { elems, len, fast } = entry.rarr;
+      const { elems, len } = entry.rarr;
       out.push(...v, ...GC.ref_test, { stype: T_RARR }, OP.if, 0x40,
         ...v, ...GC.ref_cast, { stype: T_RARR }, ...GC.struct_get, { type: T_RARR }, RARR.elems, OP.local_tee, ...L(elems),
-        ...GC.array_len, OP.local_set, ...L(len), OP.i32_const, 1, OP.local_set, ...L(fast),
-        OP.else, OP.i32_const, 0, OP.local_set, ...L(fast), OP.end);
+        ...GC.array_len, OP.local_set, ...L(len),
+        OP.else, ...v, OP.ref_is_null, OP.i32_eqz, OP.if, 0x40,
+        ...v, OP.call, { fn: this.world.hostImport('err_foreign', [VT.anyref], []) }, OP.unreachable, OP.end,
+        OP.i32_const, 0, OP.local_set, ...L(len), OP.end);
     }
     return out;
   }
@@ -722,6 +730,13 @@ class ClosedCompiler {
   }
 
   // ---- arrays -----------------------------------------------------------
+  // Index check against a decoded length; the failure path raises
+  // NullPointerException for a null array, else the bounds exception.
+  indexCheck(arrayCode, indexCode, lengthLocal) {
+    return [...indexCode, OP.local_get, ...uleb(lengthLocal), OP.i32_ge_u, OP.if, 0x40,
+      ...arrayCode, ...indexCode, OP.call, { fn: this.world.hostImport('err_index', [VT.anyref, VT.i32], []) }, OP.unreachable, OP.end];
+  }
+
   boundsCheck(indexCode, lengthLocal) {
     return [...indexCode, OP.local_get, ...uleb(lengthLocal), OP.i32_ge_u, OP.if, 0x40,
       ...indexCode, OP.local_get, ...uleb(lengthLocal),
@@ -739,13 +754,9 @@ class ClosedCompiler {
     const derived = this.derived.get(node.args[0].id)?.parr;
     if (derived) {
       const L = (i) => uleb(i);
-      const host = this.world.hostImport(`${store ? 'astore' : 'aload'}_${kind}`,
-        store ? [VT.anyref, VT.i32, t] : [VT.anyref, VT.i32], store ? [] : [t]);
-      return [OP.local_get, ...L(derived.fast), OP.if, store ? 0x40 : t,
-        ...this.boundsCheck(index, derived.len),
+      return [...this.indexCheck(array, index, derived.len),
         OP.local_get, ...L(derived.base), ...index, ...(shift ? [OP.i32_const, shift, OP.i32_shl] : []), OP.i32_add,
-        ...value, memOp, align, 0,
-        OP.else, ...array, ...index, ...value, OP.call, { fn: host }, OP.end];
+        ...value, memOp, align, 0];
     }
     const pType = refNull(T_PARR);
     const p = this.temp(pType), len = this.temp([VT.i32]);
@@ -770,13 +781,8 @@ class ClosedCompiler {
     const value = store ? this.use(node.args[2], 'A') : [];
     const derived = this.derived.get(node.args[0].id)?.rarr;
     if (derived) {
-      const L = (i) => uleb(i);
-      const host = this.world.hostImport(store ? 'aastore' : 'aaload',
-        store ? [VT.anyref, VT.i32, VT.anyref] : [VT.anyref, VT.i32], store ? [] : [VT.anyref]);
-      return [OP.local_get, ...L(derived.fast), OP.if, store ? 0x40 : VT.anyref,
-        ...this.boundsCheck(index, derived.len),
-        OP.local_get, ...L(derived.elems), ...index, ...value, ...(store ? GC.array_set : GC.array_get), { type: T_REFS },
-        OP.else, ...array, ...index, ...value, OP.call, { fn: host }, OP.end];
+      return [...this.indexCheck(array, index, derived.len),
+        OP.local_get, ...uleb(derived.elems), ...index, ...value, ...(store ? GC.array_set : GC.array_get), { type: T_REFS }];
     }
     const eType = refNull(T_REFS);
     const e = this.temp(eType), len = this.temp([VT.i32]);
@@ -797,10 +803,7 @@ class ClosedCompiler {
     const array = this.use(node.args[0], 'A');
     const derived = this.derived.get(node.args[0].id);
     const cached = derived?.parr || derived?.rarr;
-    if (cached) {
-      return [OP.local_get, ...uleb(cached.fast), OP.if, VT.i32, OP.local_get, ...uleb(cached.len), OP.else,
-        ...array, OP.call, { fn: this.world.hostImport('alen', [VT.anyref], [VT.i32]) }, OP.end];
-    }
+    if (cached) return [...this.nonNull(array), OP.drop, OP.local_get, ...uleb(cached.len)];
     return [...array, ...GC.ref_test, { stype: T_PARR }, OP.if, VT.i32,
       ...array, ...GC.ref_cast, { stype: T_PARR }, ...GC.struct_get, { type: T_PARR }, PARR.len,
       OP.else, ...array, ...GC.ref_test, { stype: T_RARR }, OP.if, VT.i32,

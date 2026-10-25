@@ -32,6 +32,7 @@ const STORE = Symbol('closed.store');
 const BASE_KEY = '_wasmBase';
 const KIND = { '[Z': 0, '[B': 1, '[C': 2, '[S': 3, '[I': 4, '[J': 5, '[F': 6, '[D': 7 };
 const KIND_SHIFT = [0, 0, 1, 1, 2, 3, 2, 3];
+const ELEMENT_TYPE = { '[Z': 'boolean', '[B': 'byte', '[C': 'char', '[S': 'short', '[I': 'int', '[J': 'long', '[F': 'float', '[D': 'double' };
 
 // The shared rec group. Every closed module declares it first, so these type
 // indices are identical across modules and canonicalize to the same types.
@@ -113,6 +114,7 @@ class ClosedRuntime {
     this.heap = jvm.wasmHeap;
     this.ops = helperModule();
     this.layouts = new Map();
+    this.adoptedArrays = 0;
     const ops = this.ops;
     this.toJs = (value) => (value === null ? null : ops.toJs(value));
   }
@@ -122,9 +124,48 @@ class ClosedRuntime {
     if (typeof value === 'object' || typeof value === 'function') {
       const store = value[STORE];
       if (store !== undefined) return store;
-      if (ArrayBuffer.isView(value)) return this.parrOf(value);
+      if (ArrayBuffer.isView(value)) {
+        const parr = this.parrOf(value);
+        return parr === value ? this.adoptArray(value) : parr;
+      }
+      if (Array.isArray(value)) return this.adoptArray(value);
     }
     return value;
+  }
+
+  // A Java array the VM built outside closed storage (JRE natives return
+  // plain JS arrays, TypedArrays off the heap). Module code assumes every
+  // array it sees is closed storage, so the array is copied into closed
+  // storage when it first crosses in, and that store stays its identity for
+  // all later crossings. A native that keeps mutating an array it already
+  // handed out would not be seen by the guest; `adoptedArrays` counts them.
+  adoptArray(value) {
+    const type = value.type;
+    if (typeof type !== 'string' || type[0] !== '[') return value;
+    const length = value.length;
+    let adopted;
+    if (KIND[type] !== undefined) {
+      adopted = this.heap.alloc(type, length);
+      if (!adopted || adopted.buffer !== this.heap.memory.buffer) return value;
+      for (let i = 0; i < length; i++) {
+        const v = value[i];
+        adopted[i] = type === '[J' ? BigInt(v ?? 0) : (typeof v === 'boolean' ? (v ? 1 : 0) : (v ?? 0));
+      }
+      adopted.type = type;
+      adopted.elementType = value.elementType ?? ELEMENT_TYPE[type];
+      adopted.cidx = classIndexOf(this.jvm, type);
+    } else {
+      const copy = new Array(length);
+      for (let i = 0; i < length; i++) copy[i] = value[i] ?? null;
+      copy.type = type;
+      copy.elementType = value.elementType ?? (type.startsWith('[L') ? type.slice(2, -1) : type.slice(1));
+      adopted = this.referenceArray(copy);
+    }
+    adopted.hashCode = value.hashCode ?? this.jvm.nextHashCode++;
+    const store = adopted[STORE] ?? this.parrOf(adopted);
+    Object.defineProperty(value, STORE, { value: store, configurable: true });
+    this.adoptedArrays += 1;
+    return store;
   }
 
   parrOf(view) {
