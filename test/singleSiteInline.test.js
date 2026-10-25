@@ -62,6 +62,36 @@ test('one restoring call expands with exact cold state and independent array sim
       site.fastPositional={invoke,rawInvoke:null,lookupClass:'InlineLoopChild',receiverType:null,debugGuarded:true};
     }
     const observations=[];
+    // Generated code hands back exact interpreter frames: on a deopt, or with
+    // a thrown guest exception that the frames' own handlers must still see.
+    // Finish them with the interpreter and the frames' exception tables, as
+    // the scheduler would, so either exit must still produce the guest result.
+    const labelPc=item=>item?.labelDef?parseInt(item.labelDef.slice(1,-1)):-1;
+    const unwind=(thread,e,pc)=>{
+      while(!j.dispatchExceptionInFrame(thread.callStack.peek(),e,pc)){
+        thread.callStack.pop();
+        if(thread.callStack.isEmpty())return false;
+        const caller=thread.callStack.peek();pc=labelPc(caller.instructions[caller.pc-1]);
+      }
+      return true;
+    };
+    const finish=async(thread,pending)=>{
+      if(pending){
+        const top=thread.callStack.isEmpty()?null:thread.callStack.peek();
+        if(!top||!unwind(thread,pending,labelPc(top.instructions[top.pc])))
+          return pending?.type||pending?.message||String(pending);
+      }
+      for(let steps=0;!thread.callStack.isEmpty();steps++){
+        if(steps>100000)return 'resume did not finish';
+        const frame=thread.callStack.peek(),at=frame.pc,ins=frame.instructions[frame.pc++].instruction;
+        try{if(ins)await j.executeInstruction(ins,frame,thread);}
+        catch(e){
+          if(!unwind(thread,e,thread.callStack.peek()===frame?labelPc(frame.instructions[at]):-1))
+            return e?.type||e?.message||String(e);
+        }
+      }
+      return null;
+    };
     for (const [count,isNull,suspend] of
       [[2,false,false],[3,false,false],[2,true,false],[0,true,false],[600,false,true]]) for (const body of [g,rebound]) {
       const a=isNull?null:new Int32Array(count===600?600:2);
@@ -72,6 +102,7 @@ test('one restoring call expands with exact cold state and independent array sim
         {method:parent,lookupClass:'InlineLoopCaller',generated:body,freeFrame:null});
       let result,error;
       const beforeEntries=j.jit.singleSiteInlineEntries||0;
+      j.classes.InlineLoopChild.staticFields.set('opaque:I',0);
       try {result=invoke(a,count,thread);} catch(e) {error=e;}
       if(mode!=='control'&&count===2&&!isNull&&!(j.jit.singleSiteInlineEntries>beforeEntries))t.comment(JSON.stringify({
         rebound:body===rebound,source:body.jvmRestoringDirectPositionalBody.jvmGeneratedSource.includes('singleSite'),
@@ -83,13 +114,22 @@ test('one restoring call expands with exact cold state and independent array sim
         result:typeof result==='symbol'?String(result):result&&{deopt:result.deopt,reason:result.reason},
         frames:thread.callStack.items.map(f=>({method:f.method.name,pc:f.pc,
           locals:f.locals.map(normalize),stack:f.stack.items.map(normalize)}))});
+      if(isNull){
+        const observation=observations[observations.length-1];
+        observation.outcome=error||result?.deopt?await finish(thread,error):null;
+        observation.handlerRan=j.classes.InlineLoopChild.staticFields.get('opaque:I')===1;
+      }
     }
     if(mode!=='control')t.ok(j.jit.singleSiteInlineEntries>0,'the expanded site really executes');
     if(observations[0].pixels?.[0]!==14)t.comment(JSON.stringify(observations[0]));
     t.deepEqual(observations[0].pixels,[14,14],'both caller iterations execute the span');
     t.ok(observations[2].error,'bounds case really throws');
-    t.ok(observations[4].error,'null case really throws');
+    t.equal(observations[4].outcome,'java/lang/NullPointerException',
+      'null case really throws, directly or from its restored frames');
+    t.ok(observations[4].handlerRan,'null case runs the guest handler before rethrowing');
     t.notOk(observations[6].error,'null zero-trip loop does not throw');
+    t.equal(observations[6].outcome,null,'null zero-trip loop completes, directly or from its restored frames');
+    t.notOk(observations[6].handlerRan,'null zero-trip loop never enters the handler');
     t.ok(observations[8].result?.deopt,'long loop really suspends');
     t.ok(observations[8].frames.some(f=>f.method==='span'),'suspension restores the child');
     if(mode!=='control') {

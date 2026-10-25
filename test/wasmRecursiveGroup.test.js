@@ -202,10 +202,19 @@ test('a two-class recursive group seals into wasm->wasm edges and stays sealed',
     'its call into the group is a direct dcall_, not a slot and not a bridge');
   t.equal(later.meta.deoptableCalls, 0, 'so the later caller has no deoptable site of its own');
 
+  // The first pong can be lowered while ping is still compiling; its resume
+  // companion then records a deferrable "callee not ready" demotion, and a
+  // later entry rebuilds pong once ping is ready. A rebuilt member takes the
+  // sealed edge over, so the module withdrawn below is whichever is live now.
+  const pongLive = (pong.callee || pong).meta;
+  t.deepEqual(linker.slotState(PONG), ['direct'], 'ping -> pong is still a bound table slot');
+  t.equal(linker.table.get(pingMeta.linkSlots[0]), pongLive.runv,
+    'ping\'s slot holds the live pong export');
+
   // 4. withdrawing a member pins the sealed edge instead of reviving the stub
   wasm.withdrawModule(pong);
   t.deepEqual(linker.slotState(PONG), ['pinned'], 'ping -> pong is pinned, not stubbed');
-  t.equal(linker.table.get(pingMeta.linkSlots[0]), pongMeta.runv,
+  t.equal(linker.table.get(pingMeta.linkSlots[0]), pongLive.runv,
     'the table still holds the withdrawn module\'s export');
   t.equal(await driveOnce(jitted, 'drive', rounds), expectedDrive,
     'the pinned group still agrees with the interpreter');
@@ -218,7 +227,7 @@ test('a two-class recursive group seals into wasm->wasm edges and stays sealed',
     { asCallee: true, entryPath: 'recursive-group-test' });
   t.equal(pong.status, 'ready', pong.lastCompileError || 'pong recompiled');
   const pongMeta2 = (pong.callee || pong).meta;
-  t.notEqual(pongMeta2, pongMeta, 'with a new artifact');
+  t.notEqual(pongMeta2, pongLive, 'with a new artifact');
   t.deepEqual(linker.slotState(PONG), ['direct'], 'ping -> pong follows the new module');
   t.equal(linker.table.get(pingMeta.linkSlots[0]), pongMeta2.runv,
     'the table holds the NEW export');
