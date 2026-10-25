@@ -3648,6 +3648,14 @@ class StructuredWasmCompiler {
         ? hierarchy.resolveInit(owner, descriptor)
         : hierarchy.resolveSpecial(this.className, owner, name, descriptor);
       if (!impl) throw new Unsupported(`invokespecial ${owner}.${name} unresolved`);
+      // See WasmJit.constructorAwaitsInitialization. A canonical constructor
+      // link owns a precise frame for an unfinished construction, so with it
+      // enabled a guarded target remains linkable and nothing waits.
+      if (name === '<init>' &&
+          !(this.wasmJit.ctorCompileEnabled && this.wasmJit.canonicalEhLinksEnabled) &&
+          this.wasmJit.constructorAwaitsInitialization(impl.className, descriptor)) {
+        throw new Unsupported(`<init> ${impl.className} not initialized`, impl.className);
+      }
       direct = readyOrThrow(impl.className);
       if (name === '<init>') {
         // Raw constructor links must finish atomically. A canonical target
