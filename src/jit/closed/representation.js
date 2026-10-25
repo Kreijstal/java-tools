@@ -237,19 +237,24 @@ class ClosedRuntime {
     return store;
   }
 
-  // Superclass-first layout of a guest class: primitive fields at fixed
-  // offsets in linear memory, reference fields at fixed indices of `refs`.
-  // An inherited field has the same offset/index in every subclass, so a
-  // compiled field access needs only the declaring class.
+  // Preserve the closed array type when linear allocation falls back to a
+  // host TypedArray. A negative base selects checked host element access;
+  // length, kind, identity and the canonical JS view stay in the same handle.
   spillPrimitiveArray(view) {
     if (view[STORE] !== undefined) return view[STORE];
     const kind = KIND[view.type];
     if (kind === undefined) throw new TypeError('Primitive array descriptor required');
     const store = this.ops.newParr(-1, view.length, kind, view);
     Object.defineProperty(view, STORE, { value: store });
+    this.spilledArrays = (this.spilledArrays || 0) + 1;
+    this.spilledArrayBytes = (this.spilledArrayBytes || 0) + view.byteLength;
     return store;
   }
 
+  // Superclass-first layout of a guest class: primitive fields at fixed
+  // offsets in linear memory, reference fields at fixed indices of `refs`.
+  // An inherited field has the same offset/index in every subclass, so a
+  // compiled field access needs only the declaring class.
   layout(className) {
     const jvm = this.jvm, classData = jvm.classes[className];
     if (!classData) return null;

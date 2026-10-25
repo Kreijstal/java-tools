@@ -114,6 +114,8 @@ class ClosedWorld {
       moduleBytes: this.moduleBytes || 0,
       optimisticAsyncSites: this.optimisticAsyncSites || 0,
       adoptedArrays: this.runtime.adoptedArrays,
+      spilledArrays: this.runtime.spilledArrays || 0,
+      spilledArrayBytes: this.runtime.spilledArrayBytes || 0,
       ...this.counters,
     };
   }
@@ -1645,7 +1647,39 @@ class ClosedWorld {
   }
 
   // ---- entry adapters ---------------------------------------------------
-  translateTrap(error) {
+  captureTrap(error, thread = this.thread, frame = thread?.closedEntryFrame) {
+    // Failure-only, bounded diagnostics: retain no frames, values or SSA.
+    try {
+      this.trapReports ||= new WeakSet();
+      if (this.trapReports.has(error) || (this.trapReportCount || 0) >= 16) return null;
+      this.trapReports.add(error);
+      this.trapReportCount = (this.trapReportCount || 0) + 1;
+      const usage = this.runtime?.heap?.usage?.();
+      const text = value => value == null ? null : String(value).slice(0, 500);
+      const heap = {};
+      for (const key of ['allocated', 'free', 'live', 'limit', 'reserved']) {
+        if (Number.isFinite(usage?.[key])) heap[key] = usage[key];
+      }
+      const detail = {
+        kind: 'closed-world-trap', message: String(error.message).slice(0, 1000),
+        stack: String(error.stack || '').slice(0, 8000),
+        thread: {id: Number.isFinite(thread?.id) ? thread.id : null, name: text(thread?.name)},
+        javaEntry: frame ? {className: text(frame.className),
+          methodName: text(frame.method?.name), descriptor: text(frame.method?.descriptor)} : null,
+        heap, spilledArrays: this.runtime?.spilledArrays || 0,
+        spilledArrayBytes: this.runtime?.spilledArrayBytes || 0,
+        moduleBytes: this.moduleBytes || 0,
+      };
+      try { Object.defineProperty(error, 'jvmClosedWorld', {value: detail, configurable: true}); } catch (_) {}
+      try {
+        const pending = this.jvm?.onRuntimeDiagnostic?.(detail);
+        if (pending && typeof pending.then === 'function') Promise.resolve(pending).catch(() => {});
+      } catch (_) {}
+      return detail;
+    } catch (_) { return null; }
+  }
+
+  translateTrap(error, thread = this.thread, frame = thread?.closedEntryFrame) {
     if (error instanceof WebAssembly.RuntimeError && /null/i.test(error.message)) {
       return { type: 'java/lang/NullPointerException', message: null };
     }
@@ -1654,10 +1688,14 @@ class ClosedWorld {
     if (error instanceof RangeError && /call stack/i.test(error.message)) {
       return { type: 'java/lang/StackOverflowError', message: null };
     }
+    const detail = error instanceof WebAssembly.RuntimeError ? this.captureTrap(error, thread, frame) : null;
     if (error instanceof WebAssembly.RuntimeError && !this.reportedTrap) {
       // Any other trap is a closed-world defect, never Java semantics.
       this.reportedTrap = true;
-      reportDiagnostic(`[closed-world] trap: ${error.message}\n${error.stack || ''}`);
+      let context = '';
+      // A collector may mutate the record, including introducing cycles.
+      try { if (detail) context = `\n[closed-world] context: ${JSON.stringify({...detail, stack: undefined})}`; } catch (_) {}
+      reportDiagnostic(`[closed-world] trap: ${error.message}\n${error.stack || ''}${context}`);
     }
     return error;
   }
@@ -1673,7 +1711,7 @@ class ClosedWorld {
       return record.fn(...wasmArgs);
     } catch (error) {
       if (error instanceof WebAssembly.Exception && error.is(this.tag)) throw this.runtime.toJs(error.getArg(this.tag, 0));
-      throw this.translateTrap(error);
+      throw this.translateTrap(error, thread, thread?.callStack?.peek?.());
     } finally {
       this.setDepth(depth);
       this.syncDepth--;
@@ -1787,7 +1825,7 @@ class ClosedWorld {
     try {
       let thrown = error;
       if (error instanceof WebAssembly.Exception && error.is(this.tag)) thrown = this.runtime.toJs(error.getArg(this.tag, 0));
-      else thrown = this.translateTrap(error);
+      else thrown = this.translateTrap(error, thread, frame);
       if (thrown instanceof Error) { tick.reject(thrown); return; }
       if (frame.initializingClassName) this.jvm.failClassInitialization(frame);
       thread.callStack.pop();

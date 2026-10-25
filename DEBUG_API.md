@@ -317,6 +317,22 @@ Use the repository test runner if a focused filename changes:
 npm test -- debug
 ```
 
+## Closed-world runtime failures
+
+Closed-world Wasm functions retain Java method names in their Wasm stack traces.
+Unexpected traps also carry `error.jvmClosedWorld`: the original message/stack,
+Java entry point, thread identity, native heap usage and cumulative primitive
+array spill counts/bytes. Heap `live` is an allocator upper bound, not a GC or
+total-JavaScript-heap measurement. Frames, guest values and compiler graphs are
+not retained by these snapshots.
+
+Set `jvm.onRuntimeDiagnostic = detail => { ... }` before execution to collect
+these records, including failures on guest threads while the overall run remains
+pending. Records have `kind: 'closed-world-trap'`; duplicate errors are suppressed
+and at most 16 snapshots are emitted per closed-world instance. Capture happens
+only on failure and needs no profiling flag. Collector/logging failures cannot
+replace the original trap or leave a failed scheduler segment pending.
+
 ## Current limitations
 
 - semantic step-over, step-out, and finish are not yet distinct from a single
