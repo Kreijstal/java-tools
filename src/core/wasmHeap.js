@@ -398,9 +398,8 @@ class WasmHeap {
     // from the allocation stats rather than from this counter.
     if (!this.registry) return;
     this.arrayViewsLive += 1;
-    // Every heap-backed view is registered, including extents too large to
-    // bin. Binning is decided in reclaimExtent; registration here is also what
-    // lets arrayViewsLive fall back to zero, which is growTo's precondition.
+    // Every heap-backed view is registered. Registration also lets
+    // arrayViewsLive fall back to zero, which is growTo's precondition.
     this.registry.register(view, record, view);
   }
 
@@ -411,7 +410,11 @@ class WasmHeap {
     if (!held.viewless && this.arrayViewsLive > 0) this.arrayViewsLive -= 1;
     if (held.viewOnly) return;
     const { base, bytes } = held;
-    if (!(base > 0) || !(bytes > 0) || bytes > MAX_BINNED_BYTES) return;
+    // Array size classes are sparse and exact-fit. The small-object slab
+    // ceiling must not discard dead image, audio or other large buffers:
+    // doing so permanently spends their linear storage and eventually sends
+    // every subsequent allocation through host element-access imports.
+    if (!(base > 0) || !(bytes > 0)) return;
     let bin = this.arrayBins.get(bytes);
     if (!bin) { bin = []; this.arrayBins.set(bytes, bin); }
     bin.push(base);
