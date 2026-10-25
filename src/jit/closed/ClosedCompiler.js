@@ -54,13 +54,9 @@ const PRIM_ARRAY = {
 const SHIFT = { iaload: 2, laload: 3, faload: 2, daload: 3, baload: 0, caload: 1, saload: 1,
   iastore: 2, lastore: 3, fastore: 2, dastore: 3, bastore: 0, castore: 1, sastore: 1 };
 
-// Wasm value type of a value of `kind` with closed representation `repr`.
-const REPR_TYPE = { obj: T_OBJ, parr: T_PARR, rarr: T_RARR };
-function wasmType(kind, repr) {
-  if (kind === 'A' && REPR_TYPE[repr]) return refNull(REPR_TYPE[repr]);
-  return [WT[kind]];
-}
-const typed = (repr) => REPR_TYPE[repr] !== undefined;
+// A representation with its own Wasm reference type (see
+// ClosedWorld.reprSubtype for the lattice).
+const typed = (repr) => !!repr && repr !== 'any' && repr !== 'null';
 const NULL_REF = [OP.ref_null, HT.none];
 
 function zero(kind) {
@@ -74,6 +70,8 @@ function zero(kind) {
 }
 
 class Unsupported extends Error {}
+// Every null check names its site (JVM_CLOSED_WORLD_DEBUG_NPE=1).
+const DEBUG_NPE = typeof process !== 'undefined' && process.env.JVM_CLOSED_WORLD_DEBUG_NPE === '1';
 
 // Operations that can raise a Java exception inside the module.
 const THROWING = new Set(['idiv', 'irem', 'ldiv', 'lrem', 'getfield', 'putfield', 'arraylength', 'aaload', 'aastore',
@@ -148,6 +146,11 @@ class ClosedCompiler {
   // `refCode` is always a side-effect-free local.get (or ref.null), so the
   // covered form reads it twice and keeps its static type.
   nonNull(refCode) {
+    if (DEBUG_NPE) {
+      const site = this.world.sites.push({ where: `${this.entry.key}@${this.currentNode?.op}:${this.currentNode?.pc}` }) - 1;
+      return [...refCode, OP.ref_is_null, OP.if, 0x40, OP.i32_const, ...sleb(site),
+        OP.call, { fn: this.world.hostImport('err_npe_at', [VT.i32], []) }, OP.unreachable, OP.end, ...refCode, OP.ref_as_non_null];
+    }
     if (this.tryDepth === 0) return [...refCode, OP.br_on_null, ...uleb(this.depthOf('npe'))];
     return [...refCode, OP.ref_is_null, OP.if, 0x40,
       OP.call, { fn: this.world.hostImport('err_npe', [], []) }, OP.unreachable, OP.end,
@@ -170,7 +173,7 @@ class ClosedCompiler {
     let index = this.localOfValue.get(value.id);
     if (index === undefined) {
       index = this.paramCount + this.locals.length;
-      this.locals.push(wasmType(value.kind, this.reprOf(value)));
+      this.locals.push(this.world.wasmType(value.kind, this.reprOf(value)));
       this.localOfValue.set(value.id, index);
     }
     return index;
@@ -186,8 +189,10 @@ class ClosedCompiler {
   useAs(value, kind, repr) {
     const code = this.use(value, kind);
     if (kind !== 'A' || !typed(repr) || !value || value.op === 'aconst_null' || !this.live(value)) return code;
-    return this.reprOf(value) === repr ? code : [...code, ...GC.ref_cast_null, { stype: REPR_TYPE[repr] }];
+    return this.world.reprSubtype(this.reprOf(value), repr) ? code : [...code, ...this.castTo(repr)];
   }
+
+  castTo(repr) { return [...GC.ref_cast_null, { stype: this.world.typeOfRepr(repr) }]; }
 
   // ---- reference representations ---------------------------------------
   // Each reference value's closed representation, from the Java static types
@@ -201,7 +206,7 @@ class ClosedCompiler {
     const join = (a, b) => {
       if (!a || a.repr === 'null') return b;
       if (!b || b.repr === 'null') return a;
-      return { desc: a.desc === b.desc ? a.desc : null, repr: a.repr === b.repr ? a.repr : 'any' };
+      return { desc: a.desc === b.desc ? a.desc : null, repr: world.reprJoin(a.repr, b.repr) };
     };
     const classDesc = (name) => (name.startsWith('[') ? name : `L${name};`);
     const typeOf = (value) => {
@@ -592,15 +597,12 @@ class ClosedCompiler {
       let entry = this.derived.get(value.id);
       if (!entry) { entry = {}; this.derived.set(value.id, entry); }
       if (entry[kind]) return;
-      // A value already typed $obj is its own decoded reference.
-      if (kind === 'obj') entry.obj = { base: this.local([VT.i32]), ref: this.reprOf(value) === 'obj' ? this.localFor(value) : this.local(refNull(T_OBJ)) };
       if (kind === 'parr') entry.parr = { base: this.local([VT.i32]), len: this.local([VT.i32]) };
       if (kind === 'rarr') entry.rarr = { elems: this.local(refNull(T_REFS)), len: this.local([VT.i32]) };
     };
     for (const id of this.fn.reachable) {
       for (const node of this.fn.blocks[id].body) {
         const plan = this.plan.get(node.id);
-        if (plan && (plan.kind === 'field-get' || plan.kind === 'field-put')) want(node.args[0], 'obj');
         if (PRIM_ARRAY[node.op]) want(node.args[0], 'parr');
         if (node.op === 'aaload' || node.op === 'aastore') want(node.args[0], 'rarr');
       }
@@ -624,18 +626,6 @@ class ClosedCompiler {
     const nonNull = value.op === 'param' && value.imm.index === 0 && !this.entry.isStatic;
     const ifNull = (onNull, onValue) => (nonNull ? onValue
       : [...v, OP.ref_is_null, OP.if, 0x40, ...onNull, OP.else, ...onValue, OP.end]);
-    if (entry.obj && repr === 'obj') {
-      out.push(...ifNull([OP.i32_const, 0, OP.local_set, ...L(entry.obj.base)],
-        [...v, ...GC.struct_get, { type: T_OBJ }, OBJ.base, OP.local_set, ...L(entry.obj.base)]));
-    } else if (entry.obj) {
-      const { base, ref } = entry.obj;
-      out.push(...v, ...GC.ref_test, { stype: T_OBJ }, OP.if, 0x40,
-        ...v, ...GC.ref_cast, { stype: T_OBJ }, OP.local_tee, ...L(ref), ...GC.struct_get, { type: T_OBJ }, OBJ.base,
-        OP.local_set, ...L(base),
-        OP.else, OP.ref_null, ...refNull(T_OBJ).slice(1), OP.local_set, ...L(ref),
-        ...v, OP.ref_is_null, OP.if, VT.i32, OP.i32_const, 0, OP.else, OP.i32_const, ...sleb(-1), OP.end,
-        OP.local_set, ...L(base), OP.end);
-    }
     // Arrays decode to base/elems and length. Null decodes with length 0, so
     // the access's one unsigned bounds check also raises its
     // NullPointerException. A primitive array outside closed storage is a
@@ -735,7 +725,7 @@ class ClosedCompiler {
   finish(node, out) {
     if (node.kind && node.kind !== 'V' && this.live(node)) {
       const repr = node.kind === 'A' ? this.reprOf(node) : null;
-      if (typed(repr) && this.producedRepr(node) !== repr) out.push(...GC.ref_cast_null, { stype: REPR_TYPE[repr] });
+      if (typed(repr) && !this.world.reprSubtype(this.producedRepr(node), repr)) out.push(...this.castTo(repr));
       out.push(...this.set(node));
     }
     else if (node.kind && node.kind !== 'V') out.push(OP.drop);
@@ -750,6 +740,7 @@ class ClosedCompiler {
     if (plan.kind === 'virtual') return plan.resultRepr || 'any';
     if (plan.kind === 'checkcast') return this.reprOf(node.args[0]);
     if (plan.kind === 'static-get' && node.kind === 'A') return this.world.reprOfDescriptor(node.imm[2][1]);
+    if (plan.kind === 'field-get' && plan.reference) return plan.fieldRepr;
     return 'any';
   }
 
@@ -759,6 +750,7 @@ class ClosedCompiler {
 
   emitNode(node, out) {
     const op = node.op;
+    this.currentNode = node;
     const arg = (i, kind) => this.use(node.args[i], kind);
     if (op === 'param' || op === 'phi' || op === 'caught_exception' || op === 'handler_local') return;
     if (op in ICONST) { out.push(OP.i32_const, ...sleb(ICONST[op])); return this.finish(node, out); }
@@ -1015,40 +1007,23 @@ class ClosedCompiler {
     }
   }
 
+  // Reference fields are fields of the declaring class's struct; primitive
+  // fields live in linear memory at the object's base.
   fieldAccess(node, plan, isPut) {
     const object = this.use(node.args[0], 'A');
+    const repr = this.reprOf(node.args[0]);
+    if (plan.reference) {
+      const exact = this.world.reprSubtype(repr, `obj:${plan.declaring}`);
+      const target = [...this.nonNull(object), ...(exact ? [] : [...GC.ref_cast, { stype: plan.structType }])];
+      if (isPut) {
+        return [...target, ...this.useAs(node.args[1], 'A', plan.fieldRepr),
+          ...GC.struct_set, { type: plan.structType }, ...uleb(plan.structIndex)];
+      }
+      return [...target, ...GC.struct_get, { type: plan.structType }, ...uleb(plan.structIndex)];
+    }
     const value = isPut ? this.use(node.args[1], plan.valueKind) : [];
-    const derived = this.derived.get(node.args[0].id)?.obj;
-    if (derived) return this.derivedFieldAccess(derived, plan, isPut, value);
-    const cast = this.reprOf(node.args[0]) === 'obj' ? this.nonNull(object) : [...this.nonNull(object), ...GC.ref_cast, { stype: T_OBJ }];
-    if (plan.reference) {
-      return [...cast, ...GC.struct_get, { type: T_OBJ }, OBJ.refs, OP.i32_const, ...sleb(plan.index),
-        ...value, ...(isPut ? GC.array_set : GC.array_get), { type: T_REFS }];
-    }
-    const base = [...cast, ...GC.struct_get, { type: T_OBJ }, OBJ.base];
-    const memarg = (align) => [align, ...uleb(plan.offset)];
-    switch (plan.slotKind) {
-      case 'i32': return isPut ? [...base, ...value, OP.i32_store, ...memarg(2)] : [...base, OP.i32_load, ...memarg(2)];
-      case 'i64': return isPut ? [...base, ...value, OP.i64_store, ...memarg(3)] : [...base, OP.i64_load, ...memarg(3)];
-      case 'f64':
-        if (plan.valueKind === 'F') {
-          return isPut ? [...base, ...value, OP.f64_promote_f32, OP.f64_store, ...memarg(3)]
-            : [...base, OP.f64_load, ...memarg(3), OP.f32_demote_f64];
-        }
-        return isPut ? [...base, ...value, OP.f64_store, ...memarg(3)] : [...base, OP.f64_load, ...memarg(3)];
-      default: throw new Unsupported(`field slot ${plan.slotKind}`);
-    }
-  }
-
-  derivedFieldAccess(derived, plan, isPut, value) {
-    const L = (i) => uleb(i);
-    if (plan.reference) {
-      return [...this.nonNull([OP.local_get, ...L(derived.ref)]), ...GC.struct_get, { type: T_OBJ }, OBJ.refs,
-        OP.i32_const, ...sleb(plan.index), ...value, ...(isPut ? GC.array_set : GC.array_get), { type: T_REFS }];
-    }
-    // base 0: null; base -1: not closed storage (a defect; NPE is raised).
-    const base = [OP.local_get, ...L(derived.base), OP.i32_const, 0, OP.i32_le_s, OP.if, 0x40,
-      OP.call, { fn: this.world.hostImport('err_npe', [], []) }, OP.unreachable, OP.end, OP.local_get, ...L(derived.base)];
+    const base = [...this.nonNull(object), ...(repr.startsWith('obj') ? [] : [...GC.ref_cast, { stype: T_OBJ }]),
+      ...GC.struct_get, { type: T_OBJ }, OBJ.base];
     const memarg = (align) => [align, ...uleb(plan.offset)];
     switch (plan.slotKind) {
       case 'i32': return isPut ? [...base, ...value, OP.i32_store, ...memarg(2)] : [...base, OP.i32_load, ...memarg(2)];
@@ -1092,13 +1067,13 @@ class ClosedCompiler {
   // allows them; an unknown class id is a loud closed-world failure.
   virtualCall(node, plan) {
     const receiver = this.use(node.args[0], 'A');
-    const receiverIsObj = this.reprOf(node.args[0]) === 'obj';
+    const receiverIsObj = this.reprOf(node.args[0]).startsWith('obj');
     // Admitted implementations share the descriptor, so they agree on the
     // result representation; host arms return anyref and are cast to it.
     const resultRepr = plan.returnKind === 'A' ? this.reprOf(node) : null;
     plan.resultRepr = resultRepr || 'any';
-    const resultType = plan.returnKind === 'V' ? [0x40] : wasmType(plan.returnKind, resultRepr);
-    const castResult = typed(resultRepr) ? [...GC.ref_cast_null, { stype: REPR_TYPE[resultRepr] }] : [];
+    const resultType = plan.returnKind === 'V' ? [0x40] : this.world.wasmType(plan.returnKind, resultRepr);
+    const castResult = typed(resultRepr) ? this.castTo(resultRepr) : [];
     const cls = this.temp([VT.i32]);
     const code = [...this.nonNull(receiver), OP.drop];
     if (receiverIsObj) {
@@ -1141,7 +1116,7 @@ class ClosedCompiler {
     const repr = this.reprOf(node.args[0]);
     if (plan.classIds) {
       const cls = this.temp([VT.i32]);
-      test = repr === 'obj'
+      test = repr.startsWith('obj')
         ? [OP.i32_const, 1, OP.if, VT.i32, ...value, ...GC.struct_get, { type: T_OBJ }, OBJ.cls, OP.local_set, ...uleb(cls)]
         : [...value, ...GC.ref_test, { stype: T_OBJ }, OP.if, VT.i32,
           ...value, ...GC.ref_cast, { stype: T_OBJ }, ...GC.struct_get, { type: T_OBJ }, OBJ.cls, OP.local_set, ...uleb(cls)];
@@ -1171,4 +1146,4 @@ class ClosedCompiler {
   }
 }
 
-module.exports = { ClosedCompiler, Unsupported, WT, wasmType, successorsOf };
+module.exports = { ClosedCompiler, Unsupported, WT, successorsOf };

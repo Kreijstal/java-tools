@@ -30,3 +30,12 @@ test('closed module handles exception handlers, finally, rethrow and monitors li
   // toCharArray / split / getBytes results entered the module as closed storage.
   assert.ok(result.stats.adoptedArrays >= 3, `adopted ${JSON.stringify(result.stats)}`);
 });
+
+test('closed module runs the storage fixture (objects, statics, clone, handlers in loops) like HotSpot', () => {
+  const directory = compileFixture('ClosedRepr');
+  const expected = hotspot(directory, 'ClosedRepr');
+  const result = runDetailed(directory, 'ClosedRepr', { closedWorld: true, jit: JIT });
+  assert.equal(result.failure, null, result.stderr);
+  assert.equal(result.output, expected);
+  assert.ok(result.stats.admitted >= 10, `admitted ${JSON.stringify(result.stats)}`);
+});

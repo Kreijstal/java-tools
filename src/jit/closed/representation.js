@@ -23,7 +23,7 @@
 // certificates or revocation: host code reaches guest storage only through
 // the named accessors installed here, so compiled code may trust it.
 
-const { VT, OP, GC, ModuleBuilder, structType, arrayType, refNull, ref } = require('./wasmBuilder');
+const { VT, OP, GC, ModuleBuilder, structType, arrayType, subType, refNull, ref } = require('./wasmBuilder');
 // objectModel requires this module; resolve it lazily once, not per call.
 let objectModel = null;
 const classIndexOf = (jvm, name) => (objectModel ||= require('../../core/objectModel')).classIndexOf(jvm, name);
@@ -36,11 +36,14 @@ const ELEMENT_TYPE = { '[Z': 'boolean', '[B': 'byte', '[C': 'char', '[S': 'short
 
 // The shared rec group. Every closed module declares it first, so these type
 // indices are identical across modules and canonicalize to the same types.
+// $obj is non-final: a closed module declares one subtype of it per guest
+// class, holding that class's reference fields.
 const T_REFS = 'closed:0', T_OBJ = 'closed:1', T_PARR = 'closed:2', T_RARR = 'closed:3';
+const OBJ_FIELDS = [{ type: VT.i32 }, { type: VT.i32 }, { type: ref(T_REFS) }, { type: VT.externref, mutable: true }];
 function closedTypes() {
   return [
     arrayType(VT.anyref, true),
-    structType([{ type: VT.i32 }, { type: VT.i32 }, { type: ref(T_REFS) }, { type: VT.externref, mutable: true }]),
+    subType([], structType(OBJ_FIELDS)),
     structType([{ type: VT.i32 }, { type: VT.i32 }, { type: VT.i32 }, { type: VT.externref }]),
     structType([{ type: ref(T_REFS) }, { type: VT.i32 }, { type: VT.externref, mutable: true }]),
   ];
@@ -115,6 +118,10 @@ class ClosedRuntime {
     this.ops = helperModule();
     this.layouts = new Map();
     this.adoptedArrays = 0;
+    // Installed by the closed module: per-class allocators and per-field
+    // accessors. Before that, objects are plain $obj with a refs array.
+    this.classTypes = null;
+    this.untypedObjects = 0;
     const ops = this.ops;
     this.toJs = (value) => (value === null ? null : ops.toJs(value));
   }
@@ -252,8 +259,8 @@ class ClosedRuntime {
     for (const field of layout.references) {
       const index = field.index;
       Object.defineProperty(proto, field.key, {
-        get() { return runtime.toJs(ops.objGet(this[STORE], index)); },
-        set(v) { ops.objSet(this[STORE], index, runtime.toWasm(v)); },
+        get() { return runtime.toJs(runtime.refGet(field, this[STORE])); },
+        set(v) { runtime.refSet(field, this[STORE], runtime.toWasm(v)); },
         enumerable: false, configurable: false,
       });
     }
@@ -262,14 +269,42 @@ class ClosedRuntime {
     return proto;
   }
 
+  // A reference field of a closed object, by its layout entry.
+  refGet(field, store) {
+    const access = this.classTypes?.fields.get(field.key);
+    return access ? access.get(store) : this.ops.objGet(store, field.index);
+  }
+
+  refSet(field, store, value) {
+    const access = this.classTypes?.fields.get(field.key);
+    if (access) access.set(store, value);
+    else this.ops.objSet(store, field.index, value);
+  }
+
+  // The closed module's class types: every later instance of a guest class
+  // is that class's struct.
+  installClassTypes(classTypes) {
+    if (this.untypedObjects) {
+      throw new Error(`closed world: ${this.untypedObjects} guest objects were created before the module's class types`);
+    }
+    this.classTypes = classTypes;
+  }
+
   // Field container for a fresh instance, or null when the class has no
   // closed layout (JRE classes, unresolved hierarchies) or the heap is spent.
   newFields(className) {
     const layout = this.layout(className);
     if (!layout) return null;
+    let allocate = null;
+    if (this.classTypes) {
+      allocate = this.classTypes.alloc.get(className);
+      if (!allocate) throw new Error(`closed world: no closed class type for ${className}`);
+    }
     const base = this.heap.allocObject(layout.size);
     if (base < 0) return null;
-    const store = this.ops.newObj(base, layout.classId, layout.references.length);
+    let store;
+    if (allocate) store = allocate(base);
+    else { store = this.ops.newObj(base, layout.classId, layout.references.length); this.untypedObjects += 1; }
     const fields = Object.create(layout.proto);
     Object.defineProperty(fields, BASE_KEY, { value: base, writable: false, enumerable: false });
     Object.defineProperty(fields, STORE, { value: store, enumerable: false });
@@ -296,7 +331,7 @@ class ClosedRuntime {
     if (!fields) return null;
     const from = obj.fields[BASE_KEY], to = fields[BASE_KEY];
     new Uint8Array(this.heap.memory.buffer).copyWithin(to, from, from + layout.size);
-    for (const field of layout.references) this.ops.objSet(fields[STORE], field.index, this.ops.objGet(store, field.index));
+    for (const field of layout.references) this.refSet(field, fields[STORE], this.refGet(field, store));
     const cloned = Object.assign({}, obj, {
       fields, hashCode: this.jvm.nextHashCode++, isLocked: false, lockOwner: null, lockCount: 0, waitSet: [],
     });
@@ -392,6 +427,6 @@ class ClosedRuntime {
 }
 
 module.exports = {
-  ClosedRuntime, STORE, BASE_KEY, KIND, KIND_SHIFT, OBJ, PARR, RARR,
+  ClosedRuntime, STORE, BASE_KEY, KIND, KIND_SHIFT, OBJ, PARR, RARR, OBJ_FIELDS,
   T_REFS, T_OBJ, T_PARR, T_RARR, closedTypes,
 };

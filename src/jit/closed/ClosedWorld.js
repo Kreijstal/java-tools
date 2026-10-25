@@ -21,9 +21,9 @@
 // INITIALIZED, so nothing inside the module ever triggers <clinit>.
 
 const { buildSsa, resolveHandlerRanges } = require('../../analysis/opgraph/ssa');
-const { VT, ModuleBuilder } = require('./wasmBuilder');
-const { closedTypes } = require('./representation');
-const { ClosedCompiler, Unsupported, WT, wasmType } = require('./ClosedCompiler');
+const { VT, OP, GC, ModuleBuilder, structType, subType, refNull, ref, uleb, sleb } = require('./wasmBuilder');
+const { closedTypes, OBJ_FIELDS, T_OBJ, T_PARR, T_RARR, T_REFS } = require('./representation');
+const { ClosedCompiler, Unsupported, WT } = require('./ClosedCompiler');
 
 const REJECT_OPS = new Set(['jsr', 'jsr_w', 'ret', 'invokedynamic']);
 const NEWARRAY = { 4: 'boolean', 5: 'char', 6: 'float', 7: 'double', 8: 'byte', 9: 'short', 10: 'int', 11: 'long' };
@@ -127,6 +127,71 @@ class ClosedWorld {
   // host values possible). Arrays are always closed storage (foreign arrays
   // are adopted when they cross in); a guest class with a closed layout and
   // no JRE shim only ever has closed instances.
+  // One Wasm struct type per guest class with a closed layout, a subtype of
+  // its superclass's (or $obj), holding the class chain's reference fields
+  // in layout order after the $obj prefix. Superclasses come first.
+  prepareClassTypes() {
+    const types = new Map();
+    const visit = (name) => {
+      if (types.has(name)) return types.get(name);
+      if (!this.isGuestClass(name) || this.isInterface(name)) return null;
+      const layout = this.runtime.layout(name);
+      if (!layout) return null;
+      const superName = this.classAst(name)?.superClassName;
+      const parent = superName ? visit(superName) : null;
+      const entry = { name, layout, parent, index: types.size, key: `classes:${types.size}` };
+      types.set(name, entry);
+      return entry;
+    };
+    for (const name of Object.keys(this.jvm.classes)) visit(name);
+    this.classTypes = types;
+  }
+
+  isSubclass(name, ancestor) {
+    for (let current = name; current; current = this.classAst(current)?.superClassName) {
+      if (current === ancestor) return true;
+    }
+    return false;
+  }
+
+  // Representation lattice: 'obj:C' <: 'obj' (some closed object) <: 'any';
+  // 'parr', 'rarr' <: 'any'; 'null' <: everything.
+  reprSubtype(a, b) {
+    if (a === b || b === 'any' || a === 'null') return true;
+    if (b === 'obj') return a.startsWith('obj:');
+    if (a.startsWith('obj:') && b.startsWith('obj:')) return this.isSubclass(a.slice(4), b.slice(4));
+    return false;
+  }
+
+  reprJoin(a, b) {
+    if (!a || a === 'null') return b;
+    if (!b || b === 'null') return a;
+    if (a === b) return a;
+    if (a.startsWith('obj') && b.startsWith('obj')) {
+      if (a === 'obj' || b === 'obj') return 'obj';
+      for (let current = a.slice(4); current; current = this.classAst(current)?.superClassName) {
+        if (this.isSubclass(b.slice(4), current)) return this.classTypes?.has(current) ? `obj:${current}` : 'obj';
+      }
+      return 'obj';
+    }
+    return 'any';
+  }
+
+  // Wasm value type of a value of `kind` with representation `repr`.
+  wasmType(kind, repr) {
+    const type = kind === 'A' && repr ? this.typeOfRepr(repr) : null;
+    return type ? refNull(type) : [WT[kind]];
+  }
+
+  // Heap type marker of a typed representation.
+  typeOfRepr(repr) {
+    if (repr === 'parr') return T_PARR;
+    if (repr === 'rarr') return T_RARR;
+    if (repr === 'obj') return T_OBJ;
+    if (repr.startsWith('obj:')) return this.classTypes.get(repr.slice(4)).key;
+    return null;
+  }
+
   reprOfDescriptor(descriptor) {
     if (!descriptor) return 'any';
     this.reprCache ||= new Map();
@@ -141,7 +206,7 @@ class ClosedWorld {
 
   reprOfClass(className) {
     if (!this.isGuestClass(className) || (this.jvm.jre && this.jvm.jre[className]) || this.isInterface(className)) return 'any';
-    return this.runtime.layout(className) ? 'obj' : 'any';
+    return this.classTypes?.has(className) ? `obj:${className}` : 'any';
   }
 
   classId(name) { return (this.objectModel ||= require('../../core/objectModel')).classIndexOf(this.jvm, name); }
@@ -291,6 +356,10 @@ class ClosedWorld {
     this._hostImpls = {
       ref_eq: (a, b) => (toJs(a) === toJs(b) ? 1 : 0),
       err_npe: () => throwJava('java/lang/NullPointerException'),
+      err_npe_at: (site) => {
+        process.stderr.write(`[closed-world] NullPointerException at ${this.sites[site]?.where}\n`);
+        throwJava('java/lang/NullPointerException');
+      },
       init: (id) => world.initializeSync(id),
       menter: (value) => {
         const monitor = toJs(value), thread = world.thread;
@@ -421,6 +490,7 @@ class ClosedWorld {
       try { await this.jvm.preloadClasspathClasses(); } catch { /* referenced classes still load below */ }
     }
     await this.loadReferencedClasses();
+    this.prepareClassTypes();
     const candidates = [];
     for (const className of Object.keys(this.jvm.classes)) {
       if (!this.isGuestClass(className)) continue;
@@ -603,9 +673,15 @@ class ClosedWorld {
           declaring = current;
         }
         if (!field) throw new Unsupported(`field-unresolved: ${owner}.${name}`);
+        const reference = field.index !== undefined;
+        if (reference && !this.classTypes.has(declaring)) throw new Unsupported(`field-without-class-type: ${declaring}.${name}`);
         plan.set(node.id, {
-          kind: op === 'getfield' ? 'field-get' : 'field-put', reference: field.index !== undefined,
+          kind: op === 'getfield' ? 'field-get' : 'field-put', reference,
           index: field.index, offset: field.offset, slotKind: field.kind, valueKind: kindOf(descriptor), declaring,
+          // Reference fields are fields of the declaring class's struct.
+          structType: reference ? this.classTypes.get(declaring).key : null,
+          structIndex: reference ? OBJ_FIELDS.length + field.index : null,
+          fieldRepr: reference ? this.reprOfDescriptor(descriptor) : null,
         });
         return;
       }
@@ -618,7 +694,7 @@ class ClosedWorld {
         const cell = store.cell(`${name}:${descriptor}`);
         if (!cell.closedGlobal) throw new Unsupported(`static-not-closed: ${declaring}.${name}`);
         const valueKind = kindOf(descriptor);
-        const valtype = cell.closedType === 'anyref' ? wasmType('A', this.reprOfDescriptor(descriptor)) : [WT[valueKind]];
+        const valtype = cell.closedType === 'anyref' ? this.wasmType('A', this.reprOfDescriptor(descriptor)) : [WT[valueKind]];
         const global = this.staticGlobal(`s:${declaring}.${name}:${descriptor}`, valtype, cell);
         record.initClasses.add(declaring);
         plan.set(node.id, { kind: op === 'getstatic' ? 'static-get' : 'static-put', global, valueKind,
@@ -799,7 +875,7 @@ class ClosedWorld {
       'min(II)I': 'i32.min', 'max(II)I': 'i32.max', 'min(JJ)J': 'i64.min', 'max(JJ)J': 'i64.max',
     }[name + descriptor];
     if (native) return { kind: 'intrinsic', op: native };
-    if ((name === 'sin' || name === 'cos') && descriptor === '(D)D') {
+    if ((name === 'sin' || name === 'cos') && descriptor === '(D)D' && !process.env.CW_X_RAWTRIG) {
       // fdlibm in Wasm (fdlibm.js), bit-identical to the JS builtin; huge
       // arguments still reach the builtin through the pure import.
       this.pureImport(`math:${name}`, [VT.f64], [VT.f64], Math[name]);
@@ -954,6 +1030,12 @@ class ClosedWorld {
 
     const builder = new ModuleBuilder();
     builder.addRecGroup('closed', closedTypes());
+    const classTypes = [...this.classTypes.values()];
+    builder.addRecGroup('classes', classTypes.map((t) => subType([t.parent ? t.parent.key : T_OBJ], structType([
+      ...OBJ_FIELDS,
+      ...t.layout.references.map((f) => ({ type: this.wasmType('A', this.reprOfDescriptor(f.descriptor)), mutable: true })),
+    ]))));
+    builder.addGlobal('emptyRefs', ref(T_REFS), false, [...GC.array_new_fixed, { type: T_REFS }, 0]);
     builder.importMemory('c', 'mem', this.runtime.heap.memory.buffer.byteLength >>> 16);
     builder.importTag('t', 'jx', [[VT.anyref]], 'jx');
     const importObject = { c: { mem: this.runtime.heap.memory }, t: { jx: this.tag }, s: {}, f: {} };
@@ -998,11 +1080,32 @@ class ClosedWorld {
     for (const name of this.trigFunctions || []) {
       require('./fdlibm').defineTrig(builder, name, (which) => `math:${which}`);
     }
+    // Per-class allocation and per-field access for the VM's JS side.
+    for (const t of classTypes) {
+      if (!this.isAbstract(t.name)) {
+        builder.declareFunction(`alloc:${t.name}`, [[VT.i32]], [ref(t.key)]);
+        builder.defineFunction(`alloc:${t.name}`, [], [OP.local_get, 0, OP.i32_const, ...sleb(t.layout.classId),
+          OP.global_get, { global: 'emptyRefs' }, OP.ref_null, VT.externref,
+          ...t.layout.references.flatMap(() => [OP.ref_null, 0x71]), ...GC.struct_new, { type: t.key }]);
+        builder.exportFunction(`a${t.index}`, `alloc:${t.name}`);
+      }
+      t.layout.references.forEach((f, j) => {
+        if (f.owner !== t.name) return;
+        const index = OBJ_FIELDS.length + f.index, fieldType = this.typeOfRepr(this.reprOfDescriptor(f.descriptor));
+        builder.declareFunction(`get:${f.key}`, [[VT.anyref]], [[VT.anyref]]);
+        builder.defineFunction(`get:${f.key}`, [], [OP.local_get, 0, ...GC.ref_cast, { stype: t.key }, ...GC.struct_get, { type: t.key }, ...uleb(index)]);
+        builder.exportFunction(`g${t.index}_${j}`, `get:${f.key}`);
+        builder.declareFunction(`set:${f.key}`, [[VT.anyref], [VT.anyref]], []);
+        builder.defineFunction(`set:${f.key}`, [], [OP.local_get, 0, ...GC.ref_cast, { stype: t.key }, OP.local_get, 1,
+          ...(fieldType ? [...GC.ref_cast_null, { stype: fieldType }] : []), ...GC.struct_set, { type: t.key }, ...uleb(index)]);
+        builder.exportFunction(`p${t.index}_${j}`, `set:${f.key}`);
+      });
+    }
     let exportIndex = 0;
     for (const [key, record] of this.entries) {
       record.exportName = `m${exportIndex++}`;
-      const params = record.paramKinds.map((k, i) => wasmType(k, record.paramReprs[i]));
-      const results = record.returnKind === 'V' ? [] : [wasmType(record.returnKind, record.returnRepr)];
+      const params = record.paramKinds.map((k, i) => this.wasmType(k, record.paramReprs[i]));
+      const results = record.returnKind === 'V' ? [] : [this.wasmType(record.returnKind, record.returnRepr)];
       builder.declareFunction(`m:${key}`, params, results);
       if (record.synchronized) builder.declareFunction(`m:${key}$body`, params, results);
       builder.exportFunction(record.exportName, `m:${key}`);
@@ -1013,12 +1116,28 @@ class ClosedWorld {
       builder.defineFunction(`m:${key}$body`, body.locals, body.code);
       builder.defineFunction(`m:${key}`, ...this.synchronizedWrapper(record, key));
     }
-    const bytes = builder.build();
+    let bytes = builder.build();
+    // Diagnostic: substitute externally optimized bytes for this exact module.
+    if (process.env.CW_X_OPT) {
+      const fs = require('node:fs');
+      const raw = `${process.env.CW_X_OPT}.raw.wasm`;
+      if (!fs.existsSync(raw)) fs.writeFileSync(raw, bytes);
+      else if (!Buffer.from(bytes).equals(fs.readFileSync(raw))) throw new Error('closed world: CW_X_OPT module differs from the raw dump');
+      else if (fs.existsSync(process.env.CW_X_OPT)) bytes = new Uint8Array(fs.readFileSync(process.env.CW_X_OPT));
+    }
     this.moduleBytes = bytes.length;
     if (process.env.JVM_CLOSED_WORLD_DUMP) require('node:fs').writeFileSync(process.env.JVM_CLOSED_WORLD_DUMP, bytes);
     const instance = new WebAssembly.Instance(new WebAssembly.Module(bytes), importObject);
     this.instance = instance;
     for (const g of (this.staticGlobals || new Map()).values()) g.cell.rebind(instance.exports[g.exportName]);
+    const alloc = new Map(), fields = new Map();
+    for (const t of classTypes) {
+      if (!this.isAbstract(t.name)) alloc.set(t.name, instance.exports[`a${t.index}`]);
+      t.layout.references.forEach((f, j) => {
+        if (f.owner === t.name) fields.set(f.key, { get: instance.exports[`g${t.index}_${j}`], set: instance.exports[`p${t.index}_${j}`] });
+      });
+    }
+    this.runtime.installClassTypes({ alloc, fields });
     for (const record of this.entries.values()) {
       record.fn = instance.exports[record.exportName];
       record.ready = false;
@@ -1036,11 +1155,11 @@ class ClosedWorld {
     const n = record.paramKinds.length;
     const lock = n, result = n + 1;
     const hasResult = record.returnKind !== 'V';
-    const locals = [[VT.anyref], ...(hasResult ? [wasmType(record.returnKind, record.returnRepr)] : [])];
+    const locals = [[VT.anyref], ...(hasResult ? [this.wasmType(record.returnKind, record.returnRepr)] : [])];
     const lockCode = record.isStatic ? [OP.global_get, { global: record.lockGlobal }, ...GC.any_convert_extern] : [OP.local_get, 0];
     const call = (name) => [OP.local_get, ...uleb(lock), OP.call, { fn: this.hostImport(name, [VT.anyref], []) }];
     const code = [...lockCode, OP.local_set, ...uleb(lock), ...call('menter'),
-      OP.try, ...(hasResult ? wasmType(record.returnKind, record.returnRepr) : [0x40])];
+      OP.try, ...(hasResult ? this.wasmType(record.returnKind, record.returnRepr) : [0x40])];
     for (let i = 0; i < n; i++) code.push(OP.local_get, ...uleb(i));
     code.push(OP.call, { fn: `m:${key}$body` }, OP.catch_all, ...call('mexit'), OP.rethrow, 0, OP.end);
     if (hasResult) code.push(OP.local_set, ...uleb(result));

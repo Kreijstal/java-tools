@@ -115,7 +115,7 @@ const OP = {
 // 0xfb-prefixed GC ops and 0xfc-prefixed saturating truncations.
 const GC = {
   struct_new: [0xfb, 0x00], struct_get: [0xfb, 0x02], struct_set: [0xfb, 0x05],
-  array_new: [0xfb, 0x06], array_new_default: [0xfb, 0x07], array_get: [0xfb, 0x0b],
+  array_new: [0xfb, 0x06], array_new_default: [0xfb, 0x07], array_new_fixed: [0xfb, 0x08], array_get: [0xfb, 0x0b],
   array_set: [0xfb, 0x0e], array_len: [0xfb, 0x0f], array_fill: [0xfb, 0x10], array_copy: [0xfb, 0x11],
   ref_test: [0xfb, 0x14], ref_test_null: [0xfb, 0x15], ref_cast: [0xfb, 0x16], ref_cast_null: [0xfb, 0x17],
   br_on_cast: [0xfb, 0x18], br_on_cast_fail: [0xfb, 0x19],
@@ -130,6 +130,10 @@ const SAT = {
 const storage = (type, mutable) => [...(Array.isArray(type) ? type : [type]), mutable ? 1 : 0];
 const structType = (fields) => [0x5f, ...vec(fields.map((f) => storage(f.type, f.mutable)))];
 const arrayType = (type, mutable) => [0x5e, ...storage(type, mutable)];
+// A declared subtype: non-final unless `final`, with the given supertypes
+// (type markers or indices).
+const subType = (supers, composite, final = false) => [final ? 0x4f : 0x50,
+  ...uleb(supers.length), ...supers.map((t) => (typeof t === 'number' ? uleb(t) : [{ type: t }])).flat(), ...composite];
 const funcType = (params, results) => [0x60,
   ...uleb(params.length), ...params.flat(), ...uleb(results.length), ...results.flat()];
 
@@ -340,5 +344,5 @@ ModuleBuilder.prototype.nameSection = function nameSection(funcIndex) {
 
 module.exports = {
   VT, HT, OP, GC, SAT, uleb, sleb, f32bytes, f64bytes, refNull, ref, heapType,
-  structType, arrayType, funcType, ModuleBuilder,
+  structType, arrayType, subType, funcType, ModuleBuilder,
 };
