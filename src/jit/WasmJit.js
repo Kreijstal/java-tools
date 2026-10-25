@@ -3114,8 +3114,11 @@ class WasmJit {
     };
   }
 
-  freezeCompilation() {
+  // `classNames`, when given, limits the freeze to the classes preparation
+  // saw; a class loaded afterwards warms up and compiles as usual.
+  freezeCompilation(classNames = null) {
     this.compilationFrozen = true;
+    this.frozenClassNames = classNames;
   }
 
   thawCompilation() {
@@ -3292,7 +3295,8 @@ class WasmJit {
         if (this.census) this._censusNote(frame, 'below-warmup');
         return null;
       }
-      if (this.compilationFrozen) {
+      if (this.compilationFrozen &&
+          (!this.frozenClassNames || this.frozenClassNames.has(frame.className))) {
         if (this.census) this._censusNote(frame, 'compilation-frozen');
         return null;
       }

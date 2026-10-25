@@ -24,13 +24,9 @@ test('JVM should execute ProducerConsumer.class, demonstrate wait/notify, and no
   };
 
   const runTest = async () => {
-    // The bound below is about the scheduler: ten 100 ms sleeps inside
-    // synchronized blocks must not cost much more than the sleeps. Since
-    // 32911e3c, run() prepares before main() by default, which preloads and
-    // compiles the whole `sources` classpath (every sample class, growing
-    // with the corpus) -- over a second here, none of it ProducerConsumer's.
-    // Measure the old lifecycle so the limit keeps bounding wait/notify/sleep.
-    const jvm = new JVM({ classpath: ['sources'], prepareBeforeMain: false });
+    // Default lifecycle: run() prepares before main(), but only what
+    // ProducerConsumer reaches, not every sample class in `sources`.
+    const jvm = new JVM({ classpath: ['sources'] });
     const output = [];
     jvm.registerJreMethods({
       'java/io/PrintStream': {

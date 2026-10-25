@@ -175,6 +175,17 @@ class JVM {
     // the pass (loop-free methods warm up over a couple of calls) for boot
     // time.
     this.prepareLoopsOnly = options.prepareLoopsOnly === true;
+    // Which classes that pass loads. 'reachable' (the default) loads what the
+    // main class can reach: the transitive closure of constant-pool class
+    // references, plus string constants that name a classpath class (a
+    // literal Class.forName). 'classpath' loads every class file on the
+    // classpath first, which makes a directory holding many unrelated
+    // programs cost every one of them the whole directory.
+    this.prepareScope = options.prepareScope ??
+      ((typeof process !== 'undefined' && process.env.JVM_PREPARE_SCOPE) || 'reachable');
+    if (this.prepareScope !== 'reachable' && this.prepareScope !== 'classpath') {
+      throw new TypeError("prepareScope must be 'reachable' or 'classpath'");
+    }
     // False until run() hands control to guest code. THE boundary the
     // measurement contract is written against: before it, compiling on this
     // thread is free because nothing the guest can observe has started; after
@@ -837,6 +848,7 @@ class JVM {
     if (options.prepare !== false && this.prepareBeforeMain !== false) {
       await this.precompileInitializedClasses({
         preloadClasspath: true,
+        preloadScope: this.prepareScope,
         initializedOnly: false,
         effectful: this.prepareEffectful,
         wasm: this.prepareWasm,
@@ -864,7 +876,10 @@ class JVM {
       // contract for the 0.2 one. Set JVM_JIT_WASM_EXECUTION_ONLY=0 to run
       // the alternative and measure what the freeze actually buys.
       if (process.env.JVM_JIT_WASM_EXECUTION_ONLY !== "0") {
-        this.jit?.wasmJit?.freezeCompilation?.();
+        // Only what preparation saw is frozen. A class loaded later (by
+        // reflection, or one reachability could not see) was never prepared,
+        // and freezing it too would keep its loops off Wasm for good.
+        this.jit?.wasmJit?.freezeCompilation?.(new Set(Object.keys(this.classes)));
       } else if (this.jit?.wasmJit) {
         this.jit.wasmJit.executionOnlyDeclined = true;
       }
@@ -1414,7 +1429,8 @@ class JVM {
   async _precompileInitializedClasses(options = {}) {
     let preloadedClasses = 0;
     if (options.preloadClasspath === true) {
-      const preload = await this.preloadClasspathClasses(options.onProgress);
+      const preload = await this.preloadClasspathClasses(options.onProgress,
+        {scope: options.preloadScope});
       preloadedClasses = preload.classes;
     }
     const loopsOnly = options.loopsOnly === true;
@@ -1817,7 +1833,7 @@ class JVM {
   // explicit preparation phase may parse every application class so its
   // methods can be compiled without running <clinit> or changing Java-visible
   // initialization order.
-  async preloadClasspathClasses(onProgress = null) {
+  async preloadClasspathClasses(onProgress = null, {scope = 'classpath'} = {}) {
     const names = new Set();
     const classFs = this.fs || fs;
     const visitDirectory = async (root, relative = "") => {
@@ -1861,6 +1877,12 @@ class JVM {
         }
       }
     }
+    if (scope === 'reachable') {
+      // Roots are the classes already loaded (the main class and the JRE
+      // bootstrap); the listing only says which names a string can mean.
+      const referenced = await this.preloadReferencedClasses(onProgress, {classpathNames: names});
+      return {classes: 0, referencedClasses: referenced};
+    }
     let completed = 0;
     for (const name of names) {
       await this.loadClassByName(name);
@@ -1885,7 +1907,11 @@ class JVM {
   // Enumerating the classpath finds the guest's own classes but not the JRE
   // classes they refer to, and those are what keep being registered after
   // main() otherwise.
-  collectReferencedClassNames(classData, into) {
+  //
+  // With `classpathNames` (reachability preparation) an array class names its
+  // element class, and a string constant naming a classpath class counts as
+  // a reference: that is how a literal Class.forName reaches a class.
+  collectReferencedClassNames(classData, into, classpathNames = null) {
     const pool = classData?.constantPool;
     if (Array.isArray(pool)) {
       const utf8 = (index) => {
@@ -1897,6 +1923,13 @@ class JVM {
         if (entry.tag === 7) {
           const name = utf8(entry.info.name_index);
           if (name) into.add(name);
+          if (classpathNames && name && name.startsWith("[")) {
+            for (const element of objectTypesInDescriptor(name)) into.add(element);
+          }
+        } else if (entry.tag === 8 && classpathNames) {
+          const text = utf8(entry.info.string_index);
+          const name = typeof text === "string" && text.replace(/\./g, "/");
+          if (name && classpathNames.has(name)) into.add(name);
         } else if (entry.tag === 12) {
           for (const name of objectTypesInDescriptor(
             utf8(entry.info.descriptor_index))) {
@@ -1917,12 +1950,16 @@ class JVM {
 
   // Load the transitive closure of what the already-loaded classes refer to.
   // Free: this runs before main().
-  async preloadReferencedClasses(onProgress = null) {
+  // Reachability preparation (`classpathNames`) runs this to a fixed point:
+  // its roots are a handful of classes, so a fixed round count would stop
+  // partway down an ordinary reference chain. Each name is tried once.
+  async preloadReferencedClasses(onProgress = null, {classpathNames = null} = {}) {
     let loaded = 0;
-    for (let round = 0; round < 8; round += 1) {
+    const attempted = new Set();
+    for (let round = 0; classpathNames || round < 8; round += 1) {
       const wanted = new Set();
       for (const classData of Object.values(this.classes)) {
-        this.collectReferencedClassNames(classData, wanted);
+        this.collectReferencedClassNames(classData, wanted, classpathNames);
       }
       // A JRE-override stub for an application class (applicationFallback)
       // is registered before its class file is read; preparation must see
@@ -1930,9 +1967,10 @@ class JVM {
       const missing = [...wanted].filter((name) =>
         name && !name.startsWith("[") && (!this.classes[name] ||
           this.classes[name].isJreStub && this.jre[name] &&
-            this.jre[name].applicationFallback));
+            this.jre[name].applicationFallback) && !attempted.has(name));
       if (!missing.length) break;
       for (const name of missing) {
+        attempted.add(name);
         try {
           await this.loadClassByName(name);
         } catch (error) {
