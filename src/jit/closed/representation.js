@@ -370,11 +370,20 @@ class ClosedRuntime {
       if (type === 'i32') return typeof v === 'boolean' ? (v ? 1 : 0) : v | 0;
       return Number(v);
     };
-    const global = new WebAssembly.Global({ value: type, mutable: true }, coerce(value));
+    // The value of record. A closed module defines its own global for each
+    // static it uses and the cell rebinds to that export, so module code
+    // reads a defined global instead of an imported one.
+    let global = new WebAssembly.Global({ value: type, mutable: true }, coerce(value));
     const cell = {
       present: !!present,
-      closedGlobal: global,
       closedType: type,
+      get closedGlobal() { return global; },
+      rebind(next) {
+        try { next.value = global.value; } catch (error) {
+          throw new Error(`closed world: static ${key} holds a value its module global cannot: ${error.message}`);
+        }
+        global = next;
+      },
       get value() { return type === 'anyref' ? runtime.toJs(global.value) : global.value; },
       set value(v) { global.value = coerce(v); },
     };

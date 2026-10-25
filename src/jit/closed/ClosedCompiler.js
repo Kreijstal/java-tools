@@ -20,7 +20,7 @@
 // exception handlers, so no frame inside the module can observe the
 // difference).
 
-const { VT, OP, GC, SAT, sleb, uleb, f32bytes, f64bytes, refNull } = require('./wasmBuilder');
+const { VT, HT, OP, GC, SAT, sleb, uleb, f32bytes, f64bytes, refNull } = require('./wasmBuilder');
 const { T_OBJ, T_PARR, T_RARR, T_REFS, OBJ, PARR, RARR, KIND, KIND_SHIFT } = require('./representation');
 
 const WT = { I: VT.i32, J: VT.i64, F: VT.f32, D: VT.f64, A: VT.anyref };
@@ -54,13 +54,22 @@ const PRIM_ARRAY = {
 const SHIFT = { iaload: 2, laload: 3, faload: 2, daload: 3, baload: 0, caload: 1, saload: 1,
   iastore: 2, lastore: 3, fastore: 2, dastore: 3, bastore: 0, castore: 1, sastore: 1 };
 
+// Wasm value type of a value of `kind` with closed representation `repr`.
+const REPR_TYPE = { obj: T_OBJ, parr: T_PARR, rarr: T_RARR };
+function wasmType(kind, repr) {
+  if (kind === 'A' && REPR_TYPE[repr]) return refNull(REPR_TYPE[repr]);
+  return [WT[kind]];
+}
+const typed = (repr) => REPR_TYPE[repr] !== undefined;
+const NULL_REF = [OP.ref_null, HT.none];
+
 function zero(kind) {
   switch (kind) {
     case 'I': return [OP.i32_const, 0];
     case 'J': return [OP.i64_const, 0];
     case 'F': return [OP.f32_const, ...f32bytes(0)];
     case 'D': return [OP.f64_const, ...f64bytes(0)];
-    default: return [OP.ref_null, VT.anyref];
+    default: return NULL_REF;
   }
 }
 
@@ -113,6 +122,7 @@ class ClosedCompiler {
         }
       }
     }
+    this.inferReprs();
     this.analyzeControl();
     const code = [];
     // Entry phis seeded from parameters (a loop back to the method entry).
@@ -160,7 +170,7 @@ class ClosedCompiler {
     let index = this.localOfValue.get(value.id);
     if (index === undefined) {
       index = this.paramCount + this.locals.length;
-      this.locals.push([WT[value.kind]]);
+      this.locals.push(wasmType(value.kind, this.reprOf(value)));
       this.localOfValue.set(value.id, index);
     }
     return index;
@@ -168,9 +178,79 @@ class ClosedCompiler {
 
   use(value, kind) {
     if (!value || value.op === 'undef' || !this.live(value)) return zero(kind || value?.kind);
-    if (value.op === 'aconst_null') return [OP.ref_null, VT.anyref];
+    if (value.op === 'aconst_null') return NULL_REF;
     return [OP.local_get, ...uleb(this.localFor(value))];
   }
+
+  // A reference value as `repr` (a typed callee parameter or return).
+  useAs(value, kind, repr) {
+    const code = this.use(value, kind);
+    if (kind !== 'A' || !typed(repr) || !value || value.op === 'aconst_null' || !this.live(value)) return code;
+    return this.reprOf(value) === repr ? code : [...code, ...GC.ref_cast_null, { stype: REPR_TYPE[repr] }];
+  }
+
+  // ---- reference representations ---------------------------------------
+  // Each reference value's closed representation, from the Java static types
+  // bytecode gives it (descriptors, checkcast, allocation), joined at phis.
+  inferReprs() {
+    const world = this.world, fn = this.fn, entry = this.entry;
+    const types = new Map(); // id -> {desc, repr} ; null type = only null so far
+    const NULL = { desc: null, repr: 'null' };
+    const ANY = { desc: null, repr: 'any' };
+    const ofDesc = (desc) => ({ desc, repr: world.reprOfDescriptor(desc) });
+    const join = (a, b) => {
+      if (!a || a.repr === 'null') return b;
+      if (!b || b.repr === 'null') return a;
+      return { desc: a.desc === b.desc ? a.desc : null, repr: a.repr === b.repr ? a.repr : 'any' };
+    };
+    const classDesc = (name) => (name.startsWith('[') ? name : `L${name};`);
+    const typeOf = (value) => {
+      switch (value.op) {
+        case 'param': {
+          const i = value.imm.index;
+          if (!entry.isStatic && i === 0) return { desc: classDesc(entry.className), repr: entry.paramReprs[0] };
+          return { desc: entry.paramDescriptors[i - (entry.isStatic ? 0 : 1)], repr: entry.paramReprs[i] };
+        }
+        case 'aconst_null': return NULL;
+        case 'getfield': case 'getstatic': return ofDesc(value.imm[2][1]);
+        case 'invokestatic': case 'invokespecial': case 'invokevirtual': case 'invokeinterface': {
+          const d = value.imm[2][1];
+          return ofDesc(d.slice(d.indexOf(')') + 1));
+        }
+        case 'aaload': {
+          const array = types.get(value.args[0]?.id);
+          return array && array.desc && array.desc[0] === '[' ? ofDesc(array.desc.slice(1)) : ANY;
+        }
+        case 'checkcast': return ofDesc(classDesc(value.imm));
+        case 'new': return ofDesc(classDesc(value.imm));
+        case 'newarray': {
+          const letter = { boolean: 'Z', byte: 'B', char: 'C', short: 'S', int: 'I', long: 'J', float: 'F', double: 'D',
+            4: 'Z', 5: 'C', 6: 'F', 7: 'D', 8: 'B', 9: 'S', 10: 'I', 11: 'J' }[value.imm];
+          return letter ? ofDesc(`[${letter}`) : ANY;
+        }
+        case 'anewarray': return ofDesc(`[${classDesc(value.imm)}`);
+        case 'multianewarray': return ofDesc(Array.isArray(value.imm) ? value.imm[0] : value.imm);
+        case 'phi': return value.args.reduce((t, arg) => (arg && this.live(arg) ? join(t, types.get(arg.id)) : t), null);
+        default: return ANY;
+      }
+    };
+    const refs = fn.values.filter((v) => v.kind === 'A');
+    for (let changed = true, rounds = 0; changed; rounds++) {
+      if (rounds > 64) throw new Unsupported('reference types did not settle');
+      changed = false;
+      for (const value of refs) {
+        const next = typeOf(value);
+        const prev = types.get(value.id);
+        if (next && (!prev || prev.repr !== next.repr || prev.desc !== next.desc)) {
+          types.set(value.id, next);
+          changed = true;
+        }
+      }
+    }
+    this.reprs = new Map([...types].map(([id, t]) => [id, t.repr === 'null' ? 'any' : t.repr]));
+  }
+
+  reprOf(value) { return (value && this.reprs?.get(value.id)) || 'any'; }
 
   set(value) { return [OP.local_set, ...uleb(this.localFor(value))]; }
 
@@ -475,7 +555,7 @@ class ClosedCompiler {
     }
     if (op === 'return') { out.push(OP.return); return; }
     const kind = this.entry.returnKind;
-    out.push(...this.use(term.args[0], kind), OP.return);
+    out.push(...this.useAs(term.args[0], kind, this.entry.returnRepr), OP.return);
   }
 
   // ---- straight-line nodes -----------------------------------------------
@@ -508,7 +588,8 @@ class ClosedCompiler {
       let entry = this.derived.get(value.id);
       if (!entry) { entry = {}; this.derived.set(value.id, entry); }
       if (entry[kind]) return;
-      if (kind === 'obj') entry.obj = { base: this.local([VT.i32]), ref: this.local(refNull(T_OBJ)) };
+      // A value already typed $obj is its own decoded reference.
+      if (kind === 'obj') entry.obj = { base: this.local([VT.i32]), ref: this.reprOf(value) === 'obj' ? this.localFor(value) : this.local(refNull(T_OBJ)) };
       if (kind === 'parr') entry.parr = { base: this.local([VT.i32]), len: this.local([VT.i32]) };
       if (kind === 'rarr') entry.rarr = { elems: this.local(refNull(T_REFS)), len: this.local([VT.i32]) };
     };
@@ -534,7 +615,15 @@ class ClosedCompiler {
     const v = this.use(value, 'A');
     const out = [];
     const L = (i) => uleb(i);
-    if (entry.obj) {
+    const repr = this.reprOf(value);
+    // `this` is never null.
+    const nonNull = value.op === 'param' && value.imm.index === 0 && !this.entry.isStatic;
+    const ifNull = (onNull, onValue) => (nonNull ? onValue
+      : [...v, OP.ref_is_null, OP.if, 0x40, ...onNull, OP.else, ...onValue, OP.end]);
+    if (entry.obj && repr === 'obj') {
+      out.push(...ifNull([OP.i32_const, 0, OP.local_set, ...L(entry.obj.base)],
+        [...v, ...GC.struct_get, { type: T_OBJ }, OBJ.base, OP.local_set, ...L(entry.obj.base)]));
+    } else if (entry.obj) {
       const { base, ref } = entry.obj;
       out.push(...v, ...GC.ref_test, { stype: T_OBJ }, OP.if, 0x40,
         ...v, ...GC.ref_cast, { stype: T_OBJ }, OP.local_tee, ...L(ref), ...GC.struct_get, { type: T_OBJ }, OBJ.base,
@@ -548,7 +637,12 @@ class ClosedCompiler {
     // NullPointerException. A primitive array outside closed storage is a
     // closed-world defect and fails here; that keeps every slow path a throw,
     // with no call returning into the access.
-    if (entry.parr) {
+    if (entry.parr && repr === 'parr') {
+      const { base, len } = entry.parr;
+      out.push(...ifNull([OP.i32_const, 0, OP.local_set, ...L(len)],
+        [...v, ...GC.struct_get, { type: T_PARR }, PARR.base, OP.local_set, ...L(base),
+          ...v, ...GC.struct_get, { type: T_PARR }, PARR.len, OP.local_set, ...L(len)]));
+    } else if (entry.parr) {
       const { base, len } = entry.parr;
       const tmp = this.temp(refNull(T_PARR));
       out.push(...v, ...GC.ref_test, { stype: T_PARR }, OP.if, 0x40,
@@ -559,7 +653,12 @@ class ClosedCompiler {
         OP.i32_const, 0, OP.local_set, ...L(len), OP.end);
       this.release(refNull(T_PARR), tmp);
     }
-    if (entry.rarr) {
+    if (entry.rarr && repr === 'rarr') {
+      const { elems, len } = entry.rarr;
+      out.push(...ifNull([OP.i32_const, 0, OP.local_set, ...L(len)],
+        [...v, ...GC.struct_get, { type: T_RARR }, RARR.elems, OP.local_tee, ...L(elems),
+          ...GC.array_len, OP.local_set, ...L(len)]));
+    } else if (entry.rarr) {
       const { elems, len } = entry.rarr;
       out.push(...v, ...GC.ref_test, { stype: T_RARR }, OP.if, 0x40,
         ...v, ...GC.ref_cast, { stype: T_RARR }, ...GC.struct_get, { type: T_RARR }, RARR.elems, OP.local_tee, ...L(elems),
@@ -630,8 +729,28 @@ class ClosedCompiler {
   }
 
   finish(node, out) {
-    if (node.kind && node.kind !== 'V' && this.live(node)) out.push(...this.set(node));
+    if (node.kind && node.kind !== 'V' && this.live(node)) {
+      const repr = node.kind === 'A' ? this.reprOf(node) : null;
+      if (typed(repr) && this.producedRepr(node) !== repr) out.push(...GC.ref_cast_null, { stype: REPR_TYPE[repr] });
+      out.push(...this.set(node));
+    }
     else if (node.kind && node.kind !== 'V') out.push(OP.drop);
+  }
+
+  // Representation an emitted node leaves on the stack; host imports, field
+  // and element loads and statics produce anyref.
+  producedRepr(node) {
+    const plan = this.plan.get(node.id);
+    if (!plan) return 'any';
+    if (plan.kind === 'call') return this.calleeOf(plan.fn)?.returnRepr || 'any';
+    if (plan.kind === 'virtual') return plan.resultRepr || 'any';
+    if (plan.kind === 'checkcast') return this.reprOf(node.args[0]);
+    if (plan.kind === 'static-get' && node.kind === 'A') return this.world.reprOfDescriptor(node.imm[2][1]);
+    return 'any';
+  }
+
+  calleeOf(fnKey) {
+    return typeof fnKey === 'string' && fnKey.startsWith('m:') ? this.world.entries.get(fnKey.slice(2)) : null;
   }
 
   emitNode(node, out) {
@@ -642,7 +761,7 @@ class ClosedCompiler {
     if (op in LCONST) { out.push(OP.i64_const, ...sleb(LCONST[op])); return this.finish(node, out); }
     if (op in FCONST) { out.push(OP.f32_const, ...f32bytes(FCONST[op])); return this.finish(node, out); }
     if (op in DCONST) { out.push(OP.f64_const, ...f64bytes(DCONST[op])); return this.finish(node, out); }
-    if (op === 'aconst_null') { out.push(OP.ref_null, VT.anyref); return this.finish(node, out); }
+    if (op === 'aconst_null') { out.push(...NULL_REF); return this.finish(node, out); }
     if (op === 'bipush' || op === 'sipush') { out.push(OP.i32_const, ...sleb(Number(node.imm))); return this.finish(node, out); }
     if (op === 'ldc' || op === 'ldc_w' || op === 'ldc2_w') { out.push(...this.constant(node)); return this.finish(node, out); }
     if (op === 'iinc') {
@@ -818,7 +937,7 @@ class ClosedCompiler {
       case 'field-get': return this.fieldAccess(node, plan, false);
       case 'field-put': return this.fieldAccess(node, plan, true);
       case 'static-get': return this.staticGet(plan);
-      case 'static-put': return [...arg(0, plan.valueKind), ...this.staticPut(plan)];
+      case 'static-put': return [...this.useAs(node.args[0], plan.valueKind, this.world.reprOfDescriptor(node.imm[2][1])), ...this.staticPut(plan)];
       case 'call': return this.call(node, plan);
       case 'virtual': return this.virtualCall(node, plan);
       case 'noop': return [];
@@ -928,9 +1047,12 @@ class ClosedCompiler {
     return [OP.global_set, { global: plan.global }];
   }
 
-  callArgs(node, plan) {
+  // Arguments in order, each as the callee's parameter representation
+  // (anyref for host imports).
+  callArgs(node, plan, fnKey = plan.fn) {
+    const callee = this.calleeOf(fnKey);
     const code = [];
-    plan.argKinds.forEach((kind, i) => code.push(...this.use(node.args[i], kind)));
+    plan.argKinds.forEach((kind, i) => code.push(...this.useAs(node.args[i], kind, callee ? callee.paramReprs[i] : 'any')));
     return code;
   }
 
@@ -946,12 +1068,22 @@ class ClosedCompiler {
   // allows them; an unknown class id is a loud closed-world failure.
   virtualCall(node, plan) {
     const receiver = this.use(node.args[0], 'A');
-    const resultType = plan.returnKind === 'V' ? 0x40 : WT[plan.returnKind];
+    const receiverIsObj = this.reprOf(node.args[0]) === 'obj';
+    // Admitted implementations share the descriptor, so they agree on the
+    // result representation; host arms return anyref and are cast to it.
+    const resultRepr = plan.returnKind === 'A' ? this.reprOf(node) : null;
+    plan.resultRepr = resultRepr || 'any';
+    const resultType = plan.returnKind === 'V' ? [0x40] : wasmType(plan.returnKind, resultRepr);
+    const castResult = typed(resultRepr) ? [...GC.ref_cast_null, { stype: REPR_TYPE[resultRepr] }] : [];
     const cls = this.temp([VT.i32]);
-    const args = this.callArgs(node, plan);
     const code = [...this.nonNull(receiver), OP.drop];
-    code.push(...receiver, ...GC.ref_test, { stype: T_OBJ }, OP.if, resultType,
-      ...receiver, ...GC.ref_cast, { stype: T_OBJ }, ...GC.struct_get, { type: T_OBJ }, OBJ.cls, OP.local_set, ...uleb(cls));
+    if (receiverIsObj) {
+      code.push(...receiver, ...GC.struct_get, { type: T_OBJ }, OBJ.cls, OP.local_set, ...uleb(cls),
+        OP.i32_const, 1, OP.if, ...resultType);
+    } else {
+      code.push(...receiver, ...GC.ref_test, { stype: T_OBJ }, OP.if, ...resultType,
+        ...receiver, ...GC.ref_cast, { stype: T_OBJ }, ...GC.struct_get, { type: T_OBJ }, OBJ.cls, OP.local_set, ...uleb(cls));
+    }
     const arms = plan.targets; // [{classIds:[...], fn}]
     let open = 0;
     for (const arm of arms) {
@@ -959,14 +1091,17 @@ class ClosedCompiler {
         code.push(OP.local_get, ...uleb(cls), OP.i32_const, ...sleb(arm.classIds[i]), OP.i32_eq);
         if (i) code.push(OP.i32_or);
       }
-      code.push(OP.if, resultType, ...args, OP.call, { fn: arm.fn }, OP.else);
+      const callee = this.calleeOf(arm.fn);
+      code.push(OP.if, ...resultType, ...this.callArgs(node, plan, arm.fn), OP.call, { fn: arm.fn });
+      if (!callee) code.push(...castResult);
+      code.push(OP.else);
       open += 1;
     }
     code.push(OP.local_get, ...uleb(cls), OP.i32_const, ...sleb(plan.siteId),
       OP.call, { fn: this.world.hostImport('vmiss', [VT.i32, VT.i32], []) }, OP.unreachable);
     for (let i = 0; i < open; i++) code.push(OP.end);
     code.push(OP.else);
-    if (plan.hostFn) code.push(...args, OP.call, { fn: plan.hostFn });
+    if (plan.hostFn) code.push(...this.callArgs(node, plan, plan.hostFn), OP.call, { fn: plan.hostFn }, ...castResult);
     else code.push(OP.i32_const, ...sleb(-1), OP.i32_const, ...sleb(plan.siteId),
       OP.call, { fn: this.world.hostImport('vmiss', [VT.i32, VT.i32], []) }, OP.unreachable);
     code.push(OP.end);
@@ -979,10 +1114,13 @@ class ClosedCompiler {
   typeTest(node, plan, isCast) {
     const value = this.use(node.args[0], 'A');
     let test;
+    const repr = this.reprOf(node.args[0]);
     if (plan.classIds) {
       const cls = this.temp([VT.i32]);
-      test = [...value, ...GC.ref_test, { stype: T_OBJ }, OP.if, VT.i32,
-        ...value, ...GC.ref_cast, { stype: T_OBJ }, ...GC.struct_get, { type: T_OBJ }, OBJ.cls, OP.local_set, ...uleb(cls)];
+      test = repr === 'obj'
+        ? [OP.i32_const, 1, OP.if, VT.i32, ...value, ...GC.struct_get, { type: T_OBJ }, OBJ.cls, OP.local_set, ...uleb(cls)]
+        : [...value, ...GC.ref_test, { stype: T_OBJ }, OP.if, VT.i32,
+          ...value, ...GC.ref_cast, { stype: T_OBJ }, ...GC.struct_get, { type: T_OBJ }, OBJ.cls, OP.local_set, ...uleb(cls)];
       if (!plan.classIds.length) test.push(OP.i32_const, 0);
       plan.classIds.forEach((id, i) => {
         test.push(OP.local_get, ...uleb(cls), OP.i32_const, ...sleb(id), OP.i32_eq);
@@ -1009,4 +1147,4 @@ class ClosedCompiler {
   }
 }
 
-module.exports = { ClosedCompiler, Unsupported, WT, successorsOf };
+module.exports = { ClosedCompiler, Unsupported, WT, wasmType, successorsOf };

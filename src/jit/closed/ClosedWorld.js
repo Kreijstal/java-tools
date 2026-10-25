@@ -23,7 +23,7 @@
 const { buildSsa, resolveHandlerRanges } = require('../../analysis/opgraph/ssa');
 const { VT, ModuleBuilder } = require('./wasmBuilder');
 const { closedTypes } = require('./representation');
-const { ClosedCompiler, Unsupported, WT } = require('./ClosedCompiler');
+const { ClosedCompiler, Unsupported, WT, wasmType } = require('./ClosedCompiler');
 
 const REJECT_OPS = new Set(['jsr', 'jsr_w', 'ret', 'invokedynamic']);
 const NEWARRAY = { 4: 'boolean', 5: 'char', 6: 'float', 7: 'double', 8: 'byte', 9: 'short', 10: 'int', 11: 'long' };
@@ -122,6 +122,28 @@ class ClosedWorld {
     const ast = this.classAst(name);
     return !!ast && ((ast.flags || []).includes('abstract') || (ast.flags || []).includes('interface'));
   }
+  // Closed representation every value of a Java static type has inside the
+  // module: 'obj' ($obj), 'parr' ($parr), 'rarr' ($rarr), or 'any' (anyref:
+  // host values possible). Arrays are always closed storage (foreign arrays
+  // are adopted when they cross in); a guest class with a closed layout and
+  // no JRE shim only ever has closed instances.
+  reprOfDescriptor(descriptor) {
+    if (!descriptor) return 'any';
+    this.reprCache ||= new Map();
+    let repr = this.reprCache.get(descriptor);
+    if (repr !== undefined) return repr;
+    if (descriptor[0] === '[') repr = /^\[[ZBCSIJFD]$/.test(descriptor) ? 'parr' : 'rarr';
+    else if (descriptor[0] === 'L') repr = this.reprOfClass(descriptor.slice(1, -1));
+    else repr = 'any';
+    this.reprCache.set(descriptor, repr);
+    return repr;
+  }
+
+  reprOfClass(className) {
+    if (!this.isGuestClass(className) || (this.jvm.jre && this.jvm.jre[className]) || this.isInterface(className)) return 'any';
+    return this.runtime.layout(className) ? 'obj' : 'any';
+  }
+
   classId(name) { return (this.objectModel ||= require('../../core/objectModel')).classIndexOf(this.jvm, name); }
 
   findDeclaredMethod(className, name, descriptor) {
@@ -235,6 +257,13 @@ class ClosedWorld {
   // An import that never throws: bound directly, with no conversion wrapper.
   pureImport(key, params, results, impl) {
     if (!this.imports.has(key)) this.imports.set(key, { field: key, params, results, impl, pure: true });
+    return key;
+  }
+
+  // A static field the module defines (and exports for its cell to rebind to).
+  staticGlobal(key, valtype, cell) {
+    this.staticGlobals ||= new Map();
+    if (!this.staticGlobals.has(key)) this.staticGlobals.set(key, { valtype, cell });
     return key;
   }
 
@@ -518,7 +547,9 @@ class ClosedWorld {
       key, className, method, fn, isStatic,
       paramKinds: [...(isStatic ? [] : ['A']), ...params.map(kindOf)],
       paramDescriptors: params,
+      paramReprs: [...(isStatic ? [] : [this.reprOfClass(className)]), ...params.map((p) => this.reprOfDescriptor(p))],
       returnKind: kindOf(ret),
+      returnRepr: this.reprOfDescriptor(ret),
       plan: new Map(),
       calls: new Set(),
       initClasses: new Set(),
@@ -587,8 +618,8 @@ class ClosedWorld {
         const cell = store.cell(`${name}:${descriptor}`);
         if (!cell.closedGlobal) throw new Unsupported(`static-not-closed: ${declaring}.${name}`);
         const valueKind = kindOf(descriptor);
-        const valtype = cell.closedType === 'anyref' ? [VT.anyref] : [WT[valueKind]];
-        const global = this.globalImport(`s:${declaring}.${name}:${descriptor}`, valtype, true, cell.closedGlobal);
+        const valtype = cell.closedType === 'anyref' ? wasmType('A', this.reprOfDescriptor(descriptor)) : [WT[valueKind]];
+        const global = this.staticGlobal(`s:${declaring}.${name}:${descriptor}`, valtype, cell);
         record.initClasses.add(declaring);
         plan.set(node.id, { kind: op === 'getstatic' ? 'static-get' : 'static-put', global, valueKind,
           initClass: this.initCheckFor(record, declaring) });
@@ -940,6 +971,15 @@ class ClosedWorld {
       builder.importGlobal('s', field, g.valtype, g.mutable, key);
       importObject.s[field] = g.mutable ? g.value : new WebAssembly.Global({ value: 'externref', mutable: false }, g.value);
     }
+    const { OP: O, HT: H, f32bytes: f32b, f64bytes: f64b } = require('./wasmBuilder');
+    let staticIndex = 0;
+    for (const [key, g] of this.staticGlobals || []) {
+      const init = { [VT.i32]: [O.i32_const, 0], [VT.i64]: [O.i64_const, 0], [VT.f32]: [O.f32_const, ...f32b(0)],
+        [VT.f64]: [O.f64_const, ...f64b(0)] }[g.valtype[0]] || [O.ref_null, H.none];
+      builder.addGlobal(key, g.valtype, true, init);
+      g.exportName = `s${staticIndex++}`;
+      builder.exportGlobal(g.exportName, key);
+    }
     let importIndex = 0;
     const countImports = process.env?.JVM_CLOSED_WORLD_STATS === 'imports';
     if (countImports) this.importCalls = new Map();
@@ -961,8 +1001,8 @@ class ClosedWorld {
     let exportIndex = 0;
     for (const [key, record] of this.entries) {
       record.exportName = `m${exportIndex++}`;
-      const params = record.paramKinds.map((k) => [WT[k]]);
-      const results = record.returnKind === 'V' ? [] : [[WT[record.returnKind]]];
+      const params = record.paramKinds.map((k, i) => wasmType(k, record.paramReprs[i]));
+      const results = record.returnKind === 'V' ? [] : [wasmType(record.returnKind, record.returnRepr)];
       builder.declareFunction(`m:${key}`, params, results);
       if (record.synchronized) builder.declareFunction(`m:${key}$body`, params, results);
       builder.exportFunction(record.exportName, `m:${key}`);
@@ -978,6 +1018,7 @@ class ClosedWorld {
     if (process.env.JVM_CLOSED_WORLD_DUMP) require('node:fs').writeFileSync(process.env.JVM_CLOSED_WORLD_DUMP, bytes);
     const instance = new WebAssembly.Instance(new WebAssembly.Module(bytes), importObject);
     this.instance = instance;
+    for (const g of (this.staticGlobals || new Map()).values()) g.cell.rebind(instance.exports[g.exportName]);
     for (const record of this.entries.values()) {
       record.fn = instance.exports[record.exportName];
       record.ready = false;
@@ -995,11 +1036,11 @@ class ClosedWorld {
     const n = record.paramKinds.length;
     const lock = n, result = n + 1;
     const hasResult = record.returnKind !== 'V';
-    const locals = [[VT.anyref], ...(hasResult ? [[WT[record.returnKind]]] : [])];
+    const locals = [[VT.anyref], ...(hasResult ? [wasmType(record.returnKind, record.returnRepr)] : [])];
     const lockCode = record.isStatic ? [OP.global_get, { global: record.lockGlobal }, ...GC.any_convert_extern] : [OP.local_get, 0];
     const call = (name) => [OP.local_get, ...uleb(lock), OP.call, { fn: this.hostImport(name, [VT.anyref], []) }];
     const code = [...lockCode, OP.local_set, ...uleb(lock), ...call('menter'),
-      OP.try, hasResult ? WT[record.returnKind] : 0x40];
+      OP.try, ...(hasResult ? wasmType(record.returnKind, record.returnRepr) : [0x40])];
     for (let i = 0; i < n; i++) code.push(OP.local_get, ...uleb(i));
     code.push(OP.call, { fn: `m:${key}$body` }, OP.catch_all, ...call('mexit'), OP.rethrow, 0, OP.end);
     if (hasResult) code.push(OP.local_set, ...uleb(result));
