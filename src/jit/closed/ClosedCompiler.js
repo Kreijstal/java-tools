@@ -992,30 +992,35 @@ class ClosedCompiler {
     const t = WT[kind];
     const array = this.use(node.args[0], 'A'), index = this.use(node.args[1], 'I');
     const value = store ? this.use(node.args[2], kind) : [];
+    const host = this.world.hostImport(`${store ? 'astore' : 'aload'}_${kind}`,
+      store ? [VT.anyref, VT.i32, t] : [VT.anyref, VT.i32], store ? [] : [t]);
+    const hostAccess = [...array, ...index, ...value, OP.call, { fn: host }];
+    const storage = (base, native) => [...base, OP.i32_const, 0, OP.i32_ge_s,
+      OP.if, store ? 0x40 : t, ...native, OP.else, ...hostAccess, OP.end];
     const derived = this.derived.get(node.args[0].id)?.parr;
     if (derived) {
       const L = (i) => uleb(i);
       return [...this.indexCheck(array, index, derived.len),
-        OP.local_get, ...L(derived.base), ...index, ...(shift ? [OP.i32_const, shift, OP.i32_shl] : []), OP.i32_add,
-        ...value, memOp, align, 0];
+        ...storage([OP.local_get, ...L(derived.base)], [
+          OP.local_get, ...L(derived.base), ...index, ...(shift ? [OP.i32_const, shift, OP.i32_shl] : []), OP.i32_add,
+          ...value, memOp, align, 0])];
     }
     if (this.reprOf(node.args[0]) === 'parr') {
+      const base = [...array, ...GC.struct_get, { type: T_PARR }, PARR.base];
       return [...this.typedIndexCheck(array, index, [...GC.struct_get, { type: T_PARR }, PARR.len]),
-        ...array, ...GC.struct_get, { type: T_PARR }, PARR.base, ...index, ...(shift ? [OP.i32_const, shift, OP.i32_shl] : []), OP.i32_add,
-        ...value, memOp, align, 0];
+        ...storage(base, [...base, ...index, ...(shift ? [OP.i32_const, shift, OP.i32_shl] : []), OP.i32_add,
+          ...value, memOp, align, 0])];
     }
     const pType = refNull(T_PARR);
     const p = this.temp(pType), len = this.temp([VT.i32]);
-    const host = this.world.hostImport(`${store ? 'astore' : 'aload'}_${kind}`,
-      store ? [VT.anyref, VT.i32, t] : [VT.anyref, VT.i32], store ? [] : [t]);
-    const address = [OP.local_get, ...uleb(p), ...GC.struct_get, { type: T_PARR }, PARR.base,
-      ...index, ...(shift ? [OP.i32_const, shift, OP.i32_shl] : []), OP.i32_add];
+    const base = [OP.local_get, ...uleb(p), ...GC.struct_get, { type: T_PARR }, PARR.base];
+    const address = [...base, ...index, ...(shift ? [OP.i32_const, shift, OP.i32_shl] : []), OP.i32_add];
     const out = [...array, ...GC.ref_test, { stype: T_PARR }, OP.if, store ? 0x40 : t,
       ...array, ...GC.ref_cast, { stype: T_PARR }, OP.local_tee, ...uleb(p),
       ...GC.struct_get, { type: T_PARR }, PARR.len, OP.local_set, ...uleb(len),
       ...this.boundsCheck(index, len),
-      ...address, ...value, memOp, align, 0,
-      OP.else, ...array, ...index, ...value, OP.call, { fn: host }, OP.end];
+      ...storage(base, [...address, ...value, memOp, align, 0]),
+      OP.else, ...hostAccess, OP.end];
     this.release(pType, p);
     this.release([VT.i32], len);
     return out;

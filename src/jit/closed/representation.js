@@ -170,7 +170,7 @@ class ClosedRuntime {
     let adopted;
     if (KIND[type] !== undefined) {
       adopted = this.heap.alloc(type, length);
-      if (!adopted || adopted.buffer !== this.heap.memory.buffer) return value;
+      if (!adopted) return value;
       for (let i = 0; i < length; i++) {
         const v = source[i];
         adopted[i] = type === '[J' ? BigInt(v ?? 0) : (typeof v === 'boolean' ? (v ? 1 : 0) : (v ?? 0));
@@ -186,7 +186,8 @@ class ClosedRuntime {
       adopted = this.referenceArray(copy);
     }
     adopted.hashCode = value.hashCode ?? this.jvm.nextHashCode++;
-    const store = adopted[STORE] ?? this.parrOf(adopted);
+    const store = adopted[STORE] ?? (KIND[type] !== undefined && adopted.buffer !== this.heap.memory.buffer
+      ? this.spillPrimitiveArray(adopted) : this.parrOf(adopted));
     Object.defineProperty(value, STORE, { value: store, configurable: true });
     this.adoptedArrays += 1;
     return store;
@@ -200,7 +201,9 @@ class ClosedRuntime {
     const base = this.heap.allocExtent(desc, count);
     if (base < 0) {
       const { allocPrimitiveArray } = require('../../instructions/object');
-      return this.toWasm(allocPrimitiveArray(this.jvm, ELEMENT_TYPE[desc], count));
+      const array = allocPrimitiveArray(this.jvm, ELEMENT_TYPE[desc], count);
+      const native = this.parrOf(array);
+      return native === array ? this.spillPrimitiveArray(array) : native;
     }
     const store = this.ops.newParr(base, count, kind, null);
     this.heap.registerExtent(store, base, count << KIND_SHIFT[kind]);
@@ -238,6 +241,15 @@ class ClosedRuntime {
   // offsets in linear memory, reference fields at fixed indices of `refs`.
   // An inherited field has the same offset/index in every subclass, so a
   // compiled field access needs only the declaring class.
+  spillPrimitiveArray(view) {
+    if (view[STORE] !== undefined) return view[STORE];
+    const kind = KIND[view.type];
+    if (kind === undefined) throw new TypeError('Primitive array descriptor required');
+    const store = this.ops.newParr(-1, view.length, kind, view);
+    Object.defineProperty(view, STORE, { value: store });
+    return store;
+  }
+
   layout(className) {
     const jvm = this.jvm, classData = jvm.classes[className];
     if (!classData) return null;
