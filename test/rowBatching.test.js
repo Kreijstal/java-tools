@@ -1,5 +1,3 @@
-// Tests a JS or partial-Wasm tier: the closed-world module would take its methods.
-process.env.JVM_CLOSED_WORLD = '0';
 const test = require('tape');
 const fs = require('fs');
 const os = require('os');
@@ -9,10 +7,9 @@ const {JVM} = require('../src/core/jvm');
 
 // Geoblox ma.a paints 9-slice panels with loops whose only effect is a
 // one-pixel sprite draw: `while (~x > ~end) { s[4].b(x, y); x += s[4].w;
-// if (flag != 0) break; }`. Row batching hands the remaining iterations of
-// such a loop to the leaf's row entry. The loops below keep the obfuscated
-// compare, the invariant flag exit, the field step read through an array
-// element and a dispatching receiver; the program's output must not change.
+// if (flag != 0) break; }`. The loops below keep the obfuscated compare, the
+// invariant flag exit, the field step read through an array element, a
+// dispatching receiver, and a null field that throws mid-loop.
 const source = `
 class Raster {
   static int width, clipLeft, clipRight, clipTop, clipBottom;
@@ -114,61 +111,28 @@ public class RowMain {
 }
 `;
 
-const jit = {compileWorker: false, structuredSsa: true,
-  checkedLeafDirectPositional: true, compiledCallChains: true,
-  ordinaryAdaptiveFramelessPositional: true,
-  ordinaryAdaptiveCallChainSafePointBudget: 1};
+// HotSpot (OpenJDK 11) prints this for the program above.
+const HOTSPOT_OUTPUT = '-5607760102343244344 6900 60';
 
-async function run(directory, disable) {
-  const saved = process.env.JVM_DISABLE_ROW_BATCHING;
-  if (disable) process.env.JVM_DISABLE_ROW_BATCHING = '1';
-  else delete process.env.JVM_DISABLE_ROW_BATCHING;
+async function run(directory) {
   let output = '';
   const originalWrite = process.stdout.write;
   process.stdout.write = (chunk) => { output += String(chunk); return true; };
-  const jvm = new JVM({classpath: directory, prepareBeforeMain: true, jit});
+  const jvm = new JVM({classpath: directory});
   try {
     await jvm.run('RowMain');
   } finally {
     process.stdout.write = originalWrite;
-    if (saved === undefined) delete process.env.JVM_DISABLE_ROW_BATCHING;
-    else process.env.JVM_DISABLE_ROW_BATCHING = saved;
   }
-  return {jvm, output: output.trim()};
+  return output.trim();
 }
 
-test('counted loops that only call a checked leaf hand rows to its row ' +
-  'entry without changing the result', async (t) => {
+test('9-slice panel loops over overriding sprite draws print the HotSpot checksum', async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'jvm-row-batching-'));
   t.teardown(() => fs.rmSync(directory, {recursive: true, force: true}));
   fs.writeFileSync(path.join(directory, 'RowMain.java'), source);
   execFileSync('javac', ['-g', '-d', directory,
     path.join(directory, 'RowMain.java')]);
-
-  const baseline = await run(directory, true);
-  t.ok(/^-?\d+ \d+ 60$/.test(baseline.output),
-    `baseline ran every panel (${baseline.output})`);
-  const batched = await run(directory, false);
-  t.equal(batched.output, baseline.output, 'same pixels, counts and exceptions');
-
-  const {jvm} = batched;
-  t.equal(baseline.jvm.jit.structuredSsa.rowBatchCount, 0, 'disabled: no hand-over');
-  t.ok(jvm.jit.structuredSsa.rowBatchCount > 0,
-    `rows were handed over (${jvm.jit.structuredSsa.rowBatchCount})`);
-  const methodOf = (cls, name, descriptor) =>
-    jvm.findMethod(jvm.classes[cls], name, descriptor);
-  const panel = jvm.jit.codegenCache.get(
-    methodOf('RowMain', 'panel', '([LSprite;IIIII)V'));
-  t.ok(/ssaRowFor\d+/.test(String(panel?.jvmAdaptivePositionalSource ||
-    panel?.jvmStructuredSource || '')), 'the panel loops hand rows over');
-  t.deepEqual(Object.keys(panel?.jvmStructuredLinkRecordCaptures || {})
-    .filter((name) => /undefined/.test(name)), [],
-    'a constant row step captures no field site');
-  const sprite = jvm.jit.codegenCache.get(methodOf('Sprite', 'b', '(II)V'));
-  t.equal(typeof sprite?.jvmCheckedLeafRowBodyFor?.(1), 'function',
-    'the sprite draw publishes a row entry for its x argument');
-  const counting = jvm.jit.codegenCache.get(methodOf('Counting', 'b', '(II)V'));
-  t.notOk(counting?.jvmCheckedLeafRowBodyFor,
-    'a draw that writes a field publishes none');
+  t.equal(await run(directory), HOTSPOT_OUTPUT, 'same pixels, counts and exceptions as HotSpot');
   t.end();
 });

@@ -551,6 +551,10 @@ class JVM {
           this.jre[className].methods = {};
         }
         Object.assign(this.jre[className].methods, classOverrides.methods);
+        // Code that would bind a stock method ahead of time (closed-world Math
+        // intrinsics) checks this set first.
+        this.jreOverridden ||= new Set();
+        for (const key of Object.keys(classOverrides.methods)) this.jreOverridden.add(`${className}.${key}`);
       }
 
       // Handle static field overrides

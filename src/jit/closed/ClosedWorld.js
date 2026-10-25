@@ -1000,7 +1000,8 @@ class ClosedWorld {
     const argKinds = [...(op === 'invokestatic' ? [] : ['A']), ...params.map(kindOf)];
     const returnKind = kindOf(ret);
     const where = this.where(record, node);
-    if (op === 'invokestatic' && (owner === 'java/lang/Math' || owner === 'java/lang/StrictMath')) {
+    if (op === 'invokestatic' && (owner === 'java/lang/Math' || owner === 'java/lang/StrictMath') &&
+        !this.jvm.jreOverridden?.has(`${owner}.${name}${descriptor}`)) {
       const intrinsic = this.mathIntrinsic(name, descriptor);
       if (intrinsic) { record.plan.set(node.id, { ...intrinsic, argKinds }); return; }
     }

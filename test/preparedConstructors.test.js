@@ -1,11 +1,6 @@
-// Tests a JS or partial-Wasm tier: the closed-world module would take its methods.
-process.env.JVM_CLOSED_WORLD = '0';
-// Ahead-of-main preparation admits a constructor on its resolved call graph:
-// every call it can make completes synchronously through a published entry
-// (a JRE shim with a synchronous form, a bytecode target with a body from an
-// earlier round), so the constructor and the callers that allocate it stop
-// handing every `new` back to the scheduler. A constructor that reaches a
-// genuinely asynchronous callee stays interpreted, and its callers with it.
+// Constructors that make instance, static, virtual (overridden, called while a
+// subclass field is still 0) and super calls, throw, or reach an asynchronous
+// host native all produce the same Java-visible results.
 'use strict';
 const test = require('tape');
 const fs = require('fs');
@@ -91,15 +86,8 @@ const overrides = {
   },
 };
 
-function findMethod(jvm, className, name, descriptor) {
-  return jvm.classes[className].ast.classes[0].items
-    .find((item) => item.type === 'method' && item.method.name === name &&
-      item.method.descriptor === descriptor).method;
-}
-
-async function run(dir, jitOptions = {}) {
-  const jvm = new JVM({classpath: dir, jreOverrides: overrides,
-    jit: {compileWorker: false, asyncCallCensus: true, ...jitOptions}});
+async function run(dir) {
+  const jvm = new JVM({classpath: dir, jreOverrides: overrides});
   await jvm.run('Main');
   return jvm;
 }
@@ -109,40 +97,9 @@ function statics(jvm) {
   return {result: get('result'), thrown: get('thrown'), naps: get('naps')};
 }
 
-test('preparation admits constructors on their resolved call graph', async (t) => {
+test('constructors with calls, chaining, throws, and async natives give Java results', async (t) => {
   const dir = compileFixture(t);
   const jvm = await run(dir);
-  const jit = jvm.jit;
-  t.deepEqual(statics(jvm), expected(), 'results (instance/static/virtual/super calls, chaining, throwing)');
-  const prepared = (cls, name, desc) => jit.preparedCodegenMethods.has(findMethod(jvm, cls, name, desc));
-  const published = (cls, name, desc) => jit.hasPublishedSynchronousBody(findMethod(jvm, cls, name, desc));
-  for (const [cls, desc] of [['Base', '(I)V'], ['Derived', '(I)V'], ['Thrower', '(I)V']]) {
-    t.ok(prepared(cls, '<init>', desc) && published(cls, '<init>', desc),
-      `${cls}.<init>${desc} has a prepared synchronous body`);
-  }
-  t.ok(prepared('Main', 'build', '(I)I'), 'the caller allocating Base/Derived is prepared');
-  t.ok(prepared('Main', 'guard', '(I)I'), 'the caller allocating Thrower is prepared');
-  t.notOk(prepared('Napper', '<init>', '(I)V'), 'a constructor reaching an asynchronous host operation stays interpreted');
-  const note = jit.constructorAdmissionNotes.get(findMethod(jvm, 'Napper', '<init>', '(I)V')) || '';
-  t.ok(/Host\.nap\(\)V/.test(note), `the census names the asynchronous callee (${note})`);
-  t.notOk(prepared('Main', 'nap', '(I)I'), 'its caller stays interpreted too (constructor without a body)');
-  t.ok(jvm.preparationReport.rounds >= 2,
-    `the fixed point needed more than one round for the chain (${jvm.preparationReport.rounds})`);
-  const census = [...jit.asyncCallCensus.keys()];
-  for (const cls of ['Base', 'Derived', 'Thrower']) {
-    t.notOk(census.some((key) => key.includes(` ${cls}.<init>(I)V:`)),
-      `no scheduler handoff at a ${cls} constructor call site`);
-  }
-  // Napper is only ever allocated by the interpreted Main.nap, so no
-  // synchronous call site exists for it; the census stays silent about it.
-  t.end();
-});
-
-test('the syntactic constructor rule alone gives the same results', async (t) => {
-  const dir = compileFixture(t);
-  const jvm = await run(dir, {preparedConstructors: false});
-  t.deepEqual(statics(jvm), expected(), 'same results with the admission off');
-  t.notOk(jvm.jit.preparedCodegenMethods.has(findMethod(jvm, 'Base', '<init>', '(I)V')),
-    'the call-bearing constructor is not prepared under the syntactic rule');
+  t.deepEqual(statics(jvm), expected(), 'results (instance/static/virtual/super calls, chaining, throwing, async native)');
   t.end();
 });

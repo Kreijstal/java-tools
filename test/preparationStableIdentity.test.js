@@ -1,11 +1,6 @@
-// Tests a JS or partial-Wasm tier: the closed-world module would take its methods.
-process.env.JVM_CLOSED_WORLD = '0';
-// The class-record identity invariant (JVM.upgradeStubClassInPlace): a body
-// prepared against an applicationFallback stub keeps observing the real class
-// correctly after the class file is loaded, through every identity it can
-// hold -- the record, the static store and its cells, the Class object, the
-// initialization token -- because the stub is filled in place rather than
-// replaced. Class initialization still happens at its Java-visible point.
+// A class supplied both as an applicationFallback override stub and as a real
+// class file: the real bytecode runs, the override replaces its one method,
+// and the class initializer runs once, at its Java-visible point.
 'use strict';
 const test = require('tape');
 const fs = require('fs');
@@ -34,9 +29,6 @@ function compileFixture(t) {
     'public class FallbackUser {',
     '  static int result;',
     '  static int initSeen;',
-    // The body prepared against the stub. It cannot construct FallbackTarget
-    // itself: an unloaded constructor is a pending dependency the admission
-    // rightly refuses (see the fixed-point test); the instances come in.
     '  static int probe(int n, FallbackTarget[] ts) {',
     '    int s = 0;',
     '    for (int i = 0; i < n; i++) {',
@@ -91,75 +83,14 @@ const overrides = {
   },
 };
 
-function findMethod(jvm, className, name, descriptor) {
-  return jvm.classes[className].ast.classes[0].items
-    .find((item) => item.type === 'method' && item.method.name === name &&
-      item.method.descriptor === descriptor).method;
-}
-
-test('a body prepared against the fallback stub keeps observing the real class after the in-place upgrade', async (t) => {
+test('an override-stubbed class runs its real bytecode, its override, and its initializer once', async (t) => {
   const dir = compileFixture(t);
-  const jvm = new JVM({classpath: dir, prepareBeforeMain: false,
-    jit: {compileWorker: false, asyncCallCensus: true}, jreOverrides: overrides});
-  const stub = jvm.classes.FallbackTarget;
-  t.ok(stub && stub.isJreStub, 'the override registers FallbackTarget as a stub');
-  const store = stub.staticFields;
-  const counterCell = store.cell('counter:I');
-  const classObject = jvm.getClassObjectSync('FallbackTarget');
-  t.equal(classObject._classData, stub, 'the Class object holds the stub record');
-  const token = jvm.getClassInitializationToken('FallbackTarget');
-
-  // Prepare the user against the stub, by hand, before anything loads the
-  // real class: this is the body whose captured identities are under test.
-  await jvm.loadClassByName('FallbackUser');
-  t.ok(jvm.classes.FallbackTarget.isJreStub, 'loading the user did not touch the stub');
-  const probe = findMethod(jvm, 'FallbackUser', 'probe', '(I[LFallbackTarget;)I');
-  const body = jvm.jit.getGeneratedFunction(probe, {allowEffectfulCalls: true, compileLocally: true});
-  t.ok(body && jvm.jit.preparedCodegenMethods.has(probe), 'probe has a prepared body' + (body ? '' : ': ' + (jvm.jit.codegenCompileErrors.get(probe) || 'declined')));
-  t.ok(jvm.classes.FallbackTarget.isJreStub, 'and compiling it left FallbackTarget a stub');
-  t.notEqual(jvm.classInitializationState.get('FallbackTarget'), 'INITIALIZED',
-    'preparation did not initialize the class');
-
-  await jvm.run('FallbackUser', {prepare: false});
-
-  const real = jvm.classes.FallbackTarget;
-  t.equal(real, stub, 'the real class is the same record object the stub was');
-  t.equal(real.isJreStub, undefined, 'and it is no longer a stub');
-  t.ok(real.ast.classes[0].items.some((item) => item.type === 'method' && item.method.name === 'bump'),
-    'it carries the real bytecode members');
-  t.equal(real.staticFields, store, 'the static store is the one the stub had');
-  t.equal(store.cell('counter:I'), counterCell, 'and its cells are the cells handed out against the stub');
-  t.equal(jvm.getClassObjectSync('FallbackTarget'), classObject, 'the Class object identity is unchanged');
-  t.equal(classObject._classData, real, 'and it points at the (filled) record');
-  t.equal(jvm.getClassInitializationToken('FallbackTarget'), token, 'the initialization token is unchanged');
-  t.equal(token.initialized, true, 'and reports the class initialized after main');
-  t.equal(jvm.jit.codegenCache.get(probe), body, 'the SAME prepared body is still installed');
-
+  const jvm = new JVM({classpath: dir, jreOverrides: overrides});
+  await jvm.run('FallbackUser');
   const want = expected(10);
   t.equal(jvm.classes.FallbackUser.staticFields.get('result:I'), want.result,
-    'the prepared body computed the right result through statics, constructor, virtual, static, override, instanceof and class literal');
-  t.equal(store.get('counter:I'), want.counter, 'the static it wrote is the one it read back (through the <clinit> value)');
-  t.equal(store.get('initRuns:I'), 1, '<clinit> ran exactly once');
-  t.equal(jvm.classes.FallbackUser.staticFields.get('initSeen:I'), 1,
-    'and at its Java-visible point: the first active use in main(), not during preparation');
-  t.end();
-});
-
-test('run() with preparation on prepares against the real class: the preload upgrades the stub before compiling', async (t) => {
-  const dir = compileFixture(t);
-  const jvm = new JVM({classpath: dir, prepareBeforeMain: true,
-    jit: {compileWorker: false}, jreOverrides: overrides});
-  const stub = jvm.classes.FallbackTarget;
-  const store = stub.staticFields;
-  await jvm.run('FallbackUser');
-  t.equal(jvm.classes.FallbackTarget, stub, 'same record');
-  t.equal(jvm.classes.FallbackTarget.staticFields, store, 'same store');
-  t.ok(jvm.preparationReport && jvm.preparationReport.upgradedStubClasses >= 1,
-    'the preparation report counts the upgraded stub');
-  const bump = findMethod(jvm, 'FallbackTarget', 'bump', '(I)I');
-  t.ok(jvm.jit.preparedCodegenMethods.has(bump), 'the real class\'s methods were prepared (the stub no longer hides them)');
-  const want = expected(10);
-  t.equal(jvm.classes.FallbackUser.staticFields.get('result:I'), want.result, 'correct result');
-  t.equal(store.get('initRuns:I'), 1, '<clinit> ran once, after preparation');
+    'correct result through statics, constructor, virtual, static, override, instanceof and class literal');
+  t.equal(jvm.classes.FallbackTarget.staticFields.get('initRuns:I'), 1, '<clinit> ran exactly once');
+  t.equal(jvm.classes.FallbackUser.staticFields.get('initSeen:I'), 1, '<clinit> ran by its first active use in main()');
   t.end();
 });

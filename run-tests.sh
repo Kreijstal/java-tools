@@ -83,8 +83,6 @@ run_test() {
     *data-zip-download*) timeout_cmd=(timeout 60);;
     */breakpointLocations.test.js) timeout_cmd=(timeout 120);;
     */hierarchyRename.test.js) timeout_cmd=(timeout 60);;
-    */structuredColdResume.test.js) timeout_cmd=(timeout 60);; # ~12 s alone
-    */hotCallGraphRegion.test.js) timeout_cmd=(timeout 120);;
     */jitCompiler.test.js) timeout_cmd=(timeout 600);;
     */javaFrontendAllJavaCompile.test.js) timeout_cmd=(timeout 180);;
     */javaFrontendIr.test.js) timeout_cmd=(timeout 120);;
@@ -98,7 +96,7 @@ run_test() {
     */wasmInstanceLink.test.js) timeout_cmd=(timeout 120);;
     # These decompile whole fixture corpora through CFR-JS: 27-99 s each when
     # measured six at a time on a lightly loaded machine, so 15 s always killed them.
-    */cfrExceptionLoopExits.test.js|*/cfrInvariantFanout.test.js|*/cfrNumericNegation.test.js|\
+    */cfrExceptionLoopExits.test.js|*/cfrFloatingComparisons.test.js|*/cfrInvariantFanout.test.js|*/cfrNumericNegation.test.js|\
     */cfrParallelBackedges.test.js|*/cfrPartitionedLocals.test.js|*/cfrStateMachineReadability.test.js|\
     */complementedRelationRecovery.test.js|*/guardedNestedArrayLoops.test.js|*/javaAstEmitterLoopExits.test.js)
       timeout_cmd=(timeout 300);;

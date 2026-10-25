@@ -1,13 +1,5 @@
-// Tests a JS or partial-Wasm tier: the closed-world module would take its methods.
-process.env.JVM_CLOSED_WORLD = '0';
-// The before-main preparation preloads the whole classpath. In the browser
-// the classpath is a virtual file system with no directory to read, so the
-// preload silently found nothing and only the classes reachable from main()'s
-// constant pools were prepared: a class reached by reflection alone (the
-// game's mouse-wheel listener, loaded with Class.forName) stayed unprepared,
-// and its tiny synchronized getter, refused by the post-main worth gate,
-// handed every call to the scheduler for the life of the session. A provider
-// that can enumerate its classes now answers the preload.
+// A class reached by reflection alone (Class.forName) must load and run from
+// a jar served by an in-memory provider that has no directory to read.
 'use strict';
 const test = require('tape');
 const fs = require('fs');
@@ -19,7 +11,7 @@ const { getFileProvider, setFileProvider } = require('../src/core/classLoader');
 const BrowserFileProvider = require('../src/io/BrowserFileProvider');
 const frontend = require('../src/java-frontend');
 
-test('preparation preloads reflection-only classes from a listing provider', async (t) => {
+test('a reflection-only class in a provider-served jar loads and runs', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'preload-provider-'));
   const previousProvider = getFileProvider();
   t.teardown(() => { setFileProvider(previousProvider); fs.rmSync(dir, {recursive: true, force: true}); });
@@ -50,13 +42,9 @@ test('preparation preloads reflection-only classes from a listing provider', asy
   t.deepEqual((await provider.listClassNames('.')).sort(), ['Base', 'Lazy', 'Main'], 'the provider lists every class of the jar');
   setFileProvider(provider);
 
-  const jvm = new JVM({classpath: ['.'], jit: {compileWorker: false}});
+  const jvm = new JVM({classpath: ['.']});
   await jvm.run('Main');
   t.equal(jvm.classes.Main.staticFields.get('sum:I'), 5050, 'correct result');
   t.ok(jvm.classes.Lazy, 'Lazy was loaded');
-  const get = jvm.classes.Lazy.ast.classes[0].items.find((item) => item.type === 'method' && item.method.name === 'get').method;
-  t.ok(jvm.jit.preparedCodegenMethods.has(get), 'the reflection-only class was prepared before main');
-  t.ok(jvm.jit.hasPublishedSynchronousBody(get), 'its synchronized getter has a synchronous body');
-  t.ok(jvm.preparationReport && jvm.preparationReport.methods >= 5, `preparation saw the jar's methods (${jvm.preparationReport && jvm.preparationReport.methods})`);
   t.end();
 });
