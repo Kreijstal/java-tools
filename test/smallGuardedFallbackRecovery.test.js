@@ -6,7 +6,7 @@ const{shareExistingExitTails:finish}=require('../src/decompiler/cfr')._internals
 const frame=(condition='probe()',prefix='prefix();',guard='keep()',fallback='fallback(2);')=>`Frame:{if(${condition}){${prefix}if(${guard})break Frame;}${fallback}}`;
 
 test('normal emission places a small fallback in exclusive arms without copying condition or guard',()=>{
- const source=frame(),body=[source];finish(body);assert.equal(body.join('\n'),'if(probe()){prefix();if (!(keep())) {fallback(2);}} else {fallback(2);}');
+ const source=frame(),body=[source];finish(body);assert.equal(body.join('\n'),'if(probe()){prefix();if (!keep()) {fallback(2);}} else {fallback(2);}');
  assert.equal(body[0].split('probe()').length-1,1);assert.equal(body[0].split('keep()').length-1,1);assert.equal(fold(body[0]).framesRecovered,0);
 });
 

@@ -101,20 +101,25 @@ function splitLocalLifetimes(source, {retainDiagnostics = false, reservedNames =
       // A shared budget bounds all candidate proofs in this method. Discard
       // every pending edit on exhaustion, retaining deterministic idempotence.
       if (branchIndex.work.exhausted) return unchanged();
-      if (!groups || groups.length < 2) continue;
+      // Only an arm that reads the local observes a value of its own. A
+      // write-only arm stores a dead value; renaming it would add a
+      // declaration without separating any meaning, so it stays in the
+      // original lifetime (always sound: every group is a disjoint arm).
+      const lifetimes = groups?.filter(group => group.read) || [];
+      if (lifetimes.length < 2) continue;
       const ranges = [];
-      for (let index = 1; index < groups.length; index++) {
+      for (let index = 1; index < lifetimes.length; index++) {
         let suffix = index, fresh;
         do { fresh = `${name}Lifetime${suffix++}`; } while (usedNames.has(fresh));
         usedNames.add(fresh);
-        const selected = groups[index];
+        const selected = lifetimes[index].tokens;
         let first = Infinity, last = -Infinity;
         for (const token of selected) edits.push({start: token.range.startOffset, end: token.range.endOffset, text: fresh});
         for (const token of selected) { first = Math.min(first, token.range.startOffset); last = Math.max(last, token.range.endOffset); }
         added.push(`${typeText} ${fresh};`);
         ranges.push({name: fresh, start: first - 2, end: last - 2, references: selected.length});
       }
-      diagnostics.push({name, type: typeText, groups: groups.length, conditional: true, initialized, ranges});
+      diagnostics.push({name, type: typeText, groups: lifetimes.length, conditional: true, initialized, ranges});
       continue;
     }
     // A nested block is eligible only when it contains every use of this
@@ -226,7 +231,7 @@ function splitArrayDimensionPrimitiveLocalLifetimes(source, options = {}) {
 // occurrences and enclosing conditional/abrupt-exit contexts. Binary lifting
 // finds common conditionals without enumerating paths or rescanning subtrees.
 function indexConditionalReferences(tree, tokens) {
-  const result = {nodes: [], spans: new WeakMap(), references: new Map(), declarators: new Map(),
+  const result = {nodes: [], spans: new WeakMap(), writes: new WeakSet(), references: new Map(), declarators: new Map(),
     tokens: new Map(), work: {nodesIndexed: 0, tokensIndexed: tokens.length, proofSteps: 0,
       mentionQueries: 0, mentionComparisons: 0, limit: tokens.length * 32, exhausted: false}};
   for (const token of tokens) if (token.kind === 'identifier') {
@@ -245,12 +250,16 @@ function indexConditionalReferences(tree, tokens) {
       result.nodes.push(node); result.work.nodesIndexed++;
       result.spans.set(node, {start: order, end: order});
       pending.push({node, exit: true});
+      // A simple assignment's target is written, not read. Compound
+      // assignments and increments read their operand and stay reads.
+      if (node.kind === 'AssignmentExpression' && node.operator === '=' && node.left?.kind === 'Identifier')
+        result.writes.add(node.left);
       if (node.kind === 'VariableDeclarator')
         result.declarators.set(node.name, (result.declarators.get(node.name) || 0) + 1);
       if (node.kind === 'Identifier') {
         let refs = result.references.get(node.name);
         if (!refs) result.references.set(node.name, refs = {items: [], arrayUse: false});
-        refs.items.push({order: order++, conditional});
+        refs.items.push({order: order++, conditional, write: result.writes.has(node)});
         refs.arrayUse ||= array;
       }
       if (node.kind === 'IfStatement') {
@@ -320,7 +329,7 @@ function conditionalPrimitiveGroups(indexed, tokens, name, index, blockEnds) {
     const leftStart = a?.range?.startOffset, rightStart = b?.range?.startOffset;
     const leftEnd = a?.kind === 'BlockStatement' ? blockEnds.get(leftStart) : null;
     const rightEnd = b?.kind === 'BlockStatement' ? blockEnds.get(rightStart) : null;
-    if (!leftSpan || !rightSpan || leftEnd == null || rightEnd == null) { groups.push(tokens); continue; }
+    if (!leftSpan || !rightSpan || leftEnd == null || rightEnd == null) { groups.push({tokens, read: refs.some(ref => !ref.write)}); continue; }
     const left = [], right = [];
     for (const ref of refs) {
       if (!index.tick()) return null;
@@ -329,7 +338,7 @@ function conditionalPrimitiveGroups(indexed, tokens, name, index, blockEnds) {
     }
     // Neither the condition nor any outgoing/handler use may observe the
     // shared slot. Both arms must define every read on each execution.
-    if (!left.length || !right.length || left.length + right.length !== refs.length) { groups.push(tokens); continue; }
+    if (!left.length || !right.length || left.length + right.length !== refs.length) { groups.push({tokens, read: refs.some(ref => !ref.write)}); continue; }
     const leftTokens = [], rightTokens = [];
     for (const token of tokens) {
       if (!index.tick()) return null;
@@ -337,14 +346,14 @@ function conditionalPrimitiveGroups(indexed, tokens, name, index, blockEnds) {
       else if (token.range.startOffset > rightStart && token.range.endOffset <= rightEnd) rightTokens.push(token);
     }
     if (leftTokens.length !== left.length || rightTokens.length !== right.length
-        || leftTokens.length + rightTokens.length !== tokens.length) { groups.push(tokens); continue; }
+        || leftTokens.length + rightTokens.length !== tokens.length) { groups.push({tokens, read: refs.some(ref => !ref.write)}); continue; }
     const contexts = [];
     for (let c = candidate.context; c; c = c.parent) {
       if (!index.tick()) return null;
       contexts.push(c.entry);
     }
     contexts.reverse();
-    if (!statement(a, false, proof, contexts) || !statement(b, false, proof, contexts)) { groups.push(tokens); continue; }
+    if (!statement(a, false, proof, contexts) || !statement(b, false, proof, contexts)) { groups.push({tokens, read: refs.some(ref => !ref.write)}); continue; }
     pending.push({refs: right, tokens: rightTokens}, {refs: left, tokens: leftTokens});
   }
   return groups;

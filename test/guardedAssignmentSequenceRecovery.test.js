@@ -10,7 +10,7 @@ const frame = (yes = 'a=96;b=97;', no = 'b=96;a=97;', guard = 'flag==0', conditi
 test('the normal emitter reconstructs primitive sequences after scalar selection', () => {
   const source = 'int a=0,b=0;' + frame(), body = source.split('\n');
   finish(body, ['flag'], [{name: 'flag', type: 'int'}]);
-  assert.equal(body.join('\n'), 'int a=0,b=0;if ((probe()) && (flag==0)) {a=96;b=97;} else {b=96;a=97;}');
+  assert.equal(body.join('\n'), 'int a=0,b=0;if (probe() &&\n  flag==0) {a=96;b=97;} else {b=96;a=97;}');
 });
 
 test('paired local values use one original condition and one total keep guard', () => {
