@@ -875,7 +875,7 @@ class ClosedWorld {
       'min(II)I': 'i32.min', 'max(II)I': 'i32.max', 'min(JJ)J': 'i64.min', 'max(JJ)J': 'i64.max',
     }[name + descriptor];
     if (native) return { kind: 'intrinsic', op: native };
-    if ((name === 'sin' || name === 'cos') && descriptor === '(D)D' && !process.env.CW_X_RAWTRIG) {
+    if ((name === 'sin' || name === 'cos') && descriptor === '(D)D') {
       // fdlibm in Wasm (fdlibm.js), bit-identical to the JS builtin; huge
       // arguments still reach the builtin through the pure import.
       this.pureImport(`math:${name}`, [VT.f64], [VT.f64], Math[name]);
@@ -1116,15 +1116,7 @@ class ClosedWorld {
       builder.defineFunction(`m:${key}$body`, body.locals, body.code);
       builder.defineFunction(`m:${key}`, ...this.synchronizedWrapper(record, key));
     }
-    let bytes = builder.build();
-    // Diagnostic: substitute externally optimized bytes for this exact module.
-    if (process.env.CW_X_OPT) {
-      const fs = require('node:fs');
-      const raw = `${process.env.CW_X_OPT}.raw.wasm`;
-      if (!fs.existsSync(raw)) fs.writeFileSync(raw, bytes);
-      else if (!Buffer.from(bytes).equals(fs.readFileSync(raw))) throw new Error('closed world: CW_X_OPT module differs from the raw dump');
-      else if (fs.existsSync(process.env.CW_X_OPT)) bytes = new Uint8Array(fs.readFileSync(process.env.CW_X_OPT));
-    }
+    const bytes = builder.build();
     this.moduleBytes = bytes.length;
     if (process.env.JVM_CLOSED_WORLD_DUMP) require('node:fs').writeFileSync(process.env.JVM_CLOSED_WORLD_DUMP, bytes);
     const instance = new WebAssembly.Instance(new WebAssembly.Module(bytes), importObject);
