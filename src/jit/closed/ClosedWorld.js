@@ -491,6 +491,7 @@ class ClosedWorld {
     }
     await this.loadReferencedClasses();
     this.prepareClassTypes();
+    this.knownClassLimit = this.computeKnownClassLimit();
     const candidates = [];
     for (const className of Object.keys(this.jvm.classes)) {
       if (!this.isGuestClass(className)) continue;
@@ -924,17 +925,39 @@ class ClosedWorld {
     if (/^\[[ZBCSIJFD]$/.test(target)) {
       return { kind: isCast ? 'checkcast' : 'instanceof', primitiveKind: require('./representation').KIND[target], siteId };
     }
-    if (this.isGuestClass(target)) {
-      const classIds = this.subclassIds(target).map((c) => c.id);
-      if (classIds.length <= 32) return { kind: isCast ? 'checkcast' : 'instanceof', classIds, siteId };
-    }
     const jvm = this.jvm, runtime = this.runtime;
     const { runtimeClassName } = require('../../instructions/object');
     const hostFn = this.siteImport(`isa:${target}`, [VT.anyref], [VT.i32], (value) => {
       const object = runtime.toJs(value);
       return object !== null && object !== undefined && jvm.isInstanceOfSync(runtimeClassName(object), target) ? 1 : 0;
     });
-    return { kind: isCast ? 'checkcast' : 'instanceof', hostFn, siteId };
+    const plan = { kind: isCast ? 'checkcast' : 'instanceof', hostFn, siteId };
+    if (this.isGuestClass(target)) {
+      // A class target tests the receiver's struct type, which every later
+      // subclass type extends; an interface target lists the implementing
+      // classes loaded now. Either way a closed object of a class this
+      // module never saw, or a guest object that is not closed storage (the
+      // heap was spent), is answered by JS rather than taken as a miss.
+      plan.knownClassLimit = this.knownClassLimit;
+      const classType = this.classTypes.get(target);
+      if (classType) return { ...plan, structType: classType.key };
+      const classIds = this.subclassIds(target).map((c) => c.id);
+      if (classIds.length <= 32) return { ...plan, classIds };
+    }
+    return plan;
+  }
+
+  // Class ids below the limit belong to guest classes loaded when the module
+  // was built (or to JRE classes, which no guest type test accepts); a class
+  // loaded later gets an id at or above it.
+  computeKnownClassLimit() {
+    for (const name of Object.keys(this.jvm.classes)) this.classId(name);
+    const indices = this.jvm._classIndices;
+    let limit = indices.size;
+    for (const [name, id] of indices) {
+      if (id < limit && name[0] !== '[' && !this.jvm.classes[name] && !(this.jvm.jre && this.jvm.jre[name])) limit = id;
+    }
+    return limit;
   }
 
   // An operation whose execution throws a linkage error, like the interpreter.

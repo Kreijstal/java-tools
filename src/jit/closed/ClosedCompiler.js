@@ -1114,18 +1114,30 @@ class ClosedCompiler {
     const value = this.use(node.args[0], 'A');
     let test;
     const repr = this.reprOf(node.args[0]);
-    if (plan.classIds) {
+    if (plan.structType || plan.classIds) {
+      // Closed objects: the struct type (class targets) or the class-id list
+      // (interfaces); a miss on a class newer than the module asks JS.
+      // Other values: arrays are never instances of a guest class; anything
+      // else (a guest object outside closed storage) asks JS.
       const cls = this.temp([VT.i32]);
-      test = repr.startsWith('obj')
-        ? [OP.i32_const, 1, OP.if, VT.i32, ...value, ...GC.struct_get, { type: T_OBJ }, OBJ.cls, OP.local_set, ...uleb(cls)]
-        : [...value, ...GC.ref_test, { stype: T_OBJ }, OP.if, VT.i32,
-          ...value, ...GC.ref_cast, { stype: T_OBJ }, ...GC.struct_get, { type: T_OBJ }, OBJ.cls, OP.local_set, ...uleb(cls)];
-      if (!plan.classIds.length) test.push(OP.i32_const, 0);
-      plan.classIds.forEach((id, i) => {
-        test.push(OP.local_get, ...uleb(cls), OP.i32_const, ...sleb(id), OP.i32_eq);
-        if (i) test.push(OP.i32_or);
-      });
-      test.push(OP.else, OP.i32_const, 0, OP.end);
+      const late = [OP.local_get, ...uleb(cls), OP.i32_const, ...sleb(plan.knownClassLimit), OP.i32_ge_u,
+        OP.if, VT.i32, ...value, OP.call, { fn: plan.hostFn }, OP.else, OP.i32_const, 0, OP.end];
+      let hit;
+      if (plan.structType) {
+        hit = [...value, ...GC.ref_test, { stype: plan.structType }];
+      } else {
+        hit = plan.classIds.length ? [] : [OP.i32_const, 0];
+        plan.classIds.forEach((id, i) => {
+          hit.push(OP.local_get, ...uleb(cls), OP.i32_const, ...sleb(id), OP.i32_eq);
+          if (i) hit.push(OP.i32_or);
+        });
+      }
+      const closed = [...value, ...GC.ref_cast, { stype: T_OBJ }, ...GC.struct_get, { type: T_OBJ }, OBJ.cls, OP.local_set, ...uleb(cls),
+        ...hit, OP.if, VT.i32, OP.i32_const, 1, OP.else, ...late, OP.end];
+      test = repr.startsWith('obj') ? closed
+        : [...value, ...GC.ref_test, { stype: T_OBJ }, OP.if, VT.i32, ...closed, OP.else,
+          ...value, ...GC.ref_test, { stype: T_PARR }, ...value, ...GC.ref_test, { stype: T_RARR }, OP.i32_or,
+          OP.if, VT.i32, OP.i32_const, 0, OP.else, ...value, OP.call, { fn: plan.hostFn }, OP.end, OP.end];
       this.release([VT.i32], cls);
     } else if (plan.primitiveKind !== undefined) {
       test = [...value, ...GC.ref_test, { stype: T_PARR }, OP.if, VT.i32,

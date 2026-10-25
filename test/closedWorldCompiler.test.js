@@ -39,3 +39,12 @@ test('closed module runs the storage fixture (objects, statics, clone, handlers 
   assert.equal(result.output, expected);
   assert.ok(result.stats.admitted >= 10, `admitted ${JSON.stringify(result.stats)}`);
 });
+
+test('closed module answers instanceof and checkcast like HotSpot', () => {
+  const directory = compileFixture('ClosedTypeTests');
+  const expected = hotspot(directory, 'ClosedTypeTests');
+  const result = runDetailed(directory, 'ClosedTypeTests', { closedWorld: true, jit: JIT });
+  assert.equal(result.failure, null, result.stderr);
+  assert.equal(result.output, expected);
+  assert.ok(result.stats.admitted >= 5, `admitted ${JSON.stringify(result.stats)}`);
+});
