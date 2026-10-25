@@ -95,6 +95,12 @@ run_test() {
     */wasmHeapArrays.test.js) timeout_cmd=(timeout 120);;
     */wasmInstanceInline.test.js) timeout_cmd=(timeout 120);;
     */wasmInstanceLink.test.js) timeout_cmd=(timeout 120);;
+    # These decompile whole fixture corpora through CFR-JS: 27-99 s each when
+    # measured six at a time on a lightly loaded machine, so 15 s always killed them.
+    */cfrExceptionLoopExits.test.js|*/cfrInvariantFanout.test.js|*/cfrNumericNegation.test.js|\
+    */cfrParallelBackedges.test.js|*/cfrPartitionedLocals.test.js|*/cfrStateMachineReadability.test.js|\
+    */complementedRelationRecovery.test.js|*/guardedNestedArrayLoops.test.js|*/javaAstEmitterLoopExits.test.js)
+      timeout_cmd=(timeout 300);;
     # Add other special cases here
   esac
 
