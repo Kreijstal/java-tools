@@ -1,3 +1,5 @@
+// Tests a JS or partial-Wasm tier: the closed-world module would take its methods.
+process.env.JVM_CLOSED_WORLD = '0';
 // The before-main preparation preloads the whole classpath. In the browser
 // the classpath is a virtual file system with no directory to read, so the
 // preload silently found nothing and only the classes reachable from main()'s

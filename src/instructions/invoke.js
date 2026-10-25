@@ -883,6 +883,26 @@ async function invokeinterface(frame, instruction, jvm, thread) {
     const targetReference = targetMethodHandle.reference;
     const targetNameAndType = targetReference.nameAndType;
     const invocationArgs = [...(boxedObj.capturedArgs || []), ...args];
+    if (targetMethodHandle.kind === "newInvokeSpecial") {
+      // A constructor reference (Foo::new): `new Foo; dup; args...;
+      // invokespecial <init>`, leaving the new object as the result.
+      const owner = targetReference.className;
+      if (await jvm.initializeClassIfNeeded(owner, thread)) {
+        // Re-run this invoke once Foo's <clinit> has finished.
+        frame.stack.push(obj);
+        for (const arg of args) frame.stack.push(arg);
+        frame.pc--;
+        return;
+      }
+      await require("./object").new(frame, { arg: owner }, jvm, thread);
+      frame.stack.push(frame.stack.peek());
+      for (const arg of invocationArgs) frame.stack.push(arg);
+      await invokespecial(frame, {
+        op: "invokespecial",
+        arg: ["Method", owner, [targetNameAndType.name, targetNameAndType.descriptor]],
+      }, jvm, thread);
+      return;
+    }
     for (const arg of invocationArgs) {
       frame.stack.push(arg);
     }

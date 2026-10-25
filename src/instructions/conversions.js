@@ -4,8 +4,8 @@ module.exports = {
     frame.stack.push(BigInt(value));
   },
   i2f: (frame) => {
-    // In JavaScript, int and float are both numbers.
-    // No conversion is needed.
+    // An int beyond 2^24 rounds to the nearest float (123456789 -> 123456792).
+    frame.stack.push(Math.fround(frame.stack.pop()));
   },
   i2d: (frame) => {
     // In JavaScript, int, float, and double are all numbers.
@@ -22,7 +22,7 @@ module.exports = {
   },
   l2f: (frame) => {
     const value = frame.stack.pop();
-    frame.stack.push(Number(value));
+    frame.stack.push(Math.fround(Number(value)));
   },
   l2d: (frame) => {
     const value = frame.stack.pop();

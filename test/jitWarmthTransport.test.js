@@ -1,3 +1,5 @@
+// Tests a JS or partial-Wasm tier: the closed-world module would take its methods.
+process.env.JVM_CLOSED_WORLD = '0';
 // Warmth transport (docs/plan-linear-runtime.md, Phase 1.2 link state).
 //
 // A compile result that crosses from another JIT as plain data used to land

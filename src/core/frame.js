@@ -64,6 +64,13 @@ class Frame {
     this.jitHandoffPending = undefined;
     this.jitHandoffRecord = undefined;
     this.initializingClassName = undefined;
+    // Closed-module suspension (jit/closed/ClosedWorld.js): the parked
+    // continuation, the scheduler tick it settles, and how it resumes.
+    this.closedPark = undefined;
+    this.closedTick = undefined;
+    this.closedResumeWith = undefined;
+    this.closedOuterEntry = undefined;
+    this.closedAwaiting = undefined;
     this.inUse = false;
     this.resumedAt = undefined;
     this[STRUCTURED_CONTINUATION] = undefined;

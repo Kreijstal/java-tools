@@ -24,6 +24,7 @@ const { buildSsa, resolveHandlerRanges } = require('../../analysis/opgraph/ssa')
 const { VT, OP, GC, ModuleBuilder, structType, subType, refNull, ref, uleb, sleb } = require('./wasmBuilder');
 const { closedTypes, OBJ_FIELDS, T_OBJ, T_PARR, T_RARR, T_REFS } = require('./representation');
 const { ClosedCompiler, Unsupported, WT } = require('./ClosedCompiler');
+const { ASYNC_METHOD_SENTINEL } = require('../../core/constants');
 
 const REJECT_OPS = new Set(['jsr', 'jsr_w', 'ret', 'invokedynamic']);
 const NEWARRAY = { 4: 'boolean', 5: 'char', 6: 'float', 7: 'double', 8: 'byte', 9: 'short', 10: 'int', 11: 'long' };
@@ -74,13 +75,21 @@ class ClosedWorld {
     // Java exceptions inside the module are this tag with the exception as
     // payload; host imports convert whatever JS throws into it.
     this.tag = new WebAssembly.Tag({ parameters: ['anyref'] });
-    this.optimisticAsync = jit.closedWorldOptimisticAsync ??
-      (typeof process !== 'undefined' && process.env?.JVM_CLOSED_WORLD_OPTIMISTIC_ASYNC === '1');
+    // JS Promise Integration: a scheduler entry runs on its own suspendable
+    // stack, so a thread that has to stop inside the module (sleep, wait, a
+    // contended monitor, an asynchronous native) parks there and resumes at
+    // the same instruction. See park().
+    this.jspi = jspiAvailable();
+    this.syncDepth = 0;
+    this.pendingPark = null;
+    // With suspension, an asynchronous native is just another park point.
+    this.optimisticAsync = jit.closedWorldOptimisticAsync ?? (this.jspi ||
+      (typeof process !== 'undefined' && process.env?.JVM_CLOSED_WORLD_OPTIMISTIC_ASYNC === '1'));
     if (typeof process !== 'undefined' && process.env?.JVM_CLOSED_WORLD_STATS) {
       process.once('exit', () => {
         const rejected = [...this.rejected].map(([key, reason]) => `${key}\t${reason}`).join('\n');
         // Synchronous: an asynchronous pipe write is truncated at exit.
-        const write = (text) => require('node:fs').writeSync(2, text);
+        const write = (text) => require('fs').writeSync(2, text);
         write(`[closed-world] ${JSON.stringify(this.stats())}\n`);
         if (process.env.JVM_CLOSED_WORLD_STATS === 'rejects') write(`${rejected}\n`);
         if (this.importCalls) {
@@ -356,6 +365,12 @@ class ClosedWorld {
     this._hostImpls = {
       ref_eq: (a, b) => (toJs(a) === toJs(b) ? 1 : 0),
       err_npe: () => throwJava('java/lang/NullPointerException'),
+      err_soe: () => throwJava('java/lang/StackOverflowError'),
+      err_npe_invoke: (siteId) => {
+        const { items, item, owner, name } = this.sites[siteId].npe;
+        throw new WebAssembly.Exception(tag, [{ type: 'java/lang/NullPointerException', message: null,
+          context: { frame: { instructions: items }, pc: item.pc, className: owner, methodName: name } }]);
+      },
       err_npe_at: (site) => {
         process.stderr.write(`[closed-world] NullPointerException at ${this.sites[site]?.where}\n`);
         throwJava('java/lang/NullPointerException');
@@ -366,7 +381,23 @@ class ClosedWorld {
         if (isNull(monitor)) throwJava('java/lang/NullPointerException');
         if (!monitor.isLocked) { monitor.isLocked = true; monitor.lockOwner = thread.id; monitor.lockCount = 1; }
         else if (monitor.lockOwner === thread.id) monitor.lockCount++;
-        else throw new ClosedWorldError('closed world: contended monitor (module code cannot block)');
+        else {
+          // Park as BLOCKED; the scheduler makes the thread runnable once the
+          // owner releases, and the retry takes the monitor.
+          const acquire = () => {
+            if (!monitor.isLocked) {
+              monitor.isLocked = true; monitor.lockOwner = thread.id; monitor.lockCount = 1;
+              thread.blockingOn = undefined;
+              return true;
+            }
+            thread.status = 'BLOCKED'; thread.blockingOn = monitor;
+            return false;
+          };
+          if (!world.requestPark({ value: undefined, retry: acquire })) {
+            throw new ClosedWorldError('closed world: contended monitor (module code cannot block)');
+          }
+          thread.status = 'BLOCKED'; thread.blockingOn = monitor;
+        }
       },
       mexit: (value) => {
         const monitor = toJs(value), thread = world.thread;
@@ -459,6 +490,176 @@ class ClosedWorld {
     }
   }
 
+  // A host call's result as a Wasm value, or a park request when the call
+  // asked this thread to stop (sleep, wait) or returned a Promise. The call
+  // site checks the module's park flag right after the call and, when it is
+  // set, calls the suspending park import, which returns the real result.
+  hostResult(kind, result, where, returnDesc) {
+    if (result && typeof result.then === 'function') {
+      if (this.requestPark({ promise: result, kind, returnDesc })) return parkDummy(kind);
+      throw new ClosedWorldError(`closed world: host method ${where} returned a Promise`);
+    }
+    // The native pushed a guest frame (reflection, method handles, Thread
+    // starts); what it returns lands on the entry frame's operand stack.
+    if (result === ASYNC_METHOD_SENTINEL) {
+      if (this.requestPark({ frameResult: kind })) return parkDummy(kind);
+      throw new ClosedWorldError(`closed world: host method ${where} pushed a frame and this entry cannot park`);
+    }
+    const thread = this.thread;
+    // A native that pushed guest frames (doClick runs its listeners) expects
+    // them to run before its caller continues.
+    if (thread && thread.closedEntryFrame && thread.callStack.peek() !== thread.closedEntryFrame
+        && this.requestPark({ value: this.fromHost(kind, result, returnDesc) })) {
+      return parkDummy(kind);
+    }
+    if (thread && thread.status !== 'runnable') {
+      if (this.requestPark({ value: this.fromHost(kind, result, returnDesc) })) return parkDummy(kind);
+      throw new ClosedWorldError(`closed world: host method ${where} asked thread ${thread.id} to ${thread.status}`);
+    }
+    return this.fromHost(kind, result, returnDesc);
+  }
+
+  // JRE natives may return a bare JS array for a Java array result. The
+  // interpreter tolerates that, but closed storage needs the array's type to
+  // adopt it, and the declared return type is that type.
+  fromHost(kind, result, returnDesc) {
+    if (kind === 'A' && returnDesc && returnDesc[0] === '[' && result && typeof result === 'object'
+        && typeof result.type !== 'string' && (Array.isArray(result) || ArrayBuffer.isView(result))) {
+      result.type = returnDesc;
+    }
+    return this.fromJs(kind, result);
+  }
+
+  // Parking needs a suspendable stack with no JS frame between it and the
+  // module: a promising scheduler entry, not a synchronous nested one.
+  requestPark(request) {
+    if (!this.jspi || !this.parkFlag || this.syncDepth !== 0 || !this.thread?.closedEntryFrame) return false;
+    this.pendingPark = request;
+    this.parkFlag.value = 1;
+    return true;
+  }
+
+  // The suspending import behind every park check, one per result type.
+  parkImport(kind) {
+    const key = `park:${kind}`;
+    if (!this.imports.has(key)) {
+      const world = this;
+      this.imports.set(key, { field: key, params: [], results: kind === 'V' ? [] : [WT[kind]], suspending: true,
+        impl: () => world.park(kind) });
+    }
+    return key;
+  }
+
+  // Other threads enter the module while this one is parked; the depth
+  // counter is per thread, so it comes back with the continuation.
+  async park(kind) {
+    const depth = this.getDepth();
+    try { return await this.parkFor(kind); } finally { this.setDepth(depth); }
+  }
+
+  async parkFor(kind) {
+    const request = this.pendingPark, thread = this.thread;
+    this.pendingPark = null;
+    this.parkFlag.value = 0;
+    this.counters.parks = (this.counters.parks || 0) + 1;
+    if (request.promise) {
+      // An asynchronous native holds the scheduler, exactly as it does for
+      // an interpreted caller: the tick that entered the module is pending.
+      // A native can run guest frames above the entry frame (newInstance runs
+      // the constructor); an exception they leave lands on the entry frame.
+      const frame = thread.closedEntryFrame;
+      frame.closedAwaiting = true;
+      let value;
+      try { value = await request.promise; } catch (error) { throw this.hostThrow(error); } finally {
+        frame.closedAwaiting = undefined;
+        this.thread = thread;
+      }
+      const outcome = frame.closedResumeWith;
+      frame.closedResumeWith = undefined;
+      if (outcome && 'thrown' in outcome) throw this.hostThrow(outcome.thrown);
+      if (value === ASYNC_METHOD_SENTINEL) return this.frameResult(kind, thread);
+      const result = this.fromHost(kind, value, request.returnDesc);
+      if (thread.callStack.peek() !== frame) {
+        const pushed = await this.yieldThread(thread);
+        if (pushed && 'thrown' in pushed) throw this.hostThrow(pushed.thrown);
+      }
+      return result;
+    }
+    if (request.frameResult) return this.frameResult(request.frameResult, thread);
+    if (request.invoke) return this.parkedInvoke(request, thread);
+    if (request.init) return this.parkedInit(request.init, thread);
+    for (;;) {
+      const outcome = await this.yieldThread(thread);
+      if (outcome && 'thrown' in outcome) throw this.hostThrow(outcome.thrown);
+      if (!request.retry || request.retry()) return request.value;
+    }
+  }
+
+  // A native pushed a guest frame: run it, then take its return value from
+  // the entry frame's operand stack.
+  async frameResult(kind, thread) {
+    const entry = thread.closedEntryFrame;
+    const outcome = await this.yieldThread(thread);
+    if (outcome && 'thrown' in outcome) throw this.hostThrow(outcome.thrown);
+    if (kind === 'V') return undefined;
+    return this.fromJs(kind, entry.stack.isEmpty() ? null : entry.stack.pop());
+  }
+
+  // The callee runs as an ordinary frame above the parked entry frame; its
+  // return value lands on the entry frame's operand stack, an exception that
+  // reaches the entry frame comes back here (JVM.handleException).
+  async parkedInvoke(request, thread) {
+    const signature = request.invoke, entry = thread.closedEntryFrame;
+    const Frame = (this.Frame ||= require('../../core/frame'));
+    const frame = new Frame(signature.method);
+    frame.className = signature.className;
+    if (request.onStack) {
+      // A synthetic invoke frame: the operands its one instruction pops.
+      for (const value of request.args) frame.stack.push(value);
+      frame.jitJsDisabled = true;
+    } else {
+      let slot = 0;
+      signature.paramKinds.forEach((kind, i) => {
+        frame.locals[slot] = request.args[i];
+        slot += kind === 'J' || kind === 'D' ? 2 : 1;
+      });
+    }
+    thread.callStack.push(frame);
+    this.counters.slowCalls = (this.counters.slowCalls || 0) + 1;
+    const outcome = await this.yieldThread(thread);
+    if (outcome && 'thrown' in outcome) throw this.hostThrow(outcome.thrown);
+    return signature.returnKind === 'V' ? undefined : this.fromJs(signature.returnKind, entry.stack.pop());
+  }
+
+  async parkedInit(className, thread) {
+    const jvm = this.jvm;
+    for (;;) {
+      if (jvm.classInitializationState.get(className) === 'INITIALIZED') return;
+      let pushed;
+      try { pushed = await jvm.initializeClassIfNeeded(className, thread); } catch (error) { throw this.hostThrow(error); } finally { this.thread = thread; }
+      if (!pushed) return;
+      const outcome = await this.yieldThread(thread);
+      if (outcome && 'thrown' in outcome) throw this.hostThrow(outcome.thrown);
+    }
+  }
+
+  // JVM.handleException found the parked entry frame on top: the exception
+  // came out of a frame the module was waiting for, so the module throws it.
+  deliverException(frame, exception) {
+    frame.closedResumeWith = { thrown: exception };
+    return true;
+  }
+
+  // End this scheduler tick with the thread parked in the module; the next
+  // tick that finds the entry frame on top resumes it.
+  yieldThread(thread) {
+    const frame = thread.closedEntryFrame;
+    return new Promise((resume) => {
+      frame.closedPark = resume;
+      endSegment(frame, PARKED);
+    });
+  }
+
   // A synchronous native call as an import: (receiver?, args...) -> result.
   nativeImport(key, native, descriptor, hasReceiver) {
     const { params, ret } = parseMethodDescriptor(descriptor);
@@ -471,13 +672,7 @@ class ClosedWorld {
       const offset = hasReceiver ? 1 : 0;
       const args = kinds.map((k, i) => world.toJsValue(k, wasmArgs[i + offset]));
       const result = native(jvm, receiver, args, world.thread);
-      if (result && typeof result.then === 'function') {
-        throw new ClosedWorldError(`closed world: host method ${key} returned a Promise`);
-      }
-      if (world.thread && world.thread.status !== 'runnable') {
-        throw new ClosedWorldError(`closed world: host method ${key} asked thread ${world.thread.id} to ${world.thread.status}`);
-      }
-      return world.fromJs(retKind, result);
+      return world.hostResult(retKind, result, key, ret);
     };
     return this.siteImport(key, wasmParams, retKind === 'V' ? [] : [WT[retKind]], impl);
   }
@@ -487,7 +682,7 @@ class ClosedWorld {
     if (this.built) return;
     this.built = true;
     if (typeof this.jvm.preloadClasspathClasses === 'function') {
-      try { await this.jvm.preloadClasspathClasses(); } catch { /* referenced classes still load below */ }
+      try { await this.jvm.preloadClasspathClasses(null, { scope: this.jvm.prepareScope }); } catch { /* referenced classes still load below */ }
     }
     await this.loadReferencedClasses();
     this.prepareClassTypes();
@@ -506,7 +701,9 @@ class ClosedWorld {
     }
     for (const record of candidates) this.entries.set(record.key, record);
     // Greatest fixed point: drop methods that call something not admitted.
-    for (let changed = true; changed;) {
+    // With JSPI such a call is a stub that runs the callee as an ordinary
+    // frame (see slowCallStub), so nothing is dropped.
+    for (let changed = !this.jspi; changed;) {
       changed = false;
       for (const [key, record] of this.entries) {
         const missing = [...record.calls].find((callee) => !this.entries.has(callee));
@@ -808,6 +1005,13 @@ class ClosedWorld {
         return;
       }
       if (!this.isGuestClass(target.owner)) throw new Unsupported(`invoke-nonguest: ${target.owner}.${name}`);
+      if (this.jspi && target.method && flagsOf(target.method).includes('native')) {
+        // A guest native (JNI registry): the interpreter's invoke resolves it.
+        const siteId = this.sites.push({ where, target: `${owner}.${name}${descriptor}`,
+          invoke: { op, imm: node.imm, className: record.className, argKinds, returnKind } }) - 1;
+        record.plan.set(node.id, { kind: 'import', fn: this.bytecodeInvokeImport(siteId), argKinds, initClass });
+        return;
+      }
       const calleeKey = `${target.owner}.${name}${descriptor}`;
       record.calls.add(calleeKey);
       record.plan.set(node.id, { kind: 'call', fn: `m:${calleeKey}`, argKinds, initClass,
@@ -835,6 +1039,12 @@ class ClosedWorld {
       arms.get(fn).push(id);
     }
     if (arms.size > 16) throw new Unsupported(`megamorphic: ${owner}.${name}`);
+    const siteId = this.sites.push({ where, target: `${owner}.${name}${descriptor}`,
+      invoke: { op, imm: node.imm, className: record.className, argKinds, returnKind } }) - 1;
+    // With JSPI, a receiver the module has no code for (a class newer than
+    // the module, a lambda, any host object without a native) runs this very
+    // instruction in an ordinary frame while the caller is parked.
+    const fallbackFn = this.jspi ? this.bytecodeInvokeImport(siteId) : null;
     let hostFn = null;
     if (hostCapable) {
       // The static owner's own native (if any) is what most host receivers run.
@@ -858,16 +1068,17 @@ class ClosedWorld {
             native = resolveVirtualHost.call(world, receiver, owner, name, descriptor);
             if (className !== undefined) byClass.set(className, native);
           }
+          if (!native) {
+            if (fallbackFn) return world.parkBytecodeInvoke(siteId, wasmArgs);
+            throw new ClosedWorldError(`closed world: no host implementation of ${owner}.${name}${descriptor} for ${className}`);
+          }
           const args = params.map((p, i) => world.toJsValue(kindOf(p), wasmArgs[i + 1]));
           const result = native(world.jvm, receiver, args, world.thread);
-          if (result && typeof result.then === 'function') throw new ClosedWorldError(`closed world: host virtual ${owner}.${name} returned a Promise`);
-          if (world.thread && world.thread.status !== 'runnable') throw new ClosedWorldError(`closed world: host virtual ${owner}.${name} asked thread ${world.thread.id} to ${world.thread.status}`);
-          return world.fromJs(returnKind, result);
+          return world.hostResult(returnKind, result, `${owner}.${name}${descriptor}`, descriptor.slice(descriptor.lastIndexOf(')') + 1));
         });
     }
-    const siteId = this.sites.push({ where, target: `${owner}.${name}${descriptor}` }) - 1;
     record.plan.set(node.id, {
-      kind: 'virtual', argKinds, returnKind, siteId, hostFn,
+      kind: 'virtual', argKinds, returnKind, siteId, hostFn, fallbackFn,
       targets: [...arms].map(([fn, classIds]) => ({ fn, classIds })),
     });
   }
@@ -913,9 +1124,40 @@ class ClosedWorld {
       current = this.jvm.jre?.[current]?.super || data?.ast?.classes?.[0]?.superClassName || null;
     }
     // java/lang/Object methods on strings and other host values.
-    const native = this.jvm._jreFindMethod('java/lang/Object', name, descriptor);
-    if (native) return native;
-    throw new ClosedWorldError(`closed world: no host implementation of ${owner}.${name}${descriptor} for ${className}`);
+    return this.jvm._jreFindMethod('java/lang/Object', name, descriptor) || null;
+  }
+
+  bytecodeInvokeImport(siteId) {
+    const { argKinds, returnKind } = this.sites[siteId].invoke;
+    const world = this;
+    return this.siteImport(`vslow:${siteId}`, argKinds.map((k) => WT[k]), returnKind === 'V' ? [] : [WT[returnKind]],
+      (...wasmArgs) => world.parkBytecodeInvoke(siteId, wasmArgs));
+  }
+
+  // Park, then run the site's own invoke instruction in a one-instruction
+  // frame: the interpreter dispatches on the receiver exactly as it would
+  // for any caller, and its result comes back to the parked module.
+  parkBytecodeInvoke(siteId, wasmArgs) {
+    const site = this.sites[siteId], { argKinds, returnKind } = site.invoke;
+    const signature = site.invokeSignature ||= this.bytecodeInvokeSignature(site.invoke);
+    const args = argKinds.map((k, i) => this.toJsValue(k, wasmArgs[i]));
+    if (!this.requestPark({ invoke: signature, args, onStack: true })) {
+      throw new ClosedWorldError(`closed world: no module code for ${site.target} at ${site.where} and this entry cannot park`);
+    }
+    return parkDummy(returnKind);
+  }
+
+  bytecodeInvokeSignature({ op, imm, className, argKinds, returnKind }) {
+    const ret = { V: 'return', I: 'ireturn', J: 'lreturn', F: 'freturn', D: 'dreturn', A: 'areturn' }[returnKind];
+    const method = {
+      name: `<closed-invoke ${imm[2][0]}>`, descriptor: '()V', flags: ['static', 'synthetic'],
+      attributes: [{ type: 'code', code: {
+        localsSize: '0', stackSize: String(argKinds.length + 2),
+        codeItems: [{ labelDef: 'L0:', instruction: { op, arg: imm } }, { labelDef: 'L1:', instruction: ret }],
+        exceptionTable: [],
+      } }],
+    };
+    return { key: method.name, className, method, isStatic: true, synthetic: true, paramKinds: argKinds, returnKind };
   }
 
   planTypeTest(record, node, isCast) {
@@ -1017,6 +1259,7 @@ class ClosedWorld {
 
   initializeSync(id) {
     const target = [...this.initTargets.values()][id];
+    if (this.jspi && this.needsScheduledInit(target.className) && this.requestPark({ init: target.className })) return;
     const ok = this.jvm.initializeClassSync(target.className, this.thread, (className) => this.runClinit(className));
     if (!ok) throw new ClosedWorldError(`closed world: cannot initialize ${target.className} without blocking`);
   }
@@ -1024,14 +1267,132 @@ class ClosedWorld {
   runClinit(className) {
     const record = this.entries.get(`${className}.<clinit>()V`);
     if (!record || !record.fn) throw new ClosedWorldError(`closed world: <clinit> of ${className} is not in the module`);
-    record.fn();
+    // A nested synchronous entry: a JS frame now sits between it and any
+    // suspendable stack, so nothing below may park.
+    this.syncDepth++;
+    try { record.fn(); } finally { this.syncDepth--; }
   }
+
+  // The calling convention of `key`: its record when admitted, otherwise
+  // (JSPI) the same signature derived from its descriptor, for a stub.
+  signatureOf(key) {
+    const record = this.entries.get(key);
+    if (record || !this.jspi) return record || null;
+    this.stubSignatures ||= new Map();
+    if (this.stubSignatures.has(key)) return this.stubSignatures.get(key);
+    let signature = null;
+    const dot = key.indexOf('.'), paren = key.indexOf('(');
+    const className = key.slice(0, dot), name = key.slice(dot + 1, paren), descriptor = key.slice(paren);
+    const method = this.findDeclaredMethod(className, name, descriptor);
+    if (method) {
+      const { params, ret } = parseMethodDescriptor(descriptor);
+      const isStatic = isStaticMethod(method);
+      signature = {
+        key, className, method, isStatic, stub: true,
+        paramKinds: [...(isStatic ? [] : ['A']), ...params.map(kindOf)],
+        paramReprs: [...(isStatic ? [] : [this.reprOfClass(className)]), ...params.map((p) => this.reprOfDescriptor(p))],
+        returnKind: kindOf(ret),
+        returnRepr: this.reprOfDescriptor(ret),
+      };
+    }
+    this.stubSignatures.set(key, signature);
+    return signature;
+  }
+
+  // A method outside the module, called from inside it: hand the arguments
+  // over, park, and return what the callee's frame returned.
+  slowCallStub(signature) {
+    const code = [];
+    for (let i = 0; i < signature.paramKinds.length; i++) code.push(OP.local_get, ...uleb(i));
+    code.push(OP.call, { fn: this.slowCallImport(signature) }, OP.call, { fn: this.parkImport(signature.returnKind) });
+    const type = signature.returnKind === 'A' ? this.typeOfRepr(signature.returnRepr) : null;
+    if (type) code.push(...GC.ref_cast_null, { stype: type });
+    return code;
+  }
+
+  slowCallImport(signature) {
+    const world = this;
+    return this.siteImport(`slow:${signature.key}`, signature.paramKinds.map((k) => WT[k]), [], (...wasmArgs) => {
+      const args = signature.paramKinds.map((k, i) => world.toJsValue(k, wasmArgs[i]));
+      if (!world.requestPark({ invoke: signature, args })) {
+        throw new ClosedWorldError(`closed world: ${signature.key} runs outside the module and this entry cannot park`);
+      }
+    });
+  }
+
+  // Initialization the module cannot finish synchronously: a <clinit> that
+  // is not in the module, or a class another thread is initializing.
+  needsScheduledInit(className) {
+    const jvm = this.jvm, thread = this.thread;
+    for (let current = className; current; current = this.classAst(current)?.superClassName) {
+      const state = jvm.classInitializationState.get(current);
+      if (state === 'INITIALIZED') return false;
+      if (state === 'INITIALIZING' && jvm.classInitializationOwners.get(current) !== thread?.id) return true;
+      const classData = jvm.classes[current];
+      if (classData && jvm.findStaticInitializer(classData) && !this.entries.get(`${current}.<clinit>()V`)?.fn) return true;
+    }
+    return false;
+  }
+
+  // Module frames are invisible to the scheduler's maxStackDepth check, so
+  // methods on a call cycle count their own depth (a `depth` global) and
+  // throw StackOverflowError past the limit; Wasm stack exhaustion is a trap
+  // no Java handler can catch. Tarjan's SCCs over module calls (virtual
+  // calls record every implementation); entries only shrink afterwards, so
+  // this over-approximates.
+  markRecursion() {
+    const index = new Map(), low = new Map(), onStack = new Set(), stack = [];
+    let next = 0;
+    const visit = (root) => {
+      const work = [[root, root.calls.values()]];
+      index.set(root.key, next); low.set(root.key, next); next++;
+      stack.push(root); onStack.add(root.key);
+      while (work.length) {
+        const top = work[work.length - 1], [record, iterator] = top;
+        const step = iterator.next();
+        if (!step.done) {
+          const callee = this.entries.get(step.value);
+          if (!callee) continue;
+          if (callee === record) record.recursive = true;
+          if (!index.has(callee.key)) {
+            index.set(callee.key, next); low.set(callee.key, next); next++;
+            stack.push(callee); onStack.add(callee.key);
+            work.push([callee, callee.calls.values()]);
+          } else if (onStack.has(callee.key)) {
+            low.set(record.key, Math.min(low.get(record.key), index.get(callee.key)));
+          }
+          continue;
+        }
+        work.pop();
+        if (work.length) {
+          const parent = work[work.length - 1][0];
+          low.set(parent.key, Math.min(low.get(parent.key), low.get(record.key)));
+        }
+        if (low.get(record.key) !== index.get(record.key)) continue;
+        const component = [];
+        for (let member; member !== record;) { member = stack.pop(); onStack.delete(member.key); component.push(member); }
+        if (component.length > 1) for (const member of component) member.recursive = true;
+      }
+    };
+    for (const record of this.entries.values()) {
+      record.recursive = false;
+    }
+    for (const record of this.entries.values()) if (!index.has(record.key)) visit(record);
+    this.counters.recursive = [...this.entries.values()].filter((r) => r.recursive).length;
+  }
+
+  // The module's depth counter at an entry from the scheduler: the thread's
+  // interpreter frames (module frames below a parked entry are not counted).
+  setDepth(value) { if (this.depthGlobal) this.depthGlobal.value = value; }
+  getDepth() { return this.depthGlobal ? this.depthGlobal.value : 0; }
 
   // ---- module assembly ----------------------------------------------------
   assemble() {
+    this.markRecursion();
     // Compile bodies first: they register the imports they need.
     const bodies = new Map();
-    for (let pass = 0; pass < 2; pass++) {
+    // Each pass can only remove entries, so this reaches a fixed point.
+    for (let pass = 0; ; pass++) {
       for (const [key, record] of this.entries) {
         if (bodies.has(key)) continue;
         try {
@@ -1044,7 +1405,7 @@ class ClosedWorld {
       }
       // A compile rejection can strand callers; recompute the fixed point.
       let changed = false;
-      for (const [key, record] of this.entries) {
+      for (const [key, record] of this.jspi ? [] : this.entries) {
         const missing = [...record.calls].find((callee) => !this.entries.has(callee));
         if (missing) {
           this.entries.delete(key);
@@ -1054,7 +1415,6 @@ class ClosedWorld {
         }
       }
       if (!changed) break;
-      if (pass === 1) throw new Error('closed world: admission did not settle');
     }
     for (const key of [...bodies.keys()]) if (!this.entries.has(key)) bodies.delete(key);
     if (!this.entries.size) return;
@@ -1067,15 +1427,34 @@ class ClosedWorld {
       ...t.layout.references.map((f) => ({ type: this.wasmType('A', this.reprOfDescriptor(f.descriptor)), mutable: true })),
     ]))));
     builder.addGlobal('emptyRefs', ref(T_REFS), false, [...GC.array_new_fixed, { type: T_REFS }, 0]);
+    builder.addGlobal('park', [VT.i32], true, [OP.i32_const, 0]);
+    builder.exportGlobal('park', 'park');
+    builder.addGlobal('depth', [VT.i32], true, [OP.i32_const, 0]);
+    builder.exportGlobal('depth', 'depth');
     builder.importMemory('c', 'mem', this.runtime.heap.memory.buffer.byteLength >>> 16);
     builder.importTag('t', 'jx', [[VT.anyref]], 'jx');
     const importObject = { c: { mem: this.runtime.heap.memory }, t: { jx: this.tag }, s: {}, f: {} };
     // Synchronized methods: their body is compiled separately and called by
     // a wrapper that holds the monitor and releases it on every exit.
+    const stubs = new Map();
+    if (this.jspi) {
+      for (const record of this.entries.values()) {
+        for (const callee of record.calls) {
+          if (this.entries.has(callee) || stubs.has(callee)) continue;
+          const signature = this.signatureOf(callee);
+          if (!signature) throw new Error(`closed world: no method ${callee} for a stub`);
+          stubs.set(callee, signature);
+          this.slowCallImport(signature);
+          this.parkImport(signature.returnKind);
+        }
+      }
+      this.parkImport('V');
+    }
     for (const record of this.entries.values()) {
       if (record.synchronized) {
         this.hostImport('menter', [VT.anyref], []);
         this.hostImport('mexit', [VT.anyref], []);
+        if (this.jspi) this.parkImport('V');
       }
     }
     let globalIndex = 0;
@@ -1099,8 +1478,9 @@ class ClosedWorld {
     for (const [key, imp] of this.imports) {
       const field = `f${importIndex++}`;
       builder.importFunction('f', field, imp.params.map((p) => [p]), imp.results.map((r) => [r]), key);
-      const bound = imp.pure ? imp.impl : this.wrapHost(imp.impl, imp.params.length);
-      if (countImports) {
+      const bound = imp.suspending ? new WebAssembly.Suspending(imp.impl)
+        : imp.pure ? imp.impl : this.wrapHost(imp.impl, imp.params.length);
+      if (countImports && !imp.suspending) {
         const calls = this.importCalls;
         calls.set(key, 0);
         importObject.f[field] = (...args) => { calls.set(key, calls.get(key) + 1); return bound(...args); };
@@ -1141,6 +1521,13 @@ class ClosedWorld {
       if (record.synchronized) builder.declareFunction(`m:${key}$body`, params, results);
       builder.exportFunction(record.exportName, `m:${key}`);
     }
+    for (const [key, signature] of stubs) {
+      const params = signature.paramKinds.map((k, i) => this.wasmType(k, signature.paramReprs[i]));
+      const results = signature.returnKind === 'V' ? [] : [this.wasmType(signature.returnKind, signature.returnRepr)];
+      builder.declareFunction(`m:${key}`, params, results);
+      builder.defineFunction(`m:${key}`, [], this.slowCallStub(signature));
+    }
+    this.counters.stubs = stubs.size;
     for (const [key, body] of bodies) {
       const record = this.entries.get(key);
       if (!record.synchronized) { builder.defineFunction(`m:${key}`, body.locals, body.code); continue; }
@@ -1149,9 +1536,14 @@ class ClosedWorld {
     }
     const bytes = builder.build();
     this.moduleBytes = bytes.length;
-    if (process.env.JVM_CLOSED_WORLD_DUMP) require('node:fs').writeFileSync(process.env.JVM_CLOSED_WORLD_DUMP, bytes);
+    if (process.env.JVM_CLOSED_WORLD_DUMP) {
+      require('fs').writeFileSync(process.env.JVM_CLOSED_WORLD_DUMP, bytes);
+      require('fs').writeFileSync(`${process.env.JVM_CLOSED_WORLD_DUMP}.imports`, [...this.imports.keys()].map((k, i) => `${i}\t${k}`).join('\n'));
+    }
     const instance = new WebAssembly.Instance(new WebAssembly.Module(bytes), importObject);
     this.instance = instance;
+    this.parkFlag = instance.exports.park;
+    this.depthGlobal = instance.exports.depth;
     for (const g of (this.staticGlobals || new Map()).values()) g.cell.rebind(instance.exports[g.exportName]);
     const alloc = new Map(), fields = new Map();
     for (const t of classTypes) {
@@ -1181,7 +1573,10 @@ class ClosedWorld {
     const locals = [[VT.anyref], ...(hasResult ? [this.wasmType(record.returnKind, record.returnRepr)] : [])];
     const lockCode = record.isStatic ? [OP.global_get, { global: record.lockGlobal }, ...GC.any_convert_extern] : [OP.local_get, 0];
     const call = (name) => [OP.local_get, ...uleb(lock), OP.call, { fn: this.hostImport(name, [VT.anyref], []) }];
-    const code = [...lockCode, OP.local_set, ...uleb(lock), ...call('menter'),
+    // A contended entry parks the thread (see park()) before the body runs.
+    const enter = this.jspi ? [...call('menter'), OP.global_get, { global: 'park' }, OP.if, 0x40,
+      OP.call, { fn: this.parkImport('V') }, OP.end] : call('menter');
+    const code = [...lockCode, OP.local_set, ...uleb(lock), ...enter,
       OP.try, ...(hasResult ? this.wasmType(record.returnKind, record.returnRepr) : [0x40])];
     for (let i = 0; i < n; i++) code.push(OP.local_get, ...uleb(i));
     code.push(OP.call, { fn: `m:${key}$body` }, OP.catch_all, ...call('mexit'), OP.rethrow, 0, OP.end);
@@ -1231,6 +1626,11 @@ class ClosedWorld {
     if (error instanceof WebAssembly.RuntimeError && /null/i.test(error.message)) {
       return { type: 'java/lang/NullPointerException', message: null };
     }
+    // The depth counter keeps module recursion below the engine's limit;
+    // this is the backstop when frames are larger than it allows for.
+    if (error instanceof RangeError && /call stack/i.test(error.message)) {
+      return { type: 'java/lang/StackOverflowError', message: null };
+    }
     if (error instanceof WebAssembly.RuntimeError && !this.reportedTrap) {
       // Any other trap is a closed-world defect, never Java semantics.
       this.reportedTrap = true;
@@ -1243,19 +1643,25 @@ class ClosedWorld {
     const previous = this.thread;
     this.thread = thread;
     this.counters.entries += 1;
+    this.syncDepth++;
+    const depth = this.getDepth();
+    this.setDepth(thread ? thread.callStack.size() : 0);
     try {
       return record.fn(...wasmArgs);
     } catch (error) {
       if (error instanceof WebAssembly.Exception && error.is(this.tag)) throw this.runtime.toJs(error.getArg(this.tag, 0));
       throw this.translateTrap(error);
     } finally {
+      this.setDepth(depth);
+      this.syncDepth--;
       this.thread = previous;
     }
   }
 
   // Scheduler entry: a frame at pc 0 of an admitted, ready method.
   tryRunFrame(frame, thread) {
-    if (frame.pc !== 0) return null;
+    if (frame.closedPark) return this.resumeFrame(frame, thread);
+    if (frame.pc !== 0 || this.debugging()) return null;
     const record = this.entryByMethod.get(frame.method);
     if (!record) return null;
     if (!this.isReady(record)) { this.counters.notReady += 1; return null; }
@@ -1266,6 +1672,7 @@ class ClosedWorld {
       args[i] = this.fromJs(kind, frame.locals[slot]);
       slot += kind === 'J' || kind === 'D' ? 2 : 1;
     }
+    if (this.jspi) return this.enterSuspendable(frame, thread, record, args);
     let result;
     try {
       result = this.invokeEntry(record, args, thread);
@@ -1282,14 +1689,90 @@ class ClosedWorld {
     }
     if (frame.initializingClassName) this.jvm.completeClassInitialization(frame);
     thread.callStack.pop();
-    if (record.returnKind !== 'V' && !thread.callStack.isEmpty()) {
-      thread.callStack.peek().stack.push(this.toJsValue(record.returnKind, result));
-    }
+    this.deliverReturn(frame, thread, record.returnKind, result);
     return { handled: true, returned: true };
+  }
+
+  // Module frames cannot be stepped or hit breakpoints, so a debugging
+  // session keeps new calls on the interpreted tiers.
+  debugging() {
+    const debug = this.jvm.debugManager;
+    return !!debug && (debug.debugMode || debug.breakpoints?.size > 0);
+  }
+
+  // A scheduler entry on its own suspendable stack. The returned promise
+  // settles when the thread parks (the entry frame stays on top, holding the
+  // continuation) or when the method completes.
+  enterSuspendable(frame, thread, record, args) {
+    const fn = record.promising ||= WebAssembly.promising(record.fn);
+    const tick = beginSegment(frame);
+    // Entries nest on one thread: a frame the module waits for (a slow call,
+    // a <clinit>) can itself enter the module.
+    frame.closedOuterEntry = thread.closedEntryFrame;
+    thread.closedEntryFrame = frame;
+    this.thread = thread;
+    this.counters.entries += 1;
+    this.setDepth(thread.callStack.size());
+    fn(...args).then(
+      (result) => this.completeSuspendable(frame, thread, record, result),
+      (error) => this.failSuspendable(frame, thread, record, error));
+    return tick;
+  }
+
+  resumeFrame(frame, thread) {
+    const resume = frame.closedPark, outcome = frame.closedResumeWith;
+    frame.closedPark = null;
+    frame.closedResumeWith = undefined;
+    const tick = beginSegment(frame);
+    this.thread = thread;
+    resume(outcome);
+    return tick;
+  }
+
+  // A popped entry frame's return value, delivered as the interpreter's
+  // return does: to a pending Method.invoke, or to the frame's return parent.
+  deliverReturn(frame, thread, kind, result) {
+    const explicitParent = frame.jitGeneratedReturnParent;
+    frame.jitGeneratedReturnParent = undefined;
+    frame.jitGeneratedReturnType = undefined;
+    const { isReflectiveTarget, completeReflectiveCall } = (this.control ||= require('../../instructions/control'));
+    if (isReflectiveTarget(thread, frame)) {
+      completeReflectiveCall(thread, kind === 'V' ? null : this.toJsValue(kind, result));
+      return;
+    }
+    if (kind === 'V') return;
+    const parent = explicitParent || (thread.callStack.isEmpty() ? null : thread.callStack.peek());
+    if (parent) parent.stack.push(this.toJsValue(kind, result));
+  }
+
+  completeSuspendable(frame, thread, record, result) {
+    thread.closedEntryFrame = frame.closedOuterEntry;
+    frame.closedOuterEntry = undefined;
+    if (frame.initializingClassName) this.jvm.completeClassInitialization(frame);
+    thread.callStack.pop();
+    this.deliverReturn(frame, thread, record.returnKind, result);
+    endSegment(frame, RETURNED);
+  }
+
+  failSuspendable(frame, thread, record, error) {
+    thread.closedEntryFrame = frame.closedOuterEntry;
+    frame.closedOuterEntry = undefined;
+    const tick = frame.closedTick;
+    frame.closedTick = null;
+    let thrown = error;
+    if (error instanceof WebAssembly.Exception && error.is(this.tag)) thrown = this.runtime.toJs(error.getArg(this.tag, 0));
+    else thrown = this.translateTrap(error);
+    if (thrown instanceof Error) { tick.reject(thrown); return; }
+    if (frame.initializingClassName) this.jvm.failClassInitialization(frame);
+    thread.callStack.pop();
+    try { this.throwThroughTombstone(record, thread, thrown); } catch (e) { tick.reject(e); }
   }
 
   // Synchronous call from generated JS code: consumes the operands.
   tryInvoke(method, frame, thread) {
+    // A JS caller's frame would sit between the module and any suspension,
+    // so with JSPI the callee runs as its own scheduler frame instead.
+    if (this.jspi || this.debugging()) return NOT_CLOSED;
     const record = this.entryByMethod.get(method);
     if (!record || !this.isReady(record)) return NOT_CLOSED;
     const items = frame.stack.items;
@@ -1322,5 +1805,33 @@ class ClosedWorld {
 }
 
 const NOT_CLOSED = Symbol('closed.not-closed');
+const PARKED = Object.freeze({ handled: true });
+const RETURNED = Object.freeze({ handled: true, returned: true });
 
-module.exports = { ClosedWorld, ClosedWorldError, NOT_CLOSED, parseMethodDescriptor, kindOf };
+function jspiAvailable() {
+  if (typeof WebAssembly === 'undefined' || typeof WebAssembly.Suspending !== 'function' ||
+      typeof WebAssembly.promising !== 'function') return false;
+  const env = typeof process !== 'undefined' ? process.env : null;
+  return env?.JVM_CLOSED_WORLD_JSPI !== '0';
+}
+
+function parkDummy(kind) {
+  switch (kind) {
+    case 'J': return 0n;
+    case 'A': return null;
+    case 'V': return undefined;
+    default: return 0;
+  }
+}
+
+function beginSegment(frame) {
+  return new Promise((resolve, reject) => { frame.closedTick = { resolve, reject }; });
+}
+
+function endSegment(frame, value) {
+  const tick = frame.closedTick;
+  frame.closedTick = null;
+  tick.resolve(value);
+}
+
+module.exports = { ClosedWorld, ClosedWorldError, NOT_CLOSED, parseMethodDescriptor, kindOf, jspiAvailable };

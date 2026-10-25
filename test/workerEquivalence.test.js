@@ -1,3 +1,5 @@
+// Tests a JS or partial-Wasm tier: the closed-world module would take its methods.
+process.env.JVM_CLOSED_WORLD = '0';
 // Phase 1 worker equivalence fixtures (docs/phase1-worker-audit.md, task 5):
 // each Java fixture runs twice — worker off, then worker on — and the
 // observable Java output/state must match. The comparison is behavioral: it

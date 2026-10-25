@@ -1,3 +1,5 @@
+// Tests a JS or partial-Wasm tier: the closed-world module would take its methods.
+process.env.JVM_CLOSED_WORLD = '0';
 // pop2 discards one category-2 value (a BigInt long, or a double, which both
 // take one slot here) or two category-1 values. The verified operand widths
 // decide, in the same analysis dup2 already relies on; both the structured

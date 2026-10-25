@@ -1,3 +1,5 @@
+// Tests a JS or partial-Wasm tier: the closed-world module would take its methods.
+process.env.JVM_CLOSED_WORLD = '0';
 // The class-record identity invariant (JVM.upgradeStubClassInPlace): a body
 // prepared against an applicationFallback stub keeps observing the real class
 // correctly after the class file is loaded, through every identity it can

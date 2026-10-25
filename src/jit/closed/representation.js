@@ -148,7 +148,9 @@ class ClosedRuntime {
         const parr = this.parrOf(value);
         return parr === value ? this.adoptArray(value) : parr;
       }
-      if (Array.isArray(value)) return this.adoptArray(value);
+      // JRE natives also build array-likes ({type, length, 0: ...}).
+      if (Array.isArray(value) || (typeof value.type === 'string' && value.type[0] === '['
+          && typeof value.length === 'number')) return this.adoptArray(value);
     }
     return value;
   }
@@ -163,12 +165,14 @@ class ClosedRuntime {
     const type = value.type;
     if (typeof type !== 'string' || type[0] !== '[') return value;
     const length = value.length;
+    // Some JRE shims keep elements in `.elements` (instructions/utils.js reads both).
+    const source = Array.isArray(value.elements) ? value.elements : value;
     let adopted;
     if (KIND[type] !== undefined) {
       adopted = this.heap.alloc(type, length);
       if (!adopted || adopted.buffer !== this.heap.memory.buffer) return value;
       for (let i = 0; i < length; i++) {
-        const v = value[i];
+        const v = source[i];
         adopted[i] = type === '[J' ? BigInt(v ?? 0) : (typeof v === 'boolean' ? (v ? 1 : 0) : (v ?? 0));
       }
       adopted.type = type;
@@ -176,7 +180,7 @@ class ClosedRuntime {
       adopted.cidx = classIndexOf(this.jvm, type);
     } else {
       const copy = new Array(length);
-      for (let i = 0; i < length; i++) copy[i] = value[i] ?? null;
+      for (let i = 0; i < length; i++) copy[i] = source[i] ?? null;
       copy.type = type;
       copy.elementType = value.elementType ?? (type.startsWith('[L') ? type.slice(2, -1) : type.slice(1));
       adopted = this.referenceArray(copy);
@@ -343,7 +347,9 @@ class ClosedRuntime {
     let allocate = null;
     if (this.classTypes) {
       allocate = this.classTypes.alloc.get(className);
-      if (!allocate) throw new Error(`closed world: no closed class type for ${className}`);
+      // A class loaded after the module was built (a later run(), a late
+      // reflective load) has no struct type; its objects stay JS objects.
+      if (!allocate) { this.lateObjects = (this.lateObjects || 0) + 1; return null; }
     }
     const base = this.heap.allocObject(layout.size);
     if (base < 0) return null;

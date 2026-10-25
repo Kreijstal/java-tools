@@ -1,3 +1,5 @@
+// Tests a JS or partial-Wasm tier: the closed-world module would take its methods.
+process.env.JVM_CLOSED_WORLD = '0';
 // multianewarray was on both JIT admission lists but had no emitter case, so
 // a prepared body with `new int[a][b]` was compiled, then deopted for good
 // at its first allocation ("unsupported generated opcode multianewarray")

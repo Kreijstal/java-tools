@@ -1,3 +1,5 @@
+// Tests a JS or partial-Wasm tier: the closed-world module would take its methods.
+process.env.JVM_CLOSED_WORLD = '0';
 // Ahead-of-main preparation admits a constructor on its resolved call graph:
 // every call it can make completes synchronously through a published entry
 // (a JRE shim with a synchronous form, a bytecode target with a body from an

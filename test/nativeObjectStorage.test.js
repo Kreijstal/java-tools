@@ -1,4 +1,6 @@
 'use strict';
+// Tests a JS or partial-Wasm tier: the closed-world module would take its methods.
+process.env.JVM_CLOSED_WORLD = '0';
 const test=require('tape');
 const {getNativeObjectStorageOps,registerNativeObjectStorage,nativeObjectStorageOf}=require('../src/core/nativeObjectStorage');
 const {T,OP,assembleModule}=require('../src/jit/wasmShared');

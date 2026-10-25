@@ -1,3 +1,5 @@
+// Tests a JS or partial-Wasm tier: the closed-world module would take its methods.
+process.env.JVM_CLOSED_WORLD = '0';
 // Phase 1.1 of docs/plan-linear-runtime.md: the hotness sampler replaces the
 // invocation-count / loop-on-sight compile decision when JVM_JIT_HOTNESS=1
 // (or jit.hotness: true). No threshold decides whether a method may compile;

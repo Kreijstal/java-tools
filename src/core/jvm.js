@@ -107,6 +107,23 @@ const BURST_TICK_OPTIONS = Object.freeze({ allowBurst: true });
 const TICK_CONTINUE = Object.freeze({ completed: false });
 const TICK_COMPLETE = Object.freeze({ completed: true });
 const JIT_TICK_SLOW = Object.freeze({ slow: true, skipJit: false });
+
+// Closed world's engine requirements: Wasm GC types and JS Promise
+// Integration (see jit/closed/ClosedWorld.js).
+let closedWorldSupport;
+function closedWorldSupported() {
+  if (closedWorldSupport !== undefined) return closedWorldSupport;
+  closedWorldSupport = false;
+  if (typeof WebAssembly === 'undefined' || typeof WebAssembly.Suspending !== 'function' ||
+      typeof WebAssembly.promising !== 'function') return false;
+  try {
+    // (module (type (struct (field i32))))
+    closedWorldSupport = WebAssembly.validate(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 95, 1, 127, 0]));
+  } catch (_) {
+    closedWorldSupport = false;
+  }
+  return closedWorldSupport;
+}
 const JIT_TICK_SLOW_AFTER_PROBE = Object.freeze({ slow: true, skipJit: true });
 const PRIMITIVE_ARRAY_COMPONENTS = new Set(["Z", "B", "C", "S", "I", "J", "F", "D"]);
 
@@ -241,7 +258,15 @@ class JVM {
       configuredMaxStackDepth > 0 ? configuredMaxStackDepth : 1024;
     // Linear heap for primitive arrays: TypedArray views over one wasm
     // memory, so compiled code can access elements without import crossings.
-    const wasmHeapEnabled = options.wasmHeap ?? env.JVM_WASM_HEAP === '1';
+    // Closed world (jit/closed) is the default wherever the engine can
+    // suspend Wasm (JS Promise Integration) and has Wasm GC: Firefox and
+    // Chrome today, Node 24+. It needs the linear heap and the JIT, and
+    // closedWorld: false (or JVM_CLOSED_WORLD=0) opts out.
+    const closedWorldWanted = options.closedWorld ?? (env.JVM_CLOSED_WORLD === '1' ||
+      (env.JVM_CLOSED_WORLD !== '0' && options.jit?.enabled !== false &&
+        env.JVM_DISABLE_JIT !== '1' && closedWorldSupported()));
+    const wasmHeapEnabled = options.wasmHeap ??
+      (env.JVM_WASM_HEAP === '1' || (env.JVM_WASM_HEAP !== '0' && closedWorldWanted));
     const wasmHeapMb = Number(options.wasmHeapMb ?? env.JVM_WASM_HEAP_MB) || 256;
     this.wasmHeap = wasmHeapEnabled
       ? new (require('./wasmHeap').WasmHeap)(wasmHeapMb)
@@ -259,7 +284,7 @@ class JVM {
     // objects, arrays and statics that a single Wasm module addresses
     // directly. It replaces the opt-in slab/dense layouts entirely.
     this.closedRuntime = null;
-    if (this.wasmHeap && (options.closedWorld ?? env.JVM_CLOSED_WORLD === '1')) {
+    if (this.wasmHeap && closedWorldWanted) {
       this.wasmFields = false;
       this.denseInstanceFields = false;
       this.closedRuntime = new (require('../jit/closed/representation').ClosedRuntime)(this);
@@ -2517,6 +2542,7 @@ class JVM {
       return {slow: true, skipJit};
     }
     const entryFrame = callStack.peek();
+    if (entryFrame.closedPark) return {slow: true, skipJit: false};
     if (entryFrame.pc >= entryFrame.instructions.length ||
         entryFrame.isSynchronizedMethod && !entryFrame.monitorEntered) {
       return {slow: true, skipJit};
@@ -2694,7 +2720,8 @@ class JVM {
       // synchronously. Do not force a Promise/microtask round trip for those
       // hot scheduler entries; the interpreter runner still returns a Promise
       // when it genuinely reaches an asynchronous path.
-      if (!skipJit) {
+      // A parked closed-module frame resumes only through the JIT entry.
+      if (!skipJit || frame.closedPark) {
         let jitResult = this.jit.tryRunFrame(frame, thread);
         if (jitResult && typeof jitResult.then === "function") {
           jitResult = await jitResult;
@@ -2737,7 +2764,7 @@ class JVM {
     for (let executed = 0; executed < limit; executed++) {
       const currentFrame = callStack.isEmpty() ? null : callStack.peek();
       if (!currentFrame || currentFrame.pc >= currentFrame.instructions.length ||
-          thread.status !== 'runnable') break;
+          thread.status !== 'runnable' || currentFrame.closedPark) break;
 
       // An invoke earlier in this burst may have pushed a synchronized frame;
       // it must not execute before its monitor is held. This runs per bytecode,
@@ -4196,6 +4223,9 @@ class JVM {
       return;
     }
     const frame = callStack.peek();
+    // A closed-module entry frame parked on (or awaiting a native that runs)
+    // the frame that threw: the module dispatches the exception itself.
+    if ((frame.closedPark || frame.closedAwaiting) && this.jit?.closedWorld?.deliverException(frame, exception)) return;
 
     let pcToCheck = pc;
     if (pc === -1) {

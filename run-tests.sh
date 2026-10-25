@@ -83,6 +83,7 @@ run_test() {
     *data-zip-download*) timeout_cmd=(timeout 60);;
     */breakpointLocations.test.js) timeout_cmd=(timeout 120);;
     */hierarchyRename.test.js) timeout_cmd=(timeout 60);;
+    */structuredColdResume.test.js) timeout_cmd=(timeout 60);; # ~12 s alone
     */hotCallGraphRegion.test.js) timeout_cmd=(timeout 120);;
     */jitCompiler.test.js) timeout_cmd=(timeout 600);;
     */javaFrontendAllJavaCompile.test.js) timeout_cmd=(timeout 180);;

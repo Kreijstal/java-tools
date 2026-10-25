@@ -1,4 +1,6 @@
 'use strict';
+// Tests a JS or partial-Wasm tier: the closed-world module would take its methods.
+process.env.JVM_CLOSED_WORLD = '0';
 // Kreijstal/java-tools#403: a checked-leaf positional body for a nested
 // reference-field predicate (`return this.a.b != null`) read the compiler's
 // field-cache temporaries (`ssaFieldCache0Value`, `ssaFieldCache1Valid`, ...)

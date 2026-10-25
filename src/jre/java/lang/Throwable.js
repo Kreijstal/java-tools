@@ -137,13 +137,11 @@ module.exports = {
       return obj;
     },
     'getSuppressed()[Ljava/lang/Throwable;': (jvm, obj, args) => {
-      const suppressedArray = obj.suppressedExceptions || [];
-      // Create a Java array of Throwable
-      const javaArray = {
-        type: '[Ljava/lang/Throwable;',
-        length: suppressedArray.length,
-        elements: suppressedArray
-      };
+      // A fresh Java array each call, as in the JDK.
+      const javaArray = (obj.suppressedExceptions || []).slice();
+      javaArray.type = '[Ljava/lang/Throwable;';
+      javaArray.elementType = 'java/lang/Throwable';
+      javaArray.hashCode = jvm.nextHashCode++;
       return javaArray;
     },
     'getClass()Ljava/lang/Class;': (jvm, obj, args) => {

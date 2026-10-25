@@ -63,7 +63,7 @@ const JVM_OUTPUT_EXPECTATIONS = Object.freeze({
   RecursionTest: 'Testing recursion without static fields...\n5! = 120',
   StaticVsInstanceTest: 'Testing static vs instance methods\nStatic method result: 8\nInstance method result: 15',
   StringBuilderConcat: 'Hello World',
-  TypeConversionTest: '123456789\n1.23456789E8\n1.23456789E8',
+  TypeConversionTest: '123456789\n1.23456792E8\n1.23456789E8', // HotSpot: (float) rounds
   StringConcat: 'Hello World',
   StringConcatMethod: 'Hello World',
   SimpleStringTest: 's1.equals(s3): true\ns3.equals(s1): true\ns1: hello\ns3: hello',

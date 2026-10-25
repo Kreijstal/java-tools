@@ -1,3 +1,5 @@
+// Tests a JS or partial-Wasm tier: the closed-world module would take its methods.
+process.env.JVM_CLOSED_WORLD = '0';
 const test = require('tape');
 const { makeJavaFixtureCompiler } = require('./javaFixture');
 const fs = require('fs');

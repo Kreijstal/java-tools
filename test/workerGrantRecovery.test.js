@@ -1,4 +1,6 @@
 'use strict';
+// Tests a JS or partial-Wasm tier: the closed-world module would take its methods.
+process.env.JVM_CLOSED_WORLD = '0';
 const test=require('tape');
 const fs=require('fs'),os=require('os'),path=require('path');
 const {JVM}=require('../src/core/jvm');

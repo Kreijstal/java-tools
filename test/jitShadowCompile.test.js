@@ -1,3 +1,5 @@
+// Tests a JS or partial-Wasm tier: the closed-world module would take its methods.
+process.env.JVM_CLOSED_WORLD = '0';
 // Phase 1.4 of docs/plan-linear-runtime.md: the compile worker, verified in
 // process. A SECOND JVM instance plays the worker's shadow JVM: it loads the
 // same classes, pre-creates the static-field keys of the classes the request

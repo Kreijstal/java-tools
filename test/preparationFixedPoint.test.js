@@ -1,3 +1,5 @@
+// Tests a JS or partial-Wasm tier: the closed-world module would take its methods.
+process.env.JVM_CLOSED_WORLD = '0';
 // Ahead-of-main preparation runs to a fixed point: it repeats compile rounds
 // while a round prepares something new, revisits a method whose dependency
 // only became available after an earlier round, links every prepared call

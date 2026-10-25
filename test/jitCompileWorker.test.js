@@ -1,3 +1,5 @@
+// Tests a JS or partial-Wasm tier: the closed-world module would take its methods.
+process.env.JVM_CLOSED_WORLD = '0';
 // Phase 1.2 of docs/plan-linear-runtime.md, end to end: a real worker_threads
 // worker boots its own JVM, compiles on request, and returns plain data the
 // main JIT rebuilds and publishes. While a body is being built the method

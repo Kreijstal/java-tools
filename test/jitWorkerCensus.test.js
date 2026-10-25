@@ -1,3 +1,5 @@
+// Tests a JS or partial-Wasm tier: the closed-world module would take its methods.
+process.env.JVM_CLOSED_WORLD = '0';
 // Phase 1 worker observability (docs/phase1-worker-audit.md, tasks 2 and 3):
 // the cost of installing a worker result is broken out per phase, and the
 // worker census reports completed/superseded plus aggregated refusal and

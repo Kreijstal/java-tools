@@ -1,3 +1,5 @@
+// Tests a JS or partial-Wasm tier: the closed-world module would take its methods.
+process.env.JVM_CLOSED_WORLD = '0';
 // Phase 1.2 protocol (docs/plan-linear-runtime.md): a generated body plus a
 // symbolic description of its captured link records is enough to rebuild an
 // equivalent function on a JIT — the shape a compile worker hands back.

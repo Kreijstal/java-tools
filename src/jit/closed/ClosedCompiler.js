@@ -24,6 +24,7 @@ const { VT, HT, OP, GC, SAT, sleb, uleb, f32bytes, f64bytes, refNull } = require
 const { T_OBJ, T_PARR, T_RARR, T_REFS, OBJ, PARR, RARR, KIND, KIND_SHIFT } = require('./representation');
 
 const WT = { I: VT.i32, J: VT.i64, F: VT.f32, D: VT.f64, A: VT.anyref };
+const KIND_OF_VT = new Map(Object.entries(WT).map(([kind, vt]) => [vt, kind]));
 const ICONST = { iconst_m1: -1, iconst_0: 0, iconst_1: 1, iconst_2: 2, iconst_3: 3, iconst_4: 4, iconst_5: 5 };
 const LCONST = { lconst_0: 0n, lconst_1: 1n };
 const FCONST = { fconst_0: 0, fconst_1: 1, fconst_2: 2 };
@@ -120,9 +121,27 @@ class ClosedCompiler {
         }
       }
     }
+    this.inferHandlerLocalKinds();
+    this.markShadowedHandlerLocals();
     this.inferReprs();
     this.analyzeControl();
     const code = [];
+    // Depth accounting (ClosedWorld.markRecursion): a method on a call cycle
+    // counts its frame and throws StackOverflowError past the JVM's limit; a
+    // method with handlers remembers its depth, since an exception unwinds
+    // the counted frames above it without their returns.
+    const recursive = !!this.entry.recursive;
+    if (recursive || this.entry.handlerBlocks?.size) {
+      const depth = [OP.global_get, { global: 'depth' }];
+      this.depthLocal = this.local([VT.i32]);
+      const d = uleb(this.depthLocal);
+      if (!recursive) code.push(...depth, OP.local_set, ...d);
+      else {
+        code.push(...depth, OP.i32_const, ...sleb(1), OP.i32_add, OP.local_tee, ...d, OP.global_set, { global: 'depth' },
+          OP.local_get, ...d, OP.i32_const, ...sleb(this.world.jvm.maxStackDepth || 1024), OP.i32_gt_s, OP.if, 0x40,
+          OP.call, { fn: this.world.hostImport('err_soe', [], []) }, OP.unreachable, OP.end);
+      }
+    }
     // Entry phis seeded from parameters (a loop back to the method entry).
     const entryBlock = fn.blocks[fn.entry];
     if (entryBlock.phis.length && entryBlock.predIds[0] === 'entry') {
@@ -152,8 +171,16 @@ class ClosedCompiler {
         OP.call, { fn: this.world.hostImport('err_npe_at', [VT.i32], []) }, OP.unreachable, OP.end, ...refCode, OP.ref_as_non_null];
     }
     if (this.tryDepth === 0) return [...refCode, OP.br_on_null, ...uleb(this.depthOf('npe'))];
-    return [...refCode, OP.ref_is_null, OP.if, 0x40,
-      OP.call, { fn: this.world.hostImport('err_npe', [], []) }, OP.unreachable, OP.end,
+    // Covered: a handler may read the message, so a null receiver of an
+    // instance invoke carries the context the interpreter's NPE carries.
+    const node = this.currentNode, method = this.entry.method;
+    const items = method?.attributes?.find((a) => a.type === 'code')?.code?.codeItems;
+    const thrower = (node && (node.op === 'invokevirtual' || node.op === 'invokeinterface') && items && items[node.itemIdx])
+      ? [OP.i32_const, ...sleb(this.world.sites.push({ where: `${this.entry.key}@${node.itemIdx}`,
+        npe: { items, item: items[node.itemIdx], owner: node.imm[1], name: node.imm[2][0] } }) - 1),
+        OP.call, { fn: this.world.hostImport('err_npe_invoke', [VT.i32], []) }]
+      : [OP.call, { fn: this.world.hostImport('err_npe', [], []) }];
+    return [...refCode, OP.ref_is_null, OP.if, 0x40, ...thrower, OP.unreachable, OP.end,
       ...refCode, OP.ref_as_non_null];
   }
 
@@ -438,7 +465,7 @@ class ClosedCompiler {
   // Parallel copy of `target`'s live phis for the edge from `source`.
   edgeCopies(source, target) {
     const block = this.fn.blocks[target];
-    const phis = block.phis.filter((phi) => this.live(phi) && phi.uses.length);
+    const phis = block.phis.filter((phi) => this.live(phi) && (phi.uses.length || this.shadowedHandlerLocals?.has(phi)));
     if (!phis.length) return [];
     const index = block.predIds.indexOf(source);
     if (index < 0) throw new Error(`edge ${source}->${target} missing from predIds`);
@@ -558,9 +585,11 @@ class ClosedCompiler {
       out.push(OP.unreachable);
       return;
     }
-    if (op === 'return') { out.push(OP.return); return; }
+    const leave = this.entry.recursive
+      ? [OP.local_get, ...uleb(this.depthLocal), OP.i32_const, ...sleb(1), OP.i32_sub, OP.global_set, { global: 'depth' }] : [];
+    if (op === 'return') { out.push(...leave, OP.return); return; }
     const kind = this.entry.returnKind;
-    out.push(...this.useAs(term.args[0], kind, this.entry.returnRepr), OP.return);
+    out.push(...this.useAs(term.args[0], kind, this.entry.returnRepr), ...leave, OP.return);
   }
 
   // ---- straight-line nodes -----------------------------------------------
@@ -676,6 +705,7 @@ class ClosedCompiler {
     this.tryDepth -= 1;
     const exc = this.temp([VT.anyref]);
     out.push(OP.catch, { tag: 'jx' }, OP.local_set, ...uleb(exc));
+    if (this.depthLocal !== undefined) out.push(OP.local_get, ...uleb(this.depthLocal), OP.global_set, { global: 'depth' });
     for (const entry of site.entries) {
       const handler = this.entry.handlerBlocks.get(entry);
       const caught = this.fn.blocks[handler].body.find((n) => n.op === 'caught_exception');
@@ -717,9 +747,96 @@ class ClosedCompiler {
     this.handlerLocalCache ||= new Map();
     if (!this.handlerLocalCache.has(handler)) {
       this.handlerLocalCache.set(handler, this.fn.values.filter((v) => v.op === 'handler_local' &&
-        v.block === handler && this.live(v) && v.uses.length));
+        v.block === handler && this.wantedHandlerLocal(v)));
     }
     return this.handlerLocalCache.get(handler);
+  }
+
+  // A handler local read directly (not through a phi) may reach here without
+  // a kind; it receives the slot's value at the covered throw sites, so it
+  // takes that value's kind (javac.js output: an i2l of an int local in a
+  // handler compiled to i2l of a null reference).
+  inferHandlerLocalKinds() {
+    if (!this.entry.handlerBlocks?.size || !this.fn.slotDefsBefore) return;
+    // Phi inputs take the phi's kind (compile()); this is for direct readers.
+    const pending = this.fn.values.filter((v) => v.op === 'handler_local' && !this.live(v)
+      && v.uses.some((use) => use.op !== 'phi'));
+    if (!pending.length) return;
+    const handlerOf = new Map();
+    for (const [entry, block] of this.entry.handlerBlocks) {
+      if (!handlerOf.has(block)) handlerOf.set(block, []);
+      handlerOf.get(block).push(entry);
+    }
+    for (const v of pending) {
+      const covered = new Set(handlerOf.get(v.block) || []);
+      const kinds = new Set();
+      for (let blockId = 0; blockId < this.fn.blocks.length; blockId++) {
+        if (!this.fn.blocks[blockId]?.term) continue;
+        for (const site of this.throwSites(blockId)) {
+          if (!site.entries.some((entry) => covered.has(entry))) continue;
+          const def = this.fn.slotDefsBefore.get(site.itemIdx)?.get(v.imm.slot);
+          if (def && this.live(def)) kinds.add(def.kind);
+        }
+      }
+      // Slots are reused with other types across a try range; only a kind
+      // every covered site agrees on is the handler's.
+      if (kinds.size === 1) v.kind = [...kinds][0];
+    }
+  }
+
+  // Makes `def` (read by a handler's frame copy as `kind`) materialized.
+  keepShadowed(def, kind, seen = new Set()) {
+    if (!def || seen.has(def)) return false;
+    seen.add(def);
+    if (def.op === 'handler_local') {
+      if (this.wantedHandlerLocal(def)) return false;
+      if (!def.kind || def.kind === 'V') def.kind = kind;
+      if (def.kind !== kind) return false;
+      this.shadowedHandlerLocals.add(def);
+      return true;
+    }
+    if (def.op !== 'phi' || this.live(def)) return false;
+    def.kind = kind;
+    this.shadowedHandlerLocals.add(def);
+    for (const arg of def.args) this.keepShadowed(arg, kind, seen);
+    return true;
+  }
+
+  wantedHandlerLocal(v) {
+    return (this.live(v) && v.uses.length > 0) || !!this.shadowedHandlerLocals?.has(v);
+  }
+
+  // A throw inside a handler: the handler covering it copies the frame state
+  // at the throw, and a slot the inner handler never read is still defined by
+  // that inner handler's own handler_local (or a phi joining them). Nothing
+  // in SSA uses it, so it must be kept live (with the kind its reader wants)
+  // or the outer handler reads a never-written local (try-with-resources lost
+  // its resource).
+  markShadowedHandlerLocals() {
+    if (!this.entry.handlerBlocks?.size || !this.fn.slotDefsBefore) return;
+    const byBlock = new Map();
+    for (const v of this.fn.values) {
+      if (v.op !== 'handler_local') continue;
+      if (!byBlock.has(v.block)) byBlock.set(v.block, []);
+      byBlock.get(v.block).push(v);
+    }
+    this.shadowedHandlerLocals = new Set();
+    for (let changed = true; changed;) {
+      changed = false;
+      for (let blockId = 0; blockId < this.fn.blocks.length; blockId++) {
+        if (!this.fn.blocks[blockId]?.term) continue;
+        for (const site of this.throwSites(blockId)) {
+          const defs = this.fn.slotDefsBefore.get(site.itemIdx);
+          if (!defs) continue;
+          for (const entry of site.entries) {
+            for (const local of byBlock.get(this.entry.handlerBlocks.get(entry)) || []) {
+              if (!this.wantedHandlerLocal(local)) continue;
+              if (this.keepShadowed(defs.get(local.imm.slot), local.kind)) changed = true;
+            }
+          }
+        }
+      }
+    }
   }
 
   finish(node, out) {
@@ -745,7 +862,7 @@ class ClosedCompiler {
   }
 
   calleeOf(fnKey) {
-    return typeof fnKey === 'string' && fnKey.startsWith('m:') ? this.world.entries.get(fnKey.slice(2)) : null;
+    return typeof fnKey === 'string' && fnKey.startsWith('m:') ? this.world.signatureOf(fnKey.slice(2)) : null;
   }
 
   emitNode(node, out) {
@@ -795,7 +912,9 @@ class ClosedCompiler {
       out.push(OP.select);
       return this.finish(node, out);
     }
-    if (CONVERT[op]) { out.push(...arg(0, null), ...CONVERT[op]); return this.finish(node, out); }
+    // The opcode names its input kind; an undefined input (a slot no path
+    // wrote) still needs a zero of that kind, not a null reference.
+    if (CONVERT[op]) { out.push(...arg(0, op[0].toUpperCase().replace('L', 'J')), ...CONVERT[op]); return this.finish(node, out); }
     if (op === 'i2c') { out.push(...arg(0, 'I'), OP.i32_const, ...sleb(0xffff), OP.i32_and); return this.finish(node, out); }
     if (PRIM_ARRAY[op]) { out.push(...this.primitiveArray(node)); return this.finish(node, out); }
     if (op === 'aaload' || op === 'aastore') { out.push(...this.referenceArray(node)); return this.finish(node, out); }
@@ -962,7 +1081,9 @@ class ClosedCompiler {
         const code = [];
         plan.argKinds.forEach((kind, i) => code.push(...arg(i, kind)));
         code.push(OP.call, { fn: plan.fn });
-        return code;
+        if (!this.parkable(plan.fn)) return code;
+        const results = this.world.imports.get(plan.fn).results;
+        return this.withPark(code, results.length ? KIND_OF_VT.get(results[0]) : 'V');
       }
       case 'intrinsic': return this.intrinsic(node, plan);
       case 'instanceof': return this.typeTest(node, plan, false);
@@ -971,13 +1092,36 @@ class ClosedCompiler {
     }
   }
 
+  // A host call that may ask this thread to stop: natives, host virtual
+  // dispatch and monitor entry.
+  parkable(fn) {
+    return this.world.jspi && typeof fn === 'string' &&
+      (fn.startsWith('native:') || fn.startsWith('vhost:') || fn.startsWith('vslow:') || fn === 'h:menter');
+  }
+
+  // `code` leaves the call's result (of `kind`, typed as `type`) on the
+  // stack. When the host set the park flag, the result is a placeholder:
+  // the suspending park import parks the thread and returns the real one.
+  withPark(code, kind, type = kind === 'V' ? null : [WT[kind]], cast = []) {
+    const park = this.world.parkImport(kind);
+    const flag = [OP.global_get, { global: 'park' }];
+    if (kind === 'V') return [...code, ...flag, OP.if, 0x40, OP.call, { fn: park }, OP.end];
+    const tmp = this.temp(type);
+    const out = [...code, OP.local_set, ...uleb(tmp), ...flag, OP.if, 0x40,
+      OP.call, { fn: park }, ...cast, OP.local_set, ...uleb(tmp), OP.end, OP.local_get, ...uleb(tmp)];
+    this.release(type, tmp);
+    return out;
+  }
+
   // Lazy class initialization: one load of the class's readiness word; only
   // the first access calls out to run the initializer.
   initCheck(target) {
     if (this.checked.has(target.className)) return [];
     this.checked.add(target.className);
     const init = this.world.hostImport('init', [VT.i32], []);
-    const call = [OP.i32_const, ...sleb(target.id), OP.call, { fn: init }];
+    const call = this.world.jspi
+      ? this.withPark([OP.i32_const, ...sleb(target.id), OP.call, { fn: init }], 'V')
+      : [OP.i32_const, ...sleb(target.id), OP.call, { fn: init }];
     if (target.address === null) return call;
     return [OP.i32_const, ...sleb(target.address), OP.i32_load, 2, 0, OP.i32_eqz, OP.if, 0x40, ...call, OP.end];
   }
@@ -1096,16 +1240,21 @@ class ClosedCompiler {
       code.push(OP.else);
       open += 1;
     }
-    code.push(OP.local_get, ...uleb(cls), OP.i32_const, ...sleb(plan.siteId),
-      OP.call, { fn: this.world.hostImport('vmiss', [VT.i32, VT.i32], []) }, OP.unreachable);
+    // A class id no arm covers, or a receiver outside closed storage with no
+    // host call: the bytecode fallback (JSPI), else a loud closed-world error.
+    const miss = (clsCode) => plan.fallbackFn
+      ? [...this.callArgs(node, plan, plan.fallbackFn), OP.call, { fn: plan.fallbackFn }, ...castResult]
+      : [...clsCode, OP.i32_const, ...sleb(plan.siteId),
+        OP.call, { fn: this.world.hostImport('vmiss', [VT.i32, VT.i32], []) }, OP.unreachable];
+    code.push(...miss([OP.local_get, ...uleb(cls)]));
     for (let i = 0; i < open; i++) code.push(OP.end);
     code.push(OP.else);
     if (plan.hostFn) code.push(...this.callArgs(node, plan, plan.hostFn), OP.call, { fn: plan.hostFn }, ...castResult);
-    else code.push(OP.i32_const, ...sleb(-1), OP.i32_const, ...sleb(plan.siteId),
-      OP.call, { fn: this.world.hostImport('vmiss', [VT.i32, VT.i32], []) }, OP.unreachable);
+    else code.push(...miss([OP.i32_const, ...sleb(-1)]));
     code.push(OP.end);
     this.release([VT.i32], cls);
-    return code;
+    if (!this.world.jspi) return code;
+    return this.withPark(code, plan.returnKind, plan.returnKind === 'V' ? null : resultType, castResult);
   }
 
   // instanceof / checkcast. Guest class targets test the class id in Wasm;

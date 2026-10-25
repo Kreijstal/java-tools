@@ -1,3 +1,5 @@
+// Tests a JS or partial-Wasm tier: the closed-world module would take its methods.
+process.env.JVM_CLOSED_WORLD = '0';
 // Phase 1 observability (docs/phase1-worker-audit.md, tasks 1 and 4):
 // synchronous compilation is split into pre-main and post-main accounting,
 // with a diagnostic trace mode and an opt-in assertion that fails any

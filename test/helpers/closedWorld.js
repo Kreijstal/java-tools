@@ -49,7 +49,11 @@ function runDetailed(directory, mainClass, options = {}) {
     CLOSED_OPTIONS: JSON.stringify({ classpath: directory, wasmHeap: true, ...options }),
     CLOSED_MAIN: mainClass,
   };
-  const result = spawnSync(process.execPath, ['-e', RUNNER], { env, encoding: 'utf8', maxBuffer: 64 << 20 });
+  const node = options.jspiNode ? jspiNode() : process.execPath;
+  const jvmOptions = { ...options };
+  delete jvmOptions.jspiNode;
+  env.CLOSED_OPTIONS = JSON.stringify({ classpath: directory, wasmHeap: true, ...jvmOptions });
+  const result = spawnSync(node, ['-e', RUNNER], { env, encoding: 'utf8', maxBuffer: 64 << 20 });
   if (result.error) throw result.error;
   const parsed = parseStats(result.stderr || '');
   return { output: result.stdout, stderr: result.stderr, ...parsed };
@@ -61,4 +65,19 @@ async function runJvmJs(directory, mainClass, options = {}) {
   return result.output;
 }
 
-module.exports = { compileFixture, hotspot, runJvmJs, runDetailed };
+// A Node with JS Promise Integration (Node 24+): this one, JVM_JSPI_NODE, or
+// /usr/bin/node. null when none is available.
+let jspiNodePath;
+function jspiNode() {
+  if (jspiNodePath !== undefined) return jspiNodePath;
+  const { spawnSync } = require('node:child_process');
+  const probe = "process.stdout.write(String(typeof WebAssembly.Suspending === 'function'))";
+  for (const candidate of [process.execPath, process.env.JVM_JSPI_NODE, '/usr/bin/node']) {
+    if (!candidate) continue;
+    const result = spawnSync(candidate, ['-e', probe], { encoding: 'utf8' });
+    if (result.stdout === 'true') return (jspiNodePath = candidate);
+  }
+  return (jspiNodePath = null);
+}
+
+module.exports = { compileFixture, hotspot, runJvmJs, runDetailed, jspiNode };
