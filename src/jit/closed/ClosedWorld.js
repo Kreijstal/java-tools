@@ -906,7 +906,7 @@ class ClosedWorld {
           structType: reference ? this.classTypes.get(declaring).key : null,
           structIndex: reference ? OBJ_FIELDS.length + field.index : null,
           fieldRepr: reference ? this.reprOfDescriptor(descriptor) : null,
-          spillFn: reference ? null : this.hostFieldPlan(op, imm, kindOf(descriptor)).fn,
+          spillFn: reference ? null : this.primitiveSpillFieldImport(op, field, kindOf(descriptor)),
         });
         return;
       }
@@ -1234,6 +1234,15 @@ class ClosedWorld {
   throwingImport(key, params, results, type, message) {
     const tag = this.tag;
     return this.siteImport(key, params, results, () => { throw new WebAssembly.Exception(tag, [{ type, message }]); });
+  }
+
+  // Resolved primitive fields on a typed spilled object need no interpreter lookup.
+  primitiveSpillFieldImport(op, field, valueKind) {
+    const key = field.key, put = op === 'putfield';
+    return this.pureImport(`spillfield:${op}:${key}`, put ? [VT.externref, WT[valueKind]] : [VT.externref],
+      put ? [] : [WT[valueKind]], put
+        ? (wrapper, value) => { wrapper.fields[key] = value; }
+        : wrapper => wrapper.fields[key]);
   }
 
   hostFieldPlan(op, imm, valueKind) {
