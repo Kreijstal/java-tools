@@ -376,7 +376,7 @@ class ClosedWorld {
           context: { frame: { instructions: items }, pc: item.pc, className: owner, methodName: name } }]);
       },
       err_npe_at: (site) => {
-        process.stderr.write(`[closed-world] NullPointerException at ${this.sites[site]?.where}\n`);
+        reportDiagnostic(`[closed-world] NullPointerException at ${this.sites[site]?.where}`);
         throwJava('java/lang/NullPointerException');
       },
       init: (id) => world.initializeSync(id),
@@ -1657,7 +1657,7 @@ class ClosedWorld {
     if (error instanceof WebAssembly.RuntimeError && !this.reportedTrap) {
       // Any other trap is a closed-world defect, never Java semantics.
       this.reportedTrap = true;
-      process.stderr.write(`[closed-world] trap: ${error.stack}\n`);
+      reportDiagnostic(`[closed-world] trap: ${error.message}\n${error.stack || ''}`);
     }
     return error;
   }
@@ -1784,13 +1784,15 @@ class ClosedWorld {
     frame.closedOuterEntry = undefined;
     const tick = frame.closedTick;
     frame.closedTick = null;
-    let thrown = error;
-    if (error instanceof WebAssembly.Exception && error.is(this.tag)) thrown = this.runtime.toJs(error.getArg(this.tag, 0));
-    else thrown = this.translateTrap(error);
-    if (thrown instanceof Error) { tick.reject(thrown); return; }
-    if (frame.initializingClassName) this.jvm.failClassInitialization(frame);
-    thread.callStack.pop();
-    try { this.throwThroughTombstone(record, thread, thrown); } catch (e) { tick.reject(e); }
+    try {
+      let thrown = error;
+      if (error instanceof WebAssembly.Exception && error.is(this.tag)) thrown = this.runtime.toJs(error.getArg(this.tag, 0));
+      else thrown = this.translateTrap(error);
+      if (thrown instanceof Error) { tick.reject(thrown); return; }
+      if (frame.initializingClassName) this.jvm.failClassInitialization(frame);
+      thread.callStack.pop();
+      this.throwThroughTombstone(record, thread, thrown);
+    } catch (error) { tick.reject(error); }
   }
 
   // Synchronous call from generated JS code: consumes the operands.
@@ -1847,6 +1849,18 @@ function parkDummy(kind) {
     case 'V': return undefined;
     default: return 0;
   }
+}
+
+function reportDiagnostic(message) {
+  // Diagnostics must never replace the guest failure or strand a scheduler
+  // segment. Browser process shims have no stderr, and host loggers may throw.
+  try {
+    if (typeof process !== 'undefined' && typeof process.stderr?.write === 'function') {
+      process.stderr.write(message + '\n');
+    } else if (typeof console !== 'undefined' && typeof console.error === 'function') {
+      console.error(message);
+    }
+  } catch (_) { /* Preserve the original failure even if logging fails. */ }
 }
 
 function beginSegment(frame) {
