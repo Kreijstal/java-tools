@@ -61,6 +61,20 @@ test('keeps unsupported scopes, unbraced arms, shadows and lexical ambiguity unt
  }
 });
 
+test('write-only arms keep the original lifetime; only arms that read a value are renamed',()=>{
+ for(const source of [
+  'int x=0;if(flag){x=1;}else{x=2;}',
+  'int x=0;int y=0;if(outer()){if(choose()){prefix();if(!keep()){x=220;y=170;}}else{x=220;y=170;}}',
+  'int x=0;if(flag){x=1;use(x);}else{x=2;}',
+  'int x=0;if(flag){x=1;x+=2;}else{x=2;}',
+ ])assert.equal(split(source).source,source,source);
+ const source='int x=0;if(a){if(b){x=1;use(x);}else{x=5;}}else{x=2;use(x);}',r=split(source,{retainDiagnostics:true});
+ assert.equal(r.source,'int x=0;int xLifetime1;\nif(a){if(b){x=1;use(x);}else{x=5;}}else{xLifetime1=2;use(xLifetime1);}');
+ assert.equal(r.diagnostics.locals[0].groups,2);assert.equal(undo(r.source),source);assert.equal(split(r.source).source,r.source);
+ const counted='int x=0;if(flag){x=1;x++;}else{x=2;use(x);}';
+ assert.equal(split(counted).source,'int x=0;int xLifetime1;\nif(flag){x=1;x++;}else{xLifetime1=2;use(xLifetime1);}');
+});
+
 test('compiler enables branch and phase recovery without application flags',()=>{
  const finish=require('../src/decompiler/cfr')._internals.shareExistingExitTails;
  const source='int x=0;try{if(flag){x=1;use(x);x=2;use(x);}else{x=3;use(x);x=4;use(x);}}catch(RuntimeException failure){throw failure;}';

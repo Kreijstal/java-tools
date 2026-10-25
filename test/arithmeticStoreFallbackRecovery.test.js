@@ -9,7 +9,7 @@ test('integral arithmetic stores occupy exclusive arms while preserving other ex
 });
 test('normal emission reconstructs computed assignments after earlier terminal cleanup',()=>{
  const source=frame('this.position-1'),body=[source];finish(body,[],[],fields);
- assert.equal(body[0],'if(choose()){if (!early()) {prefix();if (!keep()) {this.position=this.position-1;}}} else {this.position=this.position-1;}');
+ assert.equal(body[0],'if (!choose()) {this.position=this.position-1;} else if (!early()) {prefix();if (!keep()) {this.position=this.position-1;}}');
 });
 test('integer promotion, shifts, division and original association remain explicit',()=>{
  for(const rhs of ['this.position+1','this.position*3-7','(this.position+1)*(this.position-3)','this.position/(1-this.position)','this.position%(1-this.position)','~this.position','this.position>>>33','this.position&7|this.position^3'])assert.equal(fold(frame(rhs),{ownedFields:fields}).framesRecovered,1,rhs);
