@@ -55,6 +55,13 @@ for(const[name,source]of[
  ['comments','int selected=read();if(selected!=0){'+inner+'}else{/* keep */zero();}'],
 ])test('refuses '+name,()=>assert.equal(recover(source,options).source,source));
 
+test('removed switch boundaries do not leave whitespace-only lines',()=>{
+ for(const content of ['case 2: second(); break; default: rest();','']){
+  const source='int selected=read();\nswitch(selected){\n  case 1:first();break;\n  default:\n    switch(selected){\n      '+content+'\n    }\n    break;\n  case 3:last();break;\n}';
+  const result=finish(source);assert.equal(result.dispatchesRecovered,1);assert.doesNotMatch(result.source,/^[ \t]+$/m);assert.equal(finish(result.source).source,result.source);
+ }
+});
+
 test('the default decision policy combines both layers without application flags',()=>{
  const source='int selected=read();if(selected!=0){switch(selected){case 1:first();break;default:switch(selected){case 2:second();break;default:rest();}break;}}else{zero();}';
  const result=finish(source);assert.equal(result.dispatchesRecovered,2);assert.equal((result.source.match(/switch\s*\(/g)||[]).length,1);assert.match(result.source,/case 0:/);assert.equal(finish(result.source).source,result.source);

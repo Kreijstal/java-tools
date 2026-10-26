@@ -281,9 +281,15 @@ function recoverScalarIfDispatches(source, proof, {retainDiagnostics = false, ne
         if (invalid) return;
         const before = starts.get(innerNode.range.startOffset) - 1;
         if (tokens[before]?.text !== ':' || tokens[before - 1]?.text !== 'default') continue;
-        const start = tokens[before - 1].range.startOffset;
-        nested = {start, end:end.end, text:wrapped.slice(tokens[inner.open].range.endOffset, tokens[inner.close].range.startOffset)
-          + (completes ? '\nbreak;' : '')};
+        let start = tokens[before - 1].range.startOffset;
+        // The removed braces/label owned this indentation. Do not strand it on
+        // a now-empty line; all nontrivia action bytes stay inside the body.
+        const body = wrapped.slice(tokens[inner.open].range.endOffset, tokens[inner.close].range.startOffset).trim();
+        if (!body) {
+          const line = wrapped.lastIndexOf('\n', start - 1) + 1;
+          if (!wrapped.slice(line, start).trim()) start = line;
+        }
+        nested = {start, end:end.end, text:body + (completes ? '\nbreak;' : '')};
         break;
       }
     });
