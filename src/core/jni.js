@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
-const { ensureJavaThread } = require('../jre/java/lang/Thread');
+const threadJre = require('../jre/java/lang/Thread');
+const { ensureJavaThread } = threadJre;
 
 /**
  * Java Native Interface (JNI) implementation for the JavaScript JVM
@@ -14,6 +15,9 @@ class JNI {
     this.jvm = jvm;
     this.nativeRegistry = new Map(); // className:methodName:descriptor -> native function
     this.nativeLibraries = new Map(); // library name -> library object
+    // Trusted built-in provenance for compiler intrinsics. Public registrations
+    // receive new wrappers, so replacing a built-in never inherits its proof.
+    this.builtinNativeImplementations = new WeakMap();
     this.registryVersion = 0;
     this.verbose = false;
     
@@ -173,6 +177,10 @@ class JNI {
     };
   }
 
+  builtinImplementationOf(native) {
+    return this.builtinNativeImplementations.get(native) || null;
+  }
+
   /**
    * Initialize built-in JRE native methods by migrating existing implementations
    * @private
@@ -210,6 +218,9 @@ class JNI {
         const currentThread = jniEnv.jvm.threads[jniEnv.jvm.currentThreadIndex];
         return ensureJavaThread(jniEnv.jvm, currentThread);
       });
+    this.builtinNativeImplementations.set(
+      this.findNativeMethod('java/lang/Thread', 'currentThread', '()Ljava/lang/Thread;'),
+      threadJre.staticMethods['currentThread()Ljava/lang/Thread;']);
 
     if (this.verbose) {
       console.log('JNI: Initialized built-in native methods');

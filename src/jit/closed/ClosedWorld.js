@@ -695,6 +695,26 @@ class ClosedWorld {
 
   // A synchronous native call as an import: (receiver?, args...) -> result.
   nativeImport(key, native, descriptor, hasReceiver) {
+    // The standard currentThread native cannot suspend, push guest frames or
+    // change thread state. Keep its time-slice poll, but avoid allocating an
+    // argument array and testing the general host-result protocol on every
+    // renderer/context lookup. Function identity preserves custom overrides.
+    if (!hasReceiver && key === 'native:java/lang/Thread.currentThread()Ljava/lang/Thread;') {
+      const threadJre = require('../../jre/java/lang/Thread');
+      const implementation = this.jvm.jni?.builtinImplementationOf(native) || native;
+      if (implementation === threadJre.staticMethods['currentThread()Ljava/lang/Thread;']) {
+        const world = this;
+        return this.siteImport(key, [], [VT.anyref], () => {
+          const thread = world.thread || world.jvm.threads[world.jvm.currentThreadIndex];
+          const value = world.runtime.toWasm(threadJre.ensureJavaThread(world.jvm, thread));
+          if (world.sliceExpired() && world.requestPark({value})) {
+            world.counters.preempted += 1;
+            return null;
+          }
+          return value;
+        });
+      }
+    }
     const { params, ret } = parseMethodDescriptor(descriptor);
     const kinds = params.map(kindOf), retKind = kindOf(ret);
     const wasmParams = [...(hasReceiver ? [VT.anyref] : []), ...kinds.map((k) => WT[k])];
