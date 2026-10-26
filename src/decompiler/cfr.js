@@ -27,7 +27,7 @@ const { listRegionSplitCandidates, applyRegionSplit } = require('../passes/regio
 const { jreClassInfo, jreMethodCandidates } = require('../java-frontend/jreMetadata');
 const { JavaParser } = require('../java-frontend/parser');
 const { tokenizeJava } = require('../java-frontend/lexer');
-const { promoteBooleanStackCarriers, foldPrimitiveValueBranches, factorCommonBranchTails, factorLabeledBlockReturnTails, simplifyControlFrames, removeFallthroughLabelBreaks, localizePlainBlockLoopBreaks, foldLeadingWhileBreakGuards, foldEffectfulPlainBlockExits, simplifyIdentityReferenceCasts, recoverScalarLabelDispatches, specializePathGuards, recoverPostGuardExits, recoverArrayIndexIncrements, foldLabeledBooleanDecisions, foldVoidReturnExits, foldNestedIfGuards, foldLabeledSkipGuards, foldLabeledIfElseExits, foldLabeledExitTrees, foldLabeledGuardTrees, removeDeadRegionSelectors, removeDeadReceiverSnapshots, removeCaughtExceptionCopies } = require('./javaAstEmitter');
+const { promoteBooleanStackCarriers, foldPrimitiveValueBranches, localizeForLoopDeclarations, factorCommonBranchTails, factorLabeledBlockReturnTails, simplifyControlFrames, removeFallthroughLabelBreaks, localizePlainBlockLoopBreaks, foldLeadingWhileBreakGuards, foldEffectfulPlainBlockExits, simplifyIdentityReferenceCasts, recoverScalarLabelDispatches, specializePathGuards, recoverPostGuardExits, recoverArrayIndexIncrements, foldLabeledBooleanDecisions, foldVoidReturnExits, foldNestedIfGuards, foldLabeledSkipGuards, foldLabeledIfElseExits, foldLabeledExitTrees, foldLabeledGuardTrees, removeDeadRegionSelectors, removeDeadReceiverSnapshots, removeCaughtExceptionCopies } = require('./javaAstEmitter');
 
 const VERSION = 'CFR-JS 0.4.0';
 const javaStatementParser = new JavaParser();
@@ -1354,6 +1354,12 @@ function formatMethod(cls, method, options = {}) {
     && !bodyCompletesAbruptly(body)
     && !body.some((line) => /(?:stateLoop:|\bwhile\b|\bcontinue\b)/.test(String(line)))) {
     body.push(`return ${defaultValueForType(methodResultType)};`);
+  }
+  if (!hasPartitionedState) {
+    // Missing declarations and independent lifetimes are now materialized.
+    // Narrow only a complete, proven loop-local lifetime at this final stage.
+    const localized = localizeForLoopDeclarations(body.join('\n'), {reservedNames: localState.paramNames});
+    if (localized.declarationsMoved) replaceArrayContents(body, localized.source.split('\n'));
   }
   assertNoFallback(body, { className: cls.className, methodName: method.name, descriptor: method.descriptor });
   const result = formatBlock(header, body);
@@ -5315,7 +5321,7 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     if (partitionOversizedMethod) {
       return partitionVoidStateMachine(lines, method, localState);
     }
-    const body = coalesceDefaultConstructorBody(sinkForInitDeclarations(rewriteWhileLoopsAsFor(lines)), method);
+    const body = coalesceDefaultConstructorBody(rewriteWhileLoopsAsFor(lines), method);
     return useStateMachine ? body : compactBlankSourceLines(body.join('\n')).split('\n');
   } catch (err) {
     // Expression reconstruction can still decline stack-carrying joins. The
@@ -8200,33 +8206,6 @@ function rewriteWhileLoopsAsFor(lines) {
 // `for` belongs in that `for`, which is where the source had it - and the
 // method-scope copy has to go, or the two declarations collide and the later one
 // loses its type.
-function sinkForInitDeclarations(lines) {
-  const out = lines.slice();
-  for (let index = 0; index < out.length; index += 1) {
-    const header = /^(\s*)(?:[A-Za-z_$][A-Za-z0-9_$]*:\s*)?for \((?:([A-Za-z_$][A-Za-z0-9_$.<>\[\], ]*?)\s+)?([A-Za-z_$][A-Za-z0-9_$]*) = [^;]*; /.exec(String(out[index]));
-    if (!header) continue;
-    const [, , headerType, name] = header;
-    const end = enclosingBlockEndLine(out, index);
-    if (end === -1) continue;
-    const declarationPattern = new RegExp(`^([A-Za-z_$][A-Za-z0-9_$.<>\\[\\], ]*?)\\s+${escapeRegExp(name)}(?: = [^;]+)?;$`);
-    const declarationIndex = out.findIndex((line, position) => position < index
-      && declarationPattern.test(String(line)));
-    if (declarationIndex === -1) continue;
-    const declaration = declarationPattern.exec(String(out[declarationIndex]));
-    const uses = new RegExp(`\\b${escapeRegExp(name)}\\b`);
-    const usedElsewhere = out.some((line, position) => position !== declarationIndex
-      && (position < index || position > end) && uses.test(String(line)));
-    if (usedElsewhere) continue;
-    if (!headerType) {
-      out[index] = String(out[index]).replace(
-        new RegExp(`for \\(${escapeRegExp(name)} = `), `for (${declaration[1]} ${name} = `);
-    }
-    out.splice(declarationIndex, 1);
-    index -= 1;
-  }
-  return out;
-}
-
 function pushLoopLines(lines, loopLines) {
   const forLoop = rewriteWhileAsFor(lines[lines.length - 1], loopLines);
   if (!forLoop) {
