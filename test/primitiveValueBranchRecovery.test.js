@@ -33,6 +33,13 @@ test('retains the predicate once and numeric literal spelling exactly', () => {
   assert.equal(recover(source).source, 'while(again()) { value = ((flag=probe()) && tick()) ? 0x8000_0000 : -2147483648; }');
 });
 
+test('many independent decisions retain order without iterative whole-source rewriting', () => {
+  const decisions=Array.from({length:1000},(_,i)=>`if(probe(${i})) { value=${i}; } else { value=-${i}; }`);
+  const result=recover(decisions.join('\n'));
+  assert.equal(result.branchesFolded,1000);
+  assert.equal(result.source,Array.from({length:1000},(_,i)=>`value = (probe(${i})) ? ${i} : -${i};`).join('\n'));
+});
+
 for (const [name, source] of [
   ['unqualified field', 'if(probe()) { field=left; } else { field=right; }'],
   ['qualified field', 'if(probe()) { this.value=left; } else { this.value=right; }'],

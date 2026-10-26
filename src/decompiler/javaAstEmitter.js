@@ -2984,12 +2984,13 @@ function foldPrimitiveValueBranches(source, {localType = null} = {}) {
       if (value) edits.push({start: tokens[start].range.startOffset, end: tokens[otherEnd].range.endOffset, text: value.source});
     }
     if (!edits.length) return unchanged();
-    let result = wrapped, previous = wrapped.length;
-    for (const edit of edits.sort((a,b) => b.start - a.start)) {
-      if (edit.end > previous) return unchanged();
-      result = result.slice(0, edit.start) + edit.text + result.slice(edit.end); previous = edit.start;
+    const fragments = []; let cursor = 0;
+    for (const edit of edits.sort((a,b) => a.start - b.start)) {
+      if (edit.start < cursor) return unchanged();
+      fragments.push(wrapped.slice(cursor, edit.start), edit.text); cursor = edit.end;
     }
-    return {source: result.slice(2, -2), branchesFolded: edits.length};
+    fragments.push(wrapped.slice(cursor));
+    return {source: fragments.join('').slice(2, -2), branchesFolded: edits.length};
   } catch (error) {
     if (error instanceof RangeError || error instanceof SyntaxError) return unchanged();
     throw error;
