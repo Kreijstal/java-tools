@@ -20,6 +20,13 @@ test('default source decisions fold proven primitive choices without external ty
  assert.equal(unit(result.source).source,result.source);
 });
 
+test('default value recovery keeps complete ordered ladders rather than mixing a partial ternary',()=>{
+ for(const source of [
+  'int value=0;if(first()){value=1;}else if(second()){value=2;}else{value=3;}',
+  'double value=0;if(first()){value=1.0;}else{{if(second()){value=2.0;}else{value=3.0;}}}',
+ ]){const result=body(source);assert.equal(result.valueBranchesFolded,0);assert.ok(!result.source.includes('?'));assert.equal(body(result.source).source,result.source);}
+});
+
 for(const source of[
  'int selected=read();Runnable r=()->{if(!(!test()))work();};',
  'class Local{void f(){if(!(!test()))work();}}',

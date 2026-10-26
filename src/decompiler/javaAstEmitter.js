@@ -3069,6 +3069,14 @@ function foldPrimitiveValueBranches(source, {localType = null} = {}) {
     }
     const edits = [];
     for (const node of branches) {
+      // A partial ternary at the end of an ordered ladder mixes two decision
+      // styles and can obscure the earlier alternatives. Keep that ladder
+      // until its complete value selection has a readable representation.
+      let owner = node, parent = parents.get(owner);
+      while (parent?.kind === 'BlockStatement' && parent.statements.length === 1) {
+        owner = parent; parent = parents.get(owner);
+      }
+      if (scoped && parent?.kind === 'IfStatement' && parent.alternate === owner) continue;
       const taken = arm(node.consequent), other = arm(node.alternate);
       if (!taken || !other) continue;
       const start = starts.get(node.range?.startOffset), condition = start + 1, endCondition = pairs.get(condition);

@@ -93,7 +93,11 @@ test('source replay proves scoped primitive declarations without a caller type t
   const source='final int value;try{synchronized(lock){if((flag=read())!=0&&boxed){value=2147483647;}else{value=-2147483648;}}}finally{done();}';
   assert.equal(foldPrimitiveValueBranches(source).branchesFolded,1);
   const nested='int value=0;if(first()){use();}else if(second()){value=3;}else{value=5;}';
-  assert.equal(foldPrimitiveValueBranches(nested).source,'int value=0;if(first()){use();}else {\nvalue = (second()) ? (3) : (5);\n}');
+  assert.equal(foldPrimitiveValueBranches(nested).source,nested);
+  const wrapped='double value=0;int a=1,b=2;if(first()){value=1.0;}else{if(second()){value=2.0;}else{value=3.0;}}';
+  assert.equal(foldPrimitiveValueBranches(wrapped).source,wrapped);
+  const loop='int value=0;while(again())if(test()){value=1;}else{value=2;}';
+  assert.equal(foldPrimitiveValueBranches(loop).source,'int value=0;while(again()){\nvalue = (test()) ? (1) : (2);\n}');
 });
 
 test('source replay refuses shadowing, widened conversions, fields and unproven operands', () => {
