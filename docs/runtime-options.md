@@ -1,5 +1,37 @@
 # Runtime options
 
+## Approximate browser memory and startup heap capacity
+
+`JVM.getMemoryUsage()` returns optional Chromium `performance.memory` values
+and separate allocated, current-capacity and reserved-capacity bytes for known
+linear heaps in the current context. Weak tracking does not retain discarded
+VMs. `estimatedUsedBytes` adds allocated linear bytes to the reported JS heap;
+it is approximate, may double-count on some engines, and is not process RSS.
+Ordinary buffer memory may already be included in the browser's JS estimate.
+The browser API may return cached or quantized values. Worker heaps, GPU/DOM
+storage and native compiled-code allocations are not fully measured; the report
+explicitly sets `workersIncluded: false`. Unsupported browsers report null JS
+estimates while retaining known linear counters.
+
+The generic constructor options `wasmHeapMaxMb`, `wasmHeapBudgetMb` and
+`wasmHeapHeadroomMb` allow startup expansion above the configured `wasmHeapMb`.
+Without a maximum and budget, the configured heap remains fixed and its
+constructor does not query the browser's potentially cached counter. When
+enabled, selection uses estimated existing JS/linear bytes, the remaining
+planning budget and headroom, in 32 MiB steps. A reported device-memory bucket
+of 2 GiB or less, missing estimates, missing weak heap accounting or inadequate
+headroom leaves the configured capacity unchanged. The browser JS heap limit
+also caps the planning budget. The headroom default is 96 MiB.
+
+Capacity is selected before creating the new memory or exposing array views.
+No live buffer is grown or detached. If an expanded reservation is refused,
+construction retries the original configured capacity; failure at that original
+capacity retains the existing error behavior. The decision is available as
+`wasmHeapAllocationPolicy` and in the memory report. This is an approximate
+startup policy, not proof of an application-wide memory ceiling or permission
+to expand without bound. Embedding applications own their maximum and budget;
+unsupported browsers retain their configured capacity.
+
 ## Linear heap recovery
 
 The linear heap keeps exact-size free lists until bump allocation exhausts
@@ -45,7 +77,7 @@ Foreign arrays retain the checked general path. No preparation or execution
 flag is required.
 
 `node scripts/benchmarkClosedArrayOverflow.js --baseline <commit>` compares
-the baseline with the staged versions of the five relevant source modules.
+the baseline with the staged versions of the relevant source modules.
 `--candidate <commit>` selects immutable candidate modules instead. Other
 runtime edits are excluded, the JRE index is derived from the pinned sources,
 and each sample reports source/class digests and the compiled module size.

@@ -2,13 +2,13 @@
 // Isolate the changed compiler/runtime modules from unrelated working edits.
 // Each sample uses a fresh VM and the same compiled Java fixture. Timings
 // cover the compiled array loop only, not startup, collection or game FPS.
-const {execFileSync} = require('node:child_process');
+const {execFileSync, spawnSync} = require('node:child_process');
 const {readFileSync, rmSync} = require('node:fs');
 const {createHash} = require('node:crypto');
 const Module = require('node:module');
 const path = require('node:path');
 const root = path.join(__dirname, '..');
-const changed = ['src/core/freeExtents.js', 'src/core/wasmHeap.js',
+const changed = ['src/core/freeExtents.js', 'src/core/wasmHeap.js', 'src/core/jvm.js', 'src/core/browserMemory.js',
   'src/jit/closed/representation.js', 'src/jit/closed/ClosedCompiler.js', 'src/jit/closed/primitiveSpillArray.js'];
 
 if (process.argv[2] === '--browser') {
@@ -39,8 +39,13 @@ if (process.argv[2] === '--browser') {
     if (!Number.isSafeInteger(size)) throw Error('Missing source: ' + name);
     offset = end + 1; sources.set(path.join(root, name), bytes.subarray(offset, offset + size).toString()); offset += size + 1;
   }
-  if (variant === 'candidate') for (const name of changed) sources.set(path.join(root, name),
-    execFileSync('git', ['show', (candidate === 'INDEX' ? ':' : candidate + ':') + name], {cwd: root, encoding: 'utf8'}));
+  if (variant === 'candidate') for (const name of changed) {
+    const result = spawnSync('git', ['show', (candidate === 'INDEX' ? ':' : candidate + ':') + name], {cwd: root, encoding: 'utf8'});
+    if (result.status === 0) sources.set(path.join(root, name), result.stdout);
+    else if (sources.has(path.join(root, name))) throw Error('Candidate source missing: ' + name);
+    // New dependencies may not exist in an older candidate. If its modules
+    // actually require one, the pinned loader below still refuses that load.
+  }
   const jreRoot = path.join(root, 'src/jre') + path.sep;
   const jreFiles = [...sources.keys()].filter(name => name.startsWith(jreRoot) && name.endsWith('.js') && !name.endsWith('/index.js')).sort();
   sources.set(path.join(jreRoot, 'index.js'), 'module.exports={' + jreFiles.map(name =>

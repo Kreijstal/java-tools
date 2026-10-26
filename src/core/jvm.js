@@ -166,6 +166,11 @@ function arrayComponentType(descriptor) {
 }
 
 class JVM {
+  getMemoryUsage() {
+    return {...require('./browserMemory').captureMemoryUsage(this.wasmHeap),
+      allocationPolicy: this.wasmHeapAllocationPolicy};
+  }
+
   constructor(options = {}) {
     this.threads = [];
     this.currentThreadIndex = 0;
@@ -268,9 +273,19 @@ class JVM {
     const wasmHeapEnabled = options.wasmHeap ??
       (env.JVM_WASM_HEAP === '1' || (env.JVM_WASM_HEAP !== '0' && closedWorldWanted));
     const wasmHeapMb = Number(options.wasmHeapMb ?? env.JVM_WASM_HEAP_MB) || 256;
-    this.wasmHeap = wasmHeapEnabled
-      ? new (require('./wasmHeap').WasmHeap)(wasmHeapMb)
-      : null;
+    this.wasmHeapAllocationPolicy = wasmHeapEnabled
+      ? require('./browserMemory').selectWasmHeapSize(wasmHeapMb, options) : null;
+    this.wasmHeap = null;
+    if (wasmHeapEnabled) {
+      const {WasmHeap} = require('./wasmHeap');
+      try { this.wasmHeap = new WasmHeap(this.wasmHeapAllocationPolicy.selectedMb); }
+      catch (error) {
+        if (this.wasmHeapAllocationPolicy.selectedMb <= wasmHeapMb) throw error;
+        this.wasmHeapAllocationPolicy.selectedMb = wasmHeapMb;
+        this.wasmHeapAllocationPolicy.reason = 'allocation-refused';
+        this.wasmHeap = new WasmHeap(wasmHeapMb);
+      }
+    }
     // Primitive instance fields in that same memory at static per-class
     // offsets (see core/objectModel.js). Requires the heap; off by default.
     this.wasmFields = !!this.wasmHeap &&

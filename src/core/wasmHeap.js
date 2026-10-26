@@ -26,6 +26,7 @@ const CTOR = {
   '[I': Int32Array, '[J': BigInt64Array, '[F': Float32Array, '[D': Float64Array,
 };
 const {FreeExtents} = require('./freeExtents');
+const {trackHeap} = require('./browserMemory');
 
 // Diagnostics must not assume a Node process: the browser bundle ships a
 // `process` shim without stderr, and a missing stream turned this one-time
@@ -132,6 +133,7 @@ class WasmHeap {
     // to objectModel's slab accessors, which read `heap.i32` on every access
     // rather than caching it, so they can be re-derived after a growth.
     this.refreshViews();
+    trackHeap(this);
   }
 
   // The single view-refresh hook docs/refactor.md 2.3 requires. Everything
