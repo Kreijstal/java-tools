@@ -2919,6 +2919,83 @@ function foldVoidReturnExits(source) {
   return {source:output.slice(2,-2),frames,jumpsReturned,tailsRemoved};
 }
 
+// A local-only primitive decision can be expressed at its original position
+// even inside loops, handlers and monitors. Unlike tail factoring, this never
+// moves a continuation or crosses a control/exception/monitor boundary.
+function foldPrimitiveValueBranches(source, {localType = null} = {}) {
+  const unchanged = () => ({source, branchesFolded: 0});
+  if (!localType || /\\u+[0-9a-fA-F]{4}/.test(source)) return unchanged();
+  try {
+    const wrapped = `{\n${source}\n}`;
+    const parsed = statementParser.parseStatement(wrapped, {requireComplete: true});
+    const lexed = tokenizeJava(wrapped);
+    if (lexed.diagnostics.length) return unchanged();
+    const tokens = lexed.tokens.filter(token => !['whitespace', 'eof'].includes(token.kind));
+    // Keep comment spelling/placement intact rather than dropping it from a
+    // branch rewritten as one expression.
+    if (tokens.some((token,index) => wrapped.slice(index ? tokens[index-1].range.endOffset : 0,
+      token.range.startOffset).trim())) return unchanged();
+    const starts = new Map(tokens.map((token, index) => [token.range.startOffset, index]));
+    const pairs = new Map(), stack = [];
+    for (let i = 0; i < tokens.length; i++) {
+      if (['(', '[', '{'].includes(tokens[i].text)) stack.push(i);
+      else if ([')', ']', '}'].includes(tokens[i].text)) {
+        const open = stack.pop();
+        if (open == null || '([{'.indexOf(tokens[open].text) !== ')]}'.indexOf(tokens[i].text)) return unchanged();
+        pairs.set(open, i);
+      }
+    }
+    if (stack.length) return unchanged();
+    const branches = [], shadowed = new Set(); let unsupported = false;
+    const captures = new Set(['ClassDeclaration', 'InterfaceDeclaration', 'EnumDeclaration', 'RecordDeclaration',
+      'MethodDeclaration', 'ConstructorDeclaration', 'LambdaExpression', 'AnonymousClassBody']);
+    function walk(node) {
+      if (!node || typeof node !== 'object') return;
+      if (Array.isArray(node)) {node.forEach(walk);return;}
+      if (node.kind?.startsWith('Unsupported') || captures.has(node.kind)) unsupported = true;
+      if ((node.kind === 'VariableDeclarator' || node.kind?.includes('Parameter')) && typeof node.name === 'string')
+        shadowed.add(node.name);
+      if (node.kind === 'IfStatement') branches.push(node);
+      for (const [key, value] of Object.entries(node)) if (!['range', 'tokens', 'meta'].includes(key)) walk(value);
+    }
+    walk(parsed);
+    if (unsupported) return unchanged();
+    // Types come from actual lifted JVM locals/parameters. Inline declarations
+    // may shadow a spelling, so conservatively refuse that spelling everywhere.
+    const type = name => shadowed.has(name) ? null : localType(name);
+    function arm(node) {
+      if (node?.kind !== 'BlockStatement' || node.statements?.length !== 1) return null;
+      const open = starts.get(node.range?.startOffset), close = pairs.get(open);
+      if (tokens[open]?.text !== '{' || tokens[close]?.text !== '}') return null;
+      return [rawStatement(wrapped.slice(tokens[open].range.endOffset, tokens[close].range.startOffset).trim())];
+    }
+    const edits = [];
+    for (const node of branches) {
+      const taken = arm(node.consequent), other = arm(node.alternate);
+      if (!taken || !other) continue;
+      const start = starts.get(node.range?.startOffset), condition = start + 1, endCondition = pairs.get(condition);
+      const takenStart = starts.get(node.consequent.range?.startOffset), takenEnd = pairs.get(takenStart);
+      const otherStart = starts.get(node.alternate.range?.startOffset), otherEnd = pairs.get(otherStart);
+      if (tokens[start]?.text !== 'if' || tokens[condition]?.text !== '(' || endCondition == null
+          || takenStart !== endCondition + 1 || tokens[takenEnd + 1]?.text !== 'else'
+          || otherStart !== takenEnd + 2 || otherEnd == null) continue;
+      const predicate = wrapped.slice(tokens[condition].range.endOffset, tokens[endCondition].range.startOffset);
+      const value = valueProducingBranch(predicate, taken, other, type);
+      if (value) edits.push({start: tokens[start].range.startOffset, end: tokens[otherEnd].range.endOffset, text: value.source});
+    }
+    if (!edits.length) return unchanged();
+    let result = wrapped, previous = wrapped.length;
+    for (const edit of edits.sort((a,b) => b.start - a.start)) {
+      if (edit.end > previous) return unchanged();
+      result = result.slice(0, edit.start) + edit.text + result.slice(edit.end); previous = edit.start;
+    }
+    return {source: result.slice(2, -2), branchesFolded: edits.length};
+  } catch (error) {
+    if (error instanceof RangeError || error instanceof SyntaxError) return unchanged();
+    throw error;
+  }
+}
+
 // Run after stack-carrier cleanup: two copies of the same CFG tail may initially
 // spell the same Boolean argument using different temporary names. Parse the
 // final source for control/scope proofs, while retaining original expression
@@ -3542,6 +3619,7 @@ module.exports = {
   flattenStandaloneBlocks,
   treeToStatements, emitStatements, rawExpression, rawStatement, hasUnreachableStatement,
   promoteBooleanStackCarriers,
+  foldPrimitiveValueBranches,
   factorCommonBranchTails,
   factorLabeledBlockReturnTails,
   simplifyControlFrames,

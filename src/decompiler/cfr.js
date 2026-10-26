@@ -27,7 +27,7 @@ const { listRegionSplitCandidates, applyRegionSplit } = require('../passes/regio
 const { jreClassInfo, jreMethodCandidates } = require('../java-frontend/jreMetadata');
 const { JavaParser } = require('../java-frontend/parser');
 const { tokenizeJava } = require('../java-frontend/lexer');
-const { promoteBooleanStackCarriers, factorCommonBranchTails, factorLabeledBlockReturnTails, simplifyControlFrames, removeFallthroughLabelBreaks, localizePlainBlockLoopBreaks, foldLeadingWhileBreakGuards, foldEffectfulPlainBlockExits, simplifyIdentityReferenceCasts, recoverScalarLabelDispatches, specializePathGuards, recoverPostGuardExits, recoverArrayIndexIncrements, foldLabeledBooleanDecisions, foldVoidReturnExits, foldNestedIfGuards, foldLabeledSkipGuards, foldLabeledIfElseExits, foldLabeledExitTrees, foldLabeledGuardTrees, removeDeadRegionSelectors, removeDeadReceiverSnapshots, removeCaughtExceptionCopies } = require('./javaAstEmitter');
+const { promoteBooleanStackCarriers, foldPrimitiveValueBranches, factorCommonBranchTails, factorLabeledBlockReturnTails, simplifyControlFrames, removeFallthroughLabelBreaks, localizePlainBlockLoopBreaks, foldLeadingWhileBreakGuards, foldEffectfulPlainBlockExits, simplifyIdentityReferenceCasts, recoverScalarLabelDispatches, specializePathGuards, recoverPostGuardExits, recoverArrayIndexIncrements, foldLabeledBooleanDecisions, foldVoidReturnExits, foldNestedIfGuards, foldLabeledSkipGuards, foldLabeledIfElseExits, foldLabeledExitTrees, foldLabeledGuardTrees, removeDeadRegionSelectors, removeDeadReceiverSnapshots, removeCaughtExceptionCopies } = require('./javaAstEmitter');
 
 const VERSION = 'CFR-JS 0.4.0';
 const javaStatementParser = new JavaParser();
@@ -5258,13 +5258,13 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
         const match = /^(boolean|byte|char|short|int|long|float|double) ([A-Za-z_$][\w$]*)(?: = .+)?;$/.exec(declaration);
         if (match) retainedPrimitiveTypes.set(match[2], match[1]);
       }
+      // Boolean promotion may have changed an int carrier's declaration.
+      // Never type an eliminated carrier from stale allocator metadata.
+      const localType = name => retainedPrimitiveTypes.get(name)
+        || (stackCarrierTypes.has(name) ? null : localState.sourceTypeForName(name));
+      source = foldPrimitiveValueBranches(source, {localType}).source;
       source = factorCommonBranchTails(source, {
-        integralConditions: integralConditionsFromCache(cache),
-        // Boolean promotion may have changed an int carrier's declaration.
-        // Use its final type, and never type an eliminated carrier from stale
-        // allocator metadata. Other names must be proven actual JVM locals.
-        localType: name => retainedPrimitiveTypes.get(name)
-          || (stackCarrierTypes.has(name) ? null : localState.sourceTypeForName(name)),
+        integralConditions: integralConditionsFromCache(cache), localType,
       }).source;
     }
     let lines = source ? source.split('\n') : [];
