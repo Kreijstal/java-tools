@@ -715,6 +715,41 @@ const NONTHROWING = new Set([
 
 function canThrow(op) { return !NONTHROWING.has(op); }
 
+// Some bytecode puts a loop latch just beyond a protected range, although it
+// branches back into that range. Java can express the loop inside the try if
+// the latch cannot throw and has no other normal entry. Include only an exact
+// boundary block, never a throwing continuation or an exception-handler entry.
+// The ordinary throwing-PC priority check and original-edge contracts below
+// still verify the enlarged region against the original exception table/CFG.
+function includePureLoopLatches(groups, cfg, codeItems, syncHandlers) {
+  if (syncHandlers?.size) return groups;
+  const pc = block => codeItems[cfg.blocks[block].insns[0]].pc;
+  if (cfg.blocks.some((block, index) => !Number.isSafeInteger(pc(block.id))
+      || index && pc(block.id) <= pc(cfg.blocks[index - 1].id))) return groups;
+  const byPc = new Map(cfg.blocks.map(block => [pc(block.id), block.id]));
+  const handlers = new Set(groups.flatMap(group => group.catches.map(c => c.handler_pc)));
+  const predecessors = cfg.blocks.map(() => []);
+  for (const block of cfg.blocks) for (const target of succOfTerm(cfg.term[block.id]))
+    if (target != null) predecessors[target].push(block.id);
+  return groups.map(group => {
+    const ranges = group.ranges.map(range => ({...range}));
+    for (const range of ranges) {
+      while (true) {
+        const block = byPc.get(range.end_pc);
+        if (block == null || block === cfg.entry || block + 1 >= cfg.n || handlers.has(pc(block))) break;
+        if (cfg.blocks[block].insns.some(i => canThrow(insnOp(codeItems[i])))) break;
+        const previous = predecessors[block];
+        if (!previous.length || previous.some(p => !inAnyRange(pc(p), ranges))) break;
+        const backedge = succOfTerm(cfg.term[block]).some(target => target != null
+          && pc(target) < pc(block) && inAnyRange(pc(target), ranges));
+        if (!backedge) break;
+        range.end_pc = pc(block + 1);
+      }
+    }
+    return {...group, ranges, end_pc: Math.max(...ranges.map(range => range.end_pc))};
+  });
+}
+
 // A shared terminal catch may protect disconnected normal-flow components.
 // Keep throwing gaps outside their own tries; give each component its actual
 // unique normal entry, even when that entry is not its lowest bytecode PC.
@@ -999,7 +1034,8 @@ function structureMethodImpl(codeItems, exceptionTable, opts = {}) {
 function structureWithExceptions(codeItems, exceptionTable, methodCfg, render, opts = {}) {
   const normalized = normalizeTable(
     exceptionTable, opts.syncHandlers || null, opts.isCatchAssignable || null, codeItems);
-  const groups = partitionFragmentedGroups(normalized.groups, methodCfg, codeItems, opts.syncHandlers);
+  const fragments = partitionFragmentedGroups(normalized.groups, methodCfg, codeItems, opts.syncHandlers);
+  const groups = includePureLoopLatches(fragments, methodCfg, codeItems, opts.syncHandlers);
   // Innermost first, with later equal-size ranges processed first so a handler
   // cannot absorb an unstructured copy of finally cleanup as its continuation.
   const ordered = groups.slice().sort((a, b) =>
