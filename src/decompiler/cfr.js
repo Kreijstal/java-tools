@@ -5985,7 +5985,7 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
       // A dup can leave the freshly allocated array live for a field/array
       // store after this local store.  Materialize the shared expression now
       // so every consumer observes the one JVM allocation.
-      if (stack.includes(value) && value.newArraySpill && /^new\b/.test(value.code)) {
+      if (stack.includes(value) && (value.newArraySpill || value.arrayLiteral) && /^new\b/.test(value.code)) {
         materializeNewArraySpill(value, lines, localState);
       }
       const renderedValue = renderStoreExpression(value);
@@ -6286,7 +6286,7 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
       // A dup_x2 can leave the freshly allocated value below this outer-array
       // store for a following astore.  Materialize it once and mutate the
       // shared expression so both consumers retain JVM reference identity.
-      if (stack.includes(value) && value.newArraySpill && /^new\b/.test(value.code)) {
+      if (stack.includes(value) && (value.newArraySpill || value.arrayLiteral) && /^new\b/.test(value.code)) {
         materializeNewArraySpill(value, lines, localState);
       }
       value = renderStoreExpression(value);
@@ -6337,7 +6337,7 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
     if (op === 'putstatic') {
       const ref = parseMemberRef(instruction.arg);
       const rawValue = pop(stack);
-      if (stack.includes(rawValue) && rawValue.newArraySpill && /^new\b/.test(rawValue.code)) {
+      if (stack.includes(rawValue) && (rawValue.newArraySpill || rawValue.arrayLiteral) && /^new\b/.test(rawValue.code)) {
         materializeNewArraySpill(rawValue, lines, localState);
       }
       const value = coerceExpressionForType(renderStoreExpression(rawValue), descriptorToJavaType(ref.descriptor));
@@ -6361,7 +6361,7 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
     if (op === 'putfield') {
       const ref = parseMemberRef(instruction.arg);
       const rawValue = pop(stack);
-      if (stack.includes(rawValue) && rawValue.newArraySpill && /^new\b/.test(rawValue.code)) {
+      if (stack.includes(rawValue) && (rawValue.newArraySpill || rawValue.arrayLiteral) && /^new\b/.test(rawValue.code)) {
         materializeNewArraySpill(rawValue, lines, localState);
       }
       const value = coerceExpressionForType(renderStoreExpression(rawValue), descriptorToJavaType(ref.descriptor));
@@ -11230,6 +11230,15 @@ function duplicateStackExpression(value) {
 function materializeNewArraySpill(value, lines, localState) {
   const name = localState.nextSyntheticName();
   lines.push(`${value.type} ${name} = ${value.code};`);
+  // A constant-sized allocation may already carry deferred element stores.
+  // Preserve partial fills and their recorded order when it escapes folding;
+  // rendering only the allocation silently replaces these elements with zero.
+  if (value.arrayLiteral) {
+    for (const [index, element] of value.arrayLiteral.elements) {
+      const rendered = coerceExpressionForType(renderStoreExpression(element), value.arrayLiteral.elementType);
+      lines.push(`${name}[${index}] = ${rendered.code};`);
+    }
+  }
   value.code = name;
   value.newArraySpill = undefined;
   value.arrayLiteral = undefined;

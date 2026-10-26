@@ -3,6 +3,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const {execFileSync} = require('node:child_process');
 const test = require('tape');
 const { assembleJasminSource } = require('../src/utils/jasminAssembly');
 const { decompileClassFile } = require('../src/decompiler/cfr');
@@ -165,6 +166,55 @@ function decompileFixture(tempDir, name, source) {
   assembleJasminSource(source, classFile);
   return decompileClassFile(classFile);
 }
+
+test('fixed-size array aliases retain identity and initialized contents after recompilation', (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-fixed-array-alias-'));
+  try {
+    const original = path.join(directory, 'original'), rebuilt = path.join(directory, 'rebuilt');
+    fs.mkdirSync(original); fs.mkdirSync(rebuilt);
+    const source = `public class FixedArrayAliases {
+      static int[] shared;
+      int[] stored;
+      static int[] tile(int[][] map) {
+        int[] decoded = map[0] = new int[32];
+        decoded[5] = 0x12345678;
+        return decoded;
+      }
+      int[] instance() {return stored = new int[7];}
+      static int[] statics() {return shared = new int[9];}
+      static int[] locals() {
+        int[] a, b; a = b = new int[3]; a[0] = 23; return b;
+      }
+      static int[] initialized() {
+        int[] a; shared = a = new int[] {3, 5, 7}; a[0] = 11; return shared;
+      }
+      public static void main(String[] args) {
+        int[][] map = new int[1][]; int[] row = tile(map);
+        System.out.println(row == map[0]); System.out.println(map[0][5]);
+        FixedArrayAliases object = new FixedArrayAliases();
+        System.out.println(object.instance() == object.stored);
+        System.out.println(statics() == shared);
+        System.out.println(locals()[0]);
+        int[] values = initialized();
+        System.out.println(values == shared);
+        System.out.println(values[0] + values[1] + values[2]);
+      }
+    }`;
+    const input = path.join(original, 'FixedArrayAliases.java');
+    fs.writeFileSync(input, source);
+    execFileSync('javac', ['--release', '8', '-d', original, input]);
+    const expected = execFileSync('java', ['-cp', original, 'FixedArrayAliases'], {encoding: 'utf8'});
+    const generated = decompileClassFile(path.join(original, 'FixedArrayAliases.class'));
+    const output = path.join(rebuilt, 'FixedArrayAliases.java');
+    fs.writeFileSync(output, generated);
+    execFileSync('javac', ['--release', '8', '-d', rebuilt, output]);
+    const actual = execFileSync('java', ['-cp', rebuilt, 'FixedArrayAliases'], {encoding: 'utf8'});
+    t.equal(expected, 'true\n305419896\ntrue\ntrue\n23\ntrue\n23\n', 'independent bytecode reference');
+    t.equal(actual, expected, 'array, field, static and local aliases match the original program');
+    t.equal((generated.match(/new int\[32\]/g) || []).length, 1, 'one tile-mask allocation');
+  } finally {fs.rmSync(directory, {recursive: true, force: true});}
+  t.end();
+});
 
 test('dup2 of a category-2 call result evaluates the call once', (t) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-dup-side-effect-'));
