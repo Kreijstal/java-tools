@@ -24,6 +24,8 @@ test('default value recovery keeps complete ordered ladders rather than mixing a
  for(const source of [
   'int value=0;if(first()){value=1;}else if(second()){value=2;}else{value=3;}',
   'double value=0;if(first()){value=1.0;}else{{if(second()){value=2.0;}else{value=3.0;}}}',
+  'double value=0;if(!(number<1.0)){if(!(number<2.0)){if(third()){value=1.0;}else{value=2.0;}}else{value=3.0;}}else{value=4.0;}',
+  'int value=0;if(first()){{if(second()){value=1;}else{value=2;}}}else{value=3;}',
  ]){const result=body(source);assert.equal(result.valueBranchesFolded,0);assert.ok(!result.source.includes('?'));assert.equal(body(result.source).source,result.source);}
 });
 

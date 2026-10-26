@@ -3076,7 +3076,8 @@ function foldPrimitiveValueBranches(source, {localType = null} = {}) {
       while (parent?.kind === 'BlockStatement' && parent.statements.length === 1) {
         owner = parent; parent = parents.get(owner);
       }
-      if (scoped && parent?.kind === 'IfStatement' && parent.alternate === owner) continue;
+      if (scoped && parent?.kind === 'IfStatement'
+          && (parent.alternate === owner || parent.consequent === owner && parent.alternate)) continue;
       const taken = arm(node.consequent), other = arm(node.alternate);
       if (!taken || !other) continue;
       const start = starts.get(node.range?.startOffset), condition = start + 1, endCondition = pairs.get(condition);
