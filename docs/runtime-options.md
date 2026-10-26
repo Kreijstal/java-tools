@@ -1,5 +1,20 @@
 # Runtime options
 
+## Closed-world loop field reuse
+
+The closed-world compiler automatically reuses ordinary primitive fields of
+`this` across loops when the method contains no field writes, calls, class
+initialization or synchronization. Array element writes cannot alias object
+fields. The compiler reads each eligible field once at method entry and shares
+that local among its SSA reads. No application map or runtime flag is needed.
+
+Volatile reads block this optimization, including acquire reads through another
+receiver. Other receivers retain their original null checks and evaluation
+order. Methods that can mutate a field through an alias or a call keep their
+original reads. Reference fields and their array metadata retain the existing
+code generation; extending the optimization to them did not demonstrate a
+repeatable browser performance gain.
+
 ## Approximate browser memory and startup heap capacity
 
 `JVM.getMemoryUsage()` returns optional Chromium `performance.memory` values
