@@ -60,6 +60,7 @@ const { foldGuardedLoopContinuations: recoverLoopContinuation, foldNonrepeatingW
 const {removeCaughtExceptionCopies: recoverCaughtCopies} = require('./caughtExceptionCopyRecovery');
 const {localizeForLoopDeclarations: recoverForDeclarations} = require('./forLoopDeclarationRecovery');
 const {localizeLocalInitializations: recoverLocalInitializations} = require('./localInitializationRecovery');
+const {localizeCompilationUnitDeclarations: recoverSourceDeclarations} = require('./sourceLocalDeclarationRecovery');
 
 const rawExpression = (source) => createNode('UnsupportedExpression', { source: String(source) });
 const rawStatement = (source) => createNode('UnsupportedStatement', { source: String(source) });
@@ -714,7 +715,20 @@ function localizeForLoopDeclarations(source, options = {}) {
 
 function localizeLocalInitializations(source, options = {}) {
   try {return recoverLocalInitializations(source, controlCleanupSource(source), options);}
-  catch(error) {if(error instanceof RangeError)return {source,declarationsMerged:0};throw error;}
+  catch(error) {if(error instanceof RangeError)return {source,declarationsMerged:0,inertStoresRemoved:0};throw error;}
+}
+
+function localizeBodyDeclarations(source, options = {}) {
+  // An earlier standalone inert store may become a declaration initializer;
+  // resolve that prefix before proving a complete for-header lifetime.
+  const stores = localizeLocalInitializations(source, options);
+  const loops = localizeForLoopDeclarations(stores.source, options);
+  return {source: loops.source, declarationsMoved: loops.declarationsMoved,
+    declarationsMerged: stores.declarationsMerged, inertStoresRemoved: stores.inertStoresRemoved};
+}
+
+function localizeCompilationUnitDeclarations(source) {
+  return recoverSourceDeclarations(source, localizeBodyDeclarations);
 }
 
 function recoverScalarLabelDispatches(source, options = {}) {
@@ -3634,6 +3648,8 @@ module.exports = {
   promoteBooleanStackCarriers,
   localizeForLoopDeclarations,
   localizeLocalInitializations,
+  localizeBodyDeclarations,
+  localizeCompilationUnitDeclarations,
   foldPrimitiveValueBranches,
   factorCommonBranchTails,
   factorLabeledBlockReturnTails,

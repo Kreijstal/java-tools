@@ -13,7 +13,7 @@ for(const[name,wrap]of[
  const source='Object value=null;'+wrap('value = allocate();use(value);value=next();use(value);');
  const result=recover(source);assert.equal(result.declarationsMerged,1);
  assert.equal(result.source,wrap('Object value = allocate();use(value);value=next();use(value);'));
- assert.deepEqual(recover(result.source),{source:result.source,declarationsMerged:0});
+ assert.deepEqual(recover(result.source),{source:result.source,declarationsMerged:0,inertStoresRemoved:0});
 });
 
 test('retains exact declared types and first-store RHS bytes, removing only inert defaults',()=>{
@@ -24,8 +24,33 @@ test('retains exact declared types and first-store RHS bytes, removing only iner
   ['int[]','null','new int[size()]'],['java.util.List<String>','null','new java.util.ArrayList<>()'],
  ]){
   const source=`${type} value=${initial};\nvalue = ${rhs};use(value);`;
-  assert.deepEqual(recover(source),{source:`${type} value = ${rhs};use(value);`,declarationsMerged:1});
+  assert.deepEqual(recover(source),{source:`${type} value = ${rhs};use(value);`,declarationsMerged:1,inertStoresRemoved:0});
  }
+});
+
+test('skips leading inert stores without observing an old value or moving effects',()=>{
+ for(const[type,zero,rhs]of[['int','0','effect()'],['double','-0.0d','effect()'],['Object','null','new Object()']]){
+  const source=`${type} value;value=${zero};value=${zero};try{value=${rhs};use(value);}finally{cleanup();}`;
+  const result=recover(source);assert.deepEqual(result,{source:`try{${type} value=${rhs};use(value);}finally{cleanup();}`,declarationsMerged:1,inertStoresRemoved:2});
+  assert.deepEqual(recover(result.source),{source:result.source,declarationsMerged:0,inertStoresRemoved:0});
+ }
+ const source='int value;if(flag()){value=0;}effect();value=next();use(value);';
+ assert.deepEqual(recover(source),{source:'if(flag()){}effect();int value=next();use(value);',declarationsMerged:1,inertStoresRemoved:1});
+});
+
+test('retains a default observed by handlers, self reads and effectful subsequent stores',()=>{
+ for(const[tail,expected]of[
+  ['try{value=effect();}finally{use(value);}','int value=0;try{value=effect();}finally{use(value);}'],
+  ['value=value+1;use(value);','int value=0;value=value+1;use(value);'],
+  ['value=effect();value=next();use(value);','int value=effect();value=next();use(value);'],
+ ]){
+  const result=recover('int value;value=0;'+tail);assert.equal(result.source,expected);assert.equal(recover(result.source).source,expected);
+ }
+});
+
+test('accounts for one thousand leading stores without repeated whole-source recovery',()=>{
+ const source='int value;'+Array.from({length:1000},(_,i)=>`value=${i};`).join('')+'try{value=effect();use(value);}finally{cleanup();}';
+ assert.deepEqual(recover(source),{source:'try{int value=effect();use(value);}finally{cleanup();}',declarationsMerged:1,inertStoresRemoved:1000});
 });
 
 test('keeps dependency stores in order and narrows independent block lifetimes',()=>{
@@ -75,15 +100,15 @@ for(const[name,source]of[
  ['comment offsets','int value;/* keep */value=next();use(value);'],
  ['unicode translation','int val\\u0075e;value=next();use(value);'],
  ['malformed syntax','int value;value=('],
-])test(`refuses ${name}`,()=>assert.deepEqual(recover(source),{source,declarationsMerged:0}));
+])test(`refuses ${name}`,()=>assert.deepEqual(recover(source),{source,declarationsMerged:0,inertStoresRemoved:0}));
 
 test('reserved names and one thousand independent locals remain deterministic',()=>{
  const source='int value;value=next();use(value);';
- assert.deepEqual(recover(source,{reservedNames:['value']}),{source,declarationsMerged:0});
+ assert.deepEqual(recover(source,{reservedNames:['value']}),{source,declarationsMerged:0,inertStoresRemoved:0});
  const many=Array.from({length:1000},(_,i)=>`int v${i};v${i}=next();use(v${i});`).join('\n');
  const result=recover(many);assert.equal(result.declarationsMerged,1000);
  assert.equal(result.source.match(/int v\d+=next/g).length,1000);
- assert.deepEqual(recover(result.source),{source:result.source,declarationsMerged:0});
+ assert.deepEqual(recover(result.source),{source:result.source,declarationsMerged:0,inertStoresRemoved:0});
 });
 
 function run(command,args,cwd){const r=spawnSync(command,args,{cwd,encoding:'utf8',maxBuffer:4*1024*1024});assert.equal(r.status,0,r.stderr||r.error?.stack||r.stdout);return r.stdout.trim();}
@@ -95,7 +120,7 @@ test('native scopes preserve overload types, reference identity, throwing stores
   const contexts=[s=>s,s=>`if(seed!=0){${s}}`,s=>`try{${s}}finally{cleanup();}`,s=>`synchronized(monitor){${s}}`,s=>`try{throw marker;}catch(RuntimeException caught){${s}}`,s=>`try{trace.append('p');}finally{${s}}`,s=>`for(int i=0;i<3;i++){if(i==seed)continue;${s}if(i==1)break;}`];
   const methods=[],checks=[];
   for(const[typeIndex,[type,zero,rhs]]of types.entries())for(const[contextIndex,wrap]of contexts.entries()){
-   const before=`${type} value=${zero};try{${wrap(`value=${rhs};trace.append(tag(value));consume(value);`)}}catch(Throwable failure){trace.append(failure==marker?"marker":failure.getClass().getName());}finally{trace.append('f').append(Thread.holdsLock(lock));}`;
+   const before=`${type} value=${zero};value=${zero};try{${wrap(`value=${rhs};trace.append(tag(value));consume(value);`)}}catch(Throwable failure){trace.append(failure==marker?"marker":failure.getClass().getName());}finally{trace.append('f').append(Thread.holdsLock(lock));}`;
    const next=recover(before);assert.equal(next.declarationsMerged,1,before);
    for(const[prefix,body]of[['old',before],['next',next.source]])methods.push(`static String ${prefix}${typeIndex}_${contextIndex}(int seed,int mode,boolean nullLock){currentMode=mode;trace.setLength(0);Object monitor=nullLock?null:lock;${body}return trace.toString();}`);
    checks.push(`{String expected=old${typeIndex}_${contextIndex}(seed,mode,nullLock),actual=next${typeIndex}_${contextIndex}(seed,mode,nullLock);if(!expected.equals(actual))throw new AssertionError("${typeIndex}/${contextIndex}:"+expected+" != "+actual);cases++;}`);

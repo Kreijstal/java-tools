@@ -5,7 +5,7 @@
 // follow that store in the same existing block, so no handler/join can observe
 // an old value or enter the narrowed scope without executing initialization.
 function localizeLocalInitializations(source, proof, {reservedNames = []} = {}) {
-  const unchanged = () => ({source, declarationsMerged: 0});
+  const unchanged = () => ({source, declarationsMerged: 0, inertStoresRemoved: 0});
   if (!proof || !Array.isArray(reservedNames)) return unchanged();
   const {wrapped, parsed, tokens, starts, closes, children} = proof;
   const primitives = new Set(['boolean','byte','short','char','int','long','float','double']);
@@ -27,7 +27,7 @@ function localizeLocalInitializations(source, proof, {reservedNames = []} = {}) 
         && assignment.operator === '=' && assignment.left?.kind === 'Identifier') {
       const start = starts.get(node.range?.startOffset);
       if (tokens[start]?.text === assignment.left.name && tokens[start + 1]?.text === '=')
-        stores.set(tokens[start].range.startOffset, {start, owner: parent});
+        stores.set(tokens[start].range.startOffset, {start, owner: parent, right: assignment.right});
     }
     children(node, child => walk(child, node));
     intervals.set(node, {begin, end: ordinal++});
@@ -54,7 +54,14 @@ function localizeLocalInitializations(source, proof, {reservedNames = []} = {}) 
     const end = close == null ? null : tokens[close].range.startOffset;
     blockBounds.set(node, end);return end;
   }
-  const edits = []; let merged = 0;
+  const edits = []; let merged = 0, inertStoresRemoved = 0;
+  function removeStatement(start, end) {
+    const lineStart = wrapped.lastIndexOf('\n', start - 1) + 1, newline = wrapped.indexOf('\n', end);
+    if (newline >= 0 && !wrapped.slice(lineStart, start).trim() && !wrapped.slice(end, newline).trim()) {
+      start = lineStart;end = newline + 1;
+    }
+    return {start, end, text: ''};
+  }
   for (const {node, owner} of declarations) {
     const [variable] = node.declarators || [], type = node.variableType;
     const primitive = type?.kind === 'PrimitiveType' && primitives.has(type.name);
@@ -73,27 +80,35 @@ function localizeLocalInitializations(source, proof, {reservedNames = []} = {}) 
     if (declared.length !== 1) continue;
     const binding = declared[0], references = uses.filter(token => token !== binding);
     if (!references.length) continue;
-    const store = stores.get(references[0].range.startOffset);
-    if (!store || tokens[endDeclaration].range.endOffset > references[0].range.startOffset) continue;
-    const outer = intervals.get(owner), inner = intervals.get(store.owner), endOwner = endBlock(store.owner);
-    if (!outer || !inner || inner.begin < outer.begin || inner.end > outer.end || endOwner == null) continue;
-    const endStore = semicolon(store.start);
-    if (endStore == null || tokens[endStore].range.endOffset > endOwner) continue;
-    // Excluding the declaration and store target, even a RHS self-reference
-    // appears before this boundary. Reads in headers/handlers/sibling blocks
-    // also fail these lexical bounds rather than acquiring a new binding.
-    const remaining = references.slice(1);
-    if (remaining.length && (remaining[0].range.startOffset < tokens[endStore].range.endOffset
-      || remaining.at(-1).range.endOffset > endOwner)) continue;
+    const outer = intervals.get(owner), prefix = []; let best = null;
+    // Earlier standalone literal/null stores are also inert. Account for each
+    // once, and erase them only when a later first store owns every remaining
+    // reference. A read, conversion, effect or self-consuming RHS ends the scan.
+    for (let index = 0; index < references.length; index++) {
+      const store = stores.get(references[index].range.startOffset);
+      if (!store || tokens[endDeclaration].range.endOffset > references[index].range.startOffset) break;
+      const endStore = semicolon(store.start);
+      if (endStore == null) break;
+      const next = references[index + 1], endOffset = tokens[endStore].range.endOffset;
+      if (next && next.range.startOffset < endOffset) break;
+      const inner = intervals.get(store.owner), endOwner = endBlock(store.owner);
+      if (outer && inner && inner.begin >= outer.begin && inner.end <= outer.end
+          && endOwner != null && endOffset <= endOwner
+          && (!next || references.at(-1).range.endOffset <= endOwner))
+        best = {target: references[index], prefixCount: prefix.length};
+      const inert = primitive ? scalarLiteral(store.right)
+        : store.right?.kind === 'LiteralExpression' && store.right.literalKind === 'null';
+      if (!inert) break;
+      prefix.push({start: tokens[store.start].range.startOffset, end: endOffset});
+    }
+    if (!best) continue;
     const typeText = wrapped.slice(tokens[declaration].range.startOffset, binding.range.startOffset).trim();
     if (!typeText) continue;
-    let removalStart = tokens[declaration].range.startOffset, removalEnd = tokens[endDeclaration].range.endOffset;
-    const lineStart = wrapped.lastIndexOf('\n', removalStart - 1) + 1, newline = wrapped.indexOf('\n', removalEnd);
-    if (newline >= 0 && !wrapped.slice(lineStart, removalStart).trim() && !wrapped.slice(removalEnd, newline).trim()) {
-      removalStart = lineStart;removalEnd = newline + 1;
-    }
-    edits.push({start: removalStart, end: removalEnd, text: ''},
-      {start: references[0].range.startOffset, end: references[0].range.startOffset, text: typeText + ' '});
+    edits.push(removeStatement(tokens[declaration].range.startOffset, tokens[endDeclaration].range.endOffset),
+      {start: best.target.range.startOffset, end: best.target.range.startOffset, text: typeText + ' '});
+    for (let index = 0; index < best.prefixCount; index++)
+      edits.push(removeStatement(prefix[index].start, prefix[index].end));
+    inertStoresRemoved += best.prefixCount;
     merged++;
   }
   if (!merged) return unchanged();
@@ -103,7 +118,7 @@ function localizeLocalInitializations(source, proof, {reservedNames = []} = {}) 
     fragments.push(wrapped.slice(cursor, edit.start), edit.text);cursor = edit.end;
   }
   fragments.push(wrapped.slice(cursor));
-  return {source: fragments.join('').slice(2, -2), declarationsMerged: merged};
+  return {source: fragments.join('').slice(2, -2), declarationsMerged: merged, inertStoresRemoved};
 }
 
 module.exports = {localizeLocalInitializations};
