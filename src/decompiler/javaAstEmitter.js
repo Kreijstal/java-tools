@@ -59,6 +59,7 @@ const { foldGuardedLoopContinuations: recoverLoopContinuation, foldNonrepeatingW
 
 const {removeCaughtExceptionCopies: recoverCaughtCopies} = require('./caughtExceptionCopyRecovery');
 const {localizeForLoopDeclarations: recoverForDeclarations} = require('./forLoopDeclarationRecovery');
+const {localizeLocalInitializations: recoverLocalInitializations} = require('./localInitializationRecovery');
 
 const rawExpression = (source) => createNode('UnsupportedExpression', { source: String(source) });
 const rawStatement = (source) => createNode('UnsupportedStatement', { source: String(source) });
@@ -709,6 +710,11 @@ function removeCaughtExceptionCopies(source, declarations, carrierNames) {
 function localizeForLoopDeclarations(source, options = {}) {
   try {return recoverForDeclarations(source, controlCleanupSource(source), options);}
   catch(error) {if(error instanceof RangeError)return {source,declarationsMoved:0};throw error;}
+}
+
+function localizeLocalInitializations(source, options = {}) {
+  try {return recoverLocalInitializations(source, controlCleanupSource(source), options);}
+  catch(error) {if(error instanceof RangeError)return {source,declarationsMerged:0};throw error;}
 }
 
 function recoverScalarLabelDispatches(source, options = {}) {
@@ -3627,6 +3633,7 @@ module.exports = {
   treeToStatements, emitStatements, rawExpression, rawStatement, hasUnreachableStatement,
   promoteBooleanStackCarriers,
   localizeForLoopDeclarations,
+  localizeLocalInitializations,
   foldPrimitiveValueBranches,
   factorCommonBranchTails,
   factorLabeledBlockReturnTails,

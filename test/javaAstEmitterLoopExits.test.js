@@ -2906,10 +2906,10 @@ test('default decompilation removes typed null constructor snapshots and preserv
     fs.writeFileSync(path.join(native,'SnapshotArguments.java'),source);
     run('javac',['--release','8','-d',native,path.join(native,'SnapshotArguments.java')],temporary);
     const decompiled=decompileClassFile(path.join(native,'SnapshotArguments.class'));assertNoFallback(decompiled);
-    // The live return carrier remains; every unread constructor placeholder
-    // has gone. Do not demand deletion of observable/live reference stores.
-    assert.equal((decompiled.match(/SnapshotArguments stackIn_\d+_\d+ = null;/g)||[]).length,1);
-    assert.doesNotMatch(decompiled,/^\s*stackIn_\d+_\d+ = null;/m);
+    // The live return carrier remains at the allocation. Its inert null
+    // declaration now merges with that first store; unread placeholders vanish.
+    assert.equal((decompiled.match(/SnapshotArguments stackIn_\d+_\d+ = new SnapshotArguments\(/g)||[]).length,1);
+    assert.doesNotMatch(decompiled,/(?:SnapshotArguments )?stackIn_\d+_\d+ = null;/);
     fs.writeFileSync(path.join(rebuilt,'SnapshotArguments.java'),decompiled);
     const driver=`class SnapshotRunner {public static void main(String[] args){for(boolean left:new boolean[]{false,true})for(boolean right:new boolean[]{false,true})for(int fail=-5;fail<=5;fail++)System.out.println(left+":"+right+":"+fail+":"+SnapshotArguments.run(left,right,fail));}}`;
     for(const directory of [native,rebuilt]){fs.writeFileSync(path.join(directory,'SnapshotRunner.java'),driver);run('javac',['--release','8','-d',directory,path.join(directory,'SnapshotArguments.java'),path.join(directory,'SnapshotRunner.java')],temporary);}

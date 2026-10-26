@@ -27,7 +27,7 @@ const { listRegionSplitCandidates, applyRegionSplit } = require('../passes/regio
 const { jreClassInfo, jreMethodCandidates } = require('../java-frontend/jreMetadata');
 const { JavaParser } = require('../java-frontend/parser');
 const { tokenizeJava } = require('../java-frontend/lexer');
-const { promoteBooleanStackCarriers, foldPrimitiveValueBranches, localizeForLoopDeclarations, factorCommonBranchTails, factorLabeledBlockReturnTails, simplifyControlFrames, removeFallthroughLabelBreaks, localizePlainBlockLoopBreaks, foldLeadingWhileBreakGuards, foldEffectfulPlainBlockExits, simplifyIdentityReferenceCasts, recoverScalarLabelDispatches, specializePathGuards, recoverPostGuardExits, recoverArrayIndexIncrements, foldLabeledBooleanDecisions, foldVoidReturnExits, foldNestedIfGuards, foldLabeledSkipGuards, foldLabeledIfElseExits, foldLabeledExitTrees, foldLabeledGuardTrees, removeDeadRegionSelectors, removeDeadReceiverSnapshots, removeCaughtExceptionCopies } = require('./javaAstEmitter');
+const { promoteBooleanStackCarriers, foldPrimitiveValueBranches, localizeForLoopDeclarations, localizeLocalInitializations, factorCommonBranchTails, factorLabeledBlockReturnTails, simplifyControlFrames, removeFallthroughLabelBreaks, localizePlainBlockLoopBreaks, foldLeadingWhileBreakGuards, foldEffectfulPlainBlockExits, simplifyIdentityReferenceCasts, recoverScalarLabelDispatches, specializePathGuards, recoverPostGuardExits, recoverArrayIndexIncrements, foldLabeledBooleanDecisions, foldVoidReturnExits, foldNestedIfGuards, foldLabeledSkipGuards, foldLabeledIfElseExits, foldLabeledExitTrees, foldLabeledGuardTrees, removeDeadRegionSelectors, removeDeadReceiverSnapshots, removeCaughtExceptionCopies } = require('./javaAstEmitter');
 
 const VERSION = 'CFR-JS 0.4.0';
 const javaStatementParser = new JavaParser();
@@ -1360,6 +1360,10 @@ function formatMethod(cls, method, options = {}) {
     // Narrow only a complete, proven loop-local lifetime at this final stage.
     const localized = localizeForLoopDeclarations(body.join('\n'), {reservedNames: localState.paramNames});
     if (localized.declarationsMoved) replaceArrayContents(body, localized.source.split('\n'));
+    // Keep the first store in place; merge only inert declarations whose
+    // complete remaining lifetime belongs to that store's existing block.
+    const initialized = localizeLocalInitializations(body.join('\n'), {reservedNames: localState.paramNames});
+    if (initialized.declarationsMerged) replaceArrayContents(body, initialized.source.split('\n'));
   }
   assertNoFallback(body, { className: cls.className, methodName: method.name, descriptor: method.descriptor });
   const result = formatBlock(header, body);
