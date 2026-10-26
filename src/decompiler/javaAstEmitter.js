@@ -615,19 +615,33 @@ function removeDeadRegionSelectors(source, declarations, selectorNames) {
     declarations: declarations.filter(declaration => !removed.some(name => declaration === candidates.get(name).declaration))};
 }
 
-// Remove only allocator-owned, unread Object stack slots whose complete body
+// Remove only allocator-owned, unread reference stack slots whose complete body
 // occurrences are standalone stores of this/null. Neither right-hand side can
 // throw, allocate, initialize a class or perform a field/array/volatile read.
 // Retain all surrounding conditions, protected regions, monitors and transfers.
 function removeDeadReceiverSnapshots(source, declarations, carrierNames) {
   const unchanged = () => ({source, declarations, removed: []});
-  const candidates = new Map();
-  for (const name of carrierNames || []) {
-    if (!/^stackIn_\d+_\d+$/.test(name)) continue;
-    const declaration = `Object ${name} = null;`;
-    if (declarations.filter(item => item === declaration).length === 1)
-      candidates.set(name, {declaration, allowed: new Set(), edits: []});
+  const candidates = new Map(), names = new Set([...carrierNames || []].filter(name => /^stackIn_\d+_\d+$/.test(name)));
+  if (!names.size) return unchanged();
+  const byName = new Map();
+  // A declared reference type does not initialize that class. A literal
+  // null initializer and this/null stores are just as inert for a concrete
+  // class or array as for Object; never infer this from spelling alone.
+  // Parse each declaration once, rather than once for every stack carrier.
+  for (const declaration of declarations) {
+    try {
+      const node = statementParser.parseStatement(declaration, {requireComplete: true});
+      const variable = node.declarators?.[0], type = node.variableType;
+      if (node.kind !== 'LocalVariableDeclarationStatement'
+          || node.modifiers?.length || node.annotations?.length || node.declarators.length !== 1
+          || !names.has(variable.name)
+          || !(type?.kind === 'ClassType' && type.name !== 'var' || type?.kind === 'ArrayType')
+          || variable.initializer?.kind !== 'LiteralExpression' || variable.initializer.literalKind !== 'null') continue;
+      byName.set(variable.name, [...byName.get(variable.name) || [], declaration]);
+    } catch (_) { /* Unsupported declarations remain untouched. */ }
   }
+  for (const [name, matches] of byName) if (matches.length === 1)
+    candidates.set(name, {declaration: matches[0], allowed: new Set(), edits: []});
   if (!candidates.size || [source, ...declarations].some(text => /\\u+[0-9a-fA-F]{4}/.test(text))) return unchanged();
   const wrapped = `{\n${source}\n}`;
   let parsed, tokens;

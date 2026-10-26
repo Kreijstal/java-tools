@@ -5239,6 +5239,15 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
       retainedDeclarations = booleans ? booleans.declarations : uniqueDeclarations;
     }
     if (!useStateMachine) {
+      const selectors = removeDeadRegionSelectors(source, retainedDeclarations, structured.selectorDecls);
+      source = selectors.source;
+      retainedDeclarations = selectors.declarations;
+      const receivers = removeDeadReceiverSnapshots(source, retainedDeclarations, stackCarrierTypes.keys());
+      source = receivers.source;
+      retainedDeclarations = receivers.declarations;
+    }
+    // Removing inert carrier stores can expose scalar-only branch arms.
+    if (!useStateMachine) {
       const retainedPrimitiveTypes = new Map();
       for (const declaration of retainedDeclarations) {
         const match = /^(boolean|byte|char|short|int|long|float|double) ([A-Za-z_$][\w$]*)(?: = .+)?;$/.exec(declaration);
@@ -5252,14 +5261,6 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
         localType: name => retainedPrimitiveTypes.get(name)
           || (stackCarrierTypes.has(name) ? null : localState.sourceTypeForName(name)),
       }).source;
-    }
-    if (!useStateMachine) {
-      const selectors = removeDeadRegionSelectors(source, retainedDeclarations, structured.selectorDecls);
-      source = selectors.source;
-      retainedDeclarations = selectors.declarations;
-      const receivers = removeDeadReceiverSnapshots(source, retainedDeclarations, stackCarrierTypes.keys());
-      source = receivers.source;
-      retainedDeclarations = receivers.declarations;
     }
     let lines = source ? source.split('\n') : [];
     lines.unshift(...retainedDeclarations);

@@ -1472,7 +1472,7 @@ if(pick()) {  work(); } else {  }
 try {  fail(); } catch(Exception error) {  caught(error); }
 synchronized(lock) {  finish(); }`);
   for(const [declarations,names] of [[[declaration],[]],[[declaration,declaration],[name]],
-    [[`Thing ${name} = null;`],[name]],[[`Object ${name};`],[name]]])
+    [[`int ${name} = 0;`],[name]],[[`Object ${name};`],[name]]])
     assert.equal(removeDeadReceiverSnapshots(source,declarations,names).source,source);
   for(const body of [
     `${name}=this; return ${name};`, `${name}=effect();`, `${name}=other;`, `${name}=new Object();`,
@@ -1490,10 +1490,31 @@ synchronized(lock) {  finish(); }`);
   assert.deepEqual(removeDeadReceiverSnapshots(mixed,[declaration,'Object stackIn_3_0 = null;'],[name,'stackIn_3_0']).removed,[name]);
 });
 
+test('typed unread snapshot cleanup accepts references and refuses live or effectful values', () => {
+  const name='stackIn_2_0', body=`if(pick()) { ${name}=null; work(); } else { ${name}=null; }`;
+  for (const type of ['Thing','Outer.Inner','java.lang.String','Thing[]','int[][]']) {
+    const declaration=`${type} ${name} = null;`;
+    const result=removeDeadReceiverSnapshots(body,[declaration],[name]);
+    assert.deepEqual(result.removed,[name],type);assert.deepEqual(result.declarations,[]);
+    assert.equal(result.source,'if(pick()) {  work(); } else {  }');
+    for (const value of ['other','effect()','new Thing()','(Thing)null','items[index]','Owner.value']) {
+      const source=`${name}=${value};`;
+      assert.equal(removeDeadReceiverSnapshots(source,[declaration],[name]).source,source,type+': '+value);
+    }
+    const live=`${body} use(${name});`;
+    assert.equal(removeDeadReceiverSnapshots(live,[declaration],[name]).source,live);
+  }
+  for (const declaration of [`Thing ${name};`,`Thing ${name}=effect();`,`Thing ${name}=null, other=null;`,
+    `final Thing ${name}=null;`,`int ${name}=0;`,`var ${name}=null;`,`java.util.List<String> ${name}=null;`]) {
+    assert.deepEqual(removeDeadReceiverSnapshots(body,[declaration],[name]).removed,[],declaration);
+  }
+});
+
 test('receiver snapshot cleanup preserves native effects, failures, catch/finally and lock scope', () => {
   const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'cfr-dead-receiver-'));
   try {
-    const name='stackIn_2_0', declaration=`Object ${name} = null;`;
+    for (const referenceType of ['Object', 'ReceiverSnapshots']) {
+    const name='stackIn_2_0', declaration=`${referenceType} ${name} = null;`;
     const body=`try {
       if(branch()) { ${name}=this; work(mode); } else { ${name}=null; work(mode); }
       synchronized(lock) { ${name}=this; trace.append(Thread.holdsLock(lock)); work(mode); }
@@ -1528,6 +1549,7 @@ test('receiver snapshot cleanup preserves native effects, failures, catch/finall
     const file=path.join(temporary,'ReceiverSnapshots.java');fs.writeFileSync(file,source);
     run('javac',['--release','8','-d',temporary,file],temporary);
     assert.equal(run('java',['-cp',temporary,'ReceiverSnapshots'],temporary).trim().split('\n').length,96);
+    }
   } finally {fs.rmSync(temporary,{recursive:true,force:true});}
 });
 
@@ -2867,4 +2889,31 @@ test('effectful exit reconstruction preserves native effects, failure identity, 
     run('javac',['--release','8','-d',temporary,file],temporary);
     assert.equal(run('java',['-cp',temporary,'EffectfulExits'],temporary).trim(),'effectful-exits-native:24192');
   } finally { fs.rmSync(temporary,{recursive:true,force:true}); }
+});
+
+
+test('default decompilation removes typed null constructor snapshots and preserves argument effects', () => {
+  const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'cfr-typed-constructor-'));
+  try {
+    const native=path.join(temporary,'native'), rebuilt=path.join(temporary,'rebuilt');fs.mkdirSync(native);fs.mkdirSync(rebuilt);
+    const source=`public class SnapshotArguments {
+      static String trace;static int failure;final int first,second;
+      SnapshotArguments(int first,int second){trace+="C";if(failure==5)throw new IllegalStateException();if(failure==-5)throw new AssertionError();this.first=first;this.second=second;}
+      static int mark(int value){trace+=value;if(failure==value)throw new IllegalArgumentException();if(failure==-value)throw new AssertionError();return value;}
+      static SnapshotArguments create(boolean left,boolean right){try{return new SnapshotArguments(left?mark(1):mark(2),right?mark(3):mark(4));}catch(RuntimeException problem){trace+="R";throw problem;}}
+      public static String run(boolean left,boolean right,int fail){trace="";failure=fail;try{SnapshotArguments result=create(left,right);return trace+":"+result.first+":"+result.second;}catch(Throwable problem){return trace+":"+problem.getClass().getName();}}
+    }`;
+    fs.writeFileSync(path.join(native,'SnapshotArguments.java'),source);
+    run('javac',['--release','8','-d',native,path.join(native,'SnapshotArguments.java')],temporary);
+    const decompiled=decompileClassFile(path.join(native,'SnapshotArguments.class'));assertNoFallback(decompiled);
+    // The live return carrier remains; every unread constructor placeholder
+    // has gone. Do not demand deletion of observable/live reference stores.
+    assert.equal((decompiled.match(/SnapshotArguments stackIn_\d+_\d+ = null;/g)||[]).length,1);
+    assert.doesNotMatch(decompiled,/^\s*stackIn_\d+_\d+ = null;/m);
+    fs.writeFileSync(path.join(rebuilt,'SnapshotArguments.java'),decompiled);
+    const driver=`class SnapshotRunner {public static void main(String[] args){for(boolean left:new boolean[]{false,true})for(boolean right:new boolean[]{false,true})for(int fail=-5;fail<=5;fail++)System.out.println(left+":"+right+":"+fail+":"+SnapshotArguments.run(left,right,fail));}}`;
+    for(const directory of [native,rebuilt]){fs.writeFileSync(path.join(directory,'SnapshotRunner.java'),driver);run('javac',['--release','8','-d',directory,path.join(directory,'SnapshotArguments.java'),path.join(directory,'SnapshotRunner.java')],temporary);}
+    const expected=run('java',['-Xverify:all','-cp',native,'SnapshotRunner'],temporary);assert.equal(expected.trim().split('\n').length,44);
+    assert.equal(run('java',['-Xverify:all','-cp',rebuilt,'SnapshotRunner'],temporary),expected);
+  } finally {fs.rmSync(temporary,{recursive:true,force:true});}
 });
