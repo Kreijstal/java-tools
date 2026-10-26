@@ -126,6 +126,7 @@ class ClosedCompiler {
     this.markShadowedHandlerLocals();
     this.inferReprs();
     this.analyzeControl();
+    this.analyzeInvariantReceiverFields();
     const code = [];
     // Depth accounting (ClosedWorld.markRecursion): a method on a call cycle
     // counts its frame and throws StackOverflowError past the JVM's limit; a
@@ -156,6 +157,10 @@ class ClosedCompiler {
     this.checked = new Set();
     this.analyzeDerived();
     for (const param of fn.params) code.push(...this.deriveCode(param));
+    for (const node of this.invariantReceiverFields) {
+      this.currentNode = node;
+      code.push(...this.fieldAccess(node, this.plan.get(node.id), false), ...this.set(node));
+    }
     this.doTree(fn.entry, code);
     code.push(OP.unreachable, OP.end,
       OP.call, { fn: this.world.hostImport('err_npe', [], []) }, OP.unreachable);
@@ -594,6 +599,45 @@ class ClosedCompiler {
   }
 
   // ---- straight-line nodes -----------------------------------------------
+  // Array stores cannot alias an object's primitive fields. In a method with
+  // no field writes, calls, class initialization or synchronization, ordinary
+  // receiver fields therefore stay constant across its pixel/element loops.
+  // Read them once at entry. Only `this` is eligible: reading another receiver
+  // early could move a NullPointerException before an observable array store.
+  analyzeInvariantReceiverFields() {
+    this.invariantReceiverFields = [];
+    this.invariantReceiverFieldNodes = new Set();
+    if (this.entry.isStatic || !this.loopHeaders.size) return;
+    const nodes = [...this.fn.reachable].flatMap(id => this.fn.blocks[id].body);
+    const fields = new Map();
+    for (const node of nodes) {
+      const plan = this.plan.get(node.id);
+      if (plan && (plan.initClass || !['field-get', 'intrinsic', 'constant-global'].includes(plan.kind))) return;
+      if (node.op === 'monitorenter' || node.op === 'monitorexit') return;
+      if (node.op !== 'getfield') continue;
+      if (plan?.kind !== 'field-get') return;
+      const [, , [name, descriptor]] = node.imm;
+      const declaration = this.world.classAst(plan.declaring)?.items.find(item =>
+        item.type === 'field' && item.field.name === name && item.field.descriptor === descriptor)?.field;
+      // A volatile read is an acquire even when its result is unused. It can
+      // make other threads' writes visible, so none of the reads may move.
+      if (!declaration || declaration.flags?.includes('volatile') || (declaration.accessFlags & 0x0040)) return;
+      const receiver = node.args[0];
+      if (plan.reference || receiver?.op !== 'param' || receiver.imm.index !== 0) continue;
+      const key = `${plan.declaring}.${name}:${descriptor}`;
+      if (!fields.has(key)) fields.set(key, []);
+      fields.get(key).push(node);
+    }
+    for (const reads of fields.values()) {
+      const first = reads[0], local = this.localFor(first);
+      this.invariantReceiverFields.push(first);
+      for (const node of reads) {
+        this.localOfValue.set(node.id, local);
+        this.invariantReceiverFieldNodes.add(node);
+      }
+    }
+  }
+
   emitBlockBody(x, out) {
     const block = this.fn.blocks[x];
     for (const phi of block.phis) out.push(...this.deriveCode(phi));
@@ -604,6 +648,7 @@ class ClosedCompiler {
     }
     const sites = new Map(this.throwSites(x).filter((s) => s.node).map((s) => [s.node, s]));
     for (const node of block.body) {
+      if (this.invariantReceiverFieldNodes.has(node)) continue;
       const site = sites.get(node);
       if (site) this.emitCovered(x, site, (inner) => this.emitNode(node, inner), out);
       else this.emitNode(node, out);
