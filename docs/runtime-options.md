@@ -1,5 +1,32 @@
 # Runtime options
 
+## Linear heap recovery
+
+The linear heap keeps exact-size free lists until bump allocation exhausts
+available space. It then automatically transfers proven-dead array extents and
+object slabs into a shared, address-ordered pool. Adjacent extents coalesce and
+larger extents split to satisfy differently sized or aligned requests. Live
+allocations retain their addresses and views; reused storage is zeroed. The
+heap limit and growth restrictions remain unchanged.
+
+Pool searches and subsequent releases use a balanced tree with alignment-aware
+subtree capacities. The initial transfer visits existing free-list entries.
+`usage().pooledFreeBytes` reports storage in this pool; `free` includes it.
+`freeBytes` and `arrayFreeBytes` describe only the original segregated bins.
+Allocation and reclamation counters remain cumulative.
+
+This fixes stranded free space, not collection scheduling: reclamation still
+depends on host finalizers, whose prompt execution is not guaranteed. A full
+heap with no finalized storage still uses supported execution fallbacks.
+
+Run `node scripts/benchmarkHeapPressure.js --baseline <commit>` for two
+fresh-process B-C-C-B blocks. The deterministic 8 MiB exhaustion case makes
+1,000 differently sized requests after freeing 1 KiB blocks. Against commit
+`ebc81d62477eef15e73f239cf30b237e2d3248cf`, all four baseline samples spilled
+1,000 arrays and all four candidate samples spilled zero. This is allocator
+coverage, not a browser FPS or total-memory acceptance result. Allocation
+timings were variable; no general throughput improvement is established.
+
 ## Preparation policy
 
 `jit.preparationPolicy` accepts `priorityMethods` (exact

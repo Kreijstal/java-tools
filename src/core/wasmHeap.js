@@ -2,8 +2,9 @@
 
 // Linear heap for primitive Java arrays (JVM_WASM_HEAP=1): each array is a
 // TypedArray view over one WebAssembly.Memory. Dead registered storage returns
-// to exact-size free lists. JS/interpreter code indexes the view like the plain
-// arrays it replaces (TypedArray coercion matches Java element semantics),
+// to exact-size free lists, then a shared coalescing pool under pressure.
+// JS/interpreter code indexes the view like the plain arrays it replaces
+// (TypedArray coercion matches Java element semantics),
 // while compiled wasm can read `view.wasmBase` once per run and then access
 // elements with raw loads/stores. When the bump pointer runs out, allocation falls back to ordinary
 // TypedArrays (wasmBase undefined) and compiled code takes the import path —
@@ -24,6 +25,7 @@ const CTOR = {
   '[Z': Int8Array, '[B': Int8Array, '[C': Uint16Array, '[S': Int16Array,
   '[I': Int32Array, '[J': BigInt64Array, '[F': Float32Array, '[D': Float64Array,
 };
+const {FreeExtents} = require('./freeExtents');
 
 // Diagnostics must not assume a Node process: the browser bundle ships a
 // `process` shim without stderr, and a missing stream turned this one-time
@@ -42,10 +44,9 @@ function warnExhausted(limit) {
 // MAX_BINNED_BYTES are not recycled, because objects that large are rare and a
 // bin per size would cost more than it returns.
 //
-// Nothing calls free() yet, and that is deliberate. The same section is
-// explicit that "free lists alone do not establish which guest objects are
-// dead; reclaim only when liveness is known." This is the allocator
-// foundation; the liveness question is the separate, larger half of Phase 2.
+// Finalizers establish liveness; free lists alone never establish that an
+// object is dead. Under pressure the same dead storage enters a shared pool
+// that may split it or combine it with adjacent dead arrays.
 const MAX_BINNED_BYTES = 4096;
 
 // Bounded backward scan for an acceptably-aligned free extent (see
@@ -116,6 +117,9 @@ class WasmHeap {
     // exact rounded size beats a dense table: only sizes the guest actually
     // uses ever get a bin, and exact fit means no internal waste.
     this.arrayBins = new Map();
+    // Exact bins remain the normal fast path. After bump-space exhaustion,
+    // one shared pool also permits splitting and coalescing dead storage.
+    this.pressurePool = null;
     this.stats = { bumped: 0, reused: 0, freed: 0, freeBytes: 0,
       arrayBumped: 0, arrayReused: 0, arrayFreed: 0, arrayFreeBytes: 0,
       arrayReclaimed: 0 };
@@ -215,8 +219,20 @@ class WasmHeap {
       this.stats.freeBytes -= size;
       return base;
     }
+    if (this.pressurePool) {
+      const reused = this.pressurePool.take(size, 8);
+      if (reused >= 0) {
+        this.u8.fill(0, reused, reused + size);
+        this.stats.reused += 1;
+        return reused;
+      }
+    }
     const base = (this.top + 7) & ~7;
     if (base + size > this.limit && !this.growTo(base + size)) {
+      if (!this.pressurePool) {
+        this._enablePressurePool();
+        return this.allocObject(bytes);
+      }
       if (!this.exhausted) {
         this.exhausted = true;
         warnExhausted(this.limit);
@@ -228,7 +244,18 @@ class WasmHeap {
     return base;
   }
 
-  // Return an object slab to its size class. `bytes` must be the same size the
+  _enablePressurePool() {
+    if (this.pressurePool) return;
+    const pool = this.pressurePool = new FreeExtents();
+    for (const [size, bases] of this.freeBins)
+      for (const base of bases) pool.release(base, size * 8);
+    for (const [bytes, bases] of this.arrayBins)
+      for (const base of bases) pool.release(base, bytes);
+    this.freeBins.clear();
+    this.arrayBins.clear();
+    this.stats.freeBytes = this.stats.arrayFreeBytes = 0;
+  }
+  // Return an object slab to reusable storage. `bytes` must be the same size the
   // slab was allocated with; the caller owns that pairing, exactly as it owns
   // the base. Returns true when the extent was recycled, false when it was
   // dropped (too large to bin), so a caller can account for what it lost.
@@ -245,12 +272,15 @@ class WasmHeap {
       this.objectAllocations.delete(base);
       this.registry?.unregister(tracked);
     }
-    const key = size >> 3;
-    let bin = this.freeBins.get(key);
-    if (!bin) { bin = []; this.freeBins.set(key, bin); }
-    bin.push(base);
+    if (this.pressurePool) this.pressurePool.release(base, size);
+    else {
+      const key = size >> 3;
+      let bin = this.freeBins.get(key);
+      if (!bin) { bin = []; this.freeBins.set(key, bin); }
+      bin.push(base);
+      this.stats.freeBytes += size;
+    }
     this.stats.freed += 1;
-    this.stats.freeBytes += size;
     return true;
   }
 
@@ -279,10 +309,13 @@ class WasmHeap {
   // Bytes the bump pointer has handed out, and what is parked in free lists.
   // `live` is an upper bound on live bytes, not a measurement of liveness.
   usage() {
+    const pooledFreeBytes = this.pressurePool?.bytes || 0;
+    const free = this.stats.freeBytes + this.stats.arrayFreeBytes + pooledFreeBytes;
     return {
       allocated: this.top - 8,
-      free: this.stats.freeBytes + this.stats.arrayFreeBytes,
-      live: (this.top - 8) - this.stats.freeBytes - this.stats.arrayFreeBytes,
+      free,
+      live: (this.top - 8) - free,
+      pooledFreeBytes,
       limit: this.limit,
       reserved: this.maxPages * 65536,
       grows: this.growCount,
@@ -297,11 +330,9 @@ class WasmHeap {
   // because fresh wasm memory is zeroed, a recycled one because freeArray's
   // callers get it cleared here.
   //
-  // Extents are 8-aligned regardless of element width, which costs at most 7
-  // bytes per array and buys the property that a freed extent is reusable by
-  // any array of the same byte size, whatever its element type. Without it a
-  // byte array freed at an odd address could not serve an int array and the
-  // bins would fragment by alignment as well as size.
+  // Extents retain their exact size and element alignment. Reuse checks that
+  // alignment before constructing a view; the pressure pool can split off a
+  // prefix to align a differently typed replacement.
   alloc(desc, count) {
     const Ctor = CTOR[desc];
     if (!Ctor) return null;
@@ -323,12 +354,16 @@ class WasmHeap {
       view.fill(Ctor === BigInt64Array ? 0n : 0);
       view.wasmBase = reused;
       this.stats.arrayReused += 1;
-      this.stats.arrayFreeBytes -= bytes;
+      if (!this.pressurePool) this.stats.arrayFreeBytes -= bytes;
       this.watch(view, reused, bytes,desc);
       return view;
     }
     const base = (this.top + align - 1) & ~(align - 1);
     if (base + bytes > this.limit && !this.growTo(base + bytes)) {
+      if (!this.pressurePool) {
+        this._enablePressurePool();
+        return this.alloc(desc, count);
+      }
       if (!this.exhausted) {
         this.exhausted = true;
         warnExhausted(this.limit);
@@ -354,11 +389,15 @@ class WasmHeap {
     if (reused >= 0) {
       this.u8.fill(0, reused, reused + bytes);
       this.stats.arrayReused += 1;
-      this.stats.arrayFreeBytes -= bytes;
+      if (!this.pressurePool) this.stats.arrayFreeBytes -= bytes;
       return reused;
     }
     const base = (this.top + align - 1) & ~(align - 1);
     if (base + bytes > this.limit && !this.growTo(base + bytes)) {
+      if (!this.pressurePool) {
+        this._enablePressurePool();
+        return this.allocExtent(desc, count);
+      }
       if (!this.exhausted) {
         this.exhausted = true;
         warnExhausted(this.limit);
@@ -415,11 +454,18 @@ class WasmHeap {
     // doing so permanently spends their linear storage and eventually sends
     // every subsequent allocation through host element-access imports.
     if (!(base > 0) || !(bytes > 0)) return;
-    let bin = this.arrayBins.get(bytes);
-    if (!bin) { bin = []; this.arrayBins.set(bytes, bin); }
-    bin.push(base);
+    this._releaseArrayExtent(base, bytes);
     this.stats.arrayReclaimed += 1;
-    this.stats.arrayFreeBytes += bytes;
+  }
+
+  _releaseArrayExtent(base, bytes) {
+    if (this.pressurePool) this.pressurePool.release(base, bytes);
+    else {
+      let bin = this.arrayBins.get(bytes);
+      if (!bin) { bin = []; this.arrayBins.set(bytes, bin); }
+      bin.push(base);
+      this.stats.arrayFreeBytes += bytes;
+    }
   }
 
   // Pop a free extent of exactly `bytes` whose base satisfies `align`, or -1.
@@ -431,6 +477,7 @@ class WasmHeap {
   // an int[] of the same size. The scan is bounded so a bin full of
   // unusably-aligned bases degrades to bump allocation instead of a long walk.
   _takeExtent(bytes, align) {
+    if (this.pressurePool) return this.pressurePool.take(bytes, align);
     const bin = this.arrayBins.get(bytes);
     if (!bin || !bin.length) return -1;
     const mask = align - 1;
@@ -463,11 +510,8 @@ class WasmHeap {
     if (this.registry) this.registry.unregister(view);
     allocationByArray.delete(view);
     if (this.arrayViewsLive > 0) this.arrayViewsLive -= 1;
-    let bin = this.arrayBins.get(bytes);
-    if (!bin) { bin = []; this.arrayBins.set(bytes, bin); }
-    bin.push(base);
+    this._releaseArrayExtent(base, bytes);
     this.stats.arrayFreed += 1;
-    this.stats.arrayFreeBytes += bytes;
     return true;
   }
 }
