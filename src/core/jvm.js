@@ -171,6 +171,15 @@ class JVM {
       allocationPolicy: this.wasmHeapAllocationPolicy};
   }
 
+  _reportPreparationProgress(event) {
+    const progress = {phase: String(event.phase || event.tier || 'preparation').slice(0, 64),
+      completed: Number.isFinite(event.completed) ? event.completed : null,
+      total: Number.isFinite(event.total) ? event.total : null,
+      current: typeof event.current === 'string' ? event.current.slice(0, 512) : null};
+    this.preparationProgress = progress;
+    try { this.onPreparationProgress?.({...progress}); } catch (_) { /* Observation cannot fail preparation. */ }
+  }
+
   constructor(options = {}) {
     this.threads = [];
     this.currentThreadIndex = 0;
@@ -178,6 +187,8 @@ class JVM {
     // run() prepares everything before main() unless this is false. See the
     // preparation block in run().
     this.prepareBeforeMain = options.prepareBeforeMain !== false;
+    this.onPreparationProgress = typeof options.onPreparationProgress === 'function' ? options.onPreparationProgress : null;
+    this.preparationProgress = null;
     // Which methods that pass hands the Wasm tier. By default every
     // loop-bearing method gets a module; with this set only the JS-prepared
     // oversized-loop methods do (the "prepared upgrade" shape), which is what
@@ -1458,6 +1469,11 @@ class JVM {
   // values. Browser launchers may run this during an explicit preparation
   // phase to move first-use compiler work out of interactive transitions.
   async precompileInitializedClasses(options = {}) {
+    const onProgress = options.onProgress;
+    options = {...options, onProgress: progress => {
+      this._reportPreparationProgress(progress);
+      if (typeof onProgress === 'function') onProgress(progress);
+    }};
     const pauseGuest = options.effectful === true;
     if (pauseGuest) this._explicitPreparationDepth += 1;
     try {
@@ -1932,9 +1948,10 @@ class JVM {
       await this.loadClassByName(name);
       completed += 1;
       if (typeof onProgress === "function") {
-        onProgress({completed, total: names.size, tier: "class-load"});
+        onProgress({completed, total: names.size, tier: "class-load", current: name});
       }
-      await yieldToEventLoop(0, this.eventLoopYieldStrategy);
+      await yieldToEventLoop(0, hostPaintsBetweenTasks() && document.visibilityState !== 'hidden'
+        ? 'timer' : this.eventLoopYieldStrategy);
     }
     const referenced = await this.preloadReferencedClasses(onProgress);
     return {classes: completed, referencedClasses: referenced};
@@ -2013,6 +2030,7 @@ class JVM {
           this.classes[name].isJreStub && this.jre[name] &&
             this.jre[name].applicationFallback) && !attempted.has(name));
       if (!missing.length) break;
+      const totalDiscovered = loaded + missing.length;
       for (const name of missing) {
         attempted.add(name);
         try {
@@ -2023,10 +2041,11 @@ class JVM {
         }
         loaded += 1;
         if (typeof onProgress === "function") {
-          onProgress({completed: loaded, total: missing.length,
-            tier: "class-load-referenced"});
+          onProgress({completed: loaded, total: totalDiscovered,
+            tier: "class-load-referenced", current: name});
         }
-        await yieldToEventLoop(0, this.eventLoopYieldStrategy);
+        await yieldToEventLoop(0, hostPaintsBetweenTasks() && document.visibilityState !== 'hidden'
+          ? 'timer' : this.eventLoopYieldStrategy);
       }
     }
     return loaded;

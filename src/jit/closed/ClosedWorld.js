@@ -25,6 +25,7 @@ const { VT, OP, GC, ModuleBuilder, structType, subType, refNull, ref, uleb, sleb
 const { closedTypes, OBJ_FIELDS, T_OBJ, T_PARR, T_RARR, T_REFS } = require('./representation');
 const { ClosedCompiler, Unsupported, WT } = require('./ClosedCompiler');
 const { ASYNC_METHOD_SENTINEL } = require('../../core/constants');
+const {yieldToEventLoop, hostPaintsBetweenTasks} = require('../../core/hostYield');
 
 // Longest a thread runs in the module before it is parked at a host call.
 const SLICE_MS = 10;
@@ -73,6 +74,10 @@ class ClosedWorld {
     this.globalImports = new Map(); // global key -> {valtype, mutable, value}
     this.sites = [];               // diagnostics for vmiss / cce
     this.built = false;
+    this.building = false;
+    this.buildPromise = null;
+    this.preparation = null;
+    this.preparationYieldAt = 0;
     this.counters = { entries: 0, entryFallbacks: 0, notReady: 0, preempted: 0 };
     this.sliceStart = 0;
     this.thread = null;
@@ -107,6 +112,8 @@ class ClosedWorld {
   stats() {
     return {
       built: this.built,
+      building: this.building,
+      preparation: this.preparation,
       admitted: this.entries.size,
       rejected: this.rejected.size,
       rejectReasons: [...this.rejected.values()].reduce((m, r) => { const k = r.split(':')[0]; m[k] = (m[k] || 0) + 1; return m; }, {}),
@@ -704,16 +711,48 @@ class ClosedWorld {
   }
 
   // ---- admission ----------------------------------------------------------
-  async build(thread = null) {
-    if (this.built) return;
-    this.built = true;
+  reportPreparation(phase, completed = null, total = null, current = null) {
+    const progress = {phase, completed, total, current: typeof current === 'string' ? current.slice(0, 512) : null};
+    this.preparation = progress;
+    if (typeof this.jvm._reportPreparationProgress === 'function') this.jvm._reportPreparationProgress(progress);
+    else try { this.jvm.onPreparationProgress?.({...progress}); } catch (_) {}
+  }
+
+  yieldPreparation() {
+    if (now() - this.preparationYieldAt < 8) return null;
+    const paints = hostPaintsBetweenTasks() && document.visibilityState !== 'hidden';
+    return yieldToEventLoop(0, paints ? 'timer' : this.jvm.eventLoopYieldStrategy)
+      .then(() => {this.preparationYieldAt = now();});
+  }
+
+  build(thread = null) {
+    if (this.buildPromise) return this.buildPromise;
+    this.building = true;
+    this.buildPromise = Promise.resolve().then(() => this.buildModule(thread)).then(() => {
+      this.built = true;
+      this.building = false;
+      this.reportPreparation('closed-ready', 1, 1);
+    }, error => {
+      this.building = false;
+      this.reportPreparation('closed-failed');
+      throw error;
+    });
+    return this.buildPromise;
+  }
+
+  async buildModule(thread = null) {
+    this.reportPreparation('class-load', 0);
     if (typeof this.jvm.preloadClasspathClasses === 'function') {
-      try { await this.jvm.preloadClasspathClasses(null, { scope: this.jvm.prepareScope }); } catch { /* referenced classes still load below */ }
+      try { await this.jvm.preloadClasspathClasses(progress => this.reportPreparation(
+        progress.tier || 'class-load', progress.completed, progress.total, progress.current),
+      { scope: this.jvm.prepareScope }); } catch { /* referenced classes still load below */ }
     }
     await this.loadReferencedClasses();
+    this.reportPreparation('closed-layout');
+    await this.yieldPreparation();
     this.prepareClassTypes();
     this.knownClassLimit = this.computeKnownClassLimit();
-    const candidates = [];
+    const candidates = [], methods = [];
     for (const className of Object.keys(this.jvm.classes)) {
       if (!this.isGuestClass(className)) continue;
       const ast = this.classAst(className);
@@ -721,10 +760,18 @@ class ClosedWorld {
         if (item.type !== 'method') continue;
         const method = item.method;
         const key = `${className}.${method.name}${method.descriptor}`;
-        const record = this.analyze(className, method, key);
-        if (record) candidates.push(record);
+        methods.push({className, method, key});
       }
     }
+    this.reportPreparation('closed-analysis', 0, methods.length);
+    for (let index = 0; index < methods.length; index++) {
+      const {className, method, key} = methods[index];
+      this.reportPreparation('closed-analysis', index, methods.length, key);
+      const pending = this.yieldPreparation(); if (pending) await pending;
+      const record = this.analyze(className, method, key);
+      if (record) candidates.push(record);
+    }
+    this.reportPreparation('closed-analysis', methods.length, methods.length);
     for (const record of candidates) this.entries.set(record.key, record);
     // Greatest fixed point: drop methods that call something not admitted.
     // With JSPI such a call is a stub that runs the callee as an ordinary
@@ -741,7 +788,8 @@ class ClosedWorld {
       }
     }
     if (!this.entries.size) return;
-    this.assemble();
+    await this.assemble();
+    this.reportPreparation('closed-initialize');
     if (thread) await this.initializeTrivialClasses(thread);
   }
 
@@ -1425,13 +1473,19 @@ class ClosedWorld {
   getDepth() { return this.depthGlobal ? this.depthGlobal.value : 0; }
 
   // ---- module assembly ----------------------------------------------------
-  assemble() {
+  async assemble() {
+    this.reportPreparation('closed-link');
+    await this.yieldPreparation();
     this.markRecursion();
     // Compile bodies first: they register the imports they need.
     const bodies = new Map();
     // Each pass can only remove entries, so this reaches a fixed point.
     for (let pass = 0; ; pass++) {
+      const total = this.entries.size;
+      let completed = 0;
       for (const [key, record] of this.entries) {
+        this.reportPreparation('closed-compile', completed++, total, key);
+        const pending = this.yieldPreparation(); if (pending) await pending;
         if (bodies.has(key)) continue;
         try {
           bodies.set(key, new ClosedCompiler(this, record).compile());
@@ -1441,6 +1495,7 @@ class ClosedWorld {
           this.rejected.set(key, `compile: ${error.message}`);
         }
       }
+      this.reportPreparation('closed-compile', total, total);
       // A compile rejection can strand callers; recompute the fixed point.
       let changed = false;
       for (const [key, record] of this.jspi ? [] : this.entries) {
@@ -1457,6 +1512,8 @@ class ClosedWorld {
     for (const key of [...bodies.keys()]) if (!this.entries.has(key)) bodies.delete(key);
     if (!this.entries.size) return;
 
+    this.reportPreparation('closed-assemble');
+    await this.yieldPreparation();
     const builder = new ModuleBuilder();
     builder.addRecGroup('closed', closedTypes());
     const classTypes = [...this.classTypes.values()];
@@ -1578,7 +1635,10 @@ class ClosedWorld {
       require('fs').writeFileSync(process.env.JVM_CLOSED_WORLD_DUMP, bytes);
       require('fs').writeFileSync(`${process.env.JVM_CLOSED_WORLD_DUMP}.imports`, [...this.imports.keys()].map((k, i) => `${i}\t${k}`).join('\n'));
     }
-    const instance = new WebAssembly.Instance(new WebAssembly.Module(bytes), importObject);
+    this.reportPreparation('closed-module', 0, 1);
+    const module = await WebAssembly.compile(bytes);
+    const instance = await WebAssembly.instantiate(module, importObject);
+    this.reportPreparation('closed-module', 1, 1);
     this.instance = instance;
     this.parkFlag = instance.exports.park;
     this.depthGlobal = instance.exports.depth;
