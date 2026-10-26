@@ -15,6 +15,21 @@ original reads. Reference fields and their array metadata retain the existing
 code generation; extending the optimization to them did not demonstrate a
 repeatable browser performance gain.
 
+## Standard current-thread bridge
+
+Closed-world calls to the standard `Thread.currentThread()` implementation use
+a direct bridge. JNI records the provenance of its built-in wrapper so the
+compiler can recognize that implementation without mistaking a user-registered
+native for it. The bridge avoids allocating the general JNI environment and
+argument arrays, and omits result-protocol tests that this native cannot need.
+It still checks the time slice on every call and parks through the ordinary
+continuation protocol. No polling interval is increased.
+
+The returned Java thread belongs to the active compiled thread, including after
+suspension. Custom native registrations retain the general bridge, including
+Promise and pushed-frame handling. Focused validation:
+`node --test test/closedCurrentThread.test.js test/closedWorldSuspension.test.js`.
+
 ## Approximate browser memory and startup heap capacity
 
 `JVM.getMemoryUsage()` returns optional Chromium `performance.memory` values
