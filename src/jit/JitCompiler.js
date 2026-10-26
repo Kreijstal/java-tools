@@ -1,3 +1,5 @@
+const { toInt, longToFloat } = require("../core/javaNumeric");
+const { arrayStoreOk, checkArrayStore } = require("../core/arrayStore");
 const { methodIdentitySet } = require('./PreparationPolicy');
 const { yieldToEventLoop } = require("../core/hostYield");
 const normalInstructionReachability = require("./normalInstructionReachability");
@@ -7787,7 +7789,7 @@ class JitCompiler {
       case "f2d": return goNext;
       case "d2f": return `stack[sp - 1] = Math.fround(stack[sp - 1]); ${goNext}`;
       case "f2i": return `stack[sp - 1] = helpers.floatToInt(stack[sp - 1]); ${goNext}`;
-      case "d2i": return `stack[sp - 1] = Math.trunc(stack[sp - 1]) | 0; ${goNext}`;
+      case "d2i": return `stack[sp - 1] = Math.max(-2147483648, Math.min(2147483647, stack[sp - 1])) | 0; ${goNext}`;
       // Long operands are BigInt on the fast path but may arrive as plain
       // Number 0 (uninitialized long fields); the interpreter wraps every
       // operand in BigInt() before operating, and mixing throws in JS, so the
@@ -7871,7 +7873,10 @@ class JitCompiler {
           aastore: "value",
           dastore: "value",
         }[op] || "value";
-        return `{ const value = stack[--sp]; const index = stack[--sp]; const array = stack[--sp]; if (array === null || array === undefined || (index >>> 0) >= array.length) { helpers.arrayStore(value, index, array, frame, ${JSON.stringify(op)}); } else { const arrayData = array.elements || array; arrayData[index] = ${narrowed}; } } ${goNext}`;
+        // aastore takes the slow path for a value the array's element type
+        // may refuse (ArrayStoreException).
+        const refused = op === "aastore" ? " || (value !== null && !helpers.arrayStoreOk(array, value))" : "";
+        return `{ const value = stack[--sp]; const index = stack[--sp]; const array = stack[--sp]; if (array === null || array === undefined || (index >>> 0) >= array.length${refused}) { helpers.arrayStore(value, index, array, frame, ${JSON.stringify(op)}); } else { const arrayData = array.elements || array; arrayData[index] = ${narrowed}; } } ${goNext}`;
       }
       case "getfield": {
         const fieldSiteId = this.registerFieldSite(instruction.arg);
@@ -8387,15 +8392,15 @@ class JitCompiler {
         case "d2f": stack.push(Math.fround(stack.pop())); break;
         case "f2i": stack.push(floatToInt(stack.pop())); break;
         case "i2b": stack.push((stack.pop() << 24) >> 24); break;
-        case "d2i": stack.push(Math.trunc(stack.pop()) | 0); break;
+        case "d2i": stack.push(floatToInt(stack.pop())); break;
         case "l2i": stack.push(Number(BigInt.asIntN(32, stack.pop()))); break;
         case "l2d": stack.push(Number(stack.pop())); break;
         case "lxor": { const b = stack.pop(); const a = stack.pop(); stack.push(a ^ b); break; }
         case "ldiv": {
-          const b = stack.pop();
-          const a = stack.pop();
+          const b = BigInt(stack.pop());
+          const a = BigInt(stack.pop());
           if (b === 0n) throw { type: "java/lang/ArithmeticException", message: "/ by zero" };
-          stack.push(a / b);
+          stack.push(BigInt.asIntN(64, a / b));
           break;
         }
         case "lmul": { const b = stack.pop(); const a = stack.pop(); stack.push(BigInt.asIntN(64, a * b)); break; }
@@ -8637,6 +8642,14 @@ class JitCompiler {
 
   compareDouble(value2, value1, nanValue) {
     return compareDouble(value2, value1, nanValue);
+  }
+
+  longToFloat(value) {
+    return longToFloat(value);
+  }
+
+  arrayStoreOk(array, value) {
+    return arrayStoreOk(this.jvm, array, value);
   }
 
   floatToInt(value) {
@@ -8965,6 +8978,7 @@ class JitCompiler {
       }
       throw { type: "java/lang/NullPointerException", message: `Attempted to store into null array in ${frame.method.name}` };
     }
+    if (kind === "aastore" && (index >>> 0) < monoArray.len(arrayRef)) checkArrayStore(this.jvm, arrayRef, value);
     const narrowed = normalizeArrayStore(value, kind, arrayRef);
     if (!monoArray.store(arrayRef, index, narrowed)) {
       if (typeof process !== "undefined" && process.env &&
@@ -11159,6 +11173,7 @@ class JitCompiler {
     if (typeof method !== "function") return null;
     const constructorName = method.constructor && method.constructor.name;
     if (constructorName === "AsyncFunction") return null;
+    if (method.jvmPushesFrames) return null;
     // A small number of synchronous-looking reflection/thread shims install
     // Java frames and return this sentinel. They must retain the canonical
     // asynchronous handoff path.
@@ -12596,12 +12611,7 @@ function compareDouble(value2, value1, nanValue) {
   return 0;
 }
 
-function floatToInt(value) {
-  if (Number.isNaN(value)) return 0;
-  if (value >= 2147483647) return 2147483647;
-  if (value <= -2147483648) return -2147483648;
-  return Math.trunc(value) | 0;
-}
+const floatToInt = toInt;
 
 function runtimeClassName(value) {
   if (typeof value === "string" || value instanceof String) return "java/lang/String";
@@ -13014,8 +13024,21 @@ function normalizeIntrinsicCompilerIdioms(codeItems) {
   return ops;
 }
 
+// JSON has no NaN, infinities or -0; constants need all of them.
 function jsLiteral(value) {
   if (typeof value === "bigint") return `${value}n`;
+  if (typeof value === "number") {
+    if (Number.isNaN(value)) return "NaN";
+    if (value === Infinity) return "Infinity";
+    if (value === -Infinity) return "-Infinity";
+    if (Object.is(value, -0)) return "-0";
+    return String(value);
+  }
+  if (Array.isArray(value)) return `[${value.map(jsLiteral).join(", ")}]`;
+  if (value && typeof value === "object" && Object.getPrototypeOf(value) === Object.prototype) {
+    return `{${Object.keys(value).filter((key) => value[key] !== undefined)
+      .map((key) => `${JSON.stringify(key)}: ${jsLiteral(value[key])}`).join(", ")}}`;
+  }
   return JSON.stringify(value);
 }
 

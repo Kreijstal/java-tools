@@ -99,7 +99,8 @@ module.exports = {
   ldiv: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    if (value2 === 0) {
+    // Longs are BigInt (an uninitialized field may still be Number 0).
+    if (value2 == 0) {
       throw { type: 'java/lang/ArithmeticException', message: '/ by zero' };
     }
     frame.stack.push(toLong(BigInt(value1) / BigInt(value2)));
@@ -107,7 +108,8 @@ module.exports = {
   lrem: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    if (value2 === 0) {
+    // Longs are BigInt (an uninitialized field may still be Number 0).
+    if (value2 == 0) {
       throw { type: 'java/lang/ArithmeticException', message: '/ by zero' };
     }
     frame.stack.push(toLong(BigInt(value1) % BigInt(value2)));

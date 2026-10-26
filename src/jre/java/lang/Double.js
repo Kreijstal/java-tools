@@ -1,46 +1,4 @@
-function javaDoubleString(value) {
-  const d = Number(value);
-  if (isNaN(d)) {
-    return "NaN";
-  }
-  if (d === Number.POSITIVE_INFINITY) {
-    return "Infinity";
-  }
-  if (d === Number.NEGATIVE_INFINITY) {
-    return "-Infinity";
-  }
-  if (Object.is(d, -0)) {
-    return "-0.0";
-  }
-  if (d === 0.0) {
-    return "0.0";
-  }
-
-  const absD = Math.abs(d);
-  if (absD === Number.MIN_VALUE) {
-    return d < 0 ? "-4.9E-324" : "4.9E-324";
-  }
-  let s;
-
-  if (absD >= 1e-3 && absD < 1e7) {
-    s = String(d);
-    if (s.indexOf('.') === -1) {
-      s += '.0';
-    }
-  } else {
-    s = d.toExponential().toUpperCase().replace(/E\+/, 'E');
-    let [mantissa, exponent] = s.split('E');
-    if (mantissa.includes('.')) {
-      mantissa = mantissa.replace(/0+$/, '');
-      if (mantissa.endsWith('.')) {
-        mantissa = mantissa.slice(0, -1);
-      }
-    }
-    s = mantissa + 'E' + exponent;
-  }
-
-  return s;
-}
+const { javaDoubleString } = require('./floatingDecimal');
 
 module.exports = {
   super: "java/lang/Object",

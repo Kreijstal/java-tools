@@ -5150,7 +5150,10 @@ class JvmSsaBlockRenderer {
           else stack.push(String(constant | 0));
         } else if (op === "ldc" || op === "ldc_w") {
           const resolved = resolveConstant(instruction.arg);
-          if (typeof resolved === "number" && Number.isFinite(resolved) &&
+          // An integral float constant (3.4028235e38f, 2^31) is not an int.
+          const isFloat = instruction.arg && typeof instruction.arg === "object" &&
+            instruction.arg.type === "Float";
+          if (typeof resolved === "number" && !isFloat && Number.isFinite(resolved) &&
               Number.isInteger(resolved) && !Object.is(resolved, -0)) {
             stack.push(String(resolved | 0));
           } else if (typeof resolved === "number") {
@@ -5383,10 +5386,8 @@ class JvmSsaBlockRenderer {
           const input = pop();
           if (input === null) valid = false;
           else {
-            // Match the generated baseline tier exactly (NaN -> 0, truncate
-            // toward zero, wrap): tier-consistent narrowing keeps differential
-            // hashes comparable across tiers.
-            const narrowed = operand(e`(Math.trunc(${input}) | 0)`);
+            // Java narrowing: NaN -> 0, truncate toward zero, saturate.
+            const narrowed = operand(e`(Math.max(-2147483648, Math.min(2147483647, ${input})) | 0)`);
             const expressions = {
               ineg: operand(e`(-${input}) | 0`),
               i2b: operand(e`((${input} << 24) >> 24)`),
@@ -5407,7 +5408,7 @@ class JvmSsaBlockRenderer {
               i2l: operand(e`BigInt(${input})`),
               l2i: operand(e`Number(BigInt.asIntN(32, BigInt(${input})))`),
               l2d: operand(e`Number(${input})`),
-              l2f: operand(e`Math.fround(Number(${input}))`),
+              l2f: operand(e`helpers.longToFloat(${input})`),
               lneg: operand(e`BigInt.asIntN(64, -BigInt(${input}))`),
             };
             if (op === "i2l") {
@@ -5737,9 +5738,13 @@ class JvmSsaBlockRenderer {
                 lines.push(stmt(e`/*${deferred.marker}:start*/`,
                   {kind: "deferredStaticStart", marker: deferred.marker}));
               }
+              // aastore takes the slow path for a value the array's element
+              // type may refuse (ArrayStoreException).
+              const refused = op === "aastore"
+                ? e` || (${stored} !== null && !helpers.arrayStoreOk(${array}, ${stored}))` : e``;
               lines.push(
-                stmt(e`if (${array} === null || ${array} === undefined || ${
-                  arrayIndexOutOfBounds(arrayIndex, e`${array}.length`)}) {`),
+                stmt(exprConcat(e`if (${array} === null || ${array} === undefined || ${
+                  arrayIndexOutOfBounds(arrayIndex, e`${array}.length`)}`, refused, e`) {`)),
                 ...materializeLines([...stack, array, arrayIndex, stored], index, true).map((line) => `  ${line}`),
                 stmt(e`  helpers.arrayStore(${stored}, ${arrayIndex}, ${array}, frame, ${JSON.stringify(op)});`,
                   {deoptEffect: true, guestArrayHelper: true}),

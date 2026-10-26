@@ -1,3 +1,13 @@
+const { withJavaString, pushesFrames } = require('../../javaToString');
+const { valueAsString } = require('../lang/StringBuilder');
+
+// print(Object)/println(Object) print String.valueOf(value), which calls a
+// guest toString() override.
+function printObject(suffix) {
+  return pushesFrames((jvm, obj, args, thread) => withJavaString(jvm, args[0], valueAsString, thread,
+    (text) => { writeString(jvm, obj, text + suffix); }));
+}
+
 function writeString(jvm, obj, output) {
   const writeByteMethod = jvm._jreFindMethod(obj.type, 'write', '(I)V');
   if (writeByteMethod) {
@@ -46,10 +56,7 @@ module.exports = {
       writeString(jvm, obj, args[0] === 1 ? 'true' : 'false');
     },
 
-    'print(Ljava/lang/Object;)V': (jvm, obj, args) => {
-      const val = args[0];
-      writeString(jvm, obj, val === null ? 'null' : val.toString());
-    },
+    'print(Ljava/lang/Object;)V': printObject(''),
 
     'println(D)V': (jvm, obj, args) => {
       const doubleClass = jvm.classes['java/lang/Double'];
@@ -141,17 +148,7 @@ module.exports = {
       }
     },
 
-    'println(Ljava/lang/Object;)V': (jvm, obj, args) => {
-      const val = args[0];
-      const str = (val === null) ? "null" : val.toString();
-      const output = str + '\n';
-      const writeByteMethod = jvm._jreFindMethod(obj.type, 'write', '(I)V');
-      if (writeByteMethod) {
-        for (let i = 0; i < output.length; i++) {
-          writeByteMethod(jvm, obj, [output.charCodeAt(i)]);
-        }
-      }
-    },
+    'println(Ljava/lang/Object;)V': printObject('\n'),
 
     'println()V': (jvm, obj, args) => {
       const writeByteMethod = jvm._jreFindMethod(obj.type, 'write', '(I)V');

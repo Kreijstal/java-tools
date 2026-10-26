@@ -142,7 +142,7 @@ function invokeNativeSync(frame, thread, target, state, receiver, kind, jvm) {
       return undefined;
     }
     const isVoid = state.returnType === 'V' || state.returnType === 'void';
-    const suppressSentinel = kind !== 'static' && result === ASYNC_METHOD_SENTINEL;
+    const suppressSentinel = result === ASYNC_METHOD_SENTINEL;
     if (!isVoid && !suppressSentinel && result !== undefined) {
       frame.stack.push(typeof result === 'boolean' ? (result ? 1 : 0) : result);
     }
@@ -380,6 +380,9 @@ async function invokevirtual(frame, instruction, jvm, thread) {
     }
   }
 
+  // Classes walked without a declaration: their interfaces' default methods
+  // are the candidates once no class declares the method.
+  const walked = [];
   while (currentClassName) {
     let jreMethod = null;
     if (jvm.jre[currentClassName]) {
@@ -450,9 +453,23 @@ async function invokevirtual(frame, instruction, jvm, thread) {
         thread.callStack.push(newFrame);
         return;
       }
+      walked.push(classData);
       currentClassName = classData.ast.classes[0].superClassName;
     } else {
       currentClassName = null;
+    }
+  }
+
+  for (const classData of walked) {
+    const defaultTarget = await resolveDefaultInterfaceMethod(
+      jvm, classData.ast.classes[0].interfaces, methodName, descriptor);
+    if (defaultTarget) {
+      const newFrame = new Frame(defaultTarget.method);
+      newFrame.className = defaultTarget.className;
+      newFrame.locals[0] = boxedObj;
+      assignArgsToLocals(newFrame.locals, args, params, 1);
+      thread.callStack.push(newFrame);
+      return;
     }
   }
 
@@ -489,7 +506,8 @@ async function invokestatic(frame, instruction, jvm, thread) {
 
     let result = await invokeNative(jreMethod, jvm, null, args, thread);
     const { returnType } = parseDescriptor(descriptor);
-    if (returnType !== "V" && returnType !== "void" && result !== undefined) {
+    // A native that pushed a guest frame delivers its result on return.
+    if (result !== ASYNC_METHOD_SENTINEL && returnType !== "V" && returnType !== "void" && result !== undefined) {
       if (typeof result === "boolean") {
         result = result ? 1 : 0;
       }

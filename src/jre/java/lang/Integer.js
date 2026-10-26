@@ -136,3 +136,33 @@ module.exports = {
     },
   },
 };
+
+// Integer's remaining static helpers.
+Object.assign(module.exports.staticMethods, {
+  'numberOfTrailingZeros(I)I': (jvm, obj, args) => {
+    const v = args[0] | 0;
+    return v === 0 ? 32 : 31 - Math.clz32(v & -v);
+  },
+  'rotateLeft(II)I': (jvm, obj, args) => (args[0] << args[1]) | (args[0] >>> -args[1]),
+  'rotateRight(II)I': (jvm, obj, args) => (args[0] >>> args[1]) | (args[0] << -args[1]),
+  'reverse(I)I': (jvm, obj, args) => {
+    let v = args[0] | 0, result = 0;
+    for (let i = 0; i < 32; i += 1) { result = (result << 1) | (v & 1); v >>>= 1; }
+    return result | 0;
+  },
+  'reverseBytes(I)I': (jvm, obj, args) => {
+    const v = args[0];
+    return ((v << 24) | ((v & 0xff00) << 8) | ((v >>> 8) & 0xff00) | (v >>> 24)) | 0;
+  },
+  'toOctalString(I)Ljava/lang/String;': (jvm, obj, args) => jvm.newString((args[0] >>> 0).toString(8)),
+  'toUnsignedString(I)Ljava/lang/String;': (jvm, obj, args) => jvm.newString(String(args[0] >>> 0)),
+  'toUnsignedLong(I)J': (jvm, obj, args) => BigInt(args[0] >>> 0),
+  'divideUnsigned(II)I': withThrows((jvm, obj, args) => {
+    if ((args[1] | 0) === 0) throw { type: 'java/lang/ArithmeticException', message: '/ by zero' };
+    return Math.trunc((args[0] >>> 0) / (args[1] >>> 0)) | 0;
+  }, ['java/lang/ArithmeticException']),
+  'remainderUnsigned(II)I': withThrows((jvm, obj, args) => {
+    if ((args[1] | 0) === 0) throw { type: 'java/lang/ArithmeticException', message: '/ by zero' };
+    return ((args[0] >>> 0) % (args[1] >>> 0)) | 0;
+  }, ['java/lang/ArithmeticException']),
+});

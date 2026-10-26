@@ -3506,6 +3506,20 @@ class JVM {
           return true;
         }
       }
+      // JLS 12.4.2: a class's superinterfaces that declare default methods
+      // are initialized after its superclass, before the class itself.
+      for (const interfaceName of await this._superinterfacesToInitialize(classData, true)) {
+        if (await this.initializeClassIfNeeded(interfaceName, thread)) {
+          this.classInitializationState.delete(className);
+          const token = this.classInitializationTokens.get(className);
+          if (token) {
+            token.state = undefined;
+            token.initialized = false;
+          }
+          this.classInitializationOwners.delete(className);
+          return true;
+        }
+      }
 
       // Initialize static fields with default values first
       if (!classData.staticFields || !classData.staticFieldsInitialized) {
@@ -3653,10 +3667,13 @@ class JVM {
     };
     try {
       const superClassName = classData.ast?.classes?.[0]?.superClassName;
-      if (superClassName && !this.initializeClassSync(superClassName, thread, runClinit)) {
-        this.classInitializationState.delete(className);
-        this.classInitializationOwners.delete(className);
-        return false;
+      const prerequisites = [superClassName, ...this._superinterfacesToInitialize(classData, false)];
+      for (const prerequisite of prerequisites) {
+        if (prerequisite && !this.initializeClassSync(prerequisite, thread, runClinit)) {
+          this.classInitializationState.delete(className);
+          this.classInitializationOwners.delete(className);
+          return false;
+        }
       }
       if (!classData.staticFields || !classData.staticFieldsInitialized) {
         if (!classData.staticFields) {
@@ -3706,6 +3723,53 @@ class JVM {
     if (!className) return;
     frame.initializingClassName = undefined;
     this._markClassInitialized(className);
+  }
+
+  // The superinterfaces of a class (not an interface) that declare a default
+  // method, in JLS 12.4.2 order: each directly implemented interface, left to
+  // right, after its own superinterfaces. `load` loads missing interfaces
+  // (and returns a promise); otherwise only loaded ones are seen.
+  _superinterfacesToInitialize(classData, load) {
+    const cls = classData && classData.ast && classData.ast.classes && classData.ast.classes[0];
+    if (!cls || (cls.flags || []).includes("interface") || !(cls.interfaces || []).length) {
+      return load ? Promise.resolve([]) : [];
+    }
+    const declaresDefault = (iface) => (iface.items || []).some((item) => item.type === "method" &&
+      item.method.name !== "<clinit>" && !(item.method.flags || []).some((flag) => flag === "abstract" || flag === "static"));
+    const order = [], seen = new Set();
+    const visitLoaded = (name) => {
+      if (seen.has(name)) return;
+      seen.add(name);
+      const iface = this.classes[name]?.ast?.classes?.[0];
+      if (!iface) return;
+      for (const parent of iface.interfaces || []) visitLoaded(parent);
+      if (declaresDefault(iface)) order.push(name);
+    };
+    if (!load) {
+      for (const name of cls.interfaces) visitLoaded(name);
+      return order;
+    }
+    return (async () => {
+      const ensure = async (name) => {
+        if (seen.has(name)) return;
+        seen.add(name);
+        if (!this.classes[name] && !this.jre[name]) await this.loadClassByName(name);
+        for (const parent of this.classes[name]?.ast?.classes?.[0]?.interfaces || []) await ensure(parent);
+      };
+      for (const name of cls.interfaces) await ensure(name);
+      seen.clear();
+      for (const name of cls.interfaces) visitLoaded(name);
+      return order;
+    })();
+  }
+
+  // A static initializer's exception as its caller sees it: an Error as is,
+  // anything else wrapped in ExceptionInInitializerError.
+  initializerError(exception) {
+    const type = exception && exception.type;
+    if (typeof type !== "string" || this.isInstanceOf(type, "java/lang/Error")) return exception;
+    return { type: "java/lang/ExceptionInInitializerError", message: null, cause: exception,
+      hashCode: this.nextHashCode++ };
   }
 
   failClassInitialization(frame) {
@@ -4277,9 +4341,10 @@ class JVM {
 
     if (this.dispatchExceptionInFrame(frame, exception, pcToCheck)) return;
 
+    const failedInitializer = !!frame.initializingClassName;
     this.failClassInitialization(frame);
     callStack.pop();
-    this.handleException(exception, -1, thread);
+    this.handleException(failedInitializer ? this.initializerError(exception) : exception, -1, thread);
   }
 
   // Search ONE frame's exception table for a handler covering pcToCheck and,

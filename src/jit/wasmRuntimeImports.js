@@ -1,4 +1,5 @@
 'use strict';
+const { checkArrayStore } = require('../core/arrayStore');
 const {bindStaticFieldAccessors} = require('./staticFieldAccessors');
 
 function addReadinessGuard(reg,name,token) {
@@ -155,7 +156,7 @@ function pushImportFor(reg, t) {
   }
 }
 
-function addTypedArrayStoreImports(reg, methodName, traceKey = methodName) {
+function addTypedArrayStoreImports(reg, methodName, traceKey = methodName, jvm = null) {
   const trace = arrayTracer(traceKey);
   const checkedStore = (op, t, narrow) => {
     reg.addImport(`aset_${op}`, [T.ref, T.i32, t], [], (a, i, v) => {
@@ -163,6 +164,7 @@ function addTypedArrayStoreImports(reg, methodName, traceKey = methodName) {
       if (a === null || a === undefined) {
         throw NPE(`Attempted store on null array in ${methodName}`);
       }
+      if (op === 'aastore' && jvm && (i >>> 0) < monoArray.len(a)) checkArrayStore(jvm, a, v);
       const stored = narrow ? narrow(a, v) : v;
       if (!monoArray.store(a, i, stored)) {
         throw AIOOBE(i, monoArray.len(a));
@@ -276,7 +278,7 @@ function addI32ArrayLoadImports(reg, methodName, trace) {
   };
 }
 
-function addArrayImports(reg, methodName, typedArrayStores = true, traceKey = methodName) {
+function addArrayImports(reg, methodName, typedArrayStores = true, traceKey = methodName, jvm = null) {
   const trace = arrayTracer(traceKey);
   const mk = (suffix, t) => {
     // monoArray keeps each backing class (plain Array vs wasm-heap TypedArray
@@ -313,6 +315,7 @@ function addArrayImports(reg, methodName, typedArrayStores = true, traceKey = me
         if (a === null || a === undefined) {
           throw NPE(`Attempted store on null array in ${methodName}`);
         }
+        if (t === T.ref && jvm && (i >>> 0) < monoArray.len(a)) checkArrayStore(jvm, a, v);
         if (!monoArray.store(a, i, normalizeArrayStore(v, null, a))) {
           throw AIOOBE(i, monoArray.len(a));
         }
@@ -321,7 +324,7 @@ function addArrayImports(reg, methodName, typedArrayStores = true, traceKey = me
   };
   mk('i', T.i32); mk('l', T.i64); mk('f', T.f32); mk('d', T.f64); mk('r', T.ref);
   addI32ArrayLoadImports(reg, methodName, trace);
-  if (typedArrayStores) addTypedArrayStoreImports(reg, methodName, traceKey);
+  if (typedArrayStores) addTypedArrayStoreImports(reg, methodName, traceKey, jvm);
   reg.addImport('alen', [T.ref], [T.i32], (a) => {
     if (a === null || a === undefined) throw NPE(`Attempted to get length of null array in ${methodName}`);
     return monoArray.len(a);
@@ -649,8 +652,9 @@ function addSystemImport(reg, jvm, ins) {
   // so they retain the unknown write summary and conservative cache kills.
   return {params, partial:false, builtinArrayCopy,
     writes: builtinArrayCopy ? new Set() : null, initializationIdx,
-    idx:reg.addImport('sys_arraycopy', params, [], native.jvmPositionalBody ||
-      ((src, srcPos, dst, dstPos, len) => native(jvm, null, [src, srcPos, dst, dstPos, len])))};
+    idx:reg.addImport('sys_arraycopy', params, [], native.jvmPositionalBody
+      ? (src, srcPos, dst, dstPos, len) => native.jvmPositionalBody(src, srcPos, dst, dstPos, len, jvm)
+      : (src, srcPos, dst, dstPos, len) => native(jvm, null, [src, srcPos, dst, dstPos, len]))};
 }
 
 // Shared by the explicitly admitted synchronous bulk natives. Checking at

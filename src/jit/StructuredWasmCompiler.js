@@ -555,6 +555,7 @@ class StructuredWasmCompiler {
       this.method.name,
       this.wasmJit.typedArrayStoresEnabled,
       `${this.className}.${this.method.name}${this.method.descriptor}`,
+      this.jvm,
     );
 
     // Linear-heap array caches: per receiver SSA value, three locals holding

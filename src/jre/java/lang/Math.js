@@ -1,17 +1,19 @@
+const { toInt, toLong } = require('../../../core/javaNumeric');
+const { withThrows } = require('../../helpers');
 
-const LONG_MIN_VALUE = -9223372036854775808n;
-const LONG_MAX_VALUE = 9223372036854775807n;
-const LONG_EXCLUSIVE_UPPER_BOUND = 2 ** 63;
 
+// Math.round: the closest integer, ties toward positive infinity (JS
+// Math.round is exact), saturated to the result type; NaN is 0.
 function roundDoubleToLong(value) {
-  // Java specifies Math.round(double) as (long)floor(value + 0.5d).  The
-  // floating-to-long conversion saturates infinities and out-of-range finite
-  // values, while NaN converts to zero.  JVM longs are represented as BigInt.
-  const rounded = Math.floor(value + 0.5);
-  if (Number.isNaN(rounded)) return 0n;
-  if (rounded >= LONG_EXCLUSIVE_UPPER_BOUND) return LONG_MAX_VALUE;
-  if (rounded <= -LONG_EXCLUSIVE_UPPER_BOUND) return LONG_MIN_VALUE;
-  return BigInt(rounded);
+  return toLong(Math.round(value));
+}
+
+function roundFloatToInt(value) {
+  return toInt(Math.round(value));
+}
+
+function absLong(value) {
+  return value < 0 ? BigInt.asIntN(64, -BigInt(value)) : value;
 }
 
 const MathClass = {
@@ -67,18 +69,15 @@ const MathClass = {
     'sqrt(D)D': (jvm, obj, args) => {
       return Math.sqrt(args[0]);
     },
-    'abs(I)I': (jvm, obj, args) => {
-      return Math.abs(args[0]);
-    },
-    'abs(J)J': (jvm, obj, args) => args[0] < 0 ? -args[0] : args[0],
+    // abs(MIN_VALUE) is MIN_VALUE: the negation wraps.
+    'abs(I)I': (jvm, obj, args) => Math.abs(args[0]) | 0,
+    'abs(J)J': (jvm, obj, args) => absLong(args[0]),
     'abs(F)F': (jvm, obj, args) => Math.abs(args[0]),
     'abs(D)D': (jvm, obj, args) => Math.abs(args[0]),
     'ceil(D)D': (jvm, obj, args) => {
       return Math.ceil(args[0]);
     },
-    'round(F)I': (jvm, obj, args) => {
-      return Math.round(args[0]);
-    },
+    'round(F)I': (jvm, obj, args) => roundFloatToInt(args[0]),
     'round(D)J': (jvm, obj, args) => {
       return roundDoubleToLong(args[0]);
     },
@@ -116,12 +115,12 @@ const directStaticIntrinsics = {
     null, null, [value]),
   'floor(D)D': Math.floor,
   'sqrt(D)D': Math.sqrt,
-  'abs(I)I': Math.abs,
-  'abs(J)J': (value) => value < 0 ? -value : value,
+  'abs(I)I': (value) => Math.abs(value) | 0,
+  'abs(J)J': absLong,
   'abs(F)F': Math.abs,
   'abs(D)D': Math.abs,
   'ceil(D)D': Math.ceil,
-  'round(F)I': Math.round,
+  'round(F)I': roundFloatToInt,
   'round(D)J': roundDoubleToLong,
 };
 
@@ -135,5 +134,112 @@ for (const [signature, intrinsic] of Object.entries(directStaticIntrinsics)) {
   // An intrinsic without this explicit metadata remains fully conservative.
   method.jvmDirectFieldWriteKeys = Object.freeze([]);
 }
+
+// Integer helpers with Java's exact semantics: floor division, and the
+// *Exact family that throws ArithmeticException on overflow.
+const big = (value) => typeof value === 'bigint' ? value : BigInt(Math.trunc(Number(value) || 0));
+const divideByZero = () => ({ type: 'java/lang/ArithmeticException', message: '/ by zero' });
+const overflow = (kind) => ({ type: 'java/lang/ArithmeticException', message: `${kind} overflow` });
+const ARITHMETIC = ['java/lang/ArithmeticException'];
+
+function floorDivLong(x, y) {
+  x = big(x); y = big(y);
+  if (y === 0n) throw divideByZero();
+  let q = x / y;
+  if ((x % y !== 0n) && ((x < 0n) !== (y < 0n))) q -= 1n;
+  return BigInt.asIntN(64, q);
+}
+
+function floorModLong(x, y) {
+  x = big(x); y = big(y);
+  if (y === 0n) throw divideByZero();
+  const r = x % y;
+  return r !== 0n && ((r < 0n) !== (y < 0n)) ? r + y : r;
+}
+
+function floorDivInt(x, y) {
+  if ((y | 0) === 0) throw divideByZero();
+  return Math.floor(x / y) | 0;
+}
+
+function floorModInt(x, y) {
+  if ((y | 0) === 0) throw divideByZero();
+  const r = x % y;
+  return (r !== 0 && ((r < 0) !== (y < 0)) ? r + y : r) | 0;
+}
+
+function exactInt(value, kind) {
+  if (value > 2147483647 || value < -2147483648) throw overflow(kind);
+  return value;
+}
+
+function exactLong(value, kind) {
+  if (value !== BigInt.asIntN(64, value)) throw overflow(kind);
+  return value;
+}
+
+function signum(value) {
+  return value > 0 ? 1 : value < 0 ? -1 : value;
+}
+
+function ulp(value, mantissaBits, minExponent, maxValue, float) {
+  const magnitude = Math.abs(value);
+  if (magnitude !== magnitude) return NaN;
+  if (magnitude === Infinity) return Infinity;
+  if (magnitude === maxValue) return float ? Math.fround(2 ** 104) : 2 ** 971;
+  const exponent = magnitude === 0 ? minExponent : Math.max(minExponent, Math.floor(Math.log2(magnitude)));
+  // log2 can be off by one at a power of two's boundary.
+  const e = 2 ** exponent > magnitude ? exponent - 1 : 2 ** (exponent + 1) <= magnitude ? exponent + 1 : exponent;
+  return 2 ** (Math.max(minExponent, e) - mantissaBits);
+}
+
+Object.assign(MathClass.staticMethods, {
+  'floorDiv(JJ)J': withThrows((jvm, obj, args) => floorDivLong(args[0], args[1]), ARITHMETIC),
+  'floorDiv(JI)J': withThrows((jvm, obj, args) => floorDivLong(args[0], args[1]), ARITHMETIC),
+  'floorDiv(II)I': withThrows((jvm, obj, args) => floorDivInt(args[0], args[1]), ARITHMETIC),
+  'floorMod(JJ)J': withThrows((jvm, obj, args) => floorModLong(args[0], args[1]), ARITHMETIC),
+  'floorMod(JI)I': withThrows((jvm, obj, args) => Number(floorModLong(args[0], args[1])), ARITHMETIC),
+  'floorMod(II)I': withThrows((jvm, obj, args) => floorModInt(args[0], args[1]), ARITHMETIC),
+  'addExact(II)I': withThrows((jvm, obj, args) => exactInt(args[0] + args[1], 'integer'), ARITHMETIC),
+  'subtractExact(II)I': withThrows((jvm, obj, args) => exactInt(args[0] - args[1], 'integer'), ARITHMETIC),
+  'multiplyExact(II)I': withThrows((jvm, obj, args) => exactInt(args[0] * args[1], 'integer'), ARITHMETIC),
+  'incrementExact(I)I': withThrows((jvm, obj, args) => exactInt(args[0] + 1, 'integer'), ARITHMETIC),
+  'decrementExact(I)I': withThrows((jvm, obj, args) => exactInt(args[0] - 1, 'integer'), ARITHMETIC),
+  'negateExact(I)I': withThrows((jvm, obj, args) => exactInt(-args[0], 'integer'), ARITHMETIC),
+  'addExact(JJ)J': withThrows((jvm, obj, args) => exactLong(big(args[0]) + big(args[1]), 'long'), ARITHMETIC),
+  'subtractExact(JJ)J': withThrows((jvm, obj, args) => exactLong(big(args[0]) - big(args[1]), 'long'), ARITHMETIC),
+  'multiplyExact(JJ)J': withThrows((jvm, obj, args) => exactLong(big(args[0]) * big(args[1]), 'long'), ARITHMETIC),
+  'incrementExact(J)J': withThrows((jvm, obj, args) => exactLong(big(args[0]) + 1n, 'long'), ARITHMETIC),
+  'decrementExact(J)J': withThrows((jvm, obj, args) => exactLong(big(args[0]) - 1n, 'long'), ARITHMETIC),
+  'negateExact(J)J': withThrows((jvm, obj, args) => exactLong(-big(args[0]), 'long'), ARITHMETIC),
+  'toIntExact(J)I': withThrows((jvm, obj, args) => {
+    const value = big(args[0]);
+    if (value !== BigInt.asIntN(32, value)) throw overflow('integer');
+    return Number(value);
+  }, ARITHMETIC),
+  'signum(D)D': (jvm, obj, args) => signum(args[0]),
+  'signum(F)F': (jvm, obj, args) => signum(args[0]),
+  'copySign(DD)D': (jvm, obj, args) => {
+    const negative = args[1] < 0 || Object.is(args[1], -0);
+    return negative ? -Math.abs(args[0]) : Math.abs(args[0]);
+  },
+  'copySign(FF)F': (jvm, obj, args) => {
+    const negative = args[1] < 0 || Object.is(args[1], -0);
+    return Math.fround(negative ? -Math.abs(args[0]) : Math.abs(args[0]));
+  },
+  'ulp(D)D': (jvm, obj, args) => ulp(args[0], 52, -1022, Number.MAX_VALUE, false),
+  'ulp(F)F': (jvm, obj, args) => Math.fround(ulp(Math.fround(args[0]), 23, -126, 3.4028234663852886e38, true)),
+  'log10(D)D': (jvm, obj, args) => Math.log10(args[0]),
+  'log1p(D)D': (jvm, obj, args) => Math.log1p(args[0]),
+  'expm1(D)D': (jvm, obj, args) => Math.expm1(args[0]),
+  'cbrt(D)D': (jvm, obj, args) => Math.cbrt(args[0]),
+  'hypot(DD)D': (jvm, obj, args) => Math.hypot(args[0], args[1]),
+  'sinh(D)D': (jvm, obj, args) => Math.sinh(args[0]),
+  'cosh(D)D': (jvm, obj, args) => Math.cosh(args[0]),
+  'tanh(D)D': (jvm, obj, args) => Math.tanh(args[0]),
+  // Java 8's formulas (Java 9 multiplies by a precomputed constant).
+  'toRadians(D)D': (jvm, obj, args) => args[0] / 180.0 * Math.PI,
+  'toDegrees(D)D': (jvm, obj, args) => args[0] * 180.0 / Math.PI,
+});
 
 module.exports = MathClass;

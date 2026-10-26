@@ -11,7 +11,7 @@ function currentObscureStringsDate() {
 
 const JVM_OUTPUT_EXPECTATIONS = Object.freeze({
   RuntimeArithmetic: '5\n2\n6',
-  ArithmeticTest: 'Integer Arithmetic:\nSum: 13\nDifference: 7\nProduct: 30\nQuotient: 3\nRemainder: 1\n\nDouble Arithmetic:\nSum: 22222.2221\nDifference: 2469.1357000000007\nProduct: 1.219326309891785E8\nQuotient: 1.249999989875\n\nFloat Arithmetic:\nSum: 16.0\nDifference: 9.0\nProduct: 43.75\nQuotient: 3.5714285373687744',
+  ArithmeticTest: 'Integer Arithmetic:\nSum: 13\nDifference: 7\nProduct: 30\nQuotient: 3\nRemainder: 1\n\nDouble Arithmetic:\nSum: 22222.2221\nDifference: 2469.1357000000007\nProduct: 1.219326309891785E8\nQuotient: 1.249999989875\n\nFloat Arithmetic:\nSum: 16.0\nDifference: 9.0\nProduct: 43.75\nQuotient: 3.5714285',
   BitwiseOperationsTest: '-2\n536870910\n8\n14\n6',
   ComparisonInstructions: '100 < 200\n100 == 100\n1.5 < 2.5\n1.5 != NaN\n1.5 < 2.5 (double)\n1.5 != NaN (double)',
   DoubleComparisonTest: '=== Double Comparison Test ===\nd1 > d2: true\nd1 < d2: false\nd1 == d3: true\nNaN > d1: false\nNaN < d1: false\nNaN == NaN: false\nTest completed successfully!',
@@ -38,7 +38,7 @@ const JVM_OUTPUT_EXPECTATIONS = Object.freeze({
   SmallDivisionTest: '2\n1\n2\n0',
   SimpleArithmetic: '5\n1\n6',
   MethodInvocationValidationTest: 'Testing method invocation validation\nStatic method result: 8\nInstance method result: 15\nAll validations passed',
-  MathInstructions: 'Long arithmetic:\n100 + 50 = 150\n100 - 50 = 50\n100 * 50 = 5000\n100 / 50 = 2\n100 % 50 = 0\nFloat arithmetic:\n3.5 + 1.5 = 5.0\n3.5 - 1.5 = 2.0\n3.5 * 1.5 = 5.25\n3.5 / 1.5 = 2.3333332538604736\n3.5 % 1.5 = 0.5\nDouble arithmetic:\n10.5 + 2.5 = 13.0\n10.5 - 2.5 = 8.0\n10.5 * 2.5 = 26.25\n10.5 / 2.5 = 4.2\n10.5 % 2.5 = 0.5\nInteger bitwise:\n15 & 7 = 7\n15 | 7 = 15\n15 ^ 7 = 8\nLong bitwise:\n15 & 7 = 7\n15 | 7 = 15\n15 ^ 7 = 8\nShift instructions:\n8 << 2 = 32\n8 >> 1 = 4\n-8 >>> 1 = 2147483644\n8L << 2 = 32\n8L >> 1 = 4\n-8L >>> 1 = 9223372036854775804',
+  MathInstructions: 'Long arithmetic:\n100 + 50 = 150\n100 - 50 = 50\n100 * 50 = 5000\n100 / 50 = 2\n100 % 50 = 0\nFloat arithmetic:\n3.5 + 1.5 = 5.0\n3.5 - 1.5 = 2.0\n3.5 * 1.5 = 5.25\n3.5 / 1.5 = 2.3333333\n3.5 % 1.5 = 0.5\nDouble arithmetic:\n10.5 + 2.5 = 13.0\n10.5 - 2.5 = 8.0\n10.5 * 2.5 = 26.25\n10.5 / 2.5 = 4.2\n10.5 % 2.5 = 0.5\nInteger bitwise:\n15 & 7 = 7\n15 | 7 = 15\n15 ^ 7 = 8\nLong bitwise:\n15 & 7 = 7\n15 | 7 = 15\n15 ^ 7 = 8\nShift instructions:\n8 << 2 = 32\n8 >> 1 = 4\n-8 >>> 1 = 2147483644\n8L << 2 = 32\n8L >> 1 = 4\n-8L >>> 1 = 9223372036854775804',
   ConversionTest: '10',
   // 5000000000 * 3000000000 overflows int64; real Java wraps (verified
   // against OpenJDK): -3446744073709551616.

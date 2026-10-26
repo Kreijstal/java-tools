@@ -107,7 +107,7 @@ module.exports = {
   sastore: (frame) => {
     _astore(frame, "sastore");
   },
-  aastore: (frame) => {
-    _astore(frame, "aastore");
+  aastore: (frame, instruction, jvm) => {
+    _astore(frame, "aastore", jvm);
   },
 };

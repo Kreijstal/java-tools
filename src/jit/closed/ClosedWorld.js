@@ -20,6 +20,7 @@
 // closure may initialize (static access, new, invokestatic owners) is already
 // INITIALIZED, so nothing inside the module ever triggers <clinit>.
 
+const { checkArrayStore } = require('../../core/arrayStore');
 const { buildSsa, resolveHandlerRanges } = require('../../analysis/opgraph/ssa');
 const { VT, OP, GC, ModuleBuilder, structType, subType, refNull, ref, uleb, sleb } = require('./wasmBuilder');
 const { closedTypes, OBJ_FIELDS, T_OBJ, T_PARR, T_RARR, T_REFS } = require('./representation');
@@ -328,6 +329,11 @@ class ClosedWorld {
   }
 
   // ---- imports ----------------------------------------------------------
+  // The class index of Object[], whose stores need no element check.
+  objectArrayClass() {
+    return require('../../core/objectModel').classIndexOf(this.jvm, '[Ljava/lang/Object;');
+  }
+
   hostImport(name, params, results) {
     const key = `h:${name}`;
     if (!this.imports.has(key)) {
@@ -451,7 +457,15 @@ class ClosedWorld {
       astore_I: (a, i, v) => storeElement(a, i, v), astore_J: (a, i, v) => storeElement(a, i, v),
       astore_F: (a, i, v) => storeElement(a, i, v), astore_D: (a, i, v) => storeElement(a, i, v),
       aaload: (a, i) => toWasm(load(a, i)),
-      aastore: (a, i, v) => storeElement(a, i, toJs(v)),
+      aastore: (a, i, v) => {
+        const array = hostArray(a), element = toJs(v);
+        checkIndex(array, i);
+        checkArrayStore(this.jvm, array, element);
+        array[i] = element;
+      },
+      // A module aastore whose element type and value class pair is not the
+      // cached one: throws ArrayStoreException if the array refuses it.
+      arraystore: (a, v) => checkArrayStore(this.jvm, toJs(a), toJs(v)),
     };
     return this._hostImpls;
   }
@@ -1376,7 +1390,14 @@ class ClosedWorld {
     // A nested synchronous entry: a JS frame now sits between it and any
     // suspendable stack, so nothing below may park.
     this.syncDepth++;
-    try { record.fn(); } finally { this.syncDepth--; }
+    try {
+      record.fn();
+    } catch (error) {
+      if (!(error instanceof WebAssembly.Exception && error.is(this.tag))) throw error;
+      const thrown = this.runtime.toJs(error.getArg(this.tag, 0));
+      const wrapped = this.jvm.initializerError(thrown);
+      throw wrapped === thrown ? error : new WebAssembly.Exception(this.tag, [this.runtime.toWasm(wrapped)]);
+    } finally { this.syncDepth--; }
   }
 
   // The calling convention of `key`: its record when admitted, otherwise
@@ -1545,6 +1566,9 @@ class ClosedWorld {
     builder.addGlobal('park', [VT.i32], true, [OP.i32_const, 0]);
     builder.exportGlobal('park', 'park');
     builder.addGlobal('depth', [VT.i32], true, [OP.i32_const, 0]);
+    // The last (array class, value class) pair a module aastore accepted.
+    builder.addGlobal('storeArrayClass', [VT.i32], true, [OP.i32_const, ...sleb(-1)]);
+    builder.addGlobal('storeValueClass', [VT.i32], true, [OP.i32_const, ...sleb(-2)]);
     builder.exportGlobal('depth', 'depth');
     builder.importMemory('c', 'mem', this.runtime.heap.memory.buffer.byteLength >>> 16);
     builder.importTag('t', 'jx', [[VT.anyref]], 'jx');

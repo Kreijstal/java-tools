@@ -1,4 +1,5 @@
 const { enumerateFieldKeys, readField } = require('../core/objectModel');
+const { checkArrayStore } = require('../core/arrayStore');
 const resolvedClassInitializationToken = Symbol('resolvedClassInitializationToken');
 
 function classInitializationTokenFor(jvm, instruction, className) {
@@ -139,7 +140,7 @@ function diagnosticScalar(value) {
   return typeof value;
 }
 
-function _astore(frame, kind) {
+function _astore(frame, kind, jvm) {
   const value = frame.stack.pop();
   const index = frame.stack.pop();
   const arrayRef = frame.stack.pop();
@@ -187,6 +188,7 @@ function _astore(frame, kind) {
     };
   }
 
+  if (kind === "aastore" && jvm) checkArrayStore(jvm, arrayRef, value);
   const narrowed = normalizeArrayStore(value, kind, arrayRef);
   if (arrayRef.elements) arrayRef.elements[index] = narrowed;
   else arrayRef[index] = narrowed;

@@ -36,6 +36,7 @@ function createLoopRelations({ cfg, items, labels, structured, directStaticSites
             op === "ldc" || op === "ldc_w") {
           const raw = instruction && typeof instruction === "object"
             ? instruction.arg : undefined;
+          if (raw && typeof raw === "object" && raw.type === "Float") return null;
           const resolved = raw && typeof raw === "object" &&
             Object.prototype.hasOwnProperty.call(raw, "value") ? raw.value : raw;
           const number = Number(resolved);

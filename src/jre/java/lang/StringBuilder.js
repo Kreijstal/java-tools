@@ -1,4 +1,5 @@
 const { withThrows } = require('../../helpers');
+const { withJavaString, pushesFrames } = require('../../javaToString');
 const { enumerateFieldKeys, readField } = require('../../../core/objectModel');
 
 
@@ -113,10 +114,12 @@ module.exports = {
       obj.value += valueAsString(args[0]);
       return obj;
     },
-    'append(Ljava/lang/Object;)Ljava/lang/StringBuilder;': (jvm, obj, args) => {
-      obj.value += valueAsString(args[0]);
-      return obj;
-    },
+    'append(Ljava/lang/Object;)Ljava/lang/StringBuilder;': pushesFrames((jvm, obj, args, thread) =>
+      withJavaString(jvm, args[0], valueAsString, thread, (text, callingFrame) => {
+        obj.value += text;
+        if (!callingFrame) return obj;
+        callingFrame.stack.push(obj);
+      })),
     'append(Ljava/lang/CharSequence;II)Ljava/lang/StringBuilder;': (jvm, obj, args) => {
       const value = valueAsString(args[0]);
       obj.value += value.substring(args[1], args[2]);
@@ -203,3 +206,6 @@ module.exports = {
     }, ['java/lang/StringIndexOutOfBoundsException']),
   },
 };
+
+// String conversion of a JRE-converted value, shared with PrintStream.
+Object.defineProperty(module.exports, 'valueAsString', { value: valueAsString, enumerable: false });

@@ -1092,18 +1092,52 @@ class ClosedCompiler {
     return out;
   }
 
+  // aastore's ArrayStoreException check, after the index check. `rarr`
+  // pushes the array as a $rarr. Object[] stores and nulls pass in Wasm, and
+  // so does the (array class, value class) pair the last check accepted;
+  // anything else asks JS, which throws or caches the pair.
+  storeCheck(rarr, value) {
+    const cls = this.temp([VT.i32]), valueClass = this.temp([VT.i32]);
+    const objectArray = this.world.objectArrayClass();
+    const host = this.world.hostImport('arraystore', [VT.anyref, VT.anyref], []);
+    const field = (stype, index, tag) => [...value, ...GC.ref_cast, { stype }, ...GC.struct_get, { type: stype }, index,
+      ...(tag ? [OP.i32_const, ...sleb(tag), OP.i32_or] : [])];
+    // Closed objects by class id, arrays by kind or class with a tag bit;
+    // host values (strings, JRE objects) have no class here: -1.
+    const classOf = [...value, ...GC.ref_test, { stype: T_OBJ }, OP.if, VT.i32, ...field(T_OBJ, OBJ.cls, 0),
+      OP.else, ...value, ...GC.ref_test, { stype: T_PARR }, OP.if, VT.i32, ...field(T_PARR, PARR.kind, 0x40000000),
+      OP.else, ...value, ...GC.ref_test, { stype: T_RARR }, OP.if, VT.i32, ...field(T_RARR, RARR.cls, 0x20000000),
+      OP.else, OP.i32_const, ...sleb(-1), OP.end, OP.end, OP.end];
+    const code = [...value, OP.ref_is_null, OP.i32_eqz, OP.if, 0x40,
+      ...rarr, ...GC.struct_get, { type: T_RARR }, RARR.cls, OP.local_tee, ...uleb(cls),
+      OP.i32_const, ...sleb(objectArray), OP.i32_ne, OP.if, 0x40,
+      ...classOf, OP.local_tee, ...uleb(valueClass), OP.i32_const, ...sleb(-1), OP.i32_eq,
+      OP.local_get, ...uleb(cls), OP.global_get, { global: 'storeArrayClass' }, OP.i32_ne, OP.i32_or,
+      OP.local_get, ...uleb(valueClass), OP.global_get, { global: 'storeValueClass' }, OP.i32_ne, OP.i32_or,
+      OP.if, 0x40, ...rarr, ...value, OP.call, { fn: host },
+      OP.local_get, ...uleb(cls), OP.global_set, { global: 'storeArrayClass' },
+      OP.local_get, ...uleb(valueClass), OP.global_set, { global: 'storeValueClass' },
+      OP.end, OP.end, OP.end];
+    this.release([VT.i32], cls);
+    this.release([VT.i32], valueClass);
+    return code;
+  }
+
   referenceArray(node) {
     const store = node.op === 'aastore';
     const array = this.use(node.args[0], 'A'), index = this.use(node.args[1], 'I');
     const value = store ? this.use(node.args[2], 'A') : [];
+    const asRarr = this.reprOf(node.args[0]) === 'rarr' ? array : [...array, ...GC.ref_cast, { stype: T_RARR }];
+    // Emitted where the branch's own temps are live, so its temps differ.
+    const check = () => (store ? this.storeCheck(asRarr, value) : []);
     const derived = this.derived.get(node.args[0].id)?.rarr;
     if (derived) {
-      return [...this.indexCheck(array, index, derived.len),
+      return [...this.indexCheck(array, index, derived.len), ...check(),
         OP.local_get, ...uleb(derived.elems), ...index, ...value, ...(store ? GC.array_set : GC.array_get), { type: T_REFS }];
     }
     if (this.reprOf(node.args[0]) === 'rarr') {
       const elems = [...GC.struct_get, { type: T_RARR }, RARR.elems];
-      return [...this.typedIndexCheck(array, index, [...elems, ...GC.array_len]),
+      return [...this.typedIndexCheck(array, index, [...elems, ...GC.array_len]), ...check(),
         ...array, ...elems, ...index, ...value, ...(store ? GC.array_set : GC.array_get), { type: T_REFS }];
     }
     const eType = refNull(T_REFS);
@@ -1113,7 +1147,7 @@ class ClosedCompiler {
     const out = [...array, ...GC.ref_test, { stype: T_RARR }, OP.if, store ? 0x40 : VT.anyref,
       ...array, ...GC.ref_cast, { stype: T_RARR }, ...GC.struct_get, { type: T_RARR }, RARR.elems,
       OP.local_tee, ...uleb(e), ...GC.array_len, OP.local_set, ...uleb(len),
-      ...this.boundsCheck(index, len),
+      ...this.boundsCheck(index, len), ...check(),
       OP.local_get, ...uleb(e), ...index, ...value, ...(store ? GC.array_set : GC.array_get), { type: T_REFS },
       OP.else, ...array, ...index, ...value, OP.call, { fn: host }, OP.end];
     this.release(eType, e);

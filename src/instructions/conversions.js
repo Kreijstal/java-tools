@@ -1,3 +1,5 @@
+const { toInt, toLong, longToFloat } = require('../core/javaNumeric');
+
 module.exports = {
   i2l: (frame) => {
     const value = frame.stack.pop();
@@ -21,8 +23,7 @@ module.exports = {
     frame.stack.push(Number(BigInt.asIntN(32, big)));
   },
   l2f: (frame) => {
-    const value = frame.stack.pop();
-    frame.stack.push(Math.fround(Number(value)));
+    frame.stack.push(longToFloat(frame.stack.pop()));
   },
   l2d: (frame) => {
     const value = frame.stack.pop();
@@ -30,30 +31,10 @@ module.exports = {
   },
 
   f2i: (frame) => {
-    const value = frame.stack.pop();
-    // Handle special cases according to JVM specification
-    if (isNaN(value)) {
-      frame.stack.push(0);
-    } else if (value === Infinity) {
-      frame.stack.push(0x7FFFFFFF); // Integer.MAX_VALUE
-    } else if (value === -Infinity) {
-      frame.stack.push(0x80000000); // Integer.MIN_VALUE
-    } else {
-      frame.stack.push(Math.trunc(value) | 0);
-    }
+    frame.stack.push(toInt(frame.stack.pop()));
   },
   f2l: (frame) => {
-    const value = frame.stack.pop();
-    // Handle special cases according to JVM specification
-    if (isNaN(value)) {
-      frame.stack.push(BigInt(0));
-    } else if (value === Infinity) {
-      frame.stack.push(BigInt('9223372036854775807')); // Long.MAX_VALUE
-    } else if (value === -Infinity) {
-      frame.stack.push(BigInt('-9223372036854775808')); // Long.MIN_VALUE
-    } else {
-      frame.stack.push(BigInt(Math.trunc(value)));
-    }
+    frame.stack.push(toLong(frame.stack.pop()));
   },
   f2d: (frame) => {
     const value = frame.stack.pop();
@@ -61,30 +42,10 @@ module.exports = {
   },
 
   d2i: (frame) => {
-    const value = frame.stack.pop();
-    // Handle special cases according to JVM specification
-    if (isNaN(value)) {
-      frame.stack.push(0);
-    } else if (value === Infinity) {
-      frame.stack.push(0x7FFFFFFF); // Integer.MAX_VALUE
-    } else if (value === -Infinity) {
-      frame.stack.push(0x80000000); // Integer.MIN_VALUE
-    } else {
-      frame.stack.push(Math.trunc(value) | 0);
-    }
+    frame.stack.push(toInt(frame.stack.pop()));
   },
   d2l: (frame) => {
-    const value = frame.stack.pop();
-    // Handle special cases according to JVM specification
-    if (isNaN(value)) {
-      frame.stack.push(BigInt(0));
-    } else if (value === Infinity) {
-      frame.stack.push(BigInt('9223372036854775807')); // Long.MAX_VALUE
-    } else if (value === -Infinity) {
-      frame.stack.push(BigInt('-9223372036854775808')); // Long.MIN_VALUE
-    } else {
-      frame.stack.push(BigInt(Math.trunc(value)));
-    }
+    frame.stack.push(toLong(frame.stack.pop()));
   },
   d2f: (frame) => {
     const value = frame.stack.pop();

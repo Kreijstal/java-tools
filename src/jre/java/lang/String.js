@@ -1,4 +1,5 @@
 const { withThrows } = require('../../helpers');
+const { withJavaString, pushesFrames } = require('../../javaToString');
 const LongClass = require('./Long');
 const FloatClass = require('./Float');
 const DoubleClass = require('./Double');
@@ -161,7 +162,7 @@ module.exports = {
   ],
   staticFields: {},
   staticMethods: {
-    "valueOf(Ljava/lang/Object;)Ljava/lang/String;": (jvm, obj, args) => {
+    "valueOf(Ljava/lang/Object;)Ljava/lang/String;": pushesFrames((jvm, obj, args, thread) => {
       const value = args[0];
       if (value === null) {
         return jvm.internString("null");
@@ -169,8 +170,11 @@ module.exports = {
       if (typeof value === "string") {
         return value; // Already a string
       }
-      return jvm.internString(stringValue(value));
-    },
+      return withJavaString(jvm, value, stringValue, thread, (text, callingFrame) => {
+        if (!callingFrame) return jvm.internString(text);
+        callingFrame.stack.push(jvm.internString(text));
+      });
+    }),
     "valueOf(C)Ljava/lang/String;": (jvm, obj, args) => {
       const charCode = args[0];
       const charStr = String.fromCharCode(charCode);

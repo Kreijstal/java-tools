@@ -1,4 +1,8 @@
 const { withThrows } = require('../../helpers');
+const { withJavaString, pushesFrames } = require('../../javaToString');
+const { valueAsString } = require('./StringBuilder');
+const FloatClass = require('./Float');
+const DoubleClass = require('./Double');
 
 function stringValue(value) {
   if (value === null || value === undefined) return 'null';
@@ -20,13 +24,20 @@ module.exports = {
     '<init>()V': (jvm, obj) => { obj.value = ''; },
     '<init>(Ljava/lang/String;)V': (jvm, obj, args) => { obj.value = stringValue(args[0]); },
     'append(Ljava/lang/String;)Ljava/lang/StringBuffer;': append(stringValue),
-    'append(Ljava/lang/Object;)Ljava/lang/StringBuffer;': append(stringValue),
+    'append(Ljava/lang/Object;)Ljava/lang/StringBuffer;': pushesFrames((jvm, obj, args, thread) =>
+      withJavaString(jvm, args[0], valueAsString, thread, (text, callingFrame) => {
+        obj.value = String(obj.value || '') + text;
+        if (!callingFrame) return obj;
+        callingFrame.stack.push(obj);
+      })),
     'append(C)Ljava/lang/StringBuffer;': append((value) => String.fromCharCode(value)),
     'append(Z)Ljava/lang/StringBuffer;': append((value) => value ? 'true' : 'false'),
     'append(I)Ljava/lang/StringBuffer;': append(String),
     'append(J)Ljava/lang/StringBuffer;': append(String),
-    'append(F)Ljava/lang/StringBuffer;': append(String),
-    'append(D)Ljava/lang/StringBuffer;': append(String),
+    'append(F)Ljava/lang/StringBuffer;': (jvm, obj, args) => append((value) =>
+      String(FloatClass.staticMethods['toString(F)Ljava/lang/String;'](jvm, null, [value])))(jvm, obj, args),
+    'append(D)Ljava/lang/StringBuffer;': (jvm, obj, args) => append((value) =>
+      String(DoubleClass.staticMethods['toString(D)Ljava/lang/String;'](jvm, null, [value])))(jvm, obj, args),
     // The append family above already mirrors StringBuilder; these four close the
     // gap. java/lang/StringBuffer is a closed JDK class, so a name this model
     // does not carry cannot be added by the compilation that calls it - the

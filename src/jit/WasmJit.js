@@ -1,4 +1,5 @@
 'use strict';
+const { checkArrayStore } = require('../core/arrayStore');
 const {bindStaticFieldAccessors} = require('./staticFieldAccessors');
 
 // WASM tier for hot numeric methods.
@@ -252,6 +253,7 @@ class MethodTranslator {
           if (a === null || a === undefined) {
             throw NPE(`Attempted store on null array in ${name}`);
           }
+          if (t === T.ref && (i >>> 0) < monoArray.len(a)) checkArrayStore(self.jvm, a, v);
           if (!monoArray.store(a, i, normalizeArrayStore(v, null, a))) {
             throw AIOOBE(i, monoArray.len(a));
           }
@@ -262,7 +264,7 @@ class MethodTranslator {
     addI32ArrayLoadImports(self, name, trace);
     if (self.wasmJit.typedArrayStoresEnabled) {
       addTypedArrayStoreImports(self, name,
-        `${self.className}.${self.method.name}${self.method.descriptor}`);
+        `${self.className}.${self.method.name}${self.method.descriptor}`, self.jvm);
     }
     self.addImport('alen', [T.ref], [T.i32], (a) => {
       if (a === null || a === undefined) throw NPE(`Attempted to get length of null array in ${name}`);

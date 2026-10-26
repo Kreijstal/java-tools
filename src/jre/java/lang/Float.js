@@ -1,45 +1,6 @@
 const { withThrows } = require('../../helpers');
 
-function javaFloatString(value) {
-  const f = Number(value);
-  if (isNaN(f)) {
-    return "NaN";
-  }
-  if (f === Number.POSITIVE_INFINITY) {
-    return "Infinity";
-  }
-  if (f === Number.NEGATIVE_INFINITY) {
-    return "-Infinity";
-  }
-  if (Object.is(f, -0)) {
-    return "-0.0";
-  }
-  if (f === 0.0) {
-    return "0.0";
-  }
-
-  const absF = Math.abs(f);
-  let s;
-
-  if (absF >= 1e-3 && absF < 1e7) {
-    s = String(f);
-    if (s.indexOf('.') === -1) {
-      s += '.0';
-    }
-  } else {
-    s = f.toExponential().toUpperCase().replace(/E\+/, 'E');
-    let [mantissa, exponent] = s.split('E');
-    if (mantissa.includes('.')) {
-      mantissa = mantissa.replace(/0+$/, '');
-      if (mantissa.endsWith('.')) {
-        mantissa = mantissa.slice(0, -1);
-      }
-    }
-    s = mantissa + 'E' + exponent;
-  }
-
-  return s;
-}
+const { javaFloatString } = require('./floatingDecimal');
 
 function floatBits(value) {
   if (Number.isNaN(value)) return 0x7fc00000;
