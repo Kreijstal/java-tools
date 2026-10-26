@@ -62,6 +62,7 @@ const {localizeForLoopDeclarations: recoverForDeclarations} = require('./forLoop
 const {localizeLocalInitializations: recoverLocalInitializations} = require('./localInitializationRecovery');
 const {recoverCompilationUnitBodies} = require('./sourceLocalDeclarationRecovery');
 const {primitiveExpressionProof} = require('./primitiveExpressionProof');
+const {recoverBooleanLocalRepresentations: recoverBooleanRepresentations} = require('./booleanLocalRepresentationRecovery');
 
 const rawExpression = (source) => createNode('UnsupportedExpression', { source: String(source) });
 const rawStatement = (source) => createNode('UnsupportedStatement', { source: String(source) });
@@ -744,7 +745,8 @@ function localizeCompilationUnitDeclarations(source) {
 function simplifyBodyDecisions(source) {
   const original = source;
   const counts = {dispatchesRecovered: 0, predicatesSimplified: 0, predicateGroupsRemoved: 0,
-    elseIfBlocksRemoved: 0, frameCleanups: 0, valueBranchesFolded: 0};
+    elseIfBlocksRemoved: 0, frameCleanups: 0, valueBranchesFolded: 0,
+    booleanLocalsPromoted: 0, booleanComparisonsRecovered: 0, booleanSelectionsRecovered: 0};
   const unchanged = () => ({source: original, ...Object.fromEntries(Object.keys(counts).map(key => [key, 0]))});
   if (typeof source !== 'string') return unchanged();
   try {
@@ -773,6 +775,11 @@ function simplifyBodyDecisions(source) {
       const before = source;
       const values = foldPrimitiveValueBranches(source);
       source = values.source; counts.valueBranchesFolded += values.branchesFolded;
+      const booleans = recoverBooleanLocalRepresentations(source);
+      source = booleans.source;
+      counts.booleanLocalsPromoted += booleans.localsPromoted;
+      counts.booleanComparisonsRecovered += booleans.comparisonsRecovered;
+      counts.booleanSelectionsRecovered += booleans.selectionsRecovered;
       predicates();
       for (;;) {
         const result = recoverScalarIfDispatches(source, {nestedRegions: true, opaqueControls: true});
@@ -791,7 +798,7 @@ function simplifyBodyDecisions(source) {
       const frames = finalizeControlFrames(source);
       source = frames.source;
       counts.frameCleanups += frames.breaksRemoved + frames.labelsRemoved + frames.jumpsUnlabeled + frames.blocksUnwrapped;
-      // Every successful phase removes value branches, classifiers, wrapper blocks, redundant
+      // Every successful phase removes integer bit carriers, value branches, classifiers, wrapper blocks, redundant
       // logical structure or lexical exit scaffolding. Actions are never copied.
       if (source === before) break;
     }
@@ -810,7 +817,16 @@ function simplifyBodyDecisions(source) {
 
 function simplifyCompilationUnitDecisions(source) {
   return recoverCompilationUnitBodies(source, simplifyBodyDecisions, 'bodiesSimplified',
-    ['dispatchesRecovered', 'predicatesSimplified', 'predicateGroupsRemoved', 'elseIfBlocksRemoved', 'frameCleanups', 'valueBranchesFolded']);
+    ['dispatchesRecovered', 'predicatesSimplified', 'predicateGroupsRemoved', 'elseIfBlocksRemoved', 'frameCleanups', 'valueBranchesFolded',
+      'booleanLocalsPromoted', 'booleanComparisonsRecovered', 'booleanSelectionsRecovered']);
+}
+
+function recoverBooleanLocalRepresentations(source, options = {}) {
+  try {return recoverBooleanRepresentations(source, controlCleanupSource(source), options);}
+  catch (error) {
+    if (error instanceof RangeError) return {source, localsPromoted: 0, comparisonsRecovered: 0, selectionsRecovered: 0};
+    throw error;
+  }
 }
 
 function recoverScalarLabelDispatches(source, options = {}) {
@@ -3739,6 +3755,7 @@ module.exports = {
   flattenStandaloneBlocks,
   treeToStatements, emitStatements, rawExpression, rawStatement, hasUnreachableStatement,
   promoteBooleanStackCarriers,
+  recoverBooleanLocalRepresentations,
   localizeForLoopDeclarations,
   localizeLocalInitializations,
   localizeBodyDeclarations,
