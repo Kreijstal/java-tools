@@ -22,7 +22,7 @@ const { specializePathGuards: specializeGuards } = require('./pathGuardRecovery'
 const {flattenStandaloneBlocks: flattenBlocks} = require('./standaloneBlockRecovery');
 const { simplifyDominatedPredicates: simplifyDominated } = require('./dominatedPredicateRecovery');
 const { foldRedundantExitGuards: recoverRedundantExitGuards } = require('./redundantExitGuardRecovery');
-const { foldGuardedLocalAssignments: recoverGuardedLocalAssignments } = require('./guardedLocalAssignmentRecovery');
+const { foldGuardedLocalAssignments: recoverGuardedLocalAssignments, floatingLiteralType } = require('./guardedLocalAssignmentRecovery');
 const { foldStableGuardedFallbacks: recoverStableGuardedFallbacks } = require('./stableGuardedFallbackRecovery');
 const { foldGuardedAssignmentSequences: recoverGuardedAssignmentSequences } = require('./guardedAssignmentSequenceRecovery');
 const { simplifySelfCasts: recoverSelfCasts, normalizedSelfCastAst } = require('./selfCastRecovery');
@@ -61,6 +61,7 @@ const {removeCaughtExceptionCopies: recoverCaughtCopies} = require('./caughtExce
 const {localizeForLoopDeclarations: recoverForDeclarations} = require('./forLoopDeclarationRecovery');
 const {localizeLocalInitializations: recoverLocalInitializations} = require('./localInitializationRecovery');
 const {recoverCompilationUnitBodies} = require('./sourceLocalDeclarationRecovery');
+const {primitiveExpressionProof} = require('./primitiveExpressionProof');
 
 const rawExpression = (source) => createNode('UnsupportedExpression', { source: String(source) });
 const rawStatement = (source) => createNode('UnsupportedStatement', { source: String(source) });
@@ -199,7 +200,7 @@ function statementCount(statements) {
   return count;
 }
 
-function primitiveAssignment(statements, localType) {
+function primitiveAssignment(statements, localType, expressionType = null) {
   if (statements.length !== 1 || statements[0].kind !== 'UnsupportedStatement') return null;
   const parsed = parsedStraightBlock(statements[0]);
   if (!parsed || parsed.statements.length !== 1) return null;
@@ -207,6 +208,14 @@ function primitiveAssignment(statements, localType) {
   const assignment = statement.kind === 'ExpressionStatement' && statement.expression;
   if (!assignment || assignment.kind !== 'AssignmentExpression' || assignment.operator !== '='
       || assignment.left.kind !== 'Identifier') return null;
+  if (expressionType) {
+    const type = expressionType(assignment.right);
+    if (!type) return null;
+    const source = statements[0].source, tokens = tokenizeJava(source).tokens.filter(token => !['whitespace', 'eof'].includes(token.kind));
+    if (tokens[0]?.text !== assignment.left.name || tokens[1]?.text !== '=' || tokens.at(-1)?.text !== ';') return null;
+    return {name: assignment.left.name, type,
+      source: '(' + source.slice(tokens[2].range.startOffset, tokens.at(-1).range.startOffset).trim() + ')'};
+  }
   let value = assignment.right;
   let sign = '';
   if (value.kind === 'UnaryExpression' && value.prefix && ['-', '+'].includes(value.operator)) {
@@ -235,10 +244,10 @@ function primitiveAssignment(statements, localType) {
   return type ? {name: assignment.left.name, type, source: sign + source} : null;
 }
 
-function valueProducingBranch(condition, thenStatements, elseStatements, localType) {
+function valueProducingBranch(condition, thenStatements, elseStatements, localType, expressionType = null) {
   if (!localType) return null;
-  const taken = primitiveAssignment(thenStatements, localType);
-  const other = primitiveAssignment(elseStatements, localType);
+  const taken = primitiveAssignment(thenStatements, localType, expressionType);
+  const other = primitiveAssignment(elseStatements, localType, expressionType);
   if (!taken || !other || taken.name !== other.name || taken.type !== other.type) return null;
   const destination = localType(taken.name);
   // Same-type primitive arms have no conditional numeric promotion, boxing or
@@ -735,7 +744,7 @@ function localizeCompilationUnitDeclarations(source) {
 function simplifyBodyDecisions(source) {
   const original = source;
   const counts = {dispatchesRecovered: 0, predicatesSimplified: 0, predicateGroupsRemoved: 0,
-    elseIfBlocksRemoved: 0, frameCleanups: 0};
+    elseIfBlocksRemoved: 0, frameCleanups: 0, valueBranchesFolded: 0};
   const unchanged = () => ({source: original, ...Object.fromEntries(Object.keys(counts).map(key => [key, 0]))});
   if (typeof source !== 'string') return unchanged();
   try {
@@ -762,6 +771,8 @@ function simplifyBodyDecisions(source) {
     }
     for (;;) {
       const before = source;
+      const values = foldPrimitiveValueBranches(source);
+      source = values.source; counts.valueBranchesFolded += values.branchesFolded;
       predicates();
       for (;;) {
         const result = recoverScalarIfDispatches(source, {nestedRegions: true, opaqueControls: true});
@@ -780,7 +791,7 @@ function simplifyBodyDecisions(source) {
       const frames = finalizeControlFrames(source);
       source = frames.source;
       counts.frameCleanups += frames.breaksRemoved + frames.labelsRemoved + frames.jumpsUnlabeled + frames.blocksUnwrapped;
-      // Every successful phase removes classifiers, wrapper blocks, redundant
+      // Every successful phase removes value branches, classifiers, wrapper blocks, redundant
       // logical structure or lexical exit scaffolding. Actions are never copied.
       if (source === before) break;
     }
@@ -799,7 +810,7 @@ function simplifyBodyDecisions(source) {
 
 function simplifyCompilationUnitDecisions(source) {
   return recoverCompilationUnitBodies(source, simplifyBodyDecisions, 'bodiesSimplified',
-    ['dispatchesRecovered', 'predicatesSimplified', 'predicateGroupsRemoved', 'elseIfBlocksRemoved', 'frameCleanups']);
+    ['dispatchesRecovered', 'predicatesSimplified', 'predicateGroupsRemoved', 'elseIfBlocksRemoved', 'frameCleanups', 'valueBranchesFolded']);
 }
 
 function recoverScalarLabelDispatches(source, options = {}) {
@@ -3021,45 +3032,35 @@ function foldVoidReturnExits(source) {
 // moves a continuation or crosses a control/exception/monitor boundary.
 function foldPrimitiveValueBranches(source, {localType = null} = {}) {
   const unchanged = () => ({source, branchesFolded: 0});
-  if (!localType || /\\u+[0-9a-fA-F]{4}/.test(source)) return unchanged();
+  if (typeof source !== 'string' || source.length > 400000 || /\\u+[0-9a-fA-F]{4}/.test(source)) return unchanged();
   try {
-    const wrapped = `{\n${source}\n}`;
-    const parsed = statementParser.parseStatement(wrapped, {requireComplete: true});
-    const lexed = tokenizeJava(wrapped);
-    if (lexed.diagnostics.length) return unchanged();
-    const tokens = lexed.tokens.filter(token => !['whitespace', 'eof'].includes(token.kind));
-    // Keep comment spelling/placement intact rather than dropping it from a
-    // branch rewritten as one expression.
-    if (tokens.some((token,index) => wrapped.slice(index ? tokens[index-1].range.endOffset : 0,
-      token.range.startOffset).trim())) return unchanged();
-    const starts = new Map(tokens.map((token, index) => [token.range.startOffset, index]));
-    const pairs = new Map(), stack = [];
-    for (let i = 0; i < tokens.length; i++) {
-      if (['(', '[', '{'].includes(tokens[i].text)) stack.push(i);
-      else if ([')', ']', '}'].includes(tokens[i].text)) {
-        const open = stack.pop();
-        if (open == null || '([{'.indexOf(tokens[open].text) !== ')]}'.indexOf(tokens[i].text)) return unchanged();
-        pairs.set(open, i);
-      }
-    }
-    if (stack.length) return unchanged();
-    const branches = [], shadowed = new Set(); let unsupported = false;
+    const proof = controlCleanupSource(source);
+    if (!proof) return unchanged();
+    // Source replay has declarations rather than a lifted JVM-local table.
+    // Prove a unique primitive binding at each branch site. Keep the existing
+    // explicit local table path for freshly emitted, not-yet-declared locals.
+    const scoped = localType ? null : primitiveExpressionProof(proof, [], floatingLiteralType);
+    if (!localType && !scoped) return unchanged();
+    const {wrapped, parsed, tokens, starts, closes: pairs} = proof;
+    const branches = [], shadowed = new Set(), parents = new Map(); let unsupported = false;
     const captures = new Set(['ClassDeclaration', 'InterfaceDeclaration', 'EnumDeclaration', 'RecordDeclaration',
-      'MethodDeclaration', 'ConstructorDeclaration', 'LambdaExpression', 'AnonymousClassBody']);
-    function walk(node) {
+      'MethodDeclaration', 'ConstructorDeclaration', 'LambdaExpression', 'AnonymousClassBody', 'MethodReference', 'MemberReference']);
+    function walk(node, parent = null) {
       if (!node || typeof node !== 'object') return;
-      if (Array.isArray(node)) {node.forEach(walk);return;}
-      if (node.kind?.startsWith('Unsupported') || captures.has(node.kind)) unsupported = true;
+      if (Array.isArray(node)) {node.forEach(child => walk(child, parent));return;}
+      parents.set(node, parent);
+      if (node.kind?.startsWith('Unsupported') || captures.has(node.kind)
+          || node.kind === 'NewClassExpression' && node.body != null || /Pattern/.test(node.kind || '')) unsupported = true;
       if ((node.kind === 'VariableDeclarator' || node.kind?.includes('Parameter')) && typeof node.name === 'string')
         shadowed.add(node.name);
       if (node.kind === 'IfStatement') branches.push(node);
-      for (const [key, value] of Object.entries(node)) if (!['range', 'tokens', 'meta'].includes(key)) walk(value);
+      for (const [key, value] of Object.entries(node)) if (!['range', 'tokens', 'meta'].includes(key)) walk(value, node);
     }
     walk(parsed);
     if (unsupported) return unchanged();
     // Types come from actual lifted JVM locals/parameters. Inline declarations
     // may shadow a spelling, so conservatively refuse that spelling everywhere.
-    const type = name => shadowed.has(name) ? null : localType(name);
+    const type = name => shadowed.has(name) ? null : localType?.(name);
     function arm(node) {
       if (node?.kind !== 'BlockStatement' || node.statements?.length !== 1) return null;
       const open = starts.get(node.range?.startOffset), close = pairs.get(open);
@@ -3077,8 +3078,20 @@ function foldPrimitiveValueBranches(source, {localType = null} = {}) {
           || takenStart !== endCondition + 1 || tokens[takenEnd + 1]?.text !== 'else'
           || otherStart !== takenEnd + 2 || otherEnd == null) continue;
       const predicate = wrapped.slice(tokens[condition].range.endOffset, tokens[endCondition].range.startOffset);
-      const value = valueProducingBranch(predicate, taken, other, type);
-      if (value) edits.push({start: tokens[start].range.startOffset, end: tokens[otherEnd].range.endOffset, text: value.source});
+      const site = tokens[start].range.startOffset;
+      const scopedType = name => {
+        const local = scoped.locals.get(name);
+        return scoped.counts.get(name) === 1 && local && site >= local.start && site < local.end ? local.type : null;
+      };
+      const value = valueProducingBranch(predicate, taken, other, scoped ? scopedType : type,
+        scoped ? expression => scoped.pureType(expression, site) : null);
+      if (value) {
+        // Keep an owning block when replacing an else-if or an unbraced loop
+        // body: the resulting value expression should read as one action.
+        const owningBlock = scoped && ['IfStatement', 'WhileStatement', 'ForStatement', 'DoWhileStatement', 'EnhancedForStatement'].includes(parents.get(node)?.kind);
+        edits.push({start: tokens[start].range.startOffset, end: tokens[otherEnd].range.endOffset,
+          text: owningBlock ? '{\n' + value.source + '\n}' : value.source});
+      }
     }
     if (!edits.length) return unchanged();
     const fragments = []; let cursor = 0;

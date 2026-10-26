@@ -76,6 +76,95 @@ test('refuses numeric promotion, narrowing and references', () => {
   assert.deepEqual(foldPrimitiveValueBranches(source), {source,branchesFolded:0});
 });
 
+test('source replay proves scoped primitive declarations without a caller type table', () => {
+  for (const [type, a, b] of [
+    ['int','left*31+value','right^value'], ['long','left+1L','right-1L'],
+    ['float','-left','right*0x1.000002p0f'], ['double','left+1e300','-right'],
+    ['byte','left','right'], ['short','left','right'], ['char',"'a'","'z'"],
+    ['boolean','!left','right|left'],
+  ]) {
+    const zero=type==='boolean'?'false':'0';
+    const source=`${type} left=${zero},right=${zero},value=${zero};if(probe()){value=${a};}else{value=${b};}use(value);`;
+    const result=foldPrimitiveValueBranches(source);
+    assert.equal(result.branchesFolded,1,source);
+    assert.equal(result.source,source.replace(`if(probe()){value=${a};}else{value=${b};}`,`value = (probe()) ? (${a}) : (${b});`));
+    assert.equal(foldPrimitiveValueBranches(result.source).source,result.source);
+  }
+  const source='final int value;try{synchronized(lock){if((flag=read())!=0&&boxed){value=2147483647;}else{value=-2147483648;}}}finally{done();}';
+  assert.equal(foldPrimitiveValueBranches(source).branchesFolded,1);
+  const nested='int value=0;if(first()){use();}else if(second()){value=3;}else{value=5;}';
+  assert.equal(foldPrimitiveValueBranches(nested).source,'int value=0;if(first()){use();}else {\nvalue = (second()) ? (3) : (5);\n}');
+});
+
+test('source replay refuses shadowing, widened conversions, fields and unproven operands', () => {
+  for(const source of [
+    'int value=0,left=1;long right=2;if(probe()){value=left;}else{value=right;}',
+    'long value=0;int left=1,right=2;if(probe()){value=left;}else{value=right;}',
+    'byte value=0;if(probe()){value=1;}else{value=2;}',
+    'Integer value=0;if(probe()){value=1;}else{value=2;}',
+    'int value=0;if(probe()){value=other;}else{value=2;}',
+    '{int value=0;}if(probe()){value=1;}else{value=2;}',
+    'int value=0;{int value=1;}if(probe()){value=1;}else{value=2;}',
+    'for(int value=0;again();value++){if(probe()){value=1;}else{value=2;}}',
+    'int value=0;if(probe()){value=this.field;}else{value=2;}',
+    'int value=0;if(probe()){this.value=1;}else{this.value=2;}',
+    'int value=0;if(probe()){value=read();}else{value=2;}',
+    'int value=0,divisor=read();if(probe()){value=1/divisor;}else{value=2;}',
+    'int value=0;if(probe()){value=1;}else{value=2;}Object nested=new Object(){};',
+    'int value=0;if(probe()){value=1;}else{value=2;}Runnable r=Owner::run;',
+    'int value=0;if(probe()){value=1;hit();}else{value=2;}',
+    'int value=0;if(probe()){value=1;/*keep*/}else{value=2;}',
+    'int value=0;if(probe()){value=1;}else{value=2;}\\u000a',
+    'int value=0;if(probe()){value=1;}else{value=2;}'+' '.repeat(400001),
+  ]) assert.equal(foldPrimitiveValueBranches(source).source,source,source);
+});
+
+test('source replay preserves native primitive bits, predicate effects and protected completion', () => {
+  const temporary=fs.mkdtempSync(path.join(os.tmpdir(),'scoped-value-native-'));
+  const models=[
+    ['int','0','Integer.MIN_VALUE','Integer.MAX_VALUE','left+value','right-value'],
+    ['long','0L','9007199254740993L','-9007199254740993L','left+value','right-value'],
+    ['float','0.0f','Float.intBitsToFloat(0x7fc01234)','-0.0f','left','right'],
+    ['double','0.0d','Double.longBitsToDouble(0x7ff8000000001234L)','-0.0d','left','right'],
+    ['byte','0','(byte)-128','(byte)127','left','right'],
+    ['short','0','(short)-32768','(short)32767','left','right'],
+    ['char',"'\\0'","'\\0'","'\\uffff'",'left','right'],
+    ['boolean','false','false','true','!left','right^value'],
+  ];
+  const contexts=[s=>s,s=>`synchronized(monitor){trace.append('L');${s}}`,
+    s=>`try{${s}}finally{trace.append('F').append(tag(value));if(mode==1)return tag(value);if(mode==2)throw OVERRIDE;}`,
+    s=>`try{synchronized(monitor){trace.append('L');${s}}}catch(IllegalStateException failure){trace.append(failure==FAILURE?'C':'X');}finally{trace.append('F').append(tag(value));}`];
+  try {
+    let methods='',checks='';
+    for(const [i,[type,zero,a,b,yes,no]]of models.entries())for(const [context,wrap]of contexts.entries()){
+      const decision=`if(probe(flag,inject)){value=${yes};}else{value=${no};}`;
+      const declaration=`${type} left=a,right=b,value=${zero};`;
+      const old=declaration+wrap(`for(int index=0;index<2;index++){${decision}trace.append('A').append(tag(value));}`)+'return tag(value);';
+      const next=foldPrimitiveValueBranches(old);assert.equal(next.branchesFolded,1,old);
+      const oracle=declaration+wrap(`for(int index=0;index<2;index++){boolean selected=probe(flag,inject);${type}[] options=new ${type}[]{${no},${yes}};value=options[selected?1:0];trace.append('A').append(tag(value));}`)+'return tag(value);';
+      for(const [prefix,body]of [['old',old],['next',next.source],['oracle',oracle]])
+        methods+=`static String ${prefix}${i}_${context}(Boolean flag,int inject,int mode,Object monitor,${type} a,${type} b){${body}}\n`;
+      checks+=`for(int swap=0;swap<2;swap++){String expected=take(${i},${context},2,flag,inject,mode,monitor,swap);for(int variant=0;variant<2;variant++){String actual=take(${i},${context},variant,flag,inject,mode,monitor,swap);if(!expected.equals(actual))throw new AssertionError(${i}+":"+${context}+":"+variant+":"+expected+" != "+actual);}cases++;}`;
+    }
+    const fixture=`class ScopedValueNative {
+      static StringBuilder trace;static final RuntimeException FAILURE=new IllegalStateException("probe"),OVERRIDE=new IllegalArgumentException("finally");
+      static boolean probe(Boolean flag,int inject){trace.append('P');if(inject==1)throw FAILURE;boolean result=flag;trace.append(result?'T':'N');return result;}
+      static String tag(int v){return "i"+v;}static String tag(long v){return "l"+v;}
+      static String tag(float v){return "f"+Float.floatToRawIntBits(v);}static String tag(double v){return "d"+Double.doubleToRawLongBits(v);}
+      static String tag(byte v){return "b"+v;}static String tag(short v){return "s"+v;}static String tag(char v){return "c"+(int)v;}static String tag(boolean v){return "z"+v;}
+      ${methods}
+      static String take(int model,int context,int variant,Boolean flag,int inject,int mode,Object monitor,int swap){trace=new StringBuilder();String value;try{switch(model*4+context){
+      ${models.flatMap(([type,zero,a,b],i)=>contexts.map((_,context)=>`case ${i*4+context}:value=variant==0?old${i}_${context}(flag,inject,mode,monitor,swap==0?${a}:${b},swap==0?${b}:${a}):variant==1?next${i}_${context}(flag,inject,mode,monitor,swap==0?${a}:${b},swap==0?${b}:${a}):oracle${i}_${context}(flag,inject,mode,monitor,swap==0?${a}:${b},swap==0?${b}:${a});break;`)).join('\n')}
+      default:throw new AssertionError();}}catch(Throwable failure){value=failure==FAILURE?"probe":failure==OVERRIDE?"finally":failure.getClass().getName();}
+      if(monitor!=null&&Thread.holdsLock(monitor))throw new AssertionError("monitor leaked");return value+":"+trace;}
+      public static void main(String[] args){int cases=0;for(Boolean flag:new Boolean[]{false,true,null})for(int inject=0;inject<2;inject++)for(int mode=0;mode<3;mode++)for(Object monitor:new Object[]{null,new Object()}){${checks}}System.out.println("cases:"+cases);}
+    }`;
+    fs.writeFileSync(path.join(temporary,'ScopedValueNative.java'),fixture);
+    run('javac',['--release','8','ScopedValueNative.java'],temporary);
+    assert.equal(run('java',['-Xverify:all','-XX:-OmitStackTraceInFastThrow','-cp',temporary,'ScopedValueNative'],temporary),'cases:2304');
+  } finally {fs.rmSync(temporary,{recursive:true,force:true});}
+});
+
 function run(command,args,cwd) {
   const result=spawnSync(command,args,{cwd,encoding:'utf8',maxBuffer:4*1024*1024});
   assert.equal(result.status,0,result.stderr||result.error?.stack||result.stdout);

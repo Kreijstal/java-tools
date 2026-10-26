@@ -13,6 +13,13 @@ test('compilation units reuse the default decision proofs without touching heade
  const result=unit(source);assert.equal(result.bodiesSimplified,1);assert.ok(result.source.startsWith('/* kept { } */\npackage example;'));assert.match(result.source,/String value="if \(!\(a < b\)\)";/);assert.match(result.source,/\n  if\(test\(\)\)\{work\(\);\}/);assert.ok(result.source.includes('if(!(a < b))'));assert.equal(unit(result.source).source,result.source);
 });
 
+test('default source decisions fold proven primitive choices without external type flags',()=>{
+ const source='class Choices{void run(){int value=0;while(again()){if(test()){value=1;}else{value=2;}use(value);}}}';
+ const result=unit(source);assert.equal(result.valueBranchesFolded,1);assert.equal(result.bodiesSimplified,1);
+ assert.ok(!result.source.includes('if(test())'));assert.match(result.source,/value = \(test\(\)\) \? \(1\) : \(2\);/);
+ assert.equal(unit(result.source).source,result.source);
+});
+
 for(const source of[
  'int selected=read();Runnable r=()->{if(!(!test()))work();};',
  'class Local{void f(){if(!(!test()))work();}}',
