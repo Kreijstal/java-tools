@@ -57,6 +57,8 @@ const { foldGuardedLoopContinuations: recoverLoopContinuation, foldNonrepeatingW
   foldLoopElseExitGuards: recoverLoopElseExitGuard, foldSinglePassInnerLoops: recoverSinglePassInner,
   foldTerminalLoopTails: recoverTerminalLoopTail, foldNaturalLoopExits: recoverNaturalLoopExit } = require('./guardedLoopContinuationRecovery');
 
+const {removeCaughtExceptionCopies: recoverCaughtCopies} = require('./caughtExceptionCopyRecovery');
+
 const rawExpression = (source) => createNode('UnsupportedExpression', { source: String(source) });
 const rawStatement = (source) => createNode('UnsupportedStatement', { source: String(source) });
 const block = (statements) => blockStatement(statements || []);
@@ -696,6 +698,11 @@ function removeDeadReceiverSnapshots(source, declarations, carrierNames) {
   for (const edit of edits.reverse()) output = output.slice(0, edit.start) + output.slice(edit.end);
   return {source: output.slice(2, -2), removed,
     declarations: declarations.filter(declaration => !removed.some(name => declaration === candidates.get(name).declaration))};
+}
+
+function removeCaughtExceptionCopies(source, declarations, carrierNames) {
+  try {return recoverCaughtCopies(source, declarations, controlCleanupSource(source), carrierNames);}
+  catch(error) {if(error instanceof RangeError)return {source, declarations, removed:[]};throw error;}
 }
 
 function recoverScalarLabelDispatches(source, options = {}) {
@@ -3611,4 +3618,5 @@ module.exports = {
   foldLabeledGuardTrees,
   removeDeadRegionSelectors,
   removeDeadReceiverSnapshots,
+  removeCaughtExceptionCopies,
 };
