@@ -239,6 +239,7 @@ class WasmHeap {
       }
       return -1;
     }
+    if (base > this.top) this._releaseArrayExtent(this.top, base - this.top);
     this.top = base + size;
     this.stats.bumped += 1;
     return base;
@@ -370,6 +371,7 @@ class WasmHeap {
       }
       return new Ctor(count);
     }
+    if (base > this.top) this._releaseArrayExtent(this.top, base - this.top);
     this.top = base + bytes;
     this.stats.arrayBumped += 1;
     const view = new Ctor(this.memory.buffer, base, count);
@@ -404,6 +406,7 @@ class WasmHeap {
       }
       return -1;
     }
+    if (base > this.top) this._releaseArrayExtent(this.top, base - this.top);
     this.top = base + bytes;
     this.stats.arrayBumped += 1;
     return base;

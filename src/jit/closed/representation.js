@@ -200,10 +200,14 @@ class ClosedRuntime {
     const kind = KIND[desc];
     const base = this.heap.allocExtent(desc, count);
     if (base < 0) {
-      const { allocPrimitiveArray } = require('../../instructions/object');
-      const array = allocPrimitiveArray(this.jvm, ELEMENT_TYPE[desc], count);
-      const native = this.parrOf(array);
-      return native === array ? this.spillPrimitiveArray(array) : native;
+      // No host turn occurs between the failed request and this fallback;
+      // probing the same heap again cannot recover additional storage.
+      const array = new CTOR[desc](count);
+      array.type = desc;
+      array.cidx = classIndexOf(this.jvm, desc);
+      array.elementType = ELEMENT_TYPE[desc];
+      array.hashCode = this.jvm.nextHashCode++;
+      return this.spillPrimitiveArray(array);
     }
     const store = this.ops.newParr(base, count, kind, null);
     this.heap.registerExtent(store, base, count << KIND_SHIFT[kind]);

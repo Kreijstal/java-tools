@@ -4,6 +4,27 @@ const assert = require('node:assert/strict');
 const {execFileSync} = require('node:child_process');
 const path = require('node:path');
 
+test('closed overflow allocation does not retry the same exhausted heap', () => {
+  const {WasmHeap} = require('../src/core/wasmHeap');
+  const {ClosedRuntime} = require('../src/jit/closed/representation');
+  const heap = new WasmHeap(0.0625);
+  const jvm = {wasmHeap: heap, classes: {}, jre: {}, nextHashCode: 1};
+  const runtime = new ClosedRuntime(jvm);
+  heap.alloc = () => {throw new Error('exhausted heap was retried');};
+  for (const [desc, count] of [['[I', 65536], ['[J', 65536], ['[B', 65536]]) {
+    const store = runtime.newPrimitiveArray(desc, count), view = runtime.toJs(store);
+    assert.equal(runtime.ops.parrBase(store), -1);
+    assert.equal(view.type, desc);
+    assert.equal(view.length, count);
+    assert.equal(view.elementType, {'[I': 'int', '[J': 'long', '[B': 'byte'}[desc]);
+    assert.equal(runtime.toWasm(view), store);
+    assert.equal(view[0], desc === '[J' ? 0n : 0);
+    assert.equal(runtime.toJs(store), view);
+  }
+  assert.equal(runtime.spilledArrays, 3);
+  assert.equal(jvm.nextHashCode, 4);
+});
+
 test('dead large closed arrays recycle without spilling or reusing storage held by a host view', () => {
   // Exercise actual host finalization of Wasm GC handles and their optional
   // TypedArray views. No guest-visible free or liveness guess is involved.

@@ -22,6 +22,7 @@
 
 const { VT, HT, OP, GC, SAT, sleb, uleb, f32bytes, f64bytes, refNull } = require('./wasmBuilder');
 const { T_OBJ, T_PARR, T_RARR, T_REFS, OBJ, PARR, RARR, KIND, KIND_SHIFT } = require('./representation');
+const {primitiveSpillArrayImport} = require('./primitiveSpillArray');
 
 const WT = { I: VT.i32, J: VT.i64, F: VT.f32, D: VT.f64, A: VT.anyref };
 const KIND_OF_VT = new Map(Object.entries(WT).map(([kind, vt]) => [vt, kind]));
@@ -995,8 +996,13 @@ class ClosedCompiler {
     const host = this.world.hostImport(`${store ? 'astore' : 'aload'}_${kind}`,
       store ? [VT.anyref, VT.i32, t] : [VT.anyref, VT.i32], store ? [] : [t]);
     const hostAccess = [...array, ...index, ...value, OP.call, { fn: host }];
-    const storage = (base, native) => [...base, OP.i32_const, 0, OP.i32_ge_s,
-      OP.if, store ? 0x40 : t, ...native, OP.else, ...hostAccess, OP.end];
+    const spill = primitiveSpillArrayImport(this.world, op, kind);
+    const closedArray = this.reprOf(node.args[0]) === 'parr' ? array
+      : [...array, ...GC.ref_cast, { stype: T_PARR }];
+    const storage = (base, native, handle = closedArray) => [...base, OP.i32_const, 0, OP.i32_ge_s,
+      OP.if, store ? 0x40 : t, ...native, OP.else,
+      ...handle, ...GC.struct_get, { type: T_PARR }, PARR.view,
+      ...index, ...value, OP.call, { fn: spill }, OP.end];
     const derived = this.derived.get(node.args[0].id)?.parr;
     if (derived) {
       const L = (i) => uleb(i);
@@ -1019,7 +1025,7 @@ class ClosedCompiler {
       ...array, ...GC.ref_cast, { stype: T_PARR }, OP.local_tee, ...uleb(p),
       ...GC.struct_get, { type: T_PARR }, PARR.len, OP.local_set, ...uleb(len),
       ...this.boundsCheck(index, len),
-      ...storage(base, [...address, ...value, memOp, align, 0]),
+      ...storage(base, [...address, ...value, memOp, align, 0], [OP.local_get, ...uleb(p)]),
       OP.else, ...hostAccess, OP.end];
     this.release(pType, p);
     this.release([VT.i32], len);

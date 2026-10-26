@@ -15,6 +15,12 @@ subtree capacities. The initial transfer visits existing free-list entries.
 `freeBytes` and `arrayFreeBytes` describe only the original segregated bins.
 Allocation and reclamation counters remain cumulative.
 
+Alignment padding between bump allocations also returns to reusable storage.
+Without it, alternating byte and wider-element arrays leave permanent gaps
+that prevent their dead payloads from coalescing. Common partial allocations
+shrink the existing free node in place; adjacent releases extend or rebase an
+existing node instead of allocating replacement bookkeeping.
+
 This fixes stranded free space, not collection scheduling: reclamation still
 depends on host finalizers, whose prompt execution is not guaranteed. A full
 heap with no finalized storage still uses supported execution fallbacks.
@@ -26,6 +32,53 @@ fresh-process B-C-C-B blocks. The deterministic 8 MiB exhaustion case makes
 1,000 arrays and all four candidate samples spilled zero. This is allocator
 coverage, not a browser FPS or total-memory acceptance result. Allocation
 timings were variable; no general throughput improvement is established.
+
+## Primitive overflow arrays
+
+An exhausted closed-world allocation creates its typed fallback immediately;
+it does not retry the same heap without a host turn. Overflow handles retain
+their length, kind, identity and canonical TypedArray. Compiled accesses check
+null and bounds in Wasm, then pass the handle's view directly to a typed host
+import. These imports use the existing TypedArray coercions and need neither
+a second Wasm call to recover the view nor the general exception adapter.
+Foreign arrays retain the checked general path. No preparation or execution
+flag is required.
+
+`node scripts/benchmarkClosedArrayOverflow.js --baseline <commit>` compares
+the baseline with the staged versions of the five relevant source modules.
+`--candidate <commit>` selects immutable candidate modules instead. Other
+runtime edits are excluded, the JRE index is derived from the pinned sources,
+and each sample reports source/class digests and the compiled module size.
+`--allocation-only` measures 10,000 retained fallback allocations separately.
+For two fresh-browser B-C-C-B blocks, run:
+
+```sh
+node scripts/benchmarkClosedArrayOverflow.js --browser /absolute/baseline/jvm-debug.js /absolute/candidate/jvm-debug.js
+```
+
+The 2026-10-26 comparison against `8b89150132bdd3bcfa985a8facd14c5ed09f9596`
+used Node 22.23.2 and Firefox 148.0.2 on the same Linux host. The compiled loop
+executes 64 passes over 65,536 integers; every result was `534773760`.
+The raw sample times in milliseconds, listed separately in variant run order:
+
+| Probe | Baseline | Candidate |
+| --- | --- | --- |
+| Node: 10,000 overflow allocations | 17.157, 42.481, 17.509, 21.665 | 8.548, 8.980, 10.575, 10.319 |
+| Node: overflow loop | 246.402, 288.574, 333.708, 270.353 | 76.572, 80.584, 125.528, 89.770 |
+| Firefox: overflow loop | 1209, 1337, 1286, 1364 | 136, 145, 130, 121 |
+| Firefox: native loop control | 89, 103, 105, 97 | 85, 104, 82, 71 |
+
+The Node source snapshots were
+`cb529fdbc25d3385a3cfbf98ae483122095e7cc74f159d87e3513c62799851a5`
+and `e133536ef53ed5abfae8e9eae1446eb2f71802aa03c52aaeb41919fa2079a540`.
+Browser bundle SHA-256 values were
+`2364983bc01c3c8d0b92478a83c637d22b153de4ebac9f4f5d9f94eae8fd875d`
+and `46411d51cd4b3c17a4cfc6ae3e2e4155be9d796260db4c6746fedb09e1af2f91`.
+Both variants used class SHA-256
+`77942110639d4f6603e9613cdba4c3395d87c76d7b0d2015f7663dc92f50a0ef`.
+The loop probe disables scheduler preemption for its single synchronous entry;
+it does not time compilation, browser presentation or collection. These are
+microbenchmark gains, not a game FPS, total-memory or prompt-GC acceptance claim.
 
 ## Preparation policy
 

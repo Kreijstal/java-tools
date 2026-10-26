@@ -49,3 +49,17 @@ test('later reclamation recovers native allocation after a genuine exhaustion', 
   assert.equal(heap.usage().free, 512);
   assert.equal(heap.usage().live + heap.usage().free, heap.usage().allocated);
 });
+
+test('alignment gaps join reclaimed arrays instead of permanently fragmenting the heap', () => {
+  const heap = new WasmHeap(0.0625), arrays = [];
+  for (let i = 0; i < 100; i++) {
+    arrays.push(heap.alloc('[B', 1));
+    arrays.push(heap.alloc('[I', 1));
+  }
+  const end = heap.top;
+  heap.allocExtent('[B', heap.limit - heap.top);
+  for (const array of arrays) assert.equal(heap.freeArray(array), true);
+  const all = heap.alloc('[B', end - 8);
+  assert.equal(all.wasmBase, 8);
+  assert.equal(heap.usage().free, 0);
+});
