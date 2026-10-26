@@ -1066,7 +1066,8 @@ class ClosedWorld {
       if (!arms.has(fn)) arms.set(fn, []);
       arms.get(fn).push(id);
     }
-    if (arms.size > 16) throw new Unsupported(`megamorphic: ${owner}.${name}`);
+    // Every arm resolves to a known implementation. A wide class hierarchy
+    // changes dispatch size, not whether the caller can execute in Wasm.
     const siteId = this.sites.push({ where, target: `${owner}.${name}${descriptor}`,
       invoke: { op, imm: node.imm, className: record.className, argKinds, returnKind } }) - 1;
     // With JSPI, a receiver the module has no code for (a class newer than
