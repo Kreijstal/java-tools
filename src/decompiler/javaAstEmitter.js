@@ -60,7 +60,7 @@ const { foldGuardedLoopContinuations: recoverLoopContinuation, foldNonrepeatingW
 const {removeCaughtExceptionCopies: recoverCaughtCopies} = require('./caughtExceptionCopyRecovery');
 const {localizeForLoopDeclarations: recoverForDeclarations} = require('./forLoopDeclarationRecovery');
 const {localizeLocalInitializations: recoverLocalInitializations} = require('./localInitializationRecovery');
-const {localizeCompilationUnitDeclarations: recoverSourceDeclarations} = require('./sourceLocalDeclarationRecovery');
+const {recoverCompilationUnitBodies} = require('./sourceLocalDeclarationRecovery');
 
 const rawExpression = (source) => createNode('UnsupportedExpression', { source: String(source) });
 const rawStatement = (source) => createNode('UnsupportedStatement', { source: String(source) });
@@ -728,7 +728,78 @@ function localizeBodyDeclarations(source, options = {}) {
 }
 
 function localizeCompilationUnitDeclarations(source) {
-  return recoverSourceDeclarations(source, localizeBodyDeclarations);
+  return recoverCompilationUnitBodies(source, localizeBodyDeclarations, 'bodiesLocalized',
+    ['declarationsMoved', 'declarationsMerged', 'inertStoresRemoved']);
+}
+
+function simplifyBodyDecisions(source) {
+  const original = source;
+  const counts = {dispatchesRecovered: 0, predicatesSimplified: 0, predicateGroupsRemoved: 0,
+    elseIfBlocksRemoved: 0, frameCleanups: 0};
+  const unchanged = () => ({source: original, ...Object.fromEntries(Object.keys(counts).map(key => [key, 0]))});
+  if (typeof source !== 'string') return unchanged();
+  try {
+    const proof = controlCleanupSource(source);
+    if (!proof) return unchanged();
+    let captured = false;
+    function inspect(node) {
+      if (/ClassDeclaration|InterfaceDeclaration|EnumDeclaration|RecordDeclaration|MethodDeclaration|ConstructorDeclaration|LambdaExpression|MemberReference|MethodReference|AnonymousClass|Pattern/.test(node.kind || '')
+          || node.kind === 'NewClassExpression' && node.body != null) captured = true;
+      proof.children(node, inspect);
+    }
+    inspect(proof.parsed);
+    if (captured) return unchanged();
+    function predicates() {
+      for (;;) {
+        // Unknown/float relations keep their original NaN behavior. Only
+        // Boolean control contexts supply unboxing/type evidence here.
+        const result = simplifyPredicateNegations(source, {complementIntegralRelations: false});
+        if (!result.predicatesSimplified) break;
+        source = result.source; counts.predicatesSimplified += result.predicatesSimplified;
+      }
+      const grouped = simplifyPredicateGrouping(source);
+      source = grouped.source; counts.predicateGroupsRemoved += grouped.parenthesisPairsRemoved;
+    }
+    for (;;) {
+      const before = source;
+      predicates();
+      for (;;) {
+        const result = recoverScalarIfDispatches(source, {nestedRegions: true, opaqueControls: true});
+        if (!result.dispatchesRecovered) break;
+        source = result.source; counts.dispatchesRecovered += result.dispatchesRecovered;
+      }
+      for (;;) {
+        const result = flattenElseIfChains(source);
+        if (!result.blocksRemoved) break;
+        source = result.source; counts.elseIfBlocksRemoved += result.blocksRemoved;
+      }
+      predicates();
+      const switches = finalizeTerminalSwitchFrames(source);
+      source = switches.source;
+      counts.frameCleanups += switches.breaksLocalized + switches.labelsRemoved + switches.jumpsUnlabeled + switches.blocksUnwrapped;
+      const frames = finalizeControlFrames(source);
+      source = frames.source;
+      counts.frameCleanups += frames.breaksRemoved + frames.labelsRemoved + frames.jumpsUnlabeled + frames.blocksUnwrapped;
+      // Every successful phase removes classifiers, wrapper blocks, redundant
+      // logical structure or lexical exit scaffolding. Actions are never copied.
+      if (source === before) break;
+    }
+    if (source !== original) {
+      // The default emitter adds its own method indentation later. Historical
+      // source units already have that prefix: preserve it after reindentation.
+      const first = tokenizeJava(original).tokens.find(token => !['whitespace','comment','eof'].includes(token.kind));
+      const prefix = first && original.slice(original.lastIndexOf('\n', first.range.startOffset - 1) + 1, first.range.startOffset);
+      const indentation = prefix && /^[ \t]*$/.test(prefix) ? prefix : '';
+      source = reindentStructuredSource(source).source.split('\n')
+        .map(line => line.trim() ? indentation + line : line).join('\n');
+    }
+    return {source, ...counts};
+  } catch(error) {if(error instanceof RangeError)return unchanged();throw error;}
+}
+
+function simplifyCompilationUnitDecisions(source) {
+  return recoverCompilationUnitBodies(source, simplifyBodyDecisions, 'bodiesSimplified',
+    ['dispatchesRecovered', 'predicatesSimplified', 'predicateGroupsRemoved', 'elseIfBlocksRemoved', 'frameCleanups']);
 }
 
 function recoverScalarLabelDispatches(source, options = {}) {
@@ -3650,6 +3721,8 @@ module.exports = {
   localizeLocalInitializations,
   localizeBodyDeclarations,
   localizeCompilationUnitDeclarations,
+  simplifyBodyDecisions,
+  simplifyCompilationUnitDecisions,
   foldPrimitiveValueBranches,
   factorCommonBranchTails,
   factorLabeledBlockReturnTails,

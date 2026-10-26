@@ -27,7 +27,7 @@ const { listRegionSplitCandidates, applyRegionSplit } = require('../passes/regio
 const { jreClassInfo, jreMethodCandidates } = require('../java-frontend/jreMetadata');
 const { JavaParser } = require('../java-frontend/parser');
 const { tokenizeJava } = require('../java-frontend/lexer');
-const { promoteBooleanStackCarriers, foldPrimitiveValueBranches, localizeBodyDeclarations, factorCommonBranchTails, factorLabeledBlockReturnTails, simplifyControlFrames, removeFallthroughLabelBreaks, localizePlainBlockLoopBreaks, foldLeadingWhileBreakGuards, foldEffectfulPlainBlockExits, simplifyIdentityReferenceCasts, recoverScalarLabelDispatches, specializePathGuards, recoverPostGuardExits, recoverArrayIndexIncrements, foldLabeledBooleanDecisions, foldVoidReturnExits, foldNestedIfGuards, foldLabeledSkipGuards, foldLabeledIfElseExits, foldLabeledExitTrees, foldLabeledGuardTrees, removeDeadRegionSelectors, removeDeadReceiverSnapshots, removeCaughtExceptionCopies } = require('./javaAstEmitter');
+const { promoteBooleanStackCarriers, foldPrimitiveValueBranches, localizeBodyDeclarations, simplifyBodyDecisions, factorCommonBranchTails, factorLabeledBlockReturnTails, simplifyControlFrames, removeFallthroughLabelBreaks, localizePlainBlockLoopBreaks, foldLeadingWhileBreakGuards, foldEffectfulPlainBlockExits, simplifyIdentityReferenceCasts, recoverScalarLabelDispatches, specializePathGuards, recoverPostGuardExits, recoverArrayIndexIncrements, foldLabeledBooleanDecisions, foldVoidReturnExits, foldNestedIfGuards, foldLabeledSkipGuards, foldLabeledIfElseExits, foldLabeledExitTrees, foldLabeledGuardTrees, removeDeadRegionSelectors, removeDeadReceiverSnapshots, removeCaughtExceptionCopies } = require('./javaAstEmitter');
 
 const VERSION = 'CFR-JS 0.4.0';
 const javaStatementParser = new JavaParser();
@@ -1361,6 +1361,8 @@ function formatMethod(cls, method, options = {}) {
     const localized = localizeBodyDeclarations(body.join('\n'), {reservedNames: localState.paramNames});
     if (localized.declarationsMoved || localized.declarationsMerged)
       replaceArrayContents(body, localized.source.split('\n'));
+    const decisions = simplifyBodyDecisions(body.join('\n'));
+    if (decisions.source !== body.join('\n')) replaceArrayContents(body, decisions.source.split('\n'));
   }
   assertNoFallback(body, { className: cls.className, methodName: method.name, descriptor: method.descriptor });
   const result = formatBlock(header, body);

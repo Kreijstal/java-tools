@@ -123,7 +123,7 @@ function recoverScalarIfDispatches(source, proof, {retainDiagnostics = false, ne
         let reachable = true;
         for (const statement of groups[index].statements) {
           if (!reachable) { invalid = true; return false; }
-          if (statement.kind === 'BreakStatement' && targets.get(statement) === node) return true;
+          if (exitsSwitch(statement, node)) return true;
           reachable = normal(statement);
         }
         if (reachable && index === groups.length - 1) return true;
@@ -131,6 +131,26 @@ function recoverScalarIfDispatches(source, proof, {retainDiagnostics = false, ne
       return false;
     }
     return true;
+  }
+  // A conditional bare break still completes its own switch. A pending break
+  // overridden by an abrupt finally does not. Nested loops/switches capture
+  // their own bare breaks; labels in candidate actions remain excluded below.
+  function exitsSwitch(node, target) {
+    if (!node) return false;
+    if (node.kind === 'BreakStatement') return targets.get(node) === target;
+    if (node.kind === 'BlockStatement') {
+      for (const statement of node.statements) {
+        if (exitsSwitch(statement, target)) return true;
+        if (!normal(statement)) break;
+      }
+      return false;
+    }
+    if (node.kind === 'IfStatement') return exitsSwitch(node.consequent, target) || exitsSwitch(node.alternate, target);
+    if (node.kind === 'SynchronizedStatement') return exitsSwitch(node.body, target);
+    if (node.kind === 'TryStatement') return exitsSwitch(node.finallyBlock, target)
+      || (!node.finallyBlock || normal(node.finallyBlock)) &&
+        (exitsSwitch(node.block, target) || (node.catches || []).some(clause => exitsSwitch(clause.body, target)));
+    return false;
   }
   function comparison(node) {
     node = strip(node); let negate = false;
@@ -241,8 +261,8 @@ function recoverScalarIfDispatches(source, proof, {retainDiagnostics = false, ne
     walk(dispatch, node => {
       // Do not merge declaration scopes or change destinations of bare breaks.
       // Inner control frames are opaque until a separate proof supports them.
-      if (['LocalVariableDeclarationStatement', 'LabeledStatement'].includes(node.kind)
-          || !opaqueControls && (node.kind === 'SwitchStatement' || loops.has(node.kind) || node.kind === 'BreakStatement' && !node.label)) refused = true;
+      if (node.kind === 'LabeledStatement' || !opaqueControls &&
+          (node.kind === 'LocalVariableDeclarationStatement' || node.kind === 'SwitchStatement' || loops.has(node.kind) || node.kind === 'BreakStatement' && !node.label)) refused = true;
       if (opaqueControls && loops.has(node.kind)) {
         // Only preserve opaque loops with a nonconstant runtime condition.
         // A method call cannot be a Java constant expression; unconditional
@@ -252,13 +272,6 @@ function recoverScalarIfDispatches(source, proof, {retainDiagnostics = false, ne
           if (child.kind === 'MethodInvocationExpression') dynamic = true;
         });
         if (!dynamic || node.kind === 'DoWhileStatement') refused = true;
-      }
-      if (opaqueControls && node.kind === 'BreakStatement' && !node.label
-          && targets.get(node)?.kind === 'SwitchStatement'
-          && parents.get(node)?.kind !== 'SwitchBlockStatementGroup') {
-        // A conditional/protected exit can make an otherwise abrupt switch
-        // complete normally. Do not infer termination from its last statement.
-        refused = true;
       }
       if (node.kind === 'IfStatement') {
         const test = comparison(node.condition), local = locals.get(test?.name);
@@ -274,13 +287,6 @@ function recoverScalarIfDispatches(source, proof, {retainDiagnostics = false, ne
       if (values.size < 3 || values.size > 16) continue;
       if (!initialTest || initialTest.name !== name) continue;
       const prefixEnd = tokens[starts.get(initial.range.startOffset)].range.startOffset;
-      let written = false;
-      walk(dispatch, node => {
-        const operand = strip(node.kind === 'AssignmentExpression' ? node.left
-          : node.kind === 'UnaryExpression' && ['++', '--'].includes(node.operator) ? node.expression || node.operand : null);
-        if (operand?.kind === 'Identifier' && operand.name === name) written = true;
-      });
-      if (written) continue;
       const actions = [], conditions = [];
       function build(node, depth = 0) {
         if (!node) return {sequence: []};
@@ -300,6 +306,9 @@ function recoverScalarIfDispatches(source, proof, {retainDiagnostics = false, ne
           const yes = build(node.consequent, depth + 1), no = build(node.alternate, depth + 1);
           return yes && no ? {test, yes, no} : null;
         }
+        // Direct declarations would lose their old block scope. Declarations
+        // inside an opaque action keep that action's complete original bytes.
+        if (node.kind === 'LocalVariableDeclarationStatement') return null;
         const end = finish(node), first = starts.get(node.range?.startOffset);
         if (end == null || first === undefined) return null;
         if (opaqueControls) {
@@ -312,12 +321,36 @@ function recoverScalarIfDispatches(source, proof, {retainDiagnostics = false, ne
           });
           if (changedTarget) return null;
         }
-        const action = {node, first, end, normal: normal(node), ownExit: node.kind === 'BreakStatement' && targets.get(node) === frame};
+        let writesSelector = false;
+        walk(node, child => {
+          const operand = strip(child.kind === 'AssignmentExpression' ? child.left
+            : child.kind === 'UnaryExpression' && ['++', '--'].includes(child.operator) ? child.expression || child.operand : null);
+          if (operand?.kind === 'Identifier' && operand.name === name) writesSelector = true;
+        });
+        const action = {node, first, end, normal: normal(node), writesSelector,
+          ownExit: node.kind === 'BreakStatement' && targets.get(node) === frame};
         actions.push(action); return {action: actions.length - 1};
       }
       normal(dispatch);
       const tree = build(dispatch);
       if (!tree || invalid || conditions.length < 3 || conditions.length > 32 || actions.length > 128) continue;
+      // A local can be reused as scratch inside an action after classification.
+      // Propagate later classifier tests backward through normal completions.
+      // An action that may write before such a test must retain the old ladder.
+      let unsafeWrite = false;
+      function laterTests(tree, following) {
+        if (tree.action !== undefined) {
+          const action = actions[tree.action];
+          if (action.writesSelector && action.normal && following) unsafeWrite = true;
+          return action.normal && following;
+        }
+        if (tree.test) {laterTests(tree.yes, following);laterTests(tree.no, following);return true;}
+        let next = following;
+        for (let index = tree.sequence.length - 1; index >= 0; index--) next = laterTests(tree.sequence[index], next);
+        return next;
+      }
+      laterTests(tree, false);
+      if (unsafeWrite) continue;
       function path(tree, value, result) {
         if (tree.action !== undefined) {
           result.push(tree.action); return actions[tree.action].normal;

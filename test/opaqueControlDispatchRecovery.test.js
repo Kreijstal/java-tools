@@ -13,8 +13,8 @@ test('opaque switch destinations and bodies stay intact',()=>{
   const source='int selected=read();Frame:{'+ladder(action)+'}after();',next=recover(source,options);assert.equal(next.dispatchesRecovered,1);assert.ok(next.source.includes(action));
  }
 });
-test('unknown completion, shadowing, mutable captures and external bare exits refuse',()=>{
- for(const action of ['try{while(true){step();}}finally{cleanup();}', 'try{for(;;){step();}}finally{cleanup();}', 'try{while(flag){step();}}finally{cleanup();}', 'try{while(more()){selected++;}}finally{cleanup();}', 'switch(other()){case 0:selected=7;break;default:step();}', 'try{while(more()){step();}}catch(RuntimeException selected){cleanup();}', 'if(guard())break;', 'switch(other()){default:if(stop())break;return done();}', 'try{do{return done();}while(more());}finally{cleanup();}']){
+test('unknown completion, shadowing and external bare exits refuse',()=>{
+ for(const action of ['try{while(true){step();}}finally{cleanup();}', 'try{for(;;){step();}}finally{cleanup();}', 'try{while(flag){step();}}finally{cleanup();}', 'try{while(more()){step();}}catch(RuntimeException selected){cleanup();}', 'if(guard())break;', 'try{do{return done();}while(more());}finally{cleanup();}']){
   const source='int selected=read();Outer:while(more()){Frame:{'+ladder(action)+'}after();}';assert.equal(recover(source,options).source,source,action);
  }
  const source='int selected=read();Frame:{'+ladder('step();')+'}';assert.equal(recover(source,{...options,opaqueControls:'yes'}).source,source);

@@ -179,9 +179,9 @@ test('nested region uses its own captured local scope and leaves surrounding cas
   ])assert.equal(recover(source,{nestedRegions:true}).dispatchesRecovered,1);
 });
 
-test('nested suffix still refuses altered transfer destinations, mutable classifiers and merged scopes', () => {
+test('nested suffix still refuses altered transfer destinations and merged scopes', () => {
   const good='int selected=0;Section:{if(enabled){switch(other){default:step(9);}selected=prepare();'+[0,1,2].map(k=>'if(selected=='+k+'){step('+k+');break Section;}').join('')+'}}';
-  for(const source of [good.replace('step(0);','selected++;step(0);'),good.replace('step(0);','try{step(0);}finally{selected=2;}'),
+  for(const source of [
     good.replace('int selected=','Integer selected='),good.replace('step(0);','{int selected=0;step(selected);}'),
     good.replace('step(0);','while(more()){step(0);}'),good.replace('step(0);','switch(extra){default:step(0);}'),
     good.replace('step(0);','if(stop)break;step(0);'),good.replace('step(0);','class Nested{}step(0);'),

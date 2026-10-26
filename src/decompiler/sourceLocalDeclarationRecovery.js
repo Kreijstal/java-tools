@@ -3,11 +3,12 @@ const {JavaParser}=require('../java-frontend/parser');
 const {tokenizeJava}=require('../java-frontend/lexer');
 const parser=new JavaParser();
 
-// Reuse the default method-body proofs on a pinned, already generated source
+// Reuse default method-body proofs on a pinned, already generated source
 // unit. Only direct type members have global parser offsets: never descend
 // into anonymous/local classes or lambdas parsed from expression substrings.
-function localizeCompilationUnitDeclarations(source,recoverBody) {
-  const counts={bodiesLocalized:0,declarationsMoved:0,declarationsMerged:0,inertStoresRemoved:0};
+function recoverCompilationUnitBodies(source,recoverBody,bodyCounter,counters) {
+  const empty=()=>Object.fromEntries([bodyCounter,...counters].map(key=>[key,0]));
+  const counts=empty();
   const unchanged=()=>({source,...counts});
   if(typeof source!=='string'||/\\u+[0-9a-fA-F]{4}/.test(source))return unchanged();
   let document,tokens;
@@ -42,20 +43,20 @@ function localizeCompilationUnitDeclarations(source,recoverBody) {
       const body=source.slice(start,end),result=recoverBody(body,{reservedNames:(member.parameters||[]).map(p=>p.name)});
       if(result.source===body)continue;
       edits.push({start,end,text:result.source});
-      counts.bodiesLocalized++;counts.declarationsMoved+=result.declarationsMoved;
-      counts.declarationsMerged+=result.declarationsMerged;counts.inertStoresRemoved+=result.inertStoresRemoved;
+      counts[bodyCounter]++;
+      for(const key of counters)counts[key]+=result[key];
     }
   }
   try{for(const type of document.root.typeDeclarations||[])visit(type);}catch(error){
-    if(error instanceof RangeError)return {source,bodiesLocalized:0,declarationsMoved:0,declarationsMerged:0,inertStoresRemoved:0};
+    if(error instanceof RangeError)return {source,...empty()};
     throw error;
   }
   const fragments=[];let cursor=0;
   for(const edit of edits.sort((a,b)=>a.start-b.start)){
-    if(edit.start<cursor)return {source,bodiesLocalized:0,declarationsMoved:0,declarationsMerged:0,inertStoresRemoved:0};
+    if(edit.start<cursor)return {source,...empty()};
     fragments.push(source.slice(cursor,edit.start),edit.text);cursor=edit.end;
   }
   fragments.push(source.slice(cursor));
   return {source:fragments.join(''),...counts};
 }
-module.exports={localizeCompilationUnitDeclarations};
+module.exports={recoverCompilationUnitBodies};
