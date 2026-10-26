@@ -29,7 +29,8 @@ function recoverScalarIfDispatches(source, proof, {retainDiagnostics = false, ne
   }
   function inspect(node, parent, labels = [], breakFrames = [], activeLoops = []) {
     parents.set(node, parent);
-    if (/ClassDeclaration|MethodDeclaration|ConstructorDeclaration|LambdaExpression|AnonymousClass/.test(node.kind || '')) invalid = true;
+    if (/ClassDeclaration|InterfaceDeclaration|EnumDeclaration|RecordDeclaration|MethodDeclaration|ConstructorDeclaration|LambdaExpression|MemberReference|MethodReference|AnonymousClass|Pattern/.test(node.kind || '')
+        || node.kind === 'NewClassExpression' && node.body != null) invalid = true;
     if (['VariableDeclarator', 'FormalParameter'].includes(node.kind)) names.set(node.name, (names.get(node.name) || 0) + 1);
     if (node.kind === 'LocalVariableDeclarationStatement' && parent?.kind === 'BlockStatement'
         && node.variableType?.kind === 'PrimitiveType' && node.variableType.name === 'int' && !node.annotations?.length) {
@@ -116,6 +117,7 @@ function recoverScalarIfDispatches(source, proof, {retainDiagnostics = false, ne
       return final && (body || catches.some(Boolean));
     }
     if (node.kind === 'SynchronizedStatement') return normal(node.body);
+    if (node.kind === 'LabeledStatement') return normal(node.statement) || exitsTarget(node.statement, node);
     if (node.kind === 'SwitchStatement' && opaqueControls) {
       const groups = node.groups || [];
       if (!groups.some(g => g.labels.some(l => l.labelKind === 'default'))) return true;
@@ -123,7 +125,7 @@ function recoverScalarIfDispatches(source, proof, {retainDiagnostics = false, ne
         let reachable = true;
         for (const statement of groups[index].statements) {
           if (!reachable) { invalid = true; return false; }
-          if (exitsSwitch(statement, node)) return true;
+          if (exitsTarget(statement, node)) return true;
           reachable = normal(statement);
         }
         if (reachable && index === groups.length - 1) return true;
@@ -132,24 +134,33 @@ function recoverScalarIfDispatches(source, proof, {retainDiagnostics = false, ne
     }
     return true;
   }
-  // A conditional bare break still completes its own switch. A pending break
-  // overridden by an abrupt finally does not. Nested loops/switches capture
-  // their own bare breaks; labels in candidate actions remain excluded below.
-  function exitsSwitch(node, target) {
+  // A break can complete its exact lexical target, including a plain label.
+  // An abrupt finally can override that pending completion. Keep distinct
+  // targets through nested control frames rather than inferring from spelling.
+  function exitsTarget(node, target) {
     if (!node) return false;
     if (node.kind === 'BreakStatement') return targets.get(node) === target;
     if (node.kind === 'BlockStatement') {
       for (const statement of node.statements) {
-        if (exitsSwitch(statement, target)) return true;
+        if (exitsTarget(statement, target)) return true;
         if (!normal(statement)) break;
       }
       return false;
     }
-    if (node.kind === 'IfStatement') return exitsSwitch(node.consequent, target) || exitsSwitch(node.alternate, target);
-    if (node.kind === 'SynchronizedStatement') return exitsSwitch(node.body, target);
-    if (node.kind === 'TryStatement') return exitsSwitch(node.finallyBlock, target)
+    if (node.kind === 'IfStatement') return exitsTarget(node.consequent, target) || exitsTarget(node.alternate, target);
+    if (node.kind === 'SynchronizedStatement') return exitsTarget(node.body, target);
+    if (node.kind === 'LabeledStatement') return exitsTarget(node.statement, target);
+    if (loops.has(node.kind)) return exitsTarget(node.body, target);
+    if (node.kind === 'SwitchStatement') return (node.groups || []).some(group => {
+      for (const statement of group.statements) {
+        if (exitsTarget(statement, target)) return true;
+        if (!normal(statement)) break;
+      }
+      return false;
+    });
+    if (node.kind === 'TryStatement') return exitsTarget(node.finallyBlock, target)
       || (!node.finallyBlock || normal(node.finallyBlock)) &&
-        (exitsSwitch(node.block, target) || (node.catches || []).some(clause => exitsSwitch(clause.body, target)));
+        (exitsTarget(node.block, target) || (node.catches || []).some(clause => exitsTarget(clause.body, target)));
     return false;
   }
   function comparison(node) {
@@ -166,6 +177,117 @@ function recoverScalarIfDispatches(source, proof, {retainDiagnostics = false, ne
     const number = sign * Number(value.raw);
     if (number < -2147483648 || number > 2147483647) return null;
     return {name: id.name, value: number, equal: (node.operator === '==') !== negate, identifier: id};
+  }
+  const extent = node => {
+    const first = starts.get(node?.range?.startOffset), last = finish(node);
+    return first !== undefined && last !== null && last !== undefined ? {first, last,
+      start: tokens[first].range.startOffset, end: tokens[last].range.endOffset} : null;
+  };
+  function switchShape(node) {
+    if (node?.kind !== 'SwitchStatement') return null;
+    const selector = strip(node.expression), local = locals.get(selector?.name), bounds = extent(node);
+    if (selector?.kind !== 'Identifier' || names.get(selector.name) !== 1 || !local || !bounds
+        || bounds.start < local.start || bounds.end > local.end) return null;
+    const header = closes.get(bounds.first + 1), open = header + 1, close = closes.get(open);
+    if (tokens[open]?.text !== '{' || close !== bounds.last || bounds.end - bounds.start > 40000) return null;
+    const values = new Set(); let defaults = 0;
+    for (const group of node.groups || []) for (const label of group.labels || []) {
+      if (label.separator !== ':') return null;
+      if (label.labelKind === 'default') {if (++defaults > 1) return null;continue;}
+      const value = comparison({kind:'BinaryExpression',operator:'==',left:selector,right:label.expression});
+      if (!value || values.has(value.value)) return null;
+      values.add(value.value);
+    }
+    return values.size <= 64 ? {...bounds, node, name:selector.name, local, open, close, values} : null;
+  }
+  function stableCompletion(node) {
+    let safe = true;
+    walk(node, child => {
+      if (!loops.has(child.kind)) return;
+      if (child.kind === 'EnhancedForStatement') return;
+      let dynamic = false;
+      if (child.condition) walk(child.condition, value => {if (value.kind === 'MethodInvocationExpression') dynamic = true;});
+      if (!dynamic || child.kind === 'DoWhileStatement') safe = false;
+    });
+    return safe;
+  }
+  const sequenceNormal = statements => {
+    let reachable = true;
+    for (const statement of statements) {
+      if (!reachable) {invalid = true;return false;}
+      reachable = normal(statement);
+    }
+    return reachable;
+  };
+  const replaceRegion = (start, end, text, kind) => ({
+    source: (wrapped.slice(0, start) + text + wrapped.slice(end)).slice(2, -2), dispatchesRecovered: 1,
+    ...(retainDiagnostics ? {diagnostics:{kind, regionRange:{start:start-2,end:end-2}}} : {}),
+  });
+  if (opaqueControls && !switchPrefixes) {
+    // The comparison and switch both read one primitive local without any
+    // intervening work. Add the equality arm as a scoped case before all old
+    // cases, so old fallthrough can never enter it. Its source block is kept.
+    let guarded = null;
+    walk(parsed, node => {
+      if (guarded || node.kind !== 'IfStatement' || !node.alternate) return;
+      const test = comparison(node.condition);
+      if (!test) return;
+      const branch = test.equal ? node.alternate : node.consequent,
+        action = test.equal ? node.consequent : node.alternate;
+      const only = branch?.kind === 'BlockStatement' && branch.statements.length === 1 && branch.statements[0];
+      const inner = switchShape(only), outer = extent(node), work = extent(action);
+      if (!inner || inner.name !== test.name || !outer || !work || inner.values.has(test.value)
+          || inner.values.size >= 64 || outer.start < inner.local.start || outer.end > inner.local.end
+          || outer.end - outer.start > 40000 || !stableCompletion(action)) return;
+      let retargeted = false;
+      walk(action, child => {
+        if (child.kind !== 'BreakStatement' || child.label) return;
+        let target = targets.get(child);
+        while (target && target !== action) target = parents.get(target);
+        if (target !== action) retargeted = true;
+      });
+      if (retargeted) return;
+      const completes = normal(action);
+      if (invalid) return;
+      const actionBytes = wrapped.slice(work.start, work.end), scoped = action.kind === 'BlockStatement'
+        ? actionBytes : '{\n' + actionBytes + '\n}';
+      guarded = {outer, text: wrapped.slice(inner.start, tokens[inner.open].range.endOffset)
+        + '\ncase ' + test.value + ': ' + scoped + (completes ? '\nbreak;' : '') + '\n'
+        + wrapped.slice(tokens[inner.open].range.endOffset, inner.end)};
+    });
+    if (guarded && !invalid) return replaceRegion(guarded.outer.start, guarded.outer.end, guarded.text, 'guarded-switch');
+
+    // A default containing only another switch of the same local and its own
+    // outer break is a transparent dispatch layer. Preserve the inner groups
+    // in place, forbid incoming fallthrough and overlapping case values, and
+    // prevent the final inner group from falling into a later outer group.
+    let nested = null;
+    walk(parsed, node => {
+      if (nested) return;
+      const outer = switchShape(node);
+      if (!outer) return;
+      for (const [index, group] of (node.groups || []).entries()) {
+        if (group.labels?.length !== 1 || group.labels[0].labelKind !== 'default' || group.statements?.length !== 2) continue;
+        const [innerNode, exit] = group.statements, inner = switchShape(innerNode), end = extent(exit);
+        if (!inner || inner.name !== outer.name || !end || exit.kind !== 'BreakStatement' || exit.label
+            || targets.get(exit) !== node || [...inner.values].some(value => outer.values.has(value))
+            || inner.values.size + outer.values.size > 64) continue;
+        // Removing the inner switch must not widen any case-sibling binding.
+        if ((innerNode.groups || []).some(g => g.statements.some(s => s.kind === 'LocalVariableDeclarationStatement'))) continue;
+        if (index && sequenceNormal(node.groups[index - 1].statements)) continue;
+        const last = innerNode.groups?.at(-1);
+        if (last && !last.statements.every(stableCompletion)) continue;
+        const completes = last && sequenceNormal(last.statements);
+        if (invalid) return;
+        const before = starts.get(innerNode.range.startOffset) - 1;
+        if (tokens[before]?.text !== ':' || tokens[before - 1]?.text !== 'default') continue;
+        const start = tokens[before - 1].range.startOffset;
+        nested = {start, end:end.end, text:wrapped.slice(tokens[inner.open].range.endOffset, tokens[inner.close].range.startOffset)
+          + (completes ? '\nbreak;' : '')};
+        break;
+      }
+    });
+    if (nested && !invalid) return replaceRegion(nested.start, nested.end, nested.text, 'default-switch');
   }
   if (switchPrefixes) {
     let chosen;
