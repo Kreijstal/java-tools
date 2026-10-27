@@ -214,7 +214,7 @@ class ClosedCompiler {
 
   use(value, kind) {
     if (!value || value.op === 'undef' || !this.live(value)) return zero(kind || value?.kind);
-    if (value.op === 'aconst_null') return NULL_REF;
+    if (value.op === 'aconst_null' || this.reprOf(value) === 'null') return NULL_REF;
     return [OP.local_get, ...uleb(this.localFor(value))];
   }
 
@@ -237,8 +237,10 @@ class ClosedCompiler {
     const ANY = { desc: null, repr: 'any' };
     const ofDesc = (desc) => ({ desc, repr: world.reprOfDescriptor(desc) });
     const join = (a, b) => {
-      if (!a || a.repr === 'null') return b;
-      if (!b || b.repr === 'null') return a;
+      if (!a) return b;
+      if (!b) return a;
+      if (a.repr === 'null') return b;
+      if (b.repr === 'null') return a;
       return { desc: a.desc === b.desc ? a.desc : null, repr: world.reprJoin(a.repr, b.repr) };
     };
     const classDesc = (name) => (name.startsWith('[') ? name : `L${name};`);
@@ -273,19 +275,32 @@ class ClosedCompiler {
       }
     };
     const refs = fn.values.filter((v) => v.kind === 'A');
-    for (let changed = true, rounds = 0; changed; rounds++) {
-      if (rounds > 64) throw new Unsupported('reference types did not settle');
-      changed = false;
-      for (const value of refs) {
-        const next = typeOf(value);
-        const prev = types.get(value.id);
-        if (next && (!prev || prev.repr !== next.repr || prev.desc !== next.desc)) {
-          types.set(value.id, next);
-          changed = true;
+    const settle = () => {
+      for (let changed = true, rounds = 0; changed; rounds++) {
+        if (rounds > 64) throw new Unsupported('reference types did not settle');
+        changed = false;
+        for (const value of refs) {
+          const next = typeOf(value);
+          const prev = types.get(value.id);
+          if (next && (!prev || prev.repr !== next.repr || prev.desc !== next.desc)) {
+            types.set(value.id, next);
+            changed = true;
+          }
         }
       }
+    };
+    settle();
+    // Unseeded phi cycles have no discovered representation. Their values
+    // still occupy anyref locals; treating that absence like a null input
+    // incorrectly narrows downstream phis and emits invalid typed copies.
+    const unresolved = refs.filter(value => !types.has(value.id));
+    if (unresolved.length) {
+      for (const value of unresolved) types.set(value.id, ANY);
+      settle();
     }
-    this.reprs = new Map([...types].map(([id, t]) => [id, t.repr === 'null' ? 'any' : t.repr]));
+    // A proven null-only phi can be emitted as the reference bottom type,
+    // rather than read from an anyref local on a typed incoming edge.
+    this.reprs = new Map([...types].map(([id, t]) => [id, t.repr]));
   }
 
   reprOf(value) { return (value && this.reprs?.get(value.id)) || 'any'; }
