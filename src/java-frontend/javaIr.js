@@ -6708,18 +6708,41 @@ function localSlotWidth(descriptor) {
   return descriptor === 'J' || descriptor === 'D' ? 2 : 1;
 }
 
+// Loop/label lowering copies the context but shares its locals collection.
+// Allocate identities and slots from that method-wide collection: a copied
+// scalar nextSlot must not let a later declaration overwrite a loop local.
+const contextLocalAllocators = new WeakMap();
+function allocateContextLocal(context, name, descriptor, shadowing) {
+  let state = contextLocalAllocators.get(context.locals);
+  if (!state) {
+    state = {nextSlot: 0, ids: new Set()};
+    for (const local of context.locals) {
+      state.ids.add(local.id);
+      if (typeof local.slotHint === 'number') state.nextSlot = Math.max(state.nextSlot, local.slotHint + localSlotWidth(local.descriptor));
+    }
+    contextLocalAllocators.set(context.locals, state);
+  }
+  const base = `local:${name}`;
+  let suffix = context.locals.length, id = shadowing ? `${base}$${suffix}` : base;
+  while (state.ids.has(id)) id = `${base}$${suffix++}`;
+  state.ids.add(id);
+  const slotHint = Math.max(state.nextSlot, context.nextSlot || 0);
+  state.nextSlot = context.nextSlot = slotHint + localSlotWidth(descriptor);
+  return {id, slotHint};
+}
+
 function declareContextLocal(context, name, descriptor, sourceNodeId = null, meta = {}) {
   if (context.localByName.has(name)) {
     return context.localByName.get(name);
   }
-  const local = createJavaIrLocal(`local:${name}`, {
+  const allocation = allocateContextLocal(context, name, descriptor, false);
+  const local = createJavaIrLocal(allocation.id, {
     name,
     descriptor,
-    slotHint: context.nextSlot,
+    slotHint: allocation.slotHint,
     sourceNodeId,
     meta,
   });
-  context.nextSlot += localSlotWidth(descriptor);
   context.locals.push(local);
   context.localByName.set(name, local);
   return local;
@@ -6731,14 +6754,14 @@ function declareShadowingContextLocal(context, name, descriptor, sourceNodeId = 
   // for shadowing declarations (notably nested catches with the same name).
   const suffix = context.locals.length;
   context.nextLocalId = Math.max(context.nextLocalId || 0, suffix + 1);
-  const local = createJavaIrLocal(`local:${name}$${suffix}`, {
+  const allocation = allocateContextLocal(context, name, descriptor, true);
+  const local = createJavaIrLocal(allocation.id, {
     name,
     descriptor,
-    slotHint: context.nextSlot,
+    slotHint: allocation.slotHint,
     sourceNodeId,
     meta,
   });
-  context.nextSlot += localSlotWidth(descriptor);
   context.locals.push(local);
   context.localByName.set(name, local);
   return local;
@@ -7268,7 +7291,11 @@ function lowerStructuredAssignmentMethodInvocation(expression, context, sourceNo
 }
 
 function lowerStatementToJavaIrOps(statement, context) {
-  const ops = lowerStatementToJavaIrOpsInner(statement, context);
+  // A basic for initializer belongs to the loop's scope, including its test,
+  // update and body. Its binding must disappear before following statements.
+  const ops = statement && statement.kind === 'ForStatement'
+    ? withBlockScope(context, () => lowerStatementToJavaIrOpsInner(statement, context))
+    : lowerStatementToJavaIrOpsInner(statement, context);
   // Tag each op with the source line of the statement it was lowered from.
   // Ops lowered from nested statements were already tagged by the recursive
   // call, so only fill in the gaps.
