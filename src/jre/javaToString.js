@@ -15,19 +15,26 @@ function hasCode(method) {
   return !!(method && method.attributes && method.attributes.some((a) => a.type === 'code'));
 }
 
-// The guest toString() a class inherits, or null when it is the JRE's.
+// The toString() a class inherits: { className, method } for a guest
+// override, { native } for a JRE class's own, or null for Object's.
 // Instances only exist for loaded classes, so the walk never loads one.
 function guestToString(jvm, type) {
   const cache = jvm._guestToStringCache || (jvm._guestToStringCache = new Map());
   if (cache.has(type)) return cache.get(type);
   let found = null;
+  // A JRE class's own toString() (Throwable's, say) converts synchronously;
+  // Object's is left to the native's fallback.
+  const jre = (name) => {
+    const native = jvm._jreFindMethod(name, TO_STRING, TO_STRING_DESCRIPTOR);
+    return native && native !== jvm._jreFindMethod('java/lang/Object', TO_STRING, TO_STRING_DESCRIPTOR) ? { native } : null;
+  };
   for (let name = type; name;) {
     const classData = jvm.classes && jvm.classes[name];
     const cls = classData && classData.ast && classData.ast.classes && classData.ast.classes[0];
-    if (!cls) break;
+    if (!cls) { found = jre(name); break; }
     const method = jvm.findMethod(classData, TO_STRING, TO_STRING_DESCRIPTOR);
     if (method) {
-      if (hasCode(method)) found = { className: name, method };
+      found = hasCode(method) ? { className: name, method } : jre(name);
       break;
     }
     name = cls.superClassName;
@@ -45,6 +52,7 @@ function withJavaString(jvm, value, fallback, thread, then) {
   const target = value !== null && typeof value === 'object' && typeof value.type === 'string' &&
     value.type[0] !== '[' ? guestToString(jvm, value.type) : null;
   if (!target) return then(value === null || value === undefined ? 'null' : fallback(value), null);
+  if (target.native) return then(fallback(target.native(jvm, value, [])), null);
   const t = thread || jvm.threads[jvm.currentThreadIndex] || jvm.threads[0];
   const callingFrame = t.callStack.peek();
   const frame = new Frame(target.method);

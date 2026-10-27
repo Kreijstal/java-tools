@@ -6,10 +6,13 @@ function javaString(value) {
 }
 
 function throwableMessage(jvm, throwable) {
+  // Java: cause == null ? null : cause.toString().
   if (!throwable) return null;
-  if (throwable.message) return throwable.message;
-  const className = String(throwable.type || throwable.constructor && throwable.constructor.name || 'java/lang/Throwable').replace(/\//g, '.');
-  return jvm.internString(className);
+  const className = String(throwable.type || 'java/lang/Throwable').replace(/\//g, '.');
+  const message = throwable.message;
+  if (message === null || message === undefined) return jvm.internString(className);
+  const text = message && Object.prototype.hasOwnProperty.call(message, 'value') ? String(message.value) : String(message);
+  return jvm.internString(`${className}: ${text}`);
 }
 
 function messageValue(message) {

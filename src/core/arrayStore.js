@@ -12,8 +12,15 @@ function javaName(className) {
   return className ? className.replace(/\//g, '.') : 'java.lang.Object';
 }
 
+// The element class as an internal name ('Sprite', '[I'). multianewarray
+// rows record the descriptor form ('LSprite;'), other arrays the internal
+// name.
 function elementTypeOf(array) {
-  if (array.elementType !== undefined) return array.elementType;
+  const recorded = array.elementType;
+  if (typeof recorded === 'string') {
+    return recorded[0] === 'L' && recorded[recorded.length - 1] === ';' ? recorded.slice(1, -1) : recorded;
+  }
+  if (recorded !== undefined) return recorded;
   const type = array.type;
   if (typeof type !== 'string' || type[0] !== '[') return undefined;
   if (type[1] === 'L') return type.slice(2, -1);
@@ -40,7 +47,7 @@ function arrayStoreOk(jvm, array, value) {
 
 function checkArrayStore(jvm, array, value) {
   if (!arrayStoreOk(jvm, array, value)) {
-    throw { type: 'java/lang/ArrayStoreException', message: javaName(runtimeClassOf(value)) };
+    throw { type: 'java/lang/ArrayStoreException', message: jvm.internString(javaName(runtimeClassOf(value))) };
   }
 }
 

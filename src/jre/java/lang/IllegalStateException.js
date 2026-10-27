@@ -5,9 +5,13 @@ function messageValue(message) {
 }
 
 function throwableMessage(jvm, throwable) {
+  // Java: cause == null ? null : cause.toString().
   if (!throwable) return null;
-  if (throwable.message) return throwable.message;
-  return jvm.internString(String(throwable.type || 'java/lang/Throwable').replace(/\//g, '.'));
+  const className = String(throwable.type || 'java/lang/Throwable').replace(/\//g, '.');
+  const message = throwable.message;
+  if (message === null || message === undefined) return jvm.internString(className);
+  const text = message && Object.prototype.hasOwnProperty.call(message, 'value') ? String(message.value) : String(message);
+  return jvm.internString(`${className}: ${text}`);
 }
 
 module.exports = {

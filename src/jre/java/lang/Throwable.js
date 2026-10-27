@@ -6,10 +6,13 @@ function javaString(value) {
 }
 
 function throwableMessage(jvm, throwable) {
+  // Java: cause == null ? null : cause.toString().
   if (!throwable) return null;
-  if (throwable.message) return throwable.message;
-  const className = String(throwable.type || throwable.constructor && throwable.constructor.name || 'java/lang/Throwable').replace(/\//g, '.');
-  return jvm.internString(className);
+  const className = String(throwable.type || 'java/lang/Throwable').replace(/\//g, '.');
+  const message = throwable.message;
+  if (message === null || message === undefined) return jvm.internString(className);
+  const text = message && Object.prototype.hasOwnProperty.call(message, 'value') ? String(message.value) : String(message);
+  return jvm.internString(`${className}: ${text}`);
 }
 
 function messageValue(message) {
@@ -23,16 +26,29 @@ function messageValue(message) {
 // frontend match `printStackTrace(System.out)` against the PrintWriter overload
 // and cast a PrintStream to it, which is a ClassCastException the moment the
 // catch block runs.
-function printThrowableTo(sink, obj) {
-  const className = obj.type.replace(/\//g, '.');
-  const message = obj.message;
-  const errorMsg = message ? `${className}: ${messageValue(message)}` : className;
-  if (sink && sink.println) {
-    sink.println(errorMsg);
-    sink.println('\tat <native method>');
-  } else {
-    console.error(errorMsg);
-    console.error('\tat <native method>');
+// Java's printStackTrace text: the throwable and each cause. jvm.js records
+// no frames. A PrintWriter or PrintStream argument is a JRE object, so the
+// lines go through its println; the guest's StringWriter then holds them.
+function stackTraceLines(obj) {
+  const lines = [];
+  const seen = new Set();
+  for (let t = obj; t && !seen.has(t); t = t.cause) {
+    const className = String(t.type).replace(/\//g, '.');
+    const text = t.message === null || t.message === undefined ? className : `${className}: ${messageValue(t.message)}`;
+    lines.push(seen.size === 0 ? text : `Caused by: ${text}`);
+    lines.push('\tat <native method>');
+    seen.add(t);
+  }
+  return lines;
+}
+
+function printThrowableTo(jvm, sink, obj) {
+  const println = sink && typeof sink.println !== 'function' && typeof sink.type === 'string'
+    ? jvm._jreFindMethod(sink.type, 'println', '(Ljava/lang/String;)V') : null;
+  for (const line of stackTraceLines(obj)) {
+    if (sink && typeof sink.println === 'function') sink.println(line);
+    else if (println) println(jvm, sink, [jvm.internString(line)]);
+    else console.error(line);
   }
 }
 
@@ -81,42 +97,14 @@ module.exports = {
         return jvm.internString(className);
       }
     },
-    'printStackTrace()V': (jvm, obj, args) => {
-      const className = obj.type.replace(/\//g, '.');
-      const message = obj.message;
-      if (message) {
-        console.error(`${className}: ${messageValue(message)}`);
-      } else {
-        console.error(className);
-      }
-      // In a real implementation, this would print the full stack trace
-      console.error('\tat <native method>');
+    'printStackTrace()V': (jvm, obj) => {
+      printThrowableTo(jvm, null, obj);
     },
     'printStackTrace(Ljava/io/PrintWriter;)V': (jvm, obj, args) => {
-      const printWriter = args[0];
-      const className = obj.type.replace(/\//g, '.');
-      const message = obj.message;
-      
-      // Create the error message
-      let errorMsg;
-      if (message) {
-        errorMsg = `${className}: ${messageValue(message)}`;
-      } else {
-        errorMsg = className;
-      }
-      
-      // Write to PrintWriter - simplified implementation
-      if (printWriter && printWriter.println) {
-        printWriter.println(errorMsg);
-        printWriter.println('\tat <native method>');
-      } else {
-        // Fallback to console if PrintWriter doesn't have expected methods
-        console.error(errorMsg);
-        console.error('\tat <native method>');
-      }
+      printThrowableTo(jvm, args[0], obj);
     },
     'printStackTrace(Ljava/io/PrintStream;)V': (jvm, obj, args) => {
-      printThrowableTo(args[0], obj);
+      printThrowableTo(jvm, args[0], obj);
     },
     'addSuppressed(Ljava/lang/Throwable;)V': (jvm, obj, args) => {
       const suppressedException = args[0];
