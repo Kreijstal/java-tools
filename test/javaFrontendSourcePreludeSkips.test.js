@@ -103,3 +103,31 @@ test('compileJavaFile against a directory with a huge hidden tree is fast',
     `compile finishes quickly despite the hidden tree (${elapsed} ms)`);
   t.end();
 });
+
+// CI clones Krakatau under tools/, whose test sources use type-annotated
+// bounds (`<T extends @A(5) Cloneable>`) this frontend cannot describe. A
+// batch compile of several roots indexes their common ancestor, so such a
+// file anywhere below it failed every compile. The prelude is best-effort.
+test('an undescribable sibling under the source root does not fail the compile',
+  (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'src-prelude-annotated-'));
+  t.teardown(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(root, 'tools'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'tools', 'Annotated.java'),
+    'import java.lang.annotation.*;\n' +
+    '@Target(ElementType.TYPE_USE) @interface A { int value(); }\n' +
+    'class Annotated<T extends @A(5) Cloneable> { }\n');
+  fs.writeFileSync(path.join(root, 'Probe.java'),
+    'public class Probe { Sibling s; int run() { return s.value; } }\n');
+  fs.writeFileSync(path.join(root, 'Sibling.java'),
+    'public class Sibling { int value; }\n');
+
+  const result = frontend.compileJavaFile(path.join(root, 'Probe.java'), {
+    outputDir: root,
+    sourceRoot: root,
+    sourceFileName: 'Probe.java',
+  });
+  t.equal((result.written || []).length, 1, 'the probe compiles');
+  t.ok(fs.existsSync(path.join(root, 'Probe.class')), 'Probe.class is written');
+  t.end();
+});

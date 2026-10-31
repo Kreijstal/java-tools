@@ -671,7 +671,15 @@ function sourceDirectoryMetadata(sourcePath, sourcePathIsDirectory = false, opti
     }
   }
   for (const document of documents) {
-    for (const declaration of document.root.typeDeclarations || []) collectMembers(document, declaration);
+    for (const declaration of document.root.typeDeclarations || []) {
+      try {
+        collectMembers(document, declaration);
+      } catch (_) {
+        // Best-effort like parsing above: a sibling whose types this frontend
+        // cannot describe (e.g. a type-annotated bound in an unrelated file
+        // under the source root) must not fail the file being compiled.
+      }
+    }
   }
   if (metadataCache) metadataCache.set(directory, metadata);
   return metadata;
