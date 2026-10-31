@@ -471,6 +471,39 @@ function softFillRect(jvm, obj, x, y, w, h) {
   markSoftSurfaceDirty(jvm, obj._component);
 }
 
+// Rasterize horizontal spans, keeping outline spans disjoint so translucent
+// strokes composite each covered pixel once. Browser peers use native paths.
+function softRoundRect(jvm, obj, x, y, w, h, arcWidth, arcHeight, outline) {
+  if (w < 0 || h < 0 || (!outline && (w === 0 || h === 0))) return;
+  const surface = softSurface(jvm, obj);
+  if (!surface) return;
+  let rx = Math.min(w, Math.abs(arcWidth)) / 2;
+  let ry = Math.min(h, Math.abs(arcHeight)) / 2;
+  if (rx === 0 || ry === 0) { rx = 0; ry = 0; }
+  const span = (sampleY, left, top, width, height, radiusX, radiusY, offset) => {
+    if (width <= 0 || height <= 0 || sampleY < top || sampleY >= top + height) return null;
+    const dy = Math.max(top + radiusY - sampleY, sampleY - (top + height - radiusY), 0);
+    const inset = radiusY === 0 ? 0 : radiusX * (1 - Math.sqrt(Math.max(0, 1 - (dy / radiusY) ** 2)));
+    return [Math.max(0, Math.ceil(left + inset - offset)),
+      Math.min(surface.width, Math.ceil(left + width - inset - offset))];
+  };
+  const lastY = Math.min(surface.height, y + h + (outline ? 1 : 0));
+  for (let yy = Math.max(0, y); yy < lastY; yy++) {
+    const outer = outline
+      ? span(yy, x - .5, y - .5, w + 1, h + 1, rx ? rx + .5 : 0, ry ? ry + .5 : 0, 0)
+      : span(yy + .5, x, y, w, h, rx, ry, .5);
+    if (!outer || outer[0] >= outer[1]) continue;
+    const inner = outline && span(yy, x + .5, y + .5, w - 1, h - 1,
+      Math.max(0, rx - .5), Math.max(0, ry - .5), 0);
+    if (inner && inner[0] < inner[1]) {
+      softFillRect(jvm, obj, outer[0], yy, Math.max(0, inner[0] - outer[0]), 1);
+      softFillRect(jvm, obj, inner[1], yy, Math.max(0, outer[1] - inner[1]), 1);
+    } else {
+      softFillRect(jvm, obj, outer[0], yy, outer[1] - outer[0], 1);
+    }
+  }
+}
+
 module.exports = {
   super: 'java/lang/Object',
   isAbstract: true,
@@ -518,6 +551,22 @@ module.exports = {
       softFillRect(jvm, obj, x, y + h, w + 1, 1);
       softFillRect(jvm, obj, x, y, 1, h);
       softFillRect(jvm, obj, x + w, y, 1, h);
+    },
+
+    'fillRoundRect(IIIIII)V': (jvm, obj, args) => {
+      if (obj._awtGraphics) {
+        obj._awtGraphics.fillRoundRect(...args);
+        return;
+      }
+      softRoundRect(jvm, obj, ...args, false);
+    },
+
+    'drawRoundRect(IIIIII)V': (jvm, obj, args) => {
+      if (obj._awtGraphics) {
+        obj._awtGraphics.drawRoundRect(...args);
+        return;
+      }
+      softRoundRect(jvm, obj, ...args, true);
     },
 
     'drawLine(IIII)V': (jvm, obj, args) => {
