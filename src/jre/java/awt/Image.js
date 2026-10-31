@@ -7,7 +7,7 @@ module.exports = {
         return null;
       }
       return {
-        type: 'java/awt/Graphics',
+        type: 'java/awt/Graphics2D',
         _awtGraphics: obj._awtImage.getGraphics()
       };
     },

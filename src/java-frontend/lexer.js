@@ -285,6 +285,15 @@ function tokenizeJava(source) {
         advance();
       }
       const text = source.slice(startOffset, i);
+      if (text.startsWith('.') &&
+          !/^\.[0-9](?:[0-9_]*[0-9])?(?:[eE][+-]?[0-9](?:[0-9_]*[0-9])?)?[fFdD]?$/.test(text)) {
+        diagnostics.push({
+          code: 'JAVA_INVALID_FLOAT_LITERAL',
+          severity: 'error',
+          message: `Invalid floating-point literal: ${text}`,
+          range: makeRange(startOffset, i, startLine, startColumn, line, column),
+        });
+      }
       emit('number', text, startOffset, startLine, startColumn, { value: text });
       continue;
     }

@@ -57,12 +57,12 @@ function graphicsFor(jvm, obj) {
   const context = canvas && canvas.getContext && canvas.getContext('2d');
   if (context) {
     return {
-      type: 'java/awt/Graphics',
+      type: 'java/awt/Graphics2D',
       _awtGraphics: new awtFramework.CanvasGraphics(context),
       _component: obj,
     };
   }
-  return { type: 'java/awt/Graphics', _component: obj };
+  return { type: 'java/awt/Graphics2D', _component: obj };
 }
 
 /**

@@ -21,7 +21,7 @@ test('leading-dot literals and RGB/alpha accessors compile and execute through t
       public static double value;
       public static float fraction;
       public static int red, green, blue, alpha, packed;
-      public static boolean isGraphics2D, rejectsInvalidAlpha;
+      public static boolean isGraphics2D, imageIsGraphics2D, rejectsInvalidAlpha;
       public static void main(String[] args) {
         value = .35;
         value += .5;
@@ -34,6 +34,10 @@ test('leading-dot literals and RGB/alpha accessors compile and execute through t
         isGraphics2D = graphics instanceof Graphics2D;
         Graphics2D g2 = (Graphics2D) graphics;
         g2.setColor(c);
+        Graphics imageGraphics = new Canvas().createImage(2, 1).getGraphics();
+        imageIsGraphics2D = imageGraphics instanceof Graphics2D;
+        Graphics2D imageContext = (Graphics2D) imageGraphics;
+        imageContext.setColor(c);
         try { new Color(1, 2, 3, 256); }
         catch (IllegalArgumentException expected) { rejectsInvalidAlpha = true; }
       }
@@ -50,6 +54,7 @@ test('leading-dot literals and RGB/alpha accessors compile and execute through t
   t.deepEqual(['red', 'green', 'blue', 'alpha'].map(name => fields.get(`${name}:I`)), [54, 124, 223, 165], 'color channels round-trip');
   t.equal(fields.get('packed:I'), (165 << 24) | (54 << 16) | (124 << 8) | 223, 'packed ARGB retains alpha');
   t.equal(fields.get('isGraphics2D:Z'), 1, 'the returned context is a Graphics2D');
+  t.equal(fields.get('imageIsGraphics2D:Z'), 1, 'image graphics can be cast to Graphics2D');
   t.equal(fields.get('rejectsInvalidAlpha:Z'), 1, 'out-of-range alpha throws the Java exception');
   t.end();
 });
@@ -59,5 +64,53 @@ test('the unchanged software cube source compiles', t => {
   const result = javaTools.compileJava(source);
   t.deepEqual(result.artifacts.map(artifact => artifact.internalName), ['Cube3D'], 'the original source emits Cube3D');
   t.ok(result.artifacts[0].bytes.length > 0, 'bytecode is assembled');
+  t.end();
+});
+
+test('malformed leading-dot literals are rejected before bytecode generation', t => {
+  for (const literal of ['.5p+2', '.5L', '.5e', '.5_', '.5fgarbage']) {
+    t.throws(() => javaTools.compileJava(`class Invalid { double value = ${literal}; }`),
+      error => error.code === 'JAVA_INVALID_FLOAT_LITERAL' && Boolean(error.range),
+      `${literal} has a located lexical error`);
+  }
+  t.end();
+});
+
+test('software fills composite alpha, and Swing painting receives Graphics2D', async t => {
+  const source = `import java.awt.*; import javax.swing.*;
+    class PaintPanel extends JPanel {
+      public static boolean received2D;
+      protected void paintComponent(Graphics graphics) {
+        Graphics2D g = (Graphics2D) graphics;
+        received2D = true;
+        g.setColor(new Color(255, 0, 0, 128));
+        g.fillRect(0, 0, 1, 1);
+      }
+    }
+    public class SoftwareAlpha {
+      public static Canvas surface;
+      public static PaintPanel panel;
+      public static void main(String[] args) {
+        surface = new Canvas(); surface.setSize(2, 1);
+        Graphics2D g = (Graphics2D)surface.getGraphics();
+        g.setColor(new Color(0, 0, 255)); g.fillRect(0, 0, 2, 1);
+        g.setColor(new Color(255, 0, 0, 128)); g.fillRect(0, 0, 1, 1);
+        g.setColor(new Color(0, 255, 0, 0)); g.fillRect(0, 0, 2, 1);
+        panel = new PaintPanel(); panel.setSize(2, 1); panel.repaint();
+      }
+    }`;
+  const debug = new BrowserJVMDebug();
+  for (const artifact of javaTools.compileJava(source).artifacts) {
+    debug.fileProvider.virtualFS.set(`${artifact.internalName}.class`, artifact.bytes);
+  }
+  await debug.initialize();
+  await debug.run('SoftwareAlpha');
+  const fields = debug.debugController.jvm.classes.SoftwareAlpha.staticFields;
+  t.deepEqual(Array.from(fields.get('surface:Ljava/awt/Canvas;')._pixels), [0x80007f, 0xff],
+    'source-over blends translucent red over blue and ignores fully transparent green');
+  t.equal(debug.debugController.jvm.classes.PaintPanel.staticFields.get('received2D:Z'), 1,
+    'Swing paintComponent can cast its context to Graphics2D');
+  t.equal(fields.get('panel:LPaintPanel;')._pixels[0], 0x800000,
+    'Swing translucent fill blends over its opaque black software surface');
   t.end();
 });
