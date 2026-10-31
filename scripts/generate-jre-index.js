@@ -51,7 +51,7 @@ jreClasses[className] = relativePath;
 
   // Generate the index.js file content
   const classEntries = Object.entries(jreClasses)
-    .sort(([a], [b]) => a.localeCompare(b)) // Sort for consistent output
+    .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0) // Locale-independent output
     .map(([className, relativePath]) => `  '${className}': require('${relativePath}')`)
     .join(',\n');
 

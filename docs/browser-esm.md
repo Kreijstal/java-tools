@@ -1,6 +1,7 @@
 # Browser imports from source
 
-The package root points to `src/platform/browser-entry.js`. Its `browser` map
+The browser ESM entry is `src/platform/browser-entry.mjs`, which exports the
+existing `browser-entry.js` implementation. Its `browser` map
 supplies the same aliases, polyfills and unavailable Node modules as the site
 build in `config/browser-build.json`. Polyfills are runtime dependencies so
 source-building CDNs can install them.
@@ -46,3 +47,14 @@ revision. Compilation returns class bytes in memory. Multi-file compilation
 accepts a workspace filesystem through `javaTools.compileJavaFiles`.
 Optional networking, audio and worker features still require support from the
 embedding browser environment.
+
+## Validation
+
+```sh
+npx playwright install chromium
+node scripts/test-browser-cdn.mjs 'https://esm.sh/gh/Kreijstal/java-tools@COMMIT?standalone&target=es2022'
+```
+
+The smoke test imports the actual CDN module in Chromium, compiles and executes
+Java, then compiles an applet and verifies a painted canvas pixel. Set
+`BROWSER_EXECUTABLE_PATH` to use an existing Chromium installation.
