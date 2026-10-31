@@ -8,7 +8,6 @@ const { JVM } = require('../core/jvm');
 const Frame = require('../core/frame');
 const DebugController = require('../debug/debugController');
 const BrowserFileProvider = require('../io/BrowserFileProvider');
-const { setFileProvider } = require('../core/classLoader');
 const awtFramework = require('./awt');
 const audioPlatform = require('./audio');
 const legacyPlatform = require('./legacy');
@@ -144,7 +143,6 @@ class BrowserJVMDebug {
   constructor() {
     // Set up browser file provider
     this.fileProvider = new BrowserFileProvider();
-    setFileProvider(this.fileProvider);
     
     // Create the real debug controller with rewind history enabled and classpath set to root
     // Stock Firefox (154) never Ion-compiles a generator whose resume point
@@ -157,6 +155,7 @@ class BrowserJVMDebug {
     // entries run through it; the generator remains for pending
     // continuations.
     this.debugController = new DebugController({
+      fileProvider: this.fileProvider,
       rewindHistorySize: 50, classpath: ['.'],
       // Use the core's short host-turn quantum. A video-frame-sized quantum
       // delays worklet queue reports and PCM delivery beyond refill deadlines;

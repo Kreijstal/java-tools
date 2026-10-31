@@ -2,12 +2,12 @@ const fs = require('fs');
 const { getFileProvider } = require('../../../core/classLoader');
 const { withThrows } = require('../../helpers');
 
-async function loadFile(obj, filePath) {
+async function loadFile(jvm, obj, filePath) {
   obj.path = filePath && filePath.value !== undefined
     ? String(filePath.value)
     : String(filePath);
   try {
-    obj.buffer = await getFileProvider().readFile(obj.path);
+    obj.buffer = await (jvm.fileProvider || getFileProvider()).readFile(obj.path);
   } catch (providerError) {
     if (!fs || typeof fs.readFileSync !== 'function') {
       throw providerError;
@@ -28,11 +28,11 @@ module.exports = {
   super: 'java/io/InputStream',
   methods: {
     '<init>(Ljava/lang/String;)V': withThrows(async (jvm, obj, args) => {
-      await loadFile(obj, args[0]);
+      await loadFile(jvm, obj, args[0]);
     }, ['java/io/FileNotFoundException', 'java/io/IOException']),
 
     '<init>(Ljava/io/File;)V': withThrows(async (jvm, obj, args) => {
-      await loadFile(obj, args[0].path);
+      await loadFile(jvm, obj, args[0].path);
     }, ['java/io/FileNotFoundException', 'java/io/IOException']),
 
     'read()I': (jvm, obj, args) => {
