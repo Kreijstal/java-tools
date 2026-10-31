@@ -122,9 +122,10 @@ function enqueueLegacyDispatch(jvm, dispatch) {
 
 /**
  * Run a guest bytecode method on the current thread and wait for its result.
- * Uses the JVM's reflective-call mechanism so ireturn hands us the value.
+ * Uses the JVM's reflective-call mechanism. Event handlers return a boolean
+ * by default; rawResult preserves object/numeric returns for native callers.
  */
-async function runGuestMethod(jvm, className, method, locals) {
+async function runGuestMethod(jvm, className, method, locals, options = {}) {
   const frame = new Frame(method);
   frame.className = className;
   for (let i = 0; i < locals.length; i++) frame.locals[i] = locals[i];
@@ -144,7 +145,7 @@ async function runGuestMethod(jvm, className, method, locals) {
     thread.reflectiveCallFrame = frame;
     thread.reflectiveCallResolver = (value) => {
       resolved = true;
-      result = !!value;
+      result = options.rawResult ? value : !!value;
     };
     await runFrame(jvm, frame, {
       thread,
