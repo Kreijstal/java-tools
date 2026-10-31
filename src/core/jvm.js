@@ -181,6 +181,7 @@ class JVM {
   }
 
   constructor(options = {}) {
+    this.fileProvider = options.fileProvider || null;
     this.threads = [];
     this.currentThreadIndex = 0;
     this.classes = {}; // className -> { ast, constantPool }
@@ -1929,7 +1930,7 @@ class JVM {
         // A provider that can enumerate its classes (the browser's virtual
         // file system, where there is no directory to read) answers for the
         // entry; otherwise walk the directory.
-        const provider = getFileProvider();
+        const provider = this.fileProvider || getFileProvider();
         if (provider && typeof provider.listClassNames === "function") {
           for (const name of await provider.listClassNames(cp)) names.add(name);
         } else {
@@ -3078,6 +3079,7 @@ class JVM {
   }
 
   async loadClassAsync(classFilePath, options = {}) {
+    options = { ...options, fileProvider: this.fileProvider || options.fileProvider };
     // Try async first, fall back to sync for backwards compatibility
     try {
       const classData = await loadClassByPath(classFilePath, options);

@@ -1,7 +1,7 @@
 {
   "name": "jvm_tools",
   "version": "0.0.1",
-  "main": "index.js",
+  "main": "src/platform/browser-entry.js",
   "bin": {
     "java-tools-jshell": "scripts/jshell.js"
   },
@@ -37,7 +37,8 @@
     "rename-map": "node scripts/apply-rename-map.js",
     "test:cfr": "node node_modules/tape/bin/tape test/cfrIntegration.test.js test/cfrFixtures.test.js test/cfrStructuredFeatures.test.js test/cfrAdditionalFeatures.test.js test/cfrStackOrdering.test.js test/cfrObfuscationGuards.test.js && node test/cfrStateMachineReadability.test.js && node test/cfrInvariantFanout.test.js && node test/cfrExceptionLoopExits.test.js && node test/cfrComplementComparisons.test.js && node test/exceptionRegionSplitting.test.js && node test/cfrNestedLoopSplitting.test.js && node test/cfrPartitionedLocals.test.js && node test/cfrStringBuilderJoins.test.js && node test/structuredFlowVerifier.test.js && node test/javaAstEmitterLoopExits.test.js && node test/exceptionStructurer.test.js && node test/cfrParallelBackedges.test.js && node test/cfrNumericNegation.test.js && node test/cfrFloatingComparisons.test.js",
     "test:krakatau-decompiler": "node scripts/run-krakatau-decompiler-tests.js",
-    "test:java-frontend": "node node_modules/tape/bin/tape test/javaFrontendAst.test.js test/javaFrontendPassManager.test.js test/javaFrontendCfg.test.js test/javaFrontendCfgJoinStubs.test.js test/javaFrontendExpectedPassStubs.test.js test/javaFrontendIr.test.js test/javaFrontendHelloWorldCompile.test.js test/javaFrontendAllJavaCompile.test.js"
+    "test:java-frontend": "node node_modules/tape/bin/tape test/javaFrontendAst.test.js test/javaFrontendPassManager.test.js test/javaFrontendCfg.test.js test/javaFrontendCfgJoinStubs.test.js test/javaFrontendExpectedPassStubs.test.js test/javaFrontendIr.test.js test/javaFrontendHelloWorldCompile.test.js test/javaFrontendAllJavaCompile.test.js",
+    "check:jre-index": "node scripts/generate-jre-index.js --check"
   },
   "keywords": [],
   "author": "kreijstal",
@@ -58,7 +59,12 @@
     "parsimmon": "^1.18.1",
     "puppeteer": "^24.17.0",
     "url": "^0.11.4",
-    "yargs": "^17.7.2"
+    "yargs": "^17.7.2",
+    "buffer": "^6.0.3",
+    "path-browserify": "^1.0.1",
+    "process": "^0.11.10",
+    "stream-browserify": "^3.0.0",
+    "util": "^0.12.5"
   },
   "optionalDependencies": {
     "speaker": "^0.5.5"
@@ -72,15 +78,42 @@
     "ace-builds": "^1.43.2",
     "babel-loader": "^10.0.0",
     "blessed": "^0.1.81",
-    "buffer": "^6.0.3",
     "jsdom": "^26.1.0",
-    "path-browserify": "^1.0.1",
     "playwright": "^1.45.0",
-    "process": "^0.11.10",
-    "stream-browserify": "^3.0.0",
     "tape": "^5.9.0",
-    "util": "^0.12.5",
     "webpack": "^5.101.0",
     "webpack-cli": "^7.0.0"
+  },
+  "browser": {
+    "window": "./src/isomorphic/window.browser.js",
+    "os": "./src/isomorphic/os.browser.js",
+    "path": "path-browserify",
+    "util": "util/util.js",
+    "stream": "stream-browserify",
+    "buffer": "buffer/index.js",
+    "process": "process/browser.js",
+    "url": "url/url.js",
+    "fs": false,
+    "v8": false,
+    "crypto": false,
+    "zlib": false,
+    "dns": false,
+    "net": false,
+    "http": false,
+    "https": false,
+    "node-fetch": false,
+    "speaker": false,
+    "worker_threads": false,
+    "fetch-blob": false,
+    "formdata-polyfill": false,
+    "web-streams-polyfill": false
+  },
+  "module": "src/platform/browser-entry.mjs",
+  "exports": {
+    ".": {
+      "browser": "./src/platform/browser-entry.mjs",
+      "default": "./src/platform/browser-entry.js"
+    },
+    "./*": "./*"
   }
 }

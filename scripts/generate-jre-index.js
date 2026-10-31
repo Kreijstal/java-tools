@@ -33,6 +33,10 @@ function generateJreIndex() {
         walkDirectory(fullPath, `${prefix}${file}/`);
       } else if (file.endsWith('.js') && file !== 'index.js') {
         // Found a JRE class file (include nested classes with '$' but exclude index files)
+        const definition = require(fullPath);
+        const classKeys = ['super', 'methods', 'staticMethods', 'fields', 'staticFields', 'isInterface', 'interfaces'];
+        if (!definition || typeof definition !== 'object' ||
+            !classKeys.some(key => Object.prototype.hasOwnProperty.call(definition, key))) continue;
         const className = `${prefix}${file.slice(0, -3)}`; // Remove .js extension
         const relativePath = `./${prefix}${file}`;
 
@@ -51,13 +55,13 @@ jreClasses[className] = relativePath;
 
   // Generate the index.js file content
   const classEntries = Object.entries(jreClasses)
-    .sort(([a], [b]) => a.localeCompare(b)) // Sort for consistent output
+    .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0) // Locale-independent output
     .map(([className, relativePath]) => `  '${className}': require('${relativePath}')`)
     .join(',\n');
 
   const fileContent = `// NOTE: This file is GENERATED at build time by scripts/generate-jre-index.js
-// DO NOT EDIT MANUALLY - run \`npm run generate-jre-index\` to regenerate
-// This file is .gitignored and regenerated during builds for browser compatibility
+// DO NOT EDIT MANUALLY - run \`node scripts/generate-jre-index.js\` to regenerate
+// This source manifest is tracked so source-only CDN builds can resolve JRE modules.
 
 const jreClasses = {
 ${classEntries}
@@ -65,6 +69,14 @@ ${classEntries}
 
 module.exports = jreClasses;
 `;
+
+  if (process.argv.includes('--check')) {
+    if (fs.readFileSync(OUTPUT_FILE, 'utf8').replace(/\r\n/g, '\n') !== fileContent) {
+      throw new Error('JRE source manifest is stale. Run node scripts/generate-jre-index.js and commit src/jre/index.js.');
+    }
+    console.log('JRE source manifest is current');
+    return;
+  }
 
   // Write the file
   try {

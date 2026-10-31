@@ -370,7 +370,7 @@ async function loadClass(className, classPath) {
 }
 
 async function loadClassByPath(classFilePath, options = {}) {
-  const fileProvider = getFileProvider();
+  const fileProvider = options.fileProvider || getFileProvider();
 
   if (!(await fileProvider.exists(classFilePath))) {
     /* HARDENED: Replaced quiet failure with an explicit error */
@@ -390,7 +390,7 @@ async function loadClassByPath(classFilePath, options = {}) {
 
 // Synchronous versions for backwards compatibility with existing Node.js code
 function loadClassByPathSync(classFilePath, options = {}) {
-  const fileProvider = getFileProvider();
+  const fileProvider = options.fileProvider || getFileProvider();
   
   // For Node.js FileProvider, use sync methods
   /* HARDENED: Removed defensive check */

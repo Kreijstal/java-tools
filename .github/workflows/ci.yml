@@ -7,6 +7,16 @@ on:
     branches: ["*"]
 
 jobs:
+  jre-source-manifest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - run: npm ci --ignore-scripts --omit=optional
+      - run: node scripts/generate-jre-index.js --check
+
   browser-source-consumer:
     runs-on: ubuntu-latest
     strategy:
