@@ -38,6 +38,7 @@ const jreClasses = {
   'java/awt/FontMetrics': require('./java/awt/FontMetrics.js'),
   'java/awt/Frame': require('./java/awt/Frame.js'),
   'java/awt/Graphics': require('./java/awt/Graphics.js'),
+  'java/awt/Graphics2D': require('./java/awt/Graphics2D.js'),
   'java/awt/GraphicsDevice': require('./java/awt/GraphicsDevice.js'),
   'java/awt/GraphicsEnvironment': require('./java/awt/GraphicsEnvironment.js'),
   'java/awt/GridLayout': require('./java/awt/GridLayout.js'),

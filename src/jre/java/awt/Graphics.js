@@ -447,11 +447,26 @@ function softFillRect(jvm, obj, x, y, w, h) {
   const surface = softSurface(jvm, obj);
   if (!surface) return;
   const rgb = obj._softColor || 0;
+  const alpha = obj._softAlpha === undefined ? 255 : obj._softAlpha;
+  if (alpha === 0) return;
   const x0 = Math.max(0, x | 0), y0 = Math.max(0, y | 0);
   const x1 = Math.min(surface.width, (x + w) | 0), y1 = Math.min(surface.height, (y + h) | 0);
   for (let yy = y0; yy < y1; yy++) {
     const row = yy * surface.width;
-    for (let xx = x0; xx < x1; xx++) surface.pixels[row + xx] = rgb;
+    if (alpha === 255) {
+      for (let xx = x0; xx < x1; xx++) surface.pixels[row + xx] = rgb;
+    } else {
+      // Software component surfaces are opaque RGB. Composite source alpha
+      // over the existing destination, keeping the opaque path unchanged.
+      const inverseAlpha = 255 - alpha;
+      for (let xx = x0; xx < x1; xx++) {
+        const destination = surface.pixels[row + xx];
+        const r = Math.round((((rgb >>> 16) & 255) * alpha + ((destination >>> 16) & 255) * inverseAlpha) / 255);
+        const g = Math.round((((rgb >>> 8) & 255) * alpha + ((destination >>> 8) & 255) * inverseAlpha) / 255);
+        const b = Math.round(((rgb & 255) * alpha + (destination & 255) * inverseAlpha) / 255);
+        surface.pixels[row + xx] = (r << 16) | (g << 8) | b;
+      }
+    }
   }
   markSoftSurfaceDirty(jvm, obj._component);
 }
@@ -474,6 +489,8 @@ module.exports = {
     'setColor(Ljava/awt/Color;)V': (jvm, obj, args) => {
       const colorObj = args[0];
       obj._softColor = colorToRgb(colorObj);
+      const color = colorObj && (colorObj.value !== undefined ? colorObj.value : colorObj);
+      obj._softAlpha = color && typeof color === 'object' && color.a !== undefined ? color.a : 255;
       const graphicsContext = obj._awtGraphics;
       if (graphicsContext && graphicsContext.setColor && colorObj) {
         const colorValue = (colorObj.value !== undefined) ? colorObj.value : colorObj;

@@ -1470,6 +1470,12 @@ function writeClassFilesFromModel(classFileModel, outputDir, options = {}) {
 }
 
 function compileJavaAst(document, options = {}) {
+  const lexicalError = (document.diagnostics || []).find(diagnostic => diagnostic.severity === 'error');
+  if (lexicalError) {
+    throw new JavaFrontendError(lexicalError.message, {
+      code: lexicalError.code, phase: 'compile', range: lexicalError.range,
+    });
+  }
   const { lowerAstToJavaIr } = require('./javaIr');
   const { javaIrToJvmBytecodeIr } = require('./jvmBytecodeIr');
   const javaIr = lowerAstToJavaIr(document, options);
