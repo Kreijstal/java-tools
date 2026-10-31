@@ -9,6 +9,13 @@ public class SemNumberLibrary {
     try { return String.valueOf(op.getAsLong()); } catch (ArithmeticException e) { return "AE:" + e.getMessage(); }
   }
 
+  // Long.divideUnsigned/remainderUnsigned by zero say "BigInteger divide by
+  // zero" on JDK 8/11 and "/ by zero" on 17+ (and the message depends on the
+  // dividend's sign on 11), so only the exception is compared.
+  static String unsignedLong(java.util.function.LongSupplier op) {
+    try { return String.valueOf(op.getAsLong()); } catch (ArithmeticException e) { return "AE"; }
+  }
+
   public static void main(String[] args) {
     int[] ints = {0, 1, -1, 7, -7, 3, Integer.MAX_VALUE, Integer.MIN_VALUE, 0x12345678, 0x80000001};
     long[] longs = {0L, 1L, -1L, 7L, -7L, Long.MAX_VALUE, Long.MIN_VALUE, 0x123456789abcdefL, 1L << 40};
@@ -34,7 +41,7 @@ public class SemNumberLibrary {
         .append(Long.toOctalString(a)).append(',').append(Long.highestOneBit(a)).append(',')
         .append(Long.lowestOneBit(a)).append(',').append(Long.signum(a)).append(' ');
       for (long b : new long[] {1L, -1L, 3L, -3L, 0L, Long.MIN_VALUE}) {
-        sb.append(exactLong(() -> Long.divideUnsigned(a, b))).append('/').append(exactLong(() -> Long.remainderUnsigned(a, b)))
+        sb.append(unsignedLong(() -> Long.divideUnsigned(a, b))).append('/').append(unsignedLong(() -> Long.remainderUnsigned(a, b)))
           .append('/').append(Long.compareUnsigned(a, b)).append('/').append(exactLong(() -> Math.addExact(a, b)))
           .append('/').append(exactLong(() -> Math.multiplyExact(a, b))).append('/').append(exactLong(() -> Math.floorDiv(a, b))).append(' ');
       }

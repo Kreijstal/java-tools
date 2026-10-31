@@ -101,6 +101,9 @@ run_test() {
     */cfrParallelBackedges.test.js|*/cfrPartitionedLocals.test.js|*/cfrStateMachineReadability.test.js|\
     */complementedRelationRecovery.test.js|*/guardedNestedArrayLoops.test.js|*/javaAstEmitterLoopExits.test.js)
       timeout_cmd=(timeout 300);;
+    # 11-13 s alone on a loaded 16-core machine; the 15 s default killed both
+    # in a full run.
+    */javaAstEmitterTrailingLoops.test.js|*/pyramidAppletRoundTrip.test.js) timeout_cmd=(timeout 120);;
     # Add other special cases here
   esac
 
