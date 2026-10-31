@@ -25,6 +25,7 @@ const { buildSsa, resolveHandlerRanges } = require('../../analysis/opgraph/ssa')
 const { VT, OP, GC, ModuleBuilder, structType, subType, refNull, ref, uleb, sleb } = require('./wasmBuilder');
 const { closedTypes, OBJ_FIELDS, T_OBJ, T_PARR, T_RARR, T_REFS } = require('./representation');
 const { ClosedCompiler, Unsupported, WT } = require('./ClosedCompiler');
+const preparationCache = require('./preparationCache');
 const { ASYNC_METHOD_SENTINEL } = require('../../core/constants');
 const {yieldToEventLoop, hostPaintsBetweenTasks} = require('../../core/hostYield');
 
@@ -79,6 +80,10 @@ class ClosedWorld {
     this.buildPromise = null;
     this.preparation = null;
     this.preparationYieldAt = 0;
+    this.cacheIdentity = null;
+    this.preparationCache = preparationCache.browserCache();
+    this.cacheStatus = {status: 'unavailable'};
+    this.bindingEvents = [];
     this.counters = { entries: 0, entryFallbacks: 0, notReady: 0, preempted: 0 };
     this.sliceStart = 0;
     this.thread = null;
@@ -113,6 +118,7 @@ class ClosedWorld {
   stats() {
     return {
       built: this.built,
+      cache: this.cacheStatus,
       building: this.building,
       preparation: this.preparation,
       admitted: this.entries.size,
@@ -344,26 +350,32 @@ class ClosedWorld {
     return key;
   }
 
-  siteImport(key, params, results, impl) {
-    if (!this.imports.has(key)) this.imports.set(key, { field: key, params, results, impl });
+  siteImport(key, params, results, impl, binding = null) {
+    if (!this.imports.has(key)) this.imports.set(key, { field: key, params, results, impl, binding });
     return key;
   }
 
   // An import that never throws: bound directly, with no conversion wrapper.
-  pureImport(key, params, results, impl) {
-    if (!this.imports.has(key)) this.imports.set(key, { field: key, params, results, impl, pure: true });
+  pureImport(key, params, results, impl, binding = null) {
+    if (!this.imports.has(key)) this.imports.set(key, { field: key, params, results, impl, pure: true, binding });
     return key;
   }
 
   // A static field the module defines (and exports for its cell to rebind to).
-  staticGlobal(key, valtype, cell) {
+  staticGlobal(key, valtype, cell, binding = null) {
     this.staticGlobals ||= new Map();
-    if (!this.staticGlobals.has(key)) this.staticGlobals.set(key, { valtype, cell });
+    if (!this.staticGlobals.has(key)) {
+      this.staticGlobals.set(key, { valtype, cell });
+      this.bindingEvents.push({kind:'static', key, valtype, binding});
+    }
     return key;
   }
 
-  globalImport(key, valtype, mutable, value) {
-    if (!this.globalImports.has(key)) this.globalImports.set(key, { valtype, mutable, value });
+  globalImport(key, valtype, mutable, value, binding = null) {
+    if (!this.globalImports.has(key)) {
+      this.globalImports.set(key, { valtype, mutable, value });
+      this.bindingEvents.push({kind:'global', key, valtype, mutable, binding});
+    }
     return key;
   }
 
@@ -476,7 +488,7 @@ class ClosedWorld {
     return this.siteImport(`exc:${type}`, [VT.anyref], [VT.i32], (payload) => {
       const exception = runtime.toJs(payload);
       return exception && jvm.isInstanceOf(exception.type, type) ? 1 : 0;
-    });
+    }, {kind:'exception', type});
   }
 
   // A host import's JS throw as a module exception. Internal JS errors stay
@@ -726,7 +738,7 @@ class ClosedWorld {
             return null;
           }
           return value;
-        });
+        }, {kind:'native', descriptor, hasReceiver});
       }
     }
     const { params, ret } = parseMethodDescriptor(descriptor);
@@ -741,7 +753,7 @@ class ClosedWorld {
       const result = native(jvm, receiver, args, world.thread);
       return world.hostResult(retKind, result, key, ret);
     };
-    return this.siteImport(key, wasmParams, retKind === 'V' ? [] : [WT[retKind]], impl);
+    return this.siteImport(key, wasmParams, retKind === 'V' ? [] : [WT[retKind]], impl, {kind:'native', descriptor, hasReceiver});
   }
 
   // ---- admission ----------------------------------------------------------
@@ -797,6 +809,7 @@ class ClosedWorld {
         methods.push({className, method, key});
       }
     }
+    if (await preparationCache.restore(this, methods, thread)) return;
     this.reportPreparation('closed-analysis', 0, methods.length);
     for (let index = 0; index < methods.length; index++) {
       const {className, method, key} = methods[index];
@@ -946,7 +959,7 @@ class ClosedWorld {
     if (record.synchronized && isStatic) {
       const mirror = this.jvm.getClassObjectSync?.(className);
       if (!mirror) return this.reject(key, 'synchronized-static-mirror');
-      record.lockGlobal = this.globalImport(`k:${this.globalImports.size}`, [VT.externref], false, mirror);
+      record.lockGlobal = this.globalImport(`k:${this.globalImports.size}`, [VT.externref], false, mirror, {kind:'class', name:className});
     }
     try {
       for (const blockId of fn.reachable) {
@@ -1002,7 +1015,7 @@ class ClosedWorld {
         if (!cell.closedGlobal) throw new Unsupported(`static-not-closed: ${declaring}.${name}`);
         const valueKind = kindOf(descriptor);
         const valtype = cell.closedType === 'anyref' ? this.wasmType('A', this.reprOfDescriptor(descriptor)) : [WT[valueKind]];
-        const global = this.staticGlobal(`s:${declaring}.${name}:${descriptor}`, valtype, cell);
+        const global = this.staticGlobal(`s:${declaring}.${name}:${descriptor}`, valtype, cell, {owner:declaring, name, descriptor});
         record.initClasses.add(declaring);
         plan.set(node.id, { kind: op === 'getstatic' ? 'static-get' : 'static-put', global, valueKind,
           initClass: this.initCheckFor(record, declaring) });
@@ -1021,33 +1034,25 @@ class ClosedWorld {
         }
         if (this.isGuestClass(className) && !this.runtime.layout(className)) throw new Unsupported(`new-without-layout: ${className}`);
         record.initClasses.add(className);
-        const jit = this.jit;
-        const fn = this.siteImport(`new:${className}`, [], [VT.anyref],
-          () => this.runtime.toWasm(jit.allocateObject(className)));
+        const fn = this.allocationImport('object', className);
         plan.set(node.id, { kind: 'import', fn, argKinds: [], initClass: this.initCheckFor(record, className) });
         return;
       }
       case 'newarray': {
         const atype = typeof imm === 'number' ? NEWARRAY[imm] : imm;
-        const desc = { boolean: '[Z', byte: '[B', char: '[C', short: '[S', int: '[I', long: '[J', float: '[F', double: '[D' }[atype];
-        const runtime = this.runtime;
-        const fn = this.siteImport(`newarray:${atype}`, [VT.i32], [VT.anyref], (count) => runtime.newPrimitiveArray(desc, count));
+        const fn = this.allocationImport('primitive', atype);
         plan.set(node.id, { kind: 'import', fn, argKinds: ['I'] });
         return;
       }
       case 'anewarray': {
-        const { allocReferenceArray } = require('../../instructions/object');
-        const fn = this.siteImport(`anewarray:${imm}`, [VT.i32], [VT.anyref],
-          (count) => this.runtime.toWasm(allocReferenceArray(this.jvm, imm, count)));
+        const fn = this.allocationImport('reference', imm);
         plan.set(node.id, { kind: 'import', fn, argKinds: ['I'] });
         return;
       }
       case 'multianewarray': {
         const className = Array.isArray(imm) ? imm[0] : imm;
         const dims = node.args.length;
-        const { allocMultiArray } = require('../../instructions/object');
-        const fn = this.siteImport(`multianewarray:${className}:${dims}`, new Array(dims).fill(VT.i32), [VT.anyref],
-          (...counts) => this.runtime.toWasm(allocMultiArray(this.jvm, className, counts)));
+        const fn = this.allocationImport('multi', className, dims);
         plan.set(node.id, { kind: 'import', fn, argKinds: new Array(dims).fill('I') });
         return;
       }
@@ -1062,14 +1067,14 @@ class ClosedWorld {
       case 'ldc': case 'ldc_w': {
         if (typeof imm === 'string' || imm instanceof String) {
           const value = this.jvm.internString(String(imm));
-          const global = this.globalImport(`k:${this.globalImports.size}`, [VT.externref], false, value);
+          const global = this.globalImport(`k:${this.globalImports.size}`, [VT.externref], false, value, {kind:'string', value:String(imm)});
           plan.set(node.id, { kind: 'constant-global', global });
           return;
         }
         if (Array.isArray(imm) && imm[0] === 'Class') {
           const mirror = this.jvm.getClassObjectSync?.(imm[1]);
           if (!mirror) throw new Unsupported(`ldc-class: ${imm[1]}`);
-          const global = this.globalImport(`k:${this.globalImports.size}`, [VT.externref], false, mirror);
+          const global = this.globalImport(`k:${this.globalImports.size}`, [VT.externref], false, mirror, {kind:'class', name:imm[1]});
           plan.set(node.id, { kind: 'constant-global', global });
           return;
         }
@@ -1164,34 +1169,39 @@ class ClosedWorld {
         if (native) { this.rejectAsyncNative(native, `${current}.${name}${descriptor}`); break; }
         current = this.jvm.jre?.[current]?.super || this.classAst(current)?.superClassName || null;
       }
-      const world = this;
-      const { resolveVirtualHost } = this;
-      const { runtimeClassName } = (this.objectInstructions ||= require('../../instructions/object'));
-      // Resolution depends only on the receiver's class.
-      const byClass = new Map();
-      hostFn = this.siteImport(`vhost:${owner}.${name}${descriptor}`, argKinds.map((k) => WT[k]),
-        returnKind === 'V' ? [] : [WT[returnKind]], (...wasmArgs) => {
-          const receiver = world.runtime.toJs(wasmArgs[0]);
-          if (receiver === null || receiver === undefined) throw { type: 'java/lang/NullPointerException', message: null };
-          const className = runtimeClassName(receiver);
-          let native = byClass.get(className);
-          if (native === undefined) {
-            native = resolveVirtualHost.call(world, receiver, owner, name, descriptor);
-            if (className !== undefined) byClass.set(className, native);
-          }
-          if (!native) {
-            if (fallbackFn) return world.parkBytecodeInvoke(siteId, wasmArgs);
-            throw new ClosedWorldError(`closed world: no host implementation of ${owner}.${name}${descriptor} for ${className}`);
-          }
-          const args = params.map((p, i) => world.toJsValue(kindOf(p), wasmArgs[i + 1]));
-          const result = native(world.jvm, receiver, args, world.thread);
-          return world.hostResult(returnKind, result, `${owner}.${name}${descriptor}`, descriptor.slice(descriptor.lastIndexOf(')') + 1));
-        });
+      hostFn = this.virtualHostImport(owner, name, descriptor, argKinds, returnKind, siteId, !!fallbackFn);
     }
     record.plan.set(node.id, {
       kind: 'virtual', argKinds, returnKind, siteId, hostFn, fallbackFn,
       targets: [...arms].map(([fn, classIds]) => ({ fn, classIds })),
     });
+  }
+
+  virtualHostImport(owner, name, descriptor, argKinds, returnKind, siteId, fallbackFn) {
+    const { params } = parseMethodDescriptor(descriptor);
+    const world = this;
+    const { resolveVirtualHost } = this;
+    const { runtimeClassName } = (this.objectInstructions ||= require('../../instructions/object'));
+    // Resolution depends only on the receiver's class.
+    const byClass = new Map();
+    return this.siteImport(`vhost:${owner}.${name}${descriptor}`, argKinds.map((k) => WT[k]),
+      returnKind === 'V' ? [] : [WT[returnKind]], (...wasmArgs) => {
+        const receiver = world.runtime.toJs(wasmArgs[0]);
+        if (receiver === null || receiver === undefined) throw { type: 'java/lang/NullPointerException', message: null };
+        const className = runtimeClassName(receiver);
+        let native = byClass.get(className);
+        if (native === undefined) {
+          native = resolveVirtualHost.call(world, receiver, owner, name, descriptor);
+          if (className !== undefined) byClass.set(className, native);
+        }
+        if (!native) {
+          if (fallbackFn) return world.parkBytecodeInvoke(siteId, wasmArgs);
+          throw new ClosedWorldError(`closed world: no host implementation of ${owner}.${name}${descriptor} for ${className}`);
+        }
+        const args = params.map((p, i) => world.toJsValue(kindOf(p), wasmArgs[i + 1]));
+        const result = native(world.jvm, receiver, args, world.thread);
+        return world.hostResult(returnKind, result, `${owner}.${name}${descriptor}`, descriptor.slice(descriptor.lastIndexOf(')') + 1));
+      }, {kind:'virtual-host', owner, name, descriptor, argKinds, returnKind, siteId, fallback:!!fallbackFn});
   }
 
   // java.lang.Math/StrictMath without the shim adapter. Native Wasm where
@@ -1209,17 +1219,17 @@ class ClosedWorld {
     if ((name === 'sin' || name === 'cos') && descriptor === '(D)D') {
       // fdlibm in Wasm (fdlibm.js), bit-identical to the JS builtin; huge
       // arguments still reach the builtin through the pure import.
-      this.pureImport(`math:${name}`, [VT.f64], [VT.f64], Math[name]);
+      this.pureImport(`math:${name}`, [VT.f64], [VT.f64], Math[name], {kind:'math', name});
       (this.trigFunctions ||= new Set()).add(name);
       return { kind: 'call', fn: `fdlibm:${name}` };
     }
     const unary = ['sin', 'cos', 'tan', 'asin', 'acos', 'atan', 'exp', 'log', 'log10', 'cbrt', 'sinh', 'cosh', 'tanh', 'expm1', 'log1p'];
     const binary = ['atan2', 'pow', 'hypot'];
     if (descriptor === '(D)D' && unary.includes(name)) {
-      return { kind: 'import', fn: this.pureImport(`math:${name}`, [VT.f64], [VT.f64], Math[name]) };
+      return { kind: 'import', fn: this.pureImport(`math:${name}`, [VT.f64], [VT.f64], Math[name], {kind:'math', name}) };
     }
     if (descriptor === '(DD)D' && binary.includes(name)) {
-      return { kind: 'import', fn: this.pureImport(`math:${name}`, [VT.f64, VT.f64], [VT.f64], Math[name]) };
+      return { kind: 'import', fn: this.pureImport(`math:${name}`, [VT.f64, VT.f64], [VT.f64], Math[name], {kind:'math', name}) };
     }
     return null;
   }
@@ -1242,7 +1252,7 @@ class ClosedWorld {
     const { argKinds, returnKind } = this.sites[siteId].invoke;
     const world = this;
     return this.siteImport(`vslow:${siteId}`, argKinds.map((k) => WT[k]), returnKind === 'V' ? [] : [WT[returnKind]],
-      (...wasmArgs) => world.parkBytecodeInvoke(siteId, wasmArgs));
+      (...wasmArgs) => world.parkBytecodeInvoke(siteId, wasmArgs), {kind:'bytecode-invoke', siteId});
   }
 
   // Park, then run the site's own invoke instruction in a one-instruction
@@ -1278,12 +1288,7 @@ class ClosedWorld {
     if (/^\[[ZBCSIJFD]$/.test(target)) {
       return { kind: isCast ? 'checkcast' : 'instanceof', primitiveKind: require('./representation').KIND[target], siteId };
     }
-    const jvm = this.jvm, runtime = this.runtime;
-    const { runtimeClassName } = require('../../instructions/object');
-    const hostFn = this.siteImport(`isa:${target}`, [VT.anyref], [VT.i32], (value) => {
-      const object = runtime.toJs(value);
-      return object !== null && object !== undefined && jvm.isInstanceOfSync(runtimeClassName(object), target) ? 1 : 0;
-    });
+    const hostFn = this.instanceOfImport(target);
     const plan = { kind: isCast ? 'checkcast' : 'instanceof', hostFn, siteId };
     if (this.isGuestClass(target)) {
       // A class target tests the receiver's struct type, which every later
@@ -1298,6 +1303,31 @@ class ClosedWorld {
       if (classIds.length <= 32) return { ...plan, classIds };
     }
     return plan;
+  }
+
+  instanceOfImport(target) {
+    const jvm = this.jvm, runtime = this.runtime;
+    const { runtimeClassName } = require('../../instructions/object');
+    return this.siteImport(`isa:${target}`, [VT.anyref], [VT.i32], (value) => {
+      const object = runtime.toJs(value);
+      return object !== null && object !== undefined && jvm.isInstanceOfSync(runtimeClassName(object), target) ? 1 : 0;
+    }, {kind:'instanceof', target});
+  }
+
+  allocationImport(kind, name, dims = 1) {
+    const binding = {kind:'allocation', allocation:kind, name, dims};
+    if (kind === 'object') return this.siteImport(`new:${name}`, [], [VT.anyref],
+      () => this.runtime.toWasm(this.jit.allocateObject(name)), binding);
+    if (kind === 'primitive') {
+      const desc = {boolean:'[Z', byte:'[B', char:'[C', short:'[S', int:'[I', long:'[J', float:'[F', double:'[D'}[name];
+      return this.siteImport(`newarray:${name}`, [VT.i32], [VT.anyref],
+        count => this.runtime.newPrimitiveArray(desc,count), binding);
+    }
+    if (kind === 'reference') return this.siteImport(`anewarray:${name}`, [VT.i32], [VT.anyref],
+      count => this.runtime.toWasm(require('../../instructions/object').allocReferenceArray(this.jvm,name,count)), binding);
+    if (kind === 'multi') return this.siteImport(`multianewarray:${name}:${dims}`, new Array(dims).fill(VT.i32), [VT.anyref],
+      (...counts) => this.runtime.toWasm(require('../../instructions/object').allocMultiArray(this.jvm,name,counts)), binding);
+    throw new Error('Unknown cached allocation: '+kind);
   }
 
   // Class ids below the limit belong to guest classes loaded when the module
@@ -1316,7 +1346,7 @@ class ClosedWorld {
   // An operation whose execution throws a linkage error, like the interpreter.
   throwingImport(key, params, results, type, message) {
     const tag = this.tag;
-    return this.siteImport(key, params, results, () => { throw new WebAssembly.Exception(tag, [{ type, message }]); });
+    return this.siteImport(key, params, results, () => { throw new WebAssembly.Exception(tag, [{ type, message }]); }, {kind:'throw', type, message});
   }
 
   // Resolved primitive fields on a typed spilled object need no interpreter lookup.
@@ -1325,7 +1355,7 @@ class ClosedWorld {
     return this.pureImport(`spillfield:${op}:${key}`, put ? [VT.externref, WT[valueKind]] : [VT.externref],
       put ? [] : [WT[valueKind]], put
         ? (wrapper, value) => { wrapper.fields[key] = value; }
-        : wrapper => wrapper.fields[key]);
+        : wrapper => wrapper.fields[key], {kind:'spill-field', op, key, valueKind});
   }
 
   hostFieldPlan(op, imm, valueKind) {
@@ -1340,13 +1370,13 @@ class ClosedWorld {
         items.push(world.runtime.toJs(object));
         handler(frame, instruction, jvm);
         return world.fromJs(valueKind, items.pop());
-      }) };
+      }, {kind:'host-field', op, imm, valueKind}) };
     }
     return { kind: 'import', argKinds: ['A', valueKind], fn: this.siteImport(key, [VT.anyref, WT[valueKind]], [], (object, value) => {
       items.length = 0;
       items.push(world.runtime.toJs(object), world.toJsValue(valueKind, value));
       handler(frame, instruction, jvm);
-    }) };
+    }, {kind:'host-field', op, imm, valueKind}) };
   }
 
   // ---- lazy class initialization -----------------------------------------
@@ -1368,6 +1398,7 @@ class ClosedWorld {
       const address = token.wasmReadinessAddress?.(this.runtime.heap);
       target = { className, id: this.initTargets.size, address: Number.isInteger(address) ? address : null };
       this.initTargets.set(className, target);
+      this.bindingEvents.push({kind:'init', ...target});
     }
     return target;
   }
@@ -1444,7 +1475,7 @@ class ClosedWorld {
       if (!world.requestPark({ invoke: signature, args })) {
         throw new ClosedWorldError(`closed world: ${signature.key} runs outside the module and this entry cannot park`);
       }
-    });
+    }, {kind:'slow-call', key:signature.key});
   }
 
   // Initialization the module cannot finish synchronously: a <clinit> that
@@ -1673,7 +1704,9 @@ class ClosedWorld {
       builder.defineFunction(`m:${key}$body`, body.locals, body.code);
       builder.defineFunction(`m:${key}`, ...this.synchronizedWrapper(record, key));
     }
-    const bytes = builder.build();
+    let bytes = builder.build();
+    const cacheEntry = await preparationCache.capture(this, bytes);
+    if (cacheEntry) bytes = preparationCache.markedBytes(cacheEntry);
     this.moduleBytes = bytes.length;
     if (process.env.JVM_CLOSED_WORLD_DUMP) {
       require('fs').writeFileSync(process.env.JVM_CLOSED_WORLD_DUMP, bytes);
@@ -1683,6 +1716,12 @@ class ClosedWorld {
     const module = await WebAssembly.compile(bytes);
     const instance = await WebAssembly.instantiate(module, importObject);
     this.reportPreparation('closed-module', 1, 1);
+    this.installInstance(instance);
+    await preparationCache.save(this, cacheEntry, module);
+  }
+
+  installInstance(instance) {
+    const classTypes = [...this.classTypes.values()];
     this.instance = instance;
     this.parkFlag = instance.exports.park;
     this.depthGlobal = instance.exports.depth;

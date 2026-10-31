@@ -1,4 +1,51 @@
-# Optional preparation cache
+# Preparation caches
+
+## Closed-world Wasm
+
+Browser hosts can set `jvm.jit.closedWorld.cacheIdentity` to a SHA-256 identity
+of their exact compiler/runtime assets before preparation. When IndexedDB is
+available, the VM automatically caches the finished Wasm binary and symbolic
+binding metadata. An unchanged launch restores it before method analysis,
+linking and code generation. Class loading and layout still run, and every VM
+gets fresh memory, statics, strings, class mirrors, exception tags and imports.
+Guest initialization and execution retain their normal semantics.
+
+Keys cover guest bytecode/constants, native implementations/declarations,
+class layouts/IDs, heap layout, stack limit and Wasm/JSPI configuration as well
+as the host's runtime identity. Integrity receipts cover metadata and bytes.
+Missing, stale or corrupt entries and storage failures fall back to an ordinary
+build. No live VM objects, generated JavaScript, closures or SSA are stored.
+
+The origin-local IndexedDB store permits at most eight entries and 64 MiB of
+accounted storage, with a 16 MiB limit per artifact (binary bytes plus stored
+metadata bytes). Large binding metadata is gzip compressed and has a separate
+32 MiB decoded limit. Oldest entries are evicted using index keys;
+eviction does not deserialize their payloads. These limits do not bound total
+browser heap or the engine's native code memory.
+
+The WebAssembly Web API prohibits serializing `WebAssembly.Module` for persistent
+storage. Browsers therefore still compile the saved final binary on reload;
+this cache removes the VM's compiler passes, rather than claiming to persist
+browser machine code. A host-provided `preparationCache` backend can reuse native
+Modules within a process through structured cloning. A custom section binds
+such Modules to their metadata and input identity before instantiation.
+
+`closedWorld.stats().cache` reports `stored`, `hit`, `miss`, `rejected`,
+`not-stored`, `write-failed` or `unavailable`, and whether a native Module was
+reused. This is separate from Java source compilation and JVM bundle caches.
+
+Validate with:
+
+```
+/usr/bin/node --test test/closedWorldCompiler.test.js test/closedWorldPreparationCache.test.js
+```
+
+The consuming launcher's `scripts/test-closed-world-cache-browser.mjs` checks
+an isolated browser bundle across full Chromium/Firefox restarts, including
+fresh static state, zero warm analysis/assembly calls and exactly one browser
+compilation of the saved binary.
+
+## Per-method JavaScript (optional)
 
 `jvm.precompileInitializedClasses({effectful: true, preparedCodeCache})` can
 reuse trusted compiler output before the guest starts. This feature is off by

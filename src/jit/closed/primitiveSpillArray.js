@@ -20,7 +20,7 @@ function primitiveSpillArrayImport(world, op, kind) {
   const store = op.endsWith('astore'), type = types[kind];
   if (!accesses[op] || type === undefined) throw new Error('Unsupported primitive array access: ' + op);
   return world.pureImport('spill:' + op, store ? [VT.externref, VT.i32, type] : [VT.externref, VT.i32],
-    store ? [] : [type], accesses[op]);
+    store ? [] : [type], accesses[op], {kind:'spill-array', op, valueKind:kind});
 }
 
 module.exports = {primitiveSpillArrayImport};
