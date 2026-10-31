@@ -7,7 +7,7 @@ async function loadFile(jvm, obj, filePath) {
     ? String(filePath.value)
     : String(filePath);
   try {
-    obj.buffer = await (jvm.fileProvider || getFileProvider()).readFile(obj.path);
+    obj.buffer = await ((jvm && jvm.fileProvider) || getFileProvider()).readFile(obj.path);
   } catch (providerError) {
     if (!fs || typeof fs.readFileSync !== 'function') {
       throw providerError;
