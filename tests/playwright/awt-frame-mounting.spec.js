@@ -35,10 +35,21 @@ test('original Cube3D.main mounts, animates and handles dragging without a host-
   const box = await canvas.boundingBox();
   await page.mouse.move(box.x + 280, box.y + 180);
   await page.mouse.down();
+  const javaField = async name => page.evaluate(name => {
+    const jvm = window.frameMountTest.debug.debugController.jvm;
+    const cube = [...jvm._awtInputComponents.get('mouse')]
+      .find(component => (component._className || component.type) === 'Cube3D');
+    return cube.fields[`Cube3D.${name}`];
+  }, name);
+  // Java's mousePressed sets dragging, which pauses tick's auto-spin path.
+  await expect.poll(() => javaField('dragging')).toBe(1);
   const beforeDrag = await canvas.evaluate(c => c.toDataURL());
   await page.mouse.move(box.x + 420, box.y + 240, { steps: 8 });
+  await expect.poll(() => javaField('lastX')).toBeGreaterThan(350);
+  await expect.poll(() => javaField('lastY')).toBeGreaterThan(210);
   await expect.poll(() => canvas.evaluate(c => c.toDataURL())).not.toBe(beforeDrag);
   await page.mouse.up();
+  await expect.poll(() => javaField('dragging')).toBe(0);
   expect(await page.evaluate(() => window.frameMountTest.error)).toBeNull();
   expect(await page.evaluate(() => window.frameMountTest.completed)).toBe(false);
 });

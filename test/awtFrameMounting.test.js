@@ -163,3 +163,122 @@ test('AWT Frame does not repaint nested Swing children twice', async t => {
   } finally { cleanup(); }
   t.end();
 });
+
+test('BorderLayout dispatches inherited Java preferred-size overrides', async t => {
+  const cleanup = installDom();
+  try {
+    const jvm = await runSource(`import java.awt.*;
+      class PreferredEdge extends Canvas {
+        public static int height = 35;
+        public void paint(Graphics g) { g.setColor(Color.RED); g.fillRect(0, 0, getWidth(), getHeight()); }
+        public Dimension getPreferredSize() {
+          Dimension d = new Dimension(1, 1); d.width = 70; d.height = height; return d;
+        }
+      }
+      class InheritedEdge extends PreferredEdge {}
+      public class PreferredFrame {
+        public static Frame frame;
+        public static Canvas north, center;
+        public static void main(String[] args) {
+          frame = new Frame(); north = new InheritedEdge(); center = new Canvas();
+          frame.add(north, BorderLayout.NORTH); frame.add(center);
+          frame.setSize(300, 200); frame.setVisible(true);
+        }
+      }`, 'PreferredFrame');
+    const fields = jvm.classes.PreferredFrame.staticFields;
+    const north = fields.get('north:Ljava/awt/Canvas;');
+    const center = fields.get('center:Ljava/awt/Canvas;');
+    t.deepEqual([north._width, north._height], [300, 35], 'preferred dimensions come from Java bytecode and mutable Dimension fields');
+    t.deepEqual([center._y, center._height], [35, 165], 'center uses the remaining space');
+    jvm.classes.PreferredEdge.staticFields.set('height:I', 45);
+    await frameMethods['doLayout()V'](jvm, fields.get('frame:Ljava/awt/Frame;'), []);
+    t.equal(north._height, 45, 'explicit layout reads updated preferred dimensions');
+    t.equal(north._pixels[0], 0xff0000, 'explicit layout repaints the resized Canvas');
+  } finally { cleanup(); }
+  t.end();
+});
+
+test('hidden BorderLayout children release space and relayout when shown after resize', async t => {
+  const cleanup = installDom();
+  try {
+    const jvm = await runSource(`import java.awt.*;
+      public class VisibilityFrame {
+        public static Canvas west, center;
+        public static int expandedWidth;
+        public static void main(String[] args) {
+          Frame frame = new Frame(); west = new Canvas(); center = new Canvas();
+          west.setPreferredSize(new Dimension(70, 1));
+          frame.add(west, BorderLayout.WEST); frame.add(center);
+          frame.setSize(300, 200); frame.setVisible(true);
+          west.setVisible(false); expandedWidth = center.getWidth();
+          frame.setSize(360, 240); west.setVisible(true);
+        }
+      }`, 'VisibilityFrame');
+    const fields = jvm.classes.VisibilityFrame.staticFields;
+    const west = fields.get('west:Ljava/awt/Canvas;');
+    const center = fields.get('center:Ljava/awt/Canvas;');
+    t.equal(fields.get('expandedWidth:I'), 300, 'hidden west region reserves no space, matching OpenJDK');
+    t.deepEqual([west._width, west._height], [70, 240], 'showing the child restores its current bounds');
+    t.deepEqual([center._x, center._width], [70, 290], 'siblings relayout when the child is shown');
+    t.notEqual(west._canvasElement.style.display, 'none', 'the canvas peer is visible again');
+  } finally { cleanup(); }
+  t.end();
+});
+
+test('Frame show restores visibility before dimensions exist and layout changes clear stale positioning', async t => {
+  const cleanup = installDom();
+  try {
+    const jvm = await runSource(`import java.awt.*;
+      public class LayoutSwitchFrame {
+        public static Frame frame;
+        public static Canvas child;
+        public static void main(String[] args) {
+          frame = new Frame(); child = new Canvas(); frame.add(child);
+          frame.setVisible(true); frame.setVisible(false); frame.setVisible(true);
+        }
+      }`, 'LayoutSwitchFrame');
+    const fields = jvm.classes.LayoutSwitchFrame.staticFields;
+    const frame = fields.get('frame:Ljava/awt/Frame;');
+    const child = fields.get('child:Ljava/awt/Canvas;');
+    t.notEqual(frame._awtElement.style.display, 'none', 'show restores visibility without explicit dimensions');
+    await frameMethods['setSize(II)V'](jvm, frame, [300, 200]);
+    t.equal(child._canvasElement.style.position, 'absolute', 'BorderLayout establishes native child bounds');
+    for (const type of ['java/awt/FlowLayout', 'java/awt/GridLayout']) {
+      await frameMethods['setLayout(Ljava/awt/LayoutManager;)V'](jvm, frame, [{type, _rows: 1, _cols: 1}]);
+      t.deepEqual([child._canvasElement.style.position, child._canvasElement.style.left, child._canvasElement.style.top], ['', '', ''], `${type} clears stale absolute positioning`);
+    }
+  } finally { cleanup(); }
+  t.end();
+});
+
+test('Frame resolves BorderLayout aliases and re-added components use the default center', async t => {
+  const cleanup = installDom();
+  try {
+    const jvm = await runSource(`import java.awt.*;
+      public class AliasFrame {
+        public static Frame frame;
+        public static Canvas north, west, center;
+        public static void main(String[] args) {
+          frame = new Frame(); north = new Canvas(); west = new Canvas(); center = new Canvas();
+          north.setPreferredSize(new Dimension(1, 25));
+          west.setPreferredSize(new Dimension(40, 1));
+          frame.add(north, BorderLayout.PAGE_START);
+          frame.add(west, BorderLayout.LINE_START); frame.add(center);
+          frame.setSize(300, 200); frame.setVisible(true);
+        }
+      }`, 'AliasFrame');
+    const fields = jvm.classes.AliasFrame.staticFields;
+    const frame = fields.get('frame:Ljava/awt/Frame;');
+    const north = fields.get('north:Ljava/awt/Canvas;');
+    const west = fields.get('west:Ljava/awt/Canvas;');
+    const center = fields.get('center:Ljava/awt/Canvas;');
+    t.deepEqual([north._x, north._y, north._width, north._height], [0, 0, 300, 25], 'PAGE_START uses the north region');
+    t.deepEqual([west._x, west._y, west._width, west._height], [0, 25, 40, 175], 'LINE_START uses the left region');
+    t.deepEqual([center._x, center._y, center._width, center._height], [40, 25, 260, 175], 'center respects aliases');
+    await frameMethods['remove(Ljava/awt/Component;)V'](jvm, frame, [north]);
+    await frameMethods['remove(Ljava/awt/Component;)V'](jvm, frame, [center]);
+    await frameMethods['add(Ljava/awt/Component;)Ljava/awt/Component;'](jvm, frame, [north]);
+    t.deepEqual([north._x, north._y, north._width, north._height], [40, 0, 260, 200], 're-adding without a constraint uses center');
+  } finally { cleanup(); }
+  t.end();
+});

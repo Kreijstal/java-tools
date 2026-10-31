@@ -1,4 +1,5 @@
 // java.awt.Container - Base class for AWT containers
+const { resolveRegions } = require('./BorderLayout');
 
 const ensureAwtElement = (obj) => {
   if (typeof document === 'undefined') return null;
@@ -52,13 +53,7 @@ const applyLayout = (obj) => {
     containerEl.style.justifyItems = 'stretch';
     containerEl.style.gap = `${layout._vgap || 0}px ${layout._hgap || 0}px`;
 
-    const regions = new Map();
-    if (obj._components) {
-      for (const component of obj._components) {
-        const region = normalizeConstraint(component._layoutConstraint) || 'Center';
-        regions.set(region.toLowerCase(), component);
-      }
-    }
+    const regions = resolveRegions(obj._components);
 
     if (!regions.has('center') && obj._canvasElement) {
       regions.set('center', { _awtElement: obj._canvasElement });
@@ -242,6 +237,7 @@ module.exports = {
     
     'add(Ljava/awt/Component;)Ljava/awt/Component;': (jvm, obj, args) => {
       const component = args[0];
+      if (component) component._layoutConstraint = null;
       return addComponent(jvm, obj, component);
     },
 

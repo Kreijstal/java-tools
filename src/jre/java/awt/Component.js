@@ -180,8 +180,12 @@ module.exports = {
     
     'setVisible(Z)V': (jvm, obj, args) => {
       obj._visible = args[0];
-      if (obj._awtElement) {
-        obj._awtElement.style.display = obj._visible ? '' : 'none';
+      const peer = obj._awtElement || obj._canvasElement;
+      if (peer) peer.style.display = obj._visible ? '' : 'none';
+      const parent = obj._parent;
+      if (parent && !parent._contentPane &&
+          jvm.isInstanceOf(parent._className || parent.type, 'java/awt/Frame')) {
+        return jvm._jreFindMethod('java/awt/Frame', 'doLayout', '()V')(jvm, parent, []);
       }
     },
 

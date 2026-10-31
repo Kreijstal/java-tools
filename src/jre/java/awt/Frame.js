@@ -1,5 +1,8 @@
 const componentBase = require('./Component');
 const containerBase = require('./Container');
+const { resolveRegions } = require('./BorderLayout');
+const { runGuestMethod } = require('./legacyEvents');
+const { readField } = require('../../../core/objectModel');
 
 function initFrame(obj, title) {
   obj._title = title;
@@ -17,22 +20,38 @@ function isHidden(obj) {
   return obj._visible === false || obj._visible === 0;
 }
 
-function layoutBorderChildren(jvm, obj) {
+async function preferredSize(jvm, child) {
+  let owner = child._className || child.type;
+  const descriptor = '()Ljava/awt/Dimension;';
+  const native = jvm._jreFindMethod(owner, 'getPreferredSize', descriptor);
+  if (native) return native(jvm, child, [], jvm.threads[jvm.currentThreadIndex]);
+  while (owner) {
+    const data = jvm.classes[owner] || await jvm.loadClassByName(owner);
+    const method = jvm.findMethod(data, 'getPreferredSize', descriptor);
+    if (method) return runGuestMethod(jvm, owner, method, [child], { rawResult: true });
+    owner = data.ast.classes[0].superClassName;
+  }
+  throw new Error('getPreferredSize could not be resolved');
+}
+
+async function layoutBorderChildren(jvm, obj) {
   const layout = obj._layout;
   if (!layout || layout.type !== 'java/awt/BorderLayout' ||
       obj._width === undefined || obj._height === undefined) return;
   const width = Math.max(0, obj._width);
   const height = Math.max(0, obj._height);
-  const regions = new Map();
-  for (const child of obj._components || []) {
-    if (!isHidden(child)) regions.set(String(child._layoutConstraint || 'Center').toLowerCase(), child);
+  const regions = resolveRegions(obj._components);
+  for (const [region, child] of regions) {
+    if (isHidden(child)) regions.delete(region);
   }
   const hgap = layout._hgap || 0;
   const vgap = layout._vgap || 0;
   let left = 0, top = 0, right = width, bottom = height;
-  const preferred = (child, axis) => Math.max(0,
-    componentBase.methods['getPreferredSize()Ljava/awt/Dimension;'](jvm, child, [])[axis] || 0);
-  const place = (child, x, y, w, h) => {
+  const preferred = async (child, axis) => {
+    const size = await preferredSize(jvm, child);
+    return Math.max(0, readField(size.fields, `java/awt/Dimension.${axis}`));
+  };
+  const place = async (child, x, y, w, h) => {
     w = Math.max(0, w); h = Math.max(0, h);
     // Assigning canvas.width/height clears its pixels, even at the same size.
     if (child._x !== x || child._y !== y || child._width !== w || child._height !== h) {
@@ -46,36 +65,36 @@ function layoutBorderChildren(jvm, obj) {
     }
     if (child._components) {
       containerBase.methods['doLayout()V'](jvm, child, []);
-      layoutBorderChildren(jvm, child);
+      await layoutBorderChildren(jvm, child);
     }
   };
   const north = regions.get('north');
   if (north) {
-    const h = Math.min(height, preferred(north, 'height'));
-    place(north, 0, top, width, h); top += h + vgap;
+    const h = Math.min(height, await preferred(north, 'height'));
+    await place(north, 0, top, width, h); top += h + vgap;
   }
   const south = regions.get('south');
   if (south) {
-    const h = Math.min(Math.max(0, bottom - top), preferred(south, 'height'));
-    bottom -= h; place(south, 0, bottom, width, h); bottom -= vgap;
+    const h = Math.min(Math.max(0, bottom - top), await preferred(south, 'height'));
+    bottom -= h; await place(south, 0, bottom, width, h); bottom -= vgap;
   }
   const east = regions.get('east');
   if (east) {
-    const w = Math.min(width, preferred(east, 'width'));
-    right -= w; place(east, right, top, w, bottom - top); right -= hgap;
+    const w = Math.min(width, await preferred(east, 'width'));
+    right -= w; await place(east, right, top, w, bottom - top); right -= hgap;
   }
   const west = regions.get('west');
   if (west) {
-    const w = Math.min(Math.max(0, right - left), preferred(west, 'width'));
-    place(west, left, top, w, bottom - top); left += w + hgap;
+    const w = Math.min(Math.max(0, right - left), await preferred(west, 'width'));
+    await place(west, left, top, w, bottom - top); left += w + hgap;
   }
   const center = regions.get('center');
-  if (center) place(center, left, top, right - left, bottom - top);
+  if (center) await place(center, left, top, right - left, bottom - top);
   // Native bounds also size each Canvas bitmap. CSS alone cannot do that.
   if (obj._awtElement) obj._awtElement.style.display = isHidden(obj) ? 'none' : 'block';
 }
 
-function layoutFrame(jvm, obj) {
+async function layoutFrame(jvm, obj) {
   // JFrame owns a separate title-bar/content-pane peer and layout.
   if (obj._contentPane) return;
   containerBase.methods['doLayout()V'](jvm, obj, []);
@@ -92,8 +111,16 @@ function layoutFrame(jvm, obj) {
       element.style.top = `${obj._y || 0}px`;
     }
     if (isHidden(obj)) element.style.display = 'none';
+    else if (element.style.display === 'none') element.style.display = '';
   }
-  layoutBorderChildren(jvm, obj);
+  await layoutBorderChildren(jvm, obj);
+  const layoutType = obj._layout && obj._layout.type;
+  if (['java/awt/FlowLayout', 'java/awt/GridLayout', 'java/awt/CardLayout'].includes(layoutType)) {
+    for (const child of obj._components || []) {
+      const peer = child._awtElement || child._canvasElement;
+      if (peer) { peer.style.position = ''; peer.style.left = ''; peer.style.top = ''; }
+    }
+  }
   if (obj._layout === null) {
     for (const child of obj._components || []) {
       const peer = child._awtElement || child._canvasElement;
@@ -120,7 +147,7 @@ async function repaintChildren(jvm, obj) {
 
 async function containerCall(jvm, obj, key, args) {
   const result = containerBase.methods[key](jvm, obj, args);
-  layoutFrame(jvm, obj);
+  await layoutFrame(jvm, obj);
   if (obj._visible) await repaintChildren(jvm, obj);
   return result;
 }
@@ -137,7 +164,7 @@ module.exports = {
         return;
       }
       obj._disposed = false;
-      layoutFrame(jvm, obj);
+      await layoutFrame(jvm, obj);
       if (obj._awtElement) {
         const host = document.getElementById('awt-container') || document.body;
         if (host && obj._awtElement.parentNode !== host) host.appendChild(obj._awtElement);
@@ -146,12 +173,12 @@ module.exports = {
     },
     'setSize(II)V': async (jvm, obj, args) => {
       componentBase.methods['setSize(II)V'](jvm, obj, args);
-      layoutFrame(jvm, obj);
+      await layoutFrame(jvm, obj);
       if (obj._visible) await repaintChildren(jvm, obj);
     },
     'setBounds(IIII)V': async (jvm, obj, args) => {
       componentBase.methods['setBounds(IIII)V'](jvm, obj, args);
-      layoutFrame(jvm, obj);
+      await layoutFrame(jvm, obj);
       if (obj._visible) await repaintChildren(jvm, obj);
     },
     'add(Ljava/awt/Component;)Ljava/awt/Component;': (jvm, obj, args) =>
@@ -164,7 +191,10 @@ module.exports = {
       containerCall(jvm, obj, 'remove(Ljava/awt/Component;)V', args),
     'setLayout(Ljava/awt/LayoutManager;)V': (jvm, obj, args) =>
       containerCall(jvm, obj, 'setLayout(Ljava/awt/LayoutManager;)V', args),
-    'doLayout()V': (jvm, obj) => layoutFrame(jvm, obj),
+    'doLayout()V': async (jvm, obj) => {
+      await layoutFrame(jvm, obj);
+      if (obj._visible) await repaintChildren(jvm, obj);
+    },
     'dispose()V': (jvm, obj) => {
       obj._disposed = true;
       obj._visible = false;
