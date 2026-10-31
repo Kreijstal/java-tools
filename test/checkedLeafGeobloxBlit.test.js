@@ -1,4 +1,5 @@
 const test = require('tape');
+const fs = require('fs');
 const path = require('path');
 const {JVM} = require('../src/core/jvm');
 const Frame = require('../src/core/frame');
@@ -17,6 +18,9 @@ const Stack = require('../src/core/stack');
 // resolution is lazy and the method touches nothing but its two arrays.
 const classpath = path.join(__dirname, 'fixtures', 'geoblox');
 const className = 'dm';
+// The gamepack class is not distributed with this repository (*.class is
+// ignored); without a local copy the tests are skipped.
+const fixtureTest = fs.existsSync(path.join(classpath, `${className}.class`)) ? test : test.skip;
 const descriptor = '([I[IIIIIIII)V';
 
 // apps/launcher/browser-runtime.json (dekobloko-work) as of 2026-09-30, the
@@ -72,7 +76,7 @@ async function loadBlit(jvmOptions) {
   return {jvm, method};
 }
 
-test('the real Geoblox blit is admitted under the browser options, but the ' +
+fixtureTest('the real Geoblox blit is admitted under the browser options, but the ' +
   'checked-leaf tier itself is gated on jit.checkedLeafDirectPositional',
   async (t) => {
   const {jvm, method} = await loadBlit({...browserJvmOptions,
@@ -101,7 +105,7 @@ test('the real Geoblox blit is admitted under the browser options, but the ' +
   t.end();
 });
 
-test('with jit.checkedLeafDirectPositional the browser options install the ' +
+fixtureTest('with jit.checkedLeafDirectPositional the browser options install the ' +
   'real blit as a checked leaf through a compile worker', async (t) => {
   const {jvm, method} = await loadBlit({...browserJvmOptions,
     prepareBeforeMain: false,
@@ -133,7 +137,7 @@ test('with jit.checkedLeafDirectPositional the browser options install the ' +
   t.end();
 });
 
-test('the framed body compiled from the original bytes blits like the ' +
+fixtureTest('the framed body compiled from the original bytes blits like the ' +
   'reference, in range and when the last pixel overflows', async (t) => {
   const {jvm, method} = await loadBlit({...browserJvmOptions,
     jit: {...browserJvmOptions.jit, compileWorker: false, warmupThreshold: 0,
@@ -211,7 +215,7 @@ test('the framed body compiled from the original bytes blits like the ' +
 // bodies for the run; a caller compiled cold must therefore already absorb
 // the callee leaf, or the ~150,000 calls per frame all go through the
 // late-linked fastPositional site.
-test('the real dm.b(II)V, prepared cold through a compile worker, inserts ' +
+fixtureTest('the real dm.b(II)V, prepared cold through a compile worker, inserts ' +
   'the blit leaf lexically instead of calling it', async (t) => {
   const jvm = new JVM({classpath, ...browserJvmOptions,
     prepareBeforeMain: false,
