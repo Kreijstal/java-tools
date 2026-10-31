@@ -56,8 +56,8 @@ jreClasses[className] = relativePath;
     .join(',\n');
 
   const fileContent = `// NOTE: This file is GENERATED at build time by scripts/generate-jre-index.js
-// DO NOT EDIT MANUALLY - run \`npm run generate-jre-index\` to regenerate
-// This file is .gitignored and regenerated during builds for browser compatibility
+// DO NOT EDIT MANUALLY - run \`node scripts/generate-jre-index.js\` to regenerate
+// This source manifest is tracked so source-only CDN builds can resolve JRE modules.
 
 const jreClasses = {
 ${classEntries}
@@ -65,6 +65,14 @@ ${classEntries}
 
 module.exports = jreClasses;
 `;
+
+  if (process.argv.includes('--check')) {
+    if (fs.readFileSync(OUTPUT_FILE, 'utf8') !== fileContent) {
+      throw new Error('JRE source manifest is stale. Run node scripts/generate-jre-index.js and commit src/jre/index.js.');
+    }
+    console.log('JRE source manifest is current');
+    return;
+  }
 
   // Write the file
   try {
