@@ -83,26 +83,26 @@ module.exports = {
 
     'getGraphics()Ljava/awt/Graphics;': (jvm, obj, args) => {
       if (jvm?.awtWebGlPresentation && obj._canvasElement) {
-        return { type: 'java/awt/Graphics', _component: obj };
+        return { type: 'java/awt/Graphics2D', _component: obj };
       }
       if (obj._awtGraphics) {
-        return { type: 'java/awt/Graphics', _awtGraphics: obj._awtGraphics, _component: obj };
+        return { type: 'java/awt/Graphics2D', _awtGraphics: obj._awtGraphics, _component: obj };
       }
       if (obj._awtComponent && typeof obj._awtComponent.getGraphics === 'function') {
         const g = obj._awtComponent.getGraphics();
         if (g) {
-          return { type: 'java/awt/Graphics', _awtGraphics: g, _component: obj };
+          return { type: 'java/awt/Graphics2D', _awtGraphics: g, _component: obj };
         }
       }
       if (obj._canvasElement && typeof obj._canvasElement.getContext === 'function') {
         const context = obj._canvasElement.getContext('2d');
         if (context) {
-          return { type: 'java/awt/Graphics', _awtGraphics: new awtFramework.CanvasGraphics(context), _component: obj };
+          return { type: 'java/awt/Graphics2D', _awtGraphics: new awtFramework.CanvasGraphics(context), _component: obj };
         }
       }
       // Headless: hand out a context-less Graphics tied to the component so
       // raster blits (drawImage of a BufferedImage framebuffer) still land.
-      return { type: 'java/awt/Graphics', _component: obj };
+      return { type: 'java/awt/Graphics2D', _component: obj };
     },
     
     'paint(Ljava/awt/Graphics;)V': (jvm, obj, args) => {
@@ -127,12 +127,12 @@ module.exports = {
         if (obj._canvasElement && obj._canvasElement.getContext) {
           const ctx = obj._canvasElement.getContext('2d');
           if (ctx) {
-            graphics = { type: 'java/awt/Graphics', _awtGraphics: new awtFramework.CanvasGraphics(ctx), _component: obj };
+            graphics = { type: 'java/awt/Graphics2D', _awtGraphics: new awtFramework.CanvasGraphics(ctx), _component: obj };
           }
         }
         if (!graphics) graphics = jvm.createGraphicsObject(obj);
       } else {
-        graphics = { type: 'java/awt/Graphics', _component: obj };
+        graphics = { type: 'java/awt/Graphics2D', _component: obj };
       }
       if (!graphics) return;
       const { isJreDefault, runFrame } = require('./legacyEvents');

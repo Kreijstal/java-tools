@@ -1,3 +1,9 @@
+function checkComponents(jvm, components) {
+  if (components.some(value => value < 0 || value > 255)) {
+    jvm.throwException('java/lang/IllegalArgumentException', 'Color components must be between 0 and 255');
+  }
+}
+
 function color(r, g, b) {
   return { type: 'java/awt/Color', value: { r, g, b, a: 255 } };
 }
@@ -57,7 +63,17 @@ module.exports = {
       };
     },
     '<init>(III)V': (jvm, obj, args) => {
+      checkComponents(jvm, args);
       obj.value = { r: args[0], g: args[1], b: args[2], a: 255 };
     },
+    '<init>(IIII)V': (jvm, obj, args) => {
+      checkComponents(jvm, args);
+      obj.value = { r: args[0], g: args[1], b: args[2], a: args[3] };
+    },
+    'getRed()I': (jvm, obj) => obj.value.r,
+    'getGreen()I': (jvm, obj) => obj.value.g,
+    'getBlue()I': (jvm, obj) => obj.value.b,
+    'getAlpha()I': (jvm, obj) => obj.value.a,
+    'getRGB()I': (jvm, obj) => (obj.value.a << 24) | (obj.value.r << 16) | (obj.value.g << 8) | obj.value.b,
   },
 };

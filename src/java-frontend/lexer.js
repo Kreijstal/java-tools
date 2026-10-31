@@ -269,7 +269,7 @@ function tokenizeJava(source) {
       continue;
     }
 
-    if (isDigit(ch)) {
+    if (isDigit(ch) || (ch === '.' && isDigit(source[i + 1] || ''))) {
       const startOffset = i;
       const startLine = line;
       const startColumn = column;

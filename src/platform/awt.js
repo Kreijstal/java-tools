@@ -42,6 +42,7 @@ const {javaKeyCode} = require('./awt-key-code');
  * @property {number} r - Red component (0-255)
  * @property {number} g - Green component (0-255)
  * @property {number} b - Blue component (0-255)
+ * @property {number} [a] - Alpha component (0-255); omitted means opaque
  */
 
 /**
@@ -720,7 +721,9 @@ class CanvasGraphics {
 
     /** @override @param {AwtColor} color */
     setColor(color) {
-        const cssColor = `rgb(${color.r}, ${color.g}, ${color.b})`;
+        const cssColor = color.a === undefined
+            ? `rgb(${color.r}, ${color.g}, ${color.b})`
+            : `rgba(${color.r}, ${color.g}, ${color.b}, ${color.a / 255})`;
         this.ctx.fillStyle = cssColor;
         this.ctx.strokeStyle = cssColor;
     }

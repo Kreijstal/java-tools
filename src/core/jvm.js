@@ -1115,7 +1115,7 @@ class JVM {
 
     // Create the Java Graphics object with proper connection
     const graphicsObj = {
-      type: 'java/awt/Graphics',
+      type: 'java/awt/Graphics2D',
       _awtGraphics: awtGraphics,
       _component: appletObj,
     };
