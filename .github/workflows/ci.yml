@@ -21,6 +21,11 @@ jobs:
     strategy:
       matrix:
         browser: [chromium, firefox]
+    env:
+      # blank-github-cloner is private; GITHUB_TOKEN cannot read it. A token
+      # with read access to it, stored as this secret, enables the consumer
+      # steps.
+      CLONER_TOKEN: ${{ secrets.CLONER_TOKEN }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -28,22 +33,32 @@ jobs:
       - name: Runtime artifacts are not source files
         run: test -z "$(git ls-files browser-runtime)"
         working-directory: java-tools
+      - name: Cloner access
+        if: env.CLONER_TOKEN == ''
+        run: echo "::notice::CLONER_TOKEN is not set; skipping the private blank-github-cloner consumer tests"
       - uses: actions/checkout@v6
+        if: env.CLONER_TOKEN != ''
         with:
           repository: Kreijstal/blank-github-cloner
+          token: ${{ secrets.CLONER_TOKEN }}
           path: cloner
       - uses: actions/setup-node@v6
+        if: env.CLONER_TOKEN != ''
         with:
           node-version: 24
           cache: npm
           cache-dependency-path: cloner/package-lock.json
       - run: npm ci --ignore-scripts
+        if: env.CLONER_TOKEN != ''
         working-directory: cloner
       - run: npx playwright install --with-deps ${{ matrix.browser }}
+        if: env.CLONER_TOKEN != ''
         working-directory: cloner
       - run: npm run test:jvm-source
+        if: env.CLONER_TOKEN != ''
         working-directory: cloner
       - run: npm run test:jvm-source:browser
+        if: env.CLONER_TOKEN != ''
         working-directory: cloner
         env:
           JAVA_TOOLS_ROOT: ${{ github.workspace }}/java-tools
@@ -53,7 +68,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node-version: [20.x]
+        node-version: [22.x]
         java-version: [11, 17]
     steps:
       - name: Checkout code

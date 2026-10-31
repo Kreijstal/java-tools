@@ -972,11 +972,13 @@ test('CFR-JS reconstructs additional expression and declaration features', (t) =
     t.match(source, /public void releaseResource\(ByteArrayInputStream resource, Throwable primary\) \{\s*if \(resource != null\) \{\s*resource\.close\(\);\s*}\s*}/, 'try-with-resources release graph lowers to guarded close');
     t.notOk(/addSuppressed|Ltwr|\/\/\s*goto/.test(source), 'try-with-resources release scaffolding is consumed');
     t.notOk(/new StringBuilder\(\)\.append/.test(source), 'string builder implementation detail is hidden');
-    t.match(source, /int\[\] (\w+) = null;[\s\S]*?\1 = \(int\[\]\) \(\w+\);[\s\S]*?\1\[0\]/,
+    // The refined local is either declared null and assigned later, or
+    // declared at its first store.
+    t.match(source, /int\[\] (\w+)(?: = null;[\s\S]*?\b\1)? = \(int\[\]\) \(\w+\);[\s\S]*?\b\1\[0\]/,
       'primitive array opcodes refine an Object[] carrier to the verifier array type');
     // An intermediate `(Object)` cast of a local declared Object is an identity
     // cast; simplifyIdentityReferenceCasts may drop it. The Object[] cast stays.
-    t.match(source, /Object\[\] (\w+) = [^;]*;[\s\S]*?\1 = \(Object\[\]\) (?:\(Object\) )?\(?\w+\)?;/,
+    t.match(source, /Object\[\] (\w+)(?: = [^;]*;[\s\S]*?\b\1)? = \(Object\[\]\) (?:\(Object\) )?\(?\w+\)?;/,
       'post-emission Object[] refinement casts earlier Object assignments');
     t.match(source,
       /mixedPrimitiveArrayLength\(boolean param0\)[\s\S]*?java\.lang\.reflect\.Array\.getLength\([A-Za-z_$][A-Za-z0-9_$]*\)/,
@@ -1150,8 +1152,9 @@ test('CFR-JS preserves synchronized multi-exit ring-buffer selection', (t) => {
       ? source.slice(contiguous.index + contiguous[0].length, wrapped.index)
       : '';
     // Either a labeled exit taken when the flag is clear, or the overwrite as
-    // the first statement of a guard that requires the flag to be set.
-    t.match(branchGap, /if \([^)]*== 0\) \{[\s\S]*?break [^;]+;|if \([^)]*!= 0\) \{\s*$/,
+    // the first statement of a guard that requires the flag to be set (an int
+    // flag compared with zero, or a recovered boolean).
+    t.match(branchGap, /if \([^)]*== 0\) \{[\s\S]*?break [^;]+;|if \((?:[^)]*!= 0|\w+)\) \{\s*$/,
       'normal branch skips the wrapped-length overwrite');
     t.notOk(lengthLocal && new RegExp(
       `\\.write - [^;\\n]*\\.read;\\s*${lengthLocal} = [^;\\n]*\\.capacity`).test(source),
