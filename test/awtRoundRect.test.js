@@ -33,3 +33,28 @@ test('rounded rectangles execute through Graphics and Graphics2D and paint the s
   t.equal(pixel(0, 0), 0x0000ff, 'negative dimensions do not draw');
   t.end();
 });
+
+test('software rounded rectangles publish once per operation rather than per scanline', t => {
+  const graphics = require('../src/jre/java/awt/Graphics').methods;
+  const previousRaf = global.requestAnimationFrame;
+  const callbacks = [];
+  global.requestAnimationFrame = callback => callbacks.push(callback);
+  try {
+    const jvm = {};
+    const component = { _width: 120, _height: 90, _canvasElement: {} };
+    const g = { _component: component, _softColor: 0xff0000 };
+    graphics['fillRoundRect(IIIIII)V'](jvm, g, [10, 10, 90, 60, 20, 20]);
+    t.equal(jvm._awtPresentationStats.dirtyMarks, 1, 'a filled shape emits one publication');
+    t.equal(jvm._awtDroppedFrameBacklog || 0, 0, 'scanlines do not create dropped-frame backpressure');
+    graphics['drawRoundRect(IIIIII)V'](jvm, g, [10, 10, 90, 60, 20, 20]);
+    t.equal(jvm._awtPresentationStats.dirtyMarks, 2, 'an outline also emits one publication');
+    t.equal(callbacks.length, 1, 'both shapes coalesce into one pending presentation');
+    g._softAlpha = 0;
+    graphics['fillRoundRect(IIIIII)V'](jvm, g, [10, 10, 90, 60, 20, 20]);
+    t.equal(jvm._awtPresentationStats.dirtyMarks, 2, 'transparent shapes emit no publication');
+  } finally {
+    if (previousRaf === undefined) delete global.requestAnimationFrame;
+    else global.requestAnimationFrame = previousRaf;
+  }
+  t.end();
+});
