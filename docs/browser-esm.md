@@ -51,6 +51,7 @@ embedding browser environment.
 ## Validation
 
 ```sh
+npm ci
 npx playwright install chromium
 node scripts/test-browser-cdn.mjs 'https://esm.sh/gh/Kreijstal/java-tools@COMMIT?standalone&target=es2022'
 ```

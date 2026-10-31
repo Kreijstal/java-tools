@@ -33,6 +33,10 @@ function generateJreIndex() {
         walkDirectory(fullPath, `${prefix}${file}/`);
       } else if (file.endsWith('.js') && file !== 'index.js') {
         // Found a JRE class file (include nested classes with '$' but exclude index files)
+        const definition = require(fullPath);
+        const classKeys = ['super', 'methods', 'staticMethods', 'fields', 'staticFields', 'isInterface', 'interfaces'];
+        if (!definition || typeof definition !== 'object' ||
+            !classKeys.some(key => Object.prototype.hasOwnProperty.call(definition, key))) continue;
         const className = `${prefix}${file.slice(0, -3)}`; // Remove .js extension
         const relativePath = `./${prefix}${file}`;
 
@@ -67,7 +71,7 @@ module.exports = jreClasses;
 `;
 
   if (process.argv.includes('--check')) {
-    if (fs.readFileSync(OUTPUT_FILE, 'utf8') !== fileContent) {
+    if (fs.readFileSync(OUTPUT_FILE, 'utf8').replace(/\r\n/g, '\n') !== fileContent) {
       throw new Error('JRE source manifest is stale. Run node scripts/generate-jre-index.js and commit src/jre/index.js.');
     }
     console.log('JRE source manifest is current');

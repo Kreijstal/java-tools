@@ -49,3 +49,21 @@ test('concurrent browser debuggers retain their own classes across resets', asyn
   t.deepEqual(seen, ['first'], 'classpath enumeration also uses the instance provider');
   t.end();
 });
+
+test('JRE helper modules do not shadow application class names', async t => {
+  const debug = new BrowserJVMDebug();
+  const compiled = javaTools.compileJava(`
+    public class arrayCopy {
+      public static int result;
+      public static void main(String[] args) { result = 42; }
+    }
+  `);
+  for (const artifact of compiled.artifacts) {
+    debug.fileProvider.virtualFS.set(`${artifact.internalName}.class`, artifact.bytes);
+  }
+  await debug.initialize();
+  await debug.run('arrayCopy');
+  t.equal(debug.debugController.jvm.classes.arrayCopy.staticFields.get('result:I'), 42,
+    'the actual application class is loaded and executed');
+  t.end();
+});
