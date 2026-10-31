@@ -29,6 +29,7 @@ test('rounded rectangles execute through Graphics and Graphics2D and paint the s
   t.equal(pixel(110, 64), 0xffffff, 'zero-width outline draws a vertical line through its endpoint');
   t.equal(pixel(0, 80), 0xffffff, 'partially off-surface rounded rectangles are clipped');
   t.equal(pixel(85, 75), 0x80007f, 'translucent outline composites once on straight edges');
+  t.equal(pixel(66, 76), 0x80007f, 'translucent outline composites once on curved corners');
   t.equal(pixel(85, 80), 0x0000ff, 'translucent outline does not fill its interior');
   t.equal(pixel(0, 0), 0x0000ff, 'negative dimensions do not draw');
   t.end();
