@@ -103,8 +103,10 @@ test('CFR-JS classifies nested loop break and continue edges', (t) => {
 
   t.notOk(/stack-underflow/.test(actual), 'PyramidApplet decompilation does not underflow the operand stack');
   t.notOk(/^\s*\/\/\s*(if|goto|tableswitch|lookupswitch)\b/m.test(actual), 'PyramidApplet does not fall back to raw control-flow comments');
-  t.match(actual, /for \(i = 0; i < vertices\.length;[\s\S]*if \(v\[2\] > 0\.2\)/, 'vertex projection loop is structured');
-  t.match(actual, /for \(int __foreach_index32 = 0; __foreach_index32 < __foreach_array32\.length;[\s\S]*break;[\s\S]*}/, 'loop-exit goto is classified as break');
+  // The loop index may be declared in the header, and foreach temporaries are
+  // numbered by bytecode offset, which moves with the compiler's output.
+  t.match(actual, /for \((?:int )?i = 0; i < vertices\.length;[\s\S]*if \(v\[2\] > 0\.2\)/, 'vertex projection loop is structured');
+  t.match(actual, /for \(int __foreach_index(\d+) = 0; __foreach_index\1 < __foreach_array\1\.length;[\s\S]*break;[\s\S]*}/, 'loop-exit goto is classified as break');
   // The skip test may come back either as the branch condition negated in place
   // (`normal[2] < 0.0`) or as the original wrapped in `!(…)`. The first is what
   // the source said and is what the structurer produces now that it negates the
