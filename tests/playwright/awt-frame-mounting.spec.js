@@ -3,6 +3,11 @@ const fs = require('fs');
 const path = require('path');
 const source = fs.readFileSync(path.join(__dirname, '../../test/fixtures/frontend/Cube3D.java'), 'utf8');
 
+// The IDE's Display tab gets 38% of the window, and the frame is 390 px tall.
+// At the default 720 px viewport most of the canvas sits below the window, so
+// the drag below would leave the page.
+test.use({ viewport: { width: 1280, height: 1200 } });
+
 test('original Cube3D.main mounts, animates and handles dragging without a host-side mounting harness', async ({ page }) => {
   test.setTimeout(45000);
   await page.goto('/');
