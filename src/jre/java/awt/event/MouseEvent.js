@@ -1,5 +1,22 @@
 module.exports = {
   super: 'java/awt/event/InputEvent',
+  // Values from the JDK's public static final fields.
+  staticFields: {
+    'MOUSE_FIRST:I': 500,
+    'MOUSE_LAST:I': 507,
+    'MOUSE_CLICKED:I': 500,
+    'MOUSE_PRESSED:I': 501,
+    'MOUSE_RELEASED:I': 502,
+    'MOUSE_MOVED:I': 503,
+    'MOUSE_ENTERED:I': 504,
+    'MOUSE_EXITED:I': 505,
+    'MOUSE_DRAGGED:I': 506,
+    'MOUSE_WHEEL:I': 507,
+    'NOBUTTON:I': 0,
+    'BUTTON1:I': 1,
+    'BUTTON2:I': 2,
+    'BUTTON3:I': 3,
+  },
   methods: {
     '<init>()V': () => {},
     'getX()I': (jvm, obj, args) => obj.x || 0,

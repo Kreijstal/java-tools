@@ -1,5 +1,15 @@
 module.exports = {
   super: 'java/awt/AWTEvent',
+  // Values from the JDK's public static final fields.
+  staticFields: {
+    'SHIFT_MASK:I': 1,
+    'CTRL_MASK:I': 2,
+    'META_MASK:I': 4,
+    'ALT_MASK:I': 8,
+    'ACTION_FIRST:I': 1001,
+    'ACTION_LAST:I': 1001,
+    'ACTION_PERFORMED:I': 1001,
+  },
   methods: {
     '<init>()V': () => {},
     '<init>(Ljava/lang/Object;ILjava/lang/String;)V': (jvm, obj, args) => {
