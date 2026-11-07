@@ -125,6 +125,10 @@ class WasmHeap {
       arrayBumped: 0, arrayReused: 0, arrayFreed: 0, arrayFreeBytes: 0,
       arrayReclaimed: 0 };
     this.objectAllocations = new Map();
+    // Save states: registrations number the extents, and a restore marks the
+    // numbers it rewound. See restore().
+    this.extentSequence = 0;
+    this.rewoundExtents = [];
     this.registry = reclaimEnabled()
       ? new FinalizationRegistry((held) => held.kind === 'object'
         ? this.reclaimObject(held) : this.reclaimExtent(held))
@@ -417,7 +421,7 @@ class WasmHeap {
   // Reclaim an allocExtent extent when `owner` dies. Without a view it cannot
   // detach, so it does not count against growth.
   registerExtent(owner, base, bytes) {
-    if (this.registry) this.registry.register(owner, { base, bytes, viewless: true });
+    if (this.registry) this.registry.register(owner, { base, bytes, viewless: true, sequence: ++this.extentSequence });
   }
 
   // A view over an extent whose owner registerExtent already tracks. It
@@ -427,14 +431,14 @@ class WasmHeap {
     allocationByArray.set(view, { base, bytes, memory: this.memory, length: view.length, descriptor });
     if (!this.registry) return;
     this.arrayViewsLive += 1;
-    this.registry.register(view, { viewOnly: true }, view);
+    this.registry.register(view, { viewOnly: true, sequence: ++this.extentSequence }, view);
   }
 
   // Register a view so its extent returns to the free list when the view dies.
   // The view is also the unregister token, so an explicit freeArray can cancel
   // the registration and avoid binning the same extent twice.
   watch(view, base, bytes,descriptor) {
-    const record={base,bytes,memory:this.memory,length:view.length,descriptor};
+    const record={base,bytes,memory:this.memory,length:view.length,descriptor,sequence:++this.extentSequence};
     allocationByArray.set(view,record);
     // Only counted when something can report the view dead again. Without the
     // registry this would climb to millions over a session and read like a
@@ -450,7 +454,7 @@ class WasmHeap {
   // Called by the host GC after a view becomes unreachable. Carries no view --
   // by definition there is none left -- so it bins by the recorded extent.
   reclaimExtent(held) {
-    if (!held) return;
+    if (!held || this.extentRewound(held.sequence)) return;
     if (!held.viewless && this.arrayViewsLive > 0) this.arrayViewsLive -= 1;
     if (held.viewOnly) return;
     const { base, bytes } = held;
@@ -461,6 +465,44 @@ class WasmHeap {
     if (!(base > 0) || !(bytes > 0)) return;
     this._releaseArrayExtent(base, bytes);
     this.stats.arrayReclaimed += 1;
+  }
+
+  extentRewound(sequence) {
+    return this.rewoundExtents.some(([after, through]) => sequence > after && sequence <= through);
+  }
+
+  // Everything a restore must put back: the memory contents and the allocator
+  // that describes them. Committed size is not state: the memory never shrinks.
+  snapshot() {
+    return {
+      bytes: this.u8.slice(0, this.top), top: this.top, exhausted: this.exhausted,
+      freeBins: new Map([...this.freeBins].map(([size, bin]) => [size, bin.slice()])),
+      arrayBins: new Map([...this.arrayBins].map(([size, bin]) => [size, bin.slice()])),
+      pressurePool: this.pressurePool && Object.assign(Object.create(Object.getPrototypeOf(this.pressurePool)),
+        structuredClone({ ...this.pressurePool })),
+      objectAllocations: new Map(this.objectAllocations),
+      stats: { ...this.stats }, arrayViewsLive: this.arrayViewsLive, extentSequence: this.extentSequence,
+    };
+  }
+
+  // Storage allocated after the snapshot is garbage now, and its finalizers
+  // are still coming. They name addresses the restored allocator considers
+  // free and may hand out again, so a late one would release live storage.
+  // Object records are safe (reclaimObject compares against the restored
+  // map); extents are refused by registration number.
+  restore(saved) {
+    this.u8.fill(0, saved.top, this.top);
+    this.u8.set(saved.bytes);
+    this.rewoundExtents.push([saved.extentSequence, this.extentSequence]);
+    this.top = saved.top;
+    this.exhausted = saved.exhausted;
+    this.freeBins = new Map([...saved.freeBins].map(([size, bin]) => [size, bin.slice()]));
+    this.arrayBins = new Map([...saved.arrayBins].map(([size, bin]) => [size, bin.slice()]));
+    this.pressurePool = saved.pressurePool && Object.assign(Object.create(Object.getPrototypeOf(saved.pressurePool)),
+      structuredClone({ ...saved.pressurePool }));
+    this.objectAllocations = new Map(saved.objectAllocations);
+    this.stats = { ...saved.stats };
+    this.arrayViewsLive = saved.arrayViewsLive;
   }
 
   _releaseArrayExtent(base, bytes) {

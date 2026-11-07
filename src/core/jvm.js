@@ -46,6 +46,7 @@ const JSZip = require("jszip");
 const { JreBootstrap } = require("./jre-bootstrap");
 const JitCompiler = require("../jit/JitCompiler");
 const { encodeGraph, decodeGraph } = require("./stateCodec");
+const { takeSnapshot, restoreSnapshot } = require("./liveSnapshot");
 const { createClock } = require('./fakeClock');
 const {
   newFields, loadHierarchy, makeObjectRef, enumerateFieldKeys, readField,
@@ -166,6 +167,8 @@ function arrayComponentType(descriptor) {
 }
 
 class JVM {
+  _safepoint = null;
+
   getMemoryUsage() {
     return {...require('./browserMemory').captureMemoryUsage(this.wasmHeap),
       allocationPolicy: this.wasmHeapAllocationPolicy};
@@ -1356,6 +1359,53 @@ class JVM {
     });
   }
 
+  // In-page save states (core/liveSnapshot.js). Both wait for a scheduler
+  // safepoint, retrying tick by tick until the threads allow it.
+  _atSafepoint(attempt, timeoutMs) {
+    if (this._safepoint !== null) return Promise.reject(new Error('A live snapshot operation is already pending'));
+    return new Promise((resolve, reject) => {
+      // A timer, not a check in the safepoint: a stopped scheduler reaches none.
+      const timer = setTimeout(() => {
+        this._safepoint = null;
+        reject(new Error(`No safepoint for a live snapshot within ${timeoutMs} ms`));
+      }, timeoutMs);
+      const settle = (finish, value) => { clearTimeout(timer); this._safepoint = null; finish(value); };
+      this._safepoint = async () => {
+        let result;
+        try { result = await attempt(); } catch (error) { settle(reject, error); return false; }
+        if (result === undefined) return false;
+        settle(resolve, result);
+        return true;
+      };
+    });
+  }
+
+  async takeLiveSnapshot({ timeoutMs = 30000 } = {}) {
+    const world = this.jit?.closedWorld;
+    if (world) world.capturePending = true;
+    try {
+      return await this._atSafepoint(async () => {
+        if (world?.built) {
+          if (!world.captureReady()) return undefined;
+          await world.captureThreads();
+        }
+        return takeSnapshot(this);
+      }, timeoutMs);
+    } finally {
+      if (world) world.capturePending = false;
+    }
+  }
+
+  restoreLiveSnapshot(snapshot, { timeoutMs = 30000 } = {}) {
+    return this._atSafepoint(async () => {
+      const world = this.jit?.closedWorld;
+      if (world?.built && !world.restoreReady()) return undefined;
+      restoreSnapshot(this, snapshot);
+      world?.afterRestore();
+      return { status: 'restored' };
+    }, timeoutMs);
+  }
+
   async execute() {
     this.debugManager.resume();
     this._executeDepth = (this._executeDepth || 0) + 1;
@@ -1363,6 +1413,8 @@ class JVM {
 
     try {
       while (!this.debugManager.isPaused) {
+        // Between ticks: no frame is running and no tick is in flight.
+        if (this._safepoint !== null && await this._safepoint()) continue;
         if (this._explicitPreparationDepth > 0) {
           // Explicit ahead-of-time preparation owns the host thread. Let its
           // compiler tasks advance without concurrently executing a stale
@@ -2581,7 +2633,7 @@ class JVM {
       return {slow: true, skipJit};
     }
     const entryFrame = callStack.peek();
-    if (entryFrame.closedPark) return {slow: true, skipJit: false};
+    if (entryFrame.closedPark || entryFrame.pc === entryFrame.closedLoopPc) return {slow: true, skipJit: false};
     if (entryFrame.pc >= entryFrame.instructions.length ||
         entryFrame.isSynchronizedMethod && !entryFrame.monitorEntered) {
       return {slow: true, skipJit};
@@ -2602,7 +2654,7 @@ class JVM {
     let executedBytecodes = 0;
     for (let executed = 0; executed < this.interpreterBurst; executed += 1) {
       if (entryFrame.pc >= instructions.length ||
-          thread.status !== "runnable") break;
+          thread.status !== "runnable" || entryFrame.pc === entryFrame.closedLoopPc) break;
       // Batched interpretation can otherwise step across a proved native
       // header without another JIT probe. Stop only after real bytecode
       // progress, with the same fully materialized Frame and empty stack.
@@ -2760,7 +2812,7 @@ class JVM {
       // hot scheduler entries; the interpreter runner still returns a Promise
       // when it genuinely reaches an asynchronous path.
       // A parked closed-module frame resumes only through the JIT entry.
-      if (!skipJit || frame.closedPark) {
+      if (!skipJit || frame.closedPark || frame.pc === frame.closedLoopPc) {
         let jitResult = this.jit.tryRunFrame(frame, thread);
         if (jitResult && typeof jitResult.then === "function") {
           jitResult = await jitResult;
@@ -2803,7 +2855,8 @@ class JVM {
     for (let executed = 0; executed < limit; executed++) {
       const currentFrame = callStack.isEmpty() ? null : callStack.peek();
       if (!currentFrame || currentFrame.pc >= currentFrame.instructions.length ||
-          thread.status !== 'runnable' || currentFrame.closedPark) break;
+          thread.status !== 'runnable' || currentFrame.closedPark ||
+          currentFrame.pc === currentFrame.closedLoopPc) break;
 
       // An invoke earlier in this burst may have pushed a synchronized frame;
       // it must not execute before its monitor is held. This runs per bytecode,

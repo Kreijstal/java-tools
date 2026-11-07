@@ -90,6 +90,17 @@ class ClosedWorld {
     // Java exceptions inside the module are this tag with the exception as
     // payload; host imports convert whatever JS throws into it.
     this.tag = new WebAssembly.Tag({ parameters: ['anyref'] });
+    // Save states: every invoke reports its frame while this tag unwinds a
+    // thread parked in the module. See captureThreads().
+    this.saveStates = !!(jit.closedWorldSaveStates ??
+      (typeof process !== 'undefined' && process.env?.JVM_CLOSED_WORLD_SAVE_STATES === '1'));
+    this.captureTag = this.saveStates ? new WebAssembly.Tag({ parameters: [] }) : null;
+    this.saveMethods = jit.closedWorldSaveMethods ? new Set(jit.closedWorldSaveMethods) : null;
+    // While a save waits, every host call is a chance to stop at a capturable
+    // site. Normal play never reads this: it is on the time-slice slow path.
+    this.capturePending = false;
+    this.saveSites = [];
+    this.captureLog = null;
     // JS Promise Integration: a scheduler entry runs on its own suspendable
     // stack, so a thread that has to stop inside the module (sleep, wait, a
     // contended monitor, an asynchronous native) parks there and resumes at
@@ -575,7 +586,7 @@ class ClosedWorld {
   // loop and starve every other thread, so a thread that has run for a time
   // slice is parked at its next host call and goes back to the scheduler.
   sliceExpired() {
-    return this.jspi && now() - this.sliceStart > SLICE_MS;
+    return this.jspi && (this.capturePending || now() - this.sliceStart > SLICE_MS);
   }
 
   // JRE natives may return a bare JS array for a Java array result. The
@@ -599,24 +610,53 @@ class ClosedWorld {
   }
 
   // The suspending import behind every park check, one per result type.
-  parkImport(kind) {
-    const key = `park:${kind}`;
+  // A site inside capturable() parks through its own import, which is how a
+  // park knows its frames can report themselves. Only the slow path differs.
+  parkImport(kind, capturable = false) {
+    const key = capturable ? `park:${kind}:capture` : `park:${kind}`;
     if (!this.imports.has(key)) {
       const world = this;
-      this.imports.set(key, { field: key, params: [], results: kind === 'V' ? [] : [WT[kind]], suspending: true,
-        impl: () => world.park(kind) });
+      this.imports.set(key, { field: key, params: capturable ? [VT.i32] : [], results: kind === 'V' ? [] : [WT[kind]],
+        suspending: true, impl: capturable ? (proven) => world.park(kind, proven === 1) : () => world.park(kind) });
     }
     return key;
   }
 
   // Other threads enter the module while this one is parked; the depth
   // counter is per thread, so it comes back with the continuation.
-  async park(kind) {
-    const depth = this.getDepth();
-    try { return await this.parkFor(kind); } finally { this.setDepth(depth); }
+  pollImport(kind) {
+    const key = `poll:${kind}`;
+    if (!this.imports.has(key)) {
+      const world = this, value = kind === 'V' ? [] : [WT[kind]];
+      this.imports.set(key, { field: key, params: [VT.i32, ...value], results: value, suspending: true,
+        impl: (proven, result) => world.poll(kind, proven === 1, result) });
+    }
+    return key;
   }
 
-  async parkFor(kind) {
+  async poll(kind, proven, value) {
+    const depth = this.getDepth(), thread = this.thread;
+    if (!proven || !this.capturePending || this.syncDepth !== 0 || !thread?.closedEntryFrame) return value;
+    try {
+      const outcome = await this.yieldThread(thread, { kind, value });
+      if (outcome?.capture) throw new WebAssembly.Exception(this.captureTag, []);
+      if (outcome && 'thrown' in outcome) throw this.hostThrow(outcome.thrown);
+      return value;
+    } finally { this.setDepth(depth); }
+  }
+
+  get capturePending() { return this._capturePending; }
+  set capturePending(value) {
+    this._capturePending = value;
+    if (this.pollGlobal) this.pollGlobal.value = value ? 1 : 0;
+  }
+
+  async park(kind, capturable = false) {
+    const depth = this.getDepth();
+    try { return await this.parkFor(kind, capturable); } finally { this.setDepth(depth); }
+  }
+
+  async parkFor(kind, capturable = false) {
     const request = this.pendingPark, thread = this.thread;
     this.pendingPark = null;
     this.parkFlag.value = 0;
@@ -648,9 +688,107 @@ class ClosedWorld {
     if (request.invoke) return this.parkedInvoke(request, thread);
     if (request.init) return this.parkedInit(request.init, thread);
     for (;;) {
-      const outcome = await this.yieldThread(thread);
+      const outcome = await this.yieldThread(thread, request.retry || !capturable ? null : { kind, value: request.value });
+      if (outcome?.capture) throw new WebAssembly.Exception(this.captureTag, []);
       if (outcome && 'thrown' in outcome) throw this.hostThrow(outcome.thrown);
       if (!request.retry || request.retry()) return request.value;
+    }
+  }
+
+  // ---- save states --------------------------------------------------------
+  // A thread parked at a plain host call (a sleep, a wait, a time slice) can
+  // leave the module: the park throws the capture tag, each invoke on the
+  // Wasm stack reports its site and values, and the frames continue on the
+  // bytecode tiers, whose calls re-enter the module at full speed. A thread
+  // awaiting a Promise, a contended monitor or a call outside the module is
+  // not at such a point; it is reported as pending and the caller retries on
+  // a later tick.
+  captureImport(kind) {
+    const key = `cap:${kind}`;
+    const world = this;
+    const push = kind === 'site'
+      ? (site) => { world.captureLog.push({ site: world.saveSites[site], values: [] }); }
+      : (value) => { world.captureLog[world.captureLog.length - 1].values.push(world.toJsValue(kind, value)); };
+    return this.pureImport(key, kind === 'site' ? [VT.i32] : [WT[kind]], [], push);
+  }
+
+  // Whether every thread can leave the module right now. A frame the module
+  // waits on (a call outside it, a <clinit>) has an entry below it that can't.
+  captureReady() {
+    return this.jvm.threads.every((thread) => {
+      const frame = thread.closedEntryFrame;
+      return !frame || (!frame.closedOuterEntry && !thread.callStack.isEmpty() && thread.callStack.peek() === frame &&
+        !!frame.closedPark && !!frame.closedPlainPark);
+    });
+  }
+
+  // A restore abandons parked stacks, which is sound unless a host Promise
+  // would later resume one.
+  restoreReady() {
+    return this.jvm.threads.every((thread) => {
+      for (let frame = thread.closedEntryFrame; frame; frame = frame.closedOuterEntry) {
+        if (frame.closedAwaiting || frame.closedTick) return false;
+      }
+      return true;
+    });
+  }
+
+  afterRestore() {
+    this.thread = null;
+    this.pendingPark = null;
+    if (this.parkFlag) this.parkFlag.value = 0;
+    this.setDepth(0);
+  }
+
+  async captureThreads() {
+    if (!this.saveStates) throw new ClosedWorldError('closed world: module was built without save states');
+    let captured = 0, pending = 0;
+    for (const thread of this.jvm.threads) {
+      for (let frame = thread.closedEntryFrame; frame; frame = thread.closedEntryFrame) {
+        if (thread.callStack.isEmpty() || thread.callStack.peek() !== frame || !frame.closedPark ||
+            !frame.closedPlainPark) { pending += 1; break; }
+        this.captureLog = [];
+        frame.closedCapture = frame.closedPlainPark;
+        frame.closedResumeWith = { capture: true };
+        await this.resumeFrame(frame, thread);
+        captured += 1;
+      }
+    }
+    return { captured, pending };
+  }
+
+  // The entry frame becomes the outermost captured frame, keeping its place
+  // and return wiring; frames the module called go above it.
+  finishCapture(frame, thread) {
+    const log = this.captureLog, parked = frame.closedCapture;
+    this.captureLog = null;
+    frame.closedCapture = undefined;
+    frame.closedPlainPark = null;
+    thread.closedEntryFrame = frame.closedOuterEntry;
+    frame.closedOuterEntry = undefined;
+    const Frame = (this.Frame ||= require('../../core/frame'));
+    for (let i = log.length - 1; i >= 0; i--) {
+      const { site, values } = log[i], record = this.entries.get(site.key);
+      const target = i === log.length - 1 ? frame : new Frame(record.method);
+      if (target !== frame) target.className = record.className;
+      target.locals.fill(undefined);
+      target.stack.clear();
+      let next = 0;
+      for (const [slot] of site.slots) target.locals[slot] = values[next++];
+      for (const kind of site.stack) target.stack.push(kind ? values[next++] : undefined);
+      target.pc = site.itemIdx + 1;
+      if (record.loopEntry) target.closedLoopPc = record.loopEntry.pc - (target.method === record.loopEntry.method ? 0 : 1);
+      if (record.synchronized) {
+        // The module's wrapper holds one count, and its exit will not run. A
+        // frame the scheduler entered holds a second one of its own; a frame
+        // the module called takes the wrapper's over.
+        const monitor = this.jvm.frameMonitorObject(target);
+        if (target.monitorEntered) monitor.lockCount -= 1;
+        target.monitorEntered = true;
+        target.monitorOwnerThreadId = thread.id;
+      }
+      if (target !== frame) thread.callStack.push(target);
+      if (i === 0 && parked.kind !== 'V') target.stack.push(this.toJsValue(parked.kind, parked.value));
     }
   }
 
@@ -711,10 +849,11 @@ class ClosedWorld {
 
   // End this scheduler tick with the thread parked in the module; the next
   // tick that finds the entry frame on top resumes it.
-  yieldThread(thread) {
+  yieldThread(thread, plain = null) {
     const frame = thread.closedEntryFrame;
     return new Promise((resume) => {
       frame.closedPark = resume;
+      frame.closedPlainPark = plain;
       endSegment(frame, PARKED);
     });
   }
@@ -819,6 +958,7 @@ class ClosedWorld {
       if (record) candidates.push(record);
     }
     this.reportPreparation('closed-analysis', methods.length, methods.length);
+    this.addLoopEntries(candidates);
     for (const record of candidates) this.entries.set(record.key, record);
     // Greatest fixed point: drop methods that call something not admitted.
     // With JSPI such a call is a stub that runs the callee as an ordinary
@@ -901,6 +1041,91 @@ class ClosedWorld {
   reject(key, reason) {
     this.rejected.set(key, reason);
     return null;
+  }
+
+  // A captured frame continues on the bytecode tiers, and a game loop never
+  // returns, so without a way back every later call would cross into the
+  // module from outside. Each listed loop therefore gets a second entry: a
+  // copy of the method whose first instruction jumps to the outermost loop
+  // head, taking every local as a parameter in its own slot. It is an ordinary
+  // method to the rest of the pipeline, and a frame moves onto it at the head.
+  addLoopEntries(candidates) {
+    if (!this.saveMethods || !this.jspi) return;
+    for (const record of [...candidates]) {
+      if (!this.saveMethods.has(record.key) || record.synchronized) continue;
+      const loop = this.loopEntryFor(record);
+      if (loop) candidates.push(loop);
+    }
+  }
+
+  loopEntryFor(record) {
+    const built = this.loopMethod(record);
+    if (!built) return null;
+    const loop = this.analyze(record.className, built.method, built.key);
+    if (!loop) return null;
+    this.linkLoopEntry(record, loop, built);
+    return loop;
+  }
+
+  linkLoopEntry(record, loop, { method, key, pc }) {
+    this.saveMethods.add(key);
+    record.loopEntry = loop.loopEntry = { method, pc, record: loop };
+  }
+
+  // Derived only from the method, so a cached module gets the same copy back.
+  loopMethod(record) {
+    const { method, className } = record;
+    const code = method.attributes.find((a) => a.type === 'code').code;
+    const items = code.codeItems, labels = new Map();
+    items.forEach((item, index) => { if (item.labelDef) labels.set(item.labelDef.replace(/:$/, ''), index); });
+    let header = -1, span = 0;
+    items.forEach((item, index) => {
+      const op = item.instruction?.op;
+      if (!op || !(op.startsWith('goto') || op.startsWith('if'))) return;
+      const target = labels.get(String(item.instruction.arg));
+      if (target !== undefined && target <= index && index - target > span) { header = target; span = index - target; }
+    });
+    if (header < 0) return null;
+    let fn;
+    try {
+      fn = buildSsa({ codeItems: items, exceptionTable: code.exceptionTable || [], method, className },
+        { slotDefsAt: (index) => index === header });
+    } catch { return null; }
+    if (fn.rejected || fn.depthBefore.get(header) !== 0) return null;
+    const defs = fn.slotDefsBefore?.get(header) || new Map(), params = [];
+    for (let slot = 0, size = parseInt(code.localsSize, 10); slot < size;) {
+      const kind = defs.get(slot)?.kind;
+      if (kind === 'A') params.push(slot === 0 && !record.isStatic ? `L${className};` : 'Ljava/lang/Object;');
+      else params.push(kind === 'J' || kind === 'F' || kind === 'D' ? kind : 'I');
+      slot += kind === 'J' || kind === 'D' ? 2 : 1;
+    }
+    const descriptor = `(${params.join('')})${method.descriptor.slice(method.descriptor.indexOf(')') + 1)}`;
+    const name = `${method.name}$loop`, jump = { instruction: { op: 'goto', arg: items[header].labelDef.replace(/:$/, '') } };
+    const copy = { name, descriptor, flags: [...flagsOf(method).filter((flag) => flag !== 'static'), 'static'],
+      attributes: [{ type: 'code', code: { ...code, codeItems: [jump, ...items.map((item) => ({ ...item }))] } }] };
+    return { method: copy, key: `${className}.${name}${descriptor}`, pc: header + 1 };
+  }
+
+  // At the loop head of a frame the module's loop entry can take over.
+  enterLoop(frame, thread) {
+    const loop = this.entryByMethod.get(frame.method)?.loopEntry;
+    const here = frame.closedLoopPc;
+    frame.closedLoopPc = undefined;
+    if (!loop || frame.pc !== here || frame.stack.items.length || this.debugging() || !this.isReady(loop.record)) return null;
+    if (frame.method !== loop.method) {
+      const code = loop.method.attributes[0].code;
+      frame.method = loop.method;
+      frame.instructions = code.codeItems;
+      frame.exceptionTable = code.exceptionTable || [];
+      frame.pc = loop.pc;
+    }
+    const { paramKinds } = loop.record, args = new Array(paramKinds.length);
+    for (let i = 0, slot = 0; i < paramKinds.length; i++) {
+      args[i] = this.fromJs(paramKinds[i], frame.locals[slot]);
+      slot += paramKinds[i] === 'J' || paramKinds[i] === 'D' ? 2 : 1;
+    }
+    this.counters.loopEntries = (this.counters.loopEntries || 0) + 1;
+    return this.enterSuspendable(frame, thread, loop.record, args);
   }
 
   analyze(className, method, key) {
@@ -1545,6 +1770,17 @@ class ClosedWorld {
   getDepth() { return this.depthGlobal ? this.depthGlobal.value : 0; }
 
   // ---- module assembly ----------------------------------------------------
+  // Unwinding through a frame with no capture code loses that frame. Listed
+  // methods prove the chain at run time instead: an entry or a listed call site
+  // names the callee in the token, the callee keeps whether it was named, and
+  // parks only count as capturable when it was. Unlisted methods never touch
+  // the token, so they are unchanged and any path through one breaks the chain.
+  saveMethodId(key) {
+    if (!this.saveMethods?.has(key)) return 0;
+    this.saveMethodIds ||= new Map([...this.saveMethods].sort().map((name, index) => [name, index + 1]));
+    return this.saveMethodIds.get(key);
+  }
+
   async assemble() {
     this.reportPreparation('closed-link');
     await this.yieldPreparation();
@@ -1559,10 +1795,14 @@ class ClosedWorld {
         this.reportPreparation('closed-compile', completed++, total, key);
         const pending = this.yieldPreparation(); if (pending) await pending;
         if (bodies.has(key)) continue;
+        const sites = this.sites.length, saveSites = this.saveSites.length;
         try {
           bodies.set(key, new ClosedCompiler(this, record).compile());
         } catch (error) {
           if (!(error instanceof Unsupported)) throw error;
+          // Sites only the discarded body referred to.
+          this.sites.length = sites;
+          this.saveSites.length = saveSites;
           this.entries.delete(key);
           this.rejected.set(key, `compile: ${error.message}`);
         }
@@ -1596,6 +1836,12 @@ class ClosedWorld {
     builder.addGlobal('emptyRefs', ref(T_REFS), false, [...GC.array_new_fixed, { type: T_REFS }, 0]);
     builder.addGlobal('park', [VT.i32], true, [OP.i32_const, 0]);
     builder.exportGlobal('park', 'park');
+    if (this.saveMethods) {
+      builder.addGlobal('capexpect', [VT.i32], true, [OP.i32_const, 0]);
+      builder.exportGlobal('capexpect', 'capexpect');
+      builder.addGlobal('cappoll', [VT.i32], true, [OP.i32_const, 0]);
+      builder.exportGlobal('cappoll', 'cappoll');
+    }
     builder.addGlobal('depth', [VT.i32], true, [OP.i32_const, 0]);
     // The last (array class, value class) pair a module aastore accepted.
     builder.addGlobal('storeArrayClass', [VT.i32], true, [OP.i32_const, ...sleb(-1)]);
@@ -1604,6 +1850,10 @@ class ClosedWorld {
     builder.importMemory('c', 'mem', this.runtime.heap.memory.buffer.byteLength >>> 16);
     builder.importTag('t', 'jx', [[VT.anyref]], 'jx');
     const importObject = { c: { mem: this.runtime.heap.memory }, t: { jx: this.tag }, s: {}, f: {} };
+    if (this.saveStates) {
+      builder.importTag('t', 'cap', [], 'cap');
+      importObject.t.cap = this.captureTag;
+    }
     // Synchronized methods: their body is compiled separately and called by
     // a wrapper that holds the monitor and releases it on every exit.
     const stubs = new Map();
@@ -1724,6 +1974,9 @@ class ClosedWorld {
     const classTypes = [...this.classTypes.values()];
     this.instance = instance;
     this.parkFlag = instance.exports.park;
+    this.expectGlobal = instance.exports.capexpect;
+    this.pollGlobal = instance.exports.cappoll;
+    if (this.saveMethods) for (const record of this.entries.values()) record.saveId = this.saveMethodId(record.key);
     this.depthGlobal = instance.exports.depth;
     for (const g of (this.staticGlobals || new Map()).values()) g.cell.rebind(instance.exports[g.exportName]);
     const alloc = new Map(), fields = new Map();
@@ -1760,7 +2013,10 @@ class ClosedWorld {
     const code = [...lockCode, OP.local_set, ...uleb(lock), ...enter,
       OP.try, ...(hasResult ? this.wasmType(record.returnKind, record.returnRepr) : [0x40])];
     for (let i = 0; i < n; i++) code.push(OP.local_get, ...uleb(i));
-    code.push(OP.call, { fn: `m:${key}$body` }, OP.catch_all, ...call('mexit'), OP.rethrow, 0, OP.end);
+    code.push(OP.call, { fn: `m:${key}$body` });
+    // A capture moves the frame to the bytecode tiers still holding the monitor.
+    if (this.saveStates && (!this.saveMethods || this.saveMethods.has(key))) code.push(OP.catch, { tag: 'cap' }, OP.rethrow, 0);
+    code.push(OP.catch_all, ...call('mexit'), OP.rethrow, 0, OP.end);
     if (hasResult) code.push(OP.local_set, ...uleb(result));
     code.push(...call('mexit'));
     if (hasResult) code.push(OP.local_get, ...uleb(result));
@@ -1880,6 +2136,7 @@ class ClosedWorld {
   // Scheduler entry: a frame at pc 0 of an admitted, ready method.
   tryRunFrame(frame, thread) {
     if (frame.closedPark) return this.resumeFrame(frame, thread);
+    if (frame.pc !== 0 && frame.closedLoopPc !== undefined) return this.enterLoop(frame, thread);
     if (frame.pc !== 0 || this.debugging()) return null;
     const record = this.entryByMethod.get(frame.method);
     if (!record) return null;
@@ -1925,6 +2182,7 @@ class ClosedWorld {
   enterSuspendable(frame, thread, record, args) {
     const fn = record.promising ||= WebAssembly.promising(record.fn);
     const tick = beginSegment(frame);
+    if (record.saveId) this.expectGlobal.value = record.saveId;
     // Entries nest on one thread: a frame the module waits for (a slow call,
     // a <clinit>) can itself enter the module.
     frame.closedOuterEntry = thread.closedEntryFrame;
@@ -1976,6 +2234,12 @@ class ClosedWorld {
   }
 
   failSuspendable(frame, thread, record, error) {
+    if (this.saveStates && error instanceof WebAssembly.Exception && error.is(this.captureTag)) {
+      try { this.finishCapture(frame, thread); endSegment(frame, RETURNED); } catch (failure) {
+        const tick = frame.closedTick; frame.closedTick = null; tick.reject(failure);
+      }
+      return;
+    }
     thread.closedEntryFrame = frame.closedOuterEntry;
     frame.closedOuterEntry = undefined;
     const tick = frame.closedTick;

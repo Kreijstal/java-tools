@@ -3,7 +3,9 @@ const {digest}=require('./cacheDigest');
 const {uleb}=require('./wasmBuilder');
 const FORMAT='closed-world-preparation/1';
 const SECTION='jvm.closed.preparation';
-const MAX_ENTRY=16*1024*1024, MAX_TOTAL=64*1024*1024, MAX_ENTRIES=8;
+// Save-state capture makes a module about a third larger; the largest game
+// (Tomb Racer) then needs about 28 MB.
+const MAX_ENTRY=32*1024*1024, MAX_TOTAL=128*1024*1024, MAX_ENTRIES=8;
 const MAX_METADATA=32*1024*1024;
 const encode=value=>JSON.stringify(value,(_key,v)=>typeof v==='bigint'?{$bigint:String(v)}:
   typeof v==='number'&&!Number.isFinite(v)?{$number:String(v)}:Object.is(v,-0)?{$number:'-0'}:v);
@@ -85,8 +87,26 @@ function fingerprint(world) {
   const layouts=[...world.classTypes.values()].map(t=>[t.name,t.index,t.parent?.name,t.layout.classId,t.layout.size,t.layout.slots,t.layout.references]);
   return encode({format:FORMAT,runtime:world.cacheIdentity,classes,natives,layouts,indices:[...jvm._classIndices],
     jspi:world.jspi,optimisticAsync:world.optimisticAsync,maxStackDepth:jvm.maxStackDepth||1024,
-    dense:jvm.denseInstanceFields,heapPages:world.runtime.heap.memory.buffer.byteLength>>>16,
+    dense:jvm.denseInstanceFields,saveStates:world.saveStates,
+    saveMethods:world.saveMethods?[...world.saveMethods].sort():null,heapPages:world.runtime.heap.memory.buffer.byteLength>>>16,
     heapAllocated:world.runtime.heap.usage().allocated,overrides:[...(jvm.jreOverridden||[])].sort()});
+}
+
+// One row per capture site: [method, item, "slot kind ...", "kind or - ..."].
+// Each site names its method, so the key goes in a table once.
+function packSaveSites(sites) {
+  const keys=[],index=new Map();
+  const rows=(sites||[]).map(({key,itemIdx,slots,stack})=>{
+    if(!index.has(key)){index.set(key,keys.length);keys.push(key);}
+    return [index.get(key),itemIdx,slots.map(([slot,kind])=>slot+kind).join(' '),stack.map(kind=>kind||'-').join('')];
+  });
+  return {keys,rows};
+}
+function unpackSaveSites(packed) {
+  if(!packed)return [];
+  return packed.rows.map(([k,itemIdx,slots,stack])=>({key:packed.keys[k],itemIdx,
+    slots:slots?slots.split(' ').map(s=>[Number(s.slice(0,-1)),s.slice(-1)]):[],
+    stack:[...stack].map(kind=>kind==='-'?null:kind)}));
 }
 
 function marker(entry){return `${entry.key}:${entry.metadataHash}:${entry.bytesHash}`;}
@@ -126,7 +146,9 @@ function markedBytes(entry) {
 function restoreImport(world,spec) {
   const {key,params,results,binding:b}=spec;
   if(key.startsWith('h:'))return world.hostImport(key.slice(2),params,results);
-  if(key.startsWith('park:'))return world.parkImport(key.slice(5));
+  if(key.startsWith('park:')){const [,kind,capture]=key.split(':');return world.parkImport(kind,capture==='capture');}
+  if(key.startsWith('poll:'))return world.pollImport(key.slice(5));
+  if(key.startsWith('cap:'))return world.captureImport(key.slice(4));
   if(!b)throw new Error('No symbolic binding for '+key);
   switch(b.kind) {
     case 'exception':return world.exceptionTypeImport(b.type);
@@ -189,10 +211,19 @@ async function restore(world,methods,thread) {
     const meta=await decodeMetadata(entry);
     for(const [name,id] of meta.indices)if(world.classId(name)!==id)throw new Error('Cached class ID changed');
     const byKey=new Map(methods.map(row=>[row.key,row.method]));
+    const loops=(meta.loops||[]).map(([key,loopKey])=>{
+      const record=meta.entries.find(r=>r.key===key);
+      const built=record&&world.loopMethod({...record,method:byKey.get(key)});
+      if(!built||built.key!==loopKey)throw new Error('Cached loop entry changed: '+key);
+      byKey.set(loopKey,built.method);
+      return {key,built};
+    });
     for(const r of meta.entries) {
       const method=byKey.get(r.key);if(!method)throw new Error('Cached method missing: '+r.key);
       world.entries.set(r.key,{...r,method,calls:new Set(r.calls),initClasses:new Set(r.initClasses)});
     }
+    for(const {key,built} of loops)world.linkLoopEntry(world.entries.get(key),world.entries.get(built.key),built);
+    world.saveSites=unpackSaveSites(meta.saveSites);
     world.rejected=new Map(meta.rejected);world.sites=restoreSites(meta.sites,byKey);world.knownClassLimit=meta.knownClassLimit;
     for(const event of meta.events) {
       if(event.kind==='init') {
@@ -217,6 +248,7 @@ async function restore(world,methods,thread) {
         !!actual.suspending!==!!spec.suspending||!!actual.pure!==!!spec.pure)throw new Error('Cached import signature changed: '+spec.key);
     }
     const imports={c:{mem:world.runtime.heap.memory},t:{jx:world.tag},s:{},f:{}};
+    if(world.saveStates)imports.t.cap=world.captureTag;
     let i=0;
     for(const spec of meta.globalImports) {
       const g=world.globalImports.get(spec.key);if(!g)throw new Error('Cached global missing');
@@ -246,7 +278,7 @@ async function restore(world,methods,thread) {
     try{await world.preparationCache.delete?.(world.cacheKey);}catch{}
     world.cacheKey=null;
     world.entries.clear();world.entryByMethod.clear();world.imports.clear();world.globalImports.clear();
-    world.staticGlobals=new Map();world.initTargets=new Map();world.sites=[];world.bindingEvents=[];
+    world.staticGlobals=new Map();world.initTargets=new Map();world.sites=[];world.saveSites=[];world.bindingEvents=[];
     world.stubSignatures=new Map();world.rejected.clear();
     world.reportPreparation('closed-cache-rejected');
     return false;
@@ -261,13 +293,14 @@ async function capture(world,bytes) {
   try {
     const imports=[...world.imports].map(([key,imp])=>({key,params:imp.params,results:imp.results,
       pure:!!imp.pure,suspending:!!imp.suspending,binding:imp.binding}));
-    if(imports.some(i=>!i.binding&&!i.key.startsWith('h:')&&!i.key.startsWith('park:')))
+    if(imports.some(i=>!i.binding&&!i.key.startsWith('h:')&&!/^(park|poll|cap):/.test(i.key)))
       throw new Error('A host import has no serializable binding');
     const metadata={
       entries:[...world.entries.values()].map(r=>({...Object.fromEntries(recordKeys.map(k=>[k,r[k]])),calls:[...r.calls],initClasses:[...r.initClasses]})),
       events:world.bindingEvents,imports,globalImports:[...world.globalImports.keys()].map(key=>({key})),
       staticExports:[...(world.staticGlobals||[])].map(([key,g])=>[key,g.exportName]),
-      indices:[...world.jvm._classIndices],sites:captureSites(world),rejected:[...world.rejected],knownClassLimit:world.knownClassLimit,
+      indices:[...world.jvm._classIndices],sites:captureSites(world),saveSites:packSaveSites(world.saveSites),
+      loops:[...world.entries.values()].filter(r=>r.loopEntry&&r.loopEntry.record!==r).map(r=>[r.key,r.loopEntry.record.key]),rejected:[...world.rejected],knownClassLimit:world.knownClassLimit,
       recursive:world.counters.recursive||0,stubs:world.counters.stubs||0,optimisticAsyncSites:world.optimisticAsyncSites||0,
     };
     const packed=await metadataBytes(metadata),size=bytes.length+packed.bytes.length;
@@ -282,4 +315,4 @@ async function save(world,entry,module) {
     world.cacheStatus={...world.cacheStatus,status:'stored',nativeModule:saved?.nativeModule??true,bytes:entry.size};}
   catch(error){world.cacheStatus={...world.cacheStatus,status:'write-failed',reason:String(error?.message||error)};}
 }
-module.exports={browserCache,restore,capture,save,markedBytes,fingerprint,FORMAT};
+module.exports={browserCache,restore,capture,save,markedBytes,fingerprint,packSaveSites,unpackSaveSites,FORMAT};

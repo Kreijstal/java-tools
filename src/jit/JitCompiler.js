@@ -922,6 +922,8 @@ class JitCompiler {
     this.wasmJit = new WasmJit(jvm, this);
     // One closed Wasm module over the closed storage (jit/closed). Built by
     // jvm.run() before main; consulted first at frame and call entry.
+    this.closedWorldSaveStates = options.closedWorldSaveStates;
+    this.closedWorldSaveMethods = options.closedWorldSaveMethods;
     this.closedWorld = jvm.closedRuntime && this.enabled !== false && options.closedWorld !== false
       ? new (require('./closed/ClosedWorld').ClosedWorld)(this) : null;
     if (options.wasmStructured === true) {
@@ -1204,7 +1206,7 @@ class JitCompiler {
   }
 
   tryRunFrame(frame, thread) {
-    if (this.closedWorld !== null && frame.pc === 0) {
+    if (this.closedWorld !== null && (frame.pc === 0 || frame.closedPark || frame.pc === frame.closedLoopPc)) {
       const closed = this.closedWorld.tryRunFrame(frame, thread);
       if (closed) return closed;
     }

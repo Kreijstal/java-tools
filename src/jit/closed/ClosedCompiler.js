@@ -72,6 +72,8 @@ function zero(kind) {
 }
 
 class Unsupported extends Error {}
+// The JS-API limit on a function's parameters plus locals (V8, SpiderMonkey).
+const MAX_FUNCTION_LOCALS = 50000;
 // Every null check names its site (JVM_CLOSED_WORLD_DEBUG_NPE=1).
 const DEBUG_NPE = typeof process !== 'undefined' && process.env.JVM_CLOSED_WORLD_DEBUG_NPE === '1';
 
@@ -128,6 +130,14 @@ class ClosedCompiler {
     this.analyzeControl();
     this.analyzeInvariantReceiverFields();
     const code = [];
+    // Save states: whether this frame was reached through a proven chain.
+    this.saveProven = undefined;
+    const saveId = this.world.saveMethodId(this.entry.key);
+    if (saveId) {
+      this.saveProven = this.local([VT.i32]);
+      code.push(OP.global_get, { global: 'capexpect' }, OP.i32_const, ...sleb(saveId), OP.i32_eq,
+        OP.local_set, ...uleb(this.saveProven), OP.i32_const, 0, OP.global_set, { global: 'capexpect' });
+    }
     // Depth accounting (ClosedWorld.markRecursion): a method on a call cycle
     // counts its frame and throws StackOverflowError past the JVM's limit; a
     // method with handlers remembers its depth, since an exception unwinds
@@ -164,6 +174,11 @@ class ClosedCompiler {
     this.doTree(fn.entry, code);
     code.push(OP.unreachable, OP.end,
       OP.call, { fn: this.world.hostImport('err_npe', [], []) }, OP.unreachable);
+    // Engines refuse the whole module over one such function; the method
+    // runs on the bytecode tiers instead.
+    if (this.paramCount + this.locals.length > MAX_FUNCTION_LOCALS) {
+      throw new Unsupported(`${this.paramCount + this.locals.length} locals (limit ${MAX_FUNCTION_LOCALS})`);
+    }
     return { locals: this.locals, code };
   }
 
@@ -491,7 +506,12 @@ class ClosedCompiler {
     const index = block.predIds.indexOf(source);
     if (index < 0) throw new Error(`edge ${source}->${target} missing from predIds`);
     const out = [];
-    for (const phi of phis) out.push(...this.use(phi.args[index], phi.kind));
+    // A join kept only for a handler can merge a slot reused at another kind.
+    // The verifier makes that slot unusable, so the edge needs only a zero.
+    for (const phi of phis) {
+      const arg = phi.args[index];
+      out.push(...this.use(arg?.kind === phi.kind ? arg : null, phi.kind));
+    }
     for (let i = phis.length - 1; i >= 0; i--) out.push(...this.set(phis[i]));
     return out;
   }
@@ -983,8 +1003,62 @@ class ClosedCompiler {
     const plan = this.plan.get(node.id);
     if (!plan) throw new Unsupported(`no plan for ${op}`);
     if (plan.initClass) out.push(...this.initCheck(plan.initClass));
-    out.push(...this.planned(node, plan));
+    out.push(...(this.world.saveStates && op.startsWith('invoke') ? this.capturable(node, plan) : this.planned(node, plan)));
     return this.finish(node, out);
+  }
+
+  // Save states (ClosedWorld.captureThreads): an invoke's frame state, reported
+  // while the capture exception unwinds through it. The normal path is the
+  // call alone. The frame resumes at the next item on the bytecode tiers, so
+  // only what the Java frame can still observe is recorded: a phi nothing
+  // reads is never written, and no continuation can read it either.
+  capturable(node, plan) {
+    // Only methods a save can stop in carry this: the rest compile as without it.
+    if (this.world.saveMethods && !this.world.saveMethods.has(this.entry.key)) return this.planned(node, plan);
+    this.context.push({ kind: 'try' });
+    this.capturing = true;
+    let code = this.planned(node, plan);
+    if (this.saveProven !== undefined) code = this.pollAfter(code, node);
+    this.capturing = false;
+    this.context.pop();
+    const recorded = (value) => this.live(value) && value.op !== 'undef' &&
+      !((value.op === 'phi' || value.op === 'caught_exception') && !value.uses.length) &&
+      !(value.op === 'handler_local' && !this.wantedHandlerLocal(value));
+    const report = [], slots = [], stack = [];
+    const emit = (value) => report.push(...this.use(value, value.kind), OP.call, { fn: this.world.captureImport(value.kind) });
+    for (const [slot, value] of node.slotState || []) {
+      if (!recorded(value)) continue;
+      slots.push([slot, value.kind]);
+      emit(value);
+    }
+    for (const value of node.stackUnder || []) {
+      stack.push(recorded(value) ? value.kind : null);
+      if (recorded(value)) emit(value);
+    }
+    const site = this.world.saveSites.push({ key: this.entry.key, itemIdx: node.itemIdx, slots, stack }) - 1;
+    const result = node.kind && node.kind !== 'V' ? this.world.wasmType(node.kind, this.producedRepr(node)) : [0x40];
+    return [OP.try, ...result, ...code, OP.catch, { tag: 'cap' },
+      OP.i32_const, ...sleb(site), OP.call, { fn: this.world.captureImport('site') }, ...report,
+      OP.rethrow, 0, OP.end];
+  }
+
+  // A listed method stops here while a save is pending, so a loop that never
+  // blocks still reaches a capturable point. Listed methods are not hot, and
+  // the rest of the program has no such check.
+  pollAfter(code, node) {
+    const kind = node.kind && node.kind !== 'V' ? node.kind : 'V';
+    const poll = this.world.pollImport(kind);
+    const flag = [OP.global_get, { global: 'cappoll' }];
+    const proven = [OP.local_get, ...uleb(this.saveProven)];
+    if (kind === 'V') return [...code, ...flag, OP.if, 0x40, ...proven, OP.call, { fn: poll }, OP.end];
+    const repr = kind === 'A' ? this.producedRepr(node) : null;
+    const type = this.world.wasmType(kind, repr);
+    const tmp = this.temp(type);
+    const out = [...code, OP.local_set, ...uleb(tmp), ...flag, OP.if, 0x40, ...proven, OP.local_get, ...uleb(tmp),
+      OP.call, { fn: poll }, ...(typed(repr) ? this.castTo(repr) : []), OP.local_set, ...uleb(tmp), OP.end,
+      OP.local_get, ...uleb(tmp)];
+    this.release(type, tmp);
+    return out;
   }
 
   constant(node) {
@@ -1208,12 +1282,16 @@ class ClosedCompiler {
   // stack. When the host set the park flag, the result is a placeholder:
   // the suspending park import parks the thread and returns the real one.
   withPark(code, kind, type = kind === 'V' ? null : [WT[kind]], cast = []) {
-    const park = this.world.parkImport(kind);
+    // Without a list every invoke carries capture code, so every chain holds.
+    const capturable = !!this.capturing;
+    const park = this.world.parkImport(kind, capturable);
+    const proven = !capturable ? [] : this.saveProven === undefined ? [OP.i32_const, 1]
+      : [OP.local_get, ...uleb(this.saveProven)];
     const flag = [OP.global_get, { global: 'park' }];
-    if (kind === 'V') return [...code, ...flag, OP.if, 0x40, OP.call, { fn: park }, OP.end];
+    if (kind === 'V') return [...code, ...flag, OP.if, 0x40, ...proven, OP.call, { fn: park }, OP.end];
     const tmp = this.temp(type);
     const out = [...code, OP.local_set, ...uleb(tmp), ...flag, OP.if, 0x40,
-      OP.call, { fn: park }, ...cast, OP.local_set, ...uleb(tmp), OP.end, OP.local_get, ...uleb(tmp)];
+      ...proven, OP.call, { fn: park }, ...cast, OP.local_set, ...uleb(tmp), OP.end, OP.local_get, ...uleb(tmp)];
     this.release(type, tmp);
     return out;
   }
@@ -1311,8 +1389,16 @@ class ClosedCompiler {
   call(node, plan) {
     const code = [];
     if (plan.nullCheckReceiver) code.push(...this.nonNull(this.use(node.args[0], 'A')), OP.drop);
-    code.push(...this.callArgs(node, plan), OP.call, { fn: plan.fn });
+    code.push(...this.expectCallee(plan.fn), ...this.callArgs(node, plan), OP.call, { fn: plan.fn });
     return code;
+  }
+
+  // Names a listed callee in the token, if this frame's chain is proven.
+  expectCallee(fnKey) {
+    if (!this.capturing || this.saveProven === undefined) return [];
+    const callee = typeof fnKey === 'string' && fnKey.startsWith('m:') ? this.world.saveMethodId(fnKey.slice(2)) : 0;
+    if (!callee) return [];
+    return [OP.local_get, ...uleb(this.saveProven), OP.i32_const, ...sleb(callee), OP.i32_mul, OP.global_set, { global: 'capexpect' }];
   }
 
   // Dispatch on the receiver's class id among the admitted implementations.
@@ -1344,7 +1430,7 @@ class ClosedCompiler {
         if (i) code.push(OP.i32_or);
       }
       const callee = this.calleeOf(arm.fn);
-      code.push(OP.if, ...resultType, ...this.callArgs(node, plan, arm.fn), OP.call, { fn: arm.fn });
+      code.push(OP.if, ...resultType, ...this.expectCallee(arm.fn), ...this.callArgs(node, plan, arm.fn), OP.call, { fn: arm.fn });
       if (!callee) code.push(...castResult);
       code.push(OP.else);
       open += 1;

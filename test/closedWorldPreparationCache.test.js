@@ -32,7 +32,7 @@ test('cache hashes also work on HTTP origins without WebCrypto', async () => {
 test('oversized final artifacts are refused without retaining a second byte copy', async () => {
   const world={cacheKey:'fixture',preparationCache:{},cacheStatus:{},imports:new Map(),entries:new Map(),
     bindingEvents:[],globalImports:new Map(),jvm:{_classIndices:new Map()},sites:[],rejected:new Map(),counters:{}};
-  assert.equal(await preparationCache.capture(world,new Uint8Array((16<<20)+1)),null);
+  assert.equal(await preparationCache.capture(world,new Uint8Array((32<<20)+1)),null);
   assert.equal(world.cacheStatus.status,'not-stored');
   assert.match(world.cacheStatus.reason,/budget/);
 });
@@ -141,4 +141,12 @@ test('byte cache still skips analysis and generation when native Module storage 
   assert.equal(warm.analyses, 0);
   assert.equal(warm.assemblies, 0);
   assert.equal(warm.compiles, 1);
+});
+
+test('the capture site table survives its packed form', () => {
+  const sites=[{key:'A.f(I)V',itemIdx:4,slots:[[0,'A'],[1,'I'],[12,'D']],stack:['J',null,'A']},
+    {key:'A.f(I)V',itemIdx:9,slots:[],stack:[]},{key:'B.g()J',itemIdx:0,slots:[[3,'F']],stack:[null]}];
+  const packed=preparationCache.packSaveSites(sites);
+  assert.equal(packed.keys.length,2);
+  assert.deepEqual(preparationCache.unpackSaveSites(JSON.parse(JSON.stringify(packed))),sites);
 });

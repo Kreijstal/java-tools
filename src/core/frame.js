@@ -71,6 +71,8 @@ class Frame {
     this.closedResumeWith = undefined;
     this.closedOuterEntry = undefined;
     this.closedAwaiting = undefined;
+    // Save states: the loop head at which this frame can re-enter the module.
+    this.closedLoopPc = undefined;
     this.inUse = false;
     this.resumedAt = undefined;
     this[STRUCTURED_CONTINUATION] = undefined;
