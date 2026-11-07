@@ -335,14 +335,24 @@ class ClosedWorld {
     return this.jvm.classes[className]?.staticFields || this.jvm.jre?.[className]?.staticFields || null;
   }
 
-  // Concrete loaded classes assignable to `target` (class ids).
+  // Concrete loaded classes assignable to `target` (class ids). Every call
+  // site asks, so the answer is kept per target while no class is added
+  // (classes are only ever added, so an unchanged count is an unchanged set).
   subclassIds(target) {
-    const ids = [];
-    for (const name of Object.keys(this.jvm.classes)) {
+    const names = Object.keys(this.jvm.classes);
+    if (this.subclassCacheSize !== names.length) {
+      this.subclassCache = new Map();
+      this.subclassCacheSize = names.length;
+    }
+    let ids = this.subclassCache.get(target);
+    if (ids) return ids.slice();
+    ids = [];
+    for (const name of names) {
       if (!this.isGuestClass(name) || this.isAbstract(name)) continue;
       if (this.jvm.isInstanceOfSync(name, target)) ids.push({ name, id: this.classId(name) });
     }
-    return ids;
+    this.subclassCache.set(target, ids);
+    return ids.slice();
   }
 
   // ---- imports ----------------------------------------------------------
