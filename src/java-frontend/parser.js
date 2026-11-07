@@ -88,10 +88,12 @@ function isTypeDeclarationStart(token, nextToken) {
   if (token.text === '@' && nextToken && nextToken.text === 'interface') {
     return true;
   }
+  // `record` is contextual: it starts a declaration only before the record's
+  // name, and is otherwise an ordinary identifier (`record = new R();`).
   return token.text === 'class'
     || token.text === 'interface'
     || token.text === 'enum'
-    || token.text === 'record';
+    || (token.text === 'record' && isNameToken(nextToken));
 }
 
 function splitTopLevel(tokens, separatorText) {
