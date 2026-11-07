@@ -469,8 +469,21 @@ module.exports = {
       }
       const className = classData.ast.classes[0].className;
       const t0 = thread || jvm.threads[jvm.currentThreadIndex] || jvm.threads[0];
+      // As on HotSpot, a private nullary constructor is reachable only from
+      // its own class: anyone else gets IllegalAccessException and the
+      // constructor never runs. Obfuscated games probe optional classes this
+      // way, behind a private constructor that throws Error.
+      const declared = jvm.findMethod(jvm.classes[className], '<init>', '()V');
+      if (declared && (declared.flags || []).includes('private')) {
+        const caller = t0 && !t0.callStack.isEmpty() ? t0.callStack.peek().className : null;
+        if (caller !== className) {
+          throw { type: 'java/lang/IllegalAccessException',
+            message: `Class ${String(caller || '').replace(/\//g, '.')} can not access a member of class ` +
+              `${className.replace(/\//g, '.')} with modifiers "private"` };
+        }
+      }
       const newObj = await jvm.createAppletInstance(className, t0);
-      const constructor = jvm.findMethod(jvm.classes[className], '<init>', '()V');
+      const constructor = declared;
       if (constructor) {
         const Frame = require('../../../core/frame');
         const initFrame = new Frame(constructor);
