@@ -16,8 +16,8 @@ as the host's runtime identity. Integrity receipts cover metadata and bytes.
 Missing, stale or corrupt entries and storage failures fall back to an ordinary
 build. No live VM objects, generated JavaScript, closures or SSA are stored.
 
-The origin-local IndexedDB store permits at most eight entries and 64 MiB of
-accounted storage, with a 16 MiB limit per artifact (binary bytes plus stored
+The origin-local IndexedDB store permits at most eight entries and 128 MiB of
+accounted storage, with a 32 MiB limit per artifact (binary bytes plus stored
 metadata bytes). Large binding metadata is gzip compressed and has a separate
 32 MiB decoded limit. Oldest entries are evicted using index keys;
 eviction does not deserialize their payloads. These limits do not bound total

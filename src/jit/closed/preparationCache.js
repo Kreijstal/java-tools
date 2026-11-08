@@ -3,8 +3,8 @@ const {digest}=require('./cacheDigest');
 const {uleb}=require('./wasmBuilder');
 const FORMAT='closed-world-preparation/1';
 const SECTION='jvm.closed.preparation';
-// Save-state capture makes a module about a third larger; the largest game
-// (Tomb Racer) then needs about 28 MB.
+// Capture instrumentation increases module size. Bound both individual
+// artifacts and aggregate storage while accommodating larger applications.
 const MAX_ENTRY=32*1024*1024, MAX_TOTAL=128*1024*1024, MAX_ENTRIES=8;
 const MAX_METADATA=32*1024*1024;
 const encode=value=>JSON.stringify(value,(_key,v)=>typeof v==='bigint'?{$bigint:String(v)}:
