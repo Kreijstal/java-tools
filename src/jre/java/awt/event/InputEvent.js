@@ -1,5 +1,24 @@
 module.exports = {
   super: 'java/awt/event/ComponentEvent',
+  // Values from the JDK's public static final fields.
+  staticFields: {
+    'SHIFT_MASK:I': 1,
+    'CTRL_MASK:I': 2,
+    'META_MASK:I': 4,
+    'ALT_MASK:I': 8,
+    'ALT_GRAPH_MASK:I': 32,
+    'BUTTON1_MASK:I': 16,
+    'BUTTON2_MASK:I': 8,
+    'BUTTON3_MASK:I': 4,
+    'SHIFT_DOWN_MASK:I': 64,
+    'CTRL_DOWN_MASK:I': 128,
+    'META_DOWN_MASK:I': 256,
+    'ALT_DOWN_MASK:I': 512,
+    'BUTTON1_DOWN_MASK:I': 1024,
+    'BUTTON2_DOWN_MASK:I': 2048,
+    'BUTTON3_DOWN_MASK:I': 4096,
+    'ALT_GRAPH_DOWN_MASK:I': 8192,
+  },
   methods: {
     'getWhen()J': (jvm, obj) => BigInt(obj.when || 0),
     'getModifiers()I': (jvm, obj) => obj.modifiers || 0,

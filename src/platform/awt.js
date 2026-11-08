@@ -85,6 +85,12 @@ class IGraphics {
     /** @param {number} x @param {number} y @param {number} width @param {number} height */
     fillOval(x, y, width, height) {}
     /** @param {number} x @param {number} y @param {number} width @param {number} height
+     *  @param {number} arcWidth @param {number} arcHeight */
+    fillRoundRect(x, y, width, height, arcWidth, arcHeight) {}
+    /** @param {number} x @param {number} y @param {number} width @param {number} height
+     *  @param {number} arcWidth @param {number} arcHeight */
+    drawRoundRect(x, y, width, height, arcWidth, arcHeight) {}
+    /** @param {number} x @param {number} y @param {number} width @param {number} height
      *  @param {number} startAngleDeg @param {number} arcAngleDeg */
     fillArc(x, y, width, height, startAngleDeg, arcAngleDeg) {}
     /** @param {number} x @param {number} y @param {number} width @param {number} height */
@@ -734,6 +740,52 @@ class CanvasGraphics {
     /** @override @param {number} x @param {number} y @param {number} width @param {number} height */
     drawRect(x, y, width, height) { this.ctx.strokeRect(x, y, width, height); }
 
+    // Arc arguments are ellipse diameters, independently clamped to each axis.
+    roundRectPath(x, y, width, height, rx, ry) {
+        const ctx = this.ctx;
+        ctx.beginPath();
+        ctx.moveTo(x + rx, y);
+        ctx.lineTo(x + width - rx, y);
+        ctx.ellipse(x + width - rx, y + ry, rx, ry, 0, -Math.PI / 2, 0);
+        ctx.lineTo(x + width, y + height - ry);
+        ctx.ellipse(x + width - rx, y + height - ry, rx, ry, 0, 0, Math.PI / 2);
+        ctx.lineTo(x + rx, y + height);
+        ctx.ellipse(x + rx, y + height - ry, rx, ry, 0, Math.PI / 2, Math.PI);
+        ctx.lineTo(x, y + ry);
+        ctx.ellipse(x + rx, y + ry, rx, ry, 0, Math.PI, Math.PI * 1.5);
+        ctx.closePath();
+    }
+
+    fillRoundRect(x, y, width, height, arcWidth, arcHeight) {
+        if (width <= 0 || height <= 0) return;
+        const rx = Math.min(width, Math.abs(arcWidth)) / 2;
+        const ry = Math.min(height, Math.abs(arcHeight)) / 2;
+        if (rx === 0 || ry === 0) {
+            this.ctx.fillRect(x, y, width, height);
+            return;
+        }
+        this.roundRectPath(x, y, width, height, rx, ry);
+        this.ctx.fill();
+    }
+
+    drawRoundRect(x, y, width, height, arcWidth, arcHeight) {
+        if (width < 0 || height < 0) return;
+        if (width === 0 || height === 0) {
+            this.ctx.fillRect(x, y, width + 1, height + 1);
+            return;
+        }
+        const rx = Math.min(width, Math.abs(arcWidth)) / 2;
+        const ry = Math.min(height, Math.abs(arcHeight)) / 2;
+        // AWT's outline includes x + width and y + height. Center the one-pixel
+        // stroke on pixel centers so its straight edges stay inside that range.
+        if (rx === 0 || ry === 0) {
+            this.ctx.strokeRect(x + 0.5, y + 0.5, width, height);
+            return;
+        }
+        this.roundRectPath(x + 0.5, y + 0.5, width, height, rx, ry);
+        this.ctx.stroke();
+    }
+
     /** @param {number} x1 @param {number} y1 @param {number} x2 @param {number} y2 */
     drawLine(x1, y1, x2, y2) {
         this.ctx.beginPath();
@@ -911,6 +963,12 @@ class MockGraphics {
     /** @override @param {number} x @param {number} y @param {number} width @param {number} height */
     fillOval(x, y, width, height) { 
         this.operations.push(`fillOval(${x}, ${y}, ${width}, ${height})`);
+    }
+    fillRoundRect(x, y, width, height, arcWidth, arcHeight) {
+        this.operations.push(`fillRoundRect(${x}, ${y}, ${width}, ${height}, ${arcWidth}, ${arcHeight})`);
+    }
+    drawRoundRect(x, y, width, height, arcWidth, arcHeight) {
+        this.operations.push(`drawRoundRect(${x}, ${y}, ${width}, ${height}, ${arcWidth}, ${arcHeight})`);
     }
     fillArc(x, y, width, height, startAngleDeg, arcAngleDeg) { 
         this.operations.push(`fillArc(${x}, ${y}, ${width}, ${height}, ${startAngleDeg}, ${arcAngleDeg})`);

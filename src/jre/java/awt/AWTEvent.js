@@ -1,5 +1,28 @@
 module.exports = {
   super: 'java/util/EventObject',
+  // Values from the JDK's public static final fields.
+  staticFields: {
+    'COMPONENT_EVENT_MASK:J': BigInt('1'),
+    'CONTAINER_EVENT_MASK:J': BigInt('2'),
+    'FOCUS_EVENT_MASK:J': BigInt('4'),
+    'KEY_EVENT_MASK:J': BigInt('8'),
+    'MOUSE_EVENT_MASK:J': BigInt('16'),
+    'MOUSE_MOTION_EVENT_MASK:J': BigInt('32'),
+    'WINDOW_EVENT_MASK:J': BigInt('64'),
+    'ACTION_EVENT_MASK:J': BigInt('128'),
+    'ADJUSTMENT_EVENT_MASK:J': BigInt('256'),
+    'ITEM_EVENT_MASK:J': BigInt('512'),
+    'TEXT_EVENT_MASK:J': BigInt('1024'),
+    'INPUT_METHOD_EVENT_MASK:J': BigInt('2048'),
+    'PAINT_EVENT_MASK:J': BigInt('8192'),
+    'INVOCATION_EVENT_MASK:J': BigInt('16384'),
+    'HIERARCHY_EVENT_MASK:J': BigInt('32768'),
+    'HIERARCHY_BOUNDS_EVENT_MASK:J': BigInt('65536'),
+    'MOUSE_WHEEL_EVENT_MASK:J': BigInt('131072'),
+    'WINDOW_STATE_EVENT_MASK:J': BigInt('262144'),
+    'WINDOW_FOCUS_EVENT_MASK:J': BigInt('524288'),
+    'RESERVED_ID_MAX:I': 1999,
+  },
   methods: {
     '<init>()V': () => {},
     'getID()I': (jvm, obj) => obj.id || 0,

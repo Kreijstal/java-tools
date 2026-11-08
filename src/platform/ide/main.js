@@ -396,12 +396,24 @@ async function bootWorkspace() {
   window.dispatchEvent(new CustomEvent('javatools:ide-ready'));
 }
 
+// A main() program that opens a Frame or JFrame runs with the terminal in
+// front, so its window would mount into the hidden Display tab. Bring the
+// tab forward whenever a Java window is added to it.
+function revealDisplayOnJavaWindow() {
+  const container = byId('awt-container');
+  if (!container) return;
+  new MutationObserver((mutations) => {
+    if (mutations.some((mutation) => mutation.addedNodes.length > 0)) reveal('display');
+  }).observe(container, { childList: true });
+}
+
 function boot() {
   context.reveal = reveal;
   context.refreshTree = () => explorer.refreshTree();
   context.openFile = (path) => documents.openFile(path);
 
   initLayout();
+  revealDisplayOnJavaWindow();
   wireToolbar();
   shell.initShell();
   explorer.refreshTree();
