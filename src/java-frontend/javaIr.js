@@ -334,8 +334,15 @@ function classTypeInternalName(type, context = {}) {
     if (context.classBySimpleName && context.classBySimpleName.has(dotted)) {
       return context.classBySimpleName.get(dotted);
     }
-    if (context.classBySimpleName && context.classBySimpleName.has(type.name)) {
-      return context.classBySimpleName.get(type.name);
+    // A partially qualified nested name (`B.C` for `A$B$C`) is registered
+    // only under its simple and fully dotted names. The simple-name entry
+    // may stand in for it only when that class really is named by the
+    // qualifier: a default-package `Font` must not capture `java.awt.Font`.
+    const bySimpleName = context.classBySimpleName && context.classBySimpleName.has(type.name)
+      ? context.classBySimpleName.get(type.name) : null;
+    if (bySimpleName) {
+      const qualified = String(bySimpleName).replace(/[/$]/g, '.');
+      if (qualified === dotted || qualified.endsWith(`.${dotted}`)) return bySimpleName;
     }
     const direct = `${String(type.packageName).replace(/\./g, '/')}/${type.name}`;
     if (jreClassInfo(direct)) return direct;
